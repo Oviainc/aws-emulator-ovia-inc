@@ -738,6 +738,15 @@ struct CapacityProviderCase {
     /// How the request addresses the provider, built from its name.
     reference: fn(&str) -> String,
     body: Value,
+    /// The variable part the refused sentence names, built from the value the request
+    /// addressed the provider with: the identifier itself for the operations that echo it,
+    /// the ARN it names for the ones that resolve it.
+    subject: fn(&str) -> String,
+}
+
+/// The capacity-provider ARN a bare provider name names in the Region these rows call.
+fn provider_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:capacity-provider:{name}")
 }
 
 #[tokio::test]
@@ -745,10 +754,13 @@ async fn a_capacity_provider_that_does_not_exist_is_refused_by_its_own_sentence(
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
 
-    // The rows differ in the operation that asked (the read, the update and the delete all
-    // resolve the same way), in the provider name, and in which of the two documented
-    // `CapacityProviderName` forms addressed it — the ARN in the refusal is built from the
-    // resolved name, so it is the same whichever form was asked with.
+    // Every row is the same two fixed clauses; what the rows differ along is the operation
+    // that asked, the provider name, which of the two documented `CapacityProviderName`
+    // forms addressed it, and therefore the variable part each operation states: the
+    // delete and the version listing echo the identifier the request carried, and the read
+    // and the update state the ARN that identifier names (each form recorded per
+    // operation — see
+    // `crate::state::capacity_provider::capacity_provider_not_found_message`).
     let cases = [
         CapacityProviderCase {
             label: "GetCapacityProvider addressed by a bare name",
@@ -756,22 +768,15 @@ async fn a_capacity_provider_that_does_not_exist_is_refused_by_its_own_sentence(
             name: "cp-msg-absent",
             reference: |name| name.to_string(),
             body: Value::Null,
+            subject: provider_arn,
         },
         CapacityProviderCase {
             label: "GetCapacityProvider addressed by the provider ARN",
             method: "GET",
             name: "cp-msg-ghost",
-            reference: |name| {
-                format!("arn:aws:lambda:{REGION}:{ACCOUNT}:capacity-provider:{name}")
-            },
+            reference: provider_arn,
             body: Value::Null,
-        },
-        CapacityProviderCase {
-            label: "DeleteCapacityProvider addressed by a bare name",
-            method: "DELETE",
-            name: "cp-msg-never-created",
-            reference: |name| name.to_string(),
-            body: Value::Null,
+            subject: provider_arn,
         },
         CapacityProviderCase {
             label: "UpdateCapacityProvider addressed by a bare name",
@@ -779,6 +784,33 @@ async fn a_capacity_provider_that_does_not_exist_is_refused_by_its_own_sentence(
             name: "cp-msg-unknown",
             reference: |name| name.to_string(),
             body: json!({ "Description": "nothing to update" }),
+            subject: provider_arn,
+        },
+        CapacityProviderCase {
+            label: "UpdateCapacityProvider addressed by the provider ARN",
+            method: "PUT",
+            name: "cp-msg-update-ghost",
+            reference: provider_arn,
+            body: json!({ "Description": "nothing to update" }),
+            subject: provider_arn,
+        },
+        CapacityProviderCase {
+            label: "DeleteCapacityProvider addressed by a bare name",
+            method: "DELETE",
+            name: "cp-msg-never-created",
+            reference: |name| name.to_string(),
+            body: Value::Null,
+            // The delete echoes what it was given, so a bare name is reported as that
+            // bare name.
+            subject: |name| name.to_string(),
+        },
+        CapacityProviderCase {
+            label: "DeleteCapacityProvider addressed by the provider ARN",
+            method: "DELETE",
+            name: "cp-msg-delete-ghost",
+            reference: provider_arn,
+            body: Value::Null,
+            subject: provider_arn,
         },
     ];
 
@@ -793,9 +825,9 @@ async fn a_capacity_provider_that_does_not_exist_is_refused_by_its_own_sentence(
         .await;
         let reported = message(&answer);
         let expected = format!(
-            "Capacity provider not found: arn:aws:lambda:{REGION}:{ACCOUNT}:capacity-provider:{}. \
-             Check that the ARN is correct and the capacity provider exists in this Region.",
-            case.name
+            "Capacity provider not found: {}. Check that the ARN is correct and the \
+             capacity provider exists in this Region.",
+            (case.subject)(case.name)
         );
         assert_eq!(
             (answer.status, answer.error_code().contains("ResourceNotFoundException")),

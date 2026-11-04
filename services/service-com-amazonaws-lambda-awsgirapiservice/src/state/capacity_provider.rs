@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! How a capacity provider is ADDRESSED: the ARN this service mints for one, the ARN
-//! resource type that ARN carries, the reading of a client-sent `CapacityProviderName`
-//! in either documented form, and the refusal a value that names no provider is answered
-//! with.
+//! resource type that ARN carries, the reading of a client-sent `CapacityProviderName` in
+//! either documented form, and the refusals a value that names no provider — or an operator
+//! role this service cannot manage its compute with — is answered with.
 //!
 //! It lives in its own module rather than in the already long [`crate::state`], which
 //! re-exports every item here, so a handler still names them as `crate::state::…` and the
@@ -74,3 +74,47 @@ pub fn capacity_provider_name_message(value: &str) -> String {
          or capacity provider ARN)"
     )
 }
+
+/// The sentence a capacity-provider operation refuses a well-formed `CapacityProviderName`
+/// that names no provider with, where that sentence's variable part is the value the REQUEST
+/// named — either documented `CapacityProviderName` form, echoed exactly as the caller
+/// supplied it.
+///
+/// WHICH form the variable part takes is RECORDED PER OPERATION, because AWS states it per
+/// operation and no model records it: the two sentences are otherwise identical, and both
+/// are the same two fixed clauses.
+///
+/// * `DeleteCapacityProvider` and `ListFunctionVersionsByCapacityProvider` echo the
+///   identifier, which is this function (corpus `simparity-wire-aws-v1`, fixture
+///   `lambda-capacity-provider-negative-paths` steps `task#4` and `task#5`: a request
+///   naming a bare provider name is answered with that bare name);
+/// * `GetCapacityProvider` and `UpdateCapacityProvider` state the capacity-provider ARN the
+///   identifier names in the Region the caller signed for, which is what
+///   [`super::resolve_capacity_provider`] builds for every caller of it (same corpus,
+///   fixture `lambda-capacity-provider-lifecycle` steps `task#3` and `task#4`: a request
+///   naming a bare provider name is answered with the full ARN).
+///
+/// Nothing in either form is read out of the store: the provider the request named does not
+/// exist, so there is no record to report anything from.
+#[must_use]
+pub fn capacity_provider_not_found_message(capacity_provider_name: &str) -> String {
+    format!(
+        "Capacity provider not found: {capacity_provider_name}. Check that the ARN is \
+         correct and the capacity provider exists in this Region."
+    )
+}
+
+/// Why a request naming an operator role this service cannot manage compute with is
+/// refused.
+///
+/// Wholly fixed text: it names neither the role the request carried nor which half of the
+/// question failed, because a caller that may not use the role is not told whether it
+/// exists.
+///
+/// The question itself is not asked here: the role a capacity provider manages compute as is
+/// assumed by the same service principal as the role a function runs as, so the ONE reading
+/// this crate has ([`super::execution_role_is_unassumable`]) answers for both, and only this
+/// sentence is the capacity-provider surface's own.
+pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
+    "The operator role is invalid or doesn't have sufficient permissions. Verify the role \
+     and permissions and try again.";

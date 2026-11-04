@@ -18,9 +18,8 @@
 //!
 //! A `CapacityProviderName` naming no provider is refused `ResourceNotFoundException`
 //! with the provider-not-found sentence, whose variable part is the value the request
-//! named — the capacity-provider operations addressed AT a provider report the ARN they
-//! resolved it to instead (`crate::state::resolve_capacity_provider`), which is how AWS
-//! words each of the two.
+//! named, echoed as supplied — the one sentence every capacity-provider operation states
+//! (`crate::state::capacity_provider::capacity_provider_not_found_message`).
 //!
 //! It writes nothing of its own: the only changes it applies are the ones the clock
 //! already made due (a `Pending` function or provider whose activation is owed becomes
@@ -238,13 +237,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(|failure| match failure {
             crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
             // A well-formed value that names no provider is refused as not found, with
-            // the value the request named as the sentence's variable part (see
-            // [`provider_not_found_message`]).
+            // the value the request named as the sentence's variable part, which is how
+            // every operation addressed at a provider states it (see
+            // `crate::state::capacity_provider::capacity_provider_not_found_message`).
             crate::state::ResolveFailure::NotFound(_) => {
                 ListFunctionVersionsByCapacityProviderErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        message: Some(provider_not_found_message(&input.capacity_provider_name)),
+                        message: Some(
+                            crate::state::capacity_provider::capacity_provider_not_found_message(
+                                &input.capacity_provider_name,
+                            ),
+                        ),
                     },
                 )
                 .into()
@@ -335,21 +339,6 @@ fn marker_order(marker: &str) -> Option<(String, u64)> {
         .qualifier
         .unwrap_or_else(|| crate::state::VERSION_LATEST.to_string());
     entry_order(&reference.name, &version)
-}
-
-/// The refusal a `CapacityProviderName` that names no provider gets.
-///
-/// The sentence is the service's own for a capacity provider that does not exist, and its
-/// variable part is the value the request named — either documented
-/// `CapacityProviderName` form, as it was given. The operations addressed AT a provider
-/// (`GetCapacityProvider`, `UpdateCapacityProvider`, `DeleteCapacityProvider`) report the
-/// ARN they resolved that value to instead, which is why the sentence is built here
-/// rather than taken from `crate::state::resolve_capacity_provider`.
-fn provider_not_found_message(capacity_provider_name: &str) -> String {
-    format!(
-        "Capacity provider not found: {capacity_provider_name}. Check that the ARN is \
-         correct and the capacity provider exists in this Region."
-    )
 }
 
 /// The modelled 400 this operation refuses a request it cannot satisfy with.

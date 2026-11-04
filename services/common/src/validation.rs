@@ -244,6 +244,25 @@ pub fn refusing_violations_with_lists<O: Operation>(
     (refusing.violations, refusing.lists)
 }
 
+/// [`refusing_violations_with_lists`], quoting one value up to the ceiling the SERVICE
+/// states ([`refusing_violations_quoting_up_to`]) instead of [`MAX_RESTORED_ECHO`].
+///
+/// The two choices a service makes about its clauses' value halves are independent — how
+/// much of ONE value a clause quotes, and whether the clause stated at a LIST member can
+/// quote the whole list — so a service that makes both reads them out of the SAME walk here
+/// rather than reading the request twice. Everything else is
+/// [`refusing_violations_with_lists`]'s: the same violations, the same lists, collected only
+/// when a violation names a list element.
+#[must_use]
+pub fn refusing_violations_with_lists_quoting_up_to<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_echo: usize,
+) -> (Vec<Violation>, HashMap<String, String>) {
+    let refusing = violations_in::<O>(protocol, req, Echoes::SubmittedWithListsUpTo(max_echo));
+    (refusing.violations, refusing.lists)
+}
+
 /// Every violation that refuses `req` before `O`'s handler runs, with the framework's own
 /// rendering of each value kept — except where the validating walk WITHHELD it, which is
 /// put back as that walk itself would have stored it ([`with_withheld_values`]).
@@ -521,6 +540,9 @@ pub(crate) enum Echoes {
     Withheld,
     /// Restore each echo, and collect the request's lists too ([`submitted_lists`]).
     SubmittedWithLists,
+    /// As [`Self::SubmittedWithLists`], quoting one value up to the bound the SERVICE
+    /// states ([`with_submitted_values_up_to`]) instead of [`MAX_RESTORED_ECHO`].
+    SubmittedWithListsUpTo(usize),
     /// Pair each violation with how a clause can state its value
     /// ([`with_submitted_echoes`]), which renders a composite value instead of leaving the
     /// framework's count summary in place.
@@ -745,6 +767,28 @@ pub(crate) fn violations_in<O: Operation>(
                         .any(|violation| list_of_element(&violation.path).is_some());
                     Refusing {
                         violations: with_submitted_values(violations, &input, O::INPUT_SCHEMA),
+                        lists: if wanted {
+                            submitted_lists(&input, O::INPUT_SCHEMA)
+                        } else {
+                            HashMap::new()
+                        },
+                        echoes: Vec::new(),
+                    }
+                }
+                Echoes::SubmittedWithListsUpTo(max_echo) => {
+                    // The same one read as `SubmittedWithLists`, under the service's own
+                    // quoting ceiling: the lists are collected on the same condition and
+                    // from the same built input.
+                    let wanted = violations
+                        .iter()
+                        .any(|violation| list_of_element(&violation.path).is_some());
+                    Refusing {
+                        violations: with_submitted_values_up_to(
+                            violations,
+                            &input,
+                            O::INPUT_SCHEMA,
+                            max_echo,
+                        ),
                         lists: if wanted {
                             submitted_lists(&input, O::INPUT_SCHEMA)
                         } else {

@@ -198,11 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             }
-            crate::state::ResolveFailure::NotFound(message) => {
+            crate::state::ResolveFailure::NotFound(_) => {
                 DeleteCapacityProviderErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        message: Some(message),
+                        // The sentence's variable part is the value the REQUEST named,
+                        // echoed as supplied: a provider that does not exist has no stored
+                        // ARN to report (see
+                        // `crate::state::capacity_provider::capacity_provider_not_found_message`).
+                        message: Some(
+                            crate::state::capacity_provider::capacity_provider_not_found_message(
+                                &input.capacity_provider_name,
+                            ),
+                        ),
                     },
                 )
             }

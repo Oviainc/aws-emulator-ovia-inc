@@ -112,6 +112,10 @@ pub mod public_access;
 /// one that passes it; see the module's own header.
 mod request_quota;
 
+/// WHERE a constraint broken by a COLLECTION's elements is stated, and what that clause says
+/// an element has to satisfy; see the module's own header.
+mod validation;
+
 /// The largest single value ONE clause of this service's validation refusal quotes back.
 ///
 /// An AWS constraint message always quotes the value it refused in full, and the shared
@@ -413,16 +417,21 @@ impl<O> StatedPerOperation<O> {
 /// [`stated_violations`] gives them. `None` when the request breaks none, and for a failure
 /// that is NOT a refusal (a body the codec cannot read at all, a member of the wrong type),
 /// which the framework's own walk answers in its own envelope.
+///
+/// The same ONE read also yields the request's own LISTS, which a clause stated at a list
+/// member quotes and no violation carries (see [`validation`]): both halves come out of the
+/// walk that already built the input, so the request is not read a third time for them.
 fn stated_refusal<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<(Vec<Violation>, Refused)> {
-    let violations = service_common::validation::refusing_violations_quoting_up_to::<O>(
-        protocol,
-        req,
-        LARGEST_QUOTED_VALUE_BYTES,
-    );
-    let stated = stated_violations(&violations)?;
+    let (violations, lists) =
+        service_common::validation::refusing_violations_with_lists_quoting_up_to::<O>(
+            protocol,
+            req,
+            LARGEST_QUOTED_VALUE_BYTES,
+        );
+    let stated = stated_violations(&violations, &lists)?;
     Some((violations, stated))
 }
 
@@ -438,7 +447,17 @@ fn stated_refusal<O: Operation>(
 /// AWS gives it instead of the envelope over its clause (see [`opaque_members`]): the
 /// envelope would quote back a token the caller cannot compose and the form a minted one
 /// has, neither of which AWS discloses.
-fn stated_violations(violations: &[Violation]) -> Option<Refused> {
+///
+/// A constraint one of a COLLECTION's elements broke is stated at the COLLECTION member,
+/// over the whole set of requirements an element of it has ([`validation`]) and quoting what
+/// that member held — which is `lists`, keyed by the member path the clause is stated at.
+/// The refusal path that is handed the violations ALONE passes no lists, so such a clause
+/// states the member and the set with no value, exactly as it does for a collection whose
+/// own `@length` was broken.
+fn stated_violations(
+    violations: &[Violation],
+    lists: &std::collections::HashMap<String, String>,
+) -> Option<Refused> {
     if violations.is_empty() {
         return None;
     }
@@ -457,7 +476,12 @@ fn stated_violations(violations: &[Violation]) -> Option<Refused> {
             _ => violation.clone(),
         })
         .collect();
-    service_common::aws_validation_refusal(&Refusal::Invalid(restated))
+    service_common::validation_message::aws_validation_refusal_over_elements_stating(
+        &Refusal::Invalid(restated),
+        service_common::validation::unanchored,
+        |collection| lists.get(collection).cloned(),
+        validation::element_set,
+    )
 }
 
 impl<O> ErasedOperation for StatedPerOperation<O>
@@ -779,7 +803,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // An unauthenticated caller keeps the framework's 403 code and wording.
             return None;
         };
-        stated_violations(violations)
+        stated_violations(violations, &std::collections::HashMap::new())
     }
 
     fn override_routing_error(

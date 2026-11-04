@@ -63,6 +63,8 @@ mod code_signing_config_listing;
 mod code_signing_config_update;
 #[path = "all/code_signing_configs.rs"]
 mod code_signing_configs;
+#[path = "all/collection_element_refusals.rs"]
+mod collection_element_refusals;
 #[path = "all/concurrency_quota_refusal_rules.rs"]
 mod concurrency_quota_refusal_rules;
 #[path = "all/durable_execution_bound.rs"]

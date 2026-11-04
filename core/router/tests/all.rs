@@ -669,6 +669,9 @@ mod lambda_signing_name_routing;
 // of them, while these neighbouring lines are stable.
 #[path = "all/lambda_execution_role_trust.rs"]
 mod lambda_execution_role_trust;
+// Declared in this span of the sorted list, for the reason the line above states.
+#[path = "all/lambda_capacity_provider_operator_role.rs"]
+mod lambda_capacity_provider_operator_role;
 // Declared in this span of the sorted list, beside the other `l…` suites, rather than at
 // the head of this file or in its appended tail: both of those are where concurrently
 // landing suites put their line, so a declaration there loses a squash merge to every one

@@ -11,6 +11,12 @@
 //! `Pending`: standing its compute resources up is owed by the clock, so a later
 //! `GetCapacityProvider` reports `Active` once that is due.
 //!
+//! The OPERATOR ROLE the request names is resolved against this account's IAM before
+//! anything is stored, because the provider manages compute AS that role: a role this
+//! account does not hold, or one whose trust policy does not admit this service, is refused
+//! `InvalidParameterValueException` with nothing persisted (see
+//! `crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -203,6 +209,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // `PermissionsConfig` names "the IAM role ARN used by the capacity provider to
+        // manage compute instances and other Amazon Web Services resources", and this
+        // service makes those calls AS that role — so the role is resolved against this
+        // account's IAM before anything is written, exactly as a function's execution role
+        // is: a role this emulator's own IAM does not hold, or one whose trust policy does
+        // not let this service assume it, is the modelled 400 and no provider is stored.
+        //
+        // The question is the ONE reading this crate has, which a function's execution role
+        // goes through too (`crate::state::execution_role_is_unassumable`): a provider's
+        // operator role is assumed by the same service principal, so only the sentence it is
+        // refused with is this surface's own. It is put to the emulator's OWN IAM over its
+        // OWN in-process transport (that reading asks through `service_common::iam_role`,
+        // whose client is built from the operation callback): nothing here opens a socket,
+        // resolves a host or reads an ambient credential. An emulator with no IAM mounted
+        // refuses nothing, so a missing answer never becomes a refusal. It is awaited with
+        // no store guard held.
+        if crate::state::execution_role_is_unassumable(
+            ctx,
+            &region,
+            &input.permissions_config.capacity_provider_operator_role_arn,
+        )
+        .await
+        {
+            return Err(invalid_parameter(
+                crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE.to_string(),
+            ));
+        }
+
         let mut store = state.lock();
         // The store is first brought up to whatever the clock already made due, so a
         // provider whose own removal was already owed is gone before this call looks for

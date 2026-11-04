@@ -105,7 +105,12 @@
 //! clauses it cannot state — one withholding the value a present member submitted while
 //! still reporting an absent member as the `null` it was, which no per-member-path decision
 //! expresses — reads that same set through [`element_constraint_set`] and nests it with
-//! [`element_set_requirement`], so the wrapper and the set stay here either way.
+//! [`element_set_requirement`], so the wrapper and the set stay here either way. A service
+//! whose recordings show a set this module's reading does not produce — one stating that an
+//! element of a list that is not `@sparse` also has to be present, or one whose list members
+//! are nested inside structures, which are looked up under their own member names — states
+//! that set itself and hands it to [`aws_validation_refusal_over_elements_stating`], which
+//! keeps every other clause, the value half and the envelope here.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -693,7 +698,13 @@ pub fn map_key_refusal_quoting(
 /// The REQUIREMENT half of a violation's clause — the `Member must …` sentence — taken
 /// out of the framework's own clause rather than spelled here, so the requirements a
 /// handler lists and the ones a reported member gets are the same sentences.
-fn requirement(kind: ViolationKind) -> String {
+///
+/// `pub` because a service that states its own clauses around a requirement — one whose
+/// dialect this module's whole-refusal entry points do not cover — needs the same sentence
+/// for the same constraint: the alternative is each such crate re-deriving it from
+/// [`Violation::message`], which is how two crates come to word one constraint two ways.
+#[must_use]
+pub fn requirement(kind: ViolationKind) -> String {
     /// How the framework separates a clause's member half from its requirement.
     const CLAUSE_SEPARATOR: &str = "failed to satisfy constraint: ";
 
@@ -1051,6 +1062,39 @@ pub fn aws_validation_refusal_over_elements(
     aws_validation_refusal_over_elements_quoting(refusal, input_schemas, quote_pattern, |_| None)
 }
 
+/// [`aws_validation_refusal_over_elements_quoting`], with the nested REQUIREMENT a grouped
+/// clause states decided by the caller.
+///
+/// The other half those recordings do not agree on: WHAT an element shape's constraint set
+/// reads as. The set this module reads off the handed-over schemas is the constraints the
+/// model declares on the element shape, looked up by the member path the clause is stated at
+/// — and a service whose recordings show more than that (every element of a list that is not
+/// `@sparse` also has to be PRESENT, which several services' refusals state beside the
+/// constraint the value broke), or whose list members are nested inside structures the
+/// handed-over schemas name under their own member names, states the requirement itself.
+/// `element_set` is asked for it by that member path, and `None` falls back to the set this
+/// module reads, so a service states only the collections whose set is its own.
+///
+/// The requirement is nested with [`element_set_requirement`] by whoever builds it;
+/// everything else is [`aws_validation_refusal_over_elements_quoting`]'s — the same
+/// grouping, the same value half, the same envelope and the same clauses for every violation
+/// that is not a collection element's.
+pub fn aws_validation_refusal_over_elements_stating(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+    quoted_collection: impl Fn(&str) -> Option<String>,
+    element_set: impl Fn(&str) -> Option<String>,
+) -> Option<Refused> {
+    grouped_refusal(
+        refusal,
+        &[],
+        &quote_pattern,
+        &quoted_collection,
+        &|_| false,
+        &element_set,
+    )
+}
+
 /// [`aws_validation_refusal_over_elements`], with the COLLECTION a grouped clause quotes
 /// decided by the caller.
 ///
@@ -1076,6 +1120,7 @@ pub fn aws_validation_refusal_over_elements_quoting(
         &quote_pattern,
         &quoted_collection,
         &|_| false,
+        &|_| None,
     )
 }
 
@@ -1103,6 +1148,7 @@ pub fn aws_validation_refusal_over_elements_withholding(
         &quote_pattern,
         &|_| None,
         &withholds_value,
+        &|_| None,
     )
 }
 
@@ -1166,6 +1212,7 @@ fn grouped_refusal(
     quote_pattern: &dyn Fn(&str) -> String,
     quoted_collection: &dyn Fn(&str) -> Option<String>,
     withholds_value: &dyn Fn(&str) -> bool,
+    element_set: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -1177,12 +1224,24 @@ fn grouped_refusal(
     for violation in &restated_violations(violations, quote_pattern) {
         let clause = list_of_element(&violation.path)
             .and_then(|collection| {
-                element_set_clause(
-                    collection,
-                    input_schemas,
-                    quote_pattern,
-                    quoted_collection(collection).as_deref(),
-                )
+                // The requirement the CALLER states for that collection comes first, and
+                // the set this module reads off the schemas stands for every collection it
+                // does not state (see
+                // [`aws_validation_refusal_over_elements_stating`]).
+                let quoted = quoted_collection(collection);
+                match element_set(collection) {
+                    Some(requirement) => Some(stated_element_clause(
+                        collection,
+                        quoted.as_deref(),
+                        &requirement,
+                    )),
+                    None => element_set_clause(
+                        collection,
+                        input_schemas,
+                        quote_pattern,
+                        quoted.as_deref(),
+                    ),
+                }
             })
             .or_else(|| {
                 withholds_value(&violation.path)
@@ -1238,16 +1297,26 @@ fn element_set_clause(
     if declared.any(|other| other != set) {
         return None;
     }
-    // The value half is the framework's own spelling of one, so a grouped clause reads like
-    // a clause about a member the walk reported.
+    Some(stated_element_clause(
+        collection,
+        quoted,
+        &element_set_requirement(&set),
+    ))
+}
+
+/// The clause stated at `collection` for `requirement`, the nested requirement its elements
+/// have to satisfy: the ONE place a grouped clause is spelled, whether the set came off the
+/// schemas or from the caller.
+///
+/// The value half is the framework's own spelling of one, so a grouped clause reads like a
+/// clause about a member the walk reported; `quoted` is the collection as the clause quotes
+/// it, and `None` states no value at all.
+fn stated_element_clause(collection: &str, quoted: Option<&str>, requirement: &str) -> String {
     let stated_value = match quoted {
         Some(value) => format!("Value '{value}' at"),
         None => "Value at".to_string(),
     };
-    Some(format!(
-        "{stated_value} '{collection}' failed to satisfy constraint: {}",
-        element_set_requirement(&set)
-    ))
+    format!("{stated_value} '{collection}' failed to satisfy constraint: {requirement}")
 }
 
 /// Every requirement the ELEMENT shape of `input_schema`'s `collection` member declares, in
@@ -1352,7 +1421,13 @@ fn rendered_bound(bound: f64) -> String {
 /// [`envelope`]'s own rendering over as many placeholder violations as there are clauses,
 /// so neither is spelled here and a grouped refusal cannot drift from an ungrouped one.
 /// `None` for no clause at all, exactly as [`envelope`] answers for no violation.
-fn envelope_over(clauses: &[String]) -> Option<String> {
+///
+/// `pub` for the same reason [`requirement`] is: a service whose clauses this module's
+/// whole-refusal entry points cannot state words them itself and still has to put them in
+/// AWS's envelope, and an envelope re-spelled per crate is how `1 validation error
+/// detected: ` comes to differ between two services.
+#[must_use]
+pub fn envelope_over(clauses: &[String]) -> Option<String> {
     let placeholder = Violation {
         path: String::new(),
         kind: ViolationKind::MissingRequiredMember,
