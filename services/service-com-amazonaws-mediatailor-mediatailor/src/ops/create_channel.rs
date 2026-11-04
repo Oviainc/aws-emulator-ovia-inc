@@ -214,6 +214,18 @@ fn stored_channel_violation(input: &CreateChannelInput) -> Option<String> {
                 output.manifest_name
             ));
         }
+        let markup_types = output
+            .hls_playlist_settings
+            .as_ref()
+            .and_then(|settings| settings.ad_markup_type.as_ref())
+            .map_or(0, Vec::len);
+        if markup_types > crate::state::MAX_AD_MARKUP_TYPES_PER_PLAYLIST {
+            return Some(format!(
+                "an HLS playlist names at most {} ad-markup types, and the one of output {} names {markup_types}",
+                crate::state::MAX_AD_MARKUP_TYPES_PER_PLAYLIST,
+                output.manifest_name
+            ));
+        }
     }
     if let Some(audiences) = input.audiences.as_ref() {
         if audiences.len() > crate::state::MAX_AUDIENCES_PER_CHANNEL {
@@ -352,7 +364,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     playback_urls(&label, &region, &input.channel_name, output);
                 ResponseOutputItem {
                     dash_playlist_settings: output.dash_playlist_settings.clone(),
-                    hls_playlist_settings: output.hls_playlist_settings.clone(),
+                    // An HLS output advertises an ad-markup type whether or not
+                    // the request named one.
+                    hls_playlist_settings: crate::state::stored_hls_playlist_settings(
+                        output.hls_playlist_settings.as_ref(),
+                    ),
                     manifest_name: output.manifest_name.clone(),
                     playback_url,
                     dual_stack_playback_url: Some(dual_stack_playback_url),
@@ -412,7 +428,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| crate::state::DEFAULT_CHANNEL_TIER.to_string()),
             filler_slate: input.filler_slate.clone(),
             time_shift_configuration: input.time_shift_configuration.clone(),
-            audiences: input.audiences.clone(),
+            // A channel created with no audience has an empty audience list,
+            // which every read of it reports as such.
+            audiences: input.audiences.clone().unwrap_or_default(),
             // Owned by `ConfigureLogsForChannel`: a channel is created with no
             // log type enabled.
             log_types: Vec::new(),

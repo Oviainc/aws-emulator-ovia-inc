@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureLogsForChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfigureLogsForChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfigureLogsForChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: writes the log types named by `LogTypes` onto the channel named by
+//! `ChannelName` in [`crate::state`], so every later read of that channel reports
+//! them, and answers with the types AS STORED. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -64,6 +59,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::channel_not_found_message;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -72,17 +69,28 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ConfigureLogsForChannelError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#ConfigureLogsForChannel")]
+// here — hence the `ConfigureLogsForChannelError` alias below.
+//
+// The model lists no error on `ConfigureLogsForChannel` itself, so
+// `BadRequestException` — the one client error this SERVICE declares ("A request
+// contains unexpected data", HTTP 400) — is widened in with `extra_errors` to
+// refuse a request naming a channel this emulator does not hold, or more log
+// types than one channel's log configuration can hold. It is the only error
+// shape the model gives this service, so it is what such a request is answered
+// with rather than a status and code no model declares, and it is the same
+// refusal the channel read and the start/stop writes answer such a name with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#ConfigureLogsForChannel",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum ConfigureLogsForChannelErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::configure_logs_for_channel::ConfigureLogsForChannelError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::configure_logs_for_channel::ConfigureLogsForChannelError`). The wrapper is
+/// kept for the `validation` refusal channel it carries.
 pub type ConfigureLogsForChannelError = crate::scaffolded::Scaffolded<ConfigureLogsForChannelErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -128,21 +136,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        mut input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfigureLogsForChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfigureLogsForChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfigureLogsForChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store nothing can be written, so answer the scaffold's 501 rather
+            // than report a write that did not happen.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ConfigureLogsForChannel",
+            ));
+        };
+
+        // What this call would store is bounded before any of it is stored, so
+        // one channel's log configuration cannot grow without bound however many
+        // times logs are configured. The list's VALUES are already refused by
+        // the framework's validation walk against `LogType`.
+        if input.log_types.len() > crate::state::MAX_LOG_EVENT_TYPES_PER_LIST {
+            return Err(ConfigureLogsForChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "LogTypes names at most {} log types, and this request names {}",
+                        crate::state::MAX_LOG_EVENT_TYPES_PER_LIST,
+                        input.log_types.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.channels.get_mut(&input.channel_name) else {
+            return Err(ConfigureLogsForChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(channel_not_found_message(&input.channel_name)),
+                },
+            )
+            .into());
+        };
+
+        // This call says which logs the channel collects, so what it carries is
+        // the channel's whole set of log types from here on: the write replaces
+        // the types in force rather than adding to them, and it touches nothing
+        // else about the stored channel.
+        record.log_types = ::std::mem::take(&mut input.log_types);
+
+        // The response reports the types AS STORED, so a caller reading the
+        // channel back sees what this call answered.
+        Ok(ConfigureLogsForChannelOutput {
+            channel_name: Some(record.name.clone()),
+            log_types: Some(record.log_types.clone()),
+        })
     }
 }

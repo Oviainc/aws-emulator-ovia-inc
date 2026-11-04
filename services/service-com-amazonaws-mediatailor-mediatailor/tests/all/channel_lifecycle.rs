@@ -23,6 +23,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::channel_response_projection::expected_hls_playlist_settings;
+
 /// The region this suite signs for, so the ARNs and playback hosts it asserts
 /// are the ones the request's SigV4 credential scope names.
 const REGION: &str = "us-east-1";
@@ -361,7 +363,7 @@ async fn create_persists_every_member_and_describe_reports_it() {
         );
         for (index, requested) in requested_outputs.iter().enumerate() {
             let output = &reported[index];
-            for member in ["ManifestName", "SourceGroup", "HlsPlaylistSettings", "DashPlaylistSettings"] {
+            for member in ["ManifestName", "SourceGroup", "DashPlaylistSettings"] {
                 assert_eq!(
                     output.get(member),
                     requested.get(member),
@@ -370,6 +372,17 @@ async fn create_persists_every_member_and_describe_reports_it() {
                     output.get(member)
                 );
             }
+            // The HLS playlist settings carry their own always-present member,
+            // so they are reported as the output was STORED with them — the
+            // `channel_response_projection` suite owns that rule.
+            let expected_hls = expected_hls_playlist_settings(requested.get("HlsPlaylistSettings"));
+            assert_eq!(
+                output.get("HlsPlaylistSettings").cloned(),
+                expected_hls,
+                "case {case:?}: expected output {index} HlsPlaylistSettings {expected_hls:?}, \
+                 got {:?}",
+                output.get("HlsPlaylistSettings")
+            );
             let manifest = requested["ManifestName"].as_str().expect("a manifest name");
             let dash_only = requested.get("DashPlaylistSettings").is_some()
                 && requested.get("HlsPlaylistSettings").is_none();

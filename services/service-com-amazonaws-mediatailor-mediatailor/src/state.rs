@@ -62,6 +62,55 @@ pub const STOPPED_CHANNEL_STATE: &str = "STOPPED";
 /// has never been started is in.
 pub const INITIAL_CHANNEL_STATE: &str = STOPPED_CHANNEL_STATE;
 
+/// The form of SCTE-35 ad markup an HLS channel output advertises when the
+/// request that created it named none.
+///
+/// `HlsPlaylistSettings$AdMarkupType` "[d]etermines the type of SCTE 35 tags to
+/// use in ad markup", and its own documentation ties each value to a tag form:
+/// `DATERANGE` uses `DATERANGE` tags "(for live or VOD content)" while
+/// `SCTE35_ENHANCED` uses `EXT-X-CUE-OUT`/`EXT-X-CUE-IN` tags "(for VOD content
+/// only)". An HLS manifest carries one of those forms whether or not the caller
+/// chose it, so a channel output always advertises a markup type, and the one it
+/// advertises when no type was chosen is the form that serves either content
+/// kind. The model declares no `@default` for the member, so the value lives
+/// here: should a later revision declare one, that default replaces this
+/// constant.
+pub const DEFAULT_AD_MARKUP_TYPE: &str = "DATERANGE";
+
+/// The HLS playlist settings one channel output is STORED with, given the
+/// settings its request carried.
+///
+/// An output that asked for no HLS playlist has none — a DASH-only output is
+/// reported without the member — but one that did advertises an ad-markup type
+/// even when the request named no member, so the stored settings carry
+/// [`DEFAULT_AD_MARKUP_TYPE`] in that case and every read of the channel reports
+/// it. A request that names the member is stored as it sent it: the model
+/// constrains the list's values, not their order or their number, so the types
+/// an output advertises are the caller's whenever the caller chose them.
+pub fn stored_hls_playlist_settings(
+    requested: Option<&HlsPlaylistSettings>,
+) -> Option<HlsPlaylistSettings> {
+    requested.map(|settings| HlsPlaylistSettings {
+        ad_markup_type: Some(
+            settings
+                .ad_markup_type
+                .clone()
+                .unwrap_or_else(|| vec![DEFAULT_AD_MARKUP_TYPE.to_string()]),
+        ),
+        ..settings.clone()
+    })
+}
+
+/// The number of ad-markup types one HLS playlist names.
+///
+/// `AdMarkupType` is a caller-sized list and the model declares no `length`
+/// constraint on it, so this figure is CHOSEN, as the other list ceilings in
+/// this module are: its purpose is that one stored channel output cannot grow
+/// without bound. It is far above the member's whole modelled value set (the
+/// generated `AD_MARKUP_TYPE_VALUES` in `crate::ops::types`), so a request that
+/// names every type it can name never reaches it.
+pub const MAX_AD_MARKUP_TYPES_PER_PLAYLIST: usize = 20;
+
 /// The number of tags one resource holds: AWS's documented tagging limit of 50
 /// tags per resource. `PutPlaybackConfiguration` and `TagResource` refuse a
 /// request that would leave a resource above it.
@@ -110,8 +159,9 @@ pub const DEFAULT_AD_BUFFET_MODE: &str = "INSERT_ALL";
 
 /// The number of event types one log-configuration list names.
 ///
-/// `EnabledLoggingStrategies` and the interaction-log event-type lists are
-/// caller-sized and the model declares no `length` constraint on any of them,
+/// `EnabledLoggingStrategies`, the interaction-log event-type lists and a
+/// channel's `LogTypes` are caller-sized and the model declares no `length`
+/// constraint on any of them,
 /// so this figure is CHOSEN: its purpose is that one stored log configuration
 /// cannot grow without bound however many times logs are configured. It is far
 /// above every one of those lists' modelled value sets, so a request that names
@@ -423,7 +473,10 @@ pub struct ChannelRecord {
     pub tier: String,
     pub filler_slate: Option<SlateSource>,
     pub time_shift_configuration: Option<TimeShiftConfiguration>,
-    pub audiences: Option<Vec<String>>,
+    /// The audiences defined in this channel, none when the request that created
+    /// it named none: the member says which audiences the channel has, so the
+    /// answer for a channel with none is an empty list rather than nothing.
+    pub audiences: Vec<String>,
     /// Owned by `ConfigureLogsForChannel`, not by the create path: the log types
     /// enabled on this channel, none until that operation enables some.
     pub log_types: Vec<String>,
@@ -447,9 +500,13 @@ impl ChannelRecord {
 
     /// The stored channel as the create path reports it.
     ///
-    /// `Tags` is ALWAYS reported: the member says what tags the channel
-    /// carries, and an untagged channel carries none, so the answer is an empty
-    /// tag set rather than an absent member.
+    /// `Tags` and `Audiences` are ALWAYS reported: each member says what the
+    /// channel HAS — the tags it carries, the audiences defined in it — and a
+    /// channel with none of either has an empty set rather than nothing, so a
+    /// caller dereferences a map and a list whatever the channel was created
+    /// with. Each of this channel's outputs is reported with the playlist
+    /// settings it was stored with, which carry their own always-present members
+    /// (see [`stored_hls_playlist_settings`]).
     ///
     /// Every channel-shaped response is this one rendering of the stored
     /// record: [`ChannelRecord::describe_output`] re-uses it member for member,
@@ -467,7 +524,7 @@ impl ChannelRecord {
             tags: Some(tags),
             tier: Some(self.tier.clone()),
             time_shift_configuration: self.time_shift_configuration.clone(),
-            audiences: self.audiences.clone(),
+            audiences: Some(self.audiences.clone()),
         }
     }
 
