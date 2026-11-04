@@ -22,6 +22,15 @@
 //! each the modelled refusal for that case — and a cluster the account really holds,
 //! active, is accepted.
 //!
+//! An EXTERNAL key store is built over a proxy that has to be THERE: once the request's
+//! own properties are judged, the proxy the request describes is reached
+//! ([`crate::state::XksProxy::answers`]) and a proxy that does not answer is refused
+//! `XksProxyUriUnreachableException` with no store created, which is the pre-flight check
+//! that keeps a client from treating a success as "the proxy is wired up". No external key
+//! manager runs in this process, so there is no proxy to answer: an external key store is
+//! not something this emulator can stand up, and it says so instead of persisting a store
+//! nothing could connect.
+//!
 //! "When the operation completes successfully, it returns the ID of the new custom key
 //! store", which "has never been connected", so it starts `DISCONNECTED` and is
 //! connected by `ConnectCustomKeyStore` rather than by this call.
@@ -540,6 +549,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                     );
                 }
+            }
+
+            // "Creates the custom key store... If the external key store proxy is
+            // unreachable, the operation fails": KMS reaches the proxy SYNCHRONOUSLY
+            // here, once everything the request itself states has been judged, and a
+            // proxy that does not answer is `XksProxyUriUnreachableException` with NO
+            // store created — the one pre-flight check a client has that an external key
+            // store is wired up before it depends on one. Whether a proxy answers is
+            // asked of the proxy ([`crate::state::XksProxy::answers`]), never of the
+            // endpoint's spelling.
+            if !proxy.answers() {
+                return Err(
+                    CreateCustomKeyStoreErrorModeled::XksProxyUriUnreachableException(
+                        XksProxyUriUnreachableException {
+                            message: Some(
+                                crate::state::XKS_PROXY_UNREACHABLE_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
             }
         }
 

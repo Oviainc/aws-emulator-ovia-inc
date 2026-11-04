@@ -392,7 +392,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // a multi-Region set share is held by every member, so a replica
                     // re-encrypts its primary's ciphertext as usual.
                     let Some(sealed_under) = state.key_in(&region, &envelope.key_id) else {
-                        return Err(crate::state::foreign_key_material());
+                        return Err(crate::state::foreign_key_material(
+                            &caller.arn,
+                            GRANT_OPERATION_RE_ENCRYPT_FROM,
+                        ));
                     };
                     // "When you use the SourceKeyId parameter to specify a KMS key, KMS
                     // uses only the KMS key you specify. If the ciphertext was encrypted
@@ -424,7 +427,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn
                                 if crate::state::names_another_region(&region, requested) =>
                             {
-                                return Err(crate::state::foreign_key_material());
+                                return Err(crate::state::foreign_key_material(
+                                    &caller.arn,
+                                    GRANT_OPERATION_RE_ENCRYPT_FROM,
+                                ));
                             }
                             crate::state::KeyRef::NotFound
                             | crate::state::KeyRef::MalformedArn => {

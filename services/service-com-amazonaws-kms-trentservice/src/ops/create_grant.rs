@@ -8,7 +8,10 @@
 //! A mutating operation — except under `DryRun`, which validates the request exactly as
 //! a real one and then refuses it with `DryRunOperationException`, persisting nothing. A
 //! request carrying a `Name` is idempotent: a retry with identical parameters answers the
-//! original grant id rather than creating a second grant.
+//! original grant id rather than creating a second grant, and the id itself is DERIVED
+//! from the grant's parameters ([`crate::state::Grant::derived_grant_id`]), so a named
+//! grant that was revoked and created again carries the id it had. A request carrying no
+//! `Name` is a new grant every time, with an id drawn from the OS CSPRNG.
 //!
 //! One deliberate divergence: a key's grants are bounded at
 //! [`crate::state::MAX_GRANTS_PER_KEY`], which is far below the grants-per-key quota KMS
@@ -630,8 +633,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (grant_id, to_persist) = match duplicate {
             Some(grant_id) => (grant_id, None),
             None => {
-                let Some(grant_id) = crate::state::mint_grant_id() else {
-                    return Err(entropy_unavailable());
+                // A NAMED grant's id is a function of the grant's parameters
+                // ([`crate::state::Grant::derived_grant_id`]), so the same named grant
+                // carries the same id whenever it is created — including after
+                // `RevokeGrant` removed it, where there is no record left to read the id
+                // from. An unnamed grant is "a new grant with a unique GrantId even if
+                // all the supplied parameters are identical", so its id is drawn from the
+                // OS CSPRNG.
+                let grant_id = match candidate.name {
+                    Some(_) => candidate.derived_grant_id(),
+                    None => match crate::state::mint_grant_id() {
+                        Some(grant_id) => grant_id,
+                        None => return Err(entropy_unavailable()),
+                    },
                 };
                 let mut grant = candidate;
                 grant.grant_id = grant_id.clone();

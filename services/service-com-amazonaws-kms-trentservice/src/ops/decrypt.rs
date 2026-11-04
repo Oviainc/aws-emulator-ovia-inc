@@ -482,7 +482,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // multi-Region set SHARE is held by every member, so a replica opens its
                 // primary's ciphertext here as usual.
                 let Some(key) = state.key_in(&region, &parsed.key_id) else {
-                    return Err(crate::state::foreign_key_material());
+                    return Err(crate::state::foreign_key_material(&caller.arn, Self::NAME));
                 };
 
                 // "Specify the key ID ... of the KMS key" only when the caller wants KMS
@@ -508,7 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn
                             if crate::state::names_another_region(&region, requested) =>
                         {
-                            return Err(crate::state::foreign_key_material());
+                            return Err(crate::state::foreign_key_material(&caller.arn, Self::NAME));
                         }
                         crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                             return Err(DecryptErrorModeled::NotFoundException(

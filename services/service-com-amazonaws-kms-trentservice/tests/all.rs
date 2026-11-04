@@ -35,6 +35,8 @@ mod custom_key_store_connection;
 mod custom_key_stores;
 #[path = "all/data_key.rs"]
 mod data_key;
+#[path = "all/data_key_length_exclusivity.rs"]
+mod data_key_length_exclusivity;
 #[path = "all/data_key_pair.rs"]
 mod data_key_pair;
 #[path = "all/data_key_pair_without_plaintext.rs"]
@@ -49,6 +51,8 @@ mod encryption_context_conditions;
 mod encryption_context_validation;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
+#[path = "all/external_key_store_proxy.rs"]
+mod external_key_store_proxy;
 #[path = "all/get_key_policy_reads.rs"]
 mod get_key_policy_reads;
 #[path = "all/get_key_rotation_status_reads.rs"]
@@ -103,6 +107,8 @@ mod multi_region_primary_serialization;
 mod multi_region_primary_settlement;
 #[path = "all/multi_region_rotation_sharing.rs"]
 mod multi_region_rotation_sharing;
+#[path = "all/named_grant_identity.rs"]
+mod named_grant_identity;
 #[path = "all/no_allow_refusal_clause.rs"]
 mod no_allow_refusal_clause;
 #[path = "all/public_key.rs"]

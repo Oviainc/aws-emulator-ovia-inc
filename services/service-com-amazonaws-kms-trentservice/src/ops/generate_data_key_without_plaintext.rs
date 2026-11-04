@@ -411,14 +411,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clamp(MIN_DATA_KEY_BYTES, MAX_DATA_KEY_BYTES),
             (Some(_), Some(_)) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "KeySpec and NumberOfBytes both specify the length of the data key; \
-                     specify either one of them, but not both.",
+                    crate::state::EXCLUSIVE_DATA_KEY_LENGTH_MESSAGE,
                 ));
             }
             (None, None) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "The length of the data key was not specified; specify either KeySpec \
-                     or NumberOfBytes.",
+                    crate::state::EXCLUSIVE_DATA_KEY_LENGTH_MESSAGE,
                 ));
             }
         };

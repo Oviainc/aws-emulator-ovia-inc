@@ -6,9 +6,10 @@
 //! The rule under test: an operation that OPENS a ciphertext can use only key material
 //! of the Region its endpoint serves, so a request naming material this endpoint holds
 //! no key for — the key the ciphertext envelope names, or a `KeyId` that is an ARN of
-//! another Region — is refused on AUTHORIZATION (`AccessDeniedException`, HTTP 400) and
-//! never reported as a lookup miss: whether that key exists elsewhere is exactly what
-//! this endpoint cannot tell the caller.
+//! another Region — is refused on AUTHORIZATION (`AccessDeniedException`, HTTP 400),
+//! naming the caller and the action and nothing about the resource beyond its being the
+//! one the ciphertext is associated with, and never reported as a lookup miss: whether
+//! that key exists elsewhere is exactly what this endpoint cannot tell the caller.
 //!
 //! The boundary is about MATERIAL and not about routing, which is what the last two
 //! tests pin: a ciphertext still opens at the endpoint whose key sealed it, a key of
@@ -34,12 +35,34 @@ const HOME: &str = REGION;
 /// The Region whose endpoint is handed that material and must refuse it.
 const ELSEWHERE: &str = "us-west-2";
 
-/// The whole of the message KMS words this refusal with: it names none of the key, the
-/// Region or the caller, because each of the three reasons it can be refused for would
-/// disclose something this endpoint cannot answer for.
-const FOREIGN_MATERIAL_MESSAGE: &str = "The ciphertext refers to a customer master key \
-     that does not exist, does not exist in this region, or you are not allowed to \
-     access.";
+/// The whole of the message KMS words this refusal with: the authorization-failure
+/// sentence every AWS service words, naming the principal it refused and the action it
+/// refused — and, of the resource, only that it is the one the CIPHERTEXT is associated
+/// with, since each of the three reasons the request can be refused for would disclose
+/// something this endpoint cannot answer for.
+///
+/// `action` is the IAM action the refused call performs on the ciphertext's key: the
+/// operation's own name for `Decrypt`, and the SOURCE half for `ReEncrypt`, which opens
+/// a ciphertext under `kms:ReEncryptFrom`.
+fn foreign_material_message(action: &str) -> String {
+    format!(
+        "User: arn:aws:iam::{account}:user/emulator is not authorized to perform: \
+         kms:{action} on the resource associated with this ciphertext because the \
+         resource does not exist in this Region, no resource-based policies allow \
+         access, or a resource-based policy explicitly denies access",
+        account = engine::emulator_account_id()
+    )
+}
+
+/// The IAM action `operation` performs on the key that sealed the ciphertext it was
+/// given — see [`foreign_material_message`].
+fn ciphertext_action(operation: &str) -> &'static str {
+    if operation == "ReEncrypt" {
+        "ReEncryptFrom"
+    } else {
+        "Decrypt"
+    }
+}
 
 /// The key id a key ARN names: its resource part after `key/`.
 fn key_id_of(key_arn: &str) -> String {
@@ -137,7 +160,8 @@ async fn key_material_of_another_region_is_refused_on_authorization() {
                  got {code:?} in {payload}"
             );
             assert_eq!(
-                message, FOREIGN_MATERIAL_MESSAGE,
+                message,
+                foreign_material_message(ciphertext_action(operation)),
                 "case {case:?}: expected the refusal KMS words for material it cannot \
                  authorize, got {message:?}"
             );

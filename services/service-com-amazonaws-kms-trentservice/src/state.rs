@@ -29,7 +29,7 @@
 //! `ring::rand::SystemRandom`) rather than from anything written here: this file
 //! composes the envelope, it does not implement cryptography.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
@@ -37,9 +37,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AliasListEntry, CustomKeyStoresListEntry, GrantConstraints, GrantListEntry, KeyLastUsageData,
-    KeyMetadata, MultiRegionConfiguration, MultiRegionKey, Tag, XksProxyConfigurationType,
-    CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
+    AliasListEntry, CustomKeyStoresListEntry, KeyLastUsageData, KeyMetadata, Tag,
+    XksProxyConfigurationType, CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
 };
 
 /// Who a request speaks for, and whether the key policy, the caller's identity policies
@@ -50,6 +49,25 @@ pub mod authorization;
 /// The CloudHSM cluster behind an `AWS_CLOUDHSM` custom key store, resolved against the
 /// CloudHSM service's own records — the one place this service judges a cluster.
 pub mod cloud_hsm;
+
+// The store's remaining concerns, each in its own file of this module and each
+// re-exported here, so every `crate::state::…` path a handler uses is unchanged by
+// where the item lives.
+mod asymmetric;
+mod grants;
+mod import;
+mod macs;
+mod multi_region;
+mod pagination;
+mod signatures;
+
+pub use asymmetric::*;
+pub use grants::*;
+pub use import::*;
+pub use macs::*;
+pub use multi_region::*;
+pub use pagination::*;
+pub use signatures::*;
 
 /// The `ExpirationModelType` of imported key material that expires, which is the
 /// default: "the default is KEY_MATERIAL_EXPIRES"
@@ -1233,9 +1251,24 @@ pub fn unauthorized_account_message(operation: &str) -> String {
 /// anything about the resource — whether it exists, whether a policy allows it, whether
 /// one denies it — says exactly that, whoever was refused.
 pub fn unauthorized_resource_message(principal: &str, operation: &str) -> String {
+    not_authorized_message(principal, operation, "this resource")
+}
+
+/// The one sentence this service words an authorization failure that can report NOTHING
+/// about the resource with: who was refused, which `kms:` action, and that the resource
+/// may not exist in this Region, that no resource-based policy may allow the action, or
+/// that one may deny it.
+///
+/// `resource` is how the refusal refers to what was asked for, which is the only part
+/// that varies between the paths that answer it: a request that named an identifier is
+/// refused about "this resource", and one that presented a CIPHERTEXT is refused about
+/// the resource that ciphertext is associated with, since the caller may have named no
+/// identifier at all. Everything else is fixed text, held here once so no two paths word
+/// the same refusal differently.
+fn not_authorized_message(principal: &str, operation: &str, resource: &str) -> String {
     format!(
-        "User: {principal} is not authorized to perform: {ARN_SERVICE}:{operation} on this \
-         resource because the resource does not exist in this Region, no resource-based \
+        "User: {principal} is not authorized to perform: {ARN_SERVICE}:{operation} on \
+         {resource} because the resource does not exist in this Region, no resource-based \
          policies allow access, or a resource-based policy explicitly denies access"
     )
 }
@@ -1260,6 +1293,20 @@ pub fn unauthorized_account<E>(operation: &str) -> crate::scaffolded::Scaffolded
 /// context at all: fixed text that names neither the entry nor the value, because what
 /// the request got wrong is the context as a whole.
 pub const INVALID_ENCRYPTION_CONTEXT_MESSAGE: &str = "Invalid EncryptionContext";
+
+/// How KMS refuses a data key request that does not state its length EXACTLY ONCE —
+/// through `KeySpec` or through `NumberOfBytes`, of which "you must specify either …
+/// (but not both) in every GenerateDataKey request"
+/// (`smithy_query(query="doc",shape="GenerateDataKeyRequest",member="KeySpec")`), so a
+/// request carrying both and one carrying neither both fail that rule.
+///
+/// The service's own validation vocabulary for that pair: fixed text with no variable
+/// parts, naming neither member's value, and the same sentence whichever way the request
+/// missed the rule — it asks for the one length the request did not state once. One
+/// constant for every operation that takes the pair, so no two of them word the same
+/// refusal differently.
+pub const EXCLUSIVE_DATA_KEY_LENGTH_MESSAGE: &str =
+    "Please specify either number of bytes or key spec.";
 
 /// Whether `context` is an encryption context KMS accepts, and the refusal that reports
 /// it when it is not.
@@ -1297,26 +1344,37 @@ pub fn check_encryption_context<E>(
 }
 
 /// How KMS refuses a request to open a ciphertext whose key material is not material
-/// this endpoint can authorize: it does not say whether that key exists, because the
-/// answer would disclose a key of another Region to a caller this endpoint cannot
-/// authorize for it.
+/// this endpoint can authorize: the authorization failure every AWS service words the
+/// same way — naming the principal it refused and the action it refused — about the
+/// resource the CIPHERTEXT is associated with, since such a request need name no
+/// identifier at all.
 ///
 /// Single-Region key material does not travel: a ciphertext minted in one Region, or a
 /// key ARN of one, presented to ANOTHER Region's endpoint names material this endpoint
 /// holds no key for — which is an authorization decision rather than a lookup, so the
-/// sentence covers all three of the reasons it can be refused at once.
-pub const FOREIGN_KEY_MATERIAL_MESSAGE: &str = "The ciphertext refers to a customer \
-     master key that does not exist, does not exist in this region, or you are not \
-     allowed to access.";
+/// refusal says nothing about whether that key exists and gives all three of the reasons
+/// it can be refused for at once ([`not_authorized_message`]).
+///
+/// `operation` is the IAM action the refused request performs on the ciphertext's key —
+/// `Decrypt` for the operation of that name, and the SOURCE action of an operation that
+/// opens a ciphertext to re-seal it — so the sentence names the permission a caller
+/// would have to be given.
+pub fn foreign_key_material_message(principal: &str, operation: &str) -> String {
+    not_authorized_message(
+        principal,
+        operation,
+        "the resource associated with this ciphertext",
+    )
+}
 
 /// The refusal every operation that OPENS a ciphertext answers for key material this
-/// endpoint cannot authorize ([`FOREIGN_KEY_MATERIAL_MESSAGE`]).
+/// endpoint cannot authorize ([`foreign_key_material_message`]).
 ///
 /// `AccessDeniedException` is not in this service's model at all — KMS answers an
 /// authorization failure with it regardless — so it travels on the error channel's own
 /// variant and is built here once, for every operation's error type.
-pub fn foreign_key_material<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::access_denied(FOREIGN_KEY_MATERIAL_MESSAGE)
+pub fn foreign_key_material<E>(principal: &str, operation: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::access_denied(foreign_key_material_message(principal, operation))
 }
 
 /// Whether `identifier` is an ARN whose Region segment is not `region`, the Region the
@@ -1914,7 +1972,42 @@ impl XksProxy {
                 .filter(|_| through_vpc_endpoint_service),
         }
     }
+
+    /// Whether an external key store proxy ANSWERS at this proxy's endpoint and API
+    /// path, which is what KMS asks before it builds an external key store over it:
+    /// creating one "tries to connect to the proxy" and refuses
+    /// `XksProxyUriUnreachableException` when it cannot, so the store is never left
+    /// half-built over a proxy nothing serves.
+    ///
+    /// Nothing here answers that question with an invented verdict. The only external
+    /// key store proxy this emulator could reach is one it serves itself, and it serves
+    /// none: there is no external key manager in this process and no connection leaves
+    /// it, so no endpoint and path a request can name has a proxy behind them and the
+    /// answer is the same for every pair. It is a property of this deployment rather than
+    /// of the values the request carried, which is why it is read from the store's own
+    /// capabilities and not from how either value is spelled.
+    pub fn answers(&self) -> bool {
+        SERVED_XKS_PROXIES
+            .iter()
+            .any(|(endpoint, path)| *endpoint == self.uri_endpoint && *path == self.uri_path)
+    }
 }
+
+/// The external key store proxies this emulator serves, each as the `(endpoint, API
+/// path)` pair an `XksProxyUriEndpoint` and `XksProxyUriPath` would have to name to reach
+/// it. It is EMPTY: an external key store proxy is an external key manager's own front
+/// end, and this process runs none.
+const SERVED_XKS_PROXIES: &[(&str, &str)] = &[];
+
+/// The whole `message` KMS answers when it cannot reach the external key store proxy a
+/// request describes. The sentence is the complete text of this refusal class: no
+/// endpoint, path or key store name is interpolated into it, so every such refusal
+/// carries exactly this string.
+pub const XKS_PROXY_UNREACHABLE_MESSAGE: &str =
+    "AWS KMS cannot communicate with the external key store proxy. This might be a \
+     transient network issue. If you see this error repeatedly, verify that your \
+     external key store proxy is active and is connected to the network, and that its \
+     endpoint URI is correct in your external key store.";
 
 /// One customer managed KMS key: its metadata, and the key material behind it.
 ///
@@ -2008,6 +2101,17 @@ pub struct Cmk {
     /// Key material a caller imported for an on-demand rotation that has not happened
     /// yet, or `None` while none is waiting — see [`PendingRotationMaterial`].
     pub pending_rotation_material: Option<PendingRotationMaterial>,
+    /// The identity of every key material a caller has IMPORTED into this key, oldest
+    /// first — see [`ImportedMaterialIdentity`].
+    ///
+    /// It is what makes imported material the key's OWN material: material that was
+    /// imported stays this key's material even once it is deleted or has expired,
+    /// because "to use the KMS key in cryptographic operations again, you must reimport
+    /// the same key material"
+    /// (`smithy_query(query="doc",shape="DeleteImportedKeyMaterial")`), so a later
+    /// import is judged against this history rather than against the material the key
+    /// happens to hold when it arrives.
+    pub imported_material_history: Vec<ImportedMaterialIdentity>,
     /// The on-demand rotation this key has STARTED whose completion the clock still
     /// owes, or `None` when none is in progress — see [`OnDemandRotation`].
     ///
@@ -2245,6 +2349,9 @@ impl Cmk {
             // Nothing has been imported for a rotation of a key that has just been
             // created.
             pending_rotation_material: None,
+            // A key that has just been created has had no material imported into it,
+            // whichever origin it carries.
+            imported_material_history: Vec::new(),
             // A key that has just been created has had no rotation at all.
             on_demand_rotation: None,
         }
@@ -2346,6 +2453,12 @@ impl Cmk {
             // What is waiting for a rotation of the primary key is waiting there: the
             // same material has to be imported into this replica for the set to rotate.
             pending_rotation_material: None,
+            // "If you replicate a multi-Region primary key with imported key material,
+            // the replica key is created with no key material. You must import the same
+            // key material that you imported into the primary key"
+            // (`smithy_query(query="doc",shape="ReplicateKey")`), so the material the
+            // SET is associated with is the material this replica expects to be given.
+            imported_material_history: self.imported_material_history.clone(),
             // A rotation in progress on the primary key is that key's: the replica is
             // created from the material the set has now.
             on_demand_rotation: None,
@@ -2449,11 +2562,16 @@ impl Cmk {
     /// leaves [`KEY_STATE_PENDING_IMPORT`] for [`KEY_STATE_ENABLED`]. A key that
     /// already had material keeps the key state it is in — a re-import does not
     /// re-enable a disabled key.
+    ///
+    /// The material's identity joins this key's [`Cmk::imported_material_history`], so a
+    /// later import of the same material is recognised as the key's own however the key
+    /// loses it in the meantime.
     pub fn import_key_material(
         &mut self,
         material: KeyMaterial,
         imported: ImportedKeyMaterial,
     ) -> Option<String> {
+        self.remember_imported_material(&material);
         self.current_key_material_id = material.id();
         self.material = material;
         self.imported_material = Some(imported);
@@ -2568,6 +2686,7 @@ impl Cmk {
         material: KeyMaterial,
         imported: ImportedKeyMaterial,
     ) -> Option<String> {
+        self.remember_imported_material(&material);
         let key_material_id = material.id();
         self.pending_rotation_material = Some(PendingRotationMaterial { material, imported });
         key_material_id
@@ -3329,207 +3448,6 @@ pub fn check_rotation_configurable(
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Multi-Region key sets
-// ---------------------------------------------------------------------------
-
-/// Which Region of one multi-Region key set holds its PRIMARY key, and which
-/// Regions hold its replica keys.
-///
-/// Every key of a multi-Region set shares one key id — "these KMS keys have the
-/// same key ID, key material, and other metadata"
-/// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`) — and this store holds
-/// one record per key id, so the set is ONE record and what distinguishes its
-/// members is the Region each of them lives in. Exactly one Region holds the
-/// primary key at any instant; every other Region named here holds a replica of
-/// it, and which is which is what `MultiRegionConfiguration` reports.
-#[derive(Debug, Clone)]
-pub struct MultiRegionTopology {
-    /// The Region holding the set's primary key once every move of the designation
-    /// the clock owes has taken effect: the Region a `MultiRegion` create minted it
-    /// in, until `UpdatePrimaryRegion` moves the designation elsewhere. A reader asks
-    /// [`Self::primary_region`] instead, which is the designation as it stands NOW.
-    settled_primary_region: String,
-    /// The Regions holding a replica key of the set once every move of the
-    /// designation the clock owes has taken effect. Sorted, so a reader reports the
-    /// replicas in a stable order across calls.
-    settled_replica_regions: BTreeSet<String>,
-    /// The move of the designation `UpdatePrimaryRegion` started and the clock has
-    /// not yet made due, or `None` when the set has no move outstanding — see
-    /// [`PendingPromotion`].
-    promotion: Option<PendingPromotion>,
-}
-
-impl MultiRegionTopology {
-    /// A freshly minted multi-Region primary key's topology: primary in the Region
-    /// it was created in, with no replica anywhere until one is created in another
-    /// Region.
-    pub fn primary_in(region: String) -> Self {
-        Self {
-            settled_primary_region: region,
-            settled_replica_regions: BTreeSet::new(),
-            promotion: None,
-        }
-    }
-
-    /// Record that `region` now holds a replica key of this set.
-    pub fn add_replica_region(&mut self, region: String) {
-        self.settled_replica_regions.insert(region);
-    }
-
-    /// Start moving the designation to the replica key in `region`, due at `due`,
-    /// answering whether that Region held a replica to promote at all.
-    ///
-    /// "This operation changes the replica key in the specified Region to a primary
-    /// key and changes the former primary key to a replica key"
-    /// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), so the two moves
-    /// are one step: the set never has two primary keys, nor none. A Region holding
-    /// no replica of the set — including the one that already holds the primary key
-    /// — has nothing to promote and leaves the topology exactly as it was.
-    ///
-    /// The move takes effect at `due` rather than at once, because until then "the
-    /// process of updating the primary Region might still be in progress" (same
-    /// doc): the designation this call moves and the transient key state that move
-    /// puts the two keys in are the SAME record, so neither is ever observable
-    /// without the other.
-    pub fn promote(&mut self, region: &str, due: SystemTime) -> bool {
-        self.settle_due_promotion();
-        if !self.settled_replica_regions.contains(region) {
-            return false;
-        }
-        self.promotion = Some(PendingPromotion {
-            region: region.to_string(),
-            due,
-        });
-        true
-    }
-
-    /// Whether the clock still owes this set the move of its designation a call has
-    /// started — the set is transiently busy, which is what refuses the management
-    /// operations of its keys.
-    pub fn promotion_in_flight(&self) -> bool {
-        self.promotion
-            .as_ref()
-            .is_some_and(|promotion| SystemTime::now() < promotion.due)
-    }
-
-    /// Whether the key `region` holds is one of the two the move in flight goes
-    /// between — the old primary key and the new one, which are the keys that carry
-    /// the transient [`KEY_STATE_UPDATING`] state while it is in flight.
-    pub fn is_moving_through(&self, region: &str) -> bool {
-        self.promotion.as_ref().is_some_and(|promotion| {
-            SystemTime::now() < promotion.due
-                && (promotion.region == region || self.settled_primary_region == region)
-        })
-    }
-
-    /// The Region holding this set's primary key NOW: the Region a move the clock has
-    /// already made due promoted, and otherwise the one the designation rests in. A
-    /// move still in flight has not happened yet, so it moves nothing a reader sees.
-    pub fn primary_region(&self) -> &str {
-        match self.due_promotion() {
-            Some(promoted) => promoted,
-            None => &self.settled_primary_region,
-        }
-    }
-
-    /// The Regions holding a replica key of this set NOW — every Region of the set
-    /// but the one [`Self::primary_region`] reports, in the sorted order the backing
-    /// set keeps them in.
-    fn replica_regions(&self) -> BTreeSet<&str> {
-        match self.due_promotion() {
-            Some(promoted) => self
-                .settled_replica_regions
-                .iter()
-                .map(String::as_str)
-                .filter(|region| *region != promoted)
-                .chain(std::iter::once(self.settled_primary_region.as_str()))
-                .collect(),
-            None => self
-                .settled_replica_regions
-                .iter()
-                .map(String::as_str)
-                .collect(),
-        }
-    }
-
-    /// The Region a move the clock has ALREADY made due promoted, which is the
-    /// designation this topology has not written down yet.
-    fn due_promotion(&self) -> Option<&str> {
-        self.promotion
-            .as_ref()
-            .filter(|promotion| SystemTime::now() >= promotion.due)
-            .map(|promotion| promotion.region.as_str())
-    }
-
-    /// Write a move the clock has already made due into the designation, so a move
-    /// started after it moves the set on from where that one left it. What a reader
-    /// sees is unchanged: this is the same designation [`Self::primary_region`]
-    /// already reports.
-    fn settle_due_promotion(&mut self) {
-        let Some(promoted) = self.due_promotion().map(str::to_string) else {
-            return;
-        };
-        self.settled_replica_regions.remove(&promoted);
-        let former_primary = std::mem::replace(&mut self.settled_primary_region, promoted);
-        self.settled_replica_regions.insert(former_primary);
-        self.promotion = None;
-    }
-
-    /// This set as the `MultiRegionConfiguration` of the key `region`'s endpoint
-    /// serves: that key is the set's primary exactly when the primary Region is its
-    /// own, and `ReplicaKeys` names every Region holding a replica, each by the key
-    /// ARN that Region's endpoint serves it under.
-    pub fn configuration(&self, key_id: &str, region: &str) -> MultiRegionConfiguration {
-        let primary_region = self.primary_region();
-        let key_type = if primary_region == region {
-            MULTI_REGION_KEY_TYPE_PRIMARY
-        } else {
-            MULTI_REGION_KEY_TYPE_REPLICA
-        };
-        MultiRegionConfiguration {
-            multi_region_key_type: Some(key_type.to_string()),
-            primary_key: Some(multi_region_member(key_id, primary_region)),
-            replica_keys: Some(
-                self.replica_regions()
-                    .into_iter()
-                    .map(|replica| multi_region_member(key_id, replica))
-                    .collect(),
-            ),
-        }
-    }
-}
-
-/// The move of one multi-Region key set's primary-key designation that an
-/// `UpdatePrimaryRegion` call started and the clock has not yet made due.
-///
-/// "Even after this operation completes, the process of updating the primary Region
-/// might still be in progress for a few more seconds. ... The old and new primary
-/// keys have a transient key state of Updating. The original key state is restored
-/// when the update is complete"
-/// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`) — so ONE record carries
-/// both halves of the move: which Region the designation is going to, and the instant
-/// it arrives there, which is also the instant the transient state it put the two keys
-/// in is over.
-#[derive(Debug, Clone)]
-struct PendingPromotion {
-    /// The Region whose replica key the move makes this set's primary key.
-    region: String,
-    /// When the move is due — [`PRIMARY_REGION_UPDATE_SPAN`] after the call that
-    /// started it. Nothing has to be written when it passes: a reader derives the
-    /// designation and the key state from it.
-    due: SystemTime,
-}
-
-/// One key of a multi-Region set, as `MultiRegionConfiguration` names it: the
-/// Region it lives in, and the key ARN that Region's endpoint serves it under.
-fn multi_region_member(key_id: &str, region: &str) -> MultiRegionKey {
-    MultiRegionKey {
-        arn: Some(key_arn(region, key_id)),
-        region: Some(region.to_string()),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4930,1627 +4848,6 @@ fn encryption_context_aad(context: Option<&HashMap<String, String>>) -> Vec<u8> 
     }
     aad
 }
-
-// ---------------------------------------------------------------------------
-// Asymmetric encryption: a ciphertext produced OUTSIDE KMS
-// ---------------------------------------------------------------------------
-
-/// Why a ciphertext presented for an asymmetric KMS key could not be opened with the
-/// private half this store holds, or why a plaintext could not be sealed to its public
-/// half.
-#[derive(Debug)]
-pub enum AsymmetricRefusal {
-    /// No library reachable from here performs the encryption scheme this key pair and
-    /// algorithm name, so there is no plaintext to answer with. The KMS key is still
-    /// real — the caller is told the capability is not written yet rather than handed
-    /// bytes that are not the plaintext of its ciphertext.
-    Unsupported,
-    /// The bytes are not a ciphertext this key pair's private half opens under those
-    /// parameters: they were produced for another key, under another algorithm, or
-    /// they have been altered.
-    NotThisCiphertext,
-    /// The library implements the scheme and refused this particular operation, with the
-    /// request already judged against every rule the scheme states. Nothing about the
-    /// request explains it, so it is a server fault rather than a refusal.
-    Failed,
-}
-
-/// The plaintext of `ciphertext`, which was encrypted under the PUBLIC half of `key`'s
-/// key pair — the bytes `GetPublicKey` publishes ([`public_key_spki`]) — with
-/// `encryption_algorithm`.
-///
-/// This is the one-way path an asymmetric encryption KMS key exists for: a party
-/// holding only the published public key encrypts without calling KMS at all, and only
-/// the private half held here opens the result. Nothing about the ciphertext says which
-/// key or algorithm produced it, so both come from the request; the ciphertext carries
-/// no additional authenticated data either, since "the standard asymmetric encryption
-/// algorithms ... that KMS uses do not support an encryption context"
-/// (`smithy_query(query="doc",shape="DecryptRequest",member="EncryptionContext")`).
-///
-/// The RSA-OAEP decryption comes from `aws-lc-rs` (`aws_lc_rs::rsa`), under the private
-/// key this store holds, with no label — the parameter set
-/// [`rsa_oaep_algorithm`] names for the algorithm. Nothing cryptographic is composed
-/// here.
-pub fn decrypt_asymmetric(
-    key: &Cmk,
-    encryption_algorithm: &str,
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, AsymmetricRefusal> {
-    let (Some(private_key), Some(key_pair)) = (
-        key.material.private_key_pkcs8(),
-        key_pair_kind(&key.key_spec),
-    ) else {
-        return Err(AsymmetricRefusal::Unsupported);
-    };
-
-    match key_pair {
-        KeyPairKind::Rsa(_) => {
-            let oaep_algorithm =
-                rsa_oaep_algorithm(encryption_algorithm).ok_or(AsymmetricRefusal::Unsupported)?;
-            let private_key = ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(private_key)
-                .map_err(|_| AsymmetricRefusal::Unsupported)?;
-            let key_size_bytes = private_key.key_size_bytes();
-            let private_key = ::aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(private_key)
-                .map_err(|_| AsymmetricRefusal::Unsupported)?;
-            // An OAEP plaintext is shorter than the modulus the ciphertext occupies,
-            // so one modulus of room always holds it.
-            let mut plaintext = vec![0u8; key_size_bytes];
-            let len = private_key
-                .decrypt(oaep_algorithm, ciphertext, &mut plaintext, None)
-                .map_err(|_| AsymmetricRefusal::NotThisCiphertext)?
-                .len();
-            plaintext.truncate(len);
-            Ok(plaintext)
-        }
-        // SM2PKE, the public-key encryption of GM/T 0003-2012, is the one encryption
-        // scheme no library reachable from here performs; the remaining key pairs are
-        // signing and key-agreement pairs, whose specs advertise no encryption
-        // algorithm at all, so a request naming one is refused before it reaches here.
-        KeyPairKind::Sm2 | KeyPairKind::Ecdsa(_) | KeyPairKind::Ed25519 => {
-            Err(AsymmetricRefusal::Unsupported)
-        }
-    }
-}
-
-/// The RSA-OAEP parameters an `EncryptionAlgorithmSpec` names: the OAEP scheme of RFC
-/// 8017 with the digest the algorithm's own name carries, used both as the message
-/// digest and as the hash of MGF1.
-///
-/// `None` for an algorithm that is not one an RSA key pair encrypts under
-/// ([`RSA_ENCRYPTION_ALGORITHMS`] is that set).
-fn rsa_oaep_algorithm(
-    encryption_algorithm: &str,
-) -> Option<&'static ::aws_lc_rs::rsa::OaepAlgorithm> {
-    match encryption_algorithm {
-        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_1 => Some(&::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1),
-        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256 => Some(&::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256),
-        _ => None,
-    }
-}
-
-/// The ciphertext of `plaintext` under the PUBLIC half of `key`'s key pair, with
-/// `encryption_algorithm` — the other direction of [`decrypt_asymmetric`], for the caller
-/// that asks KMS to encrypt rather than holding the published public key itself.
-///
-/// The public half is COMPUTED from the private half this store holds, by the same
-/// library that implements the scheme, so what seals a plaintext here is the public key
-/// `GetPublicKey` publishes ([`public_key_spki`]) and nothing else can open the result.
-/// The ciphertext carries no additional authenticated data: "the standard asymmetric
-/// encryption algorithms ... that KMS uses do not support an encryption context"
-/// (`smithy_query(query="doc",shape="DecryptRequest",member="EncryptionContext")`).
-///
-/// The plaintext must already be within the scheme's ceiling
-/// ([`max_asymmetric_plaintext_len`]), which is a documented property of the key spec and
-/// the algorithm and so is a REFUSAL the handler answers, not a failure here.
-pub fn encrypt_asymmetric(
-    key: &Cmk,
-    encryption_algorithm: &str,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, AsymmetricRefusal> {
-    let (Some(private_key), Some(key_pair)) = (
-        key.material.private_key_pkcs8(),
-        key_pair_kind(&key.key_spec),
-    ) else {
-        return Err(AsymmetricRefusal::Unsupported);
-    };
-
-    match key_pair {
-        KeyPairKind::Rsa(_) => {
-            let oaep_algorithm =
-                rsa_oaep_algorithm(encryption_algorithm).ok_or(AsymmetricRefusal::Unsupported)?;
-            let private_key = ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(private_key)
-                .map_err(|_| AsymmetricRefusal::Unsupported)?;
-            // An RSA ciphertext is exactly one modulus wide.
-            let mut ciphertext = vec![0u8; private_key.key_size_bytes()];
-            let public_key = ::aws_lc_rs::rsa::OaepPublicEncryptingKey::new(private_key.public_key())
-                .map_err(|_| AsymmetricRefusal::Unsupported)?;
-            let len = public_key
-                .encrypt(oaep_algorithm, plaintext, &mut ciphertext, None)
-                .map_err(|_| AsymmetricRefusal::Failed)?
-                .len();
-            ciphertext.truncate(len);
-            Ok(ciphertext)
-        }
-        // The same scheme coverage [`decrypt_asymmetric`] has: SM2PKE is the one
-        // encryption scheme no library reachable from here performs, and the remaining
-        // key pairs advertise no encryption algorithm at all.
-        KeyPairKind::Sm2 | KeyPairKind::Ecdsa(_) | KeyPairKind::Ed25519 => {
-            Err(AsymmetricRefusal::Unsupported)
-        }
-    }
-}
-
-/// The largest plaintext an asymmetric KMS key of `key_spec` encrypts under
-/// `encryption_algorithm`, in bytes, or `None` when the pair names no scheme with a
-/// ceiling this computes.
-///
-/// For RSAES-OAEP the ceiling is the scheme's own: a message of at most `k - 2*hLen - 2`
-/// bytes, where `k` is the modulus in bytes and `hLen` the digest's output length (RFC
-/// 8017 §7.1.1). It is therefore derived from the KEY SPEC and the ALGORITHM rather than
-/// listed, and it reproduces every ceiling the operation documents — "RSA_2048
-/// RSAES_OAEP_SHA_1: 214 bytes RSAES_OAEP_SHA_256: 190 bytes RSA_3072 RSAES_OAEP_SHA_1:
-/// 342 bytes RSAES_OAEP_SHA_256: 318 bytes RSA_4096 RSAES_OAEP_SHA_1: 470 bytes
-/// RSAES_OAEP_SHA_256: 446 bytes" (`smithy_query(query="doc",shape="Encrypt")`).
-pub fn max_asymmetric_plaintext_len(key_spec: &str, encryption_algorithm: &str) -> Option<usize> {
-    let KeyPairKind::Rsa(modulus_bits) = key_pair_kind(key_spec)? else {
-        return None;
-    };
-    let digest_len = match encryption_algorithm {
-        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_1 => ::aws_lc_rs::digest::SHA1_OUTPUT_LEN,
-        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256 => ::aws_lc_rs::digest::SHA256_OUTPUT_LEN,
-        _ => return None,
-    };
-    (modulus_bits / 8).checked_sub(2 * digest_len + 2)
-}
-
-// ---------------------------------------------------------------------------
-// Digital signatures
-// ---------------------------------------------------------------------------
-
-/// The `MessageType` of a message that is signed as it was given, hashed by the
-/// signing algorithm itself: "use RAW for unhashed messages"
-/// (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`), and the
-/// value KMS assumes when a request names none.
-pub const MESSAGE_TYPE_RAW: &str = "RAW";
-
-/// The `MessageType` of a message that is ALREADY the hash the signing algorithm
-/// would have computed: "when the value is DIGEST, KMS skips the hashing step in the
-/// signing algorithm" (the same documentation). See [`MESSAGE_TYPE_RAW`].
-pub const MESSAGE_TYPE_DIGEST: &str = "DIGEST";
-
-/// The `MessageType` of the "64-byte representative μ used in ML-DSA signing as
-/// defined in NIST FIPS 204 Section 6.2" (the same documentation), which is therefore
-/// a message type the ML-DSA signing algorithm alone takes. See [`MESSAGE_TYPE_RAW`].
-pub const MESSAGE_TYPE_EXTERNAL_MU: &str = "EXTERNAL_MU";
-
-/// The `SigningAlgorithmSpec` of pure Ed25519 (`smithy_query(shape="SigningAlgorithmSpec")`),
-/// which hashes the message inside the signature scheme itself (RFC 8032) and so
-/// "requires KMS MessageType:RAW"
-/// (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`).
-pub const SIGNING_ALGORITHM_ED25519_SHA_512: &str = "ED25519_SHA_512";
-
-/// The `SigningAlgorithmSpec` of prehashed Ed25519, which "requires KMS
-/// MessageType:DIGEST" (the same documentation). See
-/// [`SIGNING_ALGORITHM_ED25519_SHA_512`].
-pub const SIGNING_ALGORITHM_ED25519_PH_SHA_512: &str = "ED25519_PH_SHA_512";
-
-/// The `SigningAlgorithmSpec` of ML-DSA, the one algorithm whose message may be an
-/// external μ. See [`SIGNING_ALGORITHM_ED25519_SHA_512`].
-pub const SIGNING_ALGORITHM_ML_DSA_SHAKE_256: &str = "ML_DSA_SHAKE_256";
-
-/// The hash a `SigningAlgorithmSpec` hashes the message with, which is stated in the
-/// algorithm's own name: "signing algorithms that end in SHA_256 use the SHA_256
-/// hashing algorithm", and the same for SHA_384 and SHA_512
-/// (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`). It is also
-/// the length a message of [`MESSAGE_TYPE_DIGEST`] must have, because such a message
-/// is that hash already computed.
-///
-/// `None` for an algorithm the same documentation gives another hash — the SHAKE_256
-/// of ML-DSA and the SM3 of SM2DSA.
-pub fn signing_hash(signing_algorithm: &str) -> Option<&'static ::aws_lc_rs::digest::Algorithm> {
-    use ::aws_lc_rs::digest::{SHA256, SHA384, SHA512};
-
-    [
-        ("SHA_256", &SHA256),
-        ("SHA_384", &SHA384),
-        ("SHA_512", &SHA512),
-    ]
-    .into_iter()
-    .find_map(|(suffix, hash)| signing_algorithm.ends_with(suffix).then_some(hash))
-}
-
-/// Whether `signing_algorithm` signs a message of `message_type` at all.
-///
-/// An external μ is "used in ML-DSA signing", so ML-DSA is the only algorithm that
-/// takes one; each Edwards25519 algorithm takes exactly one message type
-/// ("ED25519_SHA_512 signing algorithm requires KMS MessageType:RAW",
-/// "ED25519_PH_SHA_512 signing algorithm requires KMS MessageType:DIGEST"); and every
-/// other algorithm signs either the message or its digest, since it "begins with a
-/// hash function" that `DIGEST` skips (all quoted from
-/// `smithy_query(query="doc",shape="SignRequest",member="MessageType")`).
-pub fn signs_message_type(signing_algorithm: &str, message_type: &str) -> bool {
-    if let Some(required) = required_message_type(signing_algorithm) {
-        return message_type == required;
-    }
-    if signing_algorithm == SIGNING_ALGORITHM_ML_DSA_SHAKE_256 {
-        return [
-            MESSAGE_TYPE_RAW,
-            MESSAGE_TYPE_DIGEST,
-            MESSAGE_TYPE_EXTERNAL_MU,
-        ]
-        .contains(&message_type);
-    }
-    [MESSAGE_TYPE_RAW, MESSAGE_TYPE_DIGEST].contains(&message_type)
-}
-
-/// The one `MessageType` a signing algorithm requires, for an algorithm that takes
-/// exactly one: "ED25519_SHA_512 signing algorithm requires KMS MessageType:RAW" and
-/// "ED25519_PH_SHA_512 signing algorithm requires KMS MessageType:DIGEST"
-/// (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`). `None` for
-/// an algorithm that signs either the message or its digest, which is every other one.
-///
-/// It is the table [`signs_message_type`] judges a request against, so the predicate
-/// and the refusal that names the requirement cannot disagree.
-pub fn required_message_type(signing_algorithm: &str) -> Option<&'static str> {
-    match signing_algorithm {
-        SIGNING_ALGORITHM_ED25519_SHA_512 => Some(MESSAGE_TYPE_RAW),
-        SIGNING_ALGORITHM_ED25519_PH_SHA_512 => Some(MESSAGE_TYPE_DIGEST),
-        _ => None,
-    }
-}
-
-/// Why no signature could be produced for a request the key and the algorithm are
-/// otherwise right for.
-#[derive(Debug)]
-pub enum SignatureRefusal {
-    /// No library reachable from here signs with this key pair under this algorithm,
-    /// so there are no signature bytes to answer with. The KMS key is still real —
-    /// the caller is told the operation is not written yet rather than handed bytes
-    /// that are not a signature of its message.
-    Unsupported,
-    /// The library refused to produce a signature it should have produced, which is a
-    /// server fault rather than anything about the request.
-    Failed,
-}
-
-/// The signature of `message` under the PRIVATE half of `key`'s key pair, with
-/// `signing_algorithm`.
-///
-/// `message_type` says what `message` is: [`MESSAGE_TYPE_RAW`] is the message, which
-/// is hashed with the algorithm's own hash ([`signing_hash`]) before it is signed, and
-/// [`MESSAGE_TYPE_DIGEST`] is that hash already computed, which is signed as it
-/// stands — "when the value is DIGEST, KMS skips the hashing step in the signing
-/// algorithm" (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`).
-///
-/// The bytes are the encoding the algorithm is defined to produce, which is what the
-/// `Signature` member carries: "the encoding of this value is defined by PKCS #1 in
-/// RFC 8017" for the RSA algorithms and "a DER-encoded object as defined by ANSI
-/// X9.62-2005 and RFC 3279 Section 2.2.3" for the ECDSA ones
-/// (`smithy_query(query="doc",shape="SignResponse",member="Signature")`). The private
-/// key is only read here, never copied out: it is the library that signs, and this
-/// function composes nothing cryptographic of its own.
-pub fn sign_message(
-    key: &Cmk,
-    signing_algorithm: &str,
-    message_type: &str,
-    message: &[u8],
-) -> Result<Vec<u8>, SignatureRefusal> {
-    use ::aws_lc_rs::signature::{EcdsaKeyPair, Ed25519KeyPair, RsaKeyPair};
-
-    let (Some(private_key), Some(key_pair)) = (
-        key.material.private_key_pkcs8(),
-        key_pair_kind(&key.key_spec),
-    ) else {
-        return Err(SignatureRefusal::Unsupported);
-    };
-
-    match key_pair {
-        KeyPairKind::Rsa(_) => {
-            let encoding =
-                rsa_signing_encoding(signing_algorithm).ok_or(SignatureRefusal::Unsupported)?;
-            let digest = signed_digest(signing_algorithm, message_type, message)?;
-            let pair =
-                RsaKeyPair::from_pkcs8(private_key).map_err(|_| SignatureRefusal::Failed)?;
-            // A PKCS #1 signature is exactly as long as the key's modulus.
-            let mut signature = vec![0u8; pair.public_modulus_len()];
-            pair.sign_digest(encoding, &digest, &mut signature)
-                .map_err(|_| SignatureRefusal::Failed)?;
-            Ok(signature)
-        }
-        KeyPairKind::Ecdsa(curve) => {
-            let digest = signed_digest(signing_algorithm, message_type, message)?;
-            let pair = EcdsaKeyPair::from_pkcs8(curve, private_key)
-                .map_err(|_| SignatureRefusal::Failed)?;
-            Ok(pair
-                .sign_digest(&digest)
-                .map_err(|_| SignatureRefusal::Failed)?
-                .as_ref()
-                .to_vec())
-        }
-        // Pure Ed25519 hashes the message within the signature scheme itself (RFC
-        // 8032), so what it signs is the message and not a digest of it.
-        KeyPairKind::Ed25519 if signing_algorithm == SIGNING_ALGORITHM_ED25519_SHA_512 => {
-            let pair =
-                Ed25519KeyPair::from_pkcs8(private_key).map_err(|_| SignatureRefusal::Failed)?;
-            Ok(pair.sign(message).as_ref().to_vec())
-        }
-        // The prehashed Ed25519 scheme of FIPS 186-5 Section 7.8.1 and the SM2DSA of
-        // GM/T 0003-2012 are the two signature schemes no library reachable from here
-        // produces a signature with.
-        KeyPairKind::Ed25519 | KeyPairKind::Sm2 => Err(SignatureRefusal::Unsupported),
-    }
-}
-
-/// The digest `signing_algorithm` signs for a message of `message_type`: the hash of
-/// the message, or the hash the caller already computed, taken as the digest it says
-/// it is.
-fn signed_digest(
-    signing_algorithm: &str,
-    message_type: &str,
-    message: &[u8],
-) -> Result<::aws_lc_rs::digest::Digest, SignatureRefusal> {
-    use ::aws_lc_rs::digest::{digest, Digest};
-
-    let hash = signing_hash(signing_algorithm).ok_or(SignatureRefusal::Unsupported)?;
-    if message_type == MESSAGE_TYPE_DIGEST {
-        // The caller's bytes ARE the digest, so the only thing to check is that they
-        // are as many bytes as that hash produces — which the caller checked before
-        // reaching here, and the library checks again.
-        return Digest::import_less_safe(message, hash).map_err(|_| SignatureRefusal::Failed);
-    }
-    Ok(digest(hash, message))
-}
-
-/// The RSA signature scheme a `SigningAlgorithmSpec` names: the RSASSA-PKCS1-v1_5 or
-/// the RSASSA-PSS scheme of RFC 8017, with the hash the algorithm's name carries.
-/// `None` for an algorithm that is not one an RSA key pair signs with
-/// ([`RSA_SIGNING_ALGORITHMS`] is that set).
-fn rsa_signing_encoding(
-    signing_algorithm: &str,
-) -> Option<&'static dyn ::aws_lc_rs::signature::RsaEncoding> {
-    use ::aws_lc_rs::signature::{
-        RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512, RSA_PSS_SHA256, RSA_PSS_SHA384,
-        RSA_PSS_SHA512,
-    };
-
-    match signing_algorithm {
-        "RSASSA_PKCS1_V1_5_SHA_256" => Some(&RSA_PKCS1_SHA256),
-        "RSASSA_PKCS1_V1_5_SHA_384" => Some(&RSA_PKCS1_SHA384),
-        "RSASSA_PKCS1_V1_5_SHA_512" => Some(&RSA_PKCS1_SHA512),
-        "RSASSA_PSS_SHA_256" => Some(&RSA_PSS_SHA256),
-        "RSASSA_PSS_SHA_384" => Some(&RSA_PSS_SHA384),
-        "RSASSA_PSS_SHA_512" => Some(&RSA_PSS_SHA512),
-        _ => None,
-    }
-}
-
-/// Whether `signature` is a signature of `message` under `key`'s key pair with
-/// `signing_algorithm`.
-///
-/// "The signature is verified by using the public key in the same asymmetric KMS key"
-/// (`smithy_query(query="doc",shape="Verify")`): the check is performed by the library
-/// that implements the algorithm, against the public half DERIVED from the private half
-/// this store holds ([`public_key_spki`]) — the same bytes `GetPublicKey` publishes — so
-/// a signature verifies here exactly when it verifies outside KMS, and a signature of
-/// another message, under another key or with another algorithm does not verify.
-///
-/// `message_type` says what `message` is, as it does for [`sign_message`]: a message of
-/// [`MESSAGE_TYPE_RAW`] is hashed by the scheme itself, and one of
-/// [`MESSAGE_TYPE_DIGEST`] is the hash already computed, so the signature is checked
-/// over that digest with the hashing step skipped — "a message and its hash digest are
-/// considered to be the same message"
-/// (`smithy_query(query="doc",shape="VerifyRequest",member="Message")`).
-///
-/// The errors mean what they mean for [`sign_message`]: `Unsupported` when no library
-/// reachable from here verifies this key pair under this algorithm, and `Failed` when a
-/// library refused a step it should have performed.
-pub fn signature_matches(
-    key: &Cmk,
-    signing_algorithm: &str,
-    message_type: &str,
-    message: &[u8],
-    signature: &[u8],
-) -> Result<bool, SignatureRefusal> {
-    let (Some(private_key), Some(algorithm)) = (
-        key.material.private_key_pkcs8(),
-        verification_algorithm(&key.key_spec, signing_algorithm),
-    ) else {
-        return Err(SignatureRefusal::Unsupported);
-    };
-
-    let public_key =
-        public_key_spki(&key.key_spec, private_key).ok_or(SignatureRefusal::Failed)?;
-    let parsed = ::aws_lc_rs::signature::ParsedPublicKey::new(algorithm, &public_key)
-        .map_err(|_| SignatureRefusal::Failed)?;
-    if message_type == MESSAGE_TYPE_DIGEST {
-        let digest = signed_digest(signing_algorithm, message_type, message)?;
-        return Ok(parsed.verify_digest_sig(&digest, signature).is_ok());
-    }
-    Ok(parsed.verify_sig(message, signature).is_ok())
-}
-
-/// How a signature produced with `signing_algorithm` under a key pair of `key_spec` is
-/// VERIFIED: the same scheme, hash and curve, named from the verifying side.
-///
-/// The RSA schemes are verified for any modulus the specs allow, and each curve spec
-/// names its own curve, so the parameters a signature is checked with are the key's own
-/// rather than the ones a request asked for. `None` for a pairing no library reachable
-/// from here verifies — the prehashed Ed25519 scheme and SM2DSA, which [`sign_message`]
-/// likewise produces no signature with, and ML-DSA, whose key pair this service does not
-/// hold.
-fn verification_algorithm(
-    key_spec: &str,
-    signing_algorithm: &str,
-) -> Option<&'static dyn ::aws_lc_rs::signature::VerificationAlgorithm> {
-    use ::aws_lc_rs::signature::{
-        ECDSA_P256K1_SHA256_ASN1, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1,
-        ECDSA_P521_SHA512_ASN1, ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384,
-        RSA_PKCS1_2048_8192_SHA512, RSA_PSS_2048_8192_SHA256, RSA_PSS_2048_8192_SHA384,
-        RSA_PSS_2048_8192_SHA512,
-    };
-
-    match key_pair_kind(key_spec)? {
-        KeyPairKind::Rsa(_) => match signing_algorithm {
-            "RSASSA_PKCS1_V1_5_SHA_256" => Some(&RSA_PKCS1_2048_8192_SHA256),
-            "RSASSA_PKCS1_V1_5_SHA_384" => Some(&RSA_PKCS1_2048_8192_SHA384),
-            "RSASSA_PKCS1_V1_5_SHA_512" => Some(&RSA_PKCS1_2048_8192_SHA512),
-            "RSASSA_PSS_SHA_256" => Some(&RSA_PSS_2048_8192_SHA256),
-            "RSASSA_PSS_SHA_384" => Some(&RSA_PSS_2048_8192_SHA384),
-            "RSASSA_PSS_SHA_512" => Some(&RSA_PSS_2048_8192_SHA512),
-            _ => None,
-        },
-        KeyPairKind::Ecdsa(_) => match (key_spec, signing_algorithm) {
-            ("ECC_NIST_P256", "ECDSA_SHA_256") => Some(&ECDSA_P256_SHA256_ASN1),
-            ("ECC_NIST_P384", "ECDSA_SHA_384") => Some(&ECDSA_P384_SHA384_ASN1),
-            ("ECC_NIST_P521", "ECDSA_SHA_512") => Some(&ECDSA_P521_SHA512_ASN1),
-            ("ECC_SECG_P256K1", "ECDSA_SHA_256") => Some(&ECDSA_P256K1_SHA256_ASN1),
-            _ => None,
-        },
-        KeyPairKind::Ed25519 if signing_algorithm == SIGNING_ALGORITHM_ED25519_SHA_512 => {
-            Some(&ED25519)
-        }
-        KeyPairKind::Ed25519 | KeyPairKind::Sm2 => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Message authentication codes
-// ---------------------------------------------------------------------------
-
-/// The HMAC algorithm a `MacAlgorithmSpec` names.
-///
-/// "The HMAC KMS keys and the HMAC algorithms that KMS uses conform to industry
-/// standards defined in RFC 2104" (`smithy_query(query="doc",shape="GenerateMac")`),
-/// and the spec's own name gives the hash that HMAC is built on, so `HMAC_SHA_384` is
-/// HMAC-SHA-384. `None` for a value that is not one of the four the model declares
-/// (`smithy_query(query="shape",shape="MacAlgorithmSpec")`), which the modelled enum
-/// constraint already refuses before a handler runs.
-pub fn mac_hash(mac_algorithm: &str) -> Option<::aws_lc_rs::hmac::Algorithm> {
-    use ::aws_lc_rs::hmac::{HMAC_SHA224, HMAC_SHA256, HMAC_SHA384, HMAC_SHA512};
-
-    match mac_algorithm {
-        "HMAC_SHA_224" => Some(HMAC_SHA224),
-        "HMAC_SHA_256" => Some(HMAC_SHA256),
-        "HMAC_SHA_384" => Some(HMAC_SHA384),
-        "HMAC_SHA_512" => Some(HMAC_SHA512),
-        _ => None,
-    }
-}
-
-/// The HMAC of `message` under `key`'s own key material with `mac_algorithm`: "the
-/// standard, raw HMAC defined in RFC 2104"
-/// (`smithy_query(query="doc",shape="GenerateMacResponse",member="Mac")`).
-///
-/// The tag is produced by the library that implements the algorithm, from the bytes
-/// this key holds — which never leave this process — so it is a function of the key,
-/// the algorithm and the message and of nothing else: the same three inputs give the
-/// same tag, and any change to one of them gives another.
-///
-/// `None` when the key holds no HMAC key material, or `mac_algorithm` names no HMAC
-/// algorithm: there is then no HMAC of the caller's message to answer with.
-pub fn generate_mac(key: &Cmk, mac_algorithm: &str, message: &[u8]) -> Option<Vec<u8>> {
-    let hmac_key = mac_key(key, mac_algorithm)?;
-    Some(::aws_lc_rs::hmac::sign(&hmac_key, message).as_ref().to_vec())
-}
-
-/// Whether `mac` is the HMAC of `message` under `key`'s material with `mac_algorithm`.
-///
-/// "VerifyMac computes an HMAC using the message, HMAC KMS key, and MAC algorithm that
-/// you specify, and compares the computed HMAC to the HMAC that you specify"
-/// (`smithy_query(query="doc",shape="VerifyMac")`), which is the comparison the library
-/// itself performs — in constant time, and false for a tag of the wrong length rather
-/// than a panic. A tag from another key, another algorithm or another message therefore
-/// does not verify.
-pub fn mac_matches(key: &Cmk, mac_algorithm: &str, message: &[u8], mac: &[u8]) -> bool {
-    mac_key(key, mac_algorithm)
-        .is_some_and(|hmac_key| ::aws_lc_rs::hmac::verify(&hmac_key, message, mac).is_ok())
-}
-
-/// `key`'s HMAC key material as a key of the HMAC algorithm `mac_algorithm` names, so
-/// generating a MAC and verifying one are the same key over the same bytes.
-///
-/// The material is the key's CURRENT material ([`Cmk::effective_material`]), which is
-/// what a cryptographic operation on the key uses.
-fn mac_key(key: &Cmk, mac_algorithm: &str) -> Option<::aws_lc_rs::hmac::Key> {
-    let KeyMaterial::Hmac(material) = key.effective_material() else {
-        return None;
-    };
-    Some(::aws_lc_rs::hmac::Key::new(
-        mac_hash(mac_algorithm)?,
-        material,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Grants
-// ---------------------------------------------------------------------------
-
-/// The largest number of grants this emulator's store holds for ONE KMS key.
-///
-/// A bound the EMULATOR imposes, not the quota KMS publishes: `CreateGrant` is
-/// reachable by any caller and a grant without a `Name` is a new record every time,
-/// so without a cap a loop of valid creates grows the process without end. Past it
-/// `CreateGrant` refuses with the modelled `LimitExceededException` — "a length
-/// constraint or quota was exceeded" — and persists nothing.
-pub const MAX_GRANTS_PER_KEY: usize = 500;
-
-/// The order a grant's permitted operations are reported in: the order the model
-/// DECLARES the `GrantOperation` enum's values in
-/// (`smithy_query(query="shape",shape="GrantOperation")`, whose `values` are listed in
-/// declaration order).
-///
-/// `GrantOperationList` is a plain list of that enum, so the model fixes no order for
-/// it, and the recorded AWS wire reports a grant's operations in this one whatever
-/// order the creating request listed them in. Projecting through it is what makes two
-/// readings of one grant, and two grants permitting the same set, render identically.
-pub const GRANT_OPERATION_ORDER: &[&str] = &[
-    "Decrypt",
-    "Encrypt",
-    "GenerateDataKey",
-    "GenerateDataKeyWithoutPlaintext",
-    "ReEncryptFrom",
-    "ReEncryptTo",
-    "Sign",
-    "Verify",
-    "GetPublicKey",
-    "CreateGrant",
-    "RetireGrant",
-    "DescribeKey",
-    "GenerateDataKeyPair",
-    "GenerateDataKeyPairWithoutPlaintext",
-    "GenerateMac",
-    "VerifyMac",
-    "DeriveSharedSecret",
-];
-
-/// Where `operation` comes in [`GRANT_OPERATION_ORDER`] — past the end for a value the
-/// enum does not declare, which the modelled enum constraint refuses before a handler
-/// runs, so such a value keeps the place the request gave it rather than being dropped.
-pub fn grant_operation_rank(operation: &str) -> usize {
-    GRANT_OPERATION_ORDER
-        .iter()
-        .position(|declared| *declared == operation)
-        .unwrap_or(GRANT_OPERATION_ORDER.len())
-}
-
-/// One grant on a KMS key: "a policy instrument that allows Amazon Web Services
-/// principals to use KMS keys in cryptographic operations"
-/// (`smithy_query(query="doc",shape="CreateGrant")`).
-#[derive(Debug, Clone)]
-pub struct Grant {
-    /// The minted grant id, which is also this record's map key.
-    pub grant_id: String,
-    /// The key id of the KMS key the grant applies to. A grant records the key it
-    /// RESOLVED to, never the alias the request named, so repointing an alias
-    /// cannot move an existing grant to another key.
-    pub key_id: String,
-    /// That key's ARN, which is what a grant reader reports as the entry's `KeyId`:
-    /// `KeyIdType` carries either form, and KMS reports the grant's key as the ARN.
-    pub key_arn: String,
-    /// The Region whose endpoint the grant was created through. A KMS key is a
-    /// regional resource, so its grants are too.
-    pub region: String,
-    /// "The Amazon Web Services account under which the grant was issued"
-    /// (`smithy_query(shape="GrantListEntry")` -> `IssuingAccount`).
-    pub issuing_account: String,
-    /// The `Name` the request gave, if any: "If a name was provided in the
-    /// CreateGrant request, that name is returned. Otherwise this value is null"
-    /// (`smithy_query(shape="GrantListEntry")` -> `Name`).
-    pub name: Option<String>,
-    pub creation_date: SystemTime,
-    pub grantee_principal: Option<String>,
-    pub grantee_service_principal: Option<String>,
-    pub retiring_principal: Option<String>,
-    pub retiring_service_principal: Option<String>,
-    /// "The list of operations permitted by the grant", in the order the request
-    /// listed them.
-    pub operations: Vec<String>,
-    pub constraints: Option<GrantConstraints>,
-}
-
-impl Grant {
-    /// This grant's `GrantListEntry`, computed from the record — the one place a
-    /// grant is projected onto the wire, so two readers cannot disagree.
-    ///
-    /// `Name` is ALWAYS reported: the name the grant was created with, or the empty
-    /// string for a grant created without one, so a client reading it never has to
-    /// tell a missing member from a grant that has no name. The member's own
-    /// documentation says the value "is null" for a grant created without a name
-    /// (`smithy_query(query="doc",shape="GrantListEntry",member="Name")`), but the
-    /// recorded AWS wire (`simparity-wire-aws-v1`, the `kms-grant-*` fixtures)
-    /// reports the empty string, so that is what a reader answers.
-    ///
-    /// The permitted operations are reported in the order the `GrantOperation` enum
-    /// declares its values ([`GRANT_OPERATION_ORDER`]) rather than in the order the
-    /// creating request listed them: they are a SET of permissions (which is also how
-    /// a retry of `CreateGrant` compares them, [`Self::fingerprint`]), so the
-    /// projection puts them in one canonical order and a client comparing two readings
-    /// of the same grant sees no difference.
-    pub fn list_entry(&self) -> GrantListEntry {
-        let mut operations = self.operations.clone();
-        operations.sort_by_key(|operation| grant_operation_rank(operation));
-        GrantListEntry {
-            key_id: Some(self.key_arn.clone()),
-            grant_id: Some(self.grant_id.clone()),
-            name: Some(self.name.clone().unwrap_or_default()),
-            creation_date: Some(date_time(self.creation_date)),
-            grantee_principal: self.grantee_principal.clone(),
-            retiring_principal: self.retiring_principal.clone(),
-            issuing_account: Some(self.issuing_account.clone()),
-            operations: Some(operations),
-            constraints: self.constraints.clone(),
-            grantee_service_principal: self.grantee_service_principal.clone(),
-            retiring_service_principal: self.retiring_service_principal.clone(),
-        }
-    }
-
-    /// Everything about this grant that came from the request that created it,
-    /// digested into 64 hex characters.
-    ///
-    /// "When this value is present, you can retry a `CreateGrant` request with
-    /// identical parameters; if the grant already exists, the original `GrantId` is
-    /// returned without creating a new grant"
-    /// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Name")`), so a
-    /// retry has to be recognisable from the request alone — this is what "identical
-    /// parameters" is compared as.
-    ///
-    /// The permitted operations are sorted and de-duplicated first: they are a SET
-    /// of permissions, so a request listing the same ones in another order is the
-    /// same request. The encryption-context constraints are maps, and are
-    /// canonicalized the same way for the same reason. Every part is
-    /// length-prefixed, so no two different requests can digest to the same bytes.
-    /// The grant id, the creation date and the grant tokens are NOT part of it: the
-    /// first two are what a retry is allowed to reuse, and the last is "unique with
-    /// every `CreateGrant` request".
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"kms-grant\0");
-        for part in [
-            self.key_id.as_str(),
-            self.name.as_deref().unwrap_or_default(),
-            self.grantee_principal.as_deref().unwrap_or_default(),
-            self.grantee_service_principal.as_deref().unwrap_or_default(),
-            self.retiring_principal.as_deref().unwrap_or_default(),
-            self.retiring_service_principal.as_deref().unwrap_or_default(),
-        ] {
-            feed(&mut hasher, part);
-        }
-
-        let mut operations: Vec<&str> = self.operations.iter().map(String::as_str).collect();
-        operations.sort_unstable();
-        operations.dedup();
-        for operation in operations {
-            feed(&mut hasher, operation);
-        }
-
-        let constraints = self.constraints.as_ref();
-        feed(
-            &mut hasher,
-            constraints
-                .and_then(|constraints| constraints.source_arn.as_deref())
-                .unwrap_or_default(),
-        );
-        feed_context(
-            &mut hasher,
-            "EncryptionContextEquals",
-            constraints.and_then(|constraints| constraints.encryption_context_equals.as_ref()),
-        );
-        feed_context(
-            &mut hasher,
-            "EncryptionContextSubset",
-            constraints.and_then(|constraints| constraints.encryption_context_subset.as_ref()),
-        );
-
-        hex::encode(hasher.finalize())
-    }
-
-    /// Whether this grant permits `operation` on the key `key_id` under the request's
-    /// encryption context `context`.
-    ///
-    /// A grant covers ONE key, so a grant on another key permits nothing here: "a
-    /// grant on one KMS key does not authorize use of another". It covers exactly the
-    /// operations it lists. And its encryption-context constraints "allow the
-    /// permissions in the grant only when the encryption context in the request
-    /// matches (EncryptionContextEquals) or includes (EncryptionContextSubset) the
-    /// encryption context specified in the constraint"
-    /// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Constraints")`),
-    /// and they "apply only to cryptographic operations that support an encryption
-    /// context" — so an operation that takes none is judged without them.
-    ///
-    /// A `SourceArn` constraint restricts "an Amazon Web Services resource on behalf
-    /// of which the request is made"; nothing in a direct request names such a
-    /// resource, so it narrows nothing here.
-    pub fn permits(
-        &self,
-        key_id: &str,
-        operation: &str,
-        context: Option<&HashMap<String, String>>,
-    ) -> bool {
-        if self.key_id != key_id {
-            return false;
-        }
-        if !self
-            .operations
-            .iter()
-            .any(|permitted| permitted == operation)
-        {
-            return false;
-        }
-        let takes_context = GRANT_OPERATION_PROFILES
-            .iter()
-            .find(|profile| profile.operation == operation)
-            .is_some_and(|profile| profile.encryption_context);
-        if !takes_context {
-            return true;
-        }
-        self.constraints
-            .as_ref()
-            .is_none_or(|constraints| encryption_context_allows(constraints, context))
-    }
-}
-
-/// Why a request's grant tokens do not authorize it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantRefusal {
-    /// A token is not one this service minted, so it names no grant at all — which is
-    /// what makes the GRANT TOKEN the thing that "is not valid".
-    MalformedToken,
-    /// The tokens are well formed, but no grant they name authorizes the request: the
-    /// grant is gone, is on another key, does not permit the operation, or its
-    /// encryption-context constraint is not met. Permission that would have come from
-    /// a grant is absent, which is an authorization failure rather than a bad request.
-    NotAuthorized,
-}
-
-/// Whether a grant's encryption-context constraints allow a request carrying
-/// `context`.
-///
-/// "In a grant constraint, the key in each key-value pair is not case sensitive, but
-/// the value is case sensitive"
-/// (`smithy_query(query="doc",shape="GrantConstraints")`), so the keys are folded and
-/// the values are not. An absent context is an empty one: `EncryptionContextEquals`
-/// then allows only an empty constraint, and `EncryptionContextSubset` only one with
-/// no pairs to include.
-fn encryption_context_allows(
-    constraints: &GrantConstraints,
-    context: Option<&HashMap<String, String>>,
-) -> bool {
-    let empty = HashMap::new();
-    let request = folded_keys(context.unwrap_or(&empty));
-
-    if let Some(equals) = constraints.encryption_context_equals.as_ref() {
-        if folded_keys(equals) != request {
-            return false;
-        }
-    }
-    if let Some(subset) = constraints.encryption_context_subset.as_ref() {
-        if !folded_keys(subset)
-            .into_iter()
-            .all(|(key, value)| request.get(&key) == Some(&value))
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// An encryption context with its keys folded to lower case, so two contexts that
-/// differ only in the case of their KEYS compare equal while their values stay
-/// case-sensitive.
-fn folded_keys(context: &HashMap<String, String>) -> BTreeMap<String, String> {
-    context
-        .iter()
-        .map(|(key, value)| (key.to_lowercase(), value.clone()))
-        .collect()
-}
-
-/// Add one length-prefixed part to a digest, so two different sequences of parts
-/// cannot run together into the same bytes.
-fn feed(hasher: &mut Sha256, part: &str) {
-    let len = u32::try_from(part.len()).unwrap_or(u32::MAX);
-    hasher.update(len.to_be_bytes());
-    hasher.update(part.as_bytes());
-}
-
-/// [`feed`] for an encryption-context map, under `label` so the two constraint maps
-/// cannot be swapped without changing the digest. The entries are sorted first: the
-/// map is unordered, so only its content may decide the digest.
-fn feed_context(hasher: &mut Sha256, label: &str, context: Option<&HashMap<String, String>>) {
-    feed(hasher, label);
-    let mut entries: Vec<(&str, &str)> = context
-        .map(|context| {
-            context
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    entries.sort_unstable();
-    for (key, value) in entries {
-        feed(hasher, key);
-        feed(hasher, value);
-    }
-}
-
-/// The account ARN KMS reports as a grant's `IssuingAccount`: the emulator's own
-/// account, which is the account that owns every key here.
-pub fn issuing_account_arn() -> String {
-    ::engine::emulator_arn("iam", "", "root")
-}
-
-/// How KMS words `DryRunOperationException`, "the request was rejected because the
-/// DryRun parameter was specified"
-/// (`smithy_query(query="doc",shape="DryRunOperationException")`).
-///
-/// One constant for the whole service, so no two operations word the same refusal
-/// differently.
-pub const DRY_RUN_MESSAGE: &str =
-    "The request would have succeeded, but the DryRun option is set.";
-
-/// How a `GrantId` that cannot name any grant is refused: `InvalidGrantIdException`'s
-/// message names the value the request gave, since that string is the whole of what
-/// is wrong with it.
-///
-/// One function for the whole service, so no two operations word the same malformed
-/// grant id differently.
-pub fn invalid_grant_id_message(requested: &str) -> String {
-    format!("The specified GrantId is not valid: {requested}.")
-}
-
-/// How a grant that is not held is refused: the grant id the request gave, since a
-/// grant that was never created, one already retired and one already revoked are the
-/// same absence.
-///
-/// One function for the whole service, so no two operations word it differently.
-pub fn grant_not_found_message(grant_id: &str) -> String {
-    format!("Grant ID {grant_id} not found")
-}
-
-/// How a `RetireGrant` is refused when the grant it identified is not held.
-///
-/// KMS will not confirm whether a grant exists to a caller that cannot retire it:
-/// "permission to retire a grant is determined primarily by the grant"
-/// (`smithy_query(query="doc",shape="RetireGrant")`), so with no such grant there is no
-/// permission to retire one — and the refusal is the authorization failure that reports
-/// nothing about the resource, naming the caller and the action alone
-/// ([`unauthorized_resource_message`]).
-pub fn retire_grant_access_denied_message(principal: &str, operation: &str) -> String {
-    unauthorized_resource_message(principal, operation)
-}
-
-/// A freshly minted grant id: the 64 lowercase hex characters KMS gives a grant,
-/// drawn from the OS CSPRNG so two grants never share one.
-///
-/// `None` means the platform refused to produce entropy; the caller answers a
-/// modelled server error rather than minting a predictable id.
-pub fn mint_grant_id() -> Option<String> {
-    let mut bytes = [0u8; 32];
-    SystemRandom::new().fill(&mut bytes).ok()?;
-    Some(hex::encode(bytes))
-}
-
-/// How many characters a grant id has: [`mint_grant_id`] draws 32 bytes, and hex
-/// doubles them.
-const GRANT_ID_HEX_LEN: usize = 64;
-
-/// Whether `grant_id` has the form a grant id takes.
-///
-/// `GrantIdType`'s modelled 1..128 length accepts far more than a grant id can be,
-/// so the form is what identifies a value that cannot name any grant — as opposed to
-/// a well-formed id that simply names none.
-pub fn names_a_grant_id(grant_id: &str) -> bool {
-    grant_id.len() == GRANT_ID_HEX_LEN
-        && grant_id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-}
-
-/// Tags a grant token as one this service minted, and distinguishes it from the
-/// pagination tokens, which share the encoding.
-const GRANT_TOKEN_PREFIX: &str = "grant-token/1/";
-
-/// A freshly minted grant token for `grant_id`.
-///
-/// "The returned grant token is unique with every `CreateGrant` request, even when a
-/// duplicate `GrantId` is returned. All grant tokens for the same grant ID can be
-/// used interchangeably"
-/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Name")`): the token
-/// therefore carries the grant id it belongs to plus a fresh nonce, so a new one is
-/// minted per call and any of them names the same grant. It is self-describing
-/// rather than persisted, so a grant does not accumulate a token per retry.
-///
-/// `None` means the platform refused to produce entropy.
-pub fn mint_grant_token(grant_id: &str) -> Option<String> {
-    let mut nonce = [0u8; 16];
-    SystemRandom::new().fill(&mut nonce).ok()?;
-    Some(hex::encode(format!(
-        "{GRANT_TOKEN_PREFIX}{grant_id}/{}",
-        hex::encode(nonce)
-    )))
-}
-
-/// The grant id a grant token names, or `None` when the token is not one this
-/// service minted — which is what makes a foreign token an
-/// `InvalidGrantTokenException` instead of being silently ignored.
-pub fn decode_grant_token(token: &str) -> Option<String> {
-    let decoded = hex::decode(token).ok()?;
-    let text = String::from_utf8(decoded).ok()?;
-    let rest = text.strip_prefix(GRANT_TOKEN_PREFIX)?;
-    let (grant_id, nonce) = rest.split_once('/')?;
-    (!grant_id.is_empty() && !nonce.is_empty()).then(|| grant_id.to_string())
-}
-
-/// Whether `principal` is given the way KMS requires a grant principal to be: "use
-/// the Amazon Resource Name (ARN) of an Amazon Web Services principal"
-/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="GranteePrincipal")`),
-/// and the same for the retiring principal `ListRetirableGrants` and `CreateGrant` take:
-/// "valid principals include Amazon Web Services accounts, IAM users, IAM roles,
-/// federated users, and assumed role users"
-/// (`smithy_query(query="doc",shape="ListRetirableGrantsRequest",member="RetiringPrincipal")`).
-///
-/// `PrincipalIdType`'s modelled pattern accepts any word-ish string, so the IDENTITY form
-/// is what is left to check — and it is the same union of forms every other service reads
-/// a policy principal against, so it is the tree's one reading of it
-/// ([`::service_common::arn::is_iam_principal_arn`]) rather than a second grammar here: an
-/// ARN whose resource field names no IAM or STS identity (no resource type at all, or one
-/// that is not an identity's) denotes no principal, which is what the operations model
-/// `InvalidArnException` for.
-pub fn names_a_principal_arn(principal: &str) -> bool {
-    ::service_common::arn::is_iam_principal_arn(principal)
-}
-
-/// How a value that names no AWS principal is refused: `InvalidArnException`'s message
-/// names the value the request gave, since that string is the whole of what is wrong with
-/// it.
-///
-/// KMS words this refusal of a PRINCIPAL differently from the one it words for a key
-/// identifier ([`invalid_arn_message`]) — the recorded wording names the ARN with no
-/// sentence around it — so the two live side by side here rather than one being used for
-/// both. One function for every member that carries a principal, so no two operations
-/// word the same refusal differently.
-pub fn invalid_principal_arn_message(requested: &str) -> String {
-    format!("ARN is not valid: {requested}")
-}
-
-/// What one `GrantOperation` needs of the KMS key it is granted on.
-///
-/// "This list must include only operations that are permitted in a grant. Also, the
-/// operation must be supported on the KMS key. For example, you cannot create a
-/// grant for a symmetric encryption KMS key that allows the `Sign` operation, or a
-/// grant for an asymmetric KMS key that allows the `GenerateDataKey` operation"
-/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Operations")`) —
-/// the first example is a `KeyUsage` mismatch and the second a key-TYPE mismatch, so
-/// a profile records both.
-#[derive(Debug, Clone, Copy)]
-pub struct GrantOperationProfile {
-    /// The `GrantOperation` value this profile describes
-    /// (`crate::ops::types::GRANT_OPERATION_VALUES`).
-    pub operation: &'static str,
-    /// The `KeyUsage` values a key must carry for this operation. EMPTY means the
-    /// operation is key management, which every usage permits.
-    pub usages: &'static [&'static str],
-    /// The key types ([`KeySpecProfile::family`]) that support this operation. EMPTY
-    /// means every type does.
-    pub families: &'static [&'static str],
-    /// Whether the operation this grants takes an `EncryptionContext`. The
-    /// encryption-context grant constraints "apply only to cryptographic operations
-    /// that support an encryption context … not … operations that do not support an
-    /// encryption context, such as cryptographic operations with asymmetric KMS keys
-    /// and management operations"
-    /// (`smithy_query(query="doc",shape="GrantConstraints")`), so this is what decides
-    /// whether a constraint is applied at all.
-    pub encryption_context: bool,
-}
-
-/// What each `GrantOperation` needs of the key, from the `KeyUsage` matrix
-/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`) and the
-/// operation each one grants: a cryptographic operation needs the usage that
-/// operation runs under, and the key type whose material can perform it, while
-/// `CreateGrant`, `DescribeKey` and `RetireGrant` are management operations that
-/// every key supports.
-pub const GRANT_OPERATION_PROFILES: &[GrantOperationProfile] = &[
-    GrantOperationProfile {
-        operation: "CreateGrant",
-        usages: &[],
-        families: &[],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "DescribeKey",
-        usages: &[],
-        families: &[],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "RetireGrant",
-        usages: &[],
-        families: &[],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "Encrypt",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "Decrypt",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "ReEncryptFrom",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "ReEncryptTo",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[],
-        encryption_context: true,
-    },
-    // A data key is generated under a SYMMETRIC encryption key, which is what makes
-    // `GenerateDataKey` on an asymmetric key the documented example of an operation
-    // the key does not support.
-    GrantOperationProfile {
-        operation: "GenerateDataKey",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[FAMILY_SYMMETRIC],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "GenerateDataKeyWithoutPlaintext",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[FAMILY_SYMMETRIC],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "GenerateDataKeyPair",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[FAMILY_SYMMETRIC],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "GenerateDataKeyPairWithoutPlaintext",
-        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
-        families: &[FAMILY_SYMMETRIC],
-        encryption_context: true,
-    },
-    GrantOperationProfile {
-        operation: "Sign",
-        usages: &[KEY_USAGE_SIGN_VERIFY],
-        families: &[FAMILY_ASYMMETRIC],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "Verify",
-        usages: &[KEY_USAGE_SIGN_VERIFY],
-        families: &[FAMILY_ASYMMETRIC],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "GenerateMac",
-        usages: &[KEY_USAGE_GENERATE_VERIFY_MAC],
-        families: &[FAMILY_HMAC],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "VerifyMac",
-        usages: &[KEY_USAGE_GENERATE_VERIFY_MAC],
-        families: &[FAMILY_HMAC],
-        encryption_context: false,
-    },
-    GrantOperationProfile {
-        operation: "DeriveSharedSecret",
-        usages: &[KEY_USAGE_KEY_AGREEMENT],
-        families: &[FAMILY_ASYMMETRIC],
-        encryption_context: false,
-    },
-    // The public half exists only for a key pair, under any of the three usages an
-    // asymmetric spec can carry.
-    GrantOperationProfile {
-        operation: "GetPublicKey",
-        usages: &[
-            KEY_USAGE_ENCRYPT_DECRYPT,
-            KEY_USAGE_SIGN_VERIFY,
-            KEY_USAGE_KEY_AGREEMENT,
-        ],
-        families: &[FAMILY_ASYMMETRIC],
-        encryption_context: false,
-    },
-];
-
-/// The key type [`KeySpecProfile::family`] reports for a symmetric encryption key.
-pub const FAMILY_SYMMETRIC: &str = "symmetric";
-/// See [`FAMILY_SYMMETRIC`].
-pub const FAMILY_ASYMMETRIC: &str = "asymmetric";
-/// See [`FAMILY_SYMMETRIC`].
-pub const FAMILY_HMAC: &str = "HMAC";
-
-/// Why `key` does not support the grant operation `operation`, or `None` when it
-/// does.
-///
-/// An operation [`GRANT_OPERATION_PROFILES`] does not describe is reported as
-/// supported: the modelled `GrantOperation` enum refuses an unknown value before any
-/// handler runs, so reaching here with one is not possible, and a value added to the
-/// model later must not be refused by a table that has not caught up.
-pub fn grant_operation_refusal(key: &Cmk, operation: &str) -> Option<String> {
-    let profile = GRANT_OPERATION_PROFILES
-        .iter()
-        .find(|profile| profile.operation == operation)?;
-
-    if !profile.usages.is_empty() && !profile.usages.contains(&key.key_usage.as_str()) {
-        return Some(format!(
-            "Operation {operation} is not permitted in a grant on {}, whose KeyUsage is \
-             {}; it requires a KeyUsage of {}.",
-            key.arn,
-            key.key_usage,
-            profile.usages.join(" or ")
-        ));
-    }
-
-    let family = key_spec_profile(&key.key_spec).map(KeySpecProfile::family);
-    if !profile.families.is_empty()
-        && family.is_none_or(|family| !profile.families.contains(&family))
-    {
-        return Some(format!(
-            "Operation {operation} is not permitted in a grant on {}, whose KeySpec {} is \
-             {}; it requires {} key material.",
-            key.arn,
-            key.key_spec,
-            family.unwrap_or("of an unknown type"),
-            profile.families.join(" or ")
-        ));
-    }
-
-    None
-}
-
-// ---------------------------------------------------------------------------
-// List pagination
-// ---------------------------------------------------------------------------
-
-/// Tags a `NextMarker` as one this service minted, and for which list.
-const MARKER_PREFIX: &str = "keys/1/";
-
-/// [`MARKER_PREFIX`], for the alias list. A token is tagged per LIST so a marker
-/// from one list is not accepted by another, which would silently resume a page at
-/// an item of the wrong kind instead of answering `InvalidMarkerException`.
-const ALIAS_MARKER_PREFIX: &str = "aliases/1/";
-
-/// [`MARKER_PREFIX`], for one key's tag list.
-const RESOURCE_TAG_MARKER_PREFIX: &str = "resource-tags/1/";
-
-/// [`MARKER_PREFIX`], for the grant list.
-const GRANT_MARKER_PREFIX: &str = "grants/1/";
-
-/// [`MARKER_PREFIX`], for the retirable-grant list, which pages over a different
-/// selection of grants than the per-key list and so mints its own tokens.
-const RETIRABLE_GRANT_MARKER_PREFIX: &str = "retirable-grants/1/";
-
-/// The `NextMarker` that resumes a list after `key_id`.
-///
-/// Hex-encoded so the token is opaque to a caller (who must pass it back
-/// verbatim) while still satisfying `MarkerType`'s `^[\u0020-\u00FF]*$` pattern.
-pub fn encode_marker(key_id: &str) -> String {
-    encode_marker_for(MARKER_PREFIX, key_id)
-}
-
-/// The key id a `Marker` resumes after, or `None` when the token is not one this
-/// service minted.
-pub fn decode_marker(marker: &str) -> Option<String> {
-    decode_marker_for(MARKER_PREFIX, marker)
-}
-
-/// [`encode_marker`], for the alias list: the token resumes after the alias whose
-/// ARN is `alias_arn`, since the ARN is what identifies an alias.
-pub fn encode_alias_marker(alias_arn: &str) -> String {
-    encode_marker_for(ALIAS_MARKER_PREFIX, alias_arn)
-}
-
-/// [`decode_marker`], for the alias list.
-pub fn decode_alias_marker(marker: &str) -> Option<String> {
-    decode_marker_for(ALIAS_MARKER_PREFIX, marker)
-}
-
-/// [`encode_marker`], for one key's tag list: the token resumes after the tag whose
-/// key is `tag_key`, since the tag key is what identifies a tag on a key.
-pub fn encode_resource_tag_marker(tag_key: &str) -> String {
-    encode_marker_for(RESOURCE_TAG_MARKER_PREFIX, tag_key)
-}
-
-/// [`decode_marker`], for one key's tag list.
-pub fn decode_resource_tag_marker(marker: &str) -> Option<String> {
-    decode_marker_for(RESOURCE_TAG_MARKER_PREFIX, marker)
-}
-
-/// [`encode_marker`], for the grant list: the token resumes after the grant whose
-/// id is `grant_id`.
-pub fn encode_grant_marker(grant_id: &str) -> String {
-    encode_marker_for(GRANT_MARKER_PREFIX, grant_id)
-}
-
-/// [`decode_marker`], for the grant list.
-pub fn decode_grant_marker(marker: &str) -> Option<String> {
-    decode_marker_for(GRANT_MARKER_PREFIX, marker)
-}
-
-/// [`encode_marker`], for the retirable-grant list.
-pub fn encode_retirable_grant_marker(grant_id: &str) -> String {
-    encode_marker_for(RETIRABLE_GRANT_MARKER_PREFIX, grant_id)
-}
-
-/// [`decode_marker`], for the retirable-grant list.
-pub fn decode_retirable_grant_marker(marker: &str) -> Option<String> {
-    decode_marker_for(RETIRABLE_GRANT_MARKER_PREFIX, marker)
-}
-
-/// How KMS words `InvalidMarkerException`, "the marker that specifies where pagination
-/// should next begin is not valid", on the listings whose refusal of one is recorded
-/// carrying no message.
-///
-/// KMS refuses a marker it never issued with the error CODE alone — the refusal is
-/// recorded on the wire with no `Message` member at all — so no explanatory text is
-/// manufactured for it. What was wrong with the marker is stated in a comment at the
-/// check that refuses it, not on the wire.
-///
-/// One function for every paginated operation that answers it that way, so no two of them
-/// answer the same refusal with different members — which is why it is a function
-/// returning `None` rather than `None` written out at each call site. The TAG listing is
-/// recorded naming the token instead ([`invalid_next_marker_message`]).
-#[must_use]
-pub fn invalid_marker_message() -> Option<String> {
-    None
-}
-
-/// How the TAG listing refuses a `Marker` it did not issue: by naming the token it
-/// rejected, `Invalid NextMarker: <marker>`.
-///
-/// A `Marker` "specifies where pagination should next begin"
-/// (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="Marker")`), and a
-/// token this reader never minted — or one naming a tag the key no longer carries —
-/// resumes nowhere; the token is the whole of what the request got wrong, so it is the
-/// refusal's one variable part and it travels back exactly as the request supplied it.
-///
-/// It is the tagging surface's own wording: the recorded refusal of a marker by the key,
-/// alias and grant listings carries no message at all ([`invalid_marker_message`]), so
-/// each surface keeps the wording its own refusal is recorded with rather than borrowing
-/// the other's.
-#[must_use]
-pub fn invalid_next_marker_message(marker: &str) -> String {
-    format!("Invalid NextMarker: {marker}")
-}
-
-/// [`MARKER_PREFIX`], for the custom key store list, which pages over custom key
-/// stores rather than keys and so mints its own tokens.
-const CUSTOM_KEY_STORE_MARKER_PREFIX: &str = "custom-key-stores/1/";
-
-/// [`encode_marker`], for the custom key store list: the token resumes after the
-/// key store whose id is `custom_key_store_id`.
-pub fn encode_custom_key_store_marker(custom_key_store_id: &str) -> String {
-    encode_marker_for(CUSTOM_KEY_STORE_MARKER_PREFIX, custom_key_store_id)
-}
-
-/// [`decode_marker`], for the custom key store list.
-pub fn decode_custom_key_store_marker(marker: &str) -> Option<String> {
-    decode_marker_for(CUSTOM_KEY_STORE_MARKER_PREFIX, marker)
-}
-
-/// [`MARKER_PREFIX`], for the key-material rotation list, which pages over the
-/// versions of one key's material and so mints its own tokens.
-const ROTATION_MARKER_PREFIX: &str = "key-rotations/1/";
-
-/// [`encode_marker`], for the rotation list: the token resumes after the key material
-/// whose `KeyMaterialId` is `key_material_id`.
-pub fn encode_rotation_marker(key_material_id: &str) -> String {
-    encode_marker_for(ROTATION_MARKER_PREFIX, key_material_id)
-}
-
-/// [`decode_marker`], for the rotation list.
-pub fn decode_rotation_marker(marker: &str) -> Option<String> {
-    decode_marker_for(ROTATION_MARKER_PREFIX, marker)
-}
-
-/// One encoding for every list, so no two pagers mint tokens a reader must handle
-/// differently.
-fn encode_marker_for(prefix: &str, id: &str) -> String {
-    hex::encode(format!("{prefix}{id}"))
-}
-
-/// The inverse of [`encode_marker_for`], for the list `prefix` tags.
-fn decode_marker_for(prefix: &str, marker: &str) -> Option<String> {
-    let decoded = hex::decode(marker).ok()?;
-    let text = String::from_utf8(decoded).ok()?;
-    let id = text.strip_prefix(prefix)?;
-    (!id.is_empty()).then(|| id.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Importing key material
-// ---------------------------------------------------------------------------
-
-/// The `WrappingKeySpec` values this service generates a wrapping key pair for, from
-/// `smithy_query(query="shape",shape="WrappingKeySpec")`. `SM2` is the fourth value
-/// and is not one of these: see [`wrapping_key_size`].
-pub const WRAPPING_KEY_SPEC_RSA_2048: &str = "RSA_2048";
-/// See [`WRAPPING_KEY_SPEC_RSA_2048`].
-pub const WRAPPING_KEY_SPEC_RSA_3072: &str = "RSA_3072";
-/// See [`WRAPPING_KEY_SPEC_RSA_2048`].
-pub const WRAPPING_KEY_SPEC_RSA_4096: &str = "RSA_4096";
-
-/// The RSA key size a `WrappingKeySpec` names, or `None` for a spec that is not an RSA
-/// key pair this service generates.
-///
-/// The accepted specs are the catalog above; the modulus size is read from the spec's
-/// own name through [`rsa_key_size`], the one place a modulus size becomes a key size.
-fn wrapping_key_size(wrapping_key_spec: &str) -> Option<::aws_lc_rs::rsa::KeySize> {
-    match wrapping_key_spec {
-        WRAPPING_KEY_SPEC_RSA_2048 | WRAPPING_KEY_SPEC_RSA_3072 | WRAPPING_KEY_SPEC_RSA_4096 => {
-            rsa_key_size(wrapping_key_spec.strip_prefix("RSA_")?.parse().ok()?)
-        }
-        _ => None,
-    }
-}
-
-/// Whether this service can generate a wrapping key pair of `wrapping_key_spec`.
-pub fn generates_wrapping_key(wrapping_key_spec: &str) -> bool {
-    wrapping_key_size(wrapping_key_spec).is_some()
-}
-
-/// A freshly generated wrapping key pair of the kind `wrapping_key_spec` names: the
-/// public half as X.509 `SubjectPublicKeyInfo` DER, which is what the response carries,
-/// and the private half as PKCS#8 DER, which is what this store keeps.
-///
-/// The RSA key pair comes from `aws-lc-rs` (`aws_lc_rs::rsa`) rather than from anything
-/// written here, and the public half really is the public half of the private one, so
-/// key material wrapped with it is material `ImportKeyMaterial` can open.
-///
-/// `None` means the platform refused to generate a key pair; the caller answers a
-/// modelled server error rather than returning a public key with no private half.
-pub fn mint_wrapping_key(wrapping_key_spec: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-    use ::aws_lc_rs::encoding::AsDer;
-
-    let key_size = wrapping_key_size(wrapping_key_spec)?;
-    let private_key = ::aws_lc_rs::rsa::PrivateDecryptingKey::generate(key_size).ok()?;
-    let public_key = private_key.public_key().as_der().ok()?.as_ref().to_vec();
-    let private_key_pkcs8 = private_key.as_der().ok()?.as_ref().to_vec();
-    Some((public_key, private_key_pkcs8))
-}
-
-// The matching UNWRAP of key material a caller sealed under the public half of a
-// wrapping key pair is [`unwrap_key_material`] below.
-
-/// Open key material a caller wrapped under the public half of `parameters`' wrapping
-/// key pair, with the wrapping algorithm those parameters were issued for.
-///
-/// The RSA-OAEP decryption comes from `aws-lc-rs` (`aws_lc_rs::rsa`), under the private
-/// half this store kept when the public half was handed out, so what comes back is
-/// exactly the material the caller wrapped. An `RSA_AES` wrapping has a second step:
-/// what the RSA public key encrypted is an ephemeral AES key, and that key wrapped the
-/// material — see [`Wrapping`].
-///
-/// `None` means the bytes are not key material those parameters can open: either the
-/// wrapping algorithm is one this service does not unwrap (see
-/// [`unwraps_wrapping_algorithm`]) or the unwrapping failed.
-pub fn unwrap_key_material(parameters: &ImportParameters, wrapped: &[u8]) -> Option<Vec<u8>> {
-    let wrapping = wrapping_of(&parameters.wrapping_algorithm)?;
-    let private_key =
-        ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(&parameters.private_key_pkcs8).ok()?;
-    let key_size_bytes = private_key.key_size_bytes();
-    let oaep = ::aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(private_key).ok()?;
-    // What the RSA public key encrypted is the whole material for an RSAES wrapping and
-    // the ephemeral AES key alone for an `RSA_AES` one, in which case it occupies exactly
-    // one RSA block and the AES-wrapped material is the rest.
-    let (sealed, aes_wrapped) = match wrapping {
-        Wrapping::Direct(_) => (wrapped, None),
-        Wrapping::AesKeyWrap(_) => {
-            if wrapped.len() <= key_size_bytes {
-                return None;
-            }
-            let (block, rest) = wrapped.split_at(key_size_bytes);
-            (block, Some(rest))
-        }
-    };
-    let mut opened = vec![0u8; key_size_bytes];
-    let len = oaep
-        .decrypt(wrapping.oaep_algorithm(), sealed, &mut opened, None)
-        .ok()?
-        .len();
-    opened.truncate(len);
-    match aes_wrapped {
-        None => Some(opened),
-        Some(aes_wrapped) => aes_key_unwrap(&opened, aes_wrapped),
-    }
-}
-
-/// Open key material wrapped with the ephemeral AES key `kek` under AES key wrap with
-/// padding, which is the second step of an `RSA_AES` wrapping.
-///
-/// "Generate a 256-bit AES symmetric key", "encrypt your key material with the AES key"
-/// and "encrypt the AES key with the public key", then concatenate the two
-/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`),
-/// so the material is unwrapped with the AES key the RSA block carried. The key wrap
-/// comes from `aws-lc-rs` (`aws_lc_rs::key_wrap`), not from anything written here.
-///
-/// `None` means the bytes are not material wrapped with that key.
-fn aes_key_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
-    use ::aws_lc_rs::key_wrap::KeyWrapPadded;
-
-    let kek = ::aws_lc_rs::key_wrap::AesKek::new(&::aws_lc_rs::key_wrap::AES_256, kek).ok()?;
-    let mut opened = vec![0u8; wrapped.len()];
-    let len = kek.unwrap_with_padding(wrapped, &mut opened).ok()?.len();
-    opened.truncate(len);
-    Some(opened)
-}
-
-/// Whether this service can unwrap key material wrapped with `wrapping_algorithm`.
-pub fn unwraps_wrapping_algorithm(wrapping_algorithm: &str) -> bool {
-    wrapping_of(wrapping_algorithm).is_some()
-}
-
-/// How a caller wrapped the key material it is importing, which is what the
-/// `AlgorithmSpec` of the parameters it names states.
-#[derive(Debug, Clone, Copy)]
-enum Wrapping {
-    /// The material itself is encrypted under the RSA public key: "for RSAES wrapping
-    /// algorithms, you encrypt your key material directly with the RSA public key from
-    /// KMS", with these OAEP parameters.
-    Direct(&'static ::aws_lc_rs::rsa::OaepAlgorithm),
-    /// An ephemeral AES key is encrypted under the RSA public key with these OAEP
-    /// parameters, and the material is wrapped with that AES key: "for RSA_AES wrapping
-    /// algorithms, you encrypt your key material with an AES symmetric key that you
-    /// generate, then encrypt your AES key with the RSA public key from KMS".
-    AesKeyWrap(&'static ::aws_lc_rs::rsa::OaepAlgorithm),
-}
-
-impl Wrapping {
-    /// The OAEP parameters the RSA step uses, which both forms of wrapping carry.
-    fn oaep_algorithm(&self) -> &'static ::aws_lc_rs::rsa::OaepAlgorithm {
-        match self {
-            Self::Direct(algorithm) | Self::AesKeyWrap(algorithm) => algorithm,
-        }
-    }
-}
-
-/// The wrapping an `AlgorithmSpec` names, or `None` for a spec that is not one this
-/// service unwraps: the four RSA values of
-/// `smithy_query(query="shape",shape="AlgorithmSpec")` are wrappings under the RSA key
-/// pair `GetParametersForImport` handed out, while `SM2PKE` is not RSA at all.
-///
-/// The digest in the name is the digest of the OAEP step, for both forms
-/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`).
-fn wrapping_of(wrapping_algorithm: &str) -> Option<Wrapping> {
-    match wrapping_algorithm {
-        ALGORITHM_SPEC_RSAES_OAEP_SHA_1 => Some(Wrapping::Direct(
-            &::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1,
-        )),
-        ALGORITHM_SPEC_RSAES_OAEP_SHA_256 => Some(Wrapping::Direct(
-            &::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256,
-        )),
-        ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_1 => Some(Wrapping::AesKeyWrap(
-            &::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1,
-        )),
-        ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_256 => Some(Wrapping::AesKeyWrap(
-            &::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256,
-        )),
-        _ => None,
-    }
-}
-
-/// The `AlgorithmSpec` values a caller wraps key material with directly under the RSA
-/// public key — see [`wrapping_of`].
-pub const ALGORITHM_SPEC_RSAES_OAEP_SHA_1: &str = "RSAES_OAEP_SHA_1";
-/// See [`ALGORITHM_SPEC_RSAES_OAEP_SHA_1`].
-pub const ALGORITHM_SPEC_RSAES_OAEP_SHA_256: &str = "RSAES_OAEP_SHA_256";
-/// The `AlgorithmSpec` values that wrap key material with an ephemeral AES key and that
-/// AES key under the RSA public key — see [`wrapping_of`]. They are what "supported for
-/// wrapping RSA and ECC key material" names
-/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`).
-pub const ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_1: &str = "RSA_AES_KEY_WRAP_SHA_1";
-/// See [`ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_1`].
-pub const ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_256: &str = "RSA_AES_KEY_WRAP_SHA_256";
-
-/// How long one wrapping key pair and its import token stay usable: "Each public key
-/// and import token set is valid for 24 hours"
-/// (`smithy_query(query="doc",shape="GetParametersForImport")`).
-pub const IMPORT_PARAMETERS_VALIDITY: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
-
-/// The largest number of outstanding wrapping key pairs this store holds.
-///
-/// A bound the EMULATOR imposes, not a quota KMS publishes: `GetParametersForImport`
-/// mints a key pair per call and is reachable by any caller, so without a cap a loop
-/// of valid calls grows the process without end. Past it the operation refuses with a
-/// modelled server error and mints nothing.
-pub const MAX_IMPORT_PARAMETERS: usize = 200;
-
-/// One wrapping key pair `GetParametersForImport` handed out, with the import token
-/// that names it.
-///
-/// "The public key (or 'wrapping key') of an RSA key pair that KMS generates" is
-/// returned to the caller and the private half stays here, which is what lets
-/// `ImportKeyMaterial` open the key material the caller wraps with it. "The public key
-/// and its import token are permanently linked and must be used together"
-/// (`smithy_query(query="doc",shape="GetParametersForImport")`), so the token is the
-/// key of this record and the record holds everything the import must agree with: the
-/// KMS key the parameters were issued for, and the wrapping algorithm the caller said
-/// it would use.
-///
-/// `Debug` is written by hand rather than derived so the private key is REDACTED.
-#[derive(Clone)]
-pub struct ImportParameters {
-    /// The key id of the KMS key the parameters were issued for.
-    pub key_id: String,
-    /// The `AlgorithmSpec` the request named, which is the algorithm the caller
-    /// wraps the key material with.
-    pub wrapping_algorithm: String,
-    /// The `WrappingKeySpec` the request named, which is the kind of RSA key pair
-    /// that was generated.
-    pub wrapping_key_spec: String,
-    /// The PKCS#8 DER of the private half of the wrapping key pair. It never leaves
-    /// this process: only the public half is returned, and only `ImportKeyMaterial`
-    /// reads this one.
-    pub private_key_pkcs8: Vec<u8>,
-    /// When the pair and its token stop being usable, which is
-    /// [`IMPORT_PARAMETERS_VALIDITY`] after the call that minted them.
-    pub valid_to: SystemTime,
-}
-
-impl std::fmt::Debug for ImportParameters {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImportParameters")
-            .field("key_id", &self.key_id)
-            .field("wrapping_algorithm", &self.wrapping_algorithm)
-            .field("wrapping_key_spec", &self.wrapping_key_spec)
-            .field("private_key_pkcs8", &"<redacted>")
-            .field("valid_to", &self.valid_to)
-            .finish()
-    }
-}
-
-impl ImportParameters {
-    /// Whether these parameters are still usable at `now`: an import token past its
-    /// `ParametersValidTo` "cannot be used in an ImportKeyMaterial request"
-    /// (`smithy_query(query="doc",shape="GetParametersForImport")`).
-    pub fn usable_at(&self, now: SystemTime) -> bool {
-        now < self.valid_to
-    }
-}
-
-/// The import token that names one [`ImportParameters`] record: opaque to the caller,
-/// drawn from the OS CSPRNG so no two calls share one and no client can construct one.
-///
-/// `None` means the platform refused to produce entropy; the caller answers a modelled
-/// server error rather than minting a predictable token.
-pub fn mint_import_token() -> Option<Vec<u8>> {
-    random_bytes(IMPORT_TOKEN_LEN)
-}
-
-/// How many bytes an import token carries. The value is this emulator's: `ImportToken`
-/// is only "the import token to send in a subsequent ImportKeyMaterial request"
-/// (`smithy_query(query="doc",shape="GetParametersForImportResponse",member="ImportToken")`)
-/// with a modelled 1..6144 length and no structure.
-const IMPORT_TOKEN_LEN: usize = 32;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
