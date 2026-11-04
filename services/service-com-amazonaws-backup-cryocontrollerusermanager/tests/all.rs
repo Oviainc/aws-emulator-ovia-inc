@@ -31,6 +31,8 @@ mod framework_update;
 mod legal_hold;
 #[path = "all/legal_hold_coverage.rs"]
 mod legal_hold_coverage;
+#[path = "all/legal_hold_date_range.rs"]
+mod legal_hold_date_range;
 #[path = "all/logically_air_gapped_vault.rs"]
 mod logically_air_gapped_vault;
 #[path = "all/recovery_point_deletion.rs"]

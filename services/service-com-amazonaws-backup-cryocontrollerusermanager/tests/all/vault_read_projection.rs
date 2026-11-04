@@ -20,13 +20,13 @@
 //! * the described and the listed view of one vault agree member for member, so
 //!   one projection serves both.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::vault_and_backup_job::{
-    call, create_vault, error_code, router, string_at, ACCOUNT, REGION,
+    call, create_vault, epoch_seconds, error_code, router, string_at, ACCOUNT, REGION,
 };
 
 /// Seconds in a day — `ChangeableForDays` is a day count, the `LockDate` an
@@ -64,13 +64,6 @@ const SHARED_MEMBERS: &[&str] = &[
     "MaxRetentionDays",
     "LockDate",
 ];
-
-/// Seconds since the epoch, as this protocol serialises a timestamp.
-fn epoch_seconds(now: SystemTime) -> f64 {
-    now.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-}
 
 /// Whether `value` has the hyphenated 8-4-4-4-12 hex form a KMS key id carries.
 fn is_key_id(value: &str) -> bool {

@@ -129,16 +129,27 @@ pub(crate) fn age_point(engine: &engine::InMemoryEngine, arn: &str, days: u64) {
     if days == 0 {
         return;
     }
+    let aged = stored_creation(engine, arn)
+        .checked_sub(Duration::from_secs(days * SECONDS_PER_DAY))
+        .expect("an instant that many days before the backup");
+    set_point_creation(engine, arn, aged);
+}
+
+/// Store `at` as a recovery point's creation instant.
+///
+/// The one seam the suites move a stored point's creation instant through, so a
+/// case can place a point at a known offset from an instant it sends (a legal
+/// hold's `DateRange` bound, a listing's creation filter) instead of depending
+/// on what the clock read when the point was stored. [`age_point`] is this seam
+/// applied whole days back.
+pub(crate) fn set_point_creation(engine: &engine::InMemoryEngine, arn: &str, at: SystemTime) {
     let state = engine.state::<BackupState>();
     let mut store = state.lock();
     let point = store
         .recovery_points
         .get_mut(arn)
         .expect("the recovery point the case stored");
-    point.creation_date = point
-        .creation_date
-        .checked_sub(Duration::from_secs(days * SECONDS_PER_DAY))
-        .expect("an instant that many days before the backup");
+    point.creation_date = at;
 }
 
 /// The creation instant the store holds for a recovery point.

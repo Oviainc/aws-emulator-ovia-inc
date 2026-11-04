@@ -24,7 +24,7 @@
 //! binary drives the same wire path instead of growing a second copy of it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
@@ -116,6 +116,18 @@ pub(crate) async fn call_reported(
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (status, errortype, parsed)
+}
+
+/// An instant as the seconds since the epoch this protocol serialises a
+/// timestamp as. FRACTIONAL: the model's timestamps are "accurate to
+/// milliseconds", so an instant keeps its sub-second part here instead of being
+/// truncated to a whole second, which would make it a DIFFERENT instant.
+///
+/// Shared with the sibling suites for the reason given on [`router`].
+pub(crate) fn epoch_seconds(at: SystemTime) -> f64 {
+    at.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 /// The wire error code of an error response (`__type`), or `"<none>"`.

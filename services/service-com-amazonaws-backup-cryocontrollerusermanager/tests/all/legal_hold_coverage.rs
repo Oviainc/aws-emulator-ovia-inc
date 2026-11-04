@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::recovery_point_deletion::{age_point, listed_points, router_with_engine, start_point};
 use super::vault_and_backup_job::{
-    call, create_vault, error_code, string_at, ACCOUNT, PAST_SETTLE, REGION,
+    call, create_vault, epoch_seconds, error_code, string_at, ACCOUNT, PAST_SETTLE, REGION,
 };
 
 /// Seconds in a day — the unit the fixture ages a stored recovery point by, and
@@ -104,7 +104,11 @@ async fn create_legal_hold(router: &MultiServiceRouter, request: &Value) -> (u16
 /// `GET /legal-holds/{LegalHoldId}/recovery-points` —
 /// `ListRecoveryPointsByLegalHold`'s HTTP binding, with the query string the
 /// caller's page parameters bind to.
-async fn held_points(router: &MultiServiceRouter, hold_id: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn held_points(
+    router: &MultiServiceRouter,
+    hold_id: &str,
+    query: &str,
+) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -151,7 +155,7 @@ fn listed(body: &Value) -> Vec<Value> {
 }
 
 /// The `RecoveryPointArn`s a page reports, as a set.
-fn arns_of(page: &Value) -> BTreeSet<String> {
+pub(crate) fn arns_of(page: &Value) -> BTreeSet<String> {
     listed(page)
         .iter()
         .map(|point| string_at(point, "RecoveryPointArn"))
@@ -165,6 +169,10 @@ fn set_of<'a>(arns: impl IntoIterator<Item = &'a String>) -> BTreeSet<String> {
 
 /// Seconds since the epoch `days` before now — the Unix form the model's
 /// timestamps take, which a `DateRange` bound is sent as.
+///
+/// Whole days back, so the bound is nowhere near the creation instant of any
+/// point the fixture has just stored. A bound that ends at the CURRENT instant
+/// is [`now_epoch_seconds`] instead, for the reason stated there.
 fn days_ago(days: u64) -> i64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -173,8 +181,22 @@ fn days_ago(days: u64) -> i64 {
     now - i64::try_from(days).unwrap_or_default() * SECONDS_PER_DAY
 }
 
+/// Now as fractional seconds since the epoch — the form a `DateRange` bound
+/// takes when it has to name the current instant rather than a day boundary.
+///
+/// A window closes on an INSTANT, "accurate to milliseconds" (`smithy_query`
+/// shape `DateRange`), so a bound truncated to a whole second is EARLIER than
+/// every instant inside that second: it would fall before the sub-second
+/// creation instants of the points the fixture stored moments ago, which the
+/// hold would then rightly leave out. Stated at the precision the bound
+/// carries, through the harness's own conversion, the window provably contains
+/// them whatever the clock reads.
+fn now_epoch_seconds() -> f64 {
+    epoch_seconds(SystemTime::now())
+}
+
 /// Create a legal hold over `selection` and return the id it was stored under.
-async fn hold_over(router: &MultiServiceRouter, title: &str, selection: Value) -> String {
+pub(crate) async fn hold_over(router: &MultiServiceRouter, title: &str, selection: Value) -> String {
     let (status, created) = create_legal_hold(
         router,
         &json!({
@@ -296,7 +318,10 @@ async fn a_hold_covers_the_recovery_points_its_selection_names() {
         ),
         (
             "a window reaching from before the aged point up to now",
-            json!({"DateRange": {"FromDate": days_ago(AGED_DAYS + 5), "ToDate": days_ago(0)}}),
+            json!({"DateRange": {
+                "FromDate": days_ago(AGED_DAYS + 5),
+                "ToDate": now_epoch_seconds(),
+            }}),
             set_of([aged, fresh, other_vault]),
         ),
         (
@@ -332,7 +357,10 @@ async fn a_hold_covers_the_recovery_points_its_selection_names() {
                     fixture.fresh_resource,
                     fixture.other_resource,
                 ],
-                "DateRange": {"FromDate": days_ago(AGED_DAYS + 5), "ToDate": days_ago(0)},
+                "DateRange": {
+                    "FromDate": days_ago(AGED_DAYS + 5),
+                    "ToDate": now_epoch_seconds(),
+                },
             }),
             set_of([aged, fresh, other_vault]),
         ),
