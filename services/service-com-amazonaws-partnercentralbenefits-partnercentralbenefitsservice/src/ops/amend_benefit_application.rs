@@ -707,11 +707,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // The entitlement gate, ahead of everything else this handler does — see
-        // [`crate::state::entitlement_refusal`]. It takes the store lock itself, so it
+        // The catalog this write would land in is resolved FIRST, and the
+        // partner-entitlement gate applies to a request whose catalog resolved — see
+        // [`crate::state::write_request_refusal`]. It takes the store lock itself, so it
         // runs before this handler takes one.
-        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
-            return Err(AmendBenefitApplicationErrorModeled::AccessDeniedException(denied).into());
+        match crate::state::write_request_refusal(&*self.engine, &input.catalog) {
+            Some(crate::state::WriteRequestRefusal::MissingCatalog(missing)) => {
+                return Err(
+                    AmendBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
+                )
+            }
+            Some(crate::state::WriteRequestRefusal::NotEntitled(denied)) => {
+                return Err(
+                    AmendBenefitApplicationErrorModeled::AccessDeniedException(denied).into(),
+                )
+            }
+            None => {}
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

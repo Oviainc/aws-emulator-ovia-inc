@@ -268,7 +268,10 @@ async fn every_catalog_reading_operation_answers_the_refusal_the_resolution_buil
 
 /// Every catalog this store holds, rendered, so two instants of the store compare as a
 /// whole.
-fn store_snapshot(harness: &Harness) -> String {
+///
+/// Shared with `crate::write_gate_order`, which compares the store across a run of
+/// refused writes.
+pub(crate) fn store_snapshot(harness: &Harness) -> String {
     format!(
         "{:?}",
         service_state(&**harness.engine())

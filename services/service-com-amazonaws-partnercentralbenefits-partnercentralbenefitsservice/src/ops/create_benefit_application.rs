@@ -219,14 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The entitlement gate, ahead of everything else this handler does: a caller
-        // whose account holds no active AWS partner benefit is refused before any
-        // resource is looked up, so the denial never leaks whether a resource exists. The
-        // modelled constraints were refused earlier still, by the centralized walk.
-        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
-            return Err(
-                CreateBenefitApplicationErrorModeled::AccessDeniedException(denied).into(),
-            );
+        // The catalog this create would mint into is resolved FIRST, and the
+        // partner-entitlement gate applies to a request whose catalog resolved: a catalog
+        // this service does not hold is the missing resource and is what the answer names,
+        // whoever asked — see [`crate::state::write_request_refusal`]. The modelled
+        // constraints were refused earlier still, by the centralized walk.
+        match crate::state::write_request_refusal(&*self.engine, &input.catalog) {
+            Some(crate::state::WriteRequestRefusal::MissingCatalog(missing)) => {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
+                )
+            }
+            Some(crate::state::WriteRequestRefusal::NotEntitled(denied)) => {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::AccessDeniedException(denied).into(),
+                )
+            }
+            None => {}
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

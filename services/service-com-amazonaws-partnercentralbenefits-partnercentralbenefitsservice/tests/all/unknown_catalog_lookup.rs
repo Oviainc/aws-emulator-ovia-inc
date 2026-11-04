@@ -63,7 +63,10 @@ const APPLICATION_IDENTIFIED_OPERATIONS: &[&str] = &[
 /// `CatalogName` pattern admits: a hyphenated name, the production catalog's own name in
 /// another case (the names are matched exactly), digits only, an underscored name, a
 /// single character, and a long one — the pattern bounds the length not at all.
-fn unknown_catalogs() -> Vec<(&'static str, String)> {
+///
+/// Shared with `crate::write_gate_order`, which drives the same spellings at the other
+/// entitlement.
+pub(crate) fn unknown_catalogs() -> Vec<(&'static str, String)> {
     vec![
         (
             // The instance the issue reported.
@@ -82,7 +85,7 @@ fn unknown_catalogs() -> Vec<(&'static str, String)> {
 }
 
 /// The same request, naming `catalog` instead.
-fn with_catalog(body: &Value, catalog: &str) -> Value {
+pub(crate) fn with_catalog(body: &Value, catalog: &str) -> Value {
     let mut body = body.clone();
     body["Catalog"] = json!(catalog);
     body
@@ -90,7 +93,7 @@ fn with_catalog(body: &Value, catalog: &str) -> Value {
 
 /// The well-formed request per operation that binds a `Catalog`, which is the class the
 /// rule spans.
-fn catalog_bound_requests() -> Vec<(&'static str, Value)> {
+pub(crate) fn catalog_bound_requests() -> Vec<(&'static str, Value)> {
     let requests: Vec<(&'static str, Value)> = well_formed_requests()
         .into_iter()
         .filter(|(_, body)| body.get("Catalog").is_some())
@@ -123,7 +126,12 @@ fn application_body(operation: &str, catalog: &str, identifier: &str) -> Value {
 
 /// Call `operation` and require the catalog answer: 404 `ResourceNotFoundException`
 /// naming the catalog the request supplied.
-async fn assert_catalog_not_found(harness: &Harness, case: &str, operation: &str, body: &Value) {
+pub(crate) async fn assert_catalog_not_found(
+    harness: &Harness,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) {
     let catalog = body["Catalog"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the request body names no catalog: {body:?}"));

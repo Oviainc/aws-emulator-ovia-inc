@@ -1553,7 +1553,8 @@ pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState 
     /// Every catalog, keyed by the `Catalog` input string.
     pub catalogs: BTreeMap<String, Catalog>,
     /// The AWS accounts that hold an active AWS partner benefit — the whole input to the
-    /// entitlement gate [`entitlement_refusal`] applies ahead of every operation.
+    /// entitlement gate ([`entitlement_refusal`], and [`write_request_refusal`] on a
+    /// writing operation).
     ///
     /// EMPTY at state init, and deliberately so: being a registered AWS partner is a
     /// property of an account that this API cannot establish — it models no partner
@@ -1616,6 +1617,22 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// partner account). Nothing on the wire can grant itself the entitlement.
     pub fn grant_partner_entitlement(&mut self, account: &str) -> bool {
         self.partner_accounts.insert(account.to_string())
+    }
+
+    /// The entitlement gate, judged on a store the caller already holds the lock on:
+    /// `Some(..)` when the one account this emulator presents holds no active AWS partner
+    /// benefit, so the request is refused rather than served.
+    ///
+    /// The one construction of the denial — [`entitlement_refusal`] takes the lock itself
+    /// and then asks this, so a handler that has already locked the store (because it
+    /// resolved the catalog first) applies the very same decision without re-entering the
+    /// lock.
+    pub fn entitlement_refusal(&self) -> Option<crate::ops::types::AccessDeniedException> {
+        (!self.has_active_partner_benefit(::engine::emulator_account_id())).then(|| {
+            crate::ops::types::AccessDeniedException {
+                message: PARTNER_ENTITLEMENT_REQUIRED.to_string(),
+            }
+        })
     }
 
     /// The catalog a request names, or the refusal it is answered with.
@@ -3112,13 +3129,17 @@ pub fn revision_conflict_message(id: &str, current: &str, requested: &str) -> St
 /// benefit, and the request must be refused with the modelled `AccessDeniedException`
 /// (served with [`ACCESS_DENIED_STATUS`]) instead of being served.
 ///
-/// Every operation applies this BEFORE it looks any resource up, so an un-entitled
-/// caller is told it is not entitled rather than whether a resource exists; the
-/// modelled constraints are refused earlier still, by the centralized request walk, so
-/// a malformed request is a `ValidationException` whether the caller is entitled or not.
+/// A REPORTING operation applies this BEFORE it looks any resource up, so an un-entitled
+/// caller reading the service is told it is not entitled rather than whether a resource
+/// exists; the modelled constraints are refused earlier still, by the centralized request
+/// walk, so a malformed request is a `ValidationException` whether the caller is entitled
+/// or not.
 ///
-/// The two tag-MUTATING operations (`TagResource`, `UntagResource`) are the one recorded
-/// exception and do not apply it — see `crate::ops::tag_resource`.
+/// An operation that WRITES answers its resource lookup first and applies the gate to a
+/// request whose target resolved — see [`write_request_refusal`], which is what those
+/// handlers call. The two tag-MUTATING operations (`TagResource`, `UntagResource`) go
+/// further and do not apply the gate at all, answering only their own lookup — see
+/// `crate::ops::tag_resource`.
 ///
 /// The emulator presents exactly one account (`engine::EMULATOR_ACCOUNT_ID`), so that is
 /// the account every request is made from and the only one the gate can be asked about.
@@ -3127,13 +3148,39 @@ pub fn revision_conflict_message(id: &str, current: &str, requested: &str) -> St
 pub fn entitlement_refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<crate::ops::types::AccessDeniedException> {
+    service_state(engine)?.lock().entitlement_refusal()
+}
+
+/// What a WRITING operation is refused with before it does any work of its own, in the
+/// order the service answers those two refusals in.
+#[derive(Debug)]
+pub enum WriteRequestRefusal {
+    /// The catalog the request named is not one this service holds, so the write has no
+    /// place to land and the missing catalog is the whole answer.
+    MissingCatalog(crate::ops::types::ResourceNotFoundException),
+    /// The catalog resolved, and the calling account holds no active AWS partner benefit.
+    NotEntitled(crate::ops::types::AccessDeniedException),
+}
+
+/// The refusal an operation that WRITES answers a request with ahead of its own work: the
+/// `Catalog` the request names is resolved FIRST ([`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::catalog_refusal`]),
+/// and the partner-entitlement gate applies only to a request whose catalog resolved.
+///
+/// ONE construction of that order for every writing operation, so a catalog this service
+/// does not hold is reported as the missing resource it is whichever write named it, and
+/// an un-entitled caller naming a real catalog is still denied. A store that cannot be
+/// reached answers `None`, exactly as [`entitlement_refusal`] does, and the handler's own
+/// store check turns that into the modelled server error.
+pub fn write_request_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    catalog: &str,
+) -> Option<WriteRequestRefusal> {
     let state = service_state(engine)?;
-    let entitled = state
-        .lock()
-        .has_active_partner_benefit(::engine::emulator_account_id());
-    (!entitled).then(|| crate::ops::types::AccessDeniedException {
-        message: PARTNER_ENTITLEMENT_REQUIRED.to_string(),
-    })
+    let store = state.lock();
+    if let Some(missing) = store.catalog_refusal(catalog) {
+        return Some(WriteRequestRefusal::MissingCatalog(missing));
+    }
+    store.entitlement_refusal().map(WriteRequestRefusal::NotEntitled)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

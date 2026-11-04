@@ -115,5 +115,7 @@ mod unknown_catalog_lookup;
 mod validation_error_body;
 #[path = "all/validation_exception_message.rs"]
 mod validation_exception_message;
+#[path = "all/write_gate_order.rs"]
+mod write_gate_order;
 #[path = "all/write_that_changes_nothing.rs"]
 mod write_that_changes_nothing;

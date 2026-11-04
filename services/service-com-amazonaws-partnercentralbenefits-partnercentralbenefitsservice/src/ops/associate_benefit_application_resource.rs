@@ -207,13 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The entitlement gate, ahead of everything else this handler does — see
-        // [`crate::state::entitlement_refusal`].
-        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
-            return Err(
-                AssociateBenefitApplicationResourceErrorModeled::AccessDeniedException(denied)
+        // The catalog this write would land in is resolved FIRST, and the
+        // partner-entitlement gate applies to a request whose catalog resolved — see
+        // [`crate::state::write_request_refusal`].
+        match crate::state::write_request_refusal(&*self.engine, &input.catalog) {
+            Some(crate::state::WriteRequestRefusal::MissingCatalog(missing)) => {
+                return Err(
+                    AssociateBenefitApplicationResourceErrorModeled::ResourceNotFoundException(
+                        missing,
+                    )
                     .into(),
-            );
+                )
+            }
+            Some(crate::state::WriteRequestRefusal::NotEntitled(denied)) => {
+                return Err(
+                    AssociateBenefitApplicationResourceErrorModeled::AccessDeniedException(denied)
+                        .into(),
+                )
+            }
+            None => {}
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
