@@ -214,6 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Beside the elements the document carries, the VALUES it declares are read
+        // against the IAM policy language: the version it declares has to exist, a
+        // statement's effect has to be one the language defines (compared literally), and
+        // a managed policy's document is an identity-based policy, so every resource its
+        // statements name is named by ARN or by the wildcard. The clauses, and AWS's
+        // sentence for each, are the shared reading every service taking an IAM policy
+        // document asks (`::service_common::iam_policy::identity_policy_value_defect`), so
+        // a document AWS refuses is refused here too and no policy is created.
+        if let Some(defect) =
+            ::service_common::iam_policy::identity_policy_value_defect(&input.policy_document)
+        {
+            return Err(CreatePolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(defect.message()),
+                },
+            )
+            .into());
+        }
+
         // A managed policy's document is bounded well below `policyDocumentType`'s own
         // 131072-character ceiling, so a document past the quota is refused rather
         // than stored.

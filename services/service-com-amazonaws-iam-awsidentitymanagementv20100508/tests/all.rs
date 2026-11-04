@@ -187,6 +187,8 @@ mod policy_arn_absence_wording;
 mod policy_default_version;
 #[path = "all/policy_deletion.rs"]
 mod policy_deletion;
+#[path = "all/policy_language_values.rs"]
+mod policy_language_values;
 #[path = "all/policy_listing.rs"]
 mod policy_listing;
 #[path = "all/policy_refusal_wording.rs"]

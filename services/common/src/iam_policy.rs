@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE grammar of an IAM JSON **resource-based** policy document, for every service
-//! whose API takes one as a string and has to decide whether to accept it.
+//! The ONE reading of the IAM JSON policy language, for every service whose API takes a
+//! policy document as a string and has to decide whether to accept it: the grammar of a
+//! **resource-based** document, and the VALUES the language defines for any document's
+//! elements.
 //!
 //! A member documented as "a policy document, formatted in JSON" is not satisfied by any
 //! JSON value: it carries a document in the IAM JSON policy language, and a service that
@@ -28,6 +30,13 @@
 //! the grammar here admits the wildcard the IAM language admits, and whether a particular
 //! service accepts a non-ARN resource is that service's rule, not the language's.
 //!
+//! Which ELEMENTS a document must carry is the grammar above; which VALUES those elements
+//! may declare is the reading beside it ([`identity_policy_value_defect`]) — the policy
+//! versions that exist, the two effects a statement may state, and, for an IDENTITY-based
+//! document, whose statements name the resources their actions apply to, resources named by
+//! ARN or by the wildcard. The two are applied together by a service that STORES a policy,
+//! because IAM refuses a document breaking either.
+//!
 //! This judges only the SHAPE of a document. What a policy then SAYS — whether it allows a
 //! request — is [`super::iam_authorization`], and the two read the same elements in the
 //! same forms (a string, a list of them, or the `{"AWS": …}` object a `Principal` is
@@ -36,7 +45,9 @@
 //! Each caller words its own modelled fault: [`PolicyDefect`] says WHAT the document failed
 //! to be and nothing about any one service's error shape, so a service that reports a
 //! single opaque "invalid policy" phrase can ignore it and one that names the member can
-//! render it.
+//! render it. [`PolicyValueDefect`] is the one exception, and only because AWS words those
+//! clauses identically wherever it reads a policy document: it carries IAM's own sentence
+//! per clause ([`PolicyValueDefect::message`]).
 //!
 //! Beside the grammar, [`canonical_document`] is the one LAYOUT an attached policy document
 //! is reported in: a service that stores a policy does not echo the caller's bytes but
@@ -115,15 +126,12 @@ pub fn resource_policy_defect(text: &str) -> Option<PolicyDefect> {
 /// [`resource_policy_defect`] for a document that is already parsed — for a caller that
 /// parsed it to read something else out of it and must not parse it twice.
 pub fn resource_policy_defect_of(document: &::serde_json::Value) -> Option<PolicyDefect> {
-    let Some(elements) = document.as_object() else {
+    if !document.is_object() {
         return Some(PolicyDefect::NotAnObject);
-    };
+    }
 
-    if let Some(version) = elements.get("Version") {
-        let declared = version.as_str().unwrap_or_default();
-        if !POLICY_VERSIONS.contains(&declared) {
-            return Some(PolicyDefect::UnsupportedVersion);
-        }
+    if declares_unsupported_version(document) {
+        return Some(PolicyDefect::UnsupportedVersion);
     }
 
     let statements = statements(document);
@@ -132,6 +140,15 @@ pub fn resource_policy_defect_of(document: &::serde_json::Value) -> Option<Polic
     }
 
     statements.into_iter().find_map(statement_defect)
+}
+
+/// Whether `document` declares a `Version` that is not one of [`POLICY_VERSIONS`] — the one
+/// reading of that clause, so the two readers of a document cannot come to differ about
+/// which versions exist. A document declaring none is not it: `Version` may be omitted.
+fn declares_unsupported_version(document: &::serde_json::Value) -> bool {
+    document
+        .get("Version")
+        .is_some_and(|version| !POLICY_VERSIONS.contains(&version.as_str().unwrap_or_default()))
 }
 
 /// The prefix every Amazon Resource Name begins with, and so the one thing a value has to
@@ -225,6 +242,112 @@ fn names_values(element: &::serde_json::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// The one value an IAM resource element may name BESIDE an ARN: the wildcard that stands
+/// for every resource, which the IAM policy language admits wherever a resource is named.
+pub const ANY_RESOURCE: &str = "*";
+
+/// The sentence IAM words a document whose declared policy-language version does not exist
+/// with: the version is read before anything the document says, so a document declaring one
+/// the language does not define is reported as an error in the policy's syntax and nothing
+/// of the document is named.
+pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
+
+/// The sentence IAM words a statement whose `Effect` the policy language does not define
+/// with: the document is JSON, but reading it as a policy fails, and the refusal carries
+/// nothing of the document.
+pub const POLICY_PARSE_FAILED: &str = "The policy failed legacy parsing";
+
+/// What a document declares that the IAM policy language does not define.
+///
+/// [`PolicyDefect`] is about the ELEMENTS a document carries; this is about the VALUES those
+/// elements declare, which IAM reads against the language before it accepts the document.
+/// Each clause is worded with a sentence of its own ([`Self::message`]), so the refusal a
+/// caller answers names the clause the document broke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyValueDefect {
+    /// `Version` is declared as something other than one of [`POLICY_VERSIONS`].
+    UnsupportedVersion,
+    /// A statement declares an `Effect` that is not one of [`POLICY_EFFECTS`].
+    ///
+    /// The two values are compared LITERALLY: the language defines `Allow` and `Deny`, so a
+    /// statement whose effect is spelled in any other case declares an effect the language
+    /// does not define. A statement that declares NO effect is not this clause — what a
+    /// statement is REQUIRED to carry is [`PolicyDefect::MissingEffect`].
+    UnreadableEffect,
+    /// A statement's resource element names a value that is neither an ARN
+    /// ([`ARN_PREFIX`]) nor [`ANY_RESOURCE`], so it names no resource. The value is carried
+    /// as submitted, because IAM's sentence for this clause names it.
+    NonResourceValue(String),
+}
+
+impl PolicyValueDefect {
+    /// How IAM words this clause in the malformed-document refusal it answers a document
+    /// breaking it with — AWS's own sentence per clause, as the recorded refusals of an
+    /// inline policy write show them. Only the resource clause carries anything of the
+    /// document: the other two are fixed text.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnsupportedVersion => SYNTAX_ERRORS_IN_POLICY.to_string(),
+            Self::UnreadableEffect => POLICY_PARSE_FAILED.to_string(),
+            Self::NonResourceValue(value) => {
+                format!("Resource {value} must be in ARN format or \"{ANY_RESOURCE}\".")
+            }
+        }
+    }
+}
+
+/// The clause of the IAM policy language an IDENTITY-based policy document declares a value
+/// outside, or `None` when every value it declares is one the language defines.
+///
+/// A member documented as a policy document carries a document in the IAM JSON policy
+/// language, and the language defines which values its elements may take: the policy
+/// versions that exist ([`POLICY_VERSIONS`]), the two effects a statement may state
+/// ([`POLICY_EFFECTS`]) and — for an identity-based policy, whose statements name the
+/// resources their actions apply to — resources named by ARN or by the wildcard
+/// ([`ANY_RESOURCE`]). A document that declares a value outside one of those describes no
+/// permission IAM could enforce, so the operation taking it is refused rather than storing
+/// it.
+///
+/// This reads the values; which elements a document must CARRY is the grammar above
+/// ([`resource_policy_defect`] for a resource-based policy, and the owning service's own
+/// requirement for an identity-based one), so the two are applied beside each other. A text
+/// that is no JSON object at all declares nothing to read and is reported here as `None`:
+/// that it is not a policy at all is the grammar's answer, not this one's.
+pub fn identity_policy_value_defect(text: &str) -> Option<PolicyValueDefect> {
+    let document = ::serde_json::from_str::<::serde_json::Value>(text).ok()?;
+    if !document.is_object() {
+        return None;
+    }
+    if declares_unsupported_version(&document) {
+        return Some(PolicyValueDefect::UnsupportedVersion);
+    }
+    statements(&document)
+        .into_iter()
+        .find_map(identity_statement_value_defect)
+}
+
+/// The clause one statement of an identity-based policy declares a value outside.
+///
+/// The two clauses read here are about what the statement DECLARES, which is why neither
+/// is the grammar's reading of the same element: a statement declaring NO effect is left to
+/// the grammar ([`PolicyDefect::MissingEffect`]) rather than reported here, and a resource
+/// element is read admitting the wildcard the language admits, where
+/// [`non_arn_resource`] — the reading a service whose own API documents that element as one
+/// of its ARNs asks — admits only an ARN.
+fn identity_statement_value_defect(statement: &::serde_json::Value) -> Option<PolicyValueDefect> {
+    if let Some(effect) = statement.as_object()?.get("Effect") {
+        if !POLICY_EFFECTS.contains(&effect.as_str().unwrap_or_default()) {
+            return Some(PolicyValueDefect::UnreadableEffect);
+        }
+    }
+    // The resource elements are read through the one walk of them this module already
+    // owns, so which spellings name a resource is stated once.
+    resource_values(statement)
+        .into_iter()
+        .find(|value| !value.starts_with(ARN_PREFIX) && value != ANY_RESOURCE)
+        .map(PolicyValueDefect::NonResourceValue)
 }
 
 /// The indentation one nesting level of a canonically rendered policy document is written
@@ -907,6 +1030,132 @@ mod tests {
                 defect,
                 Some(expected),
                 "case {case:?}: expected {expected:?}, got {defect:?}"
+            );
+        }
+    }
+
+    /// An identity-based policy's declared VALUES, held to the ones the policy language
+    /// defines.
+    #[test]
+    fn a_value_the_policy_language_does_not_define_is_reported_with_its_clause() {
+        /// An identity statement naming an action and a resource, as a client sends it.
+        fn identity(statement: &str) -> String {
+            format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{statement}]}}")
+        }
+
+        // The rows differ along what the rule generalises over: which clause the document
+        // breaks, which published value it declares instead, the form the resource element
+        // takes (a string or a list), which spelling of that element names the value, and
+        // where in a two-statement document the offending value sits.
+        let rows: [(&str, String, Option<PolicyValueDefect>); 14] = [
+            (
+                "every value the language defines",
+                identity("{\"Effect\":\"Allow\",\"Action\":\"svc:DoThing\",\"Resource\":\"arn:aws:svc:::thing\"}"),
+                None,
+            ),
+            (
+                "the wildcard in place of an ARN",
+                identity("{\"Effect\":\"Deny\",\"Action\":\"svc:DoThing\",\"Resource\":\"*\"}"),
+                None,
+            ),
+            (
+                "the legacy policy version",
+                "{\"Version\":\"2008-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"}]}".to_string(),
+                None,
+            ),
+            (
+                "no version at all",
+                "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"}]}".to_string(),
+                None,
+            ),
+            (
+                "a statement that declares no effect",
+                identity("{\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                None,
+            ),
+            (
+                "a version that does not exist",
+                "{\"Version\":\"2012-10-18\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"}]}".to_string(),
+                Some(PolicyValueDefect::UnsupportedVersion),
+            ),
+            (
+                "a version that is not a string",
+                "{\"Version\":20121017,\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"}]}".to_string(),
+                Some(PolicyValueDefect::UnsupportedVersion),
+            ),
+            (
+                "an effect written in another case",
+                identity("{\"Effect\":\"allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::UnreadableEffect),
+            ),
+            (
+                "an effect the language does not define",
+                identity("{\"Effect\":\"Permit\",\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::UnreadableEffect),
+            ),
+            (
+                "a resource that is no ARN",
+                identity("{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":\"things/*\"}"),
+                Some(PolicyValueDefect::NonResourceValue("things/*".to_string())),
+            ),
+            (
+                "the second value of a resource list",
+                identity("{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":[\"arn:aws:svc:::a\",\"b\"]}"),
+                Some(PolicyValueDefect::NonResourceValue("b".to_string())),
+            ),
+            (
+                "a NotResource that is no ARN",
+                identity("{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"NotResource\":\"things\"}"),
+                Some(PolicyValueDefect::NonResourceValue("things".to_string())),
+            ),
+            (
+                "the second statement's resource",
+                "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"},\
+                 {\"Effect\":\"Allow\",\"Action\":\"svc:B\",\"Resource\":\"thing\"}]}"
+                    .to_string(),
+                Some(PolicyValueDefect::NonResourceValue("thing".to_string())),
+            ),
+            (
+                "a text that is no policy at all",
+                "not json".to_string(),
+                None,
+            ),
+        ];
+
+        for (case, document, expected) in rows {
+            let defect = identity_policy_value_defect(&document);
+            assert_eq!(
+                defect, expected,
+                "case {case:?}: expected {expected:?}, got {defect:?} for {document}"
+            );
+        }
+    }
+
+    /// Each clause's sentence: fixed text for the two that carry nothing of the document,
+    /// and the submitted value for the one that names it.
+    #[test]
+    fn each_clause_is_worded_with_its_own_sentence() {
+        for (case, defect, expected) in [
+            (
+                "an unsupported version",
+                PolicyValueDefect::UnsupportedVersion,
+                "Syntax errors in policy.".to_string(),
+            ),
+            (
+                "an effect the language does not define",
+                PolicyValueDefect::UnreadableEffect,
+                "The policy failed legacy parsing".to_string(),
+            ),
+            (
+                "a resource that is no ARN",
+                PolicyValueDefect::NonResourceValue("things/*".to_string()),
+                "Resource things/* must be in ARN format or \"*\".".to_string(),
+            ),
+        ] {
+            let message = defect.message();
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
             );
         }
     }

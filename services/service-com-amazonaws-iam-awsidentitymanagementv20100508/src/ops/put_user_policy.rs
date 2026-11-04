@@ -238,6 +238,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Beside the elements the document carries, the VALUES it declares are read
+        // against the IAM policy language: the version it declares has to exist, a
+        // statement's effect has to be one the language defines (compared literally), and
+        // an inline policy is an identity-based policy, so every resource its statements
+        // name is named by ARN or by the wildcard. The clauses, and AWS's sentence for
+        // each, are the shared reading every service taking an IAM policy document asks
+        // (`::service_common::iam_policy::identity_policy_value_defect`), so a document
+        // AWS refuses is refused here too and nothing is embedded.
+        if let Some(defect) =
+            ::service_common::iam_policy::identity_policy_value_defect(&input.policy_document)
+        {
+            return Err(PutUserPolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(defect.message()),
+                },
+            )
+            .into());
+        }
+
         // The inline policies embedded in one user have a bounded aggregate size,
         // so a caller cannot grow a user's policy set without limit. A put of an
         // existing name replaces that document, so the one being replaced does not
