@@ -685,7 +685,7 @@ async fn rotate_tunnel_access_token_replaces_only_the_selected_tokens() {
     )
     .await;
     assert!(
-        status == 400 || status == 404,
+        status == 400,
         "an unmodelled clientMode must be refused, answered {status} {body:?}"
     );
 }
@@ -756,7 +756,7 @@ async fn close_tunnel_closes_the_tunnel_and_delete_removes_it() {
             );
         } else {
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {label:?}: a deleted tunnel must be gone, answered {described:?}"
             );
             assert_eq!(
@@ -932,12 +932,12 @@ async fn an_unknown_tunnel_or_arn_answers_resource_not_found() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
 
-    // A real tunnel exists, so the 404s below are about the id or ARN named,
+    // A real tunnel exists, so the refusals below are about the id or ARN named,
     // not about an empty store.
     let (_, opened) = call(
         &router,
         "OpenTunnel",
-        &json!({"destinationConfig": {"thingName": "thing-404", "services": ["SSH"]}}),
+        &json!({"destinationConfig": {"thingName": "thing-missing", "services": ["SSH"]}}),
     )
     .await;
     assert!(
@@ -978,8 +978,8 @@ async fn an_unknown_tunnel_or_arn_answers_resource_not_found() {
     for (operation, input) in cases {
         let (status, body) = call(&router, operation, &input).await;
         assert_eq!(
-            status, 404,
-            "case {operation} {input}: expected 404, answered {status} {body:?}"
+            status, 400,
+            "case {operation} {input}: expected 400, answered {status} {body:?}"
         );
         assert_eq!(
             body["__type"].as_str(),
@@ -1117,7 +1117,7 @@ async fn open_tunnel_refuses_once_the_account_holds_its_quota_of_open_tunnels() 
         }
     }
 
-    // The limit is the modelled LimitExceededException, HTTP 403.
+    // The limit is the modelled LimitExceededException.
     let stored_before = engine.state::<TunnelState>().lock().tunnels.len();
     let (status, refused) = call(
         &router,
@@ -1126,7 +1126,7 @@ async fn open_tunnel_refuses_once_the_account_holds_its_quota_of_open_tunnels() 
     )
     .await;
     assert_eq!(
-        status, 403,
+        status, 400,
         "an account at its open-tunnel quota must refuse OpenTunnel, answered {status} {refused:?}"
     );
     assert_eq!(
@@ -1223,7 +1223,7 @@ async fn a_tunnel_carries_at_most_its_limit_of_tags() {
             );
         } else {
             assert_eq!(
-                status, 403,
+                status, 400,
                 "case {count} tags at open: expected refusal, answered {status} {body:?}"
             );
             assert_eq!(
@@ -1263,7 +1263,7 @@ async fn a_tunnel_carries_at_most_its_limit_of_tags() {
     )
     .await;
     assert_eq!(
-        status, 403,
+        status, 400,
         "a new key past the limit must be refused, answered {status} {refused:?}"
     );
     assert_eq!(

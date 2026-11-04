@@ -173,7 +173,7 @@ async fn untag(case: &str, router: &MultiServiceRouter, resource_arn: &str, key:
 }
 
 /// The tag keys `ListTagsForResource` reports for `resource_arn`, or `None` when
-/// the endpoint holds no such resource (`ResourceNotFoundException`, HTTP 404).
+/// the endpoint holds no such resource (`ResourceNotFoundException`).
 async fn listed_tag_keys(router: &MultiServiceRouter, resource_arn: &str) -> Option<Vec<String>> {
     let (status, body) = call(
         router,

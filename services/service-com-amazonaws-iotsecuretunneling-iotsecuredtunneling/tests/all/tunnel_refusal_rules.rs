@@ -383,8 +383,8 @@ async fn every_not_found_refusal_names_the_tunnel_by_its_id() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
 
-    // A real tunnel exists throughout, so each 404 below is about the id or ARN
-    // named and not about an empty store.
+    // A real tunnel exists throughout, so each refusal below is about the id or
+    // ARN named and not about an empty store.
     let (live_id, live_arn) = open_tunnel(&router, "the live tunnel", None).await;
 
     // One tunnel is opened and then deleted, so a deleted id is covered beside
@@ -449,8 +449,8 @@ async fn every_not_found_refusal_names_the_tunnel_by_its_id() {
             let case = format!("{operation} {input}");
             let (status, body) = call(&router, operation, &input).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404, answered {status} {body:?}"
+                status, 400,
+                "case {case:?}: expected 400, answered {status} {body:?}"
             );
             assert_eq!(
                 error_code(&body),
@@ -487,7 +487,7 @@ async fn every_not_found_refusal_names_the_tunnel_by_its_id() {
 
 #[tokio::test]
 async fn a_not_found_refusal_on_an_arn_that_names_no_tunnel_still_refuses() {
-    // An ARN the tag paths cannot resolve to a tunnel is still a 404 with the
+    // An ARN the tag paths cannot resolve to a tunnel is still refused with the
     // modelled code: the message names the only identifier the request offered.
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
@@ -517,8 +517,8 @@ async fn a_not_found_refusal_on_an_arn_that_names_no_tunnel_still_refuses() {
             let case = format!("{operation} {arn}");
             let (status, body) = call(&router, operation, &input).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404, answered {status} {body:?}"
+                status, 400,
+                "case {case:?}: expected 400, answered {status} {body:?}"
             );
             assert_eq!(
                 error_code(&body),

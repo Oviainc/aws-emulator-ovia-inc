@@ -8,23 +8,27 @@
 //!
 //! * a tunnel the addressed Region's endpoint does not hold — never created,
 //!   deleted, or held by another Region — is the operation's MODELLED error,
-//!   `ResourceNotFoundException` with HTTP 404 (the one error
+//!   `ResourceNotFoundException` (the one error
 //!   `smithy_query(query="operation", operation="RotateTunnelAccessToken")`
 //!   declares), carrying the service's single not-found sentence;
 //! * a refusal of a request the service accepts the SHAPE of — the resolved
 //!   tunnel is no longer `OPEN`, a `destinationConfig` the requested
 //!   `clientMode` does not cover, a `services` list longer than a tunnel is
 //!   multiplexed over — is the request-time refusal AWS answers for this
-//!   operation: HTTP 400 with the wire error code `ValidationException`, a code
-//!   this service's model declares nowhere, because AWS's refusal here is not
-//!   one of the errors the operation lists either.
+//!   operation: the wire error code `ValidationException`, a code this service's
+//!   model declares nowhere, because AWS's refusal here is not one of the errors
+//!   the operation lists either.
 //!
-//! Both halves matter to a client: an SDK resolves the first into the generated
-//! error type the operation declares, and a 400 that is not a 404 keeps a retry
-//! or error classifier from treating a live-but-closed tunnel as a missing one.
-//! So the table below pins the status, the wire code and the message of every
-//! refusal this operation can produce, and asserts that no two classes collapse
-//! onto the same answer.
+//! Both classes arrive with this service's client-error status, 400: it speaks
+//! `awsJson1_1`, where the model's `@httpError` is inert, so the class a client
+//! branches on travels in the body's `__type` (and `x-amzn-errortype`), never in
+//! the status line. What must stay distinguishable is therefore the wire code: an
+//! SDK resolves `ResourceNotFoundException` into the generated error type the
+//! operation declares, and a code that is not that one keeps a retry or error
+//! classifier from treating a live-but-closed tunnel as a missing one. So the
+//! table below pins the status, the wire code and the message of every refusal
+//! this operation can produce, and asserts that no two classes collapse onto the
+//! same answer.
 //!
 //! Driven over the wire through the `MultiServiceRouter` exactly as a client
 //! reaches the service (`awsJson1_1`, `POST /` with `X-Amz-Target`).
@@ -100,9 +104,9 @@ struct Refusal {
 }
 
 /// The tunnel is not a resource this endpoint holds: the operation's own
-/// modelled error.
+/// modelled error, at this service's client-error status.
 const MODELLED_NOT_FOUND: Refusal = Refusal {
-    status: 404,
+    status: 400,
     code: "ResourceNotFoundException",
 };
 
@@ -431,8 +435,9 @@ async fn every_rotate_refusal_answers_the_error_of_its_class() {
 
 #[tokio::test]
 async fn the_not_found_refusal_is_the_only_one_a_client_resolves_to_the_modelled_error() {
-    // The two classes must stay distinguishable: a client that branches on the
-    // operation's modelled error (or on the 404) must not see a held tunnel's
+    // The two classes must stay distinguishable by the fact a client branches
+    // on — the wire error code, since both classes share one status: a client
+    // that resolves the operation's modelled error must not see a held tunnel's
     // request-time refusal as a missing resource, and must not see a missing
     // resource as a request it can fix.
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -441,18 +446,22 @@ async fn the_not_found_refusal_is_the_only_one_a_client_resolves_to_the_modelled
     for row in refusal_rows(&router, &engine).await {
         let case = &row.case;
         let (status, body) = call(&router, "RotateTunnelAccessToken", &row.request).await;
-        let is_not_found = status == MODELLED_NOT_FOUND.status;
-        assert_eq!(
-            is_not_found,
-            row.tunnel_id.is_none(),
-            "case {case:?}: only a tunnel this endpoint does not hold answers \
-             {}, answered {status} {body:?}",
-            MODELLED_NOT_FOUND.status
+        // The two classes name two codes, so one code resolves one class.
+        assert_ne!(
+            MODELLED_NOT_FOUND.code, REQUEST_TIME_REFUSAL.code,
+            "the two refusal classes must not share one wire code"
         );
+        let expected_code = if row.tunnel_id.is_none() {
+            MODELLED_NOT_FOUND.code
+        } else {
+            REQUEST_TIME_REFUSAL.code
+        };
         assert_eq!(
-            error_code(&body) == MODELLED_NOT_FOUND.code,
-            is_not_found,
-            "case {case:?}: the wire code and the status must agree, answered {status} {body:?}"
+            error_code(&body),
+            expected_code,
+            "case {case:?}: only a tunnel this endpoint does not hold answers {}, \
+             answered {status} {body:?}",
+            MODELLED_NOT_FOUND.code
         );
         // Whatever the class, a refusal is a client error and never the
         // scaffold's 501 or a server fault.

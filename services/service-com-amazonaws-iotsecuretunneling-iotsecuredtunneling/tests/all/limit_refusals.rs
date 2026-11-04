@@ -5,8 +5,9 @@
 //! RULE: when a request would take the service past a count it caps — the tunnels
 //! this account holds OPEN in one Region (`state::MAX_CONCURRENT_TUNNELS`) or the
 //! distinct tag keys one tunnel carries (`state::MAX_TAGS_PER_TUNNEL`) — it is refused with the error
-//! this service models for an exhausted limit, `LimitExceededException` at HTTP
-//! 403, whose message names the limit and the count the request would reach; the
+//! this service models for an exhausted limit, `LimitExceededException` at this
+//! protocol's client status, whose message names the limit and the count the
+//! request would reach; the
 //! refusal stores nothing and mints nothing. The error code is the modelled
 //! shape's own name, so no refusal of a capped count carries a code the service's
 //! model does not define.
@@ -37,10 +38,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region the test signs for.
 const REGION: &str = "eu-west-1";
 
-/// The wire code and status the model gives this service's limit refusal:
-/// `com.amazonaws.iotsecuretunneling#LimitExceededException`, `httpError` 403.
+/// The wire code of this service's limit refusal — the modelled shape's own name,
+/// `com.amazonaws.iotsecuretunneling#LimitExceededException` — and the status it
+/// arrives with: the `awsJson1_1` client-error status, since the model's
+/// `@httpError` is inert on this service's protocol.
 const LIMIT_CODE: &str = "LimitExceededException";
-const LIMIT_STATUS: u16 = 403;
+const LIMIT_STATUS: u16 = 400;
 
 /// A router carrying only this service, over the engine the test also inspects.
 fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {

@@ -401,7 +401,7 @@ async fn delete_still_removes_a_tunnel_that_is_already_closed() {
         let (status, described) =
             call(&router, "DescribeTunnel", &json!({"tunnelId": tunnel_id})).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: the deleted tunnel must be gone, answered {described:?}"
         );
         assert!(

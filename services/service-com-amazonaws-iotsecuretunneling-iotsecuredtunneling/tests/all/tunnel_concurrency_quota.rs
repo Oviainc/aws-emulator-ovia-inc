@@ -2,7 +2,7 @@
 
 //! What the tunnel quota counts, end to end.
 //!
-//! RULE: the quota the modelled `LimitExceededException` (HTTP 403) reports is a
+//! RULE: the quota the modelled `LimitExceededException` reports is a
 //! quota on CONCURRENCY — a tunnel occupies one of the Region's
 //! `state::MAX_CONCURRENT_TUNNELS` slots only while its status is `OPEN`, so a
 //! tunnel that has reached `CLOSED` by any route releases its slot at once even
@@ -41,10 +41,12 @@ const REGION: &str = "eu-west-1";
 /// A second Region, so a row can show that slots are not shared between them.
 const OTHER_REGION: &str = "us-west-2";
 
-/// The wire code and status the model gives this service's limit refusal:
-/// `com.amazonaws.iotsecuretunneling#LimitExceededException`, `httpError` 403.
+/// The wire code of this service's limit refusal — the modelled shape's own name,
+/// `com.amazonaws.iotsecuretunneling#LimitExceededException` — and the status it
+/// arrives with: the `awsJson1_1` client-error status, since the model's
+/// `@httpError` is inert on this service's protocol.
 const LIMIT_CODE: &str = "LimitExceededException";
-const LIMIT_STATUS: u16 = 403;
+const LIMIT_STATUS: u16 = 400;
 
 /// A router carrying only this service, over the engine the test also inspects.
 fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {

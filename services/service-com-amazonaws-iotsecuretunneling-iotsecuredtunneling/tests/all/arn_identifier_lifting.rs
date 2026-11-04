@@ -128,7 +128,7 @@ async fn an_id_is_lifted_only_out_of_a_string_that_addresses_a_tunnel() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
 
-    // A real tunnel exists throughout, so each 404 below is about the string
+    // A real tunnel exists throughout, so each refusal below is about the string
     // supplied and not about an empty store.
     let (live_id, live_arn) = open_tunnel(&router, "the live tunnel").await;
 
@@ -275,8 +275,8 @@ async fn an_id_is_lifted_only_out_of_a_string_that_addresses_a_tunnel() {
             let case = format!("{label} ({arn:?}) through {operation}");
             let (status, body) = call(&router, operation, &input).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404, answered {status} {body:?}"
+                status, 400,
+                "case {case:?}: expected 400, answered {status} {body:?}"
             );
             assert_eq!(
                 error_code(&body),

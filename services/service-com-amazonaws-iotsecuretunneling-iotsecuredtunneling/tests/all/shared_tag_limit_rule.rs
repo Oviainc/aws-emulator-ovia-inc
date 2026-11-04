@@ -204,7 +204,7 @@ async fn both_tagging_entry_points_answer_one_merged_tag_count_identically() {
             );
         } else {
             assert_eq!(
-                open_status, 403,
+                open_status, 400,
                 "case {label:?}: {merged} distinct keys is past the limit of {limit}, answered \
                  {open_status} {open_body:?}"
             );
@@ -250,7 +250,7 @@ async fn both_tagging_entry_points_answer_one_merged_tag_count_identically() {
             );
         } else {
             assert_eq!(
-                tag_status, 403,
+                tag_status, 400,
                 "case {label:?}: {merged} distinct keys is past the limit of {limit}, answered \
                  {tag_status} {tag_body:?}"
             );

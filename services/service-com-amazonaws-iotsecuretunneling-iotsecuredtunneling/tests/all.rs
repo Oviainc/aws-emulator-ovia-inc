@@ -33,6 +33,8 @@ mod list_tunnels_page_token_scope;
 mod member_update_stamp;
 #[path = "all/minted_tunnel_id_form.rs"]
 mod minted_tunnel_id_form;
+#[path = "all/modeled_error_wire_status.rs"]
+mod modeled_error_wire_status;
 #[path = "all/owed_close_settled_by_every_entry_point.rs"]
 mod owed_close_settled_by_every_entry_point;
 #[path = "all/record_eviction_order.rs"]

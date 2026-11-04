@@ -197,7 +197,7 @@ async fn a_tunnel_is_reachable_only_through_the_region_it_was_opened_against() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {label:?}: DescribeTunnel from {other} answered {status} {refused:?}"
         );
         assert_eq!(
@@ -256,7 +256,7 @@ async fn a_tunnel_is_reachable_only_through_the_region_it_was_opened_against() {
         ] {
             let (status, refused) = call(&router, Some(other), operation, &input).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {label:?}: {operation} from {other} answered {status} {refused:?}"
             );
             assert_eq!(
@@ -287,7 +287,7 @@ async fn a_tunnel_is_reachable_only_through_the_region_it_was_opened_against() {
         ] {
             let (status, refused) = call(&router, Some(other), operation, &input).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {label:?}: {operation} from {other} answered {status} {refused:?}"
             );
             assert_eq!(
@@ -435,7 +435,7 @@ async fn two_regions_hold_their_own_record_of_one_tunnel_id() {
         &json!({"tunnelId": tunnel_id}),
     )
     .await;
-    assert_eq!(status, 404, "a deleted tunnel answered {described:?}");
+    assert_eq!(status, 400, "a deleted tunnel answered {described:?}");
     let (status, described) = call(
         &router,
         Some(AWAY),

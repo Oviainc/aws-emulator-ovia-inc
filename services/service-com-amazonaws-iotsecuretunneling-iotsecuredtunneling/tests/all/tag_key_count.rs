@@ -5,7 +5,7 @@
 //! RULE: the number of DISTINCT tag keys a tunnel would end up carrying, after
 //! merging the keys a request names into the ones already stored, may not exceed
 //! `state::MAX_TAGS_PER_TUNNEL`; a request past it is refused with the modelled
-//! `LimitExceededException` (HTTP 403) and stores nothing. Both writers of the
+//! `LimitExceededException` and stores nothing. Both writers of the
 //! tag store — `OpenTunnel`'s `tags` and `TagResource`'s `tags` — count through
 //! the same helper on the state, so one table of rows is asserted against both
 //! and the two paths cannot answer differently.
@@ -221,7 +221,7 @@ async fn both_tagging_entry_points_count_the_same_distinct_keys() {
             );
         } else {
             assert_eq!(
-                status, 403,
+                status, 400,
                 "case {case:?}: {} distinct keys is past the limit of {MAX_TAGS_PER_TUNNEL}, \
                  answered {status} {body:?}",
                 distinct.len()
@@ -263,7 +263,7 @@ async fn both_tagging_entry_points_count_the_same_distinct_keys() {
             );
         } else {
             assert_eq!(
-                status, 403,
+                status, 400,
                 "case {case:?}: {} distinct keys is past the limit of {MAX_TAGS_PER_TUNNEL}, \
                  answered {status} {body:?}",
                 distinct.len()
@@ -356,7 +356,7 @@ async fn the_count_is_of_the_keys_the_tunnel_would_end_up_with() {
             );
         } else {
             assert_eq!(
-                status, 403,
+                status, 400,
                 "case {label:?}: the key set would pass the limit of {MAX_TAGS_PER_TUNNEL}, \
                  answered {status} {body:?}"
             );
