@@ -106,7 +106,12 @@ const CALLS: &[(&str, &[(&str, &str)])] = &[
 
 /// A router serving only this service with request authentication ON, plus the access key id
 /// the emulator published for this run — the one credential a refusal has RESOLVED.
-fn authenticating_router() -> (MultiServiceRouter, String) {
+///
+/// Shared with the suite about WHICH user that published credential belongs to
+/// (`tests/all/caller_identity_resolution.rs`), which turns the authenticator back off
+/// before it drives its calls: the credential-reading block is the same either way, and
+/// `vended_credentials` is the only place that id can be read.
+pub(crate) fn authenticating_router() -> (MultiServiceRouter, String) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(true);

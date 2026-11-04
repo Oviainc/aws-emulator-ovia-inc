@@ -242,16 +242,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Whose credentials: the named user, every user when `AllUsers` is set, or —
         // with neither — "the user whose credentials are used to call the operation",
-        // resolved from the request's access key id exactly as `GetUser` resolves it.
+        // resolved from the request's access key id in the one place this service
+        // resolves an absent `UserName`
+        // (`crate::state::authorization::caller_identity`).
         let user_filter = if all_users {
             None
         } else {
             match &input.user_name {
                 Some(user_name) => Some(crate::state::name_key(user_name)),
                 None => {
-                    let akid = ::engine::extract_akid(&ctx.parts().headers);
-                    match store.access_keys.get(&akid) {
-                        Some(record) => Some(record.user_key.clone()),
+                    match crate::state::authorization::caller_identity::implicit_user_key(
+                        &store, ctx,
+                    ) {
+                        Some(user_key) => Some(user_key),
                         None => {
                             // Credentials that belong to no IAM user resolve to no
                             // user, and the call is refused rather than answered from

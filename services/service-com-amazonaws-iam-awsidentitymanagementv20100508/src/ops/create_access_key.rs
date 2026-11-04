@@ -168,9 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         // With no `UserName` the key belongs to whoever signed the request, which is
-        // resolved from that access key id — the same resolution `GetUser` performs.
-        // A caller whose credentials belong to no IAM user is refused rather than
-        // having an identity invented for it.
+        // resolved from that access key id in the one place this service resolves an
+        // absent `UserName` (`crate::state::authorization::caller_identity`). A caller
+        // whose credentials belong to no IAM user is refused rather than having an
+        // identity invented for it.
         //
         // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real
         // IAM also serves a nameless call made with ACCOUNT ROOT credentials ("this
@@ -182,8 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // served. That path is declined, not implemented.
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
-            None => match store.access_keys.get(&caller_akid) {
-                Some(record) => record.user_key.clone(),
+            None => match crate::state::authorization::caller_identity::implicit_user_key(
+                &store, ctx,
+            ) {
+                Some(user_key) => user_key,
                 None => {
                     // Neither modelled client error fits: the request named no
                     // entity to be missing and no quota was reached, so the

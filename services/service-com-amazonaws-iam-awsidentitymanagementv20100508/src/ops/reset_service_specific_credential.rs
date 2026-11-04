@@ -167,16 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         // With no `UserName`, "the operation assumes the user whose credentials are
-        // used to call the operation", resolved through the same binding `GetUser`,
-        // `ListServiceSpecificCredentials` and `UpdateServiceSpecificCredential`
-        // resolve a nameless caller through. A caller whose credentials belong to no
-        // IAM user is refused rather than having an identity invented for it, through
-        // the one refusal this service answers every unresolvable implicit `UserName`
-        // with.
+        // used to call the operation", resolved in the one place this service resolves
+        // an absent `UserName` (`crate::state::authorization::caller_identity`). A caller
+        // whose credentials belong to no IAM user is refused rather than having an
+        // identity invented for it, through the one refusal this service answers every
+        // unresolvable implicit `UserName` with.
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
-            None => match store.access_keys.get(&caller_akid) {
-                Some(record) => record.user_key.clone(),
+            None => match crate::state::authorization::caller_identity::implicit_user_key(
+                &store, ctx,
+            ) {
+                Some(user_key) => user_key,
                 None => {
                     ::tracing::info!(
                         audit = true,

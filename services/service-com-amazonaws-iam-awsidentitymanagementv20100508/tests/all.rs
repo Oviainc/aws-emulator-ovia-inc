@@ -45,6 +45,8 @@ mod aws_managed_policy_catalog;
 mod boundary_and_provider_writes;
 #[path = "all/boundary_refusal_message_wording.rs"]
 mod boundary_refusal_message_wording;
+#[path = "all/caller_identity_resolution.rs"]
+mod caller_identity_resolution;
 #[path = "all/change_password.rs"]
 mod change_password;
 #[path = "all/composed_condition_context.rs"]

@@ -159,17 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // With no `UserName` the profile reported is the one of the IAM user the
-        // request was signed by, resolved from the request's access key id exactly as
-        // `GetUser` resolves it. Credentials that belong to no IAM user resolve to no
-        // user, so such a request is refused rather than having an identity invented
-        // for it — IAM serves the nameless form from an AssumeRoot session, which
-        // this emulator has no principal for.
+        // request was signed by, resolved from the request's access key id in the one
+        // place this service resolves an absent `UserName`
+        // (`crate::state::authorization::caller_identity`). Credentials that belong to no
+        // IAM user resolve to no user, so such a request is refused rather than having an
+        // identity invented for it — IAM serves the nameless form from an AssumeRoot
+        // session, which this emulator has no principal for.
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
             None => {
-                let akid = ::engine::extract_akid(&ctx.parts().headers);
-                match store.access_keys.get(&akid) {
-                    Some(record) => record.user_key.clone(),
+                match crate::state::authorization::caller_identity::implicit_user_key(&store, ctx) {
+                    Some(user_key) => user_key,
                     None => {
                         // `GetLoginProfile` models only `NoSuchEntityException` and
                         // `ServiceFailureException`, and neither fits: the request

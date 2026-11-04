@@ -186,16 +186,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         // With no `UserName`, "IAM determines the user name implicitly based on the Amazon
-        // Web Services access key ID signing the request", resolved through the same
-        // binding `UploadSigningCertificate` and `DeleteAccessKey` resolve a nameless
-        // caller through — and, for the same reason they do, a caller whose credentials
-        // belong to no IAM user is refused rather than having an identity invented for
-        // it: this emulator holds no root user entity, so the documented root-credential
-        // path is declined, not implemented.
+        // Web Services access key ID signing the request", resolved in the one place this
+        // service resolves an absent `UserName`
+        // (`crate::state::authorization::caller_identity`) — and, for the same reason the
+        // rest of the family does, a caller whose credentials belong to no IAM user is
+        // refused rather than having an identity invented for it: this emulator holds no
+        // root user entity, so the documented root-credential path is declined, not
+        // implemented.
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
-            None => match store.access_keys.get(&caller_akid) {
-                Some(record) => record.user_key.clone(),
+            None => match crate::state::authorization::caller_identity::implicit_user_key(
+                &store, ctx,
+            ) {
+                Some(user_key) => user_key,
                 None => {
                     ::tracing::info!(
                         audit = true,

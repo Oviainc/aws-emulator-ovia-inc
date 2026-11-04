@@ -161,16 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // With no `UserName` the operation reports the IAM user the request was
-        // signed by, which is resolved from the request's access key id. An access
-        // key belongs to a user only once that user minted it, so a caller holding
-        // credentials that are not an IAM user's gets the refusal IAM answers
-        // rather than an invented identity.
+        // signed by, which is resolved from the request's access key id in the one
+        // place this service resolves an absent `UserName`
+        // ([`crate::state::authorization::caller_identity`]): the user that minted the
+        // key, or — for the long-term credential this emulator publishes — the user that
+        // credential belongs to. A caller holding credentials that are not an IAM user's
+        // gets the refusal IAM answers rather than an invented identity.
         let key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
             None => {
-                let akid = ::engine::extract_akid(&ctx.parts().headers);
-                match store.access_keys.get(&akid) {
-                    Some(record) => record.user_key.clone(),
+                match crate::state::authorization::caller_identity::implicit_user_key(&store, ctx) {
+                    Some(user_key) => user_key,
                     None => {
                         // `GetUser` models only `NoSuchEntityException` and
                         // `ServiceFailureException`
@@ -180,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // this service answers every unresolvable implicit `UserName`
                         // with, worded and coded in the one place the family holds it,
                         // so no identity is invented here.
-                        return Err(crate::state::must_specify_user_name())
+                        return Err(crate::state::must_specify_user_name());
                     }
                 }
             }

@@ -185,15 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         // With no `UserName` the password deleted is that of the IAM user the request
-        // was signed by, resolved from the signing access key id exactly as
-        // `CreateLoginProfile`, `GetLoginProfile` and `DeleteAccessKey` resolve a
-        // nameless caller. A caller whose credentials belong to no IAM user is refused
-        // rather than having an identity invented for it: IAM serves the nameless form
-        // from an AssumeRoot session, which this emulator has no principal for.
+        // was signed by, resolved from the signing access key id in the one place this
+        // service resolves an absent `UserName`
+        // (`crate::state::authorization::caller_identity`). A caller whose credentials
+        // belong to no IAM user is refused rather than having an identity invented for
+        // it: IAM serves the nameless form from an AssumeRoot session, which this
+        // emulator has no principal for.
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
-            None => match store.access_keys.get(&caller_akid) {
-                Some(record) => record.user_key.clone(),
+            None => match crate::state::authorization::caller_identity::implicit_user_key(
+                &store, ctx,
+            ) {
+                Some(user_key) => user_key,
                 None => {
                     ::tracing::info!(
                         audit = true,

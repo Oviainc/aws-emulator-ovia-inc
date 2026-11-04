@@ -24,7 +24,7 @@
 //! 1. **who** — the principal the request's SigV4 access key id speaks for: the IAM user
 //!    that holds a LONG-TERM key, read out of
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`], the same
-//!    map `GetUser` and `CreateAccessKey` resolve a nameless caller through, or — for a
+//!    map [`caller_identity`] resolves a nameless caller through, or — for a
 //!    TEMPORARY credential — the role session that key was vended for, read out of
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::role_sessions`], the
 //!    record the vending operation leaves in this store;
@@ -110,6 +110,11 @@ use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, Prin
 /// this gate decides, re-exported so a handler names one as
 /// `crate::state::authorization::<CONST>`.
 pub mod actions;
+
+/// Which IAM user a request that named none addresses — the other half of "who a signed
+/// request speaks for", resolved from the same access key id this gate judges the call on
+/// and read by every operation of this service whose `UserName` is optional.
+pub mod caller_identity;
 
 pub use actions::*;
 

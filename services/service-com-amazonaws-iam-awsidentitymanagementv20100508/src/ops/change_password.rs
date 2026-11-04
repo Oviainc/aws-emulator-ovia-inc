@@ -203,13 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The request names no user, so the one whose password changes is whoever
-        // SIGNED it: the access key id the request carries, resolved to its IAM user
-        // exactly as `GetUser` and `CreateLoginProfile` resolve a nameless caller.
+        // SIGNED it: the access key id the request carries, resolved to its IAM user in
+        // the one place this service resolves a nameless caller
+        // (`crate::state::authorization::caller_identity`).
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
-        let Some(user_key) = store
-            .access_keys
-            .get(&caller_akid)
-            .map(|record| record.user_key.clone())
+        let Some(user_key) =
+            crate::state::authorization::caller_identity::implicit_user_key(&store, ctx)
         else {
             ::tracing::info!(
                 audit = true,
@@ -218,12 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 caller_akid = %caller_akid,
                 "no password was changed"
             );
-            // A credential no IAM user owns is the account's own long-term credential
-            // or a session another service minted — the position account root
-            // credentials and an assumed role are in. "The Amazon Web Services account
-            // root user password is not affected by this operation", and a role session
-            // has no console password of its own, so such a caller is the wrong TYPE of
-            // user for this transaction rather than a user that cannot be found.
+            // A credential no IAM user owns is a session another service minted, or the
+            // account's own root credentials — the position an assumed role is in. "The
+            // Amazon Web Services account root user password is not affected by this
+            // operation", and a role session has no console password of its own, so such
+            // a caller is the wrong TYPE of user for this transaction rather than a user
+            // that cannot be found.
             return Err(ChangePasswordErrorModeled::InvalidUserTypeException(
                 InvalidUserTypeException {
                     message: Some(

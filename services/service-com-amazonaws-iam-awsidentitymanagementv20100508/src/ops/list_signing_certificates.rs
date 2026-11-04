@@ -210,8 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Whose certificates: the named user, or — with no `UserName` — "the user name is
         // determined implicitly based on the Amazon Web Services access key ID used to
-        // sign the request", resolved through the key bindings exactly as `GetUser`
-        // resolves it.
+        // sign the request", resolved in the one place this service resolves an absent
+        // `UserName` (`crate::state::authorization::caller_identity`).
         //
         // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real IAM
         // also serves a nameless call made with ACCOUNT ROOT credentials. This emulator
@@ -221,9 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
             None => {
-                let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
-                match store.access_keys.get(&caller_akid) {
-                    Some(record) => record.user_key.clone(),
+                match crate::state::authorization::caller_identity::implicit_user_key(&store, ctx) {
+                    Some(user_key) => user_key,
                     None => {
                         // No modelled error fits: the request named no entity to be
                         // missing, so the refusal is the one this service answers

@@ -211,8 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Whose keys: the named user, or — with no `UserName` — "the user name is
         // determined implicitly based on the Amazon Web Services access key ID used to
-        // sign the request", resolved through the key bindings exactly as `GetUser`
-        // resolves it.
+        // sign the request", resolved in the one place this service resolves an absent
+        // `UserName` (`crate::state::authorization::caller_identity`).
         //
         // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real
         // IAM also serves a nameless call made with ACCOUNT ROOT credentials ("the root
@@ -223,9 +223,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
             None => {
-                let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
-                match store.access_keys.get(&caller_akid) {
-                    Some(record) => record.user_key.clone(),
+                match crate::state::authorization::caller_identity::implicit_user_key(&store, ctx) {
+                    Some(user_key) => user_key,
                     None => {
                         // Neither modelled error fits: the request named no entity to
                         // be missing, so the refusal is the one this service answers
@@ -286,19 +285,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // happened to spell, since IAM names "are not distinguished by case".
         let user_name = user.user_name.clone();
 
-        let tail = store.access_keys.range::<str, _>((
-            match &resume_after {
-                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
-                None => ::std::ops::Bound::Unbounded,
-            },
-            ::std::ops::Bound::Unbounded,
-        ));
-        let selected = tail.filter(|(_, record)| record.user_key == user_key);
+        // The long-term credential the REQUEST is authenticating with, when the account
+        // holds no key record for it and it belongs to the user being listed: the pair
+        // this emulator publishes. It is a long-term key of that user all the same (the
+        // principal `sts:GetCallerIdentity` reports for it is that user), so a client
+        // enumerating its own keys to rotate them sees the one it is authenticating with
+        // rather than concluding it holds none. Only the caller that PRESENTED the id is
+        // told it: it is the id that caller already signed with, and no other caller's
+        // listing reports it.
+        //
+        // LIMITATION: the published pair is held by the authentication layer, not by this
+        // account's key registry, so `DeleteAccessKey` and `UpdateAccessKey` do not reach
+        // it — deleting the credential a caller authenticates with is not something this
+        // emulator can serve.
+        let published =
+            crate::state::authorization::caller_identity::published_credential(&store, ctx)
+                .filter(|credential| credential.user_key == user_key);
+
+        // Every long-term key of this user, in access-key-id order: the keys
+        // `iam:CreateAccessKey` minted for it, plus that published credential. The
+        // published one carries the status a credential in service has and the user's own
+        // creation instant, because the pair was published before any request was served
+        // — both read from the account contract and the store, nothing minted here.
+        let mut keys: Vec<(&str, &str, ::aws_smithy_types::DateTime)> = store
+            .access_keys
+            .iter()
+            .filter(|(_, record)| record.user_key == user_key)
+            .map(|(access_key_id, record)| {
+                (
+                    access_key_id.as_str(),
+                    record.status.as_str(),
+                    record.create_date,
+                )
+            })
+            .collect();
+        if let Some(credential) = &published {
+            keys.push((
+                credential.access_key_id.as_str(),
+                crate::state::ACCESS_KEY_ACTIVE_STATUS,
+                user.create_date,
+            ));
+        }
+        keys.sort_unstable_by_key(|(access_key_id, ..)| *access_key_id);
+
+        // The page resumes strictly after the position in that order the marker names.
+        let selected = keys.into_iter().filter(|(access_key_id, ..)| {
+            resume_after
+                .as_deref()
+                .is_none_or(|after| *access_key_id > after)
+        });
 
         let mut access_key_metadata = Vec::new();
         let mut is_truncated = false;
         let mut last_key = None;
-        for (access_key_id, record) in selected {
+        for (access_key_id, status, create_date) in selected {
             if access_key_metadata.len() == page_size {
                 // There is at least one more key of this user, so the caller needs
                 // another page to see it.
@@ -307,11 +347,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             access_key_metadata.push(AccessKeyMetadata {
                 user_name: Some(user_name.clone()),
-                access_key_id: Some(access_key_id.clone()),
-                status: Some(record.status.clone()),
-                create_date: Some(record.create_date),
+                access_key_id: Some(access_key_id.to_string()),
+                status: Some(status.to_string()),
+                create_date: Some(create_date),
             });
-            last_key = Some(access_key_id.clone());
+            last_key = Some(access_key_id.to_string());
         }
 
         Ok(ListAccessKeysOutput {
