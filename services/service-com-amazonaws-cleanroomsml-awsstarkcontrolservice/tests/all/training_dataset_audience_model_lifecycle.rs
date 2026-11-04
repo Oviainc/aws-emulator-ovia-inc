@@ -75,7 +75,7 @@ fn authorization(region: &str) -> String {
 /// Percent-encode a value for one URI path SEGMENT, the way an AWS SDK encodes a
 /// non-greedy `@httpLabel`: everything outside the unreserved set is escaped, so the `/`
 /// inside an ARN cannot be read as a segment boundary.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -255,7 +255,7 @@ fn minimal_dataset(name: &str) -> Value {
 ///
 /// Checked here rather than through the crate's own predicate, so a wrong predicate
 /// cannot make this test pass.
-fn matches_arn_pattern(value: &str, resource: &str, region: &str) -> bool {
+pub(crate) fn matches_arn_pattern(value: &str, resource: &str, region: &str) -> bool {
     let prefix = format!("arn:aws:cleanrooms-ml:{region}:{ACCOUNT}:{resource}/");
     let Some(id) = value.strip_prefix(&prefix) else {
         return false;
@@ -300,7 +300,7 @@ pub(crate) fn is_timestamp(value: &Value) -> bool {
 
 /// Now, in seconds since the Unix epoch — the window a create's `createTime` must fall
 /// in.
-fn unix_now() -> f64 {
+pub(crate) fn unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is past the Unix epoch")
@@ -311,7 +311,7 @@ fn unix_now() -> f64 {
 ///
 /// A timestamp member is compared as an instant (see [`timestamp_seconds`]); every other
 /// member must come back exactly as it was stored.
-fn assert_member_round_trips(case: &str, member: &str, expected: &Value, observed: &Value) {
+pub(crate) fn assert_member_round_trips(case: &str, member: &str, expected: &Value, observed: &Value) {
     if member.ends_with("Time") {
         let expected_seconds = timestamp_seconds(expected);
         let observed_seconds = timestamp_seconds(observed);

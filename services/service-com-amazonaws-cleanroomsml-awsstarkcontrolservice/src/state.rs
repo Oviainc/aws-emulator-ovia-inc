@@ -10,6 +10,10 @@
 //! handlers reads and writes, plus the summary projections the list operations
 //! return.
 //!
+//! The configured model algorithm is the custom-model link: `CreateConfiguredModelAlgorithm`
+//! persists the container configuration a trained model is built from, and
+//! `GetConfiguredModelAlgorithm` reports it back from that one record.
+//!
 //! The ML input channel is the collaboration-scoped link of the same chain: a
 //! channel is created under a membership, and every member of the collaboration
 //! that membership belongs to can list the channels it holds.
@@ -18,8 +22,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CollaborationMLInputChannelSummary, ConflictException, Dataset, PayerConfiguration,
-    ResourceNotFoundException, TrainingDatasetSummary,
+    CollaborationMLInputChannelSummary, ConflictException, ContainerConfig, Dataset,
+    InferenceContainerConfig, PayerConfiguration, ResourceNotFoundException, TrainingDatasetSummary,
 };
 
 /// The region a minted ARN names when the request carries no SigV4 credential
@@ -235,6 +239,34 @@ impl MlInputChannel {
     }
 }
 
+/// One Clean Rooms ML configured model algorithm, as this emulator persists it.
+///
+/// The resource is container configuration plus the role that reads the
+/// repository, and `GetConfiguredModelAlgorithmResponse` models no status member
+/// at all — so the algorithm is ready the moment the create returns and the
+/// clock owes it no transition.
+#[derive(Debug, Clone)]
+pub struct ConfiguredModelAlgorithm {
+    /// The `ConfiguredModelAlgorithmArn` this record is keyed by.
+    pub arn: String,
+    /// The region the create was signed for, which the ARN names. A regional
+    /// endpoint reports only its own region's resources, so this is the scope
+    /// every read of this record is checked against.
+    pub region: String,
+    pub name: String,
+    pub role_arn: String,
+    /// The training container the create named, held as the request carried it so
+    /// the get reports exactly what was stored.
+    pub training_container_config: Option<ContainerConfig>,
+    /// The inference container the create named, held the same way.
+    pub inference_container_config: Option<InferenceContainerConfig>,
+    pub kms_key_arn: Option<String>,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-cleanroomsml-awsstarkcontrolservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
@@ -245,6 +277,10 @@ pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
     pub training_datasets: BTreeMap<String, TrainingDataset>,
     /// Every audience model, keyed by its ARN.
     pub audience_models: BTreeMap<String, AudienceModel>,
+    /// Every configured model algorithm, keyed by its ARN, which gives the
+    /// list that pages over them the one stable total order its pagination
+    /// token indexes into.
+    pub configured_model_algorithms: BTreeMap<String, ConfiguredModelAlgorithm>,
     /// Every ML input channel, keyed by its ARN, which gives the
     /// collaboration- and membership-scoped lists the one stable total order
     /// their pagination tokens index into.
@@ -297,6 +333,18 @@ impl ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
             .filter(|dataset| dataset.region == region)
     }
 
+    /// The configured model algorithm `arn` names, if the endpoint `region`
+    /// serves it — the same regional scope as [`Self::training_dataset`].
+    pub fn configured_model_algorithm(
+        &self,
+        arn: &str,
+        region: &str,
+    ) -> Option<&ConfiguredModelAlgorithm> {
+        self.configured_model_algorithms
+            .get(arn)
+            .filter(|algorithm| algorithm.region == region)
+    }
+
     /// The audience model `arn` names, if the endpoint `region` serves it, with
     /// any status change the clock owes it already materialised.
     pub fn settled_audience_model_mut(
@@ -322,6 +370,15 @@ pub fn training_dataset_arn(id: &str, region: &str) -> String {
 /// The ARN of an audience model with resource id `id`, in `region`.
 pub fn audience_model_arn(id: &str, region: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("audience-model/{id}"))
+}
+
+/// The ARN of a configured model algorithm with resource id `id`, in `region`.
+pub fn configured_model_algorithm_arn(id: &str, region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("configured-model-algorithm/{id}"),
+    )
 }
 
 /// The ARN of the ML input channel with resource id `id`, created under the
