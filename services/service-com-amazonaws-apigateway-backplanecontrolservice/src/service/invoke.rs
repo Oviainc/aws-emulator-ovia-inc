@@ -15,8 +15,8 @@
 //!
 //! So this module is the second half of [`crate::service::EmulatedService`]: the claim
 //! ([`claims_parts`], read by `Service::can_handle`) and the serving
-//! ([`serve`], reached from the two seams the router offers before and after
-//! authentication). Every status it answers is computed from the control plane's own
+//! ([`serve`], reached from the one seam the router offers before it authenticates
+//! anything). Every status it answers is computed from the control plane's own
 //! records, and the two things it WRITES are the metering a usage plan's throttle consists
 //! of ([`metered_refusal`]) — the rate a key's requests are admitted at cannot be computed
 //! without recording the ones already admitted — and the stage's own RESPONSE CACHE
@@ -1072,13 +1072,13 @@ fn addresses_connections(path: &str) -> bool {
 /// Serve one request addressed to a deployed stage's invoke URL, from the control plane's
 /// own records.
 ///
-/// Free-standing and reached with the ONE shared engine, so the two seams that serve this
-/// data plane — `Service::override_routing_error` for a request carrying no credential and
-/// `CredentialedDataPlane` for one carrying a SigV4 credential — answer identically; they
-/// differ only in whether the emulator verified a signature on the way in.
+/// Free-standing and reached with the ONE shared engine, from the one seam that serves
+/// this data plane — `Service::override_routing_error`, which the router reaches before it
+/// authenticates anything — so every invoke of a deployed stage is answered from the same
+/// records, whatever credential it carries.
 ///
 /// Every response leaves here NAMING THE REQUEST it answered, in the header API Gateway
-/// reports a request id in: this is the one funnel both seams reach, so a served
+/// reports a request id in: this is the one funnel every outcome reaches, so a served
 /// integration, a gateway refusal and an endpoint that serves nothing all report one, and
 /// a client can correlate the response it holds with the request the API processed.
 /// `service_common` owns both the minting and the header, so this data plane reports the
@@ -3671,13 +3671,18 @@ fn call_context(
 /// signed SDK request carries, or in the `X-Amz-Credential` query parameter of a presigned
 /// URL.
 ///
-/// Only PRESENCE is read. Whether the signature over that credential is correct is the
-/// emulator's own check, never a service's — which is why this is the predicate BOTH the
-/// routing seam and this module use: `Service::override_operation` names the data plane as
-/// an operation exactly when this is true, so the router verifies the credential before
-/// anything is served, and an `AWS_IAM` method is admitted below exactly when the same
-/// predicate holds. Two different predicates would let a presigned invoke of an `AWS_IAM`
-/// method be served from the pre-authentication seam.
+/// Only PRESENCE is read, which is all a method's `authorizationType` turns on: `AWS_IAM`
+/// is "for using AWS IAM permissions" (`Method$authorizationType`), so a request carrying
+/// no credential at all is refused here, and one that carries a credential is admitted. The
+/// presigned form is read beside the header form because a presigned URL carries its
+/// credential in the query string, so reading only the header would refuse a presigned
+/// invoke of an `AWS_IAM` method that AWS admits.
+///
+/// Whether the SIGNATURE over that credential is correct is the emulator's own check, never
+/// a service's — and it is one the emulator cannot make for this plane: it verifies a
+/// request against the signing name of the service that claimed it, which for this service
+/// is its control plane's, while an invoke is signed under the data plane's own
+/// (`crate::service`'s module docs state the whole rule).
 pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
     if req
         .headers()

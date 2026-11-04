@@ -354,3 +354,7 @@ mod stage_export_version_and_containers;
 // stage's `patchOperations` are read by.
 #[path = "all/stage_canary_and_patch_grammar.rs"]
 mod stage_canary_and_patch_grammar;
+// Appended for the reason the note above gives: what a deployed stage answers a SIGNED
+// invoke with, on an emulator that verifies request signatures.
+#[path = "all/stage_invoke_signed.rs"]
+mod stage_invoke_signed;

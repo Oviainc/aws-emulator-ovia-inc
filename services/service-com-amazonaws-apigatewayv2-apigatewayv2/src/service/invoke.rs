@@ -19,7 +19,7 @@
 //! This module is therefore the second data-plane half of
 //! [`crate::service::EmulatedService`] (beside [`super::websocket`]'s): the claim
 //! ([`claims_parts`], read by `Service::can_handle`) and the serving ([`serve`], reached
-//! from the two seams the router offers before and after authentication). It is a READ of
+//! from the one seam the router offers before it authenticates anything). It is a READ of
 //! this service's own records — a request to a stage changes nothing here — and every
 //! status it answers is computed from them.
 //!
@@ -491,13 +491,18 @@ fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -
 /// signed SDK request carries, or in the `X-Amz-Credential` query parameter of a presigned
 /// URL.
 ///
-/// Only PRESENCE is read. Whether the signature over that credential is correct is the
-/// emulator's own check, never a service's — which is why this is the predicate BOTH the
-/// routing seam and this module use: `Service::override_operation` names the data plane as
-/// an operation exactly when this is true, so the router verifies the credential before
-/// anything is served, and an `AWS_IAM` route is admitted below exactly when the same
-/// predicate holds. Two different predicates would let a presigned invoke of an `AWS_IAM`
-/// route be served from the pre-authentication seam.
+/// Only PRESENCE is read, which is all a route's `AuthorizationType` turns on: `AWS_IAM`
+/// authorizes the caller by IAM permissions, so a request carrying no credential at all is
+/// refused here, and one that carries a credential is admitted. The presigned form is read
+/// beside the header form because a presigned URL carries its credential in the query
+/// string, so reading only the header would refuse a presigned invoke of an `AWS_IAM` route
+/// that AWS admits.
+///
+/// Whether the SIGNATURE over that credential is correct is the emulator's own check, never
+/// a service's — and it is one the emulator cannot make for this plane: it verifies a
+/// request against the signing name of the service that claimed it, which for this service
+/// is its control plane's, while an invoke is signed under the data plane's own
+/// (`crate::service`'s module docs state the whole rule).
 pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
     if req
         .headers()
