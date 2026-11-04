@@ -264,7 +264,7 @@ async fn a_documented_finding_field_is_accepted_wherever_a_field_name_is_taken()
         );
         assert_eq!(
             saved["findingCriteria"]["criterion"][field],
-            condition,
+            crate::filter_condition_spellings::reported_condition(&condition),
             "case {case}: expected the saved criterion to round-trip, got {saved:?}"
         );
 

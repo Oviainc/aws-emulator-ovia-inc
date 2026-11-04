@@ -65,6 +65,8 @@ mod entity_set_delete_retention;
 mod expected_bucket_owner_form;
 #[path = "all/filter_action_suppression.rs"]
 mod filter_action_suppression;
+#[path = "all/filter_condition_spellings.rs"]
+mod filter_condition_spellings;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
 #[path = "all/filter_detector_timestamp.rs"]
@@ -75,6 +77,8 @@ mod filter_lifecycle;
 mod filter_listing;
 #[path = "all/filter_only_conditions.rs"]
 mod filter_only_conditions;
+#[path = "all/filter_rank_positions.rs"]
+mod filter_rank_positions;
 #[path = "all/filter_update_isolation.rs"]
 mod filter_update_isolation;
 #[path = "all/finding_field_catalog.rs"]
@@ -125,6 +129,8 @@ mod ip_set_location_syntax;
 mod ip_set_name_alphabet;
 #[path = "all/ip_set_update_and_delete.rs"]
 mod ip_set_update_and_delete;
+#[path = "all/legacy_condition_round_trip.rs"]
+mod legacy_condition_round_trip;
 #[path = "all/malware_protection_plan.rs"]
 mod malware_protection_plan;
 #[path = "all/malware_protection_plan_delete.rs"]

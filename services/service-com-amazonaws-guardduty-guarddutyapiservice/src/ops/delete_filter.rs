@@ -2,8 +2,9 @@
 
 //! @op DeleteFilter
 //! IMPLEMENTED: drops the named filter off the detector, so a later `GetFilter` no
-//! longer reports it and a second delete of the same name is refused. This is the ONLY
-//! file to touch for this operation.
+//! longer reports it and a second delete of the same name is refused; the filters that
+//! sat behind it move up a position ([`close_rank_gap`]). This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,13 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if detector.filters.remove(&input.filter_name).is_none() {
+        let Some(removed) = detector.filters.remove(&input.filter_name) else {
             // The name resolved above under the same lock, so this cannot be reached.
             return Err(DeleteFilterErrorModeled::InternalServerErrorException(
                 crate::state::state_unavailable(),
             )
             .into());
-        }
+        };
+        // The position this filter occupied is vacated, so the filters BEHIND it
+        // move up one. A refused delete returns above and so moves nothing.
+        close_rank_gap(detector, removed.rank);
 
         // The detector holds one fewer sub-resource than before, which is the same
         // change `CreateFilter` records on it in the other direction and the same one
@@ -199,4 +203,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// member.
 fn bad_request(message: impl Into<String>) -> DeleteFilterError {
     crate::scaffolded::Scaffolded::invalid_input(message)
+}
+
+/// Move every filter that sat BEHIND the position `vacated` up one place.
+///
+/// `Rank` "specifies the position of the filter in the list of current filters"
+/// and "the order in which this filter is applied to the findings"
+/// (`smithy_query(operation="GetFilter")`), over `FilterRank`'s 1..100 range — a
+/// POSITION in the detector's filter list, not an opaque label. Dropping a filter
+/// removes a place from that list, so the filters ranked after the one that went
+/// away each stand one place earlier than before, keeping their order among
+/// themselves and leaving no gap at the position that was freed. A filter ranked
+/// ahead of it does not move, and a filter carrying no rank has no position to
+/// move — as has a delete of a filter that carried none, which frees no place.
+fn close_rank_gap(detector: &mut crate::state::Detector, vacated: Option<i32>) {
+    let Some(vacated) = vacated else {
+        return;
+    };
+    for filter in detector.filters.values_mut() {
+        let Some(rank) = filter.rank else { continue };
+        if rank > vacated {
+            // The range starts at 1 and only a rank strictly behind the vacated
+            // one moves, so the result stays within `FilterRank`.
+            filter.rank = Some(rank.saturating_sub(1).max(1));
+        }
+    }
 }

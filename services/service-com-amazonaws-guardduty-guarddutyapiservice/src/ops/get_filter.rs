@@ -2,8 +2,10 @@
 
 //! @op GetFilter
 //! IMPLEMENTED: reports the filter `CreateFilter` saved, read straight off the stored
-//! record. A name the detector does not hold is refused with `BadRequestException`,
-//! never a hollow 200. This is the ONLY file to touch for this operation.
+//! record, with each criterion condition reported under every spelling the model
+//! offers for it ([`reported_criteria`]). A name the detector does not hold is refused
+//! with `BadRequestException`, never a hollow 200. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -187,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| crate::state::FILTER_ACTION_NOOP.to_string()),
             rank: filter.rank,
-            finding_criteria: filter.finding_criteria.clone(),
+            finding_criteria: reported_criteria(&filter.finding_criteria),
             // Projected through the ONE tag-map rule every read of this service
             // shares ([`crate::state::reported_tags`]): the member is always
             // reported, empty when nothing tagged the filter.
@@ -208,4 +210,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// member.
 fn bad_request(message: impl Into<String>) -> GetFilterError {
     crate::scaffolded::Scaffolded::invalid_input(message)
+}
+
+/// Project a saved filter's criteria the way a read reports them: every condition
+/// under EVERY spelling the model offers for it.
+///
+/// `Condition` models each comparison twice — the current member and the
+/// `@deprecated` alias that preceded it (`Equals`/`Eq`, `NotEquals`/`Neq`,
+/// `GreaterThan`/`Gt`, `GreaterThanOrEqual`/`Gte`, `LessThan`/`Lt`,
+/// `LessThanOrEqual`/`Lte`, `smithy_query(shape="Condition")`) — and the two
+/// spellings of a pair are the SAME comparison, which is why
+/// [`crate::state::finding_matches`] evaluates them identically. A read therefore
+/// reports a stored comparison under both of its spellings, whichever one the
+/// create or update wrote it in: a client that reads back the filter it configured
+/// finds its own spelling there, and so does a client reading the other one.
+///
+/// `Matches`/`NotMatches` have no second spelling and are reported as stored.
+fn reported_criteria(criteria: &FindingCriteria) -> FindingCriteria {
+    let Some(criterion) = criteria.criterion.as_ref() else {
+        return criteria.clone();
+    };
+    FindingCriteria {
+        criterion: Some(
+            criterion
+                .iter()
+                .map(|(field, condition)| (field.clone(), reported_condition(condition)))
+                .collect(),
+        ),
+    }
+}
+
+/// One `Condition`, with each comparison it carries filled in under both of its
+/// spellings. See [`reported_criteria`].
+fn reported_condition(condition: &Condition) -> Condition {
+    // A pair whose two members hold the same type. A comparison written under one
+    // spelling is reported under both; a filter that carries BOTH members carries
+    // two comparisons, which stay as they were written.
+    let list = |deprecated: &Option<Vec<String>>, current: &Option<Vec<String>>| match (
+        deprecated, current,
+    ) {
+        (Some(deprecated), None) => (Some(deprecated.clone()), Some(deprecated.clone())),
+        (None, Some(current)) => (Some(current.clone()), Some(current.clone())),
+        (deprecated, current) => (deprecated.clone(), current.clone()),
+    };
+    // An ordering pair whose members DIFFER in type: the current member targets
+    // `Long` and the deprecated one `Integer`
+    // (`smithy_query(shape="Condition")`), so a threshold the deprecated member
+    // cannot hold is reported under the current spelling alone rather than
+    // wrapped into a different number.
+    let number = |deprecated: &Option<i32>, current: &Option<i64>| match (*deprecated, *current) {
+        (Some(deprecated), None) => (Some(deprecated), Some(i64::from(deprecated))),
+        (None, Some(current)) => (i32::try_from(current).ok(), Some(current)),
+        (deprecated, current) => (deprecated, current),
+    };
+    let (eq, equals) = list(&condition.eq, &condition.equals);
+    let (neq, not_equals) = list(&condition.neq, &condition.not_equals);
+    let (gt, greater_than) = number(&condition.gt, &condition.greater_than);
+    let (gte, greater_than_or_equal) = number(&condition.gte, &condition.greater_than_or_equal);
+    let (lt, less_than) = number(&condition.lt, &condition.less_than);
+    let (lte, less_than_or_equal) = number(&condition.lte, &condition.less_than_or_equal);
+    Condition {
+        eq,
+        neq,
+        gt,
+        gte,
+        lt,
+        lte,
+        equals,
+        not_equals,
+        greater_than,
+        greater_than_or_equal,
+        less_than,
+        less_than_or_equal,
+        matches: condition.matches.clone(),
+        not_matches: condition.not_matches.clone(),
+    }
 }

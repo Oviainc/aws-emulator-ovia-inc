@@ -429,7 +429,8 @@ async fn the_filter_apis_accept_the_conditions_a_findings_read_refuses() {
             "case {label:?}: get-filter expected 200, got {status} {saved:?}"
         );
         assert_eq!(
-            saved["findingCriteria"], narrowed,
+            saved["findingCriteria"],
+            crate::filter_condition_spellings::reported_criteria(&narrowed),
             "case {label:?}: expected the saved filter to report the criteria the create stored, got {saved:?}"
         );
 
@@ -466,7 +467,8 @@ async fn the_filter_apis_accept_the_conditions_a_findings_read_refuses() {
             "case {label:?}: get-filter after the update expected 200, got {status} {saved:?}"
         );
         assert_eq!(
-            saved["findingCriteria"], narrowed,
+            saved["findingCriteria"],
+            crate::filter_condition_spellings::reported_criteria(&narrowed),
             "case {label:?}: expected the updated filter to report the criteria the update stored, got {saved:?}"
         );
     }

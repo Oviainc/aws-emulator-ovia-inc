@@ -677,7 +677,12 @@ async fn a_saved_filter_is_reported_as_it_was_stored() {
         ("description", json!("severity at least one")),
         ("action", json!("ARCHIVE")),
         ("rank", json!(42)),
-        ("findingCriteria", criteria.clone()),
+        (
+            "findingCriteria",
+            // A read reports every condition under both spellings of its pair
+            // (`filter_condition_spellings`).
+            crate::filter_condition_spellings::reported_criteria(&criteria),
+        ),
         ("tags", json!({"team": "security"})),
         ("version", json!(1)),
     ] {

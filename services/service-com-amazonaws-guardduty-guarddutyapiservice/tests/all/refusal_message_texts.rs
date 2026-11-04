@@ -470,7 +470,8 @@ async fn a_criteria_member_the_service_will_not_accept_names_that_member() {
     .await;
     assert_eq!(status, 200, "get-filter: got {status} {read:?}");
     assert_eq!(
-        read["findingCriteria"], accepted,
+        read["findingCriteria"],
+        crate::filter_condition_spellings::reported_criteria(&accepted),
         "the saved filter must report the criteria the create stored, got {read:?}"
     );
 }

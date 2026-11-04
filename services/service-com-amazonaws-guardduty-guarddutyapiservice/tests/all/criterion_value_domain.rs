@@ -384,7 +384,8 @@ async fn a_condition_the_field_admits_is_served_by_every_operation() {
             "case {why:?}: the saved filter must read back, got {status} {body:?}"
         );
         assert_eq!(
-            body["findingCriteria"], criteria,
+            body["findingCriteria"],
+            crate::filter_condition_spellings::reported_criteria(&criteria),
             "case {why:?}: expected the criteria the create accepted, got {:?}",
             body["findingCriteria"]
         );

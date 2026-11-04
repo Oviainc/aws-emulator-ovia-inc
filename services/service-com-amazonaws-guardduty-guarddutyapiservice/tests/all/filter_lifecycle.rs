@@ -314,10 +314,20 @@ fn assert_create_round_trip(case: &str, sent: &Value, read: &Value) {
     );
     for member in ["description", "rank", "findingCriteria"] {
         match sent.get(member) {
-            Some(expected) => assert_eq!(
-                &read[member], expected,
-                "case {case}: expected {member} {expected} as stored, got {read:?}"
-            ),
+            Some(expected) => {
+                // A read reports every condition under both spellings of its pair
+                // (`filter_condition_spellings`), so the criteria the create stored
+                // are compared in that reported form.
+                let expected = if member == "findingCriteria" {
+                    crate::filter_condition_spellings::reported_criteria(expected)
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(
+                    read[member], expected,
+                    "case {case}: expected {member} {expected} as stored, got {read:?}"
+                )
+            }
             None => assert!(
                 read[member].is_null(),
                 "case {case}: the create named no {member}, so the read must invent none, got {read:?}"
@@ -472,11 +482,17 @@ async fn an_update_writes_the_members_it_names_and_leaves_the_rest() {
         // A member the update named carries its new value; one it did not name carries
         // the value the create stored.
         for member in ["description", "action", "rank", "findingCriteria"] {
-            let expected = update
+            let mut expected = update
                 .get(member)
                 .or_else(|| created_body.get(member))
                 .cloned()
                 .unwrap_or(Value::Null);
+            if member == "findingCriteria" {
+                // A read reports every condition under both spellings of its pair
+                // (`filter_condition_spellings`), so the criteria the write stored
+                // are compared in that reported form.
+                expected = crate::filter_condition_spellings::reported_criteria(&expected);
+            }
             assert_eq!(
                 read[member], expected,
                 "case {case}: expected {member} {expected}, got {read:?}"

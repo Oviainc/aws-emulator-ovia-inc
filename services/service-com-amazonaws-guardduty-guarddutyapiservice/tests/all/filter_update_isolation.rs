@@ -320,11 +320,16 @@ async fn an_update_changes_only_the_filter_it_names() {
         )
         .await;
         for member in ["description", "action", "rank", "findingCriteria"] {
-            let expected = update
+            let mut expected = update
                 .get(member)
                 .or_else(|| created.get(member))
                 .cloned()
                 .unwrap_or(Value::Null);
+            if member == "findingCriteria" {
+                // A read reports every condition under both spellings of its pair
+                // (`filter_condition_spellings`).
+                expected = crate::filter_condition_spellings::reported_criteria(&expected);
+            }
             assert_eq!(
                 after[member], expected,
                 "case {case}: expected {member} {expected}, got {after:?}"
