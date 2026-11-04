@@ -51,19 +51,33 @@ impl Harness {
         Self { router, engine }
     }
 
-    /// Dispatch one request and return its status and parsed JSON body.
+    /// Dispatch one request, signed for [`REGION`], and return its status and parsed
+    /// JSON body.
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        self.call_in_region(REGION, method, path, body).await
+    }
+
+    /// [`Self::call`], signed for `region`: the handlers take the request's region from
+    /// its SigV4 credential scope, so this is how a case drives one emulator from two
+    /// regions.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let payload = match &body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("a JSON request body")),
             None => Bytes::new(),
         };
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://quicksight.{REGION}.amazonaws.com{path}"))
+            .uri(format!("https://quicksight.{region}.amazonaws.com{path}"))
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/quicksight/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/quicksight/aws4_request, \
                      SignedHeaders=host, Signature=abc"
                 ),
             )

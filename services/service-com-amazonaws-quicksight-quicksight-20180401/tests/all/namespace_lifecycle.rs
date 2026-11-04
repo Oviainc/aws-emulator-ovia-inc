@@ -33,18 +33,51 @@ const EMPTY_ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-west-2";
 
 fn namespace_arn(account: &str, namespace: &str) -> String {
-    format!("arn:aws:quicksight:{REGION}:{account}:namespace/{namespace}")
+    namespace_arn_in(REGION, account, namespace)
+}
+
+/// The ARN a namespace created in `region` under `(account, namespace)` carries.
+///
+/// `pub(crate)` with the region as a parameter so the sibling suites shape one
+/// namespace request the same way: a URI or an ARN that drifted between two copies
+/// would hide a defect rather than show it.
+pub(crate) fn namespace_arn_in(region: &str, account: &str, namespace: &str) -> String {
+    format!("arn:aws:quicksight:{region}:{account}:namespace/{namespace}")
 }
 
 async fn create_namespace(harness: &Harness, account: &str, body: Value) -> (u16, Value) {
+    create_namespace_in(harness, REGION, account, body).await
+}
+
+/// `CreateNamespace`: `POST /accounts/{AwsAccountId}`, signed for `region`.
+/// Source: smithy_query(query="operation", operation="CreateNamespace").
+pub(crate) async fn create_namespace_in(
+    harness: &Harness,
+    region: &str,
+    account: &str,
+    body: Value,
+) -> (u16, Value) {
     harness
-        .call("POST", &format!("/accounts/{account}"), Some(body))
+        .call_in_region(region, "POST", &format!("/accounts/{account}"), Some(body))
         .await
 }
 
 async fn describe_namespace(harness: &Harness, account: &str, namespace: &str) -> (u16, Value) {
+    describe_namespace_in(harness, REGION, account, namespace).await
+}
+
+/// `DescribeNamespace`: `GET /accounts/{AwsAccountId}/namespaces/{Namespace}`, signed
+/// for `region`.
+/// Source: smithy_query(query="operation", operation="DescribeNamespace").
+pub(crate) async fn describe_namespace_in(
+    harness: &Harness,
+    region: &str,
+    account: &str,
+    namespace: &str,
+) -> (u16, Value) {
     harness
-        .call(
+        .call_in_region(
+            region,
             "GET",
             &format!("/accounts/{account}/namespaces/{namespace}"),
             None,
@@ -54,7 +87,7 @@ async fn describe_namespace(harness: &Harness, account: &str, namespace: &str) -
 
 /// Bring the creation transition the clock owes this namespace forward, so a case can
 /// observe the terminal status without sleeping for the span.
-fn settle_creation(harness: &Harness, account: &str, namespace: &str) {
+pub(crate) fn settle_creation(harness: &Harness, account: &str, namespace: &str) {
     let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
     let mut store = state.lock();
     let record = store

@@ -17,6 +17,8 @@ mod account_subscription;
 mod data_source_data_set_lifecycle;
 #[path = "all/data_source_update.rs"]
 mod data_source_update;
+#[path = "all/describe_namespace.rs"]
+mod describe_namespace;
 #[path = "all/iam_policy_assignment_lifecycle.rs"]
 mod iam_policy_assignment_lifecycle;
 #[path = "all/namespace_lifecycle.rs"]
