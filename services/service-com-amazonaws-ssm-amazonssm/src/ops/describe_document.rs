@@ -10,6 +10,11 @@
 //! already owes ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), which was due at the same
 //! instant even if nobody had called.
 //!
+//! "The document version for which you want information. Can be a specific version or the
+//! default version", so the version a request names — by selector or by version name — is
+//! the one reported, and a request that names neither is served the document's DEFAULT
+//! version ([`crate::state::DocumentRecord::select_requested`]).
+//!
 //! Implementing this operation also closes
 //! `issues/.../ssm-describedocument-stub.md`, which asks for exactly this handler;
 //! `CreateDocument` needs it for anything to read its write back.
@@ -179,15 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The document version for which you want information. Can be a specific
-        // version or the default version": `$LATEST` and `$DEFAULT` both name the one
-        // version this document holds, and any other number names a version it does
-        // not carry.
-        if let Some(requested) = input
-            .document_version
-            .as_deref()
-            .filter(|version| !version.is_empty())
-        {
-            if !record.holds_version(requested) {
+        // version or the default version", and a `VersionName` is "unique across all
+        // versions of a document": a read that names neither resolves to the default
+        // version, and a selector or a version name no version of the document answers
+        // to names nothing to report.
+        let version = match record.select_requested(
+            input.document_version.as_deref(),
+            input.version_name.as_deref(),
+        ) {
+            Ok(version) => version,
+            Err(crate::state::DocumentVersionRejection::Version(requested)) => {
                 return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
                     InvalidDocumentVersion {
                         message: Some(format!(
@@ -198,15 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-        }
-        // "This value is unique across all versions of a document", so a version name
-        // the document does not carry names no version of it.
-        if let Some(requested) = input
-            .version_name
-            .as_deref()
-            .filter(|version_name| !version_name.is_empty())
-        {
-            if !record.holds_version_name(requested) {
+            Err(crate::state::DocumentVersionRejection::VersionName(requested)) => {
                 return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
                     InvalidDocumentVersion {
                         message: Some(format!(
@@ -217,10 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-        }
+        };
 
         Ok(DescribeDocumentOutput {
-            document: Some(record.to_description()),
+            document: Some(record.description_of(version)),
         })
     }
 }

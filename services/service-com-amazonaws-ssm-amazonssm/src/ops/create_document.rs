@@ -6,7 +6,9 @@
 //!
 //! What it persists is read back by `DescribeDocument`; both reach the one store in
 //! [`crate::state`]. A document name is unique within a Region, so a create against a
-//! name the Region already holds is refused with `DocumentAlreadyExists`.
+//! name the Region already holds is refused with `DocumentAlreadyExists`. The create
+//! mints the document's FIRST version ([`crate::state::FIRST_DOCUMENT_VERSION`]), which
+//! is both its latest and its default one until `UpdateDocument` appends another.
 //!
 //! Everything the response reports beyond the request's own members is derived from the
 //! content that was persisted (`crate::state::parse_document_content`): the schema
@@ -335,57 +337,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::DocumentRecord {
             name: input.name.clone(),
             region,
-            display_name: input.display_name.clone(),
-            version_name: input.version_name.clone(),
             document_type,
-            document_format,
-            target_type: input.target_type.clone(),
-            hash: crate::state::document_content_hash(&input.content),
-            content: input.content.clone(),
-            parsed,
-            requires: input.requires.clone(),
-            attachment_names: attachment_names(input.attachments.as_deref()),
             tags: crate::state::to_btree_map(input.tags.clone()),
             // "The Amazon Web Services user that created the document": this create ran
             // for the emulator's one account.
             owner: ::engine::emulator_account_id().to_string(),
-            created_date: now,
-            // "The status of the SSM document": a document Systems Manager is still
-            // registering is `Creating`, and the clock owes its move to `Active` at
-            // `active_due`, so a caller acting straight after this call still sees the
-            // transient status.
-            status: crate::state::DOCUMENT_STATUS_CREATING.to_string(),
-            active_due: Some(now + crate::state::DOCUMENT_TRANSITION_DELAY),
+            versions: vec![crate::state::DocumentVersionRecord {
+                version: crate::state::FIRST_DOCUMENT_VERSION,
+                display_name: input.display_name.clone(),
+                version_name: input.version_name.clone(),
+                document_format,
+                target_type: input.target_type.clone(),
+                hash: crate::state::document_content_hash(&input.content),
+                content: input.content.clone(),
+                parsed,
+                requires: input.requires.clone(),
+                attachment_names: crate::state::attachment_names(input.attachments.as_deref()),
+                created_date: now,
+                // "The status of the SSM document": a document Systems Manager is still
+                // registering is `Creating`, and the clock owes its move to `Active` at
+                // `active_due`, so a caller acting straight after this call still sees
+                // the transient status.
+                status: crate::state::DOCUMENT_STATUS_CREATING.to_string(),
+                active_due: Some(now + crate::state::DOCUMENT_TRANSITION_DELAY),
+            }],
+            // "The default version" of a document that holds one version is that
+            // version; `UpdateDocumentDefaultVersion` is what moves it afterwards.
+            default_version: crate::state::FIRST_DOCUMENT_VERSION,
         };
-        let description = record.to_description();
+        let description = record
+            .description_of_version(crate::state::DOCUMENT_VERSION_DEFAULT)
+            .ok_or_else(|| {
+                CreateDocumentErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the created document holds no version".to_string()),
+                })
+            })?;
         store.insert_document(record);
 
         Ok(CreateDocumentOutput {
             document_description: Some(description),
         })
     }
-}
-
-/// The attachment names `AttachmentsInformation` reports — "details about the document
-/// attachments, including names" — for the attachment sources a create named.
-///
-/// An `AttachmentsSource` carries "the name of the document attachment file" in `Name`;
-/// a source that names none is identified by the file its `Values` URL points at, which
-/// is the last segment of that URL.
-fn attachment_names(attachments: Option<&[AttachmentsSource]>) -> Vec<String> {
-    attachments
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|source| {
-            source
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .or_else(|| {
-                    let value = source.values.as_ref()?.first()?;
-                    let file = value.rsplit('/').next().unwrap_or(value);
-                    (!file.is_empty()).then(|| file.to_string())
-                })
-        })
-        .collect()
 }

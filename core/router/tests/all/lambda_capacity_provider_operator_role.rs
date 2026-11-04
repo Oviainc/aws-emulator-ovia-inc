@@ -4,20 +4,19 @@
 //!
 //! RULE: `CreateCapacityProvider` resolves the IAM role its `PermissionsConfig` names
 //! against this account's IAM records before it writes, and refuses the create with
-//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — when IAM ANSWERS that
-//! the role is one this service cannot manage compute as: this account's IAM holds no role
-//! under the name the ARN carries, or the role it does hold carries a trust policy that does
-//! NOT let `lambda.amazonaws.com` perform `sts:AssumeRole` on it. The provider manages
-//! compute instances AS that role, and the role is part of what the client provisions here,
-//! so neither an absent record nor a trust policy that withholds the assume can be the role
-//! a stored provider names.
+//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — when IAM ANSWERS with a
+//! role whose trust policy does NOT let `lambda.amazonaws.com` perform `sts:AssumeRole` on
+//! it. The provider manages compute instances AS that role, so a role this service cannot
+//! assume cannot be the role a stored provider names.
 //!
-//! That ABSENT-record half is what separates this surface from a function's EXECUTION role,
-//! which `all/lambda_execution_role_trust.rs` pins to the weaker reading: an execution role
-//! is routinely provisioned out of band, so a name IAM holds nothing under says nothing about
-//! it, while this operation is recorded refusing an operator role that does not exist. A role
-//! of ANOTHER account is served by both: that account's IAM is not this emulator's to ask, so
-//! there is no answer to ground a refusal in.
+//! A refusal has to be GROUNDED in a trust document IAM answered with, so what IAM cannot
+//! answer about is served and stored as supplied: a name this account's IAM holds no role
+//! under (an operator role is normally provisioned outside the client that creates the
+//! provider) and a role of ANOTHER account (that account's IAM is not this emulator's to
+//! ask). That is the reading
+//! `service_com_amazonaws_lambda_awsgirapiservice::state::capacity_provider::operator_role_is_unassumable`
+//! implements through the shared `service_common::iam_role::held_role_is_unassumable`, and
+//! the one `all/lambda_execution_role_trust.rs` pins for a function's EXECUTION role.
 //!
 //! The refusal's message is wholly fixed text: it names neither the role nor which half of
 //! the question failed.
@@ -242,17 +241,18 @@ fn rows() -> Vec<Row> {
             accepted: false,
         },
         Row {
-            // "This account's IAM holds no role under that name" IS an answer about the
-            // role the caller named, because the role a provider manages compute as is
-            // part of what the client provisions here — and this operation is recorded
-            // refusing an operator role that does not exist. So it is refused, with the
-            // same fixed sentence as a role whose trust policy withholds the assume,
-            // which is the reading
+            // A name this account's IAM holds no role under is evidence about this
+            // emulator's store, not about the role the caller named — an operator role is
+            // normally provisioned outside the client that creates the provider — and a
+            // refusal has to be grounded in a trust document IAM answered with. That is
+            // the reading
             // `crate::state::capacity_provider::operator_role_is_unassumable` implements
-            // and what separates it from this service's execution role.
+            // (the shared `service_common::iam_role::held_role_is_unassumable`), the same
+            // one a function's EXECUTION role takes, so this one is served exactly as
+            // another account's role below is.
             case: "a role this account's IAM holds none of",
             role: Role::AbsentFromIam,
-            accepted: false,
+            accepted: true,
         },
         Row {
             // Nothing is KNOWN about another account's role — its IAM is not this

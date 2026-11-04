@@ -330,26 +330,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_document().into());
         };
         // "You can specify $DEFAULT, $LATEST, or a specific version number"
-        // (`DocumentVersion`): both aliases name the one version a document holds here,
-        // and any other number names a version it does not carry. A request that names
-        // none runs the document's default version.
-        let document_version = match non_empty(input.document_version.as_deref()) {
-            None => crate::state::DOCUMENT_VERSION_DEFAULT.to_string(),
-            Some(requested) => {
-                if !document.holds_version(requested) {
-                    return Err(SendCommandErrorModeled::InvalidDocumentVersion(
-                        InvalidDocumentVersion {
-                            message: Some(format!(
-                                "Document {} has no version '{requested}'",
-                                document.name
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                requested.to_string()
-            }
+        // (`DocumentVersion`): each names one of the versions the document holds, and a
+        // number it does not hold names none. A request that names no version runs the
+        // document's default version, and the version resolved here is the one whose
+        // content the command runs.
+        let requested_version = non_empty(input.document_version.as_deref())
+            .unwrap_or(crate::state::DOCUMENT_VERSION_DEFAULT);
+        let Some(version) = document.select(requested_version) else {
+            return Err(SendCommandErrorModeled::InvalidDocumentVersion(
+                InvalidDocumentVersion {
+                    message: Some(format!(
+                        "Document {} has no version '{requested_version}'",
+                        document.name
+                    )),
+                },
+            )
+            .into());
         };
+        let document_version = requested_version.to_string();
 
         // "The Sha256 or Sha1 hash created by the system when the document was created"
         // (`DocumentHash`): a send that carries one is asking to run the document whose
@@ -364,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .filter(|named| !named.is_empty())
                 .unwrap_or(crate::state::DOCUMENT_HASH_TYPE);
-            if hash_type == crate::state::DOCUMENT_HASH_TYPE && hash != document.hash {
+            if hash_type == crate::state::DOCUMENT_HASH_TYPE && hash != version.hash {
                 return Err(SendCommandErrorModeled::InvalidDocument(InvalidDocument {
                     message: Some(format!(
                         "Document {} doesn't have {hash_type} hash '{hash}'",
@@ -415,7 +413,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             if let Some(why) = crate::state::commands::unsupported_platform(
                 &document.name,
-                &document.parsed.platform_types,
+                &version.parsed.platform_types,
                 node,
             ) {
                 return Err(SendCommandErrorModeled::UnsupportedPlatformType(
@@ -465,7 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         if let Some(why) = crate::state::commands::parameter_rejection(
             &document.name,
-            &document.parsed.parameters,
+            &version.parsed.parameters,
             &supplied,
         ) {
             return Err(
@@ -512,7 +510,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // under is reported whichever spelling the request named it by.
             document_name: document.name.clone(),
             document_version,
-            step_names: document.parsed.step_names.clone(),
+            step_names: version.parsed.step_names.clone(),
             comment: input.comment.clone(),
             parameters: supplied,
             instance_ids: named,

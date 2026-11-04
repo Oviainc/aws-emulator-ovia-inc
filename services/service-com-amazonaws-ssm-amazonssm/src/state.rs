@@ -28,11 +28,13 @@
 //! whole, labels and every retained version with it.
 //!
 //! The second is **SSM documents**: `CreateDocument` registers a document,
-//! `DescribeDocument` reports it and `GetDocument` reports its content. A document is
-//! keyed by `(region, name)` the same way, and everything a read reports beyond the
-//! request's own members — the schema version, the description, the parameters, the
-//! platform types, the hash — is derived from the content that was persisted (see
-//! [`parse_document_content`]). The content itself is held exactly as the create supplied
+//! `UpdateDocument` appends a version to it, `DescribeDocument` reports one of those
+//! versions and `GetDocument` reports its content. A document is keyed by
+//! `(region, name)` the same way and holds its versions oldest-first
+//! ([`DocumentVersionRecord`]), and everything a read reports beyond the request's own
+//! members — the schema version, the description, the parameters, the platform types, the
+//! hash — is derived from the content that version persisted (see
+//! [`parse_document_content`]). The content itself is held exactly as the call supplied
 //! it, and a read that asks for another `DocumentFormat` is served the same content
 //! re-rendered in it ([`document_format::rendered_content`]).
 //!
@@ -129,12 +131,12 @@ pub mod tagging;
 use service_settings::ServiceSettingRecord;
 
 use crate::ops::types::{
-    Activation, AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
-    InstanceInformation, InstanceProperty, Parameter, ParameterHistory, ParameterInlinePolicy,
-    ParameterMetadata, Tag, ASSOCIATION_STATUS_NAME_VALUES, DESCRIBE_ACTIVATIONS_FILTER_KEYS_VALUES,
-    INSTANCE_INFORMATION_FILTER_KEY_VALUES, INSTANCE_PROPERTY_FILTER_KEY_VALUES,
-    PARAMETER_TIER_VALUES, PARAMETER_TYPE_VALUES, PING_STATUS_VALUES, PLATFORM_TYPE_VALUES,
-    RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
+    Activation, AttachmentInformation, AttachmentsSource, DocumentDescription, DocumentParameter,
+    DocumentRequires, InstanceInformation, InstanceProperty, Parameter, ParameterHistory,
+    ParameterInlinePolicy, ParameterMetadata, Tag, ASSOCIATION_STATUS_NAME_VALUES,
+    DESCRIBE_ACTIVATIONS_FILTER_KEYS_VALUES, INSTANCE_INFORMATION_FILTER_KEY_VALUES,
+    INSTANCE_PROPERTY_FILTER_KEY_VALUES, PARAMETER_TIER_VALUES, PARAMETER_TYPE_VALUES,
+    PING_STATUS_VALUES, PLATFORM_TYPE_VALUES, RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
@@ -792,18 +794,37 @@ pub const DOCUMENT_STATUS_CREATING: &str = "Creating";
 /// See [`DOCUMENT_STATUS_CREATING`].
 pub const DOCUMENT_STATUS_ACTIVE: &str = "Active";
 
-/// How long a document stays `Creating` before the clock owes its move to `Active`.
+/// The `DocumentStatus` a version Systems Manager is still registering FOR AN EXISTING
+/// document carries, from the same modelled enum: "the document is being updated" is
+/// what `Updating` says, so a version `UpdateDocument` has just minted is `Updating`
+/// where a version `CreateDocument` minted is [`DOCUMENT_STATUS_CREATING`].
+pub const DOCUMENT_STATUS_UPDATING: &str = "Updating";
+
+/// How long a document version stays `Creating` or `Updating` before the clock owes its
+/// move to `Active`.
 ///
-/// AWS publishes no span for it, so this is the emulator's CHOSEN transient window.
+/// AWS publishes no span for it, so this is the emulator's CHOSEN transient window: three
+/// seconds, the span this emulator gives a transition nobody documents.
 /// It is deliberately never zero: a caller that reads a document straight after
 /// creating it observes `Creating`, the way it would against the real service, and the
 /// move is materialised by [`ComAmazonawsSsmAmazonssmState::materialize_due`] when the
 /// clock makes it due rather than by any call.
-pub const DOCUMENT_TRANSITION_DELAY: Duration = Duration::from_millis(500);
+pub const DOCUMENT_TRANSITION_DELAY: Duration = Duration::from_secs(3);
 
 /// The version a newly created document carries: "The document version" counts from 1,
-/// and `UpdateDocument` — still a scaffold — is what mints a second one.
-pub const FIRST_DOCUMENT_VERSION: &str = "1";
+/// and each `UpdateDocument` mints the next number after the latest one
+/// ([`DocumentRecord::next_version`]).
+pub const FIRST_DOCUMENT_VERSION: u64 = 1;
+
+/// How many versions of ONE document this store keeps.
+///
+/// The model states no number for it — the modelled `DocumentVersionLimitExceeded`
+/// ("The document has too many versions. Delete one or more document versions and try
+/// again.") is the error an update past the limit reports — so this is the emulator's
+/// own guard, the way [`MAX_DOCUMENTS_TOTAL`] is: a document's version history grows by
+/// one on every update and each version holds up to [`MAX_DOCUMENT_CONTENT`] of its own
+/// content, so without a bound one document could grow this process without end.
+pub const MAX_DOCUMENT_VERSIONS: usize = 100;
 
 /// The `DocumentVersion` selectors that name a version by role rather than by number
 /// (the modelled `DocumentVersion` pattern `^([$]LATEST|[$]DEFAULT|^[1-9][0-9]*$)$`).
@@ -2362,12 +2383,86 @@ pub fn document_content_hash(content: &str) -> String {
     ::hex::encode(::sha2::Sha256::digest(content.as_bytes()))
 }
 
-/// One stored SSM document: what the create supplied, what the service derived from its
-/// content, and the status move the clock still owes.
+/// The attachment names `AttachmentsInformation` reports — "details about the document
+/// attachments, including names" — for the attachment sources one call named.
 ///
-/// A document holds exactly one version here ([`FIRST_DOCUMENT_VERSION`]):
-/// `UpdateDocument`, the operation that mints a second one, is still a scaffold, so
-/// `LatestVersion` and `DefaultVersion` are that one version.
+/// An `AttachmentsSource` carries "the name of the document attachment file" in `Name`;
+/// a source that names none is identified by the file its `Values` URL points at, which
+/// is the last segment of that URL. Read by every call that supplies attachments for a
+/// version of a document, so a create and an update identify them the same way.
+pub fn attachment_names(attachments: Option<&[AttachmentsSource]>) -> Vec<String> {
+    attachments
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|source| {
+            source
+                .name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    let value = source.values.as_ref()?.first()?;
+                    let file = value.rsplit('/').next().unwrap_or(value);
+                    (!file.is_empty()).then(|| file.to_string())
+                })
+        })
+        .collect()
+}
+
+/// ONE version of a stored SSM document: what the call that minted it supplied, what the
+/// service derived from that version's content, and the status move the clock still owes
+/// it.
+///
+/// Everything here is per version because that is what the model says varies between
+/// them: `DisplayName` "can differ for each version of the document", a `VersionName` is
+/// "unique across all versions of a document", and the content — and so the hash, the
+/// schema version, the description, the parameters and the platform types derived from it
+/// — is what an update supplies a new one of.
+#[derive(Debug, Clone)]
+pub struct DocumentVersionRecord {
+    /// "The document version", counting from [`FIRST_DOCUMENT_VERSION`].
+    pub version: u64,
+    pub display_name: Option<String>,
+    pub version_name: Option<String>,
+    /// A `DocumentFormat` value: the format this version's content is written in.
+    pub document_format: String,
+    pub target_type: Option<String>,
+    /// The content exactly as the call supplied it: what
+    /// [`DocumentVersionRecord::hash`] is taken over, and what `GetDocument` reports.
+    pub content: String,
+    /// Hex-rendered Sha256 of [`DocumentVersionRecord::content`].
+    pub hash: String,
+    /// Everything derived from the content (see [`parse_document_content`]).
+    pub parsed: ParsedDocumentContent,
+    pub requires: Option<Vec<DocumentRequires>>,
+    /// The attachment names the call named, which is what `AttachmentsInformation`
+    /// reports.
+    pub attachment_names: Vec<String>,
+    pub created_date: SystemTime,
+    /// A `DocumentStatus` value.
+    pub status: String,
+    /// When the clock owes this version's move to `Active`, or `None` once that move has
+    /// been materialised.
+    pub active_due: Option<SystemTime>,
+}
+
+impl DocumentVersionRecord {
+    /// Materialise the status move the clock already owes at `now` — the move to
+    /// `Active` that was due whether or not anybody called.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        if self.active_due.is_some_and(|due| now >= due) {
+            self.active_due = None;
+            self.status = DOCUMENT_STATUS_ACTIVE.to_string();
+        }
+    }
+}
+
+/// One stored SSM document: the identity and the metadata the whole document carries,
+/// and every version of it the store holds.
+///
+/// A create mints the first version and each `UpdateDocument` appends the next one, so
+/// `LatestVersion` is the last version held. The DEFAULT version moves only when
+/// `UpdateDocumentDefaultVersion` moves it, which is why an update's new version is the
+/// latest without becoming the default.
 #[derive(Debug, Clone)]
 pub struct DocumentRecord {
     /// The name the create supplied, which is what a read reports and part of the
@@ -2375,35 +2470,29 @@ pub struct DocumentRecord {
     pub name: String,
     /// The Region the document was created in; part of its store key and of its ARN.
     pub region: String,
-    pub display_name: Option<String>,
-    pub version_name: Option<String>,
-    /// A `DocumentType` value.
+    /// A `DocumentType` value. One document is of one type: `UpdateDocument` carries no
+    /// `DocumentType` member, so a version never changes it.
     pub document_type: String,
-    /// A `DocumentFormat` value.
-    pub document_format: String,
-    pub target_type: Option<String>,
-    /// The content exactly as the create supplied it: what [`DocumentRecord::hash`] is
-    /// taken over, and what `GetDocument` reports.
-    pub content: String,
-    /// Hex-rendered Sha256 of [`DocumentRecord::content`].
-    pub hash: String,
-    /// Everything derived from the content (see [`parse_document_content`]).
-    pub parsed: ParsedDocumentContent,
-    pub requires: Option<Vec<DocumentRequires>>,
-    /// The attachment names the create named, which is what `AttachmentsInformation`
-    /// reports.
-    pub attachment_names: Vec<String>,
     pub tags: BTreeMap<String, String>,
     /// "The Amazon Web Services user that created the document"
     /// (`DocumentDescription$Owner`): the account for a document a caller created here,
     /// and [`PUBLISHED_DOCUMENT_OWNER`] for one Systems Manager publishes.
     pub owner: String,
-    pub created_date: SystemTime,
-    /// A `DocumentStatus` value.
-    pub status: String,
-    /// When the clock owes this document's move out of `Creating`, or `None` once that
-    /// move has been materialised.
-    pub active_due: Option<SystemTime>,
+    /// Every version this document holds, oldest first and the newest last. Never empty
+    /// for a record that is in the store.
+    pub versions: Vec<DocumentVersionRecord>,
+    /// "The default version", the one a read that names no version resolves to.
+    pub default_version: u64,
+}
+
+/// Why a read's `DocumentVersion` / `VersionName` pair names no version of a document,
+/// carrying what was asked for so each operation can report it in its own words.
+#[derive(Debug, Clone)]
+pub enum DocumentVersionRejection {
+    /// No version of the document is the one this `DocumentVersion` selector names.
+    Version(String),
+    /// No version of the document carries this `VersionName`.
+    VersionName(String),
 }
 
 impl DocumentRecord {
@@ -2416,32 +2505,107 @@ impl DocumentRecord {
         )
     }
 
-    /// Materialise the status move the clock already owes at `now` — the move to
-    /// `Active` that was due whether or not anybody called.
+    /// Materialise the status move the clock already owes every version at `now` — the
+    /// move to `Active` that was due whether or not anybody called.
     pub fn materialize_due(&mut self, now: SystemTime) {
-        if self.active_due.is_some_and(|due| now >= due) {
-            self.active_due = None;
-            self.status = DOCUMENT_STATUS_ACTIVE.to_string();
+        for version in &mut self.versions {
+            version.materialize_due(now);
         }
     }
 
-    /// Whether `requested` names the version of this document a read resolves to.
-    ///
-    /// "The document version for which you want information. Can be a specific version
-    /// or the default version": a document holds exactly one version here
-    /// ([`FIRST_DOCUMENT_VERSION`]), so the latest and the default selector both name
-    /// that version and any other number names a version the document does not carry.
-    pub fn holds_version(&self, requested: &str) -> bool {
-        requested == DOCUMENT_VERSION_LATEST
-            || requested == DOCUMENT_VERSION_DEFAULT
-            || requested == FIRST_DOCUMENT_VERSION
+    /// The newest version, which is "the latest version of the document"
+    /// (`DocumentDescription$LatestVersion`).
+    pub fn latest(&self) -> Option<&DocumentVersionRecord> {
+        self.versions.last()
     }
 
-    /// Whether `requested` names this document's version name: "This value is unique
-    /// across all versions of a document" (`DocumentDescription$VersionName`), so a name
-    /// the document does not carry names no version of it.
+    /// The number "the latest version of the document" carries.
+    pub fn latest_version(&self) -> u64 {
+        self.latest()
+            .map_or(FIRST_DOCUMENT_VERSION, |latest| latest.version)
+    }
+
+    /// The number the next version of this document carries: each update mints the one
+    /// after the latest.
+    pub fn next_version(&self) -> u64 {
+        self.latest_version().saturating_add(1)
+    }
+
+    /// The version `version` numbers, or `None` when this document holds no such version.
+    pub fn version(&self, version: u64) -> Option<&DocumentVersionRecord> {
+        self.versions.iter().find(|held| held.version == version)
+    }
+
+    /// The version `version_name` names: "This value is unique across all versions of a
+    /// document" (`DocumentVersionInfo$VersionName`), so it names at most one of them.
+    pub fn version_named(&self, version_name: &str) -> Option<&DocumentVersionRecord> {
+        self.versions
+            .iter()
+            .find(|held| held.version_name.as_deref() == Some(version_name))
+    }
+
+    /// The version a `DocumentVersion` selector names, or `None` when this document
+    /// holds none.
+    ///
+    /// The modelled `DocumentVersion` pattern admits three spellings: `$LATEST` names the
+    /// newest version, `$DEFAULT` names "the default version", and a number names the
+    /// version it counts.
+    pub fn select(&self, selector: &str) -> Option<&DocumentVersionRecord> {
+        match selector {
+            DOCUMENT_VERSION_LATEST => self.latest(),
+            DOCUMENT_VERSION_DEFAULT => self.version(self.default_version),
+            number => self.version(number.parse().ok()?),
+        }
+    }
+
+    /// The version a read's `DocumentVersion` and `VersionName` pair names, or why it
+    /// names none of this document's versions.
+    ///
+    /// A read that names neither resolves to the default version. A read that names only
+    /// a version NAME resolves to the version carrying it, because that name is "unique
+    /// across all versions of a document"; one that names both has to name the same
+    /// version twice, so a name the selected version does not carry names no version.
+    pub fn select_requested(
+        &self,
+        document_version: Option<&str>,
+        version_name: Option<&str>,
+    ) -> Result<&DocumentVersionRecord, DocumentVersionRejection> {
+        let document_version = document_version.filter(|selector| !selector.is_empty());
+        let version_name = version_name.filter(|name| !name.is_empty());
+        let selected = match (document_version, version_name) {
+            (Some(selector), _) => self
+                .select(selector)
+                .ok_or_else(|| DocumentVersionRejection::Version(selector.to_string()))?,
+            (None, Some(name)) => {
+                return self
+                    .version_named(name)
+                    .ok_or_else(|| DocumentVersionRejection::VersionName(name.to_string()));
+            }
+            (None, None) => self.select(DOCUMENT_VERSION_DEFAULT).ok_or_else(|| {
+                DocumentVersionRejection::Version(DOCUMENT_VERSION_DEFAULT.to_string())
+            })?,
+        };
+        match version_name {
+            Some(name) if selected.version_name.as_deref() != Some(name) => {
+                Err(DocumentVersionRejection::VersionName(name.to_string()))
+            }
+            _ => Ok(selected),
+        }
+    }
+
+    /// Whether `requested` names a version name this document carries.
     pub fn holds_version_name(&self, requested: &str) -> bool {
-        self.version_name.as_deref() == Some(requested)
+        self.version_named(requested).is_some()
+    }
+
+    /// The version whose content hashes to `hash`, or `None` when no version of this
+    /// document holds that content.
+    ///
+    /// The hash is taken over the content ([`document_content_hash`]), so two versions
+    /// hash alike exactly when their content is the same — which is what
+    /// `DuplicateDocumentContent` is reported for.
+    pub fn version_with_hash(&self, hash: &str) -> Option<&DocumentVersionRecord> {
+        self.versions.iter().find(|held| held.hash == hash)
     }
 
     /// "The current review status of a new custom Systems Manager document"
@@ -2455,45 +2619,48 @@ impl DocumentRecord {
             .then(|| DOCUMENT_REVIEW_STATUS_NOT_REVIEWED.to_string())
     }
 
-    /// The modelled `DocumentDescription` for this document.
-    pub fn to_description(&self) -> DocumentDescription {
+    /// The modelled `DocumentDescription` of `version` of this document: the version's
+    /// own members beside the whole document's name, owner, type, tags, latest version
+    /// and default version.
+    pub fn description_of(&self, version: &DocumentVersionRecord) -> DocumentDescription {
         DocumentDescription {
             // "Sha1 hashes have been deprecated", so the system hash is the Sha256 in
             // `Hash` and the deprecated member is left unset.
             sha1: None,
-            hash: Some(self.hash.clone()),
+            hash: Some(version.hash.clone()),
             hash_type: Some(DOCUMENT_HASH_TYPE.to_string()),
             name: Some(self.name.clone()),
-            display_name: self.display_name.clone(),
-            version_name: self.version_name.clone(),
+            display_name: version.display_name.clone(),
+            version_name: version.version_name.clone(),
             owner: Some(self.owner.clone()),
-            created_date: Some(::aws_smithy_types::DateTime::from(self.created_date)),
-            status: Some(self.status.clone()),
+            created_date: Some(::aws_smithy_types::DateTime::from(version.created_date)),
+            status: Some(version.status.clone()),
             // "A message returned by Amazon Web Services Systems Manager that explains
             // the Status value", which it sets for a failure; nothing here failed.
             status_information: None,
-            document_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
-            description: self.parsed.description.clone(),
-            parameters: (!self.parsed.parameters.is_empty())
-                .then(|| self.parsed.parameters.clone()),
-            platform_types: (!self.parsed.platform_types.is_empty())
-                .then(|| self.parsed.platform_types.clone()),
+            document_version: Some(version.version.to_string()),
+            description: version.parsed.description.clone(),
+            parameters: (!version.parsed.parameters.is_empty())
+                .then(|| version.parsed.parameters.clone()),
+            platform_types: (!version.parsed.platform_types.is_empty())
+                .then(|| version.parsed.platform_types.clone()),
             document_type: Some(self.document_type.clone()),
-            schema_version: self.parsed.schema_version.clone(),
-            latest_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
-            default_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
-            document_format: Some(self.document_format.clone()),
-            target_type: self.target_type.clone(),
+            schema_version: version.parsed.schema_version.clone(),
+            latest_version: Some(self.latest_version().to_string()),
+            default_version: Some(self.default_version.to_string()),
+            document_format: Some(version.document_format.clone()),
+            target_type: version.target_type.clone(),
             tags: (!self.tags.is_empty()).then(|| tagging::to_tag_list(&self.tags)),
-            attachments_information: (!self.attachment_names.is_empty()).then(|| {
-                self.attachment_names
+            attachments_information: (!version.attachment_names.is_empty()).then(|| {
+                version
+                    .attachment_names
                     .iter()
                     .map(|name| AttachmentInformation {
                         name: Some(name.clone()),
                     })
                     .collect()
             }),
-            requires: self.requires.clone(),
+            requires: version.requires.clone(),
             // "The user in your organization who created the document": the emulator
             // authenticates no human author, so there is none to report.
             author: None,
@@ -2511,6 +2678,12 @@ impl DocumentRecord {
             category: None,
             category_enum: None,
         }
+    }
+
+    /// The modelled `DocumentDescription` of the version `selector` names, or `None` when
+    /// this document holds no such version.
+    pub fn description_of_version(&self, selector: &str) -> Option<DocumentDescription> {
+        Some(self.description_of(self.select(selector)?))
     }
 }
 
@@ -2762,7 +2935,12 @@ impl ComAmazonawsSsmAmazonssmState {
         self.documents.get(&(region.to_string(), name.to_string()))
     }
 
-    /// The same document, to write it — its tags, say.
+    /// The document `name` names in `region`, to write it — to append a version to it or
+    /// to change its tags — or `None` when that Region holds none of that name.
+    ///
+    /// Only a document a caller CREATED here is reachable through this: the catalogue
+    /// Systems Manager publishes is projected on read ([`Self::published_document_record`])
+    /// and is not the account's to write.
     pub fn document_mut(&mut self, region: &str, name: &str) -> Option<&mut DocumentRecord> {
         self.documents
             .get_mut(&(region.to_string(), name.to_string()))
@@ -2782,21 +2960,25 @@ impl ComAmazonawsSsmAmazonssmState {
         Some(DocumentRecord {
             name: published.name.to_string(),
             region: region.to_string(),
-            display_name: None,
-            version_name: None,
             document_type: published.document_type.to_string(),
-            document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
-            target_type: None,
-            hash: hash.to_string(),
-            content: published.content.to_string(),
-            parsed: parsed.clone(),
-            requires: None,
-            attachment_names: Vec::new(),
             tags: BTreeMap::new(),
             owner: PUBLISHED_DOCUMENT_OWNER.to_string(),
-            created_date: self.created_at,
-            status: DOCUMENT_STATUS_ACTIVE.to_string(),
-            active_due: None,
+            versions: vec![DocumentVersionRecord {
+                version: FIRST_DOCUMENT_VERSION,
+                display_name: None,
+                version_name: None,
+                document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
+                target_type: None,
+                content: published.content.to_string(),
+                hash: hash.to_string(),
+                parsed: parsed.clone(),
+                requires: None,
+                attachment_names: Vec::new(),
+                created_date: self.created_at,
+                status: DOCUMENT_STATUS_ACTIVE.to_string(),
+                active_due: None,
+            }],
+            default_version: FIRST_DOCUMENT_VERSION,
         })
     }
 

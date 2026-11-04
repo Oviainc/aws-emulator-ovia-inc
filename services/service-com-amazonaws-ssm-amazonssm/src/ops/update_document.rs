@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDocument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Append a version to an SSM document — the update half of this service's document
+//! slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is read back by `DescribeDocument` and `GetDocument`; all three reach
+//! the one store in [`crate::state`]. "Currently, Systems Manager supports updating only
+//! the latest version of the document", so the version this mints is the one after the
+//! latest ([`crate::state::DocumentRecord::next_version`]) and becomes the document's new
+//! `LatestVersion`. The DEFAULT version does NOT move with it — that is
+//! `UpdateDocumentDefaultVersion`'s own call — so a read that names no version still
+//! reports the default one.
+//!
+//! Everything the new version reports beyond the request's own members is derived from the
+//! content it persisted (`crate::state::parse_document_content`): the schema version, the
+//! description, the parameters, the platform types and the Sha256 hash. A version is
+//! minted `Updating` and the clock owes its move to `Active`
+//! ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), so a caller reading straight after this
+//! call still sees the transient status.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +189,244 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDocument"))
+        // `Name`'s pattern, `DisplayName`'s, `VersionName`'s, `TargetType`'s and
+        // `DocumentVersion`'s patterns and lengths and the `DocumentFormat` value set are
+        // MODELLED constraints, so the centralized walk has already refused anything
+        // outside them. What is checked here is what the model cannot say: the documented
+        // size rule, the content's own structure, which version an update may append to,
+        // and whether the content or the version name is one this document already holds.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDocumentErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The content of the document must not exceed 64KB" — applied before anything
+        // parses or hashes the content, so no per-request work is proportional to an
+        // unbounded request.
+        if input.content.len() > crate::state::MAX_DOCUMENT_CONTENT {
+            return Err(UpdateDocumentErrorModeled::MaxDocumentSizeExceeded(
+                MaxDocumentSizeExceeded {
+                    message: Some(format!(
+                        "Content is {} bytes: the size limit of a document is {} bytes",
+                        input.content.len(),
+                        crate::state::MAX_DOCUMENT_CONTENT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Specify the document format for the new document version … JSON is the default
+        // format", so the format a request omits is the documented default and the format
+        // it names decides how this version's content is parsed. `DocumentFormat` is a
+        // modelled enum and the walk has already refused a value outside its value set;
+        // it is re-checked here because a value the model does not declare — the EMPTY
+        // string a request may send in place of omitting the member — must not be served
+        // as if it were the default.
+        let document_format = input
+            .document_format
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_DOCUMENT_FORMAT.to_string());
+        if !DOCUMENT_FORMAT_VALUES.contains(&document_format.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "DocumentFormat '{document_format}' isn't one of the document formats {}",
+                DOCUMENT_FORMAT_VALUES.join(", ")
+            )));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An update reports the version it minted beside the versions the document
+        // already held, so a transition due before this call is materialised first.
+        store.materialize_due(now);
+
+        // The document this update appends to: one a caller CREATED through this
+        // endpoint. A name the published catalogue carries resolves for a read, but a
+        // document Systems Manager owns is not the account's to version, which is the
+        // operation `InvalidDocumentOperation` refuses; a name neither holds names no
+        // document at all.
+        let Some(record) = store.document_mut(&region, &input.name) else {
+            return Err(if crate::state::published_document(&input.name).is_some() {
+                UpdateDocumentErrorModeled::InvalidDocumentOperation(InvalidDocumentOperation {
+                    message: Some(format!(
+                        "Document {} is owned by {} and can't be updated",
+                        input.name,
+                        crate::state::PUBLISHED_DOCUMENT_OWNER
+                    )),
+                })
+            } else {
+                UpdateDocumentErrorModeled::InvalidDocument(InvalidDocument {
+                    message: Some(format!("Document with name {} does not exist.", input.name)),
+                })
+            }
+            .into());
+        };
+
+        // "Currently, Systems Manager supports updating only the latest version of the
+        // document. You can specify the version number of the latest version or use the
+        // $LATEST variable": a selector naming no version of this document names nothing
+        // to update, and one naming a version that is not the latest names a version this
+        // operation does not update. A request that names none updates the latest.
+        let latest_version = record.latest_version();
+        if let Some(requested) = input
+            .document_version
+            .as_deref()
+            .filter(|selector| !selector.is_empty())
+        {
+            let Some(selected) = record.select(requested) else {
+                return Err(UpdateDocumentErrorModeled::InvalidDocumentVersion(
+                    InvalidDocumentVersion {
+                        message: Some(format!(
+                            "Document {} has no version '{requested}'",
+                            input.name
+                        )),
+                    },
+                )
+                .into());
+            };
+            if selected.version != latest_version {
+                return Err(UpdateDocumentErrorModeled::InvalidDocumentOperation(
+                    InvalidDocumentOperation {
+                        message: Some(format!(
+                            "Systems Manager supports updating only the latest version of the \
+                             document; the latest version of document {} is {latest_version}",
+                            input.name
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The content is parsed in the format this version declares, against the type the
+        // document was created as: `UpdateDocument` carries no `DocumentType`, so a
+        // version never changes which schema versions the content may declare.
+        let parsed = crate::state::parse_document_content(
+            &input.content,
+            &document_format,
+            &record.document_type,
+        )
+        .map_err(|rejection| match rejection {
+            crate::state::ContentRejection::Content(why) => {
+                UpdateDocumentErrorModeled::InvalidDocumentContent(InvalidDocumentContent {
+                    message: Some(why),
+                })
+            }
+            crate::state::ContentRejection::SchemaVersion(why) => {
+                UpdateDocumentErrorModeled::InvalidDocumentSchemaVersion(
+                    InvalidDocumentSchemaVersion { message: Some(why) },
+                )
+            }
+        })?;
+
+        // "The content of the association document matches another document. Change the
+        // content of the document and try again." — content a version of this document
+        // already holds is not a new version of it, so the update is refused rather than
+        // appending a version that differs in nothing. The refusal is the sentence the
+        // service states for this error class.
+        let hash = crate::state::document_content_hash(&input.content);
+        if record.version_with_hash(&hash).is_some() {
+            return Err(UpdateDocumentErrorModeled::DuplicateDocumentContent(
+                DuplicateDocumentContent {
+                    message: Some(
+                        "The content of the association document matches another document. \
+                         Change the content of the document and try again."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "This value is unique across all versions of a document, and can't be changed",
+        // so a version name another version of this document already carries cannot name
+        // this one.
+        if let Some(requested) = input
+            .version_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            if record.holds_version_name(requested) {
+                return Err(UpdateDocumentErrorModeled::DuplicateDocumentVersionName(
+                    DuplicateDocumentVersionName {
+                        message: Some(
+                            "The version name has already been used in this document. Specify a \
+                             different version name, and then try again."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The document has too many versions. Delete one or more document versions and
+        // try again." — the sentence the service states for this error class, reported
+        // when the history reaches the emulator's own guard on how many versions of one
+        // document this store keeps (`crate::state::MAX_DOCUMENT_VERSIONS`).
+        if record.versions.len() >= crate::state::MAX_DOCUMENT_VERSIONS {
+            return Err(UpdateDocumentErrorModeled::DocumentVersionLimitExceeded(
+                DocumentVersionLimitExceeded {
+                    message: Some(
+                        "The document has too many versions. Delete one or more document \
+                         versions and try again."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "If you don't specify a value for this parameter in your request, the existing
+        // value is applied to the new document version" (`DisplayName`), and
+        // `UpdateDocument` carries no `Requires` member, so the documents this one
+        // requires are the ones the version it is appended to required.
+        let (inherited_display_name, inherited_requires) = record
+            .latest()
+            .map(|latest| (latest.display_name.clone(), latest.requires.clone()))
+            .unwrap_or_default();
+        // A `VersionName` the request sends EMPTY names no version — every selector here
+        // reads it that way — so it is stored as the absent member it is rather than as a
+        // name nothing can resolve.
+        let version_name = input
+            .version_name
+            .clone()
+            .filter(|name| !name.is_empty());
+        let version = crate::state::DocumentVersionRecord {
+            version: record.next_version(),
+            display_name: input.display_name.clone().or(inherited_display_name),
+            version_name,
+            document_format,
+            target_type: input.target_type.clone(),
+            hash,
+            content: input.content.clone(),
+            parsed,
+            requires: inherited_requires,
+            attachment_names: crate::state::attachment_names(input.attachments.as_deref()),
+            created_date: now,
+            // "The status of the SSM document": a version Systems Manager is still
+            // registering for an existing document is `Updating`, and the clock owes its
+            // move to `Active` at `active_due`, so a caller acting straight after this
+            // call still sees the transient status.
+            status: crate::state::DOCUMENT_STATUS_UPDATING.to_string(),
+            active_due: Some(now + crate::state::DOCUMENT_TRANSITION_DELAY),
+        };
+        record.versions.push(version);
+
+        // The report is of the version this call minted, which is the document's new
+        // latest version; its `DefaultVersion` is the one the document already had.
+        let description = record
+            .description_of_version(crate::state::DOCUMENT_VERSION_LATEST)
+            .ok_or_else(|| {
+                UpdateDocumentErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the updated document holds no version".to_string()),
+                })
+            })?;
+
+        Ok(UpdateDocumentOutput {
+            document_description: Some(description),
+        })
     }
 }

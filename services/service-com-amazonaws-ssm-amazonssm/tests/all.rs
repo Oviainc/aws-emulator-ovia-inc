@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/document_content.rs"]
 mod document_content;
+#[path = "all/document_versions.rs"]
+mod document_versions;
 #[path = "all/cloud_connectors.rs"]
 mod cloud_connectors;
 #[path = "all/documents.rs"]

@@ -13,6 +13,11 @@
 //! ([`crate::state::document_format::rendered_content`]); nothing here holds a second
 //! copy of a document and nothing is synthesized for a document nobody created.
 //!
+//! The version served is the one the request names, by `DocumentVersion` selector or by
+//! `VersionName`; a request that names neither is served the document's DEFAULT version
+//! ([`crate::state::DocumentRecord::select_requested`]), which is not necessarily its
+//! latest one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -236,57 +241,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request named it by selector — a number or one of the two role selectors — or
         // by version name, "unique across all versions of a document". Each refusal names
         // what it was asked for, read from the request, beside the version the document
-        // actually holds, read from the store.
-        if let Some(requested) = input
-            .document_version
-            .as_deref()
-            .filter(|version| !version.is_empty() && !record.holds_version(version))
-        {
-            return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
-                InvalidDocumentVersion {
-                    message: Some(format!(
-                        "Document version: {requested} is invalid, latest version is {}",
-                        crate::state::FIRST_DOCUMENT_VERSION
-                    )),
-                },
-            )
-            .into());
-        }
-        // A version NAME is the other way of naming a version, so a name no version of
-        // the document carries names no version to report either.
-        if let Some(requested) = input
-            .version_name
-            .as_deref()
-            .filter(|name| !name.is_empty() && !record.holds_version_name(name))
-        {
-            return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
-                InvalidDocumentVersion {
-                    message: Some(format!("Document version name: {requested} is invalid")),
-                },
-            )
-            .into());
-        }
+        // actually holds, read from the store. A request that names neither is served the
+        // document's default version.
+        let version = match record.select_requested(
+            input.document_version.as_deref(),
+            input.version_name.as_deref(),
+        ) {
+            Ok(version) => version,
+            Err(crate::state::DocumentVersionRejection::Version(requested)) => {
+                return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
+                    InvalidDocumentVersion {
+                        message: Some(format!(
+                            "Document version: {requested} is invalid, latest version is {}",
+                            record.latest_version()
+                        )),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::DocumentVersionRejection::VersionName(requested)) => {
+                return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
+                    InvalidDocumentVersion {
+                        message: Some(format!("Document version name: {requested} is invalid")),
+                    },
+                )
+                .into());
+            }
+        };
 
         let (content, document_format) = crate::state::document_format::rendered_content(
-            &record.content,
-            &record.document_format,
+            &version.content,
+            &version.document_format,
             requested_format,
         );
 
         Ok(GetDocumentOutput {
             name: Some(record.name.clone()),
-            created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
-            display_name: record.display_name.clone(),
-            version_name: record.version_name.clone(),
-            document_version: Some(crate::state::FIRST_DOCUMENT_VERSION.to_string()),
-            status: Some(record.status.clone()),
+            created_date: Some(::aws_smithy_types::DateTime::from(version.created_date)),
+            display_name: version.display_name.clone(),
+            version_name: version.version_name.clone(),
+            document_version: Some(version.version.to_string()),
+            status: Some(version.status.clone()),
             // "A message returned by Amazon Web Services Systems Manager that explains
             // the Status value", which it sets for a failure; nothing here failed.
             status_information: None,
             content: Some(content),
             document_type: Some(record.document_type.clone()),
             document_format: Some(document_format),
-            requires: record.requires.clone(),
+            requires: version.requires.clone(),
             // "A description of the document attachments, including names, locations,
             // sizes": an attachment's content lives in the S3 object the create's
             // `AttachmentsSource` pointed at, which this emulator never fetched, so there
