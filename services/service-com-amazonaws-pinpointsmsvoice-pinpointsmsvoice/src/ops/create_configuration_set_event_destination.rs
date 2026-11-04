@@ -192,6 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MatchingEventTypes` entries were already checked against the model's
         // `EventType` enum by the boundary validator, before this handler ran.
         let definition = input.event_destination.unwrap_or_default();
+
+        // AUTHORIZATION (the more specific of the two decisions): a destination that
+        // publishes through an IAM role hands that role to this service, which no
+        // principal of this account may do with a role another account holds — so that is
+        // answered here, ahead of the entitlement decision below and ahead of any lookup.
+        if let Some(denied) = super::types::authorization::pass_role_denial(&definition) {
+            return Err(denied);
+        }
+
         let matching_event_types = definition.matching_event_types;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -202,6 +211,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+
+        // AUTHORIZATION: attaching an event destination is scoped to the configuration set
+        // it is attached to, so it is decided by the one rule in `types::authorization` —
+        // before the parent lookup below, which is why an unentitled caller gets this
+        // refusal rather than the 404 an absent parent would otherwise get, and gets the
+        // same one whatever destination the definition names.
+        if let Some(denied) = super::types::authorization::resource_scope_denial(&store) {
+            return Err(denied);
+        }
 
         // An event destination lives inside a configuration set, so the set must exist
         // before one can be attached to it.

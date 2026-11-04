@@ -152,7 +152,10 @@ const CASES: &[Case] = &[
         },
     },
     Case {
-        // A V1 MUTATION: dispatch must reach the handler that writes, not only the readers.
+        // A V1 MUTATION: dispatch must reach the handler that decides it, not only the
+        // readers. That decision is this account's authorization refusal — a 403 whose
+        // message is V1's own, so it shows which service answered just as a served body
+        // would.
         name: "V1 CreateConfigurationSet",
         host: V1_HOST,
         method: "POST",
@@ -162,8 +165,8 @@ const CASES: &[Case] = &[
         body: r#"{"ConfigurationSetName":"router-routing-check"}"#,
         expect: Expect::Serves {
             who: "Pinpoint SMS Voice V1",
-            status: 200,
-            marker: "{}",
+            status: 403,
+            marker: "Access Denied",
         },
     },
     Case {

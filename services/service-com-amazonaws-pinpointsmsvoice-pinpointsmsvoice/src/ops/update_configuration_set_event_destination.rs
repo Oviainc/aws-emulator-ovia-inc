@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfigurationSetEventDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfigurationSetEventDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfigurationSetEventDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +135,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfigurationSetEventDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationSetEventDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfigurationSetEventDestination"))
+        let _ = ctx;
+
+        // A `@required` path label the request binds no usable value to names nothing to
+        // update, so it is refused ahead of any lookup — which is why this is a 400 and
+        // not the 404 a name that merely does not exist gets. Both labels are read, in the
+        // order the input declares them, and the layer (and so the sentence) is
+        // `refusal_wording`'s to decide.
+        for (member, value) in [
+            ("ConfigurationSetName", &input.configuration_set_name),
+            ("EventDestinationName", &input.event_destination_name),
+        ] {
+            if let Some(message) =
+                super::types::refusal_wording::unusable_required_label(member, value)
+            {
+                return Err(
+                    UpdateConfigurationSetEventDestinationErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every member of `EventDestinationDefinition` is optional, so an absent
+        // definition updates nothing rather than being a refusal. Its
+        // `MatchingEventTypes` entries were already checked against the model's
+        // `EventType` enum by the boundary validator, before this handler ran.
+        let definition = input.event_destination.unwrap_or_default();
+
+        // AUTHORIZATION (the more specific of the two decisions): a destination that
+        // publishes through an IAM role hands that role to this service, which no
+        // principal of this account may do with a role another account holds — so that is
+        // answered here, ahead of the entitlement decision below and ahead of any lookup.
+        if let Some(denied) = super::types::authorization::pass_role_denial(&definition) {
+            return Err(denied);
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConfigurationSetEventDestinationErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the service state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // AUTHORIZATION: updating an event destination is scoped to the configuration set
+        // that owns it, so it is decided by the one rule in `types::authorization` —
+        // before the lookups below and before the definition is applied, which is why an
+        // unentitled caller gets this refusal and not the 404 an absent set or destination
+        // would otherwise get, whatever the definition carried.
+        if let Some(denied) = super::types::authorization::resource_scope_denial(&store) {
+            return Err(denied);
+        }
+
+        // An event destination lives inside a configuration set, so an absent set is the
+        // modelled `NotFoundException` just as an absent destination is: neither names a
+        // destination this request can update.
+        let set = store
+            .configuration_sets
+            .get_mut(&input.configuration_set_name)
+            .ok_or_else(|| {
+                UpdateConfigurationSetEventDestinationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "configuration set {} does not exist",
+                            input.configuration_set_name
+                        )),
+                    },
+                )
+            })?;
+        let destination = set
+            .event_destinations
+            .get_mut(&input.event_destination_name)
+            .ok_or_else(|| {
+                UpdateConfigurationSetEventDestinationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "event destination {} does not exist in configuration set {}",
+                            input.event_destination_name, input.configuration_set_name
+                        )),
+                    },
+                )
+            })?;
+
+        // This UPDATES a destination rather than replacing it, and every member of the
+        // definition is optional, so a member the request carries replaces the stored one
+        // and a member it omits states nothing about that member and leaves it as it was
+        // — the destination's own `Name`, which is its key inside the set, is not a member
+        // of the definition at all and never changes here.
+        if let Some(enabled) = definition.enabled {
+            destination.enabled = Some(enabled);
+        }
+        if let Some(matching_event_types) = definition.matching_event_types {
+            destination.matching_event_types = Some(matching_event_types);
+        }
+        if let Some(cloud_watch_logs) = definition.cloud_watch_logs_destination {
+            destination.cloud_watch_logs = Some(crate::state::CloudWatchLogsDest {
+                iam_role_arn: cloud_watch_logs.iam_role_arn,
+                log_group_arn: cloud_watch_logs.log_group_arn,
+            });
+        }
+        if let Some(kinesis_firehose) = definition.kinesis_firehose_destination {
+            destination.kinesis_firehose = Some(crate::state::KinesisFirehoseDest {
+                delivery_stream_arn: kinesis_firehose.delivery_stream_arn,
+                iam_role_arn: kinesis_firehose.iam_role_arn,
+            });
+        }
+        if let Some(sns) = definition.sns_destination {
+            destination.sns = Some(crate::state::SnsDest {
+                topic_arn: sns.topic_arn,
+            });
+        }
+
+        Ok(UpdateConfigurationSetEventDestinationOutput {})
     }
 }

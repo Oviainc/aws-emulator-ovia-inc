@@ -18,6 +18,10 @@
 //!   service's own lower-camel spelling of that member. A URI label that is PRESENT binds a
 //!   value, so a blank one is this class rather than the one above.
 //!
+//! One parameter is the exception that the member carries nothing for: a `PageSize` this
+//! service cannot read as a page bound is refused with the same code and status and NO
+//! detail member at all, so the rows for it assert the member's absence.
+//!
 //! The same member carries the text for EVERY error this service's model declares, which
 //! the `NotFoundException` rows pin, and a refused request changes nothing — the listing
 //! that follows one still answers 200 with its `ConfigurationSets` member.
@@ -84,6 +88,15 @@ impl Harness {
         // own concern and is covered where it lives.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // This suite is about how a MALFORMED request is worded, which is answered ahead
+        // of the authorization decision — the account holds the entitlement this API's
+        // resource-scoped actions need so the rows that name a set reach their parameter
+        // rather than that decision. The entitlement is pinned in
+        // `legacy_surface_authorization.rs`, including that validation still precedes it.
+        engine
+            .state::<ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState>()
+            .lock()
+            .legacy_surface_entitled = true;
         Self { router, engine }
     }
 
@@ -147,7 +160,9 @@ struct Case {
     method: &'static str,
     path: &'static str,
     body: Option<fn() -> Value>,
-    message: &'static str,
+    /// The sentence the refusal carries, or `None` where the service carries NO detail
+    /// member at all.
+    message: Option<&'static str>,
 }
 
 /// The sentence for a `@required` URI parameter that arrived with no value.
@@ -155,16 +170,20 @@ const MISSING_CONFIGURATION_SET_NAME: &str =
     "Missing required request parameters: [ConfigurationSetName]";
 
 /// The sentences for a parameter this service's validation cannot use, one per parameter
-/// the rows below exercise.
+/// the rows below exercise. `PageSize` has none: that refusal carries no detail member
+/// (see `ops/list_configuration_sets.rs`), which the `None` rows below pin.
 const INVALID_NEXT_TOKEN: &str = "The following parameter is null, empty or invalid: ['nextToken']";
-const INVALID_PAGE_SIZE: &str = "The following parameter is null, empty or invalid: ['pageSize']";
 const INVALID_CONFIGURATION_SET_NAME: &str =
     "The following parameter is null, empty or invalid: ['configurationSetName']";
 const INVALID_EVENT_DESTINATION_NAME: &str =
     "The following parameter is null, empty or invalid: ['eventDestinationName']";
 const INVALID_DESTINATION_PHONE_NUMBER: &str =
     "The following parameter is null, empty or invalid: ['destinationPhoneNumber']";
-const INVALID_CONTENT: &str = "The following parameter is null, empty or invalid: ['content']";
+/// `Content` is the one parameter with a sentence of its own: what is wrong is WHICH of
+/// the three message bodies the request chose, so the refusal names them instead of
+/// naming the member (see `ops/send_voice_message.rs`).
+const INVALID_CONTENT: &str = "Message is invalid. The message must have either a plain \
+     text, SSML, or call instructions message";
 
 /// A configuration set the invalid-parameter rows that need one can resolve, so a row
 /// cannot pass merely because the set was missing.
@@ -182,14 +201,14 @@ const CASES: &[Case] = &[
         method: "GET",
         path: "/v1/sms-voice/configuration-sets//event-destinations",
         body: None,
-        message: MISSING_CONFIGURATION_SET_NAME,
+        message: Some(MISSING_CONFIGURATION_SET_NAME),
     },
     Case {
         name: "CreateConfigurationSetEventDestination with an EMPTY path label",
         method: "POST",
         path: "/v1/sms-voice/configuration-sets//event-destinations",
         body: Some(named_destination),
-        message: MISSING_CONFIGURATION_SET_NAME,
+        message: Some(MISSING_CONFIGURATION_SET_NAME),
     },
     // ---- a @required URI parameter that bound a BLANK value --------------------------
     // A label that is present binds a value, so it reaches this service's own validation
@@ -200,21 +219,21 @@ const CASES: &[Case] = &[
         method: "GET",
         path: "/v1/sms-voice/configuration-sets/%20/event-destinations",
         body: None,
-        message: INVALID_CONFIGURATION_SET_NAME,
+        message: Some(INVALID_CONFIGURATION_SET_NAME),
     },
     Case {
         name: "DeleteConfigurationSet with a BLANK path label",
         method: "DELETE",
         path: "/v1/sms-voice/configuration-sets/%20",
         body: None,
-        message: INVALID_CONFIGURATION_SET_NAME,
+        message: Some(INVALID_CONFIGURATION_SET_NAME),
     },
     Case {
         name: "CreateConfigurationSetEventDestination with a BLANK path label",
         method: "POST",
         path: "/v1/sms-voice/configuration-sets/%20%20/event-destinations",
         body: Some(named_destination),
-        message: INVALID_CONFIGURATION_SET_NAME,
+        message: Some(INVALID_CONFIGURATION_SET_NAME),
     },
     // ---- a query parameter this service cannot use -----------------------------------
     Case {
@@ -222,7 +241,7 @@ const CASES: &[Case] = &[
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?NextToken=not-a-token",
         body: None,
-        message: INVALID_NEXT_TOKEN,
+        message: Some(INVALID_NEXT_TOKEN),
     },
     Case {
         name: "ListConfigurationSets with a NextToken this service never minted",
@@ -230,35 +249,35 @@ const CASES: &[Case] = &[
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?NextToken=6e6f70652d6e6f742d6d696e65",
         body: None,
-        message: INVALID_NEXT_TOKEN,
+        message: Some(INVALID_NEXT_TOKEN),
     },
     Case {
         name: "ListConfigurationSets with a non-numeric PageSize",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?PageSize=not-a-number",
         body: None,
-        message: INVALID_PAGE_SIZE,
+        message: None,
     },
     Case {
         name: "ListConfigurationSets with a PageSize of zero, which pages nothing",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?PageSize=0",
         body: None,
-        message: INVALID_PAGE_SIZE,
+        message: None,
     },
     Case {
         name: "ListConfigurationSets with a negative PageSize",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?PageSize=-5",
         body: None,
-        message: INVALID_PAGE_SIZE,
+        message: None,
     },
     Case {
         name: "ListConfigurationSets with a fractional PageSize",
         method: "GET",
         path: "/v1/sms-voice/configuration-sets?PageSize=2.5",
         body: None,
-        message: INVALID_PAGE_SIZE,
+        message: None,
     },
     // ---- a body member this service cannot use ---------------------------------------
     Case {
@@ -266,63 +285,63 @@ const CASES: &[Case] = &[
         method: "POST",
         path: "/v1/sms-voice/configuration-sets",
         body: Some(empty_object),
-        message: INVALID_CONFIGURATION_SET_NAME,
+        message: Some(INVALID_CONFIGURATION_SET_NAME),
     },
     Case {
         name: "CreateConfigurationSet with an empty ConfigurationSetName",
         method: "POST",
         path: "/v1/sms-voice/configuration-sets",
         body: Some(empty_set_name),
-        message: INVALID_CONFIGURATION_SET_NAME,
+        message: Some(INVALID_CONFIGURATION_SET_NAME),
     },
     Case {
         name: "CreateConfigurationSet with a blank ConfigurationSetName",
         method: "POST",
         path: "/v1/sms-voice/configuration-sets",
         body: Some(blank_set_name),
-        message: INVALID_CONFIGURATION_SET_NAME,
+        message: Some(INVALID_CONFIGURATION_SET_NAME),
     },
     Case {
         name: "CreateConfigurationSetEventDestination with no EventDestinationName",
         method: "POST",
         path: "/v1/sms-voice/configuration-sets/refusal-wording-set/event-destinations",
         body: Some(empty_object),
-        message: INVALID_EVENT_DESTINATION_NAME,
+        message: Some(INVALID_EVENT_DESTINATION_NAME),
     },
     Case {
         name: "CreateConfigurationSetEventDestination with a blank EventDestinationName",
         method: "POST",
         path: "/v1/sms-voice/configuration-sets/refusal-wording-set/event-destinations",
         body: Some(blank_destination_name),
-        message: INVALID_EVENT_DESTINATION_NAME,
+        message: Some(INVALID_EVENT_DESTINATION_NAME),
     },
     Case {
         name: "SendVoiceMessage with no DestinationPhoneNumber",
         method: "POST",
         path: "/v1/sms-voice/voice/message",
         body: Some(message_without_destination),
-        message: INVALID_DESTINATION_PHONE_NUMBER,
+        message: Some(INVALID_DESTINATION_PHONE_NUMBER),
     },
     Case {
         name: "SendVoiceMessage with a blank DestinationPhoneNumber",
         method: "POST",
         path: "/v1/sms-voice/voice/message",
         body: Some(message_with_blank_destination),
-        message: INVALID_DESTINATION_PHONE_NUMBER,
+        message: Some(INVALID_DESTINATION_PHONE_NUMBER),
     },
     Case {
         name: "SendVoiceMessage whose Content carries no message body",
         method: "POST",
         path: "/v1/sms-voice/voice/message",
         body: Some(message_without_content),
-        message: INVALID_CONTENT,
+        message: Some(INVALID_CONTENT),
     },
     Case {
         name: "SendVoiceMessage whose Content carries two message bodies",
         method: "POST",
         path: "/v1/sms-voice/voice/message",
         body: Some(message_with_two_bodies),
-        message: INVALID_CONTENT,
+        message: Some(INVALID_CONTENT),
     },
 ];
 
@@ -411,14 +430,23 @@ async fn a_parameter_this_service_cannot_use_is_refused_in_its_own_wording() {
             "case {:?}: expected x-amzn-errortype BadRequestException, got {:?}",
             case.name, answer.error_type_header
         );
-        assert_eq!(
-            answer.message(),
-            case.message,
-            "case {:?}: expected the message {:?}, got {:?}",
-            case.name,
-            case.message,
-            answer.body
-        );
+        match case.message {
+            Some(expected) => assert_eq!(
+                answer.message(),
+                expected,
+                "case {:?}: expected the message {expected:?}, got {:?}",
+                case.name,
+                answer.body
+            ),
+            // No detail member AT ALL: not an empty one, and not the modelled spelling
+            // of it either.
+            None => assert!(
+                answer.body.get("message").is_none() && !answer.has_modelled_member(),
+                "case {:?}: expected no detail member, got {:?}",
+                case.name,
+                answer.body
+            ),
+        }
         assert!(
             !answer.has_modelled_member(),
             "case {:?}: the detail text must travel in `message` alone, got {:?}",

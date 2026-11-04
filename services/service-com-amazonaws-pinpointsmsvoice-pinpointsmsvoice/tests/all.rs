@@ -13,6 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/configuration_set_lifecycle.rs"]
 mod configuration_set_lifecycle;
+#[path = "all/configuration_set_names.rs"]
+mod configuration_set_names;
+#[path = "all/event_destination_updates.rs"]
+mod event_destination_updates;
+#[path = "all/legacy_surface_authorization.rs"]
+mod legacy_surface_authorization;
 #[path = "all/parameter_refusal_wording.rs"]
 mod parameter_refusal_wording;
 #[path = "all/state_roundtrip.rs"]

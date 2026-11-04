@@ -82,6 +82,18 @@ use super::types::*;
 /// growing it without limit.
 const MAX_RECORDED_VOICE_MESSAGES: usize = 10_000;
 
+/// How this service words a `Content` that does not carry exactly one message body.
+///
+/// This class of failure has its own sentence rather than the "parameter is null, empty or
+/// invalid" wording `super::types::refusal_wording` gives a parameter whose VALUE cannot be
+/// used: what is wrong is which of the three bodies `VoiceMessageContent` declares the
+/// request chose (`smithy_query(query="shape",shape="VoiceMessageContent",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`
+/// — `CallInstructionsMessage`, `PlainTextMessage`, `SSMLMessage`), so the sentence names
+/// them. Entirely fixed text: it carries no part taken from the request, because every
+/// request that fails this way fails it the same way.
+const UNUSABLE_CONTENT_MESSAGE: &str = "Message is invalid. The message must have either a \
+     plain text, SSML, or call instructions message";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,7 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `VoiceMessageContent` holds one message body of one kind: exactly one of
         // `PlainTextMessage`, `SSMLMessage` and `CallInstructionsMessage`. None of them
         // describes nothing to speak, and two of them describe no single message, so
-        // either way `Content` is a parameter this service's validation cannot use.
+        // either way the message is not one this service can place — refused in this
+        // operation's own wording for that class ([`UNUSABLE_CONTENT_MESSAGE`]).
         let content = input.content.unwrap_or_default();
         let bodies = usize::from(content.plain_text_message.is_some())
             + usize::from(content.ssml_message.is_some())
@@ -180,9 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if bodies != 1 {
             return Err(SendVoiceMessageErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(super::types::refusal_wording::invalid_parameters(&[
-                        "Content",
-                    ])),
+                    message: Some(UNUSABLE_CONTENT_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -196,6 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+
+        // AUTHORIZATION: placing a voice call is a resource-scoped action of this API, so
+        // it is decided by the one rule in `types::authorization` — before any id is
+        // minted and before anything is recorded, so an unentitled account cannot place a
+        // call and gets the same refusal whatever numbers or content the request carried.
+        if let Some(denied) = super::types::authorization::resource_scope_denial(&store) {
+            return Err(denied);
+        }
 
         // The sequence advances before the id is minted, so no two accepted messages
         // can ever be handed the same `MessageId`.

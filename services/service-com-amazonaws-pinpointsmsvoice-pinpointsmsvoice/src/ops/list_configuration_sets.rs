@@ -179,7 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `NextToken` is opaque to the caller but it is OURS: one this service did not
         // mint cannot name a position in the listing, so it is a parameter this
-        // service's validation cannot use.
+        // service's validation cannot use — and one it names in the refusal, because the
+        // caller can only have got a usable token from this service.
         let resume_after = match input.next_token.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(raw) => Some(decode_token(raw).ok_or_else(|| {
@@ -200,6 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
+        // This listing is ACCOUNT-scoped — it names no configuration set — so it is not
+        // one of the resource-scoped actions `types::authorization` gates: it answers what
+        // is stored whether or not the account holds that entitlement.
         // The store is a `BTreeMap`, so the listing order is total and stable and a
         // token naming the last name of a page resumes exactly after it.
         let mut remaining = store.configuration_sets.keys().filter(|name| {
@@ -234,17 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// alongside a negative, fractional or non-numeric value. A count above the maximum is
 /// clamped rather than refused: the caller asked for at most that many, and it gets a
 /// `NextToken` for the remainder.
+///
+/// The refusal carries NO detail text. `BadRequestException$Message` is optional in the
+/// model (`smithy_query(query="shape",shape="BadRequestException",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`)
+/// and the service sends none for this parameter, so none is written: writing one would
+/// put a member on the wire the real response does not carry, and a client that reads a
+/// present `Message` as "the service explained the problem" would branch on it. The code
+/// and the status are the whole answer. (`NextToken`, which this service MINTS, is
+/// refused with the sentence that names it — see the caller.)
 fn parse_page_size(raw: &str) -> Result<usize, ListConfigurationSetsErrorModeled> {
-    // The refused value is NOT quoted back: this service names the parameter it could
-    // not use and nothing else, so the sentence is the same whatever was sent.
     match raw.parse::<usize>() {
         Ok(size) if size > 0 => Ok(size.min(MAX_PAGE_SIZE)),
         _ => Err(ListConfigurationSetsErrorModeled::BadRequestException(
-            BadRequestException {
-                message: Some(super::types::refusal_wording::invalid_parameters(&[
-                    "PageSize",
-                ])),
-            },
+            BadRequestException { message: None },
         )),
     }
 }

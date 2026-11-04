@@ -75,6 +75,18 @@ use super::types::*;
 /// use never reaches it.
 const MAX_CONFIGURATION_SETS: usize = 10_000;
 
+/// The characters a configuration-set name may carry BESIDE a word character.
+///
+/// `CreateConfigurationSetRequest$ConfigurationSetName` targets
+/// `WordCharactersWithDelimiters`
+/// (`smithy_query(query="shape",shape="WordCharactersWithDelimiters",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
+/// a named string shape carrying no `@pattern` — so the form it admits is the one its name
+/// states: word characters, separated by the delimiters a name is written with. These are
+/// those delimiters; everything else (a space, punctuation) is not part of a name. A word
+/// character itself — an ASCII letter, a digit or `_`, the `\w` class — is admitted
+/// wherever it appears and is not listed here.
+const NAME_DELIMITERS: [char; 2] = ['-', '.'];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -149,16 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // `ConfigurationSetName` is the only input and it is what the set is keyed by,
-        // so an absent or blank name names no resource to create: a parameter this
-        // service's validation cannot use, refused as the modelled "input you provided
-        // is invalid", HTTP 400. The name is stored EXACTLY as sent — trimming is only
-        // how blankness is detected, because every other operation resolves the set by
-        // the raw `{ConfigurationSetName}` path label, so a stored key that differs from
-        // what the caller sent would not resolve there.
+        // `ConfigurationSetName` is the only input and it is what the set is keyed by, so
+        // a name this service cannot file a set under names nothing to create: a parameter
+        // its validation cannot use, refused as the modelled "input you provided is
+        // invalid", HTTP 400. That covers an absent, empty or blank name and one carrying
+        // a character the member's shape does not admit
+        // ([`is_word_characters_with_delimiters`]) — one sentence for one class of
+        // failure. Validation is answered BEFORE the authorization decision below, so a
+        // caller can tell "fix the name" (400) from "you may not create one" (403).
+        //
+        // An admitted name is stored EXACTLY as sent, because every other operation
+        // resolves the set by the raw `{ConfigurationSetName}` path label, so a stored key
+        // that differed from what the caller sent would not resolve there.
         let name = input
             .configuration_set_name
-            .filter(|name| !name.trim().is_empty())
+            .filter(|name| is_word_characters_with_delimiters(name))
             .ok_or_else(|| {
                 CreateConfigurationSetErrorModeled::BadRequestException(BadRequestException {
                     message: Some(super::types::refusal_wording::invalid_parameters(&[
@@ -175,6 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+
+        // AUTHORIZATION: creating a configuration set is resource-scoped, so it is decided
+        // by the one rule in `types::authorization` — and decided HERE, before the store is
+        // read and before anything is inserted, so an unentitled account cannot create a
+        // set, cannot learn whether a name is taken, and gets the same answer however many
+        // callers race at one name.
+        if let Some(denied) = super::types::authorization::resource_scope_denial(&store) {
+            return Err(denied);
+        }
 
         // A configuration set name is unique within an account and region, so a second
         // create of the same name is a conflict, not an idempotent no-op.
@@ -206,4 +232,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateConfigurationSetOutput {})
     }
+}
+
+/// Whether `name` is word characters with delimiters: the form the member's shape states
+/// (see [`NAME_DELIMITERS`]).
+///
+/// A word character is an ASCII letter, a digit or `_`; a delimiter is one of
+/// [`NAME_DELIMITERS`]. A name has to be WORDS written with delimiters, so it carries at
+/// least one word character — a name of delimiters alone (`-`, `.`, `-.-`) spells no word,
+/// and neither does the empty name. Anything else is not a name either: a space,
+/// punctuation, or a letter outside ASCII.
+fn is_word_characters_with_delimiters(name: &str) -> bool {
+    name.chars().any(is_word_character)
+        && name
+            .chars()
+            .all(|character| is_word_character(character) || NAME_DELIMITERS.contains(&character))
+}
+
+/// Whether `character` is a word character: an ASCII letter, a digit, or `_`.
+fn is_word_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }

@@ -168,6 +168,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: this reads the stored set and writes nothing.
         let store = state.lock();
 
+        // AUTHORIZATION: this read is scoped to ONE configuration set, so it is decided by
+        // the one rule in `types::authorization` — before the lookup below, which is why
+        // an unentitled caller gets this refusal and not the 404 an absent name would
+        // otherwise get: a caller that may not read the set learns nothing about whether
+        // it exists.
+        if let Some(denied) = super::types::authorization::resource_scope_denial(&store) {
+            return Err(denied);
+        }
+
         let set = store
             .configuration_sets
             .get(&input.configuration_set_name)

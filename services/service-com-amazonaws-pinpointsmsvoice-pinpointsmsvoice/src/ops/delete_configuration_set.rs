@@ -157,6 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // AUTHORIZATION: deleting a configuration set is resource-scoped, so it is decided
+        // by the one rule in `types::authorization` — before the lookup below, which is
+        // why an unentitled caller gets this refusal and not the 404 an absent name would
+        // otherwise get: the write path is closed, so whether the name exists is not
+        // something this request establishes.
+        if let Some(denied) = super::types::authorization::resource_scope_denial(&store) {
+            return Err(denied);
+        }
+
         // Removing the set removes the event destinations it owns with it: they are
         // held inside the set's own record, so there is nothing left behind for a
         // later create of the same name to inherit.

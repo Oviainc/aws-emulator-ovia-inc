@@ -14,6 +14,11 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+/// Whether the account this emulator serves may perform an action of this API at all — not
+/// a modelled shape, so it carries no `_types` suffix and is NOT glob-re-exported: a caller
+/// names the module (`types::authorization::resource_scope_denial`), which keeps the
+/// refusal's origin visible at the call site.
+pub mod authorization;
 pub mod create_configuration_set_event_destination_types;
 pub mod create_configuration_set_types;
 pub mod delete_configuration_set_event_destination_types;

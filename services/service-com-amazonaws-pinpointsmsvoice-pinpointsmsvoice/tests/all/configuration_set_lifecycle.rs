@@ -53,6 +53,14 @@ impl Harness {
         // own concern and is covered where it lives.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // This suite is about what the operations DO, so the account holds the entitlement
+        // this API's resource-scoped actions need. The entitlement itself — and that an
+        // account without it reaches none of this behaviour — is pinned in
+        // `legacy_surface_authorization.rs`.
+        engine
+            .state::<ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState>()
+            .lock()
+            .legacy_surface_entitled = true;
         Self { router, engine }
     }
 
@@ -311,18 +319,20 @@ async fn creating_a_configuration_set_without_a_name_is_a_bad_request() {
 /// listing reports that name and every operation that resolves the set by its path
 /// label finds it.
 ///
-/// The rows include names whose surrounding whitespace a trimming store would have
-/// silently rewritten — the caller's own name would then no longer resolve on the child
-/// and delete paths.
+/// The rows differ in case and in which delimiters the name carries — a name a
+/// normalising store would have rewritten (lower-cased, or with its delimiters folded
+/// together) no longer resolves on the child and delete paths. A name carrying anything
+/// the member's shape does not admit is refused rather than stored, which
+/// `configuration_set_names.rs` pins.
 #[tokio::test]
 async fn a_configuration_set_keeps_exactly_the_name_it_was_created_with() {
     // (name, the same name as a URI path segment)
     let cases: &[(&str, &str)] = &[
         ("demo-set", "demo-set"),
-        (" padded ", "%20padded%20"),
-        ("trailing ", "trailing%20"),
-        ("inner space", "inner%20space"),
+        ("DEMO-SET", "DEMO-SET"),
+        ("Mixed_Case-9", "Mixed_Case-9"),
         ("dots.and_dashes-9", "dots.and_dashes-9"),
+        ("a", "a"),
     ];
 
     for (name, path_segment) in cases {
@@ -385,7 +395,9 @@ async fn a_configuration_set_keeps_exactly_the_name_it_was_created_with() {
 /// an omitted member stays omitted.
 ///
 /// The rows differ in which sub-structures are present, in how many event types are
-/// matched, and in whether `Enabled` was given at all.
+/// matched, and in whether `Enabled` was given at all. Every `IamRoleArn` names a role of
+/// the account the emulator serves, because a role another account holds is one this
+/// service may not be handed at all (`legacy_surface_authorization.rs`).
 #[tokio::test]
 async fn event_destinations_round_trip_every_sub_structure() {
     let cases: &[(&str, Value)] = &[
@@ -403,7 +415,7 @@ async fn event_destinations_round_trip_every_sub_structure() {
                 "Enabled": false,
                 "MatchingEventTypes": ["INITIATED_CALL", "RINGING"],
                 "CloudWatchLogsDestination": {
-                    "IamRoleArn": "arn:aws:iam::111122223333:role/voice-logs",
+                    "IamRoleArn": "arn:aws:iam::000000000000:role/voice-logs",
                     "LogGroupArn": "arn:aws:logs:us-east-1:111122223333:log-group:/voice:*",
                 },
             }),
@@ -414,7 +426,7 @@ async fn event_destinations_round_trip_every_sub_structure() {
                 "MatchingEventTypes": ["BUSY", "FAILED", "NO_ANSWER"],
                 "KinesisFirehoseDestination": {
                     "DeliveryStreamArn": "arn:aws:firehose:us-east-1:111122223333:deliverystream/voice",
-                    "IamRoleArn": "arn:aws:iam::111122223333:role/voice-firehose",
+                    "IamRoleArn": "arn:aws:iam::000000000000:role/voice-firehose",
                 },
             }),
         ),
@@ -425,7 +437,7 @@ async fn event_destinations_round_trip_every_sub_structure() {
                 "MatchingEventTypes": ["ANSWERED", "COMPLETED_CALL"],
                 "SnsDestination": { "TopicArn": "arn:aws:sns:us-east-1:111122223333:all" },
                 "CloudWatchLogsDestination": { "LogGroupArn": "arn:aws:logs:us-east-1:111122223333:log-group:/all:*" },
-                "KinesisFirehoseDestination": { "IamRoleArn": "arn:aws:iam::111122223333:role/all" },
+                "KinesisFirehoseDestination": { "IamRoleArn": "arn:aws:iam::000000000000:role/all" },
             }),
         ),
         ("no members at all", json!({})),
@@ -1221,49 +1233,61 @@ async fn delete_removes_the_set_and_its_event_destinations() {
     }
 }
 
-/// RULE: `UpdateConfigurationSetEventDestination` and
-/// `DeleteConfigurationSetEventDestination` are not implemented yet, so they answer the
-/// scaffold's HTTP 501 rather than an empty success — their own gap issues own them.
+/// RULE: `UpdateConfigurationSetEventDestination` changes exactly the members its
+/// definition carries and leaves the rest of the stored destination alone, and
+/// `DeleteConfigurationSetEventDestination` removes one destination from its set and
+/// nothing else — both read back through `GetConfigurationSetEventDestinations`.
+///
+/// Those two operations' own behaviour is pinned over a table in
+/// `event_destination_updates.rs`; what this row adds is that they take part in the
+/// lifecycle this suite drives.
 #[tokio::test]
-async fn the_remaining_event_destination_operations_still_answer_501() {
+async fn the_remaining_event_destination_operations_edit_one_destination() {
     let harness = Harness::new();
     assert_eq!(harness.create_set("demo-set").await.status, 200);
-    assert_eq!(
-        harness
-            .create_destination("demo-set", "dest1", json!({ "Enabled": true }))
-            .await
-            .status,
-        200
-    );
-
-    let cases: &[(&str, &str, Option<Value>)] = &[
-        (
-            "PUT",
-            "/v1/sms-voice/configuration-sets/demo-set/event-destinations/dest1",
-            Some(json!({ "EventDestination": { "Enabled": false } })),
-        ),
-        (
-            "DELETE",
-            "/v1/sms-voice/configuration-sets/demo-set/event-destinations/dest1",
-            None,
-        ),
-    ];
-
-    for (method, path, body) in cases {
-        let answer = harness.call(method, path, body.clone()).await;
+    for name in ["dest1", "dest2"] {
         assert_eq!(
-            answer.status, 501,
-            "case {method} {path}: expected 501, got {} {}",
-            answer.status, answer.body
+            harness
+                .create_destination("demo-set", name, json!({ "Enabled": true }))
+                .await
+                .status,
+            200,
+            "creating {name}"
         );
     }
 
-    // And the 501s changed nothing: the destination is still there, as created.
+    let updated = harness
+        .call(
+            "PUT",
+            "/v1/sms-voice/configuration-sets/demo-set/event-destinations/dest1",
+            Some(json!({ "EventDestination": { "Enabled": false } })),
+        )
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "the update must answer 200, got {} {}",
+        updated.status, updated.body
+    );
+
+    let deleted = harness
+        .call(
+            "DELETE",
+            "/v1/sms-voice/configuration-sets/demo-set/event-destinations/dest2",
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "the delete must answer 200, got {} {}",
+        deleted.status, deleted.body
+    );
+
+    // The update is visible and the delete removed only its own destination.
     let read = harness.get_destinations("demo-set").await;
     assert_eq!(
         read.body.get("EventDestinations"),
-        Some(&json!([{ "Name": "dest1", "Enabled": true }])),
-        "a 501 must not mutate state, got {}",
+        Some(&json!([{ "Name": "dest1", "Enabled": false }])),
+        "expected the updated destination alone, got {}",
         read.body
     );
 }

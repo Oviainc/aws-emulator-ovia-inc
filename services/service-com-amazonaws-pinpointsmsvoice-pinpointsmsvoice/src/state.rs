@@ -39,6 +39,17 @@ pub struct ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState {
     /// between calls. Bounded at `MAX_CONFIGURATION_SETS` by the handler that inserts
     /// into it (`ops::create_configuration_set`).
     pub configuration_sets: BTreeMap<String, ConfigurationSet>,
+    /// Whether the account this emulator serves holds the entitlement this legacy API's
+    /// RESOURCE-SCOPED actions need (`ops::types::authorization` states the rule and the
+    /// refusal; `ops::list_configuration_sets`, which is account-scoped, does not consult
+    /// it).
+    ///
+    /// `false` by default, because that is what the service answers the account this
+    /// emulator serves: the entitlement is granted to an account out of band and there is
+    /// no operation in this model that grants it, so nothing a caller sends can change
+    /// this field. A suite that exercises what the actions DO sets it, which is also what
+    /// keeps the gate out of those suites' way.
+    pub legacy_surface_entitled: bool,
     /// Every voice message `SendVoiceMessage` accepted, oldest first, capped at
     /// `MAX_RECORDED_VOICE_MESSAGES` with oldest-first eviction by the handler that
     /// pushes onto it (`ops::send_voice_message`).
