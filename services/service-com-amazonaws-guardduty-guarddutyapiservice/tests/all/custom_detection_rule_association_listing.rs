@@ -38,6 +38,7 @@
 
 use serde_json::{json, Value};
 
+use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{call, call_in, error_code, new_router, Router};
 
 /// `ListCustomDetectionRuleAssociations` and `CreateCustomDetectionRuleAssociation`
@@ -618,7 +619,7 @@ async fn an_unissued_token_or_an_unusable_parameter_is_refused() {
     let expected = populate(&router, HOME_REGION, &ids).await;
     let count = expected.len() as i64;
 
-    // Each row: the case, the query, and the member the refusal must name (empty
+    // Each row: the case, the query, and the member the bad value sat on (empty
     // where the modelled constraint refuses it at the request boundary, which words
     // the refusal itself).
     let rows: Vec<(String, String, &str)> = vec![
@@ -687,9 +688,13 @@ async fn an_unissued_token_or_an_unusable_parameter_is_refused() {
                 class, INVALID_INPUT,
                 "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {response:?}"
             );
-            assert!(
-                message.contains(member),
-                "case {case:?}: the refusal must name {member}, got {message:?}"
+            // Every row that reaches the handler here carries a page token, and a
+            // token this service did not issue is refused with the ONE sentence the
+            // whole pagination surface answers, which names no member at all.
+            assert_eq!(
+                message,
+                page_token_refusal(),
+                "case {case:?}: expected the page-token refusal, got {message:?}"
             );
             for echoed in ["not-a-token", "9999", &count.to_string()] {
                 assert!(

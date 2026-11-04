@@ -40,6 +40,12 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+/// The refusal sentences this service answers whatever the operation and whatever
+/// made the request unacceptable — the wording that belongs to no one resource
+/// family, beside `override_refusal` below, which words what the request boundary
+/// refused.
+pub mod refusals;
+
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };

@@ -166,10 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DETECTOR_IDS_MAX,
         )
         .map_err(|_| {
-            // Under the error CLASS, naming the parameter at fault and not quoting
-            // the token back.
+            // Under the error CLASS, with the ONE page-token sentence every
+            // paginated report of this service answers: it names no member and
+            // quotes no token back ([`crate::service::refusals::page_token_rejection`]).
             crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invalid_parameter_message(crate::state::NEXT_TOKEN_MEMBER),
+                crate::service::refusals::page_token_rejection(),
             )
         })?;
 

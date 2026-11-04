@@ -228,9 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             FINDING_IDS_MAX,
         )
         .map_err(|_| {
-            bad_request(crate::state::invalid_parameter_message(
-                crate::state::NEXT_TOKEN_MEMBER,
-            ))
+            // The ONE page-token sentence every paginated report of this service
+            // answers ([`crate::service::refusals::page_token_rejection`]).
+            bad_request(crate::service::refusals::page_token_rejection())
         })?;
 
         Ok(ListFindingsOutput {

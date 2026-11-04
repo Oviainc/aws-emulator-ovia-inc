@@ -44,7 +44,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
-use service_com_amazonaws_guardduty_guarddutyapiservice::state::NEXT_TOKEN_MEMBER;
+use crate::client_rejections::page_token_refusal;
 
 use crate::detector_lifecycle::{call_in, error_code, error_shape, router_over, Router};
 use crate::negative_class_rejections::seed_invitation;
@@ -517,9 +517,12 @@ async fn an_unissued_token_or_an_out_of_range_page_size_is_refused() {
             "case {case:?}: expected the {INVALID_INPUT} class, got {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(NEXT_TOKEN_MEMBER),
-            "case {case:?}: the refusal must name {NEXT_TOKEN_MEMBER}, got {message:?}"
+        // A page token this service did not issue is refused with the ONE sentence
+        // the whole pagination surface answers, which names no member at all.
+        assert_eq!(
+            message,
+            page_token_refusal(),
+            "case {case:?}: expected the page-token refusal, got {message:?}"
         );
         assert!(
             !message.contains(token),

@@ -30,10 +30,10 @@ use serde_json::Value;
 use crate::detector_lifecycle::{call_in, error_code, new_router, Router};
 use crate::resource_tag_addition::tag_in;
 use crate::resource_tag_removal::{tag_map, tagged_resources, tags_of, untag_in, uri_label, Tagged};
+use service_com_amazonaws_guardduty_guarddutyapiservice::service::refusals::INVALID_RESOURCE_ARN_MESSAGE;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    not_owned_message, ENTITY_SET_TRANSITION_MILLIS, IP_SET_DELETED, IP_SET_TRANSITION_MILLIS,
-    RESOURCE_ARN_MEMBER, TAGGED_SUB_RESOURCE_SEGMENTS, THREAT_INTEL_SET_DELETED,
-    THREAT_INTEL_SET_DELETION_SPAN_MILLIS,
+    ENTITY_SET_TRANSITION_MILLIS, IP_SET_DELETED, IP_SET_TRANSITION_MILLIS,
+    TAGGED_SUB_RESOURCE_SEGMENTS, THREAT_INTEL_SET_DELETED, THREAT_INTEL_SET_DELETION_SPAN_MILLIS,
 };
 
 /// The Region every request in this suite is signed for.
@@ -187,7 +187,7 @@ fn assert_refused(case: &str, arn: &str, status: u16, body: &Value) {
         class, INVALID_INPUT,
         "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
     );
-    let expected = not_owned_message(RESOURCE_ARN_MEMBER);
+    let expected = INVALID_RESOURCE_ARN_MESSAGE;
     let message = body["message"].as_str().unwrap_or_default();
     assert_eq!(
         message, expected,

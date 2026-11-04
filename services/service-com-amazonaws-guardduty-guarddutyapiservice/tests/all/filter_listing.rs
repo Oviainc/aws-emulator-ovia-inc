@@ -28,12 +28,11 @@
 
 use serde_json::{json, Value};
 
+use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
-use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DETECTOR_ID_MEMBER, NEXT_TOKEN_MEMBER,
-};
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::DETECTOR_ID_MEMBER;
 
 /// The error class every client rejection on this service carries in the body's
 /// `__type` discriminator.
@@ -510,43 +509,44 @@ async fn an_unresolvable_detector_or_token_is_refused_without_echoing_it() {
     }
 
     // Each row: the case, the detectorId the list uses, the query it carries, and the
-    // member the refusal must name.
-    let rows: Vec<(&str, String, String, &str)> = vec![
+    // member the refusal must name — `None` where the refusal's own class names none,
+    // which is how a page token this service did not issue is refused.
+    let rows: Vec<(&str, String, String, Option<&str>)> = vec![
         (
             "a well-formed detectorId no create minted",
             ABSENT_DETECTOR_ID.to_string(),
             String::new(),
-            DETECTOR_ID_MEMBER,
+            Some(DETECTOR_ID_MEMBER),
         ),
         (
             "a value that cannot be a detectorId at all",
             "not-a-detector".to_string(),
             String::new(),
-            DETECTOR_ID_MEMBER,
+            Some(DETECTOR_ID_MEMBER),
         ),
         (
             "a detectorId at the modelled minimum length",
             "x".to_string(),
             String::new(),
-            DETECTOR_ID_MEMBER,
+            Some(DETECTOR_ID_MEMBER),
         ),
         (
             "a nextToken that is not a token this service issues",
             detector.clone(),
             "?nextToken=not-a-token".to_string(),
-            NEXT_TOKEN_MEMBER,
+            None,
         ),
         (
             "a nextToken pointing past the end of the list",
             detector.clone(),
             "?nextToken=9999".to_string(),
-            NEXT_TOKEN_MEMBER,
+            None,
         ),
         (
             "a nextToken pointing at the entry just past the last one",
             detector.clone(),
             "?nextToken=2".to_string(),
-            NEXT_TOKEN_MEMBER,
+            None,
         ),
     ];
 
@@ -562,10 +562,17 @@ async fn an_unresolvable_detector_or_token_is_refused_without_echoing_it() {
             "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: the refusal must name {member}, got {message:?}"
-        );
+        match member {
+            Some(member) => assert!(
+                message.contains(member),
+                "case {case:?}: the refusal must name {member}, got {message:?}"
+            ),
+            None => assert_eq!(
+                message,
+                page_token_refusal(),
+                "case {case:?}: expected the page-token refusal, got {message:?}"
+            ),
+        }
         for echoed in ["not-a-detector", "not-a-token", "9999", ABSENT_DETECTOR_ID] {
             assert!(
                 !message.contains(echoed),

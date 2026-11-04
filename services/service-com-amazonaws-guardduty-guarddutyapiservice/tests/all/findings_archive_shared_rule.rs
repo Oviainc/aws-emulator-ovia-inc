@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use super::client_rejections::{invalid_parameter, not_owned};
+use super::client_rejections::{invalid_parameter, not_owned, UNUSABLE_INPUT_VALUE};
 use super::detector_lifecycle::{
     all_finding_ids, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -170,7 +170,7 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
 
     let upper_cased_detector = detector_id.to_uppercase();
     let upper_cased_finding = held[0].to_uppercase();
-    let rows: [(&str, &str, &str, Vec<String>, Expected); 11] = [
+    let rows: [(&str, &str, &str, Vec<String>, Expected); 12] = [
         (
             "an empty batch",
             HOME_REGION,
@@ -215,7 +215,7 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
             HOME_REGION,
             detector_id.as_str(),
             vec!["not-a-finding-id".to_string(), held[3].clone()],
-            Expected::RefusedWith(invalid_parameter("findingIds")),
+            Expected::RefusedWith(UNUSABLE_INPUT_VALUE.to_string()),
         ),
         (
             "a held finding id upper-cased",
@@ -245,14 +245,27 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
             held.clone(),
             Expected::RefusedWith(not_owned("detectorId")),
         ),
-        // The detector is resolved BEFORE the batch, so a request that fails both ways
-        // is refused on the detector id.
+        // A WELL-FORMED id the detector does not hold is resolved against the store,
+        // so the detector is resolved first and a request that fails both ways is
+        // refused on the detector id.
         (
             "a detector id nobody created AND an unheld finding id",
             HOME_REGION,
             upper_cased_detector.as_str(),
             vec!["ffffffffffffffffffffffffffffffff".to_string()],
             Expected::RefusedWith(not_owned("detectorId")),
+        ),
+        // A value that could not be a finding id at ALL is refused on its FORM, which
+        // is settled before the store is consulted — the same precedence every pure
+        // form rule on this service has (`CreateFilter` refuses a name outside the
+        // filter-name alphabet before it resolves the detector) — so this request,
+        // which also names a detector nobody created, is refused on the id.
+        (
+            "a detector id nobody created AND a value that cannot be a finding id",
+            HOME_REGION,
+            upper_cased_detector.as_str(),
+            vec!["not-a-finding-id".to_string()],
+            Expected::RefusedWith(UNUSABLE_INPUT_VALUE.to_string()),
         ),
     ];
 

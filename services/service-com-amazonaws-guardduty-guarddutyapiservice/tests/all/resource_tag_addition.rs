@@ -33,8 +33,9 @@ use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call_in, error_code, new_router, Router, ABSENT_DETECTOR_ID};
 use crate::resource_tag_removal::{arn_of, tag_map, tagged_resources, tags_of, uri_label, Tagged};
+use service_com_amazonaws_guardduty_guarddutyapiservice::service::refusals::INVALID_RESOURCE_ARN_MESSAGE;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    RESOURCE_ARN_MEMBER, TAGGED_SUB_RESOURCE_SEGMENTS, TAGS_PER_RESOURCE,
+    TAGGED_SUB_RESOURCE_SEGMENTS, TAGS_PER_RESOURCE,
 };
 
 /// The Region every request in this suite is signed for, unless a case names another.
@@ -343,9 +344,9 @@ async fn an_unresolvable_resource_arn_is_refused_without_echoing_it() {
             "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(RESOURCE_ARN_MEMBER),
-            "case {case:?}: the refusal must name {RESOURCE_ARN_MEMBER}, got {message:?}"
+        assert_eq!(
+            message, INVALID_RESOURCE_ARN_MESSAGE,
+            "case {case:?}: expected {INVALID_RESOURCE_ARN_MESSAGE:?}, got {message:?}"
         );
         for echoed in [arn.as_str(), detector.as_str()] {
             assert!(

@@ -44,9 +44,10 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    ADMIN_ACCOUNT_ID_MEMBER, ADMIN_DISABLE_SPAN_MILLIS, NEXT_TOKEN_MEMBER,
+    ADMIN_ACCOUNT_ID_MEMBER, ADMIN_DISABLE_SPAN_MILLIS,
 };
 
+use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{call_in, error_code, error_shape, new_router, Router};
 
 /// The error CLASS every client rejection on this service carries in the body's
@@ -615,9 +616,13 @@ async fn the_read_is_paginated_over_a_list_of_at_most_one_entry() {
                 "case {case:?} in {holding}: expected the {INVALID_INPUT} class, got {body:?}"
             );
             let message = body["message"].as_str().unwrap_or_default();
-            assert!(
-                message.contains(NEXT_TOKEN_MEMBER),
-                "case {case:?} in {holding}: the refusal must name {NEXT_TOKEN_MEMBER}, got {message:?}"
+            // A page token this service did not issue is refused with the ONE
+            // sentence the whole pagination surface answers, which names no member
+            // at all.
+            assert_eq!(
+                message,
+                page_token_refusal(),
+                "case {case:?} in {holding}: expected the page-token refusal, got {message:?}"
             );
             assert!(
                 !message.contains(token),

@@ -135,6 +135,19 @@ pub(crate) fn account_ids_format(member: &str) -> String {
 pub(crate) const ACCOUNT_ID_FORMAT: &str =
     "The request failed because the 'accountId' was formatted incorrectly.";
 
+/// The message GuardDuty refuses an unusable input value with where it does NOT
+/// name the member at fault: its generic input-parameter sentence. Written out here
+/// rather than read from the service so the test pins the words themselves.
+pub(crate) const UNUSABLE_INPUT_VALUE: &str =
+    "The request is rejected because an invalid or out-of-range value is specified as an input parameter.";
+
+/// The message a page token this service did not issue is refused with, on every
+/// paginated operation of this service: [`UNUSABLE_INPUT_VALUE`], which names
+/// neither `nextToken` nor the token.
+pub(crate) fn page_token_refusal() -> String {
+    UNUSABLE_INPUT_VALUE.to_string()
+}
+
 /// The message a well-formed id this account does not own is refused with.
 pub(crate) fn not_owned(member: &str) -> String {
     format!(
@@ -372,10 +385,11 @@ async fn a_second_create_detector_is_refused_as_an_existing_detector() {
 // ---------------------------------------------------------------------------
 
 /// A `NextToken` is opaque: the only thing a caller may do with it is hand back one
-/// this service issued. Anything else is a bad value for that parameter, and the
-/// rejection names the parameter rather than quoting the token.
+/// this service issued. Anything else is a value the service cannot use, refused
+/// with its generic input-parameter sentence, which names neither the member nor the
+/// token.
 #[tokio::test]
-async fn a_next_token_this_service_did_not_issue_is_refused_as_an_invalid_parameter() {
+async fn a_next_token_this_service_did_not_issue_is_refused_as_an_unusable_input_value() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
 
@@ -416,7 +430,7 @@ async fn a_next_token_this_service_did_not_issue_is_refused_as_an_invalid_parame
                     call(&router, "POST", &path, Some(body)).await
                 }
             };
-            assert_rejection(&case, status, &response, &invalid_parameter("nextToken"));
+            assert_rejection(&case, status, &response, &page_token_refusal());
             assert_quotes_nothing_back(&case, &response, token, "us-east-1");
         }
     }

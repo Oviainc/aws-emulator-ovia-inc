@@ -32,10 +32,9 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::invalid_parameter;
+use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{call, enabled_detector, error_code, new_router, Router};
 use crate::member_association::create_members;
-use service_com_amazonaws_guardduty_guarddutyapiservice::state::NEXT_TOKEN_MEMBER;
 
 /// The error class every client rejection on this service carries in the body's
 /// `__type` discriminator.
@@ -373,8 +372,9 @@ fn respellings(token: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// Assert one refusal: HTTP 400 under this service's rejection class, naming
-/// `nextToken` and quoting the token back nowhere.
+/// Assert one refusal: HTTP 400 under this service's rejection class, with the ONE
+/// page-token sentence the whole pagination surface answers — which names no member
+/// — and quoting the token back nowhere.
 fn assert_refused(case: &str, status: u16, body: &Value, token: &str) {
     assert_eq!(
         status, 400,
@@ -387,8 +387,8 @@ fn assert_refused(case: &str, status: u16, body: &Value, token: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(invalid_parameter(NEXT_TOKEN_MEMBER).as_str()),
-        "case {case:?}: expected the refusal to name {NEXT_TOKEN_MEMBER}, got {body:?}"
+        Some(page_token_refusal().as_str()),
+        "case {case:?}: expected the page-token refusal, got {body:?}"
     );
     assert!(
         !body["message"].as_str().unwrap_or_default().contains(token),

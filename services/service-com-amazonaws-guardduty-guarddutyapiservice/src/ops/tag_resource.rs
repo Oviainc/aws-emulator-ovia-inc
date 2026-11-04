@@ -164,10 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         let Some(tags) = state.tagged_resource_tags_mut(&region, &input.resource_arn) else {
-            // Classified from the REQUEST, the way every other unresolvable
-            // reference on this service is classified, and without echoing the ARN.
+            // ONE sentence for every reason the ARN did not resolve, with neither
+            // the member nor the ARN echoed
+            // ([`crate::service::refusals::resource_arn_rejection`]).
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::resource_arn_rejection(&input.resource_arn),
+                crate::service::refusals::resource_arn_rejection(),
             ));
         };
 

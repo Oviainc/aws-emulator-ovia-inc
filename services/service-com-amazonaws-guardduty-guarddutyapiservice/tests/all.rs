@@ -159,6 +159,8 @@ mod malware_scan_settings;
 mod master_account_disassociation;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
+#[path = "all/member_agnostic_refusal_texts.rs"]
+mod member_agnostic_refusal_texts;
 #[path = "all/member_association.rs"]
 mod member_association;
 #[path = "all/member_batch_no_op_clock.rs"]

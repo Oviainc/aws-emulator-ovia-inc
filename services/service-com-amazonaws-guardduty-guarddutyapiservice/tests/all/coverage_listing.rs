@@ -34,6 +34,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
+use super::client_rejections::UNUSABLE_INPUT_VALUE;
 use super::detector_lifecycle::{
     call, call_in, create_detector, enabled_detector, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -390,12 +391,12 @@ async fn a_criterion_sort_or_token_this_service_cannot_evaluate_is_refused() {
         (
             "a nextToken that is not one this service issues",
             json!({"nextToken": "not-a-token"}),
-            "nextToken",
+            UNUSABLE_INPUT_VALUE,
         ),
         (
             "a nextToken past the end of the report",
             json!({"nextToken": "0"}),
-            "nextToken",
+            UNUSABLE_INPUT_VALUE,
         ),
         (
             "maxResults below the modelled minimum of 1",

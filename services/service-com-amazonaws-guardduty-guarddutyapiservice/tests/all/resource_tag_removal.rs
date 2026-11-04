@@ -23,7 +23,8 @@
 //! 4. An ARN this endpoint resolves no resource for — another account's, another
 //!    partition's, another Region's, an id nothing minted, a resource type GuardDuty
 //!    does not tag — is refused with HTTP 400 under the `InvalidInputException`
-//!    class, which names the member and never echoes the ARN, and persists nothing.
+//!    class, under the ONE fixed sentence the whole tagging surface answers, which
+//!    never echoes the ARN, and persists nothing.
 //!
 //! The fixture that creates one resource of every class a tag ARN can name, and the
 //! ARN/read-URI helpers around it, are `pub(crate)` so the `resource_tag_addition`
@@ -33,9 +34,8 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call_in, error_code, new_router, Router, ABSENT_DETECTOR_ID};
-use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    RESOURCE_ARN_MEMBER, TAGGED_SUB_RESOURCE_SEGMENTS,
-};
+use service_com_amazonaws_guardduty_guarddutyapiservice::service::refusals::INVALID_RESOURCE_ARN_MESSAGE;
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::TAGGED_SUB_RESOURCE_SEGMENTS;
 
 /// The Region every request in this suite is signed for, unless a case names
 /// another.
@@ -573,9 +573,9 @@ async fn an_unresolvable_resource_arn_is_refused_without_echoing_it() {
             "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(RESOURCE_ARN_MEMBER),
-            "case {case:?}: the refusal must name {RESOURCE_ARN_MEMBER}, got {message:?}"
+        assert_eq!(
+            message, INVALID_RESOURCE_ARN_MESSAGE,
+            "case {case:?}: expected {INVALID_RESOURCE_ARN_MESSAGE:?}, got {message:?}"
         );
         for echoed in [arn.as_str(), detector.as_str()] {
             assert!(

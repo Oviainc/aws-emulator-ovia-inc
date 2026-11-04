@@ -40,6 +40,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::ORG_CONFIGURATION_TRANSITION_MILLIS;
 
+use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{call, call_in, error_code, new_router, Router};
 
 /// `ListCustomDetectionRuleOrgConfigurations` is
@@ -706,9 +707,8 @@ async fn an_org_configuration_is_listed_only_by_the_region_that_created_it() {
 // ---------------------------------------------------------------------------
 
 /// One refusal row: the case, the query parameters that make the request unusable,
-/// and the member the refusal must name — empty where the refusal comes from the
-/// modelled constraint rather than from the handler, which names the member in its own
-/// wording.
+/// and the member the bad value sat on — empty where the refusal comes from the
+/// modelled constraint rather than from the handler, which words the refusal itself.
 struct Refusal {
     case: &'static str,
     params: Vec<(&'static str, String)>,
@@ -792,10 +792,13 @@ async fn an_unusable_listing_request_is_refused_without_echoing_the_value() {
                 class, INVALID_INPUT,
                 "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {response:?}"
             );
-            assert!(
-                message.contains(row.member),
-                "case {case:?}: the refusal must name {}, got {message:?}",
-                row.member
+            // Every row that reaches the handler here carries a page token, and a
+            // token this service did not issue is refused with the ONE sentence the
+            // whole pagination surface answers, which names no member at all.
+            assert_eq!(
+                message,
+                page_token_refusal(),
+                "case {case:?}: expected the page-token refusal, got {message:?}"
             );
         }
         for echoed in ["not-a-token", "9999", "ENABLED", "-5"] {

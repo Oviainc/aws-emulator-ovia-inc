@@ -212,12 +212,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|_rejected_token| {
             // `paginate_window` fails on ONE thing — the token it hands back, which
-            // is not one this service issued — so the refusal names that member and
-            // nothing else; `maxResults` is a modelled `range 1..50`, refused at the
-            // boundary before this handler runs. Under the error CLASS, naming the
-            // parameter at fault and not quoting the token back.
+            // is not one this service issued; `maxResults` is a modelled
+            // `range 1..50`, refused at the boundary before this handler runs. Under
+            // the error CLASS, with the ONE page-token sentence every paginated
+            // report of this service answers: it names no member and quotes no token
+            // back ([`crate::service::refusals::page_token_rejection`]).
             crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invalid_parameter_message(crate::state::NEXT_TOKEN_MEMBER),
+                crate::service::refusals::page_token_rejection(),
             )
         })?;
 

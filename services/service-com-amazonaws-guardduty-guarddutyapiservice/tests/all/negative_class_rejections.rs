@@ -36,7 +36,7 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     INVALID_FINDING_IDS_MESSAGE, RELATIONSHIP_INVITED, SET_ID_NOT_FOUND_MESSAGE,
 };
 
-use super::client_rejections::invalid_parameter;
+use super::client_rejections::UNUSABLE_INPUT_VALUE;
 use super::detector_lifecycle::{
     all_finding_ids, call, enabled_detector, error_code, error_shape, new_router, router_over,
     Router,
@@ -510,8 +510,8 @@ async fn archiving_a_finding_id_the_detector_does_not_hold_is_refused_and_moves_
     let upper_cased = held[0].to_uppercase();
     // Each row: the id the batch names, why it resolves to nothing, and the message
     // the refusal carries — the finding-identifier sentence for a value that IS of
-    // the finding-id form but names no finding of this detector, and the
-    // parameter-value refusal for a value that could not be a finding id at all.
+    // the finding-id form but names no finding of this detector, and the generic
+    // input-parameter sentence for a value that could not be a finding id at all.
     let absent: [(&str, &str, String); 5] = [
         (
             "ffffffffffffffffffffffffffffffff",
@@ -526,17 +526,17 @@ async fn archiving_a_finding_id_the_detector_does_not_hold_is_refused_and_moves_
         (
             "not-a-finding-id",
             "not hexadecimal at all",
-            invalid_parameter("findingIds"),
+            UNUSABLE_INPUT_VALUE.to_string(),
         ),
         (
             "abc123",
             "too short to be a finding id",
-            invalid_parameter("findingIds"),
+            UNUSABLE_INPUT_VALUE.to_string(),
         ),
         (
             "0123456789abcdef0123456789abcdef0",
             "33 characters: one past the id length",
-            invalid_parameter("findingIds"),
+            UNUSABLE_INPUT_VALUE.to_string(),
         ),
     ];
 

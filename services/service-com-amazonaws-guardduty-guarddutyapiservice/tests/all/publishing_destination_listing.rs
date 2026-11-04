@@ -36,6 +36,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{
     call_in, enabled_detector, error_code, error_shape, new_router, Router, ABSENT_DETECTOR_ID,
 };
@@ -733,10 +734,21 @@ async fn an_unresolvable_detector_or_token_is_refused_without_echoing_it() {
             "case {case:?}: expected the modelled error shape {ENVELOPE}, got {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: expected the message to name {member:?}, got {message:?}"
-        );
+        if member == NEXT_TOKEN_MEMBER {
+            // A page token this service did not issue is refused with the ONE
+            // sentence the whole pagination surface answers, which names no member
+            // at all.
+            assert_eq!(
+                message,
+                page_token_refusal(),
+                "case {case:?}: expected the page-token refusal, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains(member),
+                "case {case:?}: expected the message to name {member:?}, got {message:?}"
+            );
+        }
         assert!(
             !message.contains(&secret),
             "case {case:?}: the refusal must not echo {secret:?}, got {message:?}"

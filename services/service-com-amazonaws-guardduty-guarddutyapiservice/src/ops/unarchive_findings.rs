@@ -144,6 +144,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx);
 
+        // The FORM of each named id is the handler's to check — `FindingIds` is a
+        // plain list of strings, so a value that could not be a finding id at all
+        // reaches here — and it is checked before the store is consulted, so a
+        // refused batch unarchives nothing
+        // ([`crate::service::refusals::malformed_finding_id_rejection`]).
+        if let Some(message) =
+            crate::service::refusals::malformed_finding_id_rejection(&input.finding_ids)
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
         let mut state = state.lock();
         // Both directions of this write — and both of its refusals, classified from
         // the REQUEST — are the one rule in

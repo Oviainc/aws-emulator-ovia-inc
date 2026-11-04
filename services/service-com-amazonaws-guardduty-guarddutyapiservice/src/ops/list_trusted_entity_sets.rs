@@ -195,11 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             TRUSTED_ENTITY_SET_IDS_MAX,
         )
         .map_err(|_| {
-            // Under the error CLASS, naming the parameter at fault and not quoting the
-            // token back.
-            bad_request(crate::state::invalid_parameter_message(
-                crate::state::NEXT_TOKEN_MEMBER,
-            ))
+            // Under the error CLASS, with the ONE page-token sentence every
+            // paginated report of this service answers: it names no member and
+            // quotes no token back ([`crate::service::refusals::page_token_rejection`]).
+            bad_request(crate::service::refusals::page_token_rejection())
         })?;
 
         Ok(ListTrustedEntitySetsOutput {

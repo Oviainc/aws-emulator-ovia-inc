@@ -28,7 +28,7 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::{invalid_parameter, not_owned};
+use crate::client_rejections::{invalid_parameter, not_owned, page_token_refusal};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -300,8 +300,8 @@ async fn paging_the_member_list_yields_each_member_exactly_once() {
         );
     }
 
-    // A token this service never issued is refused, naming the parameter at fault
-    // and not quoting the token back.
+    // A token this service never issued is refused with the ONE sentence the whole
+    // pagination surface answers: it names no member and quotes no token back.
     for (case, token) in [
         ("not a decimal offset at all", "banana"),
         ("past the end of the list", "99"),
@@ -309,7 +309,7 @@ async fn paging_the_member_list_yields_each_member_exactly_once() {
     ] {
         let (status, body) =
             list_members(&router, &detector_id, &format!("?nextToken={token}")).await;
-        assert_rejected(case, status, &body, &invalid_parameter("nextToken"));
+        assert_rejected(case, status, &body, &page_token_refusal());
     }
 }
 

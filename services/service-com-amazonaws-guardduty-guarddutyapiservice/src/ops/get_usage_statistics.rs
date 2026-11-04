@@ -771,9 +771,9 @@ fn page(
 ) -> Result<(Vec<String>, Option<String>), GetUsageStatisticsError> {
     let keys = ordered(totals, order);
     crate::state::paginate(listing, &keys, max_results, token, TOP_ROWS).map_err(|_| {
-        bad_request(crate::state::invalid_parameter_message(
-            crate::state::NEXT_TOKEN_MEMBER,
-        ))
+        // The ONE page-token sentence every paginated report of this service
+        // answers ([`crate::service::refusals::page_token_rejection`]).
+        bad_request(crate::service::refusals::page_token_rejection())
     })
 }
 
