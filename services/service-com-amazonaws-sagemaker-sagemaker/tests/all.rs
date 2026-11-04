@@ -75,6 +75,8 @@ mod experiment_tracking_updates;
 mod feature_group_deletion;
 #[path = "all/feature_group_lifecycle.rs"]
 mod feature_group_lifecycle;
+#[path = "all/feature_group_updates.rs"]
+mod feature_group_updates;
 #[path = "all/hub_content_references.rs"]
 mod hub_content_references;
 #[path = "all/hub_contents_listing.rs"]

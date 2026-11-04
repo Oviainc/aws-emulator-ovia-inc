@@ -492,17 +492,16 @@ fn validate_schema(input: &CreateFeatureGroupInput) -> Result<(), CreateFeatureG
 /// what the operation would do (an unknown `StorageType` is not "the default tier", an
 /// unknown `ThroughputMode` is not "on demand"), so it is refused rather than read as
 /// "not the value I compare against". `declared` is always the generated `*_VALUES` list
-/// in `ops::types`, i.e. the model's own value list.
+/// in `ops::types`, i.e. the model's own value list, and the SENTENCE is the service's own
+/// for every enum-typed member ([`crate::service::validation::enum_member_refusal`]), so
+/// two operations checking one enum cannot word the same fact differently.
 fn enum_member(
     member: &str,
     value: &str,
     declared: &[&str],
 ) -> Result<(), CreateFeatureGroupError> {
-    if declared.contains(&value) {
-        return Ok(());
+    match crate::service::validation::enum_member_refusal(member, value, declared) {
+        Some(refusal) => Err(crate::scaffolded::Scaffolded::validation(refusal)),
+        None => Ok(()),
     }
-    Err(crate::scaffolded::Scaffolded::validation(format!(
-        "{member}: '{value}' is not one of the accepted values; expected one of {}.",
-        declared.join(", ")
-    )))
 }

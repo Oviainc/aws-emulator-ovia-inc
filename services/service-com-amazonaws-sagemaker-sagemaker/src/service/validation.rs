@@ -323,6 +323,27 @@ pub(crate) fn artifact_properties_refusal(
     })
 }
 
+/// How this service states an enum-typed member carrying a value the model does not
+/// declare, or `None` when `declared` holds the value.
+///
+/// An enum reaches a handler as a plain string, so a value outside the enum is refused by
+/// the handler that reads it rather than by the walk — and the sentence is a property of
+/// the ENUM-TYPED MEMBER, not of one operation, so every handler that checks one words it
+/// here instead of each stating it again. `declared` is always a generated `*_VALUES` list
+/// in `crate::ops::types`, i.e. the model's own value list.
+pub(crate) fn enum_member_refusal(
+    member: &str,
+    value: &str,
+    declared: &[&str],
+) -> Option<String> {
+    (!declared.contains(&value)).then(|| {
+        format!(
+            "{member}: '{value}' is not one of the accepted values; expected one of {}.",
+            declared.join(", ")
+        )
+    })
+}
+
 /// The `ValidationException` envelope around one clause this service stated itself.
 ///
 /// Spelled exactly as [`aws_smithy_schema_server::envelope`] spells a single-violation

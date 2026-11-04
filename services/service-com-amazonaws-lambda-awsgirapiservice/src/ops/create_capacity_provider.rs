@@ -12,12 +12,11 @@
 //! `GetCapacityProvider` reports `Active` once that is due.
 //!
 //! The OPERATOR ROLE the request names is resolved against this account's IAM before
-//! anything is stored, because the provider manages compute AS that role: a role whose
-//! stored trust policy does not admit this service is refused
-//! `InvalidParameterValueException` with nothing persisted (see
-//! `crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE`), while a name this
-//! account's IAM holds no role under is served — a refusal has to be grounded in a trust
-//! document IAM answered with.
+//! anything is stored, because the provider manages compute AS that role: a role this
+//! account's IAM holds none of, or one whose stored trust policy does not admit this
+//! service, is refused `InvalidParameterValueException` with nothing persisted (see
+//! `crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE`), while a role of
+//! ANOTHER account — whose IAM this emulator cannot ask — is served.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +214,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PermissionsConfig` names "the IAM role ARN used by the capacity provider to
         // manage compute instances and other Amazon Web Services resources", and this
         // service makes those calls AS that role — so the role is resolved against this
-        // account's IAM before anything is written: a role whose stored trust policy does
-        // not let this service assume it is the modelled 400 and no provider is stored
+        // account's IAM before anything is written: a role this account's IAM holds none
+        // of, or one whose stored trust policy does not let this service assume it, is the
+        // modelled 400 and no provider is stored
         // (`crate::state::capacity_provider::operator_role_is_unassumable`).
         //
-        // That reading refuses only what a trust document IAM ANSWERED with withholds, as a
-        // function's execution role does: a name this account's IAM holds no role under is
-        // evidence about this emulator's store rather than about the role the caller named.
-        // It is put to the emulator's OWN IAM over its OWN in-process transport (that
-        // reading asks through `service_common::iam_role`, whose client is built from the
-        // operation callback): nothing here opens a socket, resolves a host or reads an
-        // ambient credential. An emulator with no IAM mounted to ask refuses nothing, so a
-        // missing answer never becomes a refusal. It is awaited with no store guard held.
+        // That reading states why an ABSENT IAM record answers here where it does not for a
+        // function's execution role: the role a provider manages compute as is part of what
+        // the client provisions in this account. It is put to the emulator's OWN IAM over
+        // its OWN in-process transport (that reading asks through
+        // `service_common::iam_role`, whose client is built from the operation callback):
+        // nothing here opens a socket, resolves a host or reads an ambient credential. An
+        // emulator with no IAM mounted to ask refuses nothing, so a missing answer never
+        // becomes a refusal. It is awaited with no store guard held.
         if crate::state::capacity_provider::operator_role_is_unassumable(
             ctx,
             &region,

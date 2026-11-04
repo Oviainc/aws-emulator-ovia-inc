@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFeatureGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFeatureGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFeatureGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `FeatureGroupNameOrArn` the request addresses against the
+//! feature groups `crate::state` holds, refuses a name this account holds no live group
+//! under with the modelled `ResourceNotFound`, and otherwise applies the ONE update the
+//! request carries — `FeatureAdditions`, `OnlineStoreConfig` or `ThroughputConfig` — to
+//! the stored group before answering its `FeatureGroupArn`. `DescribeFeatureGroup` reads
+//! every applied change back. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,346 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFeatureGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFeatureGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFeatureGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // "Use one of the following request parameters at a time while using the
+        // UpdateFeatureGroup API" (this operation's own doc): the three updates are
+        // alternatives and one of them is what the call is for, so a request carrying more
+        // than one states no single change and a request carrying none states no change at
+        // all. Both are refused before anything is read or written — an accepted call that
+        // updated nothing would still move the group's `LastModifiedTime`.
+        let stated = [
+            input.feature_additions.is_some(),
+            input.online_store_config.is_some(),
+            input.throughput_config.is_some(),
+        ]
+        .into_iter()
+        .filter(|stated| *stated)
+        .count();
+        if stated != 1 {
+            let at_a_time = if stated > 1 { " at a time" } else { "" };
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Use one of {}{at_a_time} while using the UpdateFeatureGroup API.",
+                UPDATE_MEMBERS.join(", ")
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a group
+        // whose deletion is done is gone here too. Each was due at its stored instant
+        // whether or not anybody called, so this call's observer makes no difference.
+        store.release_deleted_feature_groups(now);
+
+        // `FeatureGroupNameOrArn`: the ARN prefix is optional, so a group's ARN and its
+        // bare name address the one group — resolved through the crate's one feature-group
+        // lookup, which answers nothing for a group whose removal the clock already
+        // completed. A group whose deletion has already been asked for is held back the
+        // same way the delete path holds it back: it is on its way out, and "Data cannot
+        // be accessed from the OnlineStore immediately after DeleteFeatureGroup is called"
+        // (`DeleteFeatureGroup`), so there is no live group left for a mutation to change.
+        let name = crate::state::name_from_arn_or_name(&input.feature_group_name).to_string();
+        let updatable = store
+            .feature_group_mut(&input.feature_group_name)
+            .filter(|group| !group.is_deleting());
+        let Some(group) = updatable else {
+            // Never a 200 for a name this account holds no live group under: a caller
+            // cannot tell that from an update that happened. `ResourceNotFound` is the
+            // modelled refusal, worded by the one template every feature-group path
+            // shares.
+            return Err(UpdateFeatureGroupErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::feature_group_not_found(&name)),
+            })
+            .into());
+        };
+        // The provisioning the clock already owed is materialised before the update is
+        // applied: it was due at the stored instant whether or not anybody called. It needs
+        // no record of its own — this call's one state-change record, emitted below once the
+        // store guard is released, already names this operation and this group, so the
+        // transition it materialised travels with it rather than on a second line taken
+        // while the guard is still held.
+        group.settle_status(now);
+
+        // Each applier validates the whole update BEFORE it writes anything, so a refused
+        // update leaves the group exactly as it was — and only one of the three can be
+        // stated on a call, so there is no half-applied combination to reach.
+        if let Some(additions) = input.feature_additions {
+            apply_feature_additions(group, additions)?;
+        }
+        if let Some(online_store) = input.online_store_config {
+            apply_online_store_config(group, online_store)?;
+        }
+        if let Some(throughput) = input.throughput_config {
+            apply_throughput_config(group, throughput)?;
+        }
+        // "A timestamp indicating when the feature group was last updated"
+        // (`DescribeFeatureGroup`'s `LastModifiedTime`): this call is the update, so the
+        // instant moves even when the request restated a value the group already carried.
+        group.last_modified_time = now;
+        let arn = group.arn.clone();
+        drop(store);
+        // The shared feature-group directory is NOT rewritten here: it records the group's
+        // name, ARN, record-identifier and event-time features and whether its OnlineStore
+        // is on ([`::service_common::feature_store_groups::FeatureGroupRecord`]), and this
+        // operation models no member that changes any of them.
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateFeatureGroupOutput {
+            feature_group_arn: arn,
+        })
+    }
+}
+
+/// The input members that each state one update, in the order the modelled input declares
+/// them — named for the refusal that tells a caller to use one of them at a time.
+const UPDATE_MEMBERS: &[&str] = &["FeatureAdditions", "OnlineStoreConfig", "ThroughputConfig"];
+
+/// The largest number of `FeatureDefinition`s a feature group's schema may hold, from the
+/// `FeatureDefinitions` list's own `@length 1..2500`
+/// (`smithy_query(query="shape",shape="FeatureDefinitions")`).
+const MAX_FEATURE_DEFINITIONS: usize = 2500;
+
+/// The `ThroughputMode` that bills against stated capacity, as the model's `ThroughputMode`
+/// enum spells it (`THROUGHPUT_MODE_VALUES`).
+const THROUGHPUT_MODE_PROVISIONED: &str = "Provisioned";
+
+/// The `StorageType` a group can be migrated TO but not away from: "Use this parameter to
+/// migrate an existing feature group from Standard to Standard_V2 storage format… Migration
+/// is a one-way operation and cannot be reversed."
+/// (`smithy_query(query="doc",shape="OnlineStoreConfigUpdate",member="StorageType")`.)
+const STORAGE_TYPE_STANDARD_V2: &str = "Standard_V2";
+
+/// Add `additions` to `group`'s schema.
+///
+/// "You can add features for your feature group using the FeatureAdditions request
+/// parameter. Features cannot be removed from a feature group" (this operation's doc), so
+/// the additions are APPENDED to the stored definitions: the schema only grows, and the
+/// features a record already carries keep their place and their type.
+fn apply_feature_additions(
+    group: &mut crate::state::FeatureGroup,
+    additions: Vec<FeatureDefinition>,
+) -> Result<(), UpdateFeatureGroupError> {
+    // A feature group's schema is a map from feature name to type, so a name it already
+    // holds cannot be added again: the addition would have neither a single type nor a
+    // single column in the record it describes. Checked against the names the group holds
+    // AND the names earlier rows of this same request add.
+    let mut declared: ::std::collections::BTreeSet<&str> = group
+        .feature_definitions
+        .iter()
+        .map(|definition| definition.feature_name.as_str())
+        .collect();
+    for addition in &additions {
+        enum_member(
+            "FeatureAdditions.FeatureType",
+            &addition.feature_type,
+            FEATURE_TYPE_VALUES,
+        )?;
+        if let Some(collection_type) = &addition.collection_type {
+            enum_member(
+                "FeatureAdditions.CollectionType",
+                collection_type,
+                COLLECTION_TYPE_VALUES,
+            )?;
+        }
+        // The same three names the create path refuses, for the same reason: Feature Store
+        // writes those columns itself (`crate::state::RESERVED_FEATURE_NAMES`).
+        if crate::state::RESERVED_FEATURE_NAMES.contains(&addition.feature_name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "FeatureAdditions.FeatureName: '{}' is reserved by the FeatureStore and \
+                 cannot name a feature; the reserved names are {}.",
+                addition.feature_name,
+                crate::state::RESERVED_FEATURE_NAMES.join(", ")
+            )));
+        }
+        if !declared.insert(addition.feature_name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "FeatureAdditions.FeatureName: '{}' is already a Feature of FeatureGroup \
+                 {}; each feature name must be unique within a FeatureGroup and features \
+                 cannot be removed from a feature group.",
+                addition.feature_name, group.name
+            )));
+        }
+    }
+
+    // The schema is bounded by the modelled list it is reported in, so a caller looping on
+    // additions cannot grow it past what `DescribeFeatureGroup` may carry.
+    // `ResourceLimitExceeded` is the limit failure this operation models.
+    if group.feature_definitions.len() + additions.len() > MAX_FEATURE_DEFINITIONS {
+        return Err(UpdateFeatureGroupErrorModeled::ResourceLimitExceeded(
+            ResourceLimitExceeded {
+                message: Some(format!(
+                    "The maximum number of Features in a FeatureGroup is \
+                     {MAX_FEATURE_DEFINITIONS}, with current utilization of {} and a \
+                     request delta of {}.",
+                    group.feature_definitions.len(),
+                    additions.len()
+                )),
+            },
+        )
+        .into());
+    }
+
+    group.feature_definitions.extend(additions);
+    Ok(())
+}
+
+/// Apply an `OnlineStoreConfigUpdate` to `group`'s online store configuration.
+fn apply_online_store_config(
+    group: &mut crate::state::FeatureGroup,
+    update: OnlineStoreConfigUpdate,
+) -> Result<(), UpdateFeatureGroupError> {
+    // Both members of the update govern the OnlineStore — the TTL after which a record in
+    // it is hard deleted, and the tier it is served from — so a group that keeps no
+    // OnlineStore ("Turn OnlineStore off by specifying False for the EnableOnlineStore
+    // flag", `OnlineStoreConfig$EnableOnlineStore`) has no online store configuration for
+    // this member to update.
+    if !group.online_store_enabled() {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "OnlineStoreConfig: FeatureGroup {} has no OnlineStore, so its online store \
+             configuration cannot be updated.",
+            group.name
+        )));
+    }
+    let mut online_store = group.online_store_config.clone().unwrap_or_default();
+
+    if let Some(ttl_duration) = update.ttl_duration {
+        // "To remove the default TtlDuration from an existing feature group, use the
+        // UpdateFeatureGroup API and set the TtlDuration Unit and Value to null" (this
+        // operation's doc): an empty duration is how a caller drops the default TTL.
+        if ttl_duration.unit.is_none() && ttl_duration.value.is_none() {
+            online_store.ttl_duration = None;
+        } else {
+            // "ExpiresAt = EventTime + TtlDuration" (`TtlDuration`): a duration is a unit
+            // and a value together, so one without the other names no expiry instant.
+            let (Some(unit), Some(_)) = (&ttl_duration.unit, ttl_duration.value) else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "OnlineStoreConfig.TtlDuration: a TtlDuration is a Unit and a Value \
+                     together; set both to null to remove the default TtlDuration.",
+                ));
+            };
+            enum_member(
+                "OnlineStoreConfig.TtlDuration.Unit",
+                unit,
+                TTL_DURATION_UNIT_VALUES,
+            )?;
+            online_store.ttl_duration = Some(ttl_duration);
+        }
+    }
+
+    if let Some(storage_type) = update.storage_type {
+        enum_member(
+            "OnlineStoreConfig.StorageType",
+            &storage_type,
+            STORAGE_TYPE_VALUES,
+        )?;
+        // "Migration is a one-way operation and cannot be reversed"
+        // (`OnlineStoreConfigUpdate$StorageType`): a group already migrated to the tier
+        // that supports partial record updates cannot be moved off it.
+        if online_store.storage_type.as_deref() == Some(STORAGE_TYPE_STANDARD_V2)
+            && storage_type != STORAGE_TYPE_STANDARD_V2
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "OnlineStoreConfig.StorageType: migrating FeatureGroup {} to \
+                 {STORAGE_TYPE_STANDARD_V2} is a one-way operation and cannot be \
+                 reversed, so its StorageType cannot be changed to {storage_type}.",
+                group.name
+            )));
+        }
+        online_store.storage_type = Some(storage_type);
+    }
+
+    group.online_store_config = Some(online_store);
+    Ok(())
+}
+
+/// Apply a `ThroughputConfigUpdate` to `group`'s throughput configuration.
+///
+/// "You can switch between on-demand and provisioned modes or update the read / write
+/// capacity of provisioned feature groups" (`ThroughputConfigUpdate`), so a member the
+/// update leaves out keeps the value the group already runs under rather than being
+/// cleared.
+fn apply_throughput_config(
+    group: &mut crate::state::FeatureGroup,
+    update: ThroughputConfigUpdate,
+) -> Result<(), UpdateFeatureGroupError> {
+    // Every group runs under a throughput configuration: a create that stated none is
+    // stored with `crate::state::default_throughput_config`.
+    let active = group
+        .throughput_config
+        .clone()
+        .unwrap_or_else(crate::state::default_throughput_config);
+    let mode = match &update.throughput_mode {
+        Some(mode) => {
+            enum_member("ThroughputConfig.ThroughputMode", mode, THROUGHPUT_MODE_VALUES)?;
+            mode.clone()
+        }
+        None => active.throughput_mode.clone(),
+    };
+
+    let throughput_config = if mode == THROUGHPUT_MODE_PROVISIONED {
+        // "With provisioned throughput mode, you specify the read and write capacity per
+        // second that you expect your application to require" (`ThroughputConfig`): the
+        // capacity the update does not restate is the one the group already runs under, and
+        // a group switching INTO provisioned mode runs under none, so it has to state both.
+        let read = update
+            .provisioned_read_capacity_units
+            .or(active.provisioned_read_capacity_units);
+        let write = update
+            .provisioned_write_capacity_units
+            .or(active.provisioned_write_capacity_units);
+        let (Some(read), Some(write)) = (read, write) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ThroughputConfig: {THROUGHPUT_MODE_PROVISIONED} throughput mode requires \
+                 both ProvisionedReadCapacityUnits and ProvisionedWriteCapacityUnits."
+            )));
+        };
+        crate::ops::types::ThroughputConfig {
+            throughput_mode: mode,
+            provisioned_read_capacity_units: Some(read),
+            provisioned_write_capacity_units: Some(write),
+        }
+    } else {
+        // "This field is not applicable for on-demand feature groups"
+        // (`ThroughputConfig$ProvisionedReadCapacityUnits` and its write counterpart), so
+        // an on-demand group carries no capacity and a request stating one for it states
+        // a capacity nothing would be billed against.
+        if update.provisioned_read_capacity_units.is_some()
+            || update.provisioned_write_capacity_units.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ThroughputConfig: ProvisionedReadCapacityUnits and \
+                 ProvisionedWriteCapacityUnits are not applicable for {mode} feature \
+                 groups."
+            )));
+        }
+        crate::ops::types::ThroughputConfig {
+            throughput_mode: mode,
+            provisioned_read_capacity_units: None,
+            provisioned_write_capacity_units: None,
+        }
+    };
+
+    group.throughput_config = Some(throughput_config);
+    Ok(())
+}
+
+/// Refuse an enum-typed member carrying a value the model does not declare.
+///
+/// An enum reaches a handler as a plain string, and a value outside the enum changes what
+/// the update would do (an unknown `ThroughputMode` is not "on demand", an unknown
+/// `StorageType` is not "the tier it already has"), so it is refused rather than read as
+/// "not the value I compare against". `declared` is always the generated `*_VALUES` list in
+/// `ops::types`, i.e. the model's own value list, and the SENTENCE is the service's own for
+/// every enum-typed member ([`crate::service::validation::enum_member_refusal`]), so this
+/// path and the feature-group create path cannot word the same fact differently.
+fn enum_member(
+    member: &str,
+    value: &str,
+    declared: &[&str],
+) -> Result<(), UpdateFeatureGroupError> {
+    match crate::service::validation::enum_member_refusal(member, value, declared) {
+        Some(refusal) => Err(crate::scaffolded::Scaffolded::validation(refusal)),
+        None => Ok(()),
     }
 }
