@@ -350,13 +350,13 @@ async fn an_update_that_is_refused_changes_nothing() {
             label: "a name no stored queue carries",
             update: json!({"TimeoutInSeconds": 300}),
             name: Some("no-such-queue".to_string()),
-            code: "NotFoundException",
+            code: "InvalidRequestException",
         },
         Case {
             label: "an ARN no stored queue carries",
             update: json!({"TimeoutInSeconds": 300}),
             name: Some(queue_arn("no-such-queue")),
-            code: "NotFoundException",
+            code: "InvalidRequestException",
         },
     ];
 
@@ -400,7 +400,7 @@ async fn a_missing_queue_is_reported_with_the_identifier_the_request_named() {
             (status, message.as_str()),
             (
                 400,
-                format!("Game session queue {identifier} does not exist.").as_str()
+                format!("Queue name {identifier} does not exist").as_str()
             ),
             "case {identifier:?}: the refusal must name the identifier the request supplied, \
              got {status} {message:?}"

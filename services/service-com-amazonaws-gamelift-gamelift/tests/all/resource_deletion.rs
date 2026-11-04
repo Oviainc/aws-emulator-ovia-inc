@@ -83,7 +83,7 @@ fn tag_list(count: usize) -> Value {
 
 /// Assert `operation` naming `request` is refused with HTTP 400, the wire error code `code`
 /// and exactly `expected` as its `Message`.
-async fn assert_refused(
+pub(crate) async fn assert_refused(
     gamelift: &GameLift,
     operation: &str,
     request: Value,
@@ -679,19 +679,27 @@ async fn deleting_a_game_session_queue_removes_it_from_the_queue_collection() {
             );
         }
 
-        // Every other operation that acts on ONE queue now finds none, by name and by ARN.
+        // Every operation that acts on ONE queue now finds none, by name and by ARN —
+        // each refusing with the error class and sentence it words that refusal with.
         for probe in [target_name.clone(), queue_arn(&target_name)] {
-            for operation in ["UpdateGameSessionQueue", "DeleteGameSessionQueue"] {
-                assert_refused(
-                    &gamelift,
-                    operation,
-                    json!({"Name": &probe}),
-                    "NotFoundException",
-                    &format!("Game session queue {probe} does not exist."),
-                    label,
-                )
-                .await;
-            }
+            assert_refused(
+                &gamelift,
+                "UpdateGameSessionQueue",
+                json!({"Name": &probe}),
+                "InvalidRequestException",
+                &format!("Queue name {probe} does not exist"),
+                label,
+            )
+            .await;
+            assert_refused(
+                &gamelift,
+                "DeleteGameSessionQueue",
+                json!({"Name": &probe}),
+                "NotFoundException",
+                &format!("Game session queue {probe} does not exist."),
+                label,
+            )
+            .await;
         }
     }
 }

@@ -209,18 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.tick(::std::time::SystemTime::now());
 
         // "To update settings, specify the queue name to be updated and provide the new
-        // settings", by name or by ARN. A name that identifies no stored queue is the
-        // modelled `NotFoundException` ("The resource was either not created yet or
-        // deleted"), and nothing is written.
+        // settings", by name or by ARN. A `Name` that identifies no stored queue — never
+        // created, deleted, or an ARN of another account or Region — is what this path
+        // refuses as an invalid request parameter rather than as a missing resource, and
+        // nothing is written.
         let Some(name) = state.resolve_queue_name(&input.name) else {
-            return Err(UpdateGameSessionQueueErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::game_session_queue_not_found_message(
-                        &input.name,
-                    )),
-                },
-            )
-            .into());
+            return Err(invalid(
+                crate::state::game_session_queue_name_does_not_exist_message(&input.name),
+            ));
         };
         let Some(queue) = state.game_session_queues.get_mut(&name) else {
             return Err(UpdateGameSessionQueueErrorModeled::InternalServiceException(

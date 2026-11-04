@@ -1155,15 +1155,33 @@ impl GameSessionQueueRecord {
 }
 
 /// What the service answers when no queue is stored under the
-/// `GameSessionQueueNameOrArn` an operation was asked to act on — the message of the
-/// modelled `NotFoundException`, shared by every operation that names ONE queue, so the
-/// same missing queue reads the same way whichever of them was called.
+/// `GameSessionQueueNameOrArn` the request named — the message of the modelled
+/// `NotFoundException`, as the queue's delete path and the placement path both word a
+/// queue they cannot resolve.
 ///
 /// The identifier the CALLER supplied is the sentence's one variable part: either of the
-/// two forms the member accepts selects the same queue, so the refusal states what was
-/// asked for rather than anything the service resolved it to.
+/// two forms `GameSessionQueueNameOrArn` accepts selects the same queue, so the refusal
+/// states what was asked for rather than anything the service resolved it to.
+///
+/// A missing queue is NOT worded the same way by every operation that names one — see
+/// [`game_session_queue_name_does_not_exist_message`] for the sentence the queue's own
+/// update path answers with — so each path uses the text of its own refusal rather than
+/// one service-wide sentence.
 pub fn game_session_queue_not_found_message(name_or_arn: &str) -> String {
     format!("Game session queue {name_or_arn} does not exist.")
+}
+
+/// What the service answers a request to update a queue whose `Name` resolves to no
+/// stored queue, whatever made it unresolvable: a name never created, one whose queue was
+/// deleted, or an ARN naming another account or Region.
+///
+/// Fixed text `"Queue name "` and `" does not exist"`, with no trailing period; the one
+/// variable part is the `GameSessionQueueNameOrArn` the request supplied, copied verbatim.
+/// Paired with the modelled `InvalidRequestException`, which is the class this refusal
+/// carries — the status alone does not distinguish it, since the model defaults both that
+/// error and `NotFoundException` to HTTP 400.
+pub fn game_session_queue_name_does_not_exist_message(name_or_arn: &str) -> String {
+    format!("Queue name {name_or_arn} does not exist")
 }
 
 /// The refusal a request that configures a game session queue earns, or `None` when every
