@@ -1,0 +1,49 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: kinesis-video-stream-get-data-endpoint
+Issue-Step: task#3
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: kinesis-video-stream-get-data-endpoint kinesisvideo-get-data-endpoint
+Issue-Shape-Id: com.amazonaws.kinesisvideo#KinesisVideo_20170930
+Issue-Key: kinesisvideo|GetDataEndpoint|2xx->2xx|$.DataEndpoint
+Issue-Commit: d9cf74aafe764d4a8806a821a1189d14d75bb9bb
+
+# kinesisvideo wire replay: GetDataEndpoint DataEndpoint host is not an address the emulator serves
+
+> _Note: this issue was identified against the code base at commit `d9cf74aafe764d4a8806a821a1189d14d75bb9bb`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetDataEndpoint
+
+## Description
+One net-new root cause from the wire replay of corpus simparity-wire-aws-v1: GetDataEndpoint answers 200 with a well-formed-looking DataEndpoint, but the host it announces is a fabricated public kinesisvideo.<region>.amazonaws.com name that is NOT the address the emulator is reached on, so the endpoint the operation exists to hand out cannot be dialled. The corpus does not assert the recorded host literally (expected is '<shaped-not-asserted>', i.e. the recorded value is checked by shape, not by text, exactly so per-environment hosts, ids and ports are not requirements) and the emulator's value still fails that check.
+
+NOTE on related open issues, named so they are not read as covering this step. 20261104T022324Z-kinesisvideo-3-net-new-root-causes-getdataendpoint-announces.md describes the SAME underlying projection fault, but it is grounded in the BEHAVIORAL suite (simparity-behavioral-aws-v1) and carries no wire replay key at all, so nothing re-replays this fixture step when it is closed; this issue supplies that wire key. 20261029T194209Z-kinesisvideo-refusal-sentences-and-signaling-channel-endpoint-projections.md explicitly EXCLUDES '$.ResourceEndpoint / $.DataEndpoint value mismatches' as per-environment host:port values, so it does not own this cluster either, and that exclusion is the reason the divergence is still unowned. 20261103T034219Z-kinesisvideo-4-net-new-root-causes-the-putmedia.md and 20261030T183132Z-kinesisvideo-getdataendpoint-echoes-the-control-plane-host-for.md describe the OPPOSITE state (GetDataEndpoint echoing the control-plane host), which is not what this replay observes.
+
+Cause 1 of 1: the DataEndpoint announced for a stored stream is a synthetic public AWS hostname instead of an origin the emulator answers on.
+AWS: Smithy com.amazonaws.kinesisvideo#GetDataEndpoint, POST /getDataEndpoint -> 200; input APIName (required enum GET_CLIP | GET_DASH_STREAMING_SESSION_URL | GET_HLS_STREAMING_SESSION_URL | GET_IMAGES | GET_MEDIA | GET_MEDIA_FOR_FRAGMENT_LIST | LIST_FRAGMENTS | PUT_MEDIA) plus StreamName (len 1..256, pattern ^[a-zA-Z0-9_.-]+$) or StreamARN (ResourceARN); output DataEndpoint, documented 'The endpoint value. To read data from the stream or to write data to it, specify this endpoint in your application'; errors ClientLimitExceededException 400, InvalidArgumentException 400, NotAuthorizedException 401, ResourceNotFoundException 404. The operation doc is 'Gets an endpoint for a specified stream for either reading or writing ... The returned endpoint does not have the API name appended. The client needs to add the API name to the returned endpoint.' Beyond that the value's form is recorded behavior only: the recording shows a bare http(s) origin (scheme and host, empty path) whose host is distinct from the control-plane host and distinct per plane, and whose defining property is OPERATIONAL - the client then ADDRESSES it, so it must be an origin that accepts that plane's calls for that stream. The particular labels, generated ids, region and port in a recorded host are per-environment and are NOT requirements, which is why the corpus asserts this member by shape rather than by value.
+Emulator: GetDataEndpoint returns a host built only from the plane marker, a SHA-256 of the stream ARN and the public regional suffix - 'https://b-<8 hex>.kinesisvideo.<region>.amazonaws.com' for the read APIs and 'https://s-<8 hex>.kinesisvideo.<region>.amazonaws.com' for PUT_MEDIA - with nothing tying it to the authority the request arrived on. The replayed step got 'https://b-28c3d13f.kinesisvideo.us-west-2.amazonaws.com' where the shaped assertion on $.DataEndpoint expected an origin of the environment's data plane; status 200 and the rest of the response match. The '28c3d13f' label and 'us-west-2' are per-run/derived values and are not the divergence - the divergence is that the announced origin is one the emulator does not answer on (the emulator serves its data listener at the loopback address the request arrived on).
+Why: a client does exactly what the docs tell it to and dials the returned endpoint - a KVS producer/consumer SDK, kvssink, or boto3 with endpoint_url=DataEndpoint. Resolving that name yields either real AWS or NXDOMAIN, so PutMedia ingest and every media/archived-media read (GetMedia, ListFragments, GetMediaForFragmentList, GetClip, the HLS/DASH session URLs) never reach the emulator, and none of the refusal contracts on those paths can be observed. Endpoint discovery, the only documented way to find the data plane, is a dead end even though the call itself reports success.
+Fix: GetDataEndpoint's response projection - crate::state::data_endpoint / service_host in the kinesisvideo service crate's state/data_endpoint.rs, which composes 'https://{marker}-{label}.kinesisvideo.{region}.amazonaws.com' from the plane marker and an ARN digest alone, together with the module header's assumption that a client will redirect the announced name at the emulator. The announced origin must be an authority the emulator answers on (derived from the request's own address/listener, kept per-plane distinct by label or port and stable for the life of the stream), with the media and archived-media routes bound on it. Keep the per-plane distinction and the scheme/empty-path form; change only where the authority comes from.
+Traces: kinesis-video-stream-get-data-endpoint#task#3 (also kinesisvideo-get-data-endpoint#task#3).
+
+## Evidence
+Replay of corpus simparity-wire-aws-v1 against the emulator built from this checkout: emulator up (/__admin/health 200, data listener accepting), 147 steps, 118 passed, 29 mismatched, score 80.3%, 16 divergence clusters. 15 clusters are already owned by open issues or blocked by a stub and were skipped; this is the one cluster with no owning replay key and no stub.
+
+Cause 1 - divergence key 'service=kinesisvideo|GetDataEndpoint|status=200->200|keys=$.DataEndpoint', verdict mismatch, cluster of 2 steps:
+  fixture kinesis-video-stream-get-data-endpoint, step task#3 (representative)
+  fixture kinesisvideo-get-data-endpoint, step task#3
+  status: expected 200, got 200 (matches).
+  $.DataEndpoint: value_mismatch - expected '<shaped-not-asserted>' (the corpus asserts the member's shape, i.e. an origin of the environment's data plane, not the recorded literal), got 'https://b-28c3d13f.kinesisvideo.us-west-2.amazonaws.com'.
+  The 8-hex label and the region are per-run/derived values and are not the requirement; the requirement the value fails is that the announced origin is one the emulator answers on. The emulator's own data listener is reached on the loopback address of the run (emulator_detail reports the health endpoint and the data listener), never on kinesisvideo.<region>.amazonaws.com.
+
+Code: services/service-com-amazonaws-kinesisvideo-kinesisvideo-20170930/src/ops/get_data_endpoint.rs:186-205 (returns crate::state::data_endpoint(plane, &region, &stream.stream_arn), region from the SigV4 scope); services/service-com-amazonaws-kinesisvideo-kinesisvideo-20170930/src/state/data_endpoint.rs:112-125 (format!("https://{}-{}.{}", marker, label, service_host(region)) and service_host = "kinesisvideo.{region}.amazonaws.com"); :137-143 (label = first 8 hex of SHA-256 over marker + stream ARN); :27-39 (module header stating the announced name is expected to be redirected at the emulator by the client - the assumption this divergence contradicts).
+Smithy: com.amazonaws.kinesisvideo#GetDataEndpoint POST /getDataEndpoint -> 200, output GetDataEndpointOutput$DataEndpoint ('The endpoint value. To read data from the stream or to write data to it, specify this endpoint in your application'); the host's composition is unmodeled, hence recorded behavior only.
+
+## Steps to Reproduce
+1. Clone the repo, build and boot the emulator from the checkout, then replay the wire corpus simparity-wire-aws-v1.
+2. Replay fixture kinesis-video-stream-get-data-endpoint up to step task#3 (or kinesisvideo-get-data-endpoint#task#3): CreateStream for the fixture's stream name, wait for DescribeStream to report Status ACTIVE.
+3. POST /getDataEndpoint with that stream's StreamName (or StreamARN) and the step's APIName. Observed: HTTP 200 with DataEndpoint 'https://b-<8 hex>.kinesisvideo.<region>.amazonaws.com' (the PUT_MEDIA plane yields the same form with an 's-' label).
+4. Expected: HTTP 200 whose DataEndpoint is a bare http(s) origin with an empty path, per-plane distinct and distinct from the control-plane host, AND an authority the emulator answers on - so that a SigV4-signed call to it (POST /putMedia for the write plane; /getMedia, /listFragments, /getMediaForFragmentList, /getClip for the read plane) reaches the emulator. Observed instead: a public AWS name that resolves away from the emulator, so the discovered data plane cannot be reached at all.
+5. Confirm the fix by re-replaying kinesis-video-stream-get-data-endpoint#task#3 and kinesisvideo-get-data-endpoint#task#3 and checking $.DataEndpoint against the shaped assertion.
