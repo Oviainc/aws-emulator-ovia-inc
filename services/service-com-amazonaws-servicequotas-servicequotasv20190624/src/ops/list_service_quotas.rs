@@ -6,8 +6,10 @@
 //! value an approved increase has put in force laid over it, read from
 //! [`crate::state`] and paginated.
 //!
-//! * an unknown `ServiceCode`, or a `QuotaCode` the service has no quota for, is
-//!   `NoSuchResourceException`;
+//! * a `ServiceCode` this endpoint serves no quotas for is `NoSuchResourceException`
+//!   stating the service fact, and a `QuotaCode` the service has no quota for is the
+//!   same error stating the failed pair lookup — each in the crate's one sentence for it
+//!   ([`crate::service::refusals`]);
 //! * `QuotaAppliedAtLevel` picks the plane the listing reports, by the crate's one
 //!   `AppliedLevelEnum` filter rule ([`crate::state::requested_at_level`]): `ACCOUNT`
 //!   (the default when the caller names none) lists one account-wide record per quota,
@@ -129,7 +131,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !quotas_state.knows_service(&input.service_code) {
                 return Err(ListServiceQuotasErrorModeled::NoSuchResourceException(
                     NoSuchResourceException {
-                        message: Some(crate::state::no_such_service_message(&input.service_code)),
+                        message: Some(
+                            crate::service::refusals::SERVICE_NOT_AVAILABLE_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -140,16 +144,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 codes.retain(|code| code == requested);
                 if codes.is_empty() {
                     // A `QuotaCode` filter naming a pair the catalog does not hold is
-                    // the same fact every other read and write of one quota reports, so
-                    // which half of the pair failed is decided by the crate's one rule
-                    // for it (the service is known here, since an unknown one was
-                    // refused above) rather than by a second sentence of this handler's
-                    // own.
+                    // the same failed lookup every other read and write of one quota
+                    // reports, so it is stated in the crate's one sentence for it rather
+                    // than in a second sentence of this handler's own.
                     return Err(ListServiceQuotasErrorModeled::NoSuchResourceException(
                         NoSuchResourceException {
                             message: Some(
-                                quotas_state
-                                    .unresolved_quota_message(&input.service_code, requested),
+                                crate::service::refusals::QUOTA_AND_SERVICE_ABSENT_MESSAGE
+                                    .to_string(),
                             ),
                         },
                     )

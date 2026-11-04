@@ -114,10 +114,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetRequestedServiceQuotaChangeErrorModeled::NoSuchResourceException(
                     NoSuchResourceException {
-                        message: Some(format!(
-                            "no quota increase request with RequestId '{}' exists",
-                            input.request_id
-                        )),
+                        message: Some(
+                            crate::service::refusals::NO_SUCH_QUOTA_REQUEST_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

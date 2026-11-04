@@ -190,9 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         ListRequestedServiceQuotaChangeHistoryErrorModeled::NoSuchResourceException(
                             NoSuchResourceException {
-                                message: Some(crate::state::no_such_service_message(
-                                    service_code,
-                                )),
+                                message: Some(
+                                    crate::service::refusals::SERVICE_NOT_AVAILABLE_MESSAGE
+                                        .to_string(),
+                                ),
                             },
                         )
                         .into(),

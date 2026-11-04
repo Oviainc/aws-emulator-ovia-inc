@@ -529,10 +529,23 @@ async fn a_request_that_is_not_awaiting_a_decision_gets_no_case() {
             "case {case}: expected a modeled refusal, got {code}"
         );
         let message = message.unwrap_or_default();
-        assert!(
-            message.contains(request_id),
-            "case {case}: the refusal must name the RequestId, got {message:?}"
-        );
+        if expected_code == "NoSuchResourceException" {
+            // A request id that resolves to nothing is refused in the service's own
+            // FIXED sentence for that fact, so the id the caller supplied is NOT echoed
+            // back (`refusal_wording.rs` spans that rule).
+            assert!(
+                !message.is_empty() && !message.contains(request_id),
+                "case {case}: expected a refusal that states the fact without naming the \
+                 RequestId, got {message:?}"
+            );
+        } else {
+            // A refusal about the STATE of a request this endpoint DID resolve names it,
+            // so a caller can tell which of its requests was meant.
+            assert!(
+                message.contains(request_id),
+                "case {case}: the refusal must name the RequestId, got {message:?}"
+            );
+        }
 
         if !expected_status.is_empty() {
             let unchanged = read_request(who, request_id).await;

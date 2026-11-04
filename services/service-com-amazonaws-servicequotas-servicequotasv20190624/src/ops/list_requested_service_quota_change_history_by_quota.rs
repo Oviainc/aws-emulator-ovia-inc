@@ -10,9 +10,11 @@
 //! such a quota has one value and so one request history account-wide, and for a quota
 //! counted per region the requests made at this endpoint.
 //!
-//! * an unknown `(ServiceCode, QuotaCode)` pair is `NoSuchResourceException` (404),
-//!   stating whichever half of the pair the catalog does not hold
-//!   ([`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::unresolved_quota_message`]);
+//! * a `ServiceCode` this endpoint serves no quotas for is `NoSuchResourceException`
+//!   (404) stating the service fact, asked BEFORE the `QuotaCode`, and a `QuotaCode` that
+//!   service holds no quota under is the same error stating the failed pair lookup — both
+//!   in the crate's one sentence for the fact
+//!   ([`crate::service::refusals`]);
 //! * `Status` keeps the requests that now carry that `RequestStatus`;
 //! * `QuotaRequestedAtLevel` keeps the requests made at that level — `ALL` keeps
 //!   every one, and a caller that names none gets the member's documented default
@@ -131,23 +133,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut quotas_state = state.lock();
             quotas_state.settle_due_requests(::std::time::SystemTime::now());
 
+            // The listing is scoped to a `ServiceCode`, so that service has to be one
+            // this endpoint serves quotas for before the `QuotaCode` is considered at
+            // all: an unrecognised service code is the service fact, stated in the
+            // crate's one sentence for it, exactly as the service-wide listing states
+            // it.
+            if !quotas_state.knows_service(&input.service_code) {
+                return Err(
+                    ListRequestedServiceQuotaChangeHistoryByQuotaErrorModeled::NoSuchResourceException(
+                        NoSuchResourceException {
+                            message: Some(
+                                crate::service::refusals::SERVICE_NOT_AVAILABLE_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
             if quotas_state
                 .default_quota(&input.service_code, &input.quota_code)
                 .is_none()
             {
-                // The pair names no quota, so there is no history to report. WHICH half
-                // of the pair the catalog does not hold decides what the refusal states
-                // — a `ServiceCode` the catalog does not publish is the absent service,
-                // not a missing quota of it — and that is the crate's one rule for it
-                // ([`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::unresolved_quota_message`]),
-                // so this listing words the fact exactly as the service-wide one does.
+                // The service is published and holds no quota under that code, so there
+                // is no history to report: the crate's one sentence for a failed pair
+                // lookup.
                 return Err(
                     ListRequestedServiceQuotaChangeHistoryByQuotaErrorModeled::NoSuchResourceException(
                         NoSuchResourceException {
-                            message: Some(quotas_state.unresolved_quota_message(
-                                &input.service_code,
-                                &input.quota_code,
-                            )),
+                            message: Some(
+                                crate::service::refusals::QUOTA_AND_SERVICE_ABSENT_MESSAGE
+                                    .to_string(),
+                            ),
                         },
                     )
                     .into(),

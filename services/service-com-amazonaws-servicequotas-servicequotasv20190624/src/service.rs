@@ -82,6 +82,8 @@
 //! is not adjustable, a desired value that is not an increase — is a semantic refusal
 //! and stays the modelled `IllegalArgumentException` wherever it is raised.
 
+pub mod refusals;
+
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -173,6 +175,9 @@ const SERVICE_OWN_VALIDATED_MEMBERS: &[&str] = &["ResourceARN"];
 /// operations, whose `ResourceARN` has to be an ARN of one of this service's own
 /// resources). Which validator answers is a property of the MEMBER, so both state this
 /// one sentence rather than letting the VALUE decide the wording.
+///
+/// It sits beside the validator that states it; the sentences the HANDLERS state, one per
+/// fact, are in [`refusals`].
 pub const ILLEGAL_VALUE_MESSAGE: &str =
     "The request failed because you provided an illegal value for a parameter.";
 

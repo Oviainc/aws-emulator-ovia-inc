@@ -41,7 +41,10 @@
 //! * an unknown `(ServiceCode, QuotaCode)` pair -> `NoSuchResourceException` (404);
 //! * a quota AWS publishes as not adjustable -> `IllegalArgumentException` (400);
 //! * a `DesiredValue` that is not above the value in force -> `IllegalArgumentException`
-//!   (400): this operation requests an INCREASE;
+//!   (400): this operation requests an INCREASE, and the refusal puts the two bounds in
+//!   the order the service checks them — the quota's AWS default, which a value below it
+//!   is refused naming, then the value in force
+//!   ([`crate::service::refusals::not_an_increase_message`]);
 //! * a `ContextId` for a quota that is adjustable at the account level only ->
 //!   `IllegalArgumentException` (400), and the other half of the same rule: NO
 //!   `ContextId` for a quota that is adjustable for an individual resource only ->
@@ -163,15 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(default) = quotas_state.default_quota(&input.service_code, &input.quota_code)
         else {
-            // Which half of the pair the catalog does not hold decides what the refusal
-            // states, through the crate's one rule for it.
+            // A pair the catalog does not hold is the crate's one sentence for that
+            // failed lookup, whichever half of the pair is missing — the service's own
+            // fixed text, carrying nothing of the request.
             return Err(
                 RequestServiceQuotaIncreaseErrorModeled::NoSuchResourceException(
                     NoSuchResourceException {
-                        message: Some(quotas_state.unresolved_quota_message(
-                            &input.service_code,
-                            &input.quota_code,
-                        )),
+                        message: Some(
+                            crate::service::refusals::QUOTA_AND_SERVICE_ABSENT_MESSAGE
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -179,6 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let adjustable = default.adjustable;
         let resource_adjustable = default.resource_adjustable();
+        // The quota's AWS default value, which the refusal of a value that is not an
+        // increase states when the request does not even clear the default.
+        let default_value = default.value;
 
         match input.context_id.as_deref() {
             Some(context_id) if !resource_adjustable => {
@@ -239,16 +246,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.quota_code,
                 input.context_id.as_deref(),
             )
-            .unwrap_or(default.value);
+            .unwrap_or(default_value);
         if input.desired_value <= in_force {
+            // The two bounds in the order the service checks them, through the crate's one
+            // rule for the refusal: the quota's AWS DEFAULT first, which a value below it
+            // is refused naming, and then the value in force, whose sentence names no
+            // value at all. Both numbers come from this service's catalog and state, so
+            // the refusal carries nothing of the request.
+            let message = crate::service::refusals::not_an_increase_message(
+                input.desired_value,
+                default_value,
+            );
             return Err(
                 RequestServiceQuotaIncreaseErrorModeled::IllegalArgumentException(
                     IllegalArgumentException {
-                        message: Some(format!(
-                            "DesiredValue {} is not an increase on the current value {in_force} \
-                             of QuotaCode '{}'",
-                            input.desired_value, input.quota_code
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),

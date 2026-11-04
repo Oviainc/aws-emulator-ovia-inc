@@ -9,14 +9,15 @@
 //! `Client`) is `quota_workflow.rs`'s.
 //!
 //! The rule asserted, over a TABLE of pairs crossed with every operation that resolves
-//! one: a request that names a `(ServiceCode, QuotaCode)` pair the catalog does not
-//! hold is refused with the modelled `NoSuchResourceException`, in the service's ONE
-//! wording for that fact — the same sentence from whichever operation resolved the
-//! pair, with the ServiceCode and the QuotaCode of the request filled in. The reads of
-//! one quota, its listing's `QuotaCode` filter, its change history and the write that
-//! asks for an increase are all driven, so no handler gets to state the fact in a
+//! one: a request naming a `(ServiceCode, QuotaCode)` pair the catalog does not hold is
+//! refused with the modelled `NoSuchResourceException`, in the service's ONE wording for
+//! that failed lookup — the same FIXED sentence from whichever operation resolved the pair,
+//! carrying nothing of the request, so neither code the caller sent appears in it. The
+//! reads of one quota, its listing's `QuotaCode` filter, its change history and the write
+//! that asks for an increase are all driven, so no handler gets to state the fact in a
 //! sentence of its own. `auto_management_exclusions.rs` pins the same wording for the
-//! Automatic Management exclusion writers.
+//! Automatic Management exclusion writers, and `no_such_service_wording.rs` pins the
+//! sentence a call SCOPED to a service is refused with instead.
 //!
 //! The pairs are read out of the catalog over the wire (`ListServices` +
 //! `ListAWSDefaultServiceQuotas`) rather than spelled here, so the rows span services
@@ -24,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_servicequotas_servicequotasv20190624::state::no_such_quota_message;
+use service_com_amazonaws_servicequotas_servicequotasv20190624::service::refusals::QUOTA_AND_SERVICE_ABSENT_MESSAGE;
 
 use crate::quota_workflow::{client, default_quotas, emulator, service_inventory, Client};
 
@@ -227,64 +228,57 @@ async fn unheld_pairs(client: &Client) -> Vec<(String, String, String)> {
     unheld
 }
 
-/// The sentence this service states the fact in, with the two codes of the request
-/// blanked out. Spelled here so the suite pins the WORDING as well as its single
-/// sourcing: comparing a refusal against `no_such_quota_message` alone would stay green
-/// if the helper's own sentence drifted.
-const WORDING: &str = "no quota with ServiceCode '<ServiceCode>' and QuotaCode \
-                       '<QuotaCode>' exists";
+/// The sentence this service states the fact in. Spelled here so the suite pins the
+/// WORDING as well as its single sourcing: comparing a refusal against
+/// `QUOTA_AND_SERVICE_ABSENT_MESSAGE` alone would stay green if that constant's own
+/// sentence drifted.
+const WORDING: &str = "The request failed because the specified quota and service do not \
+                      exist.";
 
-/// A pair the catalog does not hold is refused with ONE wording, whichever operation
-/// resolved it — the service's own `no_such_quota_message`, with the request's codes
-/// filled in.
+/// A `QuotaCode` a published service holds no quota under is refused with ONE wording,
+/// whichever operation resolved it — the service's own fixed sentence for the fact, with
+/// nothing of the request in it.
 #[tokio::test]
 async fn every_operation_states_an_unheld_pair_in_one_wording() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
-    // The sentence with the request's two codes blanked out: every row must produce the
-    // same one, so a second wording for the fact cannot hide behind differing codes.
-    let mut templates: Vec<(String, String)> = Vec::new();
+    // Every row must produce the same sentence, so a second wording for the fact cannot
+    // hide behind differing codes.
+    let mut stated: Vec<(String, String)> = Vec::new();
 
     for (why, service_code, quota_code) in unheld_pairs(&client).await {
-        let expected = no_such_quota_message(&service_code, &quota_code);
         for (what, operation, body) in pair_requests(&service_code, &quota_code) {
             let case = format!("{why}, through {what} ({operation})");
             let message = no_such_resource_message(&client, &case, operation, &body).await;
             assert_eq!(
-                message, expected,
-                "case {case}: expected the refusal to state {expected:?}, got {message:?}"
+                message, QUOTA_AND_SERVICE_ABSENT_MESSAGE,
+                "case {case}: expected the refusal to state \
+                 {QUOTA_AND_SERVICE_ABSENT_MESSAGE:?}, got {message:?}"
             );
-            // The variable parts are the REQUEST's, not one recorded pair's.
-            assert!(
-                message.contains(&service_code) && message.contains(&quota_code),
-                "case {case}: expected the refusal to name ServiceCode {service_code:?} and \
-                 QuotaCode {quota_code:?}, got {message:?}"
-            );
-            let template = message
-                .replace(&service_code, "<ServiceCode>")
-                .replace(&quota_code, "<QuotaCode>");
-            templates.push((case, template));
+            // The sentence is FIXED: a row differing only in the codes it names gets the
+            // same string back, which the comparison across rows below pins.
+            stated.push((case, message));
         }
     }
 
-    let (first_case, first_template) = templates
+    let (first_case, first) = stated
         .first()
         .cloned()
         .expect("the table drives at least one call");
     assert!(
-        first_template.contains("<ServiceCode>") && first_template.contains("<QuotaCode>"),
-        "case {first_case}: expected one sentence carrying both codes, got {first_template:?}"
+        !first.is_empty(),
+        "case {first_case}: expected a non-empty sentence, got {first:?}"
     );
-    for (case, template) in &templates {
+    for (case, message) in &stated {
         assert_eq!(
-            template, &first_template,
-            "case {case}: expected the one wording {first_template:?}, got {template:?}"
+            message, &first,
+            "case {case}: expected the one wording {first:?}, got {message:?}"
         );
         // And the wording itself, not only that every operation shares one.
         assert_eq!(
-            template, WORDING,
-            "case {case}: expected the sentence {WORDING:?}, got {template:?}"
+            message, WORDING,
+            "case {case}: expected the sentence {WORDING:?}, got {message:?}"
         );
     }
 }

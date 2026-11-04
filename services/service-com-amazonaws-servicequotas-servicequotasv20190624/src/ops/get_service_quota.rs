@@ -123,14 +123,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(default) = quotas_state.default_quota(&input.service_code, &input.quota_code)
         else {
-            // Which half of the pair the catalog does not hold decides what the refusal
-            // states, through the crate's one rule for it.
+            // A pair the catalog does not hold is the crate's one sentence for that
+            // failed lookup, whichever half of the pair is missing — the service's own
+            // fixed text, carrying nothing of the request.
             return Err(GetServiceQuotaErrorModeled::NoSuchResourceException(
                 NoSuchResourceException {
-                    message: Some(quotas_state.unresolved_quota_message(
-                        &input.service_code,
-                        &input.quota_code,
-                    )),
+                    message: Some(
+                        crate::service::refusals::QUOTA_AND_SERVICE_ABSENT_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

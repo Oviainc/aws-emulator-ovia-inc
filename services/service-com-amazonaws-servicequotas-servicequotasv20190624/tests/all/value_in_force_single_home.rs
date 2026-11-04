@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_servicequotas_servicequotasv20190624::service::refusals::NOT_ABOVE_CURRENT_VALUE_MESSAGE;
+
 // The wire harness this crate already has: `POST /` with `X-Amz-Target:
 // ServiceQuotasV20190624.<Op>` through the `MultiServiceRouter`, over one shared
 // engine, plus its listing walker. Declared `pub(crate)` in `quota_workflow` for
@@ -264,7 +266,9 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
     }
 
     // The third reader of the same rule: a request is measured against the value in
-    // force, and its refusal names that value — the number the report published.
+    // force, and asking again for that value is refused — in the service's own fixed
+    // sentence for that bound, which names no value at all (`refusal_wording.rs` spans
+    // both bounds of this refusal and the order they are checked in).
     for row in rows
         .iter()
         .filter(|row| row.quota["Adjustable"] == json!(true))
@@ -301,9 +305,10 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
                 .get("Message")
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| panic!("case {case}: a refusal carries a Message, got {body}"));
-            assert!(
-                message.contains(&format!("{in_force}")),
-                "case {case}: the refusal must name the value in force {in_force}, got {message}"
+            assert_eq!(
+                message, NOT_ABOVE_CURRENT_VALUE_MESSAGE,
+                "case {case}: asking again for the in-force value {in_force} must be refused in \
+                 the service's sentence for that bound, got {message}"
             );
         }
     }

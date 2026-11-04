@@ -10,15 +10,20 @@
 //! and the template plane's two-service harness is `quota_request_template.rs`'s.
 //!
 //! The rule asserted, over a TABLE of unpublished service codes crossed with every
-//! operation that resolves one: a lookup fails on the OUTERMOST thing the request named
-//! that does not exist, so a `ServiceCode` the catalog does not publish is refused with
-//! the modelled `NoSuchResourceException` stating the absent SERVICE — in the service's
-//! one wording for that fact, with the `ServiceCode` of the request filled in — whether
-//! the code arrives alone or as half of a `(ServiceCode, QuotaCode)` pair, and never
-//! attributing the failure to the quota code the caller supplied. Its other half is
-//! pinned here too: a service the catalog DOES publish, named with a code it holds no
-//! quota under, still states the absent QUOTA (`no_such_quota_wording.rs` spans that
-//! fact across the same operations).
+//! operation that resolves one: the refusal is the modelled `NoSuchResourceException`
+//! stating the service's own FIXED sentence for the fact, so nothing the request carried
+//! is interpolated into it — and WHICH fact it states follows from what the call named:
+//!
+//! * a call SCOPED to the service — a listing keyed by a `ServiceCode`, including the
+//!   change history of one quota — states that the service is not available at the
+//!   endpoint the call was made at, which is what a caller can act on;
+//! * a call that resolves ONE quota by its `(ServiceCode, QuotaCode)` pair states that the
+//!   quota and the service do not exist, one sentence for the failed pair lookup whichever
+//!   half of it is the missing one.
+//!
+//! Its other half is pinned here too: a service the catalog DOES publish, named with a code
+//! it holds no quota under, is the same failed pair lookup (`no_such_quota_wording.rs`
+//! spans that across the same operations).
 //!
 //! The published codes the rows are built from are read out of the catalog over the wire
 //! (`ListServices` + `ListAWSDefaultServiceQuotas`), so the table follows whatever the
@@ -26,8 +31,8 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
-    no_such_quota_message, no_such_service_message,
+use service_com_amazonaws_servicequotas_servicequotasv20190624::service::refusals::{
+    QUOTA_AND_SERVICE_ABSENT_MESSAGE, SERVICE_NOT_AVAILABLE_MESSAGE,
 };
 
 use crate::no_such_quota_wording::{catalog_services, no_such_resource_message};
@@ -41,26 +46,33 @@ const CLIENT_FAULT: u16 = 400;
 /// The service-wide change history, whose name is too long to repeat in every row.
 const HISTORY: &str = "ListRequestedServiceQuotaChangeHistory";
 
-/// The change history of ONE quota — the listing the `ServiceCode` fact used to be
-/// stated in the quota sentence by.
+/// The change history of ONE quota — a listing keyed by a `ServiceCode`, which happens
+/// to name a `QuotaCode` under it as well.
 const HISTORY_BY_QUOTA: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
 
 /// A `QuotaCode` no service of the catalog holds, well within the member's
 /// `@length 1..128`.
 const UNHELD_QUOTA_CODE: &str = "L-00000000";
 
-/// The sentence this service states the fact in, with the `ServiceCode` of the request
-/// blanked out. Spelled here so the suite pins the WORDING as well as its single
-/// sourcing: comparing a refusal against `no_such_service_message` alone would stay
-/// green if the helper's own sentence drifted.
-const WORDING: &str = "no service quotas are available for ServiceCode '<ServiceCode>'";
+/// The sentence a call scoped to a service the endpoint does not serve is refused with,
+/// down to the trailing space the service sends it with. Spelled here so the suite pins
+/// the WORDING as well as its single sourcing: comparing a refusal against the crate's
+/// constant alone would stay green if that constant's own sentence drifted.
+const SERVICE_WORDING: &str =
+    "This service is not available in the current Region. Choose a different Region or a \
+     different service. ";
 
-/// The requests that resolve a `ServiceCode` against the catalog, as
-/// `(what the call is, operation, body)`: the four listings that take one, and the two
-/// reads and the write that take it as half of a `(ServiceCode, QuotaCode)` pair. The
-/// filtered and paged rows are there so the lookup is seen to be answered before any
-/// filter of the listing is.
-fn service_code_requests(
+/// The sentence a call that resolves ONE quota by its pair is refused with when the pair
+/// resolves to no quota — whichever half of it is the half that is missing — spelled here
+/// for the same reason.
+const PAIR_WORDING: &str = "The request failed because the specified quota and service do not \
+                            exist.";
+
+/// The LISTINGS that resolve a `ServiceCode` against the catalog, as
+/// `(what the call is, operation, body)`: the four of them that take one, each also in a
+/// filtered and paged form, so the lookup is seen to be answered before any filter of the
+/// listing is.
+fn listing_requests(
     service_code: &str,
     quota_code: &str,
 ) -> Vec<(&'static str, &'static str, Value)> {
@@ -106,6 +118,16 @@ fn service_code_requests(
                 "MaxResults": 1,
             }),
         ),
+    ]
+}
+
+/// The calls that resolve ONE quota by its `(ServiceCode, QuotaCode)` pair: the two reads
+/// of one quota and the write that asks for an increase on it.
+fn single_quota_requests(
+    service_code: &str,
+    quota_code: &str,
+) -> Vec<(&'static str, &'static str, Value)> {
+    vec![
         (
             "the single applied read",
             "GetServiceQuota",
@@ -126,6 +148,17 @@ fn service_code_requests(
             }),
         ),
     ]
+}
+
+/// Every call that resolves a `ServiceCode` at all, both classes together: what the
+/// suites that assert something common to all of them drive.
+fn service_code_requests(
+    service_code: &str,
+    quota_code: &str,
+) -> Vec<(&'static str, &'static str, Value)> {
+    let mut requests = listing_requests(service_code, quota_code);
+    requests.extend(single_quota_requests(service_code, quota_code));
+    requests
 }
 
 /// Every `ServiceCode` `ListServices` publishes, walked over the wire.
@@ -206,9 +239,10 @@ async fn unpublished_service_codes(client: &Client) -> Vec<(String, String)> {
     unpublished
 }
 
-/// A `ServiceCode` the catalog does not publish is refused with ONE wording, whichever
-/// operation resolved it, and the sentence names the absent service rather than the
-/// `QuotaCode` the caller supplied.
+/// A `ServiceCode` the catalog does not publish is refused with ONE wording per class of
+/// call, whichever operation resolved it and whatever the row's codes are — the service's
+/// own fixed sentence for the fact, naming neither the code the caller sent nor the quota
+/// code beside it.
 #[tokio::test]
 async fn every_operation_states_an_unpublished_service_code_in_one_wording() {
     let engine = emulator();
@@ -222,72 +256,75 @@ async fn every_operation_states_an_unpublished_service_code_in_one_wording() {
         .cloned()
         .expect("case setup: the catalog publishes at least one quota");
 
-    // The sentence with the request's code blanked out: every row must produce the same
-    // one, so a second wording for the fact cannot hide behind differing codes.
-    let mut templates: Vec<(String, String)> = Vec::new();
+    // Every row of each class must produce the same sentence, so a second wording for
+    // one fact cannot hide behind differing codes.
+    let mut calls = 0usize;
 
     for (why, service_code) in unpublished_service_codes(&client).await {
-        let expected = no_such_service_message(&service_code);
         for quota_code in [published_quota_code.as_str(), UNHELD_QUOTA_CODE] {
-            for (what, operation, body) in service_code_requests(&service_code, quota_code) {
-                let case = format!("{why}, QuotaCode {quota_code}, through {what} ({operation})");
-                let message = no_such_resource_message(&client, &case, operation, &body).await;
-                assert_eq!(
-                    message, expected,
-                    "case {case}: expected the refusal to state {expected:?}, got {message:?}"
-                );
-                // The fact is the absent SERVICE: the quota sentence would name the
-                // code the caller supplied, and this one must not.
-                assert!(
-                    !message.contains(quota_code),
-                    "case {case}: expected the refusal to attribute the failure to the \
-                     absent service, not to QuotaCode {quota_code:?}, got {message:?}"
-                );
-                assert_ne!(
-                    message,
-                    no_such_quota_message(&service_code, quota_code),
-                    "case {case}: expected the service sentence, got the quota one"
-                );
-                templates.push((case, message.replace(&service_code, "<ServiceCode>")));
+            for (class, expected, wording, requests) in [
+                (
+                    "scoped to the service",
+                    SERVICE_NOT_AVAILABLE_MESSAGE,
+                    SERVICE_WORDING,
+                    listing_requests(&service_code, quota_code),
+                ),
+                (
+                    "resolving one quota",
+                    QUOTA_AND_SERVICE_ABSENT_MESSAGE,
+                    PAIR_WORDING,
+                    single_quota_requests(&service_code, quota_code),
+                ),
+            ] {
+                for (what, operation, body) in requests {
+                    let case =
+                        format!("{why}, QuotaCode {quota_code}, through {what} ({operation})");
+                    let message = no_such_resource_message(&client, &case, operation, &body).await;
+                    // The crate's one sentence for the fact, and the sentence itself:
+                    // comparing against the constant alone would stay green if its own
+                    // wording drifted.
+                    assert_eq!(
+                        message, expected,
+                        "case {case}: expected a call {class} to state {expected:?}, got \
+                         {message:?}"
+                    );
+                    assert_eq!(
+                        message, wording,
+                        "case {case}: expected the sentence {wording:?} for a call {class}, got \
+                         {message:?}"
+                    );
+                    // The sentence carries nothing of the request: not the service code
+                    // that named no service, and not the quota code beside it.
+                    assert!(
+                        !message.contains(&service_code) && !message.contains(quota_code),
+                        "case {case}: expected a refusal naming neither ServiceCode \
+                         {service_code:?} nor QuotaCode {quota_code:?}, got {message:?}"
+                    );
+                    calls += 1;
+                }
             }
         }
     }
 
-    let (first_case, first_template) = templates
-        .first()
-        .cloned()
-        .expect("the table drives at least one call");
     assert!(
-        first_template.contains("<ServiceCode>"),
-        "case {first_case}: expected one sentence carrying the ServiceCode, got \
-         {first_template:?}"
+        calls >= 50,
+        "case setup: expected the table to drive every operation over at least five \
+         unpublished codes, got {calls} calls"
     );
-    for (case, template) in &templates {
-        assert_eq!(
-            template, &first_template,
-            "case {case}: expected the one wording {first_template:?}, got {template:?}"
-        );
-        // And the wording itself, not only that every operation shares one.
-        assert_eq!(
-            template, WORDING,
-            "case {case}: expected the sentence {WORDING:?}, got {template:?}"
-        );
-    }
 }
 
 /// The other half of the rule: a service the catalog DOES publish, named with a code it
-/// holds no quota under, keeps stating the absent QUOTA — so the two facts stay two
-/// sentences instead of collapsing into one.
+/// holds no quota under, is a failed PAIR lookup — stated in the pair sentence rather than
+/// in the one a call scoped to a service gets.
 #[tokio::test]
-async fn a_published_service_with_an_unheld_quota_code_states_the_quota_fact() {
+async fn a_published_service_with_an_unheld_quota_code_states_the_pair_fact() {
     let engine = emulator();
     let client = client(&engine, "eu-west-1");
 
     for (service_code, held_quota_code) in catalog_services(&client, 3).await {
-        let expected = no_such_quota_message(&service_code, UNHELD_QUOTA_CODE);
         for (what, operation, body) in service_code_requests(&service_code, UNHELD_QUOTA_CODE) {
             // The listings that take no `QuotaCode` are served for a published service,
-            // so only the rows that resolve the pair are refusals here.
+            // so only the rows that resolve the code are refusals here.
             if !body
                 .get("QuotaCode")
                 .and_then(Value::as_str)
@@ -298,13 +335,17 @@ async fn a_published_service_with_an_unheld_quota_code_states_the_quota_fact() {
             let case = format!("{service_code}/{UNHELD_QUOTA_CODE}, through {what} ({operation})");
             let message = no_such_resource_message(&client, &case, operation, &body).await;
             assert_eq!(
-                message, expected,
-                "case {case}: expected the refusal to state {expected:?}, got {message:?}"
+                message, PAIR_WORDING,
+                "case {case}: expected the refusal to state {PAIR_WORDING:?}, got {message:?}"
+            );
+            assert_eq!(
+                message, QUOTA_AND_SERVICE_ABSENT_MESSAGE,
+                "case {case}: expected the crate's one sentence for a failed pair lookup, got \
+                 {message:?}"
             );
             assert_ne!(
-                message,
-                no_such_service_message(&service_code),
-                "case {case}: expected the quota sentence for a published service, got the \
+                message, SERVICE_NOT_AVAILABLE_MESSAGE,
+                "case {case}: expected the pair sentence for a published service, got the \
                  service one"
             );
         }
@@ -397,10 +438,10 @@ async fn the_template_write_states_the_same_two_facts() {
             "case {case}: expected HTTP {CLIENT_FAULT} NoSuchResourceException, got {status} \
              {code} with {message:?}"
         );
-        let expected = no_such_service_message(service_code);
+        // The write resolves ONE quota by its pair, so it states the pair fact.
         assert_eq!(
-            message, expected,
-            "case {case}: expected the refusal to state {expected:?}, got {message:?}"
+            message, PAIR_WORDING,
+            "case {case}: expected the refusal to state {PAIR_WORDING:?}, got {message:?}"
         );
     }
 
@@ -417,11 +458,10 @@ async fn the_template_write_states_the_same_two_facts() {
             }),
         )
         .await;
-    let expected = no_such_quota_message(published_service, UNHELD_QUOTA_CODE);
     assert_eq!(
         (status, code.as_str(), message.as_str()),
-        (CLIENT_FAULT, "NoSuchResourceException", expected.as_str()),
+        (CLIENT_FAULT, "NoSuchResourceException", PAIR_WORDING),
         "case {case}: expected HTTP {CLIENT_FAULT} NoSuchResourceException stating \
-         {expected:?}, got {status} {code} with {message:?}"
+         {PAIR_WORDING:?}, got {status} {code} with {message:?}"
     );
 }

@@ -753,7 +753,9 @@ pub struct TagCeilingExceeded {
 /// Both arms are the model's `NoSuchResourceException` ("The specified resource does
 /// not exist"): an exclusion names the quota it excludes by `(ServiceCode,
 /// QuotaCode)`, so a pair no quota answers to names a resource that does not exist.
-/// The arm decides which of the two facts the refusal states.
+/// The arm decides which of the two facts the refusal states, and the sentence each is
+/// stated in is the crate's one wording for that fact
+/// ([`crate::service::refusals::exclusion_refusal_message`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionRefusal {
     /// The list is keyed by a `ServiceCode` the service catalog does not hold.
@@ -768,20 +770,6 @@ pub enum ExclusionRefusal {
         /// The code no quota of that service answers to.
         quota_code: String,
     },
-}
-
-impl ExclusionRefusal {
-    /// How the refusal is worded: the same wording every other read of a service or a
-    /// quota that does not exist answers with, so one fact has one message.
-    pub fn message(&self) -> String {
-        match self {
-            Self::UnknownService { service_code } => no_such_service_message(service_code),
-            Self::UnknownQuota {
-                service_code,
-                quota_code,
-            } => no_such_quota_message(service_code, quota_code),
-        }
-    }
 }
 
 /// Why no support case was opened for a quota increase request.
@@ -1042,24 +1030,6 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         self.default_quotas
             .iter()
             .find(|quota| quota.service_code == service_code && quota.quota_code == quota_code)
-    }
-
-    /// Which fact a `(ServiceCode, QuotaCode)` pair that resolves to no quota failed
-    /// on, worded for the modelled `NoSuchResourceException`.
-    ///
-    /// A lookup fails on the OUTERMOST thing the request named that does not exist: a
-    /// `ServiceCode` the catalog does not publish means there is no service to hold any
-    /// quota, so the refusal states the absent SERVICE
-    /// ([`no_such_service_message`]), and only a service the catalog does publish can
-    /// fail on the code itself, which states the absent QUOTA
-    /// ([`no_such_quota_message`]). Asked here rather than at each caller, so every
-    /// operation that resolves a pair attributes the failure to the same half of it.
-    pub fn unresolved_quota_message(&self, service_code: &str, quota_code: &str) -> String {
-        if self.knows_service(service_code) {
-            no_such_quota_message(service_code, quota_code)
-        } else {
-            no_such_service_message(service_code)
-        }
     }
 
     /// Every `QuotaCode` the service has a default quota for, in the order the
@@ -2211,30 +2181,6 @@ fn is_aws_partition(partition: &str) -> bool {
 pub fn is_reserved_tag_key(key: &str) -> bool {
     key.get(..RESERVED_TAG_KEY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
-}
-
-/// How this service states that `service_code` names no service it publishes quotas
-/// for, for the modelled `NoSuchResourceException`.
-///
-/// ONE wording for the fact, wherever a request names a service the catalog does not
-/// hold: the listings that take a `ServiceCode`, every lookup that resolves one as half
-/// of a `(ServiceCode, QuotaCode)` pair
-/// ([`ComAmazonawsServicequotasServicequotasv20190624State::unresolved_quota_message`]),
-/// and an Automatic Management exclusion keyed by one.
-pub fn no_such_service_message(service_code: &str) -> String {
-    format!("no service quotas are available for ServiceCode '{service_code}'")
-}
-
-/// How this service states that no quota answers to a `(ServiceCode, QuotaCode)` pair,
-/// for the modelled `NoSuchResourceException`.
-///
-/// ONE wording for the fact, wherever a request names a code a service the catalog DOES
-/// publish holds no quota under: the reads and the writes of one quota, and an Automatic
-/// Management exclusion naming one. A pair whose `ServiceCode` is itself unpublished
-/// fails on the service instead
-/// ([`ComAmazonawsServicequotasServicequotasv20190624State::unresolved_quota_message`]).
-pub fn no_such_quota_message(service_code: &str, quota_code: &str) -> String {
-    format!("no quota with ServiceCode '{service_code}' and QuotaCode '{quota_code}' exists")
 }
 
 /// How this service states that a call named no resource context for a quota whose

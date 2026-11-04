@@ -156,7 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolved_exclusion_list(input.exclusion_list)
             .map_err(|refusal| {
                 StartAutoManagementErrorModeled::NoSuchResourceException(NoSuchResourceException {
-                    message: Some(refusal.message()),
+                    message: Some(
+                        crate::service::refusals::exclusion_refusal_message(&refusal).to_string(),
+                    ),
                 })
             })?;
 
