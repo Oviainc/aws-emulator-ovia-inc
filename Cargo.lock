@@ -15045,6 +15045,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "mailparse",
  "serde_json",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-common",

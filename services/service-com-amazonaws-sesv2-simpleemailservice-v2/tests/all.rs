@@ -133,6 +133,8 @@ mod resource_tag_removal;
 mod resource_tags;
 #[path = "all/send_list_management_options.rs"]
 mod send_list_management_options;
+#[path = "all/send_suppression_from_feedback.rs"]
+mod send_suppression_from_feedback;
 #[path = "all/send_unverified_identity_refusal.rs"]
 mod send_unverified_identity_refusal;
 #[path = "all/state_roundtrip.rs"]

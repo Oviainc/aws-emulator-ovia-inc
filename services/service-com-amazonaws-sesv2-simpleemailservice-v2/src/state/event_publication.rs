@@ -34,6 +34,17 @@
 //!
 //! The refusal is worded as what the caller has to fix: the topic the destination named, and
 //! the permission its policy has to grant this service for the destination to work.
+//!
+//! What is published to a destination that takes events, and when, lives beside this:
+//! [`outcome`] decides what each recipient of an accepted message did with it and what the
+//! account's suppression list gains from that, and [`notification`] builds the documents
+//! those reactions produce and publishes each to every destination that matches it.
+
+/// The notifications a send produces, and their publication to a set's destinations.
+pub mod notification;
+/// What the recipients of an accepted message do with it, and what the suppression list
+/// gains because of it.
+pub mod outcome;
 
 /// The service principal this service publishes a configuration set's events as: the
 /// identity a destination's own policy decides the publish for.
@@ -84,7 +95,7 @@ pub async fn destination_refusal(
     // for the field: it ends up in the endpoint the in-process call is addressed at, so a
     // value that is no Region label names no topic this can read.
     let region = ::service_common::arn::region_of(topic_arn, SNS_ARN_NAMESPACE)?;
-    let policy = topic_policy(&sns_client(ctx, region), topic_arn).await?;
+    let policy = topic_policy(&sns_client(ctx.callback(), region), topic_arn).await?;
 
     let scope = super::CallerScope::of(ctx.parts());
     let source_arn = super::configuration_set_arn(&scope.region, configuration_set_name);
@@ -149,24 +160,27 @@ async fn topic_policy(client: &::aws_sdk_sns::Client, topic_arn: &str) -> Option
 
 /// An Amazon SNS client over the IN-PROCESS callback into this same emulator.
 ///
-/// `ctx.callback()` is the framework's seam for calling another emulated service, and the
-/// `http_client` it hands over dispatches the request inside this process to whichever
-/// mounted service claims it. The `endpoint_url` below is therefore an ADDRESS the
-/// in-process router reads, never a host any resolver looks up, and `region` is the label
-/// read out of the topic's own ARN.
+/// The callback ([`smithy_server_runtime::OperationContext::callback`]) is the framework's
+/// seam for calling another emulated service, and the `http_client` it hands over
+/// dispatches the request inside this process to whichever mounted service claims it. The
+/// `endpoint_url` below is therefore an ADDRESS the in-process router reads, never a host
+/// any resolver looks up, and `region` is the label read out of the topic's own ARN.
+///
+/// The callback is taken rather than the whole request context, because a publication made
+/// after the response ([`notification`]) holds a clone of it and no longer has the request.
 ///
 /// The credentials are the emulator's own root credentials, which only sign this operation's
 /// in-process calls; they are never put in a response or a log.
 fn sns_client(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_sns::Client {
     let config = ::aws_sdk_sns::Config::builder()
         .behavior_version(::aws_sdk_sns::config::BehaviorVersion::latest())
         .region(::aws_sdk_sns::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://{SNS_ARN_NAMESPACE}.{region}.amazonaws.com"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         // The transport is in-process: there is nothing to retry, time out or watch for a
         // stalled stream, and each of those would need a sleep implementation this client is
         // not given. The same goes for caching the identity: the credentials are handed over

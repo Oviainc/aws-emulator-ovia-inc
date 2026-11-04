@@ -151,7 +151,11 @@ const TENANT_NAME: &str = "TENANT_NAME";
 /// `complaint@`, `ooto@`, `suppressionlist@`) SES answers itself without delivering
 /// anything. `Metric` documents every metric as excluding mail sent to it, so a
 /// message addressed there is not counted.
-const MAILBOX_SIMULATOR_DOMAIN: &str = "simulator.amazonses.com";
+///
+/// The one home of the name is the module that decides what those mailboxes answer, so
+/// this surface and that one cannot drift.
+const MAILBOX_SIMULATOR_DOMAIN: &str =
+    crate::state::event_publication::outcome::MAILBOX_SIMULATOR_DOMAIN;
 
 /// The span one data point covers: the VDM dashboard reports sending activity by
 /// day, so a data point is one UTC day and its timestamp is the instant that day

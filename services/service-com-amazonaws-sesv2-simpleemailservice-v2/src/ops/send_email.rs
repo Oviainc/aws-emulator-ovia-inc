@@ -7,7 +7,12 @@
 //! outbound-message log with a fresh unique `MessageId`, and bumps the account's
 //! send counters. A message that carries list-management options is resolved
 //! against the contact lists first, and its recipients become contacts of the list
-//! it belongs to. This is the ONLY file to touch for this operation.
+//! it belongs to. Each recipient then does with the message what the account's
+//! suppression list and that recipient's own mailbox decide, which is what the
+//! account's suppression list is written from and what the configuration set's event
+//! destinations are told about
+//! ([`crate::state::event_publication`]). This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +139,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::event_publication;
 use crate::state::SentMessage;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -424,9 +430,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             configuration_set_name: input.configuration_set_name,
             reply_to: input.reply_to_addresses.unwrap_or_default(),
-            // Recorded, not acted on: nothing in this slice delivers a bounce or a
-            // complaint, so the address the caller nominated is part of what was
-            // accepted and readable back from the log.
+            // Recorded, not acted on: a bounce or a complaint this send produces is
+            // reported to the configuration set's event destinations below, and nothing
+            // here forwards one as mail to the address the caller nominated, so that
+            // address is part of what was accepted and readable back from the log.
             feedback_forwarding: input.feedback_forwarding_email_address,
             email_tags: input
                 .email_tags
@@ -437,7 +444,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sent_at: now,
         };
         let message_id = message.message_id.clone();
-        // The log keeps its newest `MAX_SENT_MESSAGES` entries.
+        // The log keeps its newest `MAX_SENT_MESSAGES` entries. The copy kept here is
+        // what the events of this send are built from, so they report the message
+        // exactly as the log holds it even once the log has evicted it.
+        let published = message.clone();
         store.record_sent(message);
         // A message that belongs to a contact list makes its recipients contacts of
         // that list: the unsubscribe link list management stamps into the message
@@ -473,6 +483,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recomputes it from the log rather than tallying: a tally would outlive the
         // entries it counted.
         store.settle(now);
+
+        // What each recipient does with the message, and what the account's suppression
+        // list gains from that: the list decides the outcome of a recipient already on it
+        // and a recipient's own outcome writes the list, so both are resolved here, in
+        // one pass, under the lock the send holds.
+        let outcomes = event_publication::outcome::outcomes(&mut store, &published, now);
+        // Where the events of this send are published: the destinations of the set the
+        // message named, read under the same lock.
+        let destinations = published
+            .configuration_set_name
+            .as_deref()
+            .and_then(|set_name| store.configuration_sets.get(set_name))
+            .map(|set| set.event_destinations.values().cloned().collect())
+            .unwrap_or_default();
+        let publication = event_publication::notification::PublishedSend {
+            account_id: crate::state::CallerScope::of(ctx.parts())
+                .account_id
+                .to_string(),
+            region,
+            destinations,
+            message: published,
+            outcomes,
+        };
+        // RELEASE the lock before the events are published: each publication reaches the
+        // service that owns the destination through this same emulator, and the message
+        // it reports is already recorded.
+        drop(store);
+        event_publication::notification::publish(ctx, publication);
 
         Ok(SendEmailOutput {
             message_id: Some(message_id),

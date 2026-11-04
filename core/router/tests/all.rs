@@ -843,6 +843,11 @@ mod ses_family_pre_dispatch_refusals;
 // every concurrently landing suite puts its line.
 #[path = "all/sesv2_sns_event_destination_topic_policy.rs"]
 mod sesv2_sns_event_destination_topic_policy;
+// Declared HERE, beside the sibling SESv2 suite above in this quiet span, for the same
+// reason: the head of this file and its appended tail are where every concurrently landing
+// suite puts its line, while these neighbouring lines are stable.
+#[path = "all/ses_send_events_reach_a_subscribed_queue.rs"]
+mod ses_send_events_reach_a_subscribed_queue;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/ssm_contacts_replication_set.rs"]

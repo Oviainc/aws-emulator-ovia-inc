@@ -29,6 +29,11 @@ tracing = { workspace = true }
 # generated client is needed — the emulator supplies the transport, so the SDK's own HTTPS
 # stack and runtime are left out.
 aws-sdk-sns = { version = "1", default-features = false }
+# `mailparse`: the ONE reading of an RFC 5322 / MIME message's header block — the
+# headers a message sent as `Content.Raw` carried, which a published email event reports
+# (`state::event_publication::notification`). The same crate the classic SES surface reads
+# a raw message with.
+mailparse = "0.16"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

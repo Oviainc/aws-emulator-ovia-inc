@@ -1,0 +1,521 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The event notifications a send produces, and their publication to the event
+//! destinations of the configuration set the message named.
+//!
+//! An event destination is "a place that you can send information about these events to",
+//! and the events themselves are what happened to one message: it was accepted (`Send`),
+//! it reached a recipient (`Delivery`), it failed for one (`Bounce`), or a recipient
+//! reported it (`Complaint`). The RULE this module implements: for each event an accepted
+//! message produces, every event destination of the set that is `Enabled` and whose
+//! `MatchingEventTypes` names that event's type receives one notification of it, and every
+//! other destination receives nothing.
+//!
+//! The document is the published form of what this service already holds: the message as
+//! it was accepted (its id, its sender, its recipients and its headers) and what each
+//! recipient did with it ([`super::outcome`]). Nothing a delivery attempt would have
+//! reported and nothing this emulator ran is invented for it — no processing time, no
+//! reporting MTA and no SMTP reply, because no mail server answered one.
+//!
+//! The destination kind served here is the SNS topic, which is the one this service reads
+//! and decides the publish for ([`super`]); every other kind an event destination may
+//! carry is reached through a grant of its own and is not published to from here.
+//!
+//! The publish itself goes through the in-process callback
+//! ([`smithy_server_runtime::OperationContext::callback`]), the way any emulated service
+//! reaches another, so nothing here opens a socket or leaves the host. A publish the topic
+//! does not take changes nothing about the send: the message was accepted before any event
+//! of it existed, so a failure is logged and the caller still holds its `MessageId`.
+
+use std::time::SystemTime;
+
+use serde_json::{json, Map, Value};
+
+use super::outcome::{Bounce, RecipientOutcome};
+
+/// The `EventType` value for the acceptance of a message, and the `eventType` the
+/// published document carries for it. The modelled value is what a destination's
+/// `MatchingEventTypes` names (see `crate::ops::types::EVENT_TYPE_VALUES`); the published
+/// spelling is the one the notification document uses.
+const SEND: (&str, &str) = ("SEND", "Send");
+
+/// The same pair for a message that reached a recipient.
+const DELIVERY: (&str, &str) = ("DELIVERY", "Delivery");
+
+/// The same pair for a message that failed for a recipient.
+const BOUNCE: (&str, &str) = ("BOUNCE", "Bounce");
+
+/// The same pair for a message a recipient reported as unwanted.
+const COMPLAINT: (&str, &str) = ("COMPLAINT", "Complaint");
+
+/// The header names whose values make up the `commonHeaders` of a published document,
+/// matched without regard to case the way a mail header name compares.
+const COMMON_HEADER_NAMES: [&str; 3] = ["Subject", "Message-ID", "Date"];
+
+/// One notification: the event type a destination has to match for it, and the document
+/// published to the destination.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    /// The modelled `EventType` this notification is of.
+    pub event_type: &'static str,
+    /// The published document.
+    pub document: Value,
+}
+
+/// One accepted message, what its recipients did with it, and where the configuration set
+/// it named publishes that.
+///
+/// Assembled by the send under the store lock and published once the lock is released: the
+/// publish is an in-process call into another service, and no store lock is held across
+/// one.
+#[derive(Debug, Clone)]
+pub struct PublishedSend {
+    /// The Region the send executed in, which is the Region of the ARNs a document names.
+    pub region: String,
+    /// The account the message was sent from.
+    pub account_id: String,
+    /// The event destinations of the configuration set the message named, exactly as the
+    /// store held them when the message was accepted.
+    pub destinations: Vec<crate::state::EventDestinationRecord>,
+    /// The message, as the outbound log holds it.
+    pub message: crate::state::SentMessage,
+    /// What each recipient did with the message.
+    pub outcomes: Vec<RecipientOutcome>,
+}
+
+impl PublishedSend {
+    /// Deliver every event this send produced to every destination that matches it.
+    async fn deliver(&self, callback: &::smithy_server_runtime::EmbeddedEmulator) {
+        let notifications = self.notifications();
+        for destination in &self.destinations {
+            // "`EventDestinationDefinition$Enabled`: whether SES publishes to this
+            // destination at all" — a destination that is off receives nothing, including
+            // events produced while it was off, which are not delivered late either.
+            if !destination.enabled {
+                continue;
+            }
+            let Some(topic_arn) = destination
+                .sns_destination
+                .as_ref()
+                .map(|sns| sns.topic_arn.as_str())
+            else {
+                continue;
+            };
+            for notification in &notifications {
+                if !destination
+                    .matching_event_types
+                    .iter()
+                    .any(|matched| matched.as_str() == notification.event_type)
+                {
+                    continue;
+                }
+                publish_to_topic(callback, topic_arn, &notification.document).await;
+            }
+        }
+    }
+
+    /// Every notification this send produced, in the order the events happened: the
+    /// message was accepted first, and then each recipient did what it did with it.
+    ///
+    /// Recipients that did the SAME thing are reported together, the way a notification
+    /// lists the recipients it is about: one `Bounce` per distinct failure, one `Delivery`
+    /// for the recipients the message reached, one `Complaint` for those that reported it.
+    fn notifications(&self) -> Vec<Notification> {
+        let mail = self.mail();
+        let mut notifications = vec![Notification {
+            event_type: SEND.0,
+            document: document(SEND.1, &mail, "send", json!({})),
+        }];
+
+        // One notification per distinct failure, in the order the recipients were
+        // addressed, so a message with recipients that failed differently reports each
+        // failure with its own recipients rather than merging them.
+        let mut failures: Vec<&Bounce> = Vec::new();
+        for bounce in self.outcomes.iter().filter_map(|out| out.bounce.as_ref()) {
+            if !failures.contains(&bounce) {
+                failures.push(bounce);
+            }
+        }
+        for bounce in failures {
+            let bounced: Vec<&RecipientOutcome> = self
+                .outcomes
+                .iter()
+                .filter(|out| out.bounce.as_ref() == Some(bounce))
+                .collect();
+            notifications.push(Notification {
+                event_type: BOUNCE.0,
+                document: document(
+                    BOUNCE.1,
+                    &mail,
+                    "bounce",
+                    json!({
+                        "bounceType": bounce.bounce_type,
+                        "bounceSubType": bounce.bounce_sub_type,
+                        "bouncedRecipients": bounced
+                            .iter()
+                            .map(|out| json!({
+                                "emailAddress": out.address,
+                                "action": bounce.action,
+                                "status": bounce.status,
+                                "diagnosticCode": bounce.diagnostic_code,
+                            }))
+                            .collect::<Vec<Value>>(),
+                        "timestamp": self.stamp(),
+                        "feedbackId": self.feedback_id(&bounced),
+                    }),
+                ),
+            });
+        }
+
+        let delivered: Vec<&str> = self
+            .outcomes
+            .iter()
+            .filter(|out| out.delivered)
+            .map(|out| out.address.as_str())
+            .collect();
+        if !delivered.is_empty() {
+            notifications.push(Notification {
+                event_type: DELIVERY.0,
+                document: document(
+                    DELIVERY.1,
+                    &mail,
+                    "delivery",
+                    json!({"timestamp": self.stamp(), "recipients": delivered}),
+                ),
+            });
+        }
+
+        let complained: Vec<&RecipientOutcome> = self
+            .outcomes
+            .iter()
+            .filter(|out| out.complained)
+            .collect();
+        if let Some(first) = complained.first() {
+            let mut complaint = json!({
+                "complainedRecipients": complained
+                    .iter()
+                    .map(|out| json!({"emailAddress": out.address}))
+                    .collect::<Vec<Value>>(),
+                "timestamp": self.stamp(),
+                "feedbackId": self.feedback_id(&complained),
+            });
+            if let Some(feedback_type) = first.complaint_feedback_type {
+                complaint["complaintFeedbackType"] = json!(feedback_type);
+            }
+            notifications.push(Notification {
+                event_type: COMPLAINT.0,
+                document: document(COMPLAINT.1, &mail, "complaint", complaint),
+            });
+        }
+        notifications
+    }
+
+    /// The `mail` object every notification of this send carries: the message as it was
+    /// accepted.
+    fn mail(&self) -> Value {
+        let message = &self.message;
+        let headers = self.headers();
+        let mut mail = json!({
+            "timestamp": self.stamp(),
+            "sendingAccountId": self.account_id,
+            "messageId": message.message_id,
+            "destination": message.recipients().collect::<Vec<&String>>(),
+            // The log holds the message as it was accepted, so the headers reported are
+            // the ones it carried rather than a truncation of them.
+            "headersTruncated": false,
+            "headers": headers
+                .iter()
+                .map(|(name, value)| json!({"name": name, "value": value}))
+                .collect::<Vec<Value>>(),
+            "commonHeaders": self.common_headers(&headers),
+            "tags": self.tags(),
+        });
+        if let Some(source) = &message.from {
+            mail["source"] = json!(crate::state::addr_spec(source));
+            // The identity the message was sent from, in the Region the send executed in:
+            // SES identities are per Region.
+            mail["sourceArn"] = json!(crate::state::identity_arn(
+                &self.region,
+                crate::state::addr_spec(source)
+            ));
+        }
+        mail
+    }
+
+    /// The headers the message carried, in the order they were written.
+    ///
+    /// A raw message IS a MIME document, so its own header block is what it carried: the
+    /// names keep the case the caller wrote and the values are read off unchanged. A
+    /// simple message was assembled by SES from the members the request supplied, so its
+    /// headers are those members.
+    fn headers(&self) -> Vec<(String, String)> {
+        let message = &self.message;
+        // Only a raw message is recorded without a subject of its own, because a simple
+        // message always carries one ([`crate::state::SentMessage`]).
+        if message.subject.is_none() {
+            if let Some(written) = message.body.as_deref().and_then(mime_headers) {
+                return written;
+            }
+        }
+        let mut headers = Vec::new();
+        if let Some(from) = &message.from {
+            headers.push(("From".to_string(), from.clone()));
+        }
+        for (name, addresses) in [
+            ("To", &message.to),
+            ("Cc", &message.cc),
+            ("Reply-To", &message.reply_to),
+        ] {
+            if !addresses.is_empty() {
+                headers.push((name.to_string(), addresses.join(", ")));
+            }
+        }
+        if let Some(subject) = &message.subject {
+            headers.push(("Subject".to_string(), subject.clone()));
+        }
+        headers
+    }
+
+    /// The `commonHeaders` object: the addresses the message was accepted for, and the
+    /// headers of [`COMMON_HEADER_NAMES`] it carried.
+    fn common_headers(&self, headers: &[(String, String)]) -> Value {
+        let message = &self.message;
+        let mut common = Map::new();
+        for (member, addresses) in [
+            ("from", message.from.clone().into_iter().collect::<Vec<_>>()),
+            ("to", message.to.clone()),
+            ("cc", message.cc.clone()),
+            ("bcc", message.bcc.clone()),
+            ("replyTo", message.reply_to.clone()),
+        ] {
+            if !addresses.is_empty() {
+                common.insert(member.to_string(), json!(addresses));
+            }
+        }
+        for name in COMMON_HEADER_NAMES {
+            let written = headers
+                .iter()
+                .find(|(written, _)| written.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone());
+            if let Some(value) = written {
+                // `Message-ID` is reported under the member name a published document
+                // uses for it, which drops the separator.
+                common.insert(member_name(name), json!(value));
+            }
+        }
+        Value::Object(common)
+    }
+
+    /// The `tags` of the published document: the tags the send supplied
+    /// (`SendEmailRequest$EmailTags`, "to apply to an email that you send … so that you
+    /// can publish email sending events"), and the configuration set the message named,
+    /// which SES tags every event of such a send with.
+    ///
+    /// Each value is a LIST, because one tag name may be applied more than once.
+    fn tags(&self) -> Value {
+        let mut tags: Map<String, Value> = Map::new();
+        if let Some(set) = &self.message.configuration_set_name {
+            tags.insert("ses:configuration-set".to_string(), json!([set]));
+        }
+        for (name, value) in &self.message.email_tags {
+            match tags.get_mut(name) {
+                Some(Value::Array(values)) => values.push(json!(value)),
+                _ => {
+                    tags.insert(name.clone(), json!([value]));
+                }
+            }
+        }
+        Value::Object(tags)
+    }
+
+    /// When the message was accepted, as a published document stamps an instant.
+    fn stamp(&self) -> String {
+        stamp(self.message.sent_at)
+    }
+
+    /// The identifier of the report `about` — the feedback one message produced for its
+    /// first recipient in it, which is what identifies the report as a whole.
+    fn feedback_id(&self, about: &[&RecipientOutcome]) -> String {
+        let first = about.first().map_or("", |out| out.address.as_str());
+        super::outcome::feedback_id(&self.message.message_id, first)
+    }
+}
+
+/// The member name a published document reports the header `name` under.
+fn member_name(name: &str) -> String {
+    match name {
+        "Message-ID" => "messageId".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+/// `instant` as a published document stamps one: RFC 3339, the format every timestamp of
+/// this emulator's documents is written in.
+fn stamp(instant: SystemTime) -> String {
+    ::aws_smithy_types::DateTime::from(instant)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// One notification document: the event type, the `mail` object, and the one object the
+/// event itself carries, which a document names after the event.
+fn document(event_type: &str, mail: &Value, member: &str, event: Value) -> Value {
+    let mut document = Map::new();
+    document.insert("eventType".to_string(), json!(event_type));
+    document.insert("mail".to_string(), mail.clone());
+    document.insert(member.to_string(), event);
+    Value::Object(document)
+}
+
+/// The header block of the MIME document `body`, in the order it was written, or `None`
+/// when `body` does not open with one.
+///
+/// The reading is `mailparse`'s, the crate this project reads an RFC 5322 / MIME message
+/// with: the name keeps the case it was written in, a folded header is unfolded into the
+/// one header it is, and an encoded word is decoded the way a reader of the document
+/// decodes it. The input is the stored body, which the outbound log already caps
+/// ([`crate::state::MAX_STORED_BODY_CHARS`]), so nothing unbounded is read here.
+fn mime_headers(body: &str) -> Option<Vec<(String, String)>> {
+    let (headers, _body_at) = ::mailparse::parse_headers(body.as_bytes()).ok()?;
+    let written: Vec<(String, String)> = headers
+        .iter()
+        .map(|header| (header.get_key(), header.get_value()))
+        .collect();
+    (!written.is_empty()).then_some(written)
+}
+
+/// Publish `document` to the SNS topic `topic_arn`.
+///
+/// A topic this call cannot reach — one of another account, one nothing created, or one
+/// whose ARN names no Region — takes nothing, which is logged and changes nothing about
+/// the send.
+async fn publish_to_topic(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    topic_arn: &str,
+    document: &Value,
+) {
+    let Some(region) = ::service_common::arn::region_of(topic_arn, super::SNS_ARN_NAMESPACE) else {
+        ::tracing::debug!(
+            topic_arn,
+            "an event destination's topic ARN names no Region, so no event is published to it"
+        );
+        return;
+    };
+    let published = super::sns_client(callback, region)
+        .publish()
+        .topic_arn(topic_arn)
+        .message(document.to_string())
+        .send()
+        .await;
+    if let Err(error) = published {
+        ::tracing::debug!(
+            topic_arn,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "an event destination's topic did not take a published email event"
+        );
+    }
+}
+
+/// How many event-publication tasks this process may have in flight at once.
+///
+/// An EMULATOR ceiling, not an AWS quota: a caller looping on sends must not be able to
+/// start publication tasks without end. A send that finds every permit taken publishes
+/// nothing and says so in the log, which is the same outcome as a destination that cannot
+/// be reached — the publication is best effort either way, and what the caller is told
+/// about its send does not depend on it.
+pub const MAX_IN_FLIGHT_PUBLICATION_TASKS: usize = 32;
+
+/// How long one send's whole publication may take before it is abandoned.
+///
+/// An EMULATOR ceiling as well: the transport is in-process, so a publish waits only on
+/// another handler of this same emulator, and the client disables retries and the SDK's
+/// own timeouts. This is what keeps a task waiting on a slow handler from holding its
+/// permit for the life of the process.
+pub const PUBLICATION_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
+
+/// How many publication tasks are in flight right now; see
+/// [`MAX_IN_FLIGHT_PUBLICATION_TASKS`].
+static IN_FLIGHT_PUBLICATION_TASKS: ::std::sync::atomic::AtomicUsize =
+    ::std::sync::atomic::AtomicUsize::new(0);
+
+/// One task's claim on an in-flight permit, released when the task ends — including when
+/// it ends by panicking or by being dropped at runtime shutdown, because the release is a
+/// `Drop`.
+struct PublicationPermit;
+
+impl PublicationPermit {
+    /// Claim a permit, or `None` when [`MAX_IN_FLIGHT_PUBLICATION_TASKS`] are already in
+    /// flight.
+    fn claim() -> Option<Self> {
+        IN_FLIGHT_PUBLICATION_TASKS
+            .try_update(
+                ::std::sync::atomic::Ordering::SeqCst,
+                ::std::sync::atomic::Ordering::SeqCst,
+                |in_flight| (in_flight < MAX_IN_FLIGHT_PUBLICATION_TASKS).then_some(in_flight + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for PublicationPermit {
+    fn drop(&mut self) {
+        IN_FLIGHT_PUBLICATION_TASKS.fetch_sub(1, ::std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Publish the events `send` produced, on the runtime's own time.
+///
+/// The entry point a send calls, with the store's guard released: an email event is
+/// published ASYNCHRONOUSLY — the message is accepted and answered before any event of it
+/// exists — so the publications are made on a task of their own rather than on the
+/// request's own path. With no async runtime to spawn onto there is nothing to publish on,
+/// and nothing a caller is told depends on it.
+///
+/// What bounds the task: one send produces one event per recipient reaction plus the
+/// acceptance, at most [`MAX_IN_FLIGHT_PUBLICATION_TASKS`] tasks run at once, each publish
+/// is one await with no retry loop behind it, and the whole publication is abandoned after
+/// [`PUBLICATION_DEADLINE`].
+pub fn publish(ctx: &::smithy_server_runtime::OperationContext<'_>, send: PublishedSend) {
+    // A message sent without a configuration set, or through one carrying no destination,
+    // produces events no destination receives: there is nothing to publish.
+    if send.destinations.is_empty() {
+        return;
+    }
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        ::tracing::warn!(
+            message_id = send.message.message_id,
+            "no async runtime is available to publish this send's email events on"
+        );
+        return;
+    };
+    let Some(permit) = PublicationPermit::claim() else {
+        ::tracing::warn!(
+            message_id = send.message.message_id,
+            in_flight = MAX_IN_FLIGHT_PUBLICATION_TASKS,
+            "this emulator is already publishing as many sends' email events as it runs at \
+             once; this send's events are dropped"
+        );
+        return;
+    };
+    // The callback is an owned handle into this same emulator, so the task that publishes
+    // the events outlives the request that produced them.
+    let callback = ctx.callback().clone();
+    let message_id = send.message.message_id.clone();
+    runtime.spawn(async move {
+        // Moved into the task, so the permit is held for exactly as long as the task runs
+        // and is released however it ends.
+        let _permit = permit;
+        if ::tokio::time::timeout(PUBLICATION_DEADLINE, send.deliver(&callback))
+            .await
+            .is_err()
+        {
+            ::tracing::warn!(
+                message_id,
+                deadline_secs = PUBLICATION_DEADLINE.as_secs(),
+                "this send's email events were not published inside the deadline and were \
+                 abandoned"
+            );
+        }
+    });
+}
