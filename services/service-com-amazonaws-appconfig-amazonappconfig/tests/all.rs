@@ -109,6 +109,8 @@ mod list_extension_associations;
 mod list_extensions;
 #[path = "all/list_hosted_configuration_versions.rs"]
 mod list_hosted_configuration_versions;
+#[path = "all/listing_item_instant_wire_form.rs"]
+mod listing_item_instant_wire_form;
 #[path = "all/pattern_refusal_quoting.rs"]
 mod pattern_refusal_quoting;
 #[path = "all/refusal_message_templates.rs"]
