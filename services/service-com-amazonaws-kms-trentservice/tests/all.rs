@@ -137,5 +137,7 @@ mod state_roundtrip;
 mod tagging_refusal_wording;
 #[path = "all/update_custom_key_store.rs"]
 mod update_custom_key_store;
+#[path = "all/update_primary_region_preconditions.rs"]
+mod update_primary_region_preconditions;
 #[path = "all/via_service_confinement.rs"]
 mod via_service_confinement;

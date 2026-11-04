@@ -5,6 +5,12 @@
 //! that already holds a replica of it, and makes the former primary key a replica. This
 //! is the ONLY file to touch for this operation.
 //!
+//! `KeyId` "identifies the current primary key", so a request whose identifier resolves
+//! to a REPLICA key of the set is refused, and the move changes the role of BOTH keys —
+//! the named primary key and the replica in `PrimaryRegion` — so the key-state
+//! precondition of a management operation is judged on both of them before anything is
+//! written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -273,6 +279,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The key the designation moves within, by the key id every key of its
+        // multi-Region set shares, read before the store is written through again.
+        let key_id = key.key_id.clone();
+
+        // One multi-Region key set has ONE primary-key designation, and moving it is
+        // not instantaneous: "even after this operation completes, the process of
+        // updating the primary Region might still be in progress for a few more
+        // seconds. ... The old and new primary keys have a transient key state of
+        // Updating. The original key state is restored when the update is complete"
+        // (same doc). So concurrent promotions of one set are serialized: exactly one
+        // caller moves the designation, and a caller arriving while that move is still
+        // in flight finds the set in a state this operation is not compatible with —
+        // the modelled `KMSInvalidStateException`. Nothing about such a request's own
+        // values is wrong, so it is NOT a validation failure: a client that races or
+        // retries branches on this fault to learn the set is busy. The message is the
+        // key-state wording the rest of the service uses, naming the key the request
+        // resolved to by its ARN and the state the move in flight puts the set in.
+        //
+        // It is judged BEFORE which member of the set the request named, because while
+        // the move is in flight the set has no settled answer to that question: the
+        // designation is between two of its keys.
+        if state.primary_region_update_in_flight(&key_id) {
+            return Err(UpdatePrimaryRegionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::key_state_refusal_message(
+                        key,
+                        crate::state::KEY_STATE_UPDATING,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Identifies the current primary key. When the operation completes, this KMS
+        // key will be a replica key"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegionRequest",member="KeyId")`)
+        // — the designation is the PRIMARY key's to move, so an identifier that
+        // resolved to a replica key of the set names no key this call may be made on.
+        // Which key of a set holds the designation is the set's own state, so this is
+        // the modelled `KMSInvalidStateException` rather than a bad parameter value, and
+        // the message names the key the request resolved to by its ARN
+        // (`crate::state::not_multi_region_primary_message`). The request is made at the
+        // endpoint of the Region whose key it names, so this is also what sends a
+        // promotion to the Region that holds the set's primary key.
+        if key.is_multi_region_replica() {
+            return Err(UpdatePrimaryRegionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::not_multi_region_primary_message(key)),
+                },
+            )
+            .into());
+        }
+
         // A disabled key has its own modelled refusal here — "the specified KMS key
         // is not enabled" — and any other key state outside `Enabled` (a key
         // awaiting deletion, or one awaiting imported key material) is a key state
@@ -292,33 +351,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The key the designation moves within, by the key id every key of its
-        // multi-Region set shares, read before the store is written through again.
-        let key_id = key.key_id.clone();
-
-        // One multi-Region key set has ONE primary-key designation, and moving it is
-        // not instantaneous: "even after this operation completes, the process of
-        // updating the primary Region might still be in progress for a few more
-        // seconds. ... The old and new primary keys have a transient key state of
-        // Updating. The original key state is restored when the update is complete"
-        // (same doc). So concurrent promotions of one set are serialized: exactly one
-        // caller moves the designation, and a caller arriving while that move is still
-        // in flight finds the set in a state this operation is not compatible with —
-        // the modelled `KMSInvalidStateException`. Nothing about such a request's own
-        // values is wrong, so it is NOT a validation failure: a client that races or
-        // retries branches on this fault to learn the set is busy. The message is the
-        // key-state wording the rest of the service uses, naming the key the request
-        // resolved to by its ARN and the state the move in flight puts the set in.
-        if state.primary_region_update_in_flight(&key_id) {
-            return Err(UpdatePrimaryRegionErrorModeled::KMSInvalidStateException(
-                KMSInvalidStateException {
-                    message: Some(crate::state::key_state_refusal_message(
-                        key,
-                        crate::state::KEY_STATE_UPDATING,
-                    )),
-                },
-            )
-            .into());
+        // "This operation changes the replica key in the specified Region to a primary
+        // key and changes the former primary key to a replica key" (same doc): the move
+        // changes the role of BOTH keys, so the key state precondition is the same one
+        // on both — the replica that is being promoted has to be in a key state a
+        // management operation of the set is compatible with, with the same two refusals
+        // the named key answers, each naming the key it is about by its ARN. Judged
+        // before anything is written, so a refused promotion leaves both roles as they
+        // were.
+        if let Some(replica) = state.key_in(&input.primary_region, &key_id) {
+            if replica.key_state == crate::state::KEY_STATE_DISABLED {
+                return Err(UpdatePrimaryRegionErrorModeled::DisabledException(
+                    DisabledException {
+                        message: Some(crate::state::invalid_state_message(replica)),
+                    },
+                )
+                .into());
+            }
+            if !replica.is_usable() {
+                return Err(UpdatePrimaryRegionErrorModeled::KMSInvalidStateException(
+                    KMSInvalidStateException {
+                        message: Some(crate::state::invalid_state_message(replica)),
+                    },
+                )
+                .into());
+            }
         }
 
         // "The key ID and primary Region that you specify uniquely identify the

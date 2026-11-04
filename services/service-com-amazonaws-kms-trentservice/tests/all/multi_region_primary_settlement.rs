@@ -196,6 +196,8 @@ async fn a_reported_promotion_serves_the_operations_the_move_refused() {
         // The two operations of the SET a move in flight refuses, taken once it is
         // reported: the promoted key replicates again, and the designation moves on.
         // A Region holding no key of the set is what a replicate adds a member in.
+        // Both are asked for at the endpoint of the key that now holds the set's
+        // primary designation, which is the key either of them is about.
         let elsewhere = TARGETS
             .iter()
             .find(|region| **region != target)
@@ -216,7 +218,7 @@ async fn a_reported_promotion_serves_the_operations_the_move_refused() {
         );
         ok_in(
             &router,
-            REGION,
+            target,
             "UpdatePrimaryRegion",
             &json!({"KeyId": key_id, "PrimaryRegion": REGION}),
         )

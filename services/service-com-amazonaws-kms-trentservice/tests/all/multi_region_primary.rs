@@ -8,6 +8,8 @@
 //! that already holds a replica key — making the former primary key a replica,
 //! creating no key anywhere, and changing nothing else about the set — so a later
 //! `DescribeKey` reports the moved designation through `MultiRegionConfiguration`.
+//! The `KeyId` "identifies the current primary key", so the call is made at the
+//! endpoint of the Region that holds the set's primary key now.
 //! The call is refused, persisting nothing, when the key is not a multi-Region key
 //! at all, when the identifier names no key of the Region the request was signed
 //! for, when it is not a well-formed KMS ARN, when the key's key state is not
@@ -38,7 +40,7 @@ use serde_json::json;
 use service_com_amazonaws_kms_trentservice::state::key_arn;
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, failure, ok, refused,
+    assert_empty, call, create_alias, create_key, describe, error_code, failure, ok, ok_in, refused,
     replicate_into, router, settle_key_state, text, topology_at, REGION,
 };
 
@@ -95,8 +97,14 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
 
     for primary_region in moves {
         let case = format!("primary moves to {primary_region}");
-        let answer = ok(
+        // "Identifies the current primary key"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegionRequest",member="KeyId")`),
+        // and an identifier resolves to the key the endpoint it is presented at serves,
+        // so each move is asked for at the endpoint of the Region that holds the set's
+        // primary key right now — which this row's predecessor moved.
+        let answer = ok_in(
             &router,
+            &former_primary,
             "UpdatePrimaryRegion",
             &json!({"KeyId": key_id, "PrimaryRegion": primary_region}),
         )
@@ -247,13 +255,16 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
 
         // The Region that now holds the primary key holds no replica, so asking for
         // it again names no key to promote — a bad `PrimaryRegion` value rather than
-        // a set that is busy.
-        let (status, code) = failure(
+        // a set that is busy. It is asked for at that Region's endpoint, which is the
+        // one serving the set's primary key now.
+        let (status, payload) = call(
             &router,
+            primary_region,
             "UpdatePrimaryRegion",
             &json!({"KeyId": key_id, "PrimaryRegion": primary_region}),
         )
         .await;
+        let code = error_code(&payload);
         // Every client refusal of this service answers HTTP 400 with the error
         // shape in the body's `__type`, whatever the per-shape `@httpError` says.
         assert_eq!(

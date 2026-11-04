@@ -21,8 +21,8 @@
 //!
 //! Both suites assert that over a TABLE rather than one call: the racing rows differ in
 //! how many callers race, in the Region they promote (the two-, three- and
-//! four-segment Region ids `RegionType`'s pattern admits), in how many Regions hold a
-//! key of the set and in which endpoints the racers call; the in-flight rows differ in
+//! four-segment Region ids `RegionType`'s pattern admits) and in how many Regions hold a
+//! key of the set; the in-flight rows differ in
 //! the operation attempted, in the endpoint attempting it and in whether that operation
 //! is a management operation of the set or a cryptographic one.
 
@@ -37,8 +37,13 @@ use super::harness::{
 };
 
 /// One racing row: how many callers promote at once, the Region they all promote, the
-/// other Regions that hold a key of the set, and the endpoints the racers call
-/// (cycled, so a row can race from one endpoint or from several).
+/// other Regions that hold a key of the set, and the endpoints the racers call.
+///
+/// A promotion's `KeyId` "identifies the current primary key"
+/// (`smithy_query(query="doc",shape="UpdatePrimaryRegionRequest",member="KeyId")`), so the
+/// endpoint every racer of a row calls is the one serving the set's primary key; what a
+/// promotion asked for with a REPLICA's identifier answers is
+/// [`super::update_primary_region_preconditions`]'s rule.
 struct Race {
     case: &'static str,
     racers: usize,
@@ -66,11 +71,11 @@ const RACES: &[Race] = &[
         endpoints: &[REGION],
     },
     Race {
-        case: "five callers race from every endpoint of a four-Region set",
+        case: "five callers race from the primary key's endpoint of a four-Region set",
         racers: 5,
         target: "us-gov-west-1",
         others: &["eu-west-2", "ap-southeast-2"],
-        endpoints: &[REGION, "us-gov-west-1", "eu-west-2", "ap-southeast-2"],
+        endpoints: &[REGION],
     },
 ];
 
@@ -374,7 +379,7 @@ async fn a_set_moving_its_primary_key_refuses_management_and_serves_cryptography
     );
     let promoted = ok_in(
         &router,
-        REGION,
+        target,
         "UpdatePrimaryRegion",
         &json!({"KeyId": key_id, "PrimaryRegion": REGION}),
     )

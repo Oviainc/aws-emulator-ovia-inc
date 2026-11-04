@@ -397,6 +397,199 @@ async fn material_a_key_already_holds_is_not_new_key_material() {
     }
 }
 
+/// One row of the table in
+/// [`an_import_can_only_give_a_key_material_it_is_associated_with`]: an import the key
+/// cannot be given, and the identifier the refusal must name.
+struct RefusedImport<'a> {
+    case: &'a str,
+    /// The key material the request wraps.
+    material: &'a [u8],
+    /// The `ImportType` the request states, or `None` to state none.
+    import_type: Option<&'a str>,
+    /// The `KeyMaterialId` the request names, or `None` to name none.
+    key_material_id: Option<&'a str>,
+    /// The identifier the refusal is expected to name.
+    expected_id: &'a str,
+}
+
+/// Rule 1, continued: the identifiers a key is ASSOCIATED with outlive the material
+/// itself — "to restore the usability of the KMS key, reimport the same key material"
+/// (`smithy_query(query="doc",shape="DeleteImportedKeyMaterial")`) — so once anything
+/// has been imported, an import can only give the key material it is already associated
+/// with, and the refusal names the identifier that was expected.
+///
+/// The rows differ in the wrapping (both the digest of the RSA step and whether the
+/// material travels under the RSA key or under an ephemeral AES key), in what the
+/// request says its `ImportType` is, in whether it names a `KeyMaterialId`, and in which
+/// material is presented.
+#[tokio::test]
+async fn an_import_can_only_give_a_key_material_it_is_associated_with() {
+    let router = router();
+
+    for wrapping_algorithm in ["RSAES_OAEP_SHA_256", "RSA_AES_KEY_WRAP_SHA_1"] {
+        let metadata = create_key(&router, &json!({"Origin": "EXTERNAL"})).await;
+        let key_id = text(wrapping_algorithm, &metadata, "KeyId");
+
+        // The material this key becomes associated with, and material of exactly the
+        // same kind and length that it never held.
+        let own = random_bytes(SYMMETRIC_MATERIAL_LEN).expect("entropy");
+        let own_id = symmetric_material_id(wrapping_algorithm, &own);
+        let foreign = random_bytes(SYMMETRIC_MATERIAL_LEN).expect("entropy");
+        // A well-formed `BackingKeyIdType` (64 lowercase hex,
+        // `smithy_query(query="shape",shape="BackingKeyIdType")`) that identifies none of
+        // this key's material.
+        let unheld_id = "b".repeat(64);
+
+        let (public_key, token) =
+            parameters_for(&router, wrapping_algorithm, &key_id, wrapping_algorithm).await;
+        let wrapped = wrap(wrapping_algorithm, &public_key, wrapping_algorithm, &own);
+        let imported = ok(
+            &router,
+            "ImportKeyMaterial",
+            &import_request(&key_id, &token, &wrapped, None),
+        )
+        .await;
+        assert_eq!(
+            imported["KeyMaterialId"].as_str().unwrap_or_default(),
+            own_id,
+            "case {wrapping_algorithm}: the first import names the material it imported, \
+             got {imported}"
+        );
+
+        // The material is taken away, which leaves the key waiting for material it is
+        // already associated with.
+        ok(
+            &router,
+            "DeleteImportedKeyMaterial",
+            &json!({"KeyId": key_id}),
+        )
+        .await;
+        let described = describe(&router, &key_id).await;
+        assert_eq!(
+            described["KeyState"].as_str().unwrap_or_default(),
+            "PendingImport",
+            "case {wrapping_algorithm}: deleting the material leaves the key waiting for \
+             it, got {described}"
+        );
+
+        // Every row is an import the key cannot be given.
+        let rows: Vec<RefusedImport<'_>> = vec![
+            RefusedImport {
+                case: "other material, with no ImportType stated",
+                material: &foreign,
+                import_type: None,
+                key_material_id: None,
+                expected_id: &own_id,
+            },
+            RefusedImport {
+                case: "other material, stated to be the existing material",
+                material: &foreign,
+                import_type: Some("EXISTING_KEY_MATERIAL"),
+                key_material_id: None,
+                expected_id: &own_id,
+            },
+            RefusedImport {
+                case: "other material, stated to be new material",
+                material: &foreign,
+                import_type: Some("NEW_KEY_MATERIAL"),
+                key_material_id: None,
+                expected_id: &own_id,
+            },
+            RefusedImport {
+                case: "other material, named by the identifier of the material the key has",
+                material: &foreign,
+                import_type: Some("EXISTING_KEY_MATERIAL"),
+                key_material_id: Some(&own_id),
+                expected_id: &own_id,
+            },
+            RefusedImport {
+                case: "the key's own material, named by an identifier it does not have",
+                material: &own,
+                import_type: Some("EXISTING_KEY_MATERIAL"),
+                key_material_id: Some(&unheld_id),
+                expected_id: &unheld_id,
+            },
+        ];
+        for row in rows {
+            let RefusedImport {
+                case,
+                material,
+                import_type,
+                key_material_id,
+                expected_id,
+            } = row;
+            let case = format!("{wrapping_algorithm}: {case}");
+            let (public_key, token) =
+                parameters_for(&router, &case, &key_id, wrapping_algorithm).await;
+            let wrapped = wrap(&case, &public_key, wrapping_algorithm, material);
+            let mut request = import_request(&key_id, &token, &wrapped, import_type);
+            if let Some(key_material_id) = key_material_id {
+                request["KeyMaterialId"] = json!(key_material_id);
+            }
+            let (status, code, message) =
+                refused(&router, REGION, "ImportKeyMaterial", &request).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "IncorrectKeyMaterialException"),
+                "case {case}: expected HTTP 400 IncorrectKeyMaterialException, got {status} \
+                 {code:?} {message:?}"
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "Imported key material does not have the expected identifier \
+                     ({expected_id})."
+                ),
+                "case {case}: the refusal must name the identifier that was expected, got \
+                 {message:?}"
+            );
+            // A refused import persists nothing: the key is still waiting, and is still
+            // associated with exactly the material it was.
+            let described = describe(&router, &key_id).await;
+            assert_eq!(
+                (
+                    described["KeyState"].as_str().unwrap_or_default(),
+                    described["CurrentKeyMaterialId"].as_str()
+                ),
+                ("PendingImport", None),
+                "case {case}: a refused import must leave the key as it was, got {described}"
+            );
+        }
+
+        // The material the key IS associated with, with nothing stated about it: the
+        // `ImportType` an import into a key that has been imported into defaults to is
+        // EXISTING_KEY_MATERIAL, so this is the documented way to give the key its
+        // material back, and it makes the key usable again under the identity it had.
+        // (A request that NAMES a `KeyMaterialId` is judged against the material the key
+        // holds, which is [`imported_material_stays_the_keys_own_material`]'s rule.)
+        let case = format!("{wrapping_algorithm}: its own material, with nothing stated");
+        let (public_key, token) = parameters_for(&router, &case, &key_id, wrapping_algorithm).await;
+        let wrapped = wrap(&case, &public_key, wrapping_algorithm, &own);
+        let imported = ok(
+            &router,
+            "ImportKeyMaterial",
+            &import_request(&key_id, &token, &wrapped, None),
+        )
+        .await;
+        assert_eq!(
+            imported["KeyMaterialId"].as_str().unwrap_or_default(),
+            own_id,
+            "case {case}: the identifier is a function of the material, so reimporting \
+             it keeps it, got {imported}"
+        );
+        let described = describe(&router, &key_id).await;
+        assert_eq!(
+            (
+                described["KeyState"].as_str().unwrap_or_default(),
+                described["CurrentKeyMaterialId"].as_str().unwrap_or_default()
+            ),
+            ("Enabled", own_id.as_str()),
+            "case {case}: the key is usable again, under the material it was \
+             associated with, got {described}"
+        );
+    }
+}
+
 /// Rule 1, continued: material whose expiry has passed is material KMS has already
 /// taken away, so the key waits for material again — and the material it waits for is
 /// its OWN: reimporting the material that expired makes it current with no rotation to
@@ -857,6 +1050,77 @@ async fn new_material_is_judged_by_the_material_for_every_kind_of_key() {
                 .unwrap_or_default(),
             "Enabled",
             "case {case:?}: re-importing the key's own material leaves it usable"
+        );
+
+        // And with NOTHING stated about the material: "after the first key material is
+        // imported, if this parameter is omitted then the parameter defaults to
+        // EXISTING_KEY_MATERIAL"
+        // (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ImportType")`),
+        // which is a fact about the key's HISTORY — so it holds for these kinds too,
+        // whose material KMS assigns no `KeyMaterialId` to.
+        let (public_key, token) =
+            parameters_for(&router, case, &key_id, "RSA_AES_KEY_WRAP_SHA_256").await;
+        let wrapped = wrap(case, &public_key, "RSA_AES_KEY_WRAP_SHA_256", &material);
+        let (status, payload) = call(
+            &router,
+            REGION,
+            "ImportKeyMaterial",
+            &import_request(&key_id, &token, &wrapped, None),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&payload).as_str()),
+            (200, ""),
+            "case {case:?}: an import that states no ImportType into a key that has been \
+             imported into is a re-import of its existing material, got HTTP {status} \
+             with {payload}"
+        );
+        assert_eq!(
+            describe(&router, &key_id).await["KeyState"]
+                .as_str()
+                .unwrap_or_default(),
+            "Enabled",
+            "case {case:?}: that re-import leaves the key usable"
+        );
+
+        // The same import after the material has been DELETED: the key is bound to the
+        // material it was imported with, and giving it that material back — with nothing
+        // stated — makes it usable again.
+        ok(
+            &router,
+            "DeleteImportedKeyMaterial",
+            &json!({"KeyId": key_id}),
+        )
+        .await;
+        assert_eq!(
+            describe(&router, &key_id).await["KeyState"]
+                .as_str()
+                .unwrap_or_default(),
+            "PendingImport",
+            "case {case:?}: deleting the material leaves the key waiting for it"
+        );
+        let (public_key, token) =
+            parameters_for(&router, case, &key_id, "RSA_AES_KEY_WRAP_SHA_256").await;
+        let wrapped = wrap(case, &public_key, "RSA_AES_KEY_WRAP_SHA_256", &material);
+        let (status, payload) = call(
+            &router,
+            REGION,
+            "ImportKeyMaterial",
+            &import_request(&key_id, &token, &wrapped, None),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&payload).as_str()),
+            (200, ""),
+            "case {case:?}: reimporting the same key material restores the key, got HTTP \
+             {status} with {payload}"
+        );
+        assert_eq!(
+            describe(&router, &key_id).await["KeyState"]
+                .as_str()
+                .unwrap_or_default(),
+            "Enabled",
+            "case {case:?}: the key is usable again"
         );
     }
 }
