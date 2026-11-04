@@ -90,7 +90,7 @@ async fn an_event_type_summary_reports_the_catalogs_published_values() {
             "codebuild-project-build-state-in-progress",
             "CodeBuild",
             "Project",
-            "Build state: In progress",
+            "Build state: In-progress",
         ),
         (
             "codedeploy-application-deployment-succeeded",
@@ -183,8 +183,9 @@ async fn the_catalog_data_satisfies_the_modelled_constraints() {
             entry.event_type_id
         );
         assert!(
-            !name.contains('-'),
-            "case {:?}: EventTypeName is published prose, not the id slug, got {name:?}",
+            name.contains(": "),
+            "case {:?}: EventTypeName is the published label (a category, then the state it \
+             reports), not the id slug, got {name:?}",
             entry.event_type_id
         );
     }

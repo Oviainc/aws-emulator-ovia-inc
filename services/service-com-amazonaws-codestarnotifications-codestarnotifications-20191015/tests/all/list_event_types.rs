@@ -125,24 +125,27 @@ async fn filters_select_from_the_catalog_oring_one_name_and_anding_across_names(
         "codedeploy-application-deployment-succeeded",
         "codedeploy-application-deployment-started",
     ];
+    // In the catalog's published order, so the CodeBuild in-progress event type comes
+    // after the entries the published catalog puts before it rather than beside the other
+    // build-state entries.
     const CODEBUILD: &[&str] = &[
         "codebuild-project-build-state-failed",
         "codebuild-project-build-state-succeeded",
-        "codebuild-project-build-state-in-progress",
         "codebuild-project-build-state-stopped",
         "codebuild-project-build-phase-failure",
         "codebuild-project-build-phase-success",
+        "codebuild-project-build-state-in-progress",
     ];
     const CODEBUILD_THEN_CODEDEPLOY: &[&str] = &[
         "codebuild-project-build-state-failed",
         "codebuild-project-build-state-succeeded",
-        "codebuild-project-build-state-in-progress",
         "codebuild-project-build-state-stopped",
         "codebuild-project-build-phase-failure",
         "codebuild-project-build-phase-success",
         "codedeploy-application-deployment-failed",
         "codedeploy-application-deployment-succeeded",
         "codedeploy-application-deployment-started",
+        "codebuild-project-build-state-in-progress",
     ];
 
     let cases: &[FilterCase] = &[

@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListEventTypesErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
-                            message: Some(st::INVALID_NEXT_TOKEN.to_string()),
+                            message: Some(st::invalid_next_token(token)),
                         },
                     )
                     .into());

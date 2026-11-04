@@ -19,6 +19,8 @@ mod delete_target;
 mod describe_notification_rule_fidelity;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/event_type_catalog_and_next_token.rs"]
+mod event_type_catalog_and_next_token;
 #[path = "all/list_event_types.rs"]
 mod list_event_types;
 #[path = "all/list_targets.rs"]

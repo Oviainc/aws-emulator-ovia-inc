@@ -617,14 +617,21 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
     text.strip_prefix("v1:")?.parse::<u64>().ok()
 }
 
-/// What a listing states when a `NextToken` does not decode: the sentence
-/// `InvalidNextTokenException` itself documents ("The value for the enumeration token
-/// used in the request to return the next batch of the results is not valid"). ONE text
-/// for the class, so every paginated operation of this service refuses an unknown token
-/// the same way.
-pub const INVALID_NEXT_TOKEN: &str = "The value for the enumeration token used in the \
-                                      request to return the next batch of the results is \
-                                      not valid";
+/// What a listing states when a `NextToken` does not decode: the input member that was
+/// rejected, followed by the token the request submitted, verbatim.
+///
+/// The shape's own documentation sentence ("The value for the enumeration token used in
+/// the request to return the next batch of the results is not valid") documents the
+/// CONDITION; the wire message names the parameter and echoes its value, which is the
+/// only part of this error that tells a caller WHICH token was refused. The token is the
+/// one variable part and comes from the request — nothing stored is named — and it is
+/// safe to echo because `NextToken` is not `@sensitive` and is the caller's own input.
+///
+/// ONE text for the class, so every paginated operation of this service refuses a token
+/// it did not mint the same way.
+pub fn invalid_next_token(token: &str) -> String {
+    format!("Invalid nextToken parameter {token}.")
+}
 
 /// The page size a listing uses when the request carries no `MaxResults`: the modelled
 /// maximum (`MaxResults`: `@range(min: 1, max: 100)`), so an unpaginated client sees as
@@ -787,6 +794,12 @@ pub struct EventTypeCatalogEntry {
 /// types are the capitalised singular nouns (`Repository`, `Project`, `Application`,
 /// `Pipeline`) `ListEventTypes` answers with.
 ///
+/// The table's ORDER is the order the service publishes the catalog in, and that order is
+/// the stable total order `ListEventTypes` pages walk — so an entry sits where the
+/// published catalog puts it, which is not necessarily beside the other entries of its
+/// service: an event type the service gained after the first catalog was published follows
+/// the entries that predate it.
+///
 /// This is the ONE set of event types the service publishes: `ListEventTypes` reports it,
 /// and an `EventTypeIds` entry it does not hold names no event, so the create and update
 /// paths refuse it ([`event_type_ids_violation`]) rather than storing a rule that could
@@ -805,7 +818,6 @@ pub const EVENT_TYPE_CATALOG: &[EventTypeCatalogEntry] = &[
     entry("codecommit-repository-branches-and-tags-updated", "CodeCommit", "Repository", "Branches and tags: Updated"),
     entry("codebuild-project-build-state-failed", "CodeBuild", "Project", "Build state: Failed"),
     entry("codebuild-project-build-state-succeeded", "CodeBuild", "Project", "Build state: Succeeded"),
-    entry("codebuild-project-build-state-in-progress", "CodeBuild", "Project", "Build state: In progress"),
     entry("codebuild-project-build-state-stopped", "CodeBuild", "Project", "Build state: Stopped"),
     entry("codebuild-project-build-phase-failure", "CodeBuild", "Project", "Build phase: Failure"),
     entry("codebuild-project-build-phase-success", "CodeBuild", "Project", "Build phase: Success"),
@@ -821,6 +833,7 @@ pub const EVENT_TYPE_CATALOG: &[EventTypeCatalogEntry] = &[
     entry("codepipeline-pipeline-manual-approval-failed", "CodePipeline", "Pipeline", "Manual approval: Failed"),
     entry("codepipeline-pipeline-manual-approval-needed", "CodePipeline", "Pipeline", "Manual approval: Needed"),
     entry("codepipeline-pipeline-manual-approval-succeeded", "CodePipeline", "Pipeline", "Manual approval: Succeeded"),
+    entry("codebuild-project-build-state-in-progress", "CodeBuild", "Project", "Build state: In-progress"),
     entry("codepipeline-pipeline-action-execution-succeeded", "CodePipeline", "Pipeline", "Action execution: Succeeded"),
     entry("codepipeline-pipeline-action-execution-failed", "CodePipeline", "Pipeline", "Action execution: Failed"),
     entry("codepipeline-pipeline-action-execution-canceled", "CodePipeline", "Pipeline", "Action execution: Canceled"),
