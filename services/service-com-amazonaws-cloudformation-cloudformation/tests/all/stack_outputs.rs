@@ -482,6 +482,12 @@ fn output_cases() -> Vec<OutputCase> {
                 "      Handler: index.handler\n",
                 "      Runtime: python3.12\n",
                 "      Role: !GetAtt ExecutionRole.Arn\n",
+                // `Code` is required on the type, and the deployment really creates the
+                // function in Lambda, which requires a package too.
+                "      Code:\n",
+                "        ZipFile: |\n",
+                "          def handler(event, context):\n",
+                "              return {}\n",
                 "      Tags:\n",
                 "        - Key: probe\n",
                 "          Value: tagged\n",
@@ -491,6 +497,11 @@ fn output_cases() -> Vec<OutputCase> {
                 "      FunctionName: probe-untagged\n",
                 "      Handler: index.handler\n",
                 "      Runtime: python3.12\n",
+                "      Role: !GetAtt ExecutionRole.Arn\n",
+                "      Code:\n",
+                "        ZipFile: |\n",
+                "          def handler(event, context):\n",
+                "              return {}\n",
                 "  ExecutionRole:\n",
                 "    Type: AWS::IAM::Role\n",
                 "    Properties:\n",
@@ -948,7 +959,10 @@ fn output_cases() -> Vec<OutputCase> {
                 "        Statement:\n",
                 "          - Effect: Allow\n",
                 "            Principal:\n",
-                "              Service: ecs-tasks.amazonaws.com\n",
+                // The function RUNS AS this role, so its trust policy names the principal
+                // Lambda assumes it as — which that service resolves before it creates the
+                // function.
+                "              Service: lambda.amazonaws.com\n",
                 "            Action: sts:AssumeRole\n",
                 "  DBSecret:\n",
                 "    Type: AWS::SecretsManager::Secret\n",
@@ -967,6 +981,10 @@ fn output_cases() -> Vec<OutputCase> {
                 "      Handler: index.handler\n",
                 "      Runtime: python3.12\n",
                 "      Role: !GetAtt ExecutionRole.Arn\n",
+                "      Code:\n",
+                "        ZipFile: |\n",
+                "          def handler(event, context):\n",
+                "              return {}\n",
                 "Outputs:\n",
                 "  FunctionName:\n",
                 "    Value: !Ref AppFunction\n",

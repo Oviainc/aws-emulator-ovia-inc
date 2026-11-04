@@ -72,8 +72,8 @@ const GENERATED_ID_HEX_DIGITS: usize = 12;
 const ROLE_ID_PREFIX: &str = "AROA";
 
 /// The emulator with the four services this suite exercises, mounted on ONE engine exactly as
-/// `core/router/src/lib.rs` mounts them: the stack really creates its domain, its bucket and
-/// its role in the services that own them.
+/// `core/router/src/lib.rs` mounts them: the stack really creates its domain, its bucket, its
+/// role and its function in the services that own them.
 fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -91,6 +91,12 @@ fn build_router() -> MultiServiceRouter {
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
         Arc::clone(&engine),
     ));
+    // AWS Lambda, for the `AWS::Lambda::Function` and the `AWS::Lambda::Permission` the
+    // template declares: a stack really creates both there, so the owning service has to be
+    // mounted beside CloudFormation or the create is refused and the stack fails.
+    router.register_service(
+        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     router.register_service(
         service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
     );

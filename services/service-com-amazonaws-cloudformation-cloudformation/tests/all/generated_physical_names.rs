@@ -171,8 +171,25 @@ fn properties(resource_type: &str) -> Value {
     if resource_type == "AWS::RDS::DBInstance" {
         return json!({"Engine": "mysql", "DBInstanceClass": "db.t3.micro"});
     }
+    // An `AWS::Lambda::Function` is created through `CreateFunction`, whose `Role` and
+    // `Code` are required members (and whose `Runtime` and `Handler` are required of a .zip
+    // package): the role is the one the template declares for it ([`EXEC_ROLE_LOGICAL_ID`]),
+    // the one role here whose trust policy lets Lambda assume it.
+    if resource_type == "AWS::Lambda::Function" {
+        return json!({
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Role": {"Fn::GetAtt": [EXEC_ROLE_LOGICAL_ID, "Arn"]},
+            "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"}
+        });
+    }
     json!({})
 }
+
+/// The logical id of the execution role the functions below run as. It is NOT one of the
+/// table's rows: nothing is asserted about its own generated name, and it is here because
+/// the functions cannot be created without a role Lambda can assume.
+const EXEC_ROLE_LOGICAL_ID: &str = "FunctionExecRole";
 
 /// One declared resource of the table: its logical id, and the row it came from.
 struct Declared<'a> {
@@ -203,6 +220,22 @@ fn declarations() -> Vec<Declared<'static>> {
 /// The template declaring every resource of [`declarations`], none of them named.
 fn template(declared: &[Declared<'_>]) -> String {
     let mut resources = serde_json::Map::new();
+    resources.insert(
+        EXEC_ROLE_LOGICAL_ID.to_string(),
+        json!({
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": {"Service": "lambda.amazonaws.com"},
+                        "Action": "sts:AssumeRole"
+                    }]
+                }
+            },
+        }),
+    );
     for entry in declared {
         resources.insert(
             entry.logical_id.clone(),

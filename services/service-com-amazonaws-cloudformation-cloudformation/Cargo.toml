@@ -66,10 +66,18 @@ service-common = { path = "../common" }
 # The IAM store a stack operation resolves its `RoleARN` against, to check the role's
 # trust policy lets cloudformation.amazonaws.com assume it before the stack is written.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
-
-# Reads the ZIP archive an extension's schema handler package arrives as, so the schema
-# `RegisterType` registers is the one the package carries (`ops::register_type`).
+# Writes the .zip deployment package an `AWS::Lambda::Function` declaring INLINE code is
+# created from: a template states that function's source TEXT, while Lambda's `ZipFile`
+# member is the bytes of an archive, so the source is archived in memory rather than with a
+# hand-rolled writer (`state::provisioning::lambda_function`). It also READS the ZIP archive
+# an extension's schema handler package arrives as, so the schema `RegisterType` registers is
+# the one the package carries (`ops::register_type`).
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# The service principal an `AWS::Lambda::Function`'s execution role has to admit, and the
+# sentence AWS Lambda refuses a create naming a role it cannot assume with: the stack
+# resolves that role against this account's IAM before it hands it over, and the refusal is
+# worded once, by the service that owns it.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

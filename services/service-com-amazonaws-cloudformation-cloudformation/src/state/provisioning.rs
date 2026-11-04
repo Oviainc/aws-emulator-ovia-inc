@@ -48,10 +48,11 @@
 //! model declares awsJson, [`call_query`] for one that declares awsQuery — the wire is the
 //! called service's, not this one's). The part that is
 //! per type — which service owns it, and the create, update and delete calls that make its
-//! resources exist, change and stop existing — is [`super::provisioner`], reached only
-//! through
-//! [`provisioner_for`](super::provisioner::provisioner_for), so adding a resource type
-//! never touches the algorithm here.
+//! resources exist, change and stop existing — is [`super::provisioner`]'s catalogue for
+//! every type it already carries, and a module of its own for a type added since that file
+//! passed the length a change to this repository may touch ([`lambda_function`],
+//! [`lambda_permission`]). Either way the algorithm reaches it only through [`owner_for`],
+//! so adding a resource type never touches the algorithm here.
 //!
 //! A type whose properties are not the create's own members is mapped the one way its
 //! owning API takes them, and no further: an `AWS::SQS::Queue`'s properties are the
@@ -62,7 +63,7 @@
 //!
 //! ## What a resource type needs before a stack can create it
 //!
-//! [`provisioner_for`](super::provisioner::provisioner_for) maps a template resource type
+//! [`owner_for`] maps a template resource type
 //! to the operations of the service that owns it. The type usually names that service
 //! itself: its middle segment is the service model's own `awsService.cloudFormationName`
 //! (Amazon Data Firehose's model carries `cloudFormationName: KinesisFirehose`, so its
@@ -92,9 +93,8 @@
 //! (`DescribeStackResources` and its siblings) report it as the stack DECLARED it, with
 //! the status of the deployment that recorded it — this emulator's inherited scope for
 //! such a type, not a claim that the resource exists in that service. Adding a provisioner
-//! for another type is a local change: one arm in
-//! [`provisioner_for`](super::provisioner::provisioner_for) and the create/delete pair it
-//! names, and that type's resources then really are created and deleted.
+//! for another type is a local change: one arm in [`owner_for`] and the create/delete pair
+//! it names, and that type's resources then really are created and deleted.
 //!
 //! ## Whose the resource's IDENTITY is
 //!
@@ -197,6 +197,9 @@ use serde_json::Value;
 
 use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
+
+mod lambda_function;
+mod lambda_permission;
 
 /// The awsJson media types the services this module calls speak, named once here because
 /// [`call_json_rpc`] takes the one the called service's own model declares: an answer is
@@ -500,6 +503,230 @@ pub(super) enum Removal {
     Pending(String),
 }
 
+/// WHO owns a template resource type — the one question this algorithm asks before it
+/// creates, updates, re-tags or deletes a resource, and the only thing it needs to know
+/// about a type.
+///
+/// Most types' per-type half lives in [`super::provisioner`]'s own catalogue
+/// ([`Self::Builtin`]). A type added since that file passed the length a change to this
+/// repository may touch brings its own module instead ([`Self::LambdaFunction`], whose arm
+/// is [`lambda_function`]), and this is where the two meet: every call below is the same
+/// question put to whichever module owns the type, so the algorithm itself is unchanged by
+/// where an arm lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Owner {
+    /// A type whose create, update and delete arms are entries of
+    /// [`provisioner_for`](super::provisioner::provisioner_for)'s catalogue.
+    Builtin(Provisioner),
+    /// `AWS::Lambda::Function`, whose arms are [`lambda_function`]'s.
+    LambdaFunction,
+    /// `AWS::Lambda::Permission`, whose arms are [`lambda_permission`]'s.
+    LambdaPermission,
+}
+
+/// The owner of a template resource type, or `None` for a type this emulator leaves
+/// declared-only.
+pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
+    if resource_type == lambda_function::LAMBDA_FUNCTION {
+        return Some(Owner::LambdaFunction);
+    }
+    if resource_type == lambda_permission::LAMBDA_PERMISSION {
+        return Some(Owner::LambdaPermission);
+    }
+    provisioner_for(resource_type).map(Owner::Builtin)
+}
+
+impl Owner {
+    /// Create one resource in the service that owns it — see
+    /// [`Provisioner::create`](super::provisioner::Provisioner::create).
+    async fn create(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+        propagated: &[(String, String)],
+    ) -> Result<Created, Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner.create(ctx, region, resource, propagated).await
+            }
+            Self::LambdaFunction => {
+                lambda_function::create(ctx, region, resource, propagated).await
+            }
+            // A policy statement carries no tags of its own: it is not a resource, so
+            // CloudFormation propagates none to it.
+            Self::LambdaPermission => lambda_permission::create(ctx, region, resource).await,
+        }
+    }
+
+    /// Whether the owning service reports the created resource ready — see
+    /// [`Provisioner::readiness`](super::provisioner::Provisioner::readiness).
+    async fn readiness(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        physical_resource_id: &str,
+    ) -> Result<Readiness, Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner.readiness(ctx, region, physical_resource_id).await
+            }
+            Self::LambdaFunction => Ok(lambda_function::readiness()),
+            // The statement is in force the moment `AddPermission` answers.
+            Self::LambdaPermission => Ok(Readiness::Ready),
+        }
+    }
+
+    /// The attributes the owning service publishes for a resource it now reports up — see
+    /// [`Provisioner::ready_attributes`](super::provisioner::Provisioner::ready_attributes).
+    async fn ready_attributes(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource_type: &str,
+        physical_resource_id: &str,
+    ) -> Result<BTreeMap<String, String>, Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner
+                    .ready_attributes(ctx, region, resource_type, physical_resource_id)
+                    .await
+            }
+            // A function's `Arn` is the one its create answered with, so a resource this
+            // owner created has every attribute it publishes already, and a policy
+            // statement publishes none at all.
+            Self::LambdaFunction | Self::LambdaPermission => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Whether the owning service has finished removing a deleted resource — see
+    /// [`Provisioner::removal`](super::provisioner::Provisioner::removal).
+    async fn removal(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        physical_resource_id: &str,
+    ) -> Result<Removal, Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner.removal(ctx, region, physical_resource_id).await
+            }
+            Self::LambdaFunction => {
+                lambda_function::removal(ctx, region, physical_resource_id).await
+            }
+            // `RemovePermission` takes the statement away, so there is nothing to wait for.
+            Self::LambdaPermission => Ok(Removal::Gone),
+        }
+    }
+
+    /// Apply a changed declaration to a resource that exists — see
+    /// [`Provisioner::update`](super::provisioner::Provisioner::update).
+    async fn update(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+        declared: &Value,
+    ) -> Result<Option<Created>, Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner.update(ctx, region, resource, declared).await
+            }
+            Self::LambdaFunction => lambda_function::update(ctx, region, resource, declared)
+                .await
+                .map(Some),
+            // A statement of a policy cannot be CHANGED in place: `AddPermission` adds one
+            // and `RemovePermission` removes one, so a changed declaration is reported as
+            // not applied rather than as a success that dropped the caller's change.
+            Self::LambdaPermission => Ok(None),
+        }
+    }
+
+    /// Bring a carried-forward resource's tags back into step — see
+    /// [`Provisioner::retag`](super::provisioner::Provisioner::retag).
+    async fn retag(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+        declared: &Value,
+        propagated: &[(String, String)],
+    ) -> Result<(), Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner
+                    .retag(ctx, region, resource, declared, propagated)
+                    .await
+            }
+            Self::LambdaFunction => {
+                lambda_function::retag(ctx, region, resource, declared, propagated).await
+            }
+            // A policy statement is not taggable, so nothing is asked about its tags.
+            Self::LambdaPermission => Ok(()),
+        }
+    }
+
+    /// Delete one resource from the service that owns it — see
+    /// [`Provisioner::delete`](super::provisioner::Provisioner::delete).
+    async fn delete(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+        final_snapshot: Option<&str>,
+    ) -> Result<(), Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner
+                    .delete(ctx, region, resource, final_snapshot)
+                    .await
+            }
+            // Lambda's `DeleteFunction` takes no snapshot of a function on the way out:
+            // there is no such call, so a `Snapshot` deletion policy on this type deletes
+            // the function with no snapshot invented for it.
+            Self::LambdaFunction => lambda_function::delete(ctx, region, resource).await,
+            Self::LambdaPermission => lambda_permission::delete(ctx, region, resource).await,
+        }
+    }
+
+    /// The resource's configuration as its owning service reports it, for drift detection —
+    /// see
+    /// [`Provisioner::actual_configuration`](super::provisioner::Provisioner::actual_configuration).
+    pub(super) async fn actual_configuration(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+    ) -> Result<Option<Value>, Refusal> {
+        match self {
+            Self::Builtin(provisioner) => {
+                provisioner.actual_configuration(ctx, region, resource).await
+            }
+            Self::LambdaFunction => {
+                lambda_function::actual_configuration(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                )
+                .await
+            }
+            // The policy a statement belongs to is read by the function's own drift read,
+            // so a statement reports no configuration of its own to compare.
+            Self::LambdaPermission => Ok(None),
+        }
+    }
+
+    /// How this type's provider words a refusal it classified — see
+    /// [`Provisioner::handler_message`](super::provisioner::Provisioner::handler_message).
+    fn handler_message(self, class: &str, message: &str) -> String {
+        match self {
+            Self::Builtin(provisioner) => provisioner.handler_message(class, message),
+            // AWS Lambda's resource provider reports the service's own message as it came.
+            Self::LambdaFunction | Self::LambdaPermission => message.to_string(),
+        }
+    }
+}
+
 /// Ask the services that own a Region's still-creating and still-deleting resources whether
 /// they are done yet, and record what they answer.
 ///
@@ -557,7 +784,7 @@ pub async fn advance_stabilisations(
             // still in flight holds the operation exactly as a creation that is still coming
             // up does, so the two answers are read as the one thing they both are — whether
             // the call that service accepted has been carried out.
-            let readiness = match provisioner_for(&barrier.resource_type) {
+            let readiness = match owner_for(&barrier.resource_type) {
                 Some(provisioner) => match barrier.awaited {
                     super::stabilising::Awaited::Ready => {
                         provisioner
@@ -586,7 +813,7 @@ pub async fn advance_stabilisations(
             let ready_attributes = if matches!(readiness, Ok(Readiness::Ready))
                 && barrier.awaited == super::stabilising::Awaited::Ready
             {
-                match provisioner_for(&barrier.resource_type) {
+                match owner_for(&barrier.resource_type) {
                     Some(provisioner) => provisioner
                         .ready_attributes(
                             ctx,
@@ -644,7 +871,7 @@ pub async fn advance_stabilisations(
                                 now,
                                 &barrier,
                                 &handler_failure_reason(
-                                    provisioner_for(&barrier.resource_type),
+                                    owner_for(&barrier.resource_type),
                                     &refusal,
                                 ),
                             )
@@ -953,7 +1180,7 @@ pub async fn reconcile(
                     &resource,
                     super::resource_status::UPDATE_IN_PROGRESS,
                 ));
-                let applied = match provisioner_for(&resource.resource_type) {
+                let applied = match owner_for(&resource.resource_type) {
                     Some(provisioner) => {
                         // The call is the stack's, made under its service role and about
                         // THIS resource ([`super::service_role`]).
@@ -1008,7 +1235,7 @@ pub async fn reconcile(
                             &resource,
                             super::resource_status::UPDATE_FAILED,
                             Some(handler_failure_reason(
-                                provisioner_for(&resource.resource_type),
+                                owner_for(&resource.resource_type),
                                 &refusal,
                             )),
                         ));
@@ -1026,7 +1253,7 @@ pub async fn reconcile(
             // change. Only a type with a re-tagging arm has anything asked of its service
             // ([`super::provisioner::Provisioner::retag`]), and that arm is idempotent, so a
             // resource whose tags already agree with the set has nothing called about it.
-            let retagged = match provisioner_for(&resource.resource_type) {
+            let retagged = match owner_for(&resource.resource_type) {
                 Some(provisioner) => {
                     let tags = stack.tags_for(&resource.logical_id);
                     super::service_role::on_resource(
@@ -1066,7 +1293,7 @@ pub async fn reconcile(
                         &resource,
                         super::resource_status::UPDATE_FAILED,
                         Some(handler_failure_reason(
-                            provisioner_for(&resource.resource_type),
+                            owner_for(&resource.resource_type),
                             &refusal,
                         )),
                     ));
@@ -1086,7 +1313,7 @@ pub async fn reconcile(
         // Which service owns the type, resolved ONCE here: the create below and the
         // readiness read that follows it are two questions for the same provisioner, and
         // one lookup is what keeps them from ever being asked of different ones.
-        let owner = provisioner_for(&resource.resource_type);
+        let owner = owner_for(&resource.resource_type);
         let created = match owner {
             // The resource is created WITH the tags CloudFormation gives it: the stack's
             // own, plus the three that name the stack and this resource's place in it.
@@ -1894,7 +2121,7 @@ async fn delete_pass(
         }
         // Which service is asked to delete the resource. `None` is a type this emulator
         // provisions nowhere: there is no API to call for it.
-        let owner = provisioner_for(&resource.resource_type);
+        let owner = owner_for(&resource.resource_type);
         if !resource.materialised {
             // Nothing exists in any owning service for this resource, so nothing is asked
             // of anybody. The stack still HELD the record, though, and its teardown is
@@ -2030,7 +2257,7 @@ async fn delete_pass(
             }
             Err(refusal) => {
                 let reason = handler_failure_reason(
-                    provisioner_for(&outcome.resources[index].resource_type),
+                    owner_for(&outcome.resources[index].resource_type),
                     &refusal,
                 );
                 if on_refusal == OnRefusal::Abandon {
@@ -2344,7 +2571,7 @@ fn handler_error_code(code: &str) -> &'static str {
 /// ([`super::provisioner::Provisioner::handler_message`]): for a type whose provider words a
 /// refusal through the class it put it in, that wording is part of what CloudFormation
 /// quotes. A type this emulator has no provisioner for reports the refusal as it came.
-fn handler_failure_reason(owner: Option<Provisioner>, refusal: &Refusal) -> String {
+fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal) -> String {
     // A service that worded no message at all still named the error, and the code is then
     // all there is to report.
     let message = if refusal.message.is_empty() {
@@ -2393,9 +2620,8 @@ fn denied_by_the_service_role(signing_name: &str, operation: Option<&str>) -> Op
 ///
 /// A 501 — the owning operation is still one of this emulator's stubs — is a refusal like
 /// any other, so a resource of a type this emulator DOES provision is never passed off as
-/// created when nothing created it; the type's own entry in
-/// [`provisioner_for`](super::provisioner::provisioner_for) is what decides whether a
-/// create is attempted at all.
+/// created when nothing created it; the type's own entry in [`owner_for`] is what decides
+/// whether a create is attempted at all.
 pub(super) async fn call_json_rpc(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,

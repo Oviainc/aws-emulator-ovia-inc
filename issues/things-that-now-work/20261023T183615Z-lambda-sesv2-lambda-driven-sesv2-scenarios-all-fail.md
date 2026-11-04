@@ -24,6 +24,17 @@ Issue-Commit: 3dc196f76d19116b5d570e1dc438e2b93d0e0d47
 
 > _Note: this issue was identified against the code base at commit `3dc196f76d19116b5d570e1dc438e2b93d0e0d47`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution note (filed with the fix for causes 4 and 5): causes 1 and 3 were fixed by the
+> changes that own those surfaces (the sigv4-'ses' router disambiguation and
+> `CreateFunction`'s execution-role resolution), and causes 4 and 5 by CloudFormation's
+> `AWS::Lambda::Function` / `AWS::Lambda::Permission` provisioners
+> (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioning/`).
+> **Cause 2 — `Invoke` runs no deployment package — remains OPEN**, and the units of this
+> group that invoke a function still fail on it; it is tracked under
+> `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`,
+> which owns the in-process execution substrate and the guest-side AWS SDK bridge those
+> scenarios need._
+
 ## Operation
 CreateFunction
 

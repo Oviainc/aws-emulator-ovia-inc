@@ -40,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::change_set_lifecycle::settle_the_store;
 use crate::stack_lifecycle::{
-    call, create_stack, kv, member, router_with_engine, xml_blocks, xml_text,
+    call, create_stack, iam, kv, member, router_with_engine, xml_blocks, xml_text,
 };
 use crate::sam_transform::sam_template;
 use crate::stack_resources::wire_resources;
@@ -62,6 +62,18 @@ struct Row {
     /// the TEMPLATE gave them: a resource the macro leaves alone, and the ones SAM keeps
     /// the declared logical id of.
     kept: Vec<(&'static str, &'static str)>,
+    /// The execution role this row's template NAMES rather than declares, created in IAM
+    /// before the stack deploys — an execution role provisioned outside the template, which
+    /// is what a function that "names a role of its own" is given.
+    external_role: Option<&'static str>,
+}
+
+/// A trust policy that lets AWS Lambda assume the role, which is what the service resolves
+/// before it creates a function that runs as it.
+fn lambda_trust_policy() -> String {
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+         "Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
+        .to_string()
 }
 
 /// A function declaration whose `Api` event names `RestApiId`, which is what makes the API
@@ -135,6 +147,7 @@ fn rows() -> Vec<Row> {
                 ("FailureCount", "AWS::Logs::MetricFilter"),
                 ("FailureAlarm", "AWS::CloudWatch::Alarm"),
             ],
+            external_role: None,
         },
         Row {
             case: "a simple table alone, the one serverless type that expands to a single \
@@ -146,6 +159,7 @@ fn rows() -> Vec<Row> {
             ),
             types: vec!["AWS::DynamoDB::Table"],
             kept: vec![("Sessions", "AWS::DynamoDB::Table")],
+            external_role: None,
         },
         Row {
             case: "a function that names a role of its own: no role is synthesized for it",
@@ -158,6 +172,7 @@ fn rows() -> Vec<Row> {
             ),
             types: vec!["AWS::Lambda::Function"],
             kept: vec![("Worker", "AWS::Lambda::Function")],
+            external_role: Some("declared-by-the-template"),
         },
         Row {
             case: "the YAML spelling of a function with an implicit Api event and a table",
@@ -198,6 +213,7 @@ fn rows() -> Vec<Row> {
                 // name no `RestApiId`.
                 ("ServerlessRestApi", "AWS::ApiGateway::RestApi"),
             ],
+            external_role: None,
         },
         Row {
             case: "the macro declared over resources it expands nothing of",
@@ -213,6 +229,7 @@ fn rows() -> Vec<Row> {
                 ("FailureCount", "AWS::Logs::MetricFilter"),
                 ("FailureAlarm", "AWS::CloudWatch::Alarm"),
             ],
+            external_role: None,
         },
     ]
 }
@@ -224,6 +241,23 @@ async fn deployed_resources(
     engine: &Arc<engine::InMemoryEngine>,
     row: &Row,
 ) -> Vec<(String, String)> {
+    if let Some(role) = row.external_role {
+        let (code, body) = iam(
+            router,
+            "CreateRole",
+            &[
+                ("RoleName", role),
+                ("AssumeRolePolicyDocument", &lambda_trust_policy()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {:?}: expected the execution role the template names to be created in IAM, \
+             got {code} {body}",
+            row.case
+        );
+    }
     let (code, body) = create_stack(
         router,
         row.stack,

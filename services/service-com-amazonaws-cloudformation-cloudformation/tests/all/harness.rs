@@ -73,6 +73,12 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
         Arc::clone(&engine),
     ));
+    // AWS Lambda, for the `AWS::Lambda::Function` a stack really creates there — including
+    // the one an `AWS::Serverless::Function` becomes — so a suite that deploys one reads the
+    // function back through Lambda's own wire.
+    router.register_service(
+        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

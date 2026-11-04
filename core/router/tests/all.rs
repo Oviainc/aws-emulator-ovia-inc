@@ -979,3 +979,5 @@ mod cloudformation_provisions_mq_brokers;
 mod cloudformation_refuses_mq_brokers;
 #[path = "all/cloudformation_provisions_agentcore_workload_identities.rs"]
 mod cloudformation_provisions_agentcore_workload_identities;
+#[path = "all/cloudformation_provisions_lambda_functions.rs"]
+mod cloudformation_provisions_lambda_functions;

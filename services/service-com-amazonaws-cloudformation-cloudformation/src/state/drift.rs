@@ -64,7 +64,7 @@
 
 use serde_json::Value;
 
-use super::provisioner::provisioner_for;
+use super::provisioning::owner_for;
 use super::{resource_drift_status, StoredResource, DRIFT_STATUS_DRIFTED, DRIFT_STATUS_IN_SYNC, DRIFT_STATUS_UNKNOWN};
 
 /// The error code an owning service answers when the read this module needs is still one
@@ -233,7 +233,7 @@ pub async fn detect(
 ) -> Detected {
     let mut detected = Detected::default();
     for resource in resources {
-        let (status, detail) = match provisioner_for(&resource.resource_type) {
+        let (status, detail) = match owner_for(&resource.resource_type) {
             // Nothing was created for this resource in any service, so there is no actual
             // configuration to compare: the type does not support drift detection here.
             Some(provisioner) if resource.materialised => {
