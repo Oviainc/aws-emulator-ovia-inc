@@ -27,6 +27,7 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_transcribe_transcribe::service::medical_scribe_availability::ACCOUNT_NOT_AUTHORIZED;
 use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
 
 use crate::tagging_resource_families::{expected_pairs, families, pairs, tag_list, Family};
@@ -190,6 +191,29 @@ async fn an_arn_of_another_partition_region_or_account_resolves_nothing() {
         let served = served_in.unwrap_or(DEFAULT_REGION);
 
         for family in families() {
+            // A family AWS does not offer in this Region answers every call of its own
+            // with its authorization refusal, so no resource of it exists here for an
+            // ARN to name — the create says so, and the sentence is
+            // `crate::medical_scribe_region_availability`'s subject.
+            if !family.is_served_in(served) {
+                let case = format!("{} is not served in {served}", family.case);
+                let reply = transcribe
+                    .call_in_region(
+                        family.create,
+                        family.create_request(&family.resource_name("qualified"), &CREATED_TAGS),
+                        served_in,
+                    )
+                    .await;
+                reply.refused(&case, CLIENT_ERROR_STATUS, ABSENT_CODE);
+                assert_eq!(
+                    reply.error_message(&case),
+                    ACCOUNT_NOT_AUTHORIZED,
+                    "case {case:?}: expected the refusal of a family this Region does not \
+                     serve, got {:?}",
+                    reply.body
+                );
+                continue;
+            }
             let name = family.resource_name("qualified");
             let scope = served_in.map_or_else(|| "unsigned".to_string(), str::to_string);
             let case = format!("{} / served in {served} ({scope})", family.case);
@@ -237,6 +261,27 @@ async fn the_arn_this_service_hands_out_resolves_for_every_served_region() {
         let served = served_in.unwrap_or(DEFAULT_REGION);
 
         for family in families() {
+            // See the sibling test: a family this Region does not serve has no resource
+            // here to hand out an ARN for, and its create says so.
+            if !family.is_served_in(served) {
+                let case = format!("{} is not served in {served}", family.case);
+                let reply = transcribe
+                    .call_in_region(
+                        family.create,
+                        family.create_request(&family.resource_name("served"), &CREATED_TAGS),
+                        served_in,
+                    )
+                    .await;
+                reply.refused(&case, CLIENT_ERROR_STATUS, ABSENT_CODE);
+                assert_eq!(
+                    reply.error_message(&case),
+                    ACCOUNT_NOT_AUTHORIZED,
+                    "case {case:?}: expected the refusal of a family this Region does not \
+                     serve, got {:?}",
+                    reply.body
+                );
+                continue;
+            }
             let name = family.resource_name("served");
             let scope = served_in.map_or_else(|| "unsigned".to_string(), str::to_string);
             let case = format!("{} / served in {served} ({scope})", family.case);

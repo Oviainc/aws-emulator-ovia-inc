@@ -6,6 +6,10 @@
 //! `GetTranscriptionJob` answers for an unknown job of the other family and the one
 //! whose documentation covers an entity that "doesn't exist".
 //!
+//! Served only where AWS offers AWS HealthScribe: in any other Region this call is
+//! refused before the job is looked up at all
+//! ([`crate::service::medical_scribe_availability`]).
+//!
 //! REPORTING ONLY: its sole write is the status transition the clock already owed the
 //! job ([`crate::state::MedicalScribeJobRecord::advance_clock`]), which was due at its
 //! stored instant whether or not anybody called.
@@ -154,6 +158,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The Region this request is served in: a regional endpoint reports only the
+        // jobs started through it.
+        let region = crate::state::request_region(ctx.parts());
+        // FIRST, ahead of the lookup below: the Medical Scribe family is served only in
+        // the Regions AWS offers AWS HealthScribe in, and elsewhere the account may not
+        // call it at all — so the answer is the same whether or not the named job exists
+        // (see [`crate::service::medical_scribe_availability`]).
+        if let Some(refusal) =
+            crate::service::medical_scribe_availability::account_not_authorized_in(&region)
+        {
+            return Err(GetMedicalScribeJobErrorModeled::BadRequestException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetMedicalScribeJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -166,9 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The Region this request is served in: a regional endpoint reports only the
-        // jobs started through it.
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         // The documents this job's reported output locations serve, stored at those
         // locations the first time a reader finds the job finished, exactly as

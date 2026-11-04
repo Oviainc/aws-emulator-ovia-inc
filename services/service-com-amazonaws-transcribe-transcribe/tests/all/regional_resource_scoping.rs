@@ -16,6 +16,13 @@
 //! request used). The resource NAME is held constant across Regions on purpose — that is
 //! what makes "the same name in two Regions is two resources" observable.
 //!
+//! One family is not served in every Region: the Medical Scribe family belongs to AWS
+//! HealthScribe, which is offered in a subset of this service's Regions
+//! (`service::medical_scribe_availability`). Its rows therefore assert, in a Region
+//! outside that subset, the refusal that family answers there instead of the regional
+//! scoping of a record it cannot hold — the scoping itself still being driven by every
+//! other family and, for this one, by the Region it is served in.
+//!
 //! Every call goes through the same `MultiServiceRouter` the production router
 //! dispatches on, reusing the transcription-job suite's harness
 //! (`crate::transcription_jobs`) rather than standing up a second emulator, so these
@@ -25,6 +32,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_transcribe_transcribe::service::medical_scribe_availability::{
+    ACCOUNT_NOT_AUTHORIZED, MEDICAL_SCRIBE_REGIONS,
+};
 use service_com_amazonaws_transcribe_transcribe::state::{
     DEFAULT_REGION, MAX_REGIONS, MAX_VOCABULARIES,
 };
@@ -79,6 +89,18 @@ struct Family {
     /// shape is a property of the family, not of the condition (see
     /// `crate::call_analytics_category_refusals`).
     taken_name_code: &'static str,
+    /// The Regions this family is SERVED in, or `None` for a family served wherever this
+    /// service has an endpoint. Only the Medical Scribe family names a set (see this
+    /// module's documentation).
+    served_in: Option<&'static [&'static str]>,
+}
+
+impl Family {
+    /// Whether a request served in `region` reaches this family at all.
+    fn is_served_in(&self, region: &str) -> bool {
+        self.served_in
+            .is_none_or(|regions| regions.contains(&region))
+    }
 }
 
 /// The shape most families refuse a name they already hold with.
@@ -106,6 +128,7 @@ fn families() -> Vec<Family> {
             name_in_list: "TranscriptionJobName",
             delete: "DeleteTranscriptionJob",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "medical transcription job",
@@ -128,6 +151,7 @@ fn families() -> Vec<Family> {
             name_in_list: "MedicalTranscriptionJobName",
             delete: "DeleteMedicalTranscriptionJob",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "Call Analytics job",
@@ -144,6 +168,7 @@ fn families() -> Vec<Family> {
             name_in_list: "CallAnalyticsJobName",
             delete: "DeleteCallAnalyticsJob",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "Medical Scribe job",
@@ -163,6 +188,8 @@ fn families() -> Vec<Family> {
             name_in_list: "MedicalScribeJobName",
             delete: "DeleteMedicalScribeJob",
             taken_name_code: CONFLICT_CODE,
+            // The one family of this service that is not served Region-wide.
+            served_in: Some(MEDICAL_SCRIBE_REGIONS),
         },
         Family {
             case: "custom vocabulary",
@@ -180,6 +207,7 @@ fn families() -> Vec<Family> {
             name_in_list: "VocabularyName",
             delete: "DeleteVocabulary",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "custom medical vocabulary",
@@ -199,6 +227,7 @@ fn families() -> Vec<Family> {
             name_in_list: "VocabularyName",
             delete: "DeleteMedicalVocabulary",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "custom vocabulary filter",
@@ -216,6 +245,7 @@ fn families() -> Vec<Family> {
             name_in_list: "VocabularyFilterName",
             delete: "DeleteVocabularyFilter",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "custom language model",
@@ -237,6 +267,7 @@ fn families() -> Vec<Family> {
             name_in_list: "ModelName",
             delete: "DeleteLanguageModel",
             taken_name_code: CONFLICT_CODE,
+            served_in: None,
         },
         Family {
             case: "Call Analytics category",
@@ -255,6 +286,7 @@ fn families() -> Vec<Family> {
             // This family refuses a taken name with the same shape its lookups refuse an
             // absent one with.
             taken_name_code: ABSENT_CODE,
+            served_in: None,
         },
     ]
 }
@@ -334,6 +366,35 @@ async fn a_resource_is_reachable_only_through_the_region_that_created_it() {
         );
 
         for region in ELSEWHERE {
+            if !family.is_served_in(region) {
+                // A Region this family is not served in answers every call of it with
+                // that family's refusal, so the READ and the LISTING are both refused
+                // here rather than reporting an empty answer a client would read as "the
+                // family is usable and holds nothing"
+                // (`crate::medical_scribe_region_availability` pins the sentence).
+                for (operation, request) in [
+                    (family.read, by_name(family.name_member, name)),
+                    (family.list, json!({})),
+                ] {
+                    let case = format!(
+                        "{case}: {operation} in {region}, which does not serve this family"
+                    );
+                    let reply = transcribe
+                        .call_in_region(operation, request, Some(region))
+                        .await;
+                    reply.refused(&case, CLIENT_ERROR_STATUS, ABSENT_CODE);
+                    // The SENTENCE is what tells this refusal from the not-found one the
+                    // same shape carries for a resource this Region simply does not hold.
+                    assert_eq!(
+                        reply.error_message(&case),
+                        ACCOUNT_NOT_AUTHORIZED,
+                        "case {case:?}: expected the refusal of a family this Region does \
+                         not serve, got {:?}",
+                        reply.body
+                    );
+                }
+                continue;
+            }
             let read = transcribe
                 .call_in_region(family.read, by_name(family.name_member, name), Some(region))
                 .await;
@@ -371,6 +432,24 @@ async fn one_name_is_taken_only_in_the_region_that_holds_it() {
         let case = family.case;
         let mut regions = vec![HOME];
         regions.extend_from_slice(ELSEWHERE);
+        // A Region this family is not served in can hold no name of it at all: the
+        // create is refused there, so the rows below run over the Regions that serve it.
+        for region in regions.iter().filter(|region| !family.is_served_in(region)) {
+            let case =
+                format!("{case}: create in {region}, which does not serve this family");
+            let reply = transcribe
+                .call_in_region(family.create, (family.request)(name), Some(region))
+                .await;
+            reply.refused(&case, CLIENT_ERROR_STATUS, ABSENT_CODE);
+            assert_eq!(
+                reply.error_message(&case),
+                ACCOUNT_NOT_AUTHORIZED,
+                "case {case:?}: expected the refusal of a family this Region does not \
+                 serve, got {:?}",
+                reply.body
+            );
+        }
+        regions.retain(|region| family.is_served_in(region));
 
         for region in &regions {
             transcribe
@@ -421,6 +500,9 @@ async fn a_delete_reaches_only_its_own_regions_resource() {
     for family in families() {
         let case = family.case;
         for region in [HOME, ELSEWHERE[0]] {
+            if !family.is_served_in(region) {
+                continue;
+            }
             transcribe
                 .call_in_region(family.create, (family.request)(name), Some(region))
                 .await
@@ -436,6 +518,33 @@ async fn a_delete_reaches_only_its_own_regions_resource() {
         let delete = family.delete;
         let case = family.case;
         let deleted_in = ELSEWHERE[0];
+
+        if !family.is_served_in(deleted_in) {
+            // A delete addressed to a Region this family is not served in reaches
+            // nothing: it is refused, and the record HOME holds survives it.
+            let case_refused = format!(
+                "{case}: delete in {deleted_in}, which does not serve this family"
+            );
+            let reply = transcribe
+                .call_in_region(delete, by_name(family.name_member, name), Some(deleted_in))
+                .await;
+            reply.refused(&case_refused, CLIENT_ERROR_STATUS, ABSENT_CODE);
+            assert_eq!(
+                reply.error_message(&case_refused),
+                ACCOUNT_NOT_AUTHORIZED,
+                "case {case_refused:?}: expected the refusal of a family this Region does \
+                 not serve, got {:?}",
+                reply.body
+            );
+            transcribe
+                .call_in_region(family.read, by_name(family.name_member, name), Some(HOME))
+                .await
+                .ok(&format!(
+                    "{case}: the {HOME} resource survives a delete addressed to \
+                     {deleted_in}"
+                ));
+            continue;
+        }
 
         transcribe
             .call_in_region(
@@ -890,6 +999,28 @@ async fn the_number_of_regions_a_family_holds_records_for_is_bounded() {
         // A fresh emulator per family: the cap is per family, and this row is about one
         // family reaching it.
         let transcribe = Transcribe::new();
+
+        if !family.is_served_in(&region_of(0)) {
+            // A family served only where AWS offers it can hold records for no Region
+            // outside that set, so the create below is refused there: its store is
+            // bounded more tightly than this cap bounds the others, and the cap is never
+            // the thing that stops it.
+            let outside = region_of(0);
+            let case_outside =
+                format!("{case}: a create in {outside}, which does not serve this family");
+            let reply = transcribe
+                .call_in_region(family.create, (family.request)(name), Some(&outside))
+                .await;
+            reply.refused(&case_outside, CLIENT_ERROR_STATUS, ABSENT_CODE);
+            assert_eq!(
+                reply.error_message(&case_outside),
+                ACCOUNT_NOT_AUTHORIZED,
+                "case {case_outside:?}: expected the refusal of a family this Region does \
+                 not serve, got {:?}",
+                reply.body
+            );
+            continue;
+        }
 
         for index in 0..MAX_REGIONS {
             transcribe

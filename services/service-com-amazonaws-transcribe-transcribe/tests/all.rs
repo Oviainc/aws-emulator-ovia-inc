@@ -99,6 +99,8 @@ mod medical_scribe_clinical_note_template;
 mod medical_scribe_job_listing;
 #[path = "all/medical_scribe_jobs.rs"]
 mod medical_scribe_jobs;
+#[path = "all/medical_scribe_region_availability.rs"]
+mod medical_scribe_region_availability;
 #[path = "all/medical_scribe_settings_references.rs"]
 mod medical_scribe_settings_references;
 #[path = "all/medical_transcription_job_delete.rs"]

@@ -45,6 +45,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// WHERE the Medical Scribe (AWS HealthScribe) operation family is served, and the
+/// refusal its four operations answer in a Region the feature is not offered in.
+///
+/// It lives beside the seams above because it decides, for a whole operation family,
+/// whether a request is served at all — ahead of the operation's own validation — rather
+/// than adding behaviour to any one operation. Each of the four handlers asks it first.
+pub mod medical_scribe_availability;
+
 /// Whether this service serves the request these `parts` came from.
 ///
 /// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable

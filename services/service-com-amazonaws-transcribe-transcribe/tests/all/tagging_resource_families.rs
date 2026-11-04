@@ -23,6 +23,7 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_transcribe_transcribe::service::medical_scribe_availability::MEDICAL_SCRIBE_REGIONS;
 use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
 
 use crate::transcription_jobs::Transcribe;
@@ -66,6 +67,14 @@ pub(crate) struct Family {
     /// (`smithy_query(query="shape", shape="VocabularyInfo,LanguageModel")`), so the
     /// standard tagging API is the only reader of their tag sets.
     reader: Option<Reader>,
+    /// The Regions this family is SERVED in, or `None` for a family served wherever this
+    /// service has an endpoint.
+    ///
+    /// Only the Medical Scribe family names a set: its operations belong to AWS
+    /// HealthScribe, which is offered in a subset of this service's Regions
+    /// (`service::medical_scribe_availability`), so a row driving a family through
+    /// several Regions asks [`Family::is_served_in`] first.
+    served_in: Option<&'static [&'static str]>,
 }
 
 /// Every family this service holds records of, each with a create this emulator
@@ -93,6 +102,7 @@ pub(crate) fn families() -> Vec<Family> {
                 name_member: "TranscriptionJobName",
                 record: "TranscriptionJob",
             }),
+            served_in: None,
         },
         Family {
             case: "medical transcription job",
@@ -115,6 +125,7 @@ pub(crate) fn families() -> Vec<Family> {
                 name_member: "MedicalTranscriptionJobName",
                 record: "MedicalTranscriptionJob",
             }),
+            served_in: None,
         },
         Family {
             case: "custom vocabulary",
@@ -128,6 +139,7 @@ pub(crate) fn families() -> Vec<Family> {
                 })
             },
             reader: None,
+            served_in: None,
         },
         Family {
             case: "custom medical vocabulary",
@@ -143,6 +155,7 @@ pub(crate) fn families() -> Vec<Family> {
                 })
             },
             reader: None,
+            served_in: None,
         },
         Family {
             case: "custom vocabulary filter",
@@ -156,6 +169,7 @@ pub(crate) fn families() -> Vec<Family> {
                 })
             },
             reader: None,
+            served_in: None,
         },
         Family {
             case: "custom language model",
@@ -173,6 +187,7 @@ pub(crate) fn families() -> Vec<Family> {
                 })
             },
             reader: None,
+            served_in: None,
         },
         Family {
             case: "Call Analytics category",
@@ -189,6 +204,7 @@ pub(crate) fn families() -> Vec<Family> {
                 name_member: "CategoryName",
                 record: "CategoryProperties",
             }),
+            served_in: None,
         },
         Family {
             case: "Medical Scribe job",
@@ -208,6 +224,8 @@ pub(crate) fn families() -> Vec<Family> {
                 name_member: "MedicalScribeJobName",
                 record: "MedicalScribeJob",
             }),
+            // The one family of this service that is not served Region-wide.
+            served_in: Some(MEDICAL_SCRIBE_REGIONS),
         },
         Family {
             case: "Call Analytics job",
@@ -228,6 +246,7 @@ pub(crate) fn families() -> Vec<Family> {
                 name_member: "CallAnalyticsJobName",
                 record: "CallAnalyticsJob",
             }),
+            served_in: None,
         },
     ]
 }
@@ -262,6 +281,18 @@ impl Family {
     /// The name this suite gives a resource of this family in `scenario`.
     pub(crate) fn resource_name(&self, scenario: &str) -> String {
         format!("{scenario}-{}", self.resource_type)
+    }
+
+    /// Whether a request served in `region` reaches this family at all: every family but
+    /// the Medical Scribe one is served wherever this service has an endpoint, and that
+    /// one only where AWS offers AWS HealthScribe (see [`Family::served_in`]).
+    ///
+    /// A row that drives a family through a Region of its own asks this first; a Region
+    /// outside the set answers every operation of the family with its authorization
+    /// refusal, which `crate::medical_scribe_region_availability` is the suite for.
+    pub(crate) fn is_served_in(&self, region: &str) -> bool {
+        self.served_in
+            .is_none_or(|regions| regions.contains(&region))
     }
 }
 

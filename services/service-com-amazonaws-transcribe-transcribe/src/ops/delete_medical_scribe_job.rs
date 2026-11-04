@@ -8,6 +8,10 @@
 //! PROGRESS)". After a successful delete `GetMedicalScribeJob` answers that same
 //! not-found refusal and the name is free for a new `StartMedicalScribeJob`.
 //!
+//! Served only where AWS offers AWS HealthScribe: in any other Region this call is
+//! refused before the job is looked up at all
+//! ([`crate::service::medical_scribe_availability`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,6 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The Region this request is served in: only the jobs started through this
+        // Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
+        // FIRST, ahead of the lookup below: the Medical Scribe family is served only in
+        // the Regions AWS offers AWS HealthScribe in, and elsewhere the account may not
+        // call it at all — so a cleanup routine is told it may not make the call, not
+        // that the job is already gone (see
+        // [`crate::service::medical_scribe_availability`]).
+        if let Some(refusal) =
+            crate::service::medical_scribe_availability::account_not_authorized_in(&region)
+        {
+            return Err(DeleteMedicalScribeJobErrorModeled::BadRequestException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteMedicalScribeJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -179,9 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The Region this request is served in: only the jobs started through this
-        // Region's endpoint are this call's to delete.
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The clock-owed transition is materialised FIRST (inside the lookup), so a

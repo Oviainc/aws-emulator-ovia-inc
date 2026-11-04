@@ -7,6 +7,10 @@
 //! models no deferred execution — and the clock owes it `COMPLETED` a
 //! [`crate::state::JOB_TRANSITION_DELAY`] later.
 //!
+//! Served only where AWS offers AWS HealthScribe: in any other Region the start is
+//! refused ahead of every input check and nothing is recorded
+//! ([`crate::service::medical_scribe_availability`]).
+//!
 //! NOTHING IS TRANSCRIBED: no conversation is transcribed, no speaker role is
 //! identified and no clinical note is generated, so the `MedicalScribeOutput` URIs a
 //! completed job reports name locations holding a transcript of no words and a note of
@@ -242,6 +246,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The Region this request is served in: the job is started in — and only in —
+        // the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
+        // FIRST, ahead of every check below: the Medical Scribe family is served only in
+        // the Regions AWS offers AWS HealthScribe in, and elsewhere the account may not
+        // call it at all — so the caller is told that, not that one of the members it
+        // sent is at fault, and no job is recorded (see
+        // [`crate::service::medical_scribe_availability`]).
+        if let Some(refusal) =
+            crate::service::medical_scribe_availability::account_not_authorized_in(&region)
+        {
+            return Err(StartMedicalScribeJobErrorModeled::BadRequestException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartMedicalScribeJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -333,10 +351,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(bad_request(&message));
         }
-
-        // The Region this request is served in: the job is started in — and only in —
-        // the Region the caller signed for.
-        let region = crate::state::request_region(ctx.parts());
 
         // "To make a StartMedicalScribeJob request, you must first upload your media
         // file into an Amazon S3 bucket; you can then specify the Amazon S3 location of

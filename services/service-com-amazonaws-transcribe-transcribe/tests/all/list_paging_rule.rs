@@ -169,11 +169,23 @@ impl Listing {
     /// holds a row for every family this service stores records of, each family's ARN
     /// resource type included.
     fn create_request(&self, name: &str) -> Value {
+        self.family().create_request(name, &[])
+    }
+
+    /// The family row this listing reports the records of.
+    fn family(&self) -> crate::tagging_resource_families::Family {
         families()
             .into_iter()
             .find(|family| family.create == self.create)
             .unwrap_or_else(|| panic!("no family row creates with {}", self.create))
-            .create_request(name, &[])
+    }
+
+    /// Whether a request served in `region` reaches this listing at all: the availability
+    /// of the FAMILY it reports
+    /// (`crate::tagging_resource_families::Family::is_served_in`), so a row driving one
+    /// listing through two Regions asks this before it uses either.
+    pub(crate) fn is_served_in(&self, region: &str) -> bool {
+        self.family().is_served_in(region)
     }
 
     /// Establish one record per name in [`CREATED_IN_ORDER`], in that order, in the

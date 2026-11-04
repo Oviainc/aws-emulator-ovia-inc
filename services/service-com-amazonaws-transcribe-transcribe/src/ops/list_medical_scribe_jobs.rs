@@ -8,6 +8,10 @@
 //! due — the same listing rules `ListCallAnalyticsJobs` and
 //! `ListMedicalTranscriptionJobs` follow for their own families.
 //!
+//! Served only where AWS offers AWS HealthScribe: in any other Region this listing is
+//! refused like the three operations that name a job, rather than reporting a page
+//! ([`crate::service::medical_scribe_availability`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,6 +171,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // FIRST, ahead of everything this listing reads: the Medical Scribe family is
+        // served only in the Regions AWS offers AWS HealthScribe in, and elsewhere the
+        // account may not call it at all — so the collection operation is refused like
+        // the three that name a job, rather than reporting an empty page a client would
+        // read as "the feature is usable and holds nothing" (see
+        // [`crate::service::medical_scribe_availability`]).
+        if let Some(refusal) =
+            crate::service::medical_scribe_availability::account_not_authorized_in(&region)
+        {
+            return Err(ListMedicalScribeJobsErrorModeled::BadRequestException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListMedicalScribeJobsErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -186,7 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_LIST_MAX_RESULTS,
         );
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 

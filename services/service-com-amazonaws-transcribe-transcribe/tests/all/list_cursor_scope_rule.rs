@@ -27,6 +27,8 @@
 
 use serde_json::json;
 
+use service_com_amazonaws_transcribe_transcribe::service::medical_scribe_availability::ACCOUNT_NOT_AUTHORIZED;
+
 use crate::list_cursor_rule::{refusal, CLIENT_ERROR_STATUS, REFUSAL_CODE};
 use crate::list_paging_rule::{listings, CREATED_IN_ORDER};
 use crate::transcription_jobs::Transcribe;
@@ -136,6 +138,34 @@ async fn a_cursor_minted_in_one_region_is_refused_by_the_same_listing_elsewhere(
 
     for listing in listings() {
         let transcribe = Transcribe::new();
+        // A listing whose family is not served in both Regions below has no second
+        // endpoint to replay its cursor against: the Medical Scribe family is offered
+        // only where AWS offers AWS HealthScribe
+        // (`service::medical_scribe_availability`), and in either Region here the
+        // listing is refused outright — asserted below, with the sentence itself pinned
+        // by `crate::medical_scribe_region_availability`. Its cursor scope across
+        // LISTINGS is still driven by the sibling test above, which is served in the
+        // Region an unsigned request belongs to.
+        if !listing.is_served_in(MINTING_REGION) || !listing.is_served_in(OTHER_REGION) {
+            for region in [MINTING_REGION, OTHER_REGION] {
+                if listing.is_served_in(region) {
+                    continue;
+                }
+                let case = format!("{} is not served in {region}", listing.operation);
+                let reply = listing
+                    .list_in(&transcribe, json!({"MaxResults": 1}), Some(region))
+                    .await;
+                reply.refused(&case, CLIENT_ERROR_STATUS, REFUSAL_CODE);
+                assert_eq!(
+                    reply.error_message(&case),
+                    ACCOUNT_NOT_AUTHORIZED,
+                    "case {case:?}: expected the refusal of a family this Region does not \
+                     serve, got {:?}",
+                    reply.body
+                );
+            }
+            continue;
+        }
         listing
             .create_records(&transcribe, minted_here, Some(MINTING_REGION))
             .await;
