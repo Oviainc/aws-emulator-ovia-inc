@@ -18,6 +18,10 @@ use serde_json::{json, Value};
 use super::application_lifecycle::{create_a_policy, emulator, post, Reply, ACCOUNT, REGION};
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The widest `message` a `ConflictException` carries: the member targets
+/// `String500` (`smithy_query query="shape" shape="ConflictException"`).
+const MAX_MESSAGE_LENGTH: usize = 500;
+
 /// How a row releases one application's reference to the policy under test. Each is a
 /// different way the stored `policyArn` stops pointing at it, so the rule is asserted
 /// on the reference itself and not on one operation's side effect.
@@ -67,11 +71,58 @@ async fn describe_policy(router: &MultiServiceRouter, policy_arn: &str) -> Reply
     .await
 }
 
-/// Assert the delete was refused as a conflict and the policy is still readable with
+/// Assert the delete was refused as a conflict naming the policy and every
+/// application that still references it, and that the policy is still readable with
 /// the name it was created under.
-async fn assert_blocked(router: &MultiServiceRouter, case: &str, policy_arn: &str, name: &str) {
+///
+/// `referencing` is every application holding the reference, as the `(name, ARN)`
+/// pair the refusal names it by.
+async fn assert_blocked(
+    router: &MultiServiceRouter,
+    case: &str,
+    policy_arn: &str,
+    name: &str,
+    referencing: &[(String, String)],
+) {
     let refused = delete_policy(router, policy_arn).await;
     refused.refused(case, 409, "ConflictException");
+    // The refusal carries the human-readable NAME of the policy and of each
+    // application alongside the ARNs, so a caller needs no second read to tell the
+    // user what blocks the delete.
+    let mut named: Vec<(String, String)> = referencing.to_vec();
+    named.sort();
+    let apps: Vec<String> = named
+        .iter()
+        .map(|(app_name, app_arn)| format!("{app_name} ({app_arn})"))
+        .collect();
+    let expected = format!(
+        "Cannot delete policy {name} ({policy_arn}). Policy currently associated with \
+         app(s) {}",
+        apps.join(", ")
+    );
+    let message = refused.body["message"].as_str().unwrap_or_default();
+    if expected.chars().count() <= MAX_MESSAGE_LENGTH {
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the in-use refusal {expected:?}, got {:?}",
+            refused.body
+        );
+    } else {
+        // Past the member's modelled width the trailing applications are left out
+        // rather than cut mid-ARN, so the message is a PREFIX of the full list and
+        // still names the first application that blocks the delete.
+        assert!(
+            expected.starts_with(message) && message.contains(&apps[0]),
+            "case {case:?}: expected a prefix of {expected:?} naming {:?}, got {message:?}",
+            apps[0]
+        );
+        assert!(
+            message.chars().count() <= MAX_MESSAGE_LENGTH,
+            "case {case:?}: the message must stay inside the modelled {MAX_MESSAGE_LENGTH} \
+             characters, got {} in {message:?}",
+            message.chars().count()
+        );
+    }
     assert_eq!(
         refused.body["resourceId"].as_str(),
         Some(policy_arn),
@@ -116,22 +167,30 @@ async fn a_policy_is_deleted_only_once_no_application_references_it() {
         let spare = create_a_policy(&router, "spare-policy").await;
         // The bystander never references `target`, so it must never block its delete.
         let bystander = create_an_app(&router, "bystander", Some(&spare)).await;
+        // Every application pointing at the SPARE, which is what blocks the spare's
+        // own delete at the end: the bystander, plus whatever this row repoints.
+        let mut spare_references: Vec<(String, String)> =
+            vec![("bystander".to_string(), bystander.clone())];
 
-        let mut referencing = Vec::new();
+        let mut referencing: Vec<(String, String)> = Vec::new();
         for index in 0..references {
-            referencing.push(create_an_app(&router, &format!("user-{index}"), Some(&target)).await);
+            let name = format!("user-{index}");
+            let app_arn = create_an_app(&router, &name, Some(&target)).await;
+            referencing.push((name, app_arn));
         }
 
-        // Every reference still standing blocks the delete.
+        // Every reference still standing blocks the delete, and the refusal names
+        // every application that holds one.
         for remaining in (1..=references).rev() {
             assert_blocked(
                 &router,
                 &format!("{case}: {remaining} reference(s) left"),
                 &target,
                 "target-policy",
+                &referencing,
             )
             .await;
-            let app_arn = referencing.pop().expect("a referencing application");
+            let (app_name, app_arn) = referencing.pop().expect("a referencing application");
             match release {
                 Release::DeleteTheApp => {
                     post(&router, "/delete-app", &json!({"appArn": app_arn}))
@@ -152,6 +211,7 @@ async fn a_policy_is_deleted_only_once_no_application_references_it() {
                         "case {case:?}: repointing must store the new policyArn, got {:?}",
                         repointed.body
                     );
+                    spare_references.push((app_name, app_arn.clone()));
                 }
                 Release::ClearTheReference => {
                     let cleared = post(
@@ -204,7 +264,14 @@ async fn a_policy_is_deleted_only_once_no_application_references_it() {
             "case {case:?}: an application that never named the policy must be untouched, got {:?}",
             bystander_read.body
         );
-        assert_blocked(&router, &format!("{case}: the spare is now referenced"), &spare, "spare-policy").await;
+        assert_blocked(
+            &router,
+            &format!("{case}: the spare is now referenced"),
+            &spare,
+            "spare-policy",
+            &spare_references,
+        )
+        .await;
     }
 }
 
@@ -239,9 +306,22 @@ async fn deleting_a_policy_that_does_not_exist_is_a_resource_not_found() {
     ];
 
     for (case, policy_arn) in table {
-        delete_policy(&router, policy_arn)
-            .await
-            .refused(case, 404, "ResourceNotFoundException");
+        let refused = delete_policy(&router, policy_arn).await;
+        refused.refused(case, 404, "ResourceNotFoundException");
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(format!("ResiliencyPolicy {policy_arn} not found").as_str()),
+            "case {case:?}: the 404 must name the policy the request named, got {:?}",
+            refused.body
+        );
+        let described = describe_policy(&router, policy_arn).await;
+        described.refused(case, 404, "ResourceNotFoundException");
+        assert_eq!(
+            described.body["message"].as_str(),
+            Some(format!("ResiliencyPolicy {policy_arn} not found").as_str()),
+            "case {case:?}: a read of the same unknown policy is worded the same way, got {:?}",
+            described.body
+        );
     }
 
     // A real policy still deletes afterwards: the 404s above are about the ARN, not a

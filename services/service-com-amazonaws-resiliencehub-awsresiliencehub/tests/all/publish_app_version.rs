@@ -30,6 +30,12 @@ const REGION: &str = "us-east-1";
 /// The account id `engine::mock_account_id` mints every ARN under.
 const ACCOUNT: &str = "000000000000";
 
+/// The refusal a publish of a draft with nothing to publish earns: FIXED text,
+/// naming the template requirement the request fails to meet and carrying no part
+/// of the request.
+const EMPTY_TEMPLATE_MESSAGE: &str =
+    "Invalid app template. App template must have at least 1 resource";
+
 /// An emulator holding only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -420,6 +426,16 @@ async fn publishing_an_empty_draft_is_refused_with_a_conflict() {
 
         let refused = post(&router, "/publish-app-version", &request).await;
         refused.refused(case, 409, "ConflictException");
+        // The refusal names the TEMPLATE requirement, with no part of the request
+        // in it: the same sentence whatever the application and whatever the
+        // request's `versionName`.
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(EMPTY_TEMPLATE_MESSAGE),
+            "case {case:?}: expected the empty-template refusal {EMPTY_TEMPLATE_MESSAGE:?}, \
+             got {:?}",
+            refused.body
+        );
 
         // Nothing was minted: the application has no version 1 at all.
         assert_eq!(

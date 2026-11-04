@@ -185,8 +185,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a policy `DescribeResiliencyPolicy` cannot find — the very state `CreateApp`
         // and `UpdateApp` refuse to create. So the reference, not the delete, decides:
         // while one exists the policy stays.
-        if let Some(app_arn) = first_app_referencing(&store, &input.policy_arn) {
-            return Err(still_referenced(&input.policy_arn, &app_arn));
+        let referencing = apps_referencing(&store, &input.policy_arn);
+        if !referencing.is_empty() {
+            // The refusal names the policy and every application by the NAME each was
+            // created under as well as by its ARN, so the caller needs no second read
+            // to tell the user what blocks the delete. Both names come from the store.
+            let policy_name = store
+                .policies
+                .get(&input.policy_arn)
+                .and_then(|policy| policy.policy_name.clone())
+                .unwrap_or_default();
+            return Err(still_referenced(
+                &policy_name,
+                &input.policy_arn,
+                &referencing,
+            ));
         }
 
         store.policies.remove(&input.policy_arn);
@@ -200,19 +213,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The ARN of a stored application whose `policyArn` is `policy_arn` — the
-/// lexicographically smallest one when several are, so the refusal a request earns
-/// does not depend on hash order.
-fn first_app_referencing(
+/// Every stored application whose `policyArn` is `policy_arn`, as the `(name, ARN)`
+/// pair a refusal names it by — ordered by name and then ARN, so the refusal a
+/// request earns does not depend on hash order.
+fn apps_referencing(
     store: &crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
     policy_arn: &str,
-) -> Option<String> {
-    store
+) -> Vec<(String, String)> {
+    let mut referencing: Vec<(String, String)> = store
         .apps
         .values()
         .filter(|app| app.policy_arn.as_deref() == Some(policy_arn))
-        .map(|app| app.app_arn.clone())
-        .min()
+        .map(|app| (app.name.clone(), app.app_arn.clone()))
+        .collect();
+    referencing.sort();
+    referencing
 }
 
 /// The 500 for a service mounted on an engine that holds no state for it.
@@ -227,21 +242,48 @@ fn internal_failure() -> DeleteResiliencyPolicyError {
 /// already deleted.
 fn policy_not_found(policy_arn: &str) -> DeleteResiliencyPolicyError {
     DeleteResiliencyPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("resiliency policy {policy_arn} does not exist")),
+        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })
     .into()
 }
 
-/// A 409 `ConflictException` for a policy a stored application still names, pointing
-/// at the application that blocks the delete.
-fn still_referenced(policy_arn: &str, app_arn: &str) -> DeleteResiliencyPolicyError {
+/// The widest `message` a `ConflictException` carries: the member targets
+/// `String500`, so a longer one would not satisfy the model.
+const MAX_MESSAGE_LENGTH: usize = 500;
+
+/// A 409 `ConflictException` for a policy stored applications still name, naming the
+/// policy and each application that blocks the delete by its name and its ARN.
+///
+/// `apps` is every application holding the reference, so the caller reads the whole
+/// conflict from one refusal; applications past the member's modelled width are left
+/// out rather than cut part-way. The FIRST one is always named — a refusal that named
+/// none would not report the conflict at all — so it is the only entry a policy and
+/// an application whose own ARNs fill the width can see clipped.
+fn still_referenced(
+    policy_name: &str,
+    policy_arn: &str,
+    apps: &[(String, String)],
+) -> DeleteResiliencyPolicyError {
+    let mut message = format!(
+        "Cannot delete policy {policy_name} ({policy_arn}). Policy currently associated \
+         with app(s) "
+    );
+    let mut length = message.chars().count();
+    for (index, (app_name, app_arn)) in apps.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let entry = format!("{separator}{app_name} ({app_arn})");
+        let entry_length = entry.chars().count();
+        if index > 0 && length + entry_length > MAX_MESSAGE_LENGTH {
+            break;
+        }
+        message.push_str(&entry);
+        length += entry_length;
+    }
+
     DeleteResiliencyPolicyErrorModeled::ConflictException(ConflictException {
-        message: Some(format!(
-            "resiliency policy {policy_arn} is still used by application {app_arn}; \
-             point that application at another policy or delete it first"
-        )),
+        message: Some(message.chars().take(MAX_MESSAGE_LENGTH).collect()),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

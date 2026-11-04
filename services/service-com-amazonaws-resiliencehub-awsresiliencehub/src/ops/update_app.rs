@@ -220,7 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             app.event_subscriptions = Some(event_subscriptions);
         }
 
-        Ok(UpdateAppOutput { app: app.clone() })
+        // The updated application as a read of it would answer: what it reports
+        // about its compliance follows from the assessments of it that have
+        // finished, not from this call.
+        let Some(app) = store.reported_app(&input.app_arn, ::std::time::SystemTime::now()) else {
+            return Err(app_not_found(&input.app_arn));
+        };
+        Ok(UpdateAppOutput { app })
     }
 }
 
@@ -259,7 +265,7 @@ fn app_not_found(app_arn: &str) -> UpdateAppError {
 /// ever minted.
 fn policy_not_found(policy_arn: &str) -> UpdateAppError {
     UpdateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("resiliency policy {policy_arn} does not exist")),
+        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

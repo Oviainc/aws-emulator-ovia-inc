@@ -3,8 +3,8 @@
 //! Engine state for the com-amazonaws-resiliencehub-awsresiliencehub service.
 
 use crate::ops::types::{
-    App, AppComponent, FailurePolicy, LogicalResourceId, PhysicalResource, ResiliencyPolicy,
-    ESTIMATED_COST_TIER_VALUES,
+    App, AppAssessment, AppComponent, FailurePolicy, LogicalResourceId, PhysicalResource,
+    ResiliencyPolicy, ESTIMATED_COST_TIER_VALUES,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -105,6 +105,43 @@ pub const MAX_RESOLUTIONS_PER_APP_VERSION: usize = 50;
 /// how many resources it walks. It is never zero, so a caller that reads the
 /// resolution straight after starting it still sees the non-terminal status.
 pub const RESOLUTION_SPAN: ::std::time::Duration = ::std::time::Duration::from_secs(3);
+
+/// How long an application assessment started by `StartAppAssessment` takes to
+/// finish.
+///
+/// CHOSEN, not a documented AWS duration: a real assessment's duration depends on
+/// how much of the application it walks. It is never zero, so a caller that reads
+/// the assessment straight after starting it still sees the non-terminal status.
+pub const ASSESSMENT_SPAN: ::std::time::Duration = ::std::time::Duration::from_secs(3);
+
+/// The `AssessmentStatus` value an assessment that has not finished yet reports —
+/// the non-terminal status `StartAppAssessment` answers with (one of
+/// `ASSESSMENT_STATUS_VALUES`, the enum the model gives
+/// `AppAssessment$assessmentStatus`).
+pub const ASSESSMENT_STATUS_PENDING: &str = "Pending";
+
+/// The `AssessmentStatus` value a finished assessment reports — the terminal
+/// status a read finds once [`ASSESSMENT_SPAN`] has elapsed.
+pub const ASSESSMENT_STATUS_SUCCESS: &str = "Success";
+
+/// The `AssessmentInvoker` value of an assessment a caller started itself, as
+/// opposed to one this service's assessment schedule started.
+pub const ASSESSMENT_INVOKER_USER: &str = "User";
+
+/// The `DriftStatus` an assessment reports for a drift check that was not run:
+/// this service compares no assessment against an earlier one, so no assessment
+/// reports drift it did not look for.
+pub const DRIFT_STATUS_NOT_CHECKED: &str = "NotChecked";
+
+/// The most application assessments this emulator stores for ONE application.
+///
+/// A MEMORY BOUND, not an AWS quota: `StartAppAssessment` is reachable by any
+/// caller and records one assessment per call, so without a ceiling an assessment
+/// loop grows the process until the host is out of memory. Past it
+/// `StartAppAssessment` answers its own modelled `ServiceQuotaExceededException`
+/// (HTTP 402) — the channel AWS uses when a request cannot be carried out because
+/// a limit is reached.
+pub const MAX_ASSESSMENTS_PER_APP: usize = 100;
 
 /// The `ResourceResolutionStatusType` value a resolution that has not finished
 /// yet reports — the non-terminal status `ResolveAppVersionResources` answers
@@ -226,6 +263,62 @@ impl AppVersionContents {
     }
 }
 
+/// One application assessment: the record `StartAppAssessment` starts and
+/// `DescribeAppAssessment` reports.
+///
+/// The VERDICT is computed once, from the app version and the resiliency policy as
+/// they were when the assessment was started, and frozen here — a later edit to
+/// either cannot change what a finished assessment reports. The STATUS is not
+/// stored: it is derived from the clock in [`Self::assessment_at`], so a read never
+/// has to write to move an assessment on and two readers at the same instant
+/// cannot disagree about it.
+#[derive(Debug, Clone)]
+pub struct AppAssessmentRecord {
+    /// The FINISHED assessment, verdict and all. What a reader gets before
+    /// [`Self::completes_at`] is this record with everything the assessment has
+    /// not finished computing withheld; see [`Self::assessment_at`].
+    assessment: AppAssessment,
+    /// When this assessment finishes: the instant the clock owes its move from
+    /// [`ASSESSMENT_STATUS_PENDING`] to its terminal status, whether or not
+    /// anybody asks.
+    pub completes_at: ::std::time::SystemTime,
+}
+
+impl AppAssessmentRecord {
+    /// An assessment started at `now`, finishing one [`ASSESSMENT_SPAN`] later.
+    /// `assessment` is the finished record, carrying the verdict computed from
+    /// what was assessed at `now`.
+    pub fn started_at(assessment: AppAssessment, now: ::std::time::SystemTime) -> Self {
+        Self {
+            assessment,
+            completes_at: now + ASSESSMENT_SPAN,
+        }
+    }
+
+    /// This assessment as a reader finds it at `now`.
+    ///
+    /// Until the clock reaches [`Self::completes_at`] the assessment is still
+    /// running, so it reports [`ASSESSMENT_STATUS_PENDING`] and NONE of the
+    /// members it has not finished computing — its verdict, its score and its end
+    /// time — rather than a verdict nothing has reached yet.
+    pub fn assessment_at(&self, now: ::std::time::SystemTime) -> AppAssessment {
+        let mut reported = self.assessment.clone();
+        if now < self.completes_at {
+            reported.assessment_status = ASSESSMENT_STATUS_PENDING.to_string();
+            reported.end_time = None;
+            reported.compliance = None;
+            reported.compliance_status = None;
+            reported.resiliency_score = None;
+        }
+        reported
+    }
+
+    /// The application this assessment is of.
+    pub fn app_arn(&self) -> Option<&str> {
+        self.assessment.app_arn.as_deref()
+    }
+}
+
 /// One resource resolution of one app version: the record
 /// `ResolveAppVersionResources` starts and
 /// `DescribeAppVersionResourcesResolutionStatus` reports.
@@ -276,8 +369,9 @@ impl ResourceResolution {
 /// exists only for a stored application, and `DeleteApp` drops it) times
 /// [`MAX_PUBLISHED_APP_VERSIONS_PER_APP`] plus the draft, times
 /// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] per version, the idempotency store
-/// by [`MAX_IDEMPOTENCY_TOKENS`], and `resolutions` by the same app versions
-/// times [`MAX_RESOLUTIONS_PER_APP_VERSION`].
+/// by [`MAX_IDEMPOTENCY_TOKENS`], `resolutions` by the same app versions
+/// times [`MAX_RESOLUTIONS_PER_APP_VERSION`], and `assessments` by `apps` times
+/// [`MAX_ASSESSMENTS_PER_APP`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// Every stored application, keyed by its minted `appArn`. At most
@@ -321,6 +415,16 @@ pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// access: the per-version ceiling cannot be bypassed by a handler inserting
     /// directly.
     resolutions: HashMap<String, HashMap<String, VecDeque<ResourceResolution>>>,
+    /// Every application assessment, keyed by its minted `assessmentArn`. An
+    /// assessment is recorded only for a stored application's existing version and
+    /// dropped by [`Self::forget_assessments_of`], so this map never outlives
+    /// `apps`; at most [`MAX_ASSESSMENTS_PER_APP`] entries per application.
+    ///
+    /// PRIVATE, with [`Self::record_assessment`] / [`Self::assessment`] /
+    /// [`Self::assessment_count_of`] / [`Self::forget_assessments_of`] as the only
+    /// access: the per-application ceiling cannot be bypassed by a handler
+    /// inserting directly.
+    assessments: HashMap<String, AppAssessmentRecord>,
 }
 
 impl ComAmazonawsResiliencehubAwsresiliencehubState {
@@ -444,6 +548,93 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
     pub fn forget_app_versions(&mut self, app_arn: &str) {
         self.app_versions.remove(app_arn);
         self.resolutions.remove(app_arn);
+    }
+
+    /// `app_arn`'s application as a read finds it at `now`: the stored record,
+    /// carrying the members an ASSESSMENT computes — the compliance verdict, the
+    /// resiliency score and the instants they were evaluated at — from the newest
+    /// assessment of this application that has finished by `now`.
+    ///
+    /// DERIVED on read rather than written onto the application when an assessment
+    /// finishes: an assessment finishes on the clock, whether or not anybody calls,
+    /// so what an application reports about its compliance cannot depend on a reader
+    /// having materialised it first. An application nothing has assessed keeps the
+    /// members `CreateApp` stored.
+    pub fn reported_app(&self, app_arn: &str, now: ::std::time::SystemTime) -> Option<App> {
+        let mut app = self.apps.get(app_arn)?.clone();
+        if let Some(assessed) = self.newest_finished_assessment(app_arn, now) {
+            app.compliance_status = assessed.compliance_status;
+            app.last_app_compliance_evaluation_time = assessed.end_time;
+            app.resiliency_score = assessed
+                .resiliency_score
+                .map(|score| score.score)
+                .unwrap_or_default();
+            app.last_resiliency_score_evaluation_time = assessed.end_time;
+        }
+        Some(app)
+    }
+
+    /// The assessment of `app_arn` that finished LAST of those finished by `now` —
+    /// the one an application's compliance members report, because it is the most
+    /// recent verdict on the application.
+    fn newest_finished_assessment(
+        &self,
+        app_arn: &str,
+        now: ::std::time::SystemTime,
+    ) -> Option<AppAssessment> {
+        self.assessments
+            .values()
+            .filter(|record| record.app_arn() == Some(app_arn) && record.completes_at <= now)
+            .max_by_key(|record| record.completes_at)
+            .map(|record| record.assessment_at(now))
+    }
+
+    /// Record `record` under `assessment_arn` as an assessment of one application.
+    /// The caller has already established that the application is under
+    /// [`MAX_ASSESSMENTS_PER_APP`].
+    pub fn record_assessment(&mut self, assessment_arn: &str, record: AppAssessmentRecord) {
+        self.assessments.insert(assessment_arn.to_string(), record);
+    }
+
+    /// The assessment `assessment_arn` addresses, while it is still stored.
+    pub fn assessment(&self, assessment_arn: &str) -> Option<&AppAssessmentRecord> {
+        self.assessments.get(assessment_arn)
+    }
+
+    /// The assessment `assessment_arn` addresses, for writing.
+    pub fn assessment_mut(&mut self, assessment_arn: &str) -> Option<&mut AppAssessmentRecord> {
+        self.assessments.get_mut(assessment_arn)
+    }
+
+    /// The stored assessments as a read finds them at `now` — those OF `app_arn`
+    /// when one is named, every stored one otherwise, in no particular order (a
+    /// reader that needs one orders them itself).
+    pub fn assessments_at(
+        &self,
+        app_arn: Option<&str>,
+        now: ::std::time::SystemTime,
+    ) -> Vec<AppAssessment> {
+        self.assessments
+            .values()
+            .filter(|record| app_arn.is_none_or(|wanted| record.app_arn() == Some(wanted)))
+            .map(|record| record.assessment_at(now))
+            .collect()
+    }
+
+    /// How many assessments are stored for `app_arn` — what
+    /// [`MAX_ASSESSMENTS_PER_APP`] bounds.
+    pub fn assessment_count_of(&self, app_arn: &str) -> usize {
+        self.assessments
+            .values()
+            .filter(|record| record.app_arn() == Some(app_arn))
+            .count()
+    }
+
+    /// Forget every assessment of `app_arn`, so deleting an application releases
+    /// what assessing it allocated.
+    pub fn forget_assessments_of(&mut self, app_arn: &str) {
+        self.assessments
+            .retain(|_, record| record.app_arn() != Some(app_arn));
     }
 
     /// Record a resolution of `app_version` of `app_arn`, started at `now`, as
@@ -929,6 +1120,16 @@ pub fn mint_policy_arn(region: &str) -> String {
         "resiliencehub",
         region,
         &format!("resiliency-policy/{}", mint_resource_id()),
+    )
+}
+
+/// Mint a fresh `assessmentArn`:
+/// `arn:aws:resiliencehub:<region>:<account>:app-assessment/<id>`.
+pub fn mint_assessment_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        "resiliencehub",
+        region,
+        &format!("app-assessment/{}", mint_resource_id()),
     )
 }
 

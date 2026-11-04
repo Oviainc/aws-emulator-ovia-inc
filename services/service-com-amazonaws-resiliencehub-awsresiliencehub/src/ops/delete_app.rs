@@ -186,6 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // And what the app's versions hold (their Application Components), so
         // nothing of a deleted application outlives it.
         store.forget_app_versions(&input.app_arn);
+        // And the assessments of those versions, which are assessments OF this
+        // application: an assessment of an application that no longer exists is a
+        // record no read could place.
+        store.forget_assessments_of(&input.app_arn);
 
         Ok(DeleteAppOutput {
             app_arn: input.app_arn,

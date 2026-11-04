@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAppAssessments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAppAssessments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAppAssessments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure read — it writes nothing — of the assessments stored in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState`], narrowed by the
+//! filters the request carries, ordered by the instant each assessment was started
+//! and paged with a `nextToken` that resumes exactly past the last summary
+//! answered.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAppAssessments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppAssessmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAppAssessments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(PageKey::decode(token).ok_or_else(|| {
+                invalid("nextToken: not a token this operation issued".to_string())
+            })?),
+        };
+        let descending = input.reverse_order == Some(true);
+
+        let store = state.lock();
+
+        // An `appArn` filter names ONE application, so it has to resolve: answering
+        // an empty page for an application that does not exist would report that it
+        // has no assessments rather than that there is no such application.
+        if let Some(app_arn) = input.app_arn.as_deref() {
+            if !store.apps.contains_key(app_arn) {
+                return Err(app_not_found(app_arn));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut matching = store.assessments_at(input.app_arn.as_deref(), now);
+        matching.retain(|assessment| matches_filters(assessment, &input));
+
+        // A total order over the page, so a `nextToken` resumes at exactly the
+        // element after the last one returned. `reverseOrder` flips it, which is
+        // what the member documents: the default is ascending `startTime`.
+        matching.sort_by(|left, right| {
+            let ordering = PageKey::of(left).cmp(&PageKey::of(right));
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        // Resume past the token's element, and past anything deleted since, by
+        // taking the first element strictly beyond it in the requested direction.
+        let start = match resume_from {
+            None => 0,
+            Some(token) => matching
+                .iter()
+                .position(|assessment| {
+                    let ordering = PageKey::of(assessment).cmp(&token);
+                    if descending {
+                        ordering.is_lt()
+                    } else {
+                        ordering.is_gt()
+                    }
+                })
+                .unwrap_or(matching.len()),
+        };
+        // `maxResults` is modeled `@range(min: 1, max: 100)`, which the boundary
+        // validator already enforces; absent means "as many as a page allows". A
+        // value that reaches here outside the range is refused rather than clamped,
+        // so a validator regression cannot be masked by silently narrowing a page.
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) if (1..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(invalid(format!(
+                    "maxResults: {requested} is outside the modeled range of 1 to {MAX_PAGE_SIZE}"
+                )))
+            }
+        } as usize;
+        let page = &matching[start..];
+        let returned = &page[..page_size.min(page.len())];
+
+        let next_token = (page.len() > returned.len())
+            .then(|| {
+                returned
+                    .last()
+                    .map(|assessment| PageKey::of(assessment).encode())
+            })
+            .flatten();
+
+        Ok(ListAppAssessmentsOutput {
+            assessment_summaries: returned.iter().map(summarise).collect(),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` allows. Source: the `maxResults` member's
+/// `@range(min: 1, max: 100)` (smithy_query query="operation"
+/// operation="ListAppAssessments").
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Whether `assessment` satisfies every filter `input` carries. Each filter is an
+/// EQUALITY on one member of the assessment as it stands — a member an unfinished
+/// assessment has not reached yet matches no filter on it.
+fn matches_filters(assessment: &AppAssessment, input: &ListAppAssessmentsInput) -> bool {
+    if input
+        .assessment_name
+        .as_deref()
+        .is_some_and(|name| assessment.assessment_name.as_deref() != Some(name))
+    {
+        return false;
+    }
+    // `assessmentStatus` is a LIST: an assessment matches when its status is any of
+    // the ones asked for.
+    if input
+        .assessment_status
+        .as_deref()
+        .is_some_and(|wanted| !wanted.contains(&assessment.assessment_status))
+    {
+        return false;
+    }
+    if input
+        .compliance_status
+        .as_deref()
+        .is_some_and(|wanted| assessment.compliance_status.as_deref() != Some(wanted))
+    {
+        return false;
+    }
+    if input
+        .invoker
+        .as_deref()
+        .is_some_and(|wanted| assessment.invoker != wanted)
+    {
+        return false;
+    }
+    true
+}
+
+/// The total order this operation pages over: by the instant the assessment was
+/// started, oldest first, the assessment's ARN breaking a tie between two started
+/// in the same instant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PageKey {
+    seconds: i64,
+    subsec_nanos: u32,
+    assessment_arn: String,
+}
+
+impl PageKey {
+    /// This assessment's position in the order.
+    fn of(assessment: &AppAssessment) -> Self {
+        let started = assessment.start_time.unwrap_or(::aws_smithy_types::DateTime::from_secs(0));
+        Self {
+            seconds: started.secs(),
+            subsec_nanos: started.subsec_nanos(),
+            assessment_arn: assessment.assessment_arn.clone(),
+        }
+    }
+
+    /// The `nextToken` form: the page key, hex-encoded with the workspace `hex`
+    /// crate — the same codec `ListApps` uses for its tokens. Hex is an ENCODING,
+    /// not a secret — a caller could decode or forge one — so the safety comes from
+    /// `decode` doing bounded work: a token it cannot read is refused with a 400,
+    /// and one it reads that no longer matches a stored assessment simply resumes
+    /// past everything, yielding an empty page. The result carries no whitespace, so
+    /// it satisfies `NextToken`'s `^\S{1,2000}$`.
+    fn encode(&self) -> String {
+        ::hex::encode(format!(
+            "{}.{:09}:{}",
+            self.seconds, self.subsec_nanos, self.assessment_arn
+        ))
+    }
+
+    /// Parse a token this operation issued; `None` for anything else. Bounded
+    /// work: one hex decode, two `split_once`s and two integer parses.
+    fn decode(token: &str) -> Option<Self> {
+        let plain = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+        let (instant, assessment_arn) = plain.split_once(':')?;
+        let (seconds, subsec_nanos) = instant.split_once('.')?;
+        if assessment_arn.is_empty() {
+            return None;
+        }
+        Some(Self {
+            seconds: seconds.parse().ok()?,
+            subsec_nanos: subsec_nanos.parse().ok()?,
+            assessment_arn: assessment_arn.to_string(),
+        })
+    }
+}
+
+/// Project one assessment into the list's summary view: the members
+/// `AppAssessmentSummary` carries, every one of them the assessment's own.
+fn summarise(assessment: &AppAssessment) -> AppAssessmentSummary {
+    AppAssessmentSummary {
+        app_arn: assessment.app_arn.clone(),
+        app_version: assessment.app_version.clone(),
+        assessment_status: assessment.assessment_status.clone(),
+        invoker: Some(assessment.invoker.clone()),
+        start_time: assessment.start_time,
+        end_time: assessment.end_time,
+        message: assessment.message.clone(),
+        assessment_name: assessment.assessment_name.clone(),
+        assessment_arn: assessment.assessment_arn.clone(),
+        compliance_status: assessment.compliance_status.clone(),
+        cost: assessment.cost.clone(),
+        // The summary's score is the assessment's overall score; an assessment with
+        // no score yet summarises as none of one.
+        resiliency_score: assessment
+            .resiliency_score
+            .as_ref()
+            .map(|score| score.score)
+            .unwrap_or_default(),
+        version_name: assessment.version_name.clone(),
+        drift_status: assessment.drift_status.clone(),
+    }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> ListAppAssessmentsError {
+    ListAppAssessmentsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> ListAppAssessmentsError {
+    ListAppAssessmentsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted, worded as this service words that error class.
+fn app_not_found(app_arn: &str) -> ListAppAssessmentsError {
+    ListAppAssessmentsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("App not found for appArn {app_arn}")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
 }

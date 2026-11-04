@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAppAssessment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAppAssessment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAppAssessment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure read of ONE application assessment from
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState`] — it writes
+//! nothing. An assessment that has not finished yet reports the non-terminal status
+//! and none of the verdict it has not reached; one that has reports the verdict
+//! `StartAppAssessment` computed, unchanged by anything written since.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAppAssessment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppAssessmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAppAssessment"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // The one modeled constraint on this input — `assessmentArn`'s pattern — is
+        // already refused by the boundary validator before this handler runs.
+        let store = state.lock();
+
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = store.assessment(&input.assessment_arn) else {
+            return Err(assessment_not_found(&input.assessment_arn));
+        };
+
+        Ok(DescribeAppAssessmentOutput {
+            assessment: record.assessment_at(now),
+        })
     }
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> DescribeAppAssessmentError {
+    DescribeAppAssessmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `assessmentArn` no `StartAppAssessment`
+/// minted, or whose application was deleted, worded as this service words that
+/// error class.
+fn assessment_not_found(assessment_arn: &str) -> DescribeAppAssessmentError {
+    DescribeAppAssessmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "App assessment not found for assessmentArn {assessment_arn}"
+        )),
+        resource_id: Some(assessment_arn.to_string()),
+        resource_type: Some("AppAssessment".to_string()),
+    })
+    .into()
 }

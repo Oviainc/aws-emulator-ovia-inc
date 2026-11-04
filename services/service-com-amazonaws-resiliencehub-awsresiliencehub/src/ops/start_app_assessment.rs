@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAppAssessment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAppAssessment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAppAssessment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: assesses the application's CURRENT RELEASE against the
+//! resiliency policy that application names, recording the assessment in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState`] so
+//! `DescribeAppAssessment` reports it. The verdict is computed from the assessed
+//! version's contents and the policy as they are at the call, and frozen: a later
+//! edit to either cannot change what a finished assessment reports. Assessing takes
+//! time, so the call answers the assessment it STARTED — the non-terminal
+//! `Pending` — and the terminal status, the verdict and the score are what a read
+//! finds one [`crate::state::ASSESSMENT_SPAN`] later. Any `appVersion` other than
+//! the release alias is refused with the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +173,371 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAppAssessment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAppAssessmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAppAssessment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // Every modeled constraint on this input — the two patterns, the token's
+        // length and the tag map's — is already refused by the boundary validator
+        // before this handler runs, so there is nothing left here to re-check.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An assessment is OF an app version of an application, so each link of
+        // that path has to resolve: recording an assessment of an unknown version
+        // would make a later read report an assessment of something that does not
+        // exist.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        // Only the application's current RELEASE is assessable: every other version
+        // is either the draft, which the next write changes, or a snapshot the
+        // release has already superseded, so a verdict on it would be a verdict on
+        // something that is not the application as it stands. The label is judged
+        // before it is resolved, so the refusal is the same whether or not the
+        // application has such a version.
+        if input.app_version != crate::state::RELEASE_APP_VERSION {
+            return Err(version_not_assessable(&input.app_version));
+        }
+        if !store.app_version_exists(&input.app_arn, &input.app_version) {
+            return Err(app_version_not_found(&input.app_arn, &input.app_version));
+        }
+
+        // A replayed `@idempotencyToken` answers the assessment its first call
+        // started instead of starting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(first_arn) = store.created_by_token(Self::NAME, token).cloned() {
+                if let Some(record) = store.assessment(&first_arn) {
+                    let first = record.assessment_at(now);
+                    if describes_same_assessment(&first, &input) {
+                        return Ok(StartAppAssessmentOutput { assessment: first });
+                    }
+                    return Err(token_conflict(token, &first_arn));
+                }
+            }
+        }
+
+        // The store is bounded: past the ceiling no further assessment is started.
+        if store.assessment_count_of(&input.app_arn) >= crate::state::MAX_ASSESSMENTS_PER_APP {
+            return Err(too_many_assessments(&input.app_arn));
+        }
+
+        // What is assessed: a COPY of the version's contents and of the policy the
+        // application names, so the verdict below cannot move under a later edit to
+        // either.
+        let assessed = store
+            .app_version(&input.app_arn, &input.app_version)
+            .cloned()
+            .unwrap_or_default();
+        let policy = store
+            .apps
+            .get(&input.app_arn)
+            .and_then(|app| app.policy_arn.as_deref())
+            .and_then(|policy_arn| store.policies.get(policy_arn))
+            .cloned();
+
+        let compliance = disruption_compliance(&assessed, policy.as_ref());
+        // An assessment PINS the version it graded: the release alias is a label the
+        // next publish moves, so what the assessment records is the publish sequence
+        // number that label resolved to at this call — a later read of the assessment
+        // can tell which snapshot was graded.
+        let assessed_version = assessed
+            .identifier
+            .map(|identifier| identifier.to_string())
+            .unwrap_or_else(|| input.app_version.clone());
+        let assessment_arn = crate::state::mint_assessment_arn(&region);
+        let assessment = AppAssessment {
+            app_arn: Some(input.app_arn.clone()),
+            app_version: Some(assessed_version),
+            // Started by this caller, not by an assessment schedule.
+            invoker: crate::state::ASSESSMENT_INVOKER_USER.to_string(),
+            // `cost` is left out: this emulator holds no pricing for the resources
+            // an application maps, so there is no amount to report.
+            cost: None,
+            resiliency_score: Some(resiliency_score(&compliance)),
+            compliance_status: Some(overall_compliance_status(policy.as_ref(), &compliance)),
+            compliance: Some(compliance),
+            assessment_status: crate::state::ASSESSMENT_STATUS_SUCCESS.to_string(),
+            start_time: Some(::aws_smithy_types::DateTime::from(now)),
+            end_time: Some(::aws_smithy_types::DateTime::from(
+                now + crate::state::ASSESSMENT_SPAN,
+            )),
+            message: None,
+            assessment_name: Some(input.assessment_name.clone()),
+            assessment_arn: assessment_arn.clone(),
+            policy,
+            // An untagged assessment answers `tags` as an empty map, as every other
+            // taggable record of this service does.
+            tags: crate::state::reported_tags(input.tags.clone()),
+            // Nothing failed to be read: the assessed version is this emulator's own
+            // state, so no resource of it could not be reached.
+            resource_errors_details: None,
+            // The version's own name, as the publish that froze it recorded it.
+            version_name: assessed.version_name.clone(),
+            // No assessment is compared against an earlier one here, so none
+            // reports drift it did not look for.
+            drift_status: Some(crate::state::DRIFT_STATUS_NOT_CHECKED.to_string()),
+            // `summary` carries the risks and recommendations a real assessment
+            // writes up; this service computes none, so there is nothing to
+            // summarise.
+            summary: None,
+        };
+
+        let record = crate::state::AppAssessmentRecord::started_at(assessment, now);
+        let started = record.assessment_at(now);
+        store.record_assessment(&assessment_arn, record);
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_idempotency_token(Self::NAME, token, &assessment_arn);
+        }
+
+        Ok(StartAppAssessmentOutput {
+            assessment: started,
+        })
     }
+}
+
+/// The `currentRtoInSecs` / `currentRpoInSecs` an assessment reports for a
+/// disruption the assessed version has nothing to recover from — "no recovery at
+/// all", as the widest value the modelled `Seconds` integer carries (`smithy_query
+/// query="shape" shape="Seconds"`: bounded below by 0 and not above).
+const UNRECOVERED_SECONDS: i32 = i32::MAX;
+
+/// What the assessment makes of `assessed` against `policy`, one entry per
+/// disruption type the POLICY states an objective for — an application is only
+/// compliant with the objectives it was given, so a disruption type the policy
+/// leaves out is not judged, and an application with no policy is not judged at
+/// all.
+///
+/// Recovery is backed by what the assessed version actually maps: an Application
+/// Component with no resource mapped to it has nothing to recover, so while one
+/// exists no objective is met and the assessment reports the recovery times as
+/// unreached ([`UNRECOVERED_SECONDS`]) while reporting the objective itself as
+/// achievable — mapping a resource into the component is what reaches it.
+fn disruption_compliance(
+    assessed: &crate::state::AppVersionContents,
+    policy: Option<&ResiliencyPolicy>,
+) -> ::std::collections::HashMap<String, DisruptionCompliance> {
+    let Some(objectives) = policy.and_then(|policy| policy.policy.as_ref()) else {
+        return ::std::collections::HashMap::new();
+    };
+
+    let unmapped = components_without_resources(assessed);
+    objectives
+        .iter()
+        .map(|(disruption_type, objective)| {
+            let compliance = match unmapped.first() {
+                None => DisruptionCompliance {
+                    current_rto_in_secs: objective.rto_in_secs,
+                    achievable_rto_in_secs: objective.rto_in_secs,
+                    current_rpo_in_secs: objective.rpo_in_secs,
+                    achievable_rpo_in_secs: objective.rpo_in_secs,
+                    compliance_status: COMPLIANCE_STATUS_MET.to_string(),
+                    ..DisruptionCompliance::default()
+                },
+                Some(component) => DisruptionCompliance {
+                    current_rto_in_secs: UNRECOVERED_SECONDS,
+                    achievable_rto_in_secs: objective.rto_in_secs,
+                    current_rpo_in_secs: UNRECOVERED_SECONDS,
+                    achievable_rpo_in_secs: objective.rpo_in_secs,
+                    compliance_status: COMPLIANCE_STATUS_BREACHED.to_string(),
+                    message: Some(format!(
+                        "Application Component {component} has no resources, so nothing \
+                         recovers it"
+                    )),
+                    ..DisruptionCompliance::default()
+                },
+            };
+            (disruption_type.clone(), compliance)
+        })
+        .collect()
+}
+
+/// The names of `assessed`'s Application Components that no resource of `assessed`
+/// is mapped to, in the stored components' own stable order.
+///
+/// A resource carries the components it was created with, so the mapping is read
+/// from the resource side — by the `name` the model gives `AppComponentNameList`'s
+/// members or by the `id` the component is stored under, the two ways this service
+/// lets a resource name one.
+fn components_without_resources(assessed: &crate::state::AppVersionContents) -> Vec<String> {
+    assessed
+        .app_components
+        .values()
+        .filter(|component| {
+            !assessed.resources.values().any(|resource| {
+                resource
+                    .app_components
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|mapped| {
+                        mapped.name == component.name
+                            || (mapped.id.is_some() && mapped.id == component.id)
+                    })
+            })
+        })
+        .map(|component| component.name.clone())
+        .collect()
+}
+
+/// The `ComplianceStatus` of an application whose every stated objective is
+/// reached.
+const COMPLIANCE_STATUS_MET: &str = "PolicyMet";
+
+/// The `ComplianceStatus` of an application that misses at least one of them.
+const COMPLIANCE_STATUS_BREACHED: &str = "PolicyBreached";
+
+/// The `ComplianceStatus` of an application there is no policy to judge against.
+const COMPLIANCE_STATUS_MISSING_POLICY: &str = "MissingPolicy";
+
+/// The `ComplianceStatus` of an application whose policy states no objective to
+/// judge against.
+const COMPLIANCE_STATUS_NOT_APPLICABLE: &str = "NotApplicable";
+
+/// The assessment's verdict on the application as a whole: an application is
+/// compliant only while EVERY objective its policy states is reached, there is
+/// nothing to judge an application against while it names no policy, and a policy
+/// that states no objective judges nothing.
+fn overall_compliance_status(
+    policy: Option<&ResiliencyPolicy>,
+    compliance: &::std::collections::HashMap<String, DisruptionCompliance>,
+) -> String {
+    if policy.is_none() {
+        return COMPLIANCE_STATUS_MISSING_POLICY.to_string();
+    }
+    if compliance.is_empty() {
+        return COMPLIANCE_STATUS_NOT_APPLICABLE.to_string();
+    }
+    if compliance
+        .values()
+        .any(|entry| entry.compliance_status != COMPLIANCE_STATUS_MET)
+    {
+        return COMPLIANCE_STATUS_BREACHED.to_string();
+    }
+    COMPLIANCE_STATUS_MET.to_string()
+}
+
+/// The score of a disruption type whose objective is reached, out of
+/// [`SCORE_PER_DISRUPTION`].
+const SCORE_PER_DISRUPTION: f64 = 100.0;
+
+/// The assessment's resiliency score: each disruption type the policy states an
+/// objective for scores the whole of [`SCORE_PER_DISRUPTION`] when that objective
+/// is reached and none of it when it is not, and the application's score is the
+/// mean of them — so the score says exactly how much of the policy the application
+/// meets, and an application with nothing to judge scores nothing.
+///
+/// `componentScore` is left out: it breaks the score down by scoring component
+/// (compliance, tests, alarms and standard operating procedures), and this service
+/// records no tests, alarms or procedures to score.
+fn resiliency_score(
+    compliance: &::std::collections::HashMap<String, DisruptionCompliance>,
+) -> ResiliencyScore {
+    let disruption_score: ::std::collections::HashMap<String, f64> = compliance
+        .iter()
+        .map(|(disruption_type, entry)| {
+            let score = if entry.compliance_status == COMPLIANCE_STATUS_MET {
+                SCORE_PER_DISRUPTION
+            } else {
+                0.0
+            };
+            (disruption_type.clone(), score)
+        })
+        .collect();
+    let score = if disruption_score.is_empty() {
+        0.0
+    } else {
+        disruption_score.values().sum::<f64>() / disruption_score.len() as f64
+    };
+    ResiliencyScore {
+        score,
+        disruption_score,
+        component_score: None,
+    }
+}
+
+/// Whether `stored` is the assessment `request` asks for — the idempotency check: a
+/// replayed token with the same parameters answers the first assessment, a replayed
+/// token with different parameters is a conflict.
+///
+/// `appVersion` is no part of the comparison: the only version this operation
+/// assesses is the release alias, so two calls that reach here named the same one,
+/// while the assessments they record pin whichever snapshot that alias resolved to
+/// at each call.
+fn describes_same_assessment(stored: &AppAssessment, request: &StartAppAssessmentInput) -> bool {
+    stored.app_arn.as_deref() == Some(request.app_arn.as_str())
+        && stored.assessment_name.as_deref() == Some(request.assessment_name.as_str())
+        && stored.tags == crate::state::reported_tags(request.tags.clone())
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> StartAppAssessmentError {
+    StartAppAssessmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted, worded as this service words that error class.
+fn app_not_found(app_arn: &str) -> StartAppAssessmentError {
+    StartAppAssessmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("App not found for appArn {app_arn}")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for an `appVersion` the application does not have.
+fn app_version_not_found(app_arn: &str, app_version: &str) -> StartAppAssessmentError {
+    StartAppAssessmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "App version {app_version} not found for appArn {app_arn}"
+        )),
+        resource_id: Some(app_version.to_string()),
+        resource_type: Some("AppVersion".to_string()),
+    })
+    .into()
+}
+
+/// A 400 `ValidationException` for an assessment of a version that is not the
+/// application's published release: the request names a version this operation does
+/// not assess, which is what this operation's `ValidationException` is for.
+fn version_not_assessable(app_version: &str) -> StartAppAssessmentError {
+    StartAppAssessmentErrorModeled::ValidationException(ValidationException {
+        message: Some(format!(
+            "AppAssessment version {app_version} is invalid, must be {}",
+            crate::state::RELEASE_APP_VERSION
+        )),
+    })
+    .into()
+}
+
+/// A 409 `ConflictException` naming the assessment that already holds the replayed
+/// `clientToken`.
+fn token_conflict(client_token: &str, assessment_arn: &str) -> StartAppAssessmentError {
+    StartAppAssessmentErrorModeled::ConflictException(ConflictException {
+        message: Some(format!(
+            "clientToken {client_token} was already used to start app assessment \
+             {assessment_arn} with different parameters"
+        )),
+        resource_id: Some(assessment_arn.to_string()),
+        resource_type: Some("AppAssessment".to_string()),
+    })
+    .into()
+}
+
+/// The 402 for a request that would take one application past
+/// [`crate::state::MAX_ASSESSMENTS_PER_APP`].
+fn too_many_assessments(app_arn: &str) -> StartAppAssessmentError {
+    StartAppAssessmentErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(format!(
+            "this emulator stores at most {} assessments per application, and {app_arn} \
+             has that many",
+            crate::state::MAX_ASSESSMENTS_PER_APP
+        )),
+    })
+    .into()
 }

@@ -188,15 +188,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // `name` is the application's unique identifier within the account, so the
-        // name index answers that filter directly instead of scanning.
-        let mut matching: Vec<&App> = match input.name.as_deref() {
+        // name index answers that filter directly instead of scanning. Each
+        // application is taken as it STANDS — the compliance members an assessment
+        // computes included — so the filters below and the summaries answered agree
+        // about every application.
+        let now = ::std::time::SystemTime::now();
+        let mut matching: Vec<App> = match input.name.as_deref() {
             Some(name) => store
                 .app_name_index
                 .get(name)
-                .and_then(|app_arn| store.apps.get(app_arn))
+                .and_then(|app_arn| store.reported_app(app_arn, now))
                 .into_iter()
                 .collect(),
-            None => store.apps.values().collect(),
+            None => store
+                .apps
+                .keys()
+                .filter_map(|app_arn| store.reported_app(app_arn, now))
+                .collect(),
         };
         matching.retain(|app| matches_filters(app, &input));
 
@@ -248,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flatten();
 
         Ok(ListAppsOutput {
-            app_summaries: returned.iter().map(|app| summarise(app)).collect(),
+            app_summaries: returned.iter().map(summarise).collect(),
             next_token,
         })
     }

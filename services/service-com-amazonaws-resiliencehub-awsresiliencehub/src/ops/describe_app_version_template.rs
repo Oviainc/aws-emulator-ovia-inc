@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default();
 
         Ok(DescribeAppVersionTemplateOutput {
-            app_template_body: app_template_body(&input.app_version, &contents),
+            app_template_body: app_template_body(&contents),
             app_arn: input.app_arn,
             app_version: input.app_version,
         })
@@ -204,8 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// shape="DescribeAppVersionTemplateResponse" member="appTemplateBody"`):
 /// `resources` (each with its `logicalResourceId`, `type`, `name` and
 /// `additionalInfo`), `appComponents` (each with its `name`, `type`,
-/// `resourceNames` and `additionalInfo`) and `version`, documented there as the
-/// Resilience Hub application version — so the label this template was read at.
+/// `resourceNames` and `additionalInfo`) and `version`.
+///
+/// `version` is the TEMPLATE DOCUMENT's version — [`APP_TEMPLATE_VERSION`] — and no
+/// part of the request: this body is the same document
+/// `PutDraftAppVersionTemplate` takes back in, so nothing in it can depend on which
+/// of a version's labels the read addressed it by. That is what makes one snapshot
+/// render byte-identically under the release alias and under its own publish
+/// sequence number.
 ///
 /// Rendered from the stored version, so the body a reader gets back is what the
 /// last write to that version persisted: a published version's body cannot change,
@@ -220,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// [`crate::state::MAX_RESOURCES_PER_APP_VERSION`] resources and
 /// [`crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION`] components — so no request
 /// renders a body this emulator did not already have the state for.
-fn app_template_body(app_version: &str, contents: &crate::state::AppVersionContents) -> String {
+fn app_template_body(contents: &crate::state::AppVersionContents) -> String {
     // "Don't add the resources that you want to exclude" (the member's own
     // documentation), so an excluded resource is no part of the template's
     // `resources`.
@@ -270,10 +276,22 @@ fn app_template_body(app_version: &str, contents: &crate::state::AppVersionConte
     ::serde_json::json!({
         "resources": resources,
         "appComponents": app_components,
-        "version": app_version,
+        "version": APP_TEMPLATE_VERSION,
     })
     .to_string()
 }
+
+/// The version of the app-template DOCUMENT every body is rendered in — the
+/// structure described above, the one this service reads and writes templates in.
+///
+/// A CONSTANT, and a number, because it describes the document's own shape and not
+/// the application's state: the body is the document `PutDraftAppVersionTemplate`
+/// takes back in, so it cannot carry a value that depends on the read that produced
+/// it. Recorded behaviour is what fixes that: one published snapshot read through
+/// the release alias and read again through its own publish sequence number answers
+/// the SAME body, which no per-read label satisfies. The document the template
+/// operations of this service exchange is version 2.
+const APP_TEMPLATE_VERSION: i64 = 2;
 
 /// One resource's `logicalResourceId`, carrying the members the stored
 /// `LogicalResourceId` names: the required `identifier`, plus whichever source the

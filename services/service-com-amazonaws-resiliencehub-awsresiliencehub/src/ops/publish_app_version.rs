@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|draft| !draft.is_empty())
             .cloned();
         let Some(draft) = draft else {
-            return Err(empty_draft_conflict(&input.app_arn));
+            return Err(empty_draft_conflict());
         };
 
         // The store is bounded: past the ceiling no further version is published.
@@ -250,12 +250,16 @@ fn app_not_found(app_arn: &str) -> PublishAppVersionError {
 
 /// A 409 `ConflictException` for a draft with nothing to publish: the publish is
 /// refused rather than minting an empty version a later read would report.
-fn empty_draft_conflict(app_arn: &str) -> PublishAppVersionError {
+///
+/// The refusal names the TEMPLATE requirement the request fails to meet — an app
+/// template is publishable only once it carries something — and carries no part of
+/// the request: the wording is the same for every application, so a client matching
+/// it reads this conflict apart from the other conflicts this operation models.
+fn empty_draft_conflict() -> PublishAppVersionError {
     PublishAppVersionErrorModeled::ConflictException(ConflictException {
-        message: Some(format!(
-            "the {} version of application {app_arn} is empty; add to it before publishing",
-            crate::state::DRAFT_APP_VERSION
-        )),
+        message: Some(
+            "Invalid app template. App template must have at least 1 resource".to_string(),
+        ),
         resource_id: Some(crate::state::DRAFT_APP_VERSION.to_string()),
         resource_type: Some("AppVersion".to_string()),
     })

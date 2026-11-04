@@ -323,7 +323,7 @@ fn conflict(message: impl Into<String>, app_arn: String) -> CreateAppError {
 /// ever minted.
 fn policy_not_found(policy_arn: &str) -> CreateAppError {
     CreateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("resiliency policy {policy_arn} does not exist")),
+        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

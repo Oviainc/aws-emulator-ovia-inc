@@ -31,6 +31,12 @@ const REGION: &str = "us-east-1";
 /// The account id `engine::mock_account_id` mints every ARN under.
 const ACCOUNT: &str = "000000000000";
 
+/// The `version` every rendered `appTemplateBody` carries: the version of the
+/// app-template DOCUMENT, which is the same for every app version of every
+/// application — the body is the document the template operations read and write,
+/// so no part of it depends on which label a read addressed the version by.
+const APP_TEMPLATE_VERSION: i64 = 2;
+
 /// An emulator holding only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -329,8 +335,9 @@ async fn the_release_alias_names_the_newest_snapshot_and_numbers_the_superseded_
     )
     .await;
 
-    // What the draft held at each publish, by that publish's sequence number.
-    let mut frozen: Vec<(i64, BTreeSet<String>)> = Vec::new();
+    // What the draft held at each publish, by that publish's sequence number, and
+    // the template body the release alias answered the moment it was published.
+    let mut frozen: Vec<(i64, BTreeSet<String>, Value)> = Vec::new();
     let mut in_draft: BTreeSet<String> = BTreeSet::new();
 
     for (index, row) in publish_table().into_iter().enumerate() {
@@ -350,7 +357,7 @@ async fn the_release_alias_names_the_newest_snapshot_and_numbers_the_superseded_
 
         // The release template is FROZEN: the writes just made to the draft did not
         // reach the snapshot published before them.
-        if let Some((_, published)) = frozen.last() {
+        if let Some((_, published, _)) = frozen.last() {
             let still = resource_identifiers(&template(&router, &app_arn, RELEASE_APP_VERSION).await);
             assert_eq!(
                 &still, published,
@@ -370,10 +377,9 @@ async fn the_release_alias_names_the_newest_snapshot_and_numbers_the_superseded_
             "case {case:?}: publish number {sequence} must answer the release alias \
              as its appVersion and {sequence} as its identifier, got {published:?}"
         );
-        frozen.push((sequence, in_draft.clone()));
-
         // The alias resolves to what was just published.
         let released = template(&router, &app_arn, RELEASE_APP_VERSION).await;
+        frozen.push((sequence, in_draft.clone(), released.clone()));
         assert_eq!(
             resource_identifiers(&released),
             in_draft,
@@ -382,16 +388,16 @@ async fn the_release_alias_names_the_newest_snapshot_and_numbers_the_superseded_
         );
         assert_eq!(
             released["version"],
-            json!(RELEASE_APP_VERSION),
-            "case {case:?}: the template reports the version it was read at, got \
-             {released:?}"
+            json!(APP_TEMPLATE_VERSION),
+            "case {case:?}: the template reports the app-template document version \
+             {APP_TEMPLATE_VERSION}, got {released:?}"
         );
 
         // Every SUPERSEDED snapshot is still readable under its own number, still
         // holding what it froze; the newest one's number addresses nothing, because
         // the alias is what names it.
         let newest = frozen.len() as i64;
-        for (number, held) in &frozen {
+        for (number, held, at_publish) in &frozen {
             let app_version = number.to_string();
             if *number == newest {
                 read_template(&router, &app_arn, &app_version).await.refused(
@@ -409,10 +415,14 @@ async fn the_release_alias_names_the_newest_snapshot_and_numbers_the_superseded_
                 "case {case:?}: superseded version {app_version} must still hold \
                  {held:?}, got {superseded:?}"
             );
+            // The SAME snapshot, read under its number instead of under the alias
+            // it was published to: one published version has ONE body, so nothing
+            // in it may depend on the label the read addressed it by.
             assert_eq!(
-                superseded["version"],
-                json!(app_version),
-                "case {case:?}: version {app_version} reports itself, got {superseded:?}"
+                &superseded, at_publish,
+                "case {case:?}: version {app_version} must still answer the body it \
+                 answered when it was published, expected {at_publish:?}, got \
+                 {superseded:?}"
             );
         }
 
@@ -429,8 +439,7 @@ async fn the_release_alias_names_the_newest_snapshot_and_numbers_the_superseded_
 /// The template renders the version's stored resources and Application Components:
 /// every form of `logicalResourceId` source member, an `additionalInfo` map, and the
 /// resource-to-component assignment — and a publish carries all of it across
-/// unchanged, so the release template differs from the draft's only in the version it
-/// reports.
+/// unchanged, so the release template is the draft's, document version included.
 #[tokio::test]
 async fn the_template_renders_every_stored_resource_and_component() {
     let router = emulator();
@@ -559,8 +568,14 @@ async fn the_template_renders_every_stored_resource_and_component() {
     );
     assert_eq!(
         released["version"],
-        json!(RELEASE_APP_VERSION),
-        "case \"the release template\": expected the release label, got {released:?}"
+        json!(APP_TEMPLATE_VERSION),
+        "case \"the release template\": expected the app-template document version \
+         {APP_TEMPLATE_VERSION}, got {released:?}"
+    );
+    assert_eq!(
+        released["version"], draft["version"],
+        "case \"the release template\": the document version is the same for every \
+         app version, got {released:?} and {draft:?}"
     );
 }
 

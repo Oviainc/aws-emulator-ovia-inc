@@ -154,11 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let Some(app) = store.apps.get(&input.app_arn) else {
+        // What the application reports about its compliance follows from the
+        // assessments of it that have finished, so the read is of the application as
+        // it stands now.
+        let Some(app) = store.reported_app(&input.app_arn, ::std::time::SystemTime::now()) else {
             return Err(app_not_found(&input.app_arn));
         };
 
-        Ok(DescribeAppOutput { app: app.clone() })
+        Ok(DescribeAppOutput { app })
     }
 }
 
