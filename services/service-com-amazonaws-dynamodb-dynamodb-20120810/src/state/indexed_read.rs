@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a read of a table — or of one of its secondary indexes — evaluates and reports.
+//!
+//! `Query` and `Scan` differ in WHICH entries they walk: a query reads one partition of
+//! the schema it was pointed at, a scan reads every entry of it. Everything else about
+//! being pointed at an index is the same for both, and is decided here: which index an
+//! `IndexName` resolves to and the two refusals that resolution carries, what each
+//! reported item is narrowed to ([`Selection`]), whether a read has to go on to the
+//! parent table for an attribute its index does not project, and what one row of a page
+//! was SEEN as ([`Read`]).
+//!
+//! A file of its own beside the item store rather than inside it: this is about what
+//! one REQUEST reads and reports, not about what the store holds. It is re-exported up
+//! to `crate::state`, so every caller names it `crate::state::…`.
+
+use std::collections::{BTreeSet, HashMap};
+
+use super::projection::{project_paths, projected_paths, projection_expression_paths};
+use crate::ops::types::{ConsumedCapacity, KeySchemaElement};
+use crate::state::{
+    consumed_capacity, consumed_index_capacity, enum_value_requirement, expression_conflict,
+    invalid_member, unknown_index_named, DocumentPath, IndexItemKey, Item, ItemKey, RequestError,
+    SecondaryIndex, Substitutions, Table,
+};
+
+/// How a strongly consistent read of a GLOBAL secondary index is refused: "The
+/// ConsistentRead parameter is not supported on global secondary indexes. If you query
+/// a global secondary index with ConsistentRead set to true, you will receive a
+/// ValidationException" (`Query$ConsistentRead`, and `Scan$ConsistentRead` states the
+/// same rule). The index is not named: the rule holds for every global secondary index,
+/// so the refusal reports nothing of the table.
+pub const CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE: &str =
+    "Consistent reads are not supported on global secondary indexes";
+
+/// How a read of every item attribute FROM a global secondary index that projects only
+/// some of them is refused: "If you query or scan a global secondary index, you can only
+/// request attributes that are projected into the index. Global secondary index queries
+/// cannot fetch attributes from the parent table" (`Query$Select`), so the request names
+/// an index whose projection cannot answer it.
+pub fn all_attributes_unprojected(index_name: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported \
+         for global secondary index {index_name} because its projection type is not ALL"
+    )
+}
+
+/// The secondary index a read is served from, or `None` when it reads the table itself.
+///
+/// Three facts of the request are settled here, in the order a reader meets them:
+///
+/// * "The name of a secondary index to [read]. This index can be any local secondary
+///   index or global secondary index" (`Query$IndexName`): a name this table declares no
+///   index for is the request's own mistake, stated over the name it sent
+///   ([`unknown_index_named`]);
+/// * a strongly consistent read of a global secondary index is refused
+///   ([`CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE`]);
+/// * a read of every item attribute can only be served from a global index that projects
+///   them all ([`all_attributes_unprojected`]).
+///
+/// All three are decided before anything is read, so the caller is told to fix the
+/// request rather than to retry it.
+pub fn resolve_index<'t>(
+    table: &'t Table,
+    index_name: Option<&str>,
+    consistent_read: bool,
+    selection: &Selection,
+) -> Result<Option<SecondaryIndex<'t>>, RequestError> {
+    let Some(index_name) = index_name else {
+        return Ok(None);
+    };
+    let index = table
+        .secondary_index(index_name)
+        .ok_or_else(|| unknown_index_named(index_name))?;
+    if consistent_read && index.global {
+        return Err(RequestError::Validation(
+            CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE.to_string(),
+        ));
+    }
+    if index.global && matches!(selection, Selection::AllAttributes) && !index.projects_all() {
+        return Err(RequestError::Validation(all_attributes_unprojected(
+            index.name,
+        )));
+    }
+    Ok(Some(index))
+}
+
+/// What a read reports for each item its page selected.
+#[derive(Debug)]
+pub enum Selection {
+    /// "ALL_ATTRIBUTES - Returns all of the item attributes from the specified table or
+    /// index" (`Query$Select`) — the default when a table is read.
+    AllAttributes,
+    /// "ALL_PROJECTED_ATTRIBUTES - Allowed only when querying an index. Retrieves all
+    /// attributes that have been projected into the index" — the default when an index
+    /// is read.
+    AllProjected,
+    /// "SPECIFIC_ATTRIBUTES - Returns only the attributes listed in
+    /// ProjectionExpression", which is also what naming a projection and no `Select` at
+    /// all asks for. The projection is a list of document paths, so an entry may reach
+    /// inside an attribute ([`project_paths`]).
+    Specific(Vec<DocumentPath>),
+    /// "COUNT - Returns the number of matching items, rather than the matching items
+    /// themselves."
+    Count,
+}
+
+/// What each reported item carries, from the request's `Select` and the paths its
+/// projection named.
+///
+/// "If neither Select nor ProjectionExpression are specified, DynamoDB defaults to
+/// ALL_ATTRIBUTES when accessing a table, and ALL_PROJECTED_ATTRIBUTES when accessing an
+/// index. You cannot use both Select and ProjectionExpression together in a single
+/// request, unless the value for Select is SPECIFIC_ATTRIBUTES" (`Query$Select`, which
+/// `Scan$Select` repeats), which is the whole of the rule below.
+pub fn resolve_selection(
+    select: Option<&str>,
+    requested: Option<Vec<DocumentPath>>,
+    on_index: bool,
+) -> Result<Selection, RequestError> {
+    if let Some(value) = select {
+        if !crate::ops::types::SELECT_VALUES.contains(&value) {
+            return Err(invalid_member(
+                "select",
+                Some(value),
+                &enum_value_requirement(crate::ops::types::SELECT_VALUES),
+            ));
+        }
+    }
+    match select {
+        None => Ok(match requested {
+            Some(paths) => Selection::Specific(paths),
+            None if on_index => Selection::AllProjected,
+            None => Selection::AllAttributes,
+        }),
+        Some("SPECIFIC_ATTRIBUTES") => requested.map(Selection::Specific).ok_or_else(|| {
+            RequestError::Validation(
+                "One or more parameter values were invalid: Select type SPECIFIC_ATTRIBUTES \
+                 requires the attributes to be listed in ProjectionExpression"
+                    .to_string(),
+            )
+        }),
+        // "If you use the ProjectionExpression parameter, then the value for Select can
+        // only be SPECIFIC_ATTRIBUTES. Any other value for Select will return an error."
+        Some(other) if requested.is_some() => Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: Select type {other} is not supported \
+             when the attributes to return are listed; the only Select type that is, is \
+             SPECIFIC_ATTRIBUTES"
+        ))),
+        Some("ALL_ATTRIBUTES") => Ok(Selection::AllAttributes),
+        Some("COUNT") => Ok(Selection::Count),
+        Some("ALL_PROJECTED_ATTRIBUTES") if on_index => Ok(Selection::AllProjected),
+        Some(other) => Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: Select type {other} is allowed only \
+             when an index is scanned"
+        ))),
+    }
+}
+
+/// The document paths the request's PROJECTION names, or `None` when it names none at
+/// all — in which case "all attributes will be returned" (`ProjectionExpression`).
+///
+/// The two members are the same ask one generation apart: `AttributesToGet` is "a legacy
+/// parameter. Use ProjectionExpression instead" (that member's doc), so a request that
+/// states the projection both ways is refused the way the service refuses a request that
+/// states one thing twice, and either member is read into the one path list the reader
+/// projects by — a legacy name addressing the whole attribute it names.
+///
+/// Either way the list is the one [`projected_paths`] settles: held to the ceiling that
+/// module names — which is what bounds the legacy member, since it carries no modelled
+/// length — de-duplicated, and in the order a report applies it. So what
+/// [`reported_items`] does per item it answers is a function of this service's constants
+/// rather than of the request body.
+pub fn requested_projection(
+    member: &'static str,
+    projection_expression: Option<&str>,
+    attributes_to_get: Option<&[String]>,
+    names: Option<&HashMap<String, String>>,
+) -> Result<Option<Vec<DocumentPath>>, RequestError> {
+    let legacy = attributes_to_get.filter(|names| !names.is_empty());
+    let paths = match (projection_expression, legacy) {
+        (Some(_), Some(_)) => return Err(expression_conflict("AttributesToGet", member)),
+        (Some(expression), None) => {
+            projection_expression_paths(member, expression, Substitutions::new(names, None))?
+        }
+        (None, Some(names)) => names
+            .iter()
+            .map(|name| DocumentPath::attribute_named(name))
+            .collect(),
+        (None, None) => return Ok(None),
+    };
+    projected_paths(paths).map(Some)
+}
+
+/// Whether a read needs an attribute its index does not project, which is what sends it
+/// on to the parent table.
+///
+/// What it needs is what it REPORTS plus what its FILTER reads: a filter is judged
+/// against the item, so an attribute only the filter names is still read even though no
+/// response carries it. A projection that reaches INSIDE an attribute needs that
+/// attribute, which is the top-level name the path starts at.
+pub fn needs_unprojected(
+    index: &SecondaryIndex<'_>,
+    table_key_schema: &[KeySchemaElement],
+    selection: &Selection,
+    filter_attributes: &BTreeSet<String>,
+) -> bool {
+    if index.projects_all() {
+        return false;
+    }
+    if matches!(selection, Selection::AllAttributes) {
+        return true;
+    }
+    let mut needed = filter_attributes.clone();
+    if let Selection::Specific(paths) = selection {
+        needed.extend(paths.iter().map(|path| path.attribute().to_string()));
+    }
+    needed
+        .iter()
+        .any(|name| !index.projects(table_key_schema, name))
+}
+
+/// One row a read evaluated: the stored item, and the entry the index it was read
+/// through holds for it (`None` on a base-table read).
+#[derive(Debug)]
+pub struct Read<'a> {
+    item: &'a Item,
+    entry: Option<Item>,
+    /// Whether this read went on to the parent table for the attributes its index does
+    /// not project, which only a local secondary index can do.
+    fetched: bool,
+}
+
+impl<'a> Read<'a> {
+    /// The row `item` is read as through `index` (`None` for the table itself), having
+    /// gone on to the parent table when `fetched`.
+    pub fn new(
+        item: &'a Item,
+        index: Option<&SecondaryIndex<'_>>,
+        table_key_schema: &[KeySchemaElement],
+        fetched: bool,
+    ) -> Self {
+        Self {
+            item,
+            entry: index.map(|index| index.entry(item, table_key_schema)),
+            fetched,
+        }
+    }
+
+    /// The STORED item this row projects, which is what a `LastEvaluatedKey` is taken
+    /// from.
+    pub fn item(&self) -> &'a Item {
+        self.item
+    }
+
+    /// The attributes this read SAW — what its filter is judged against, what it is
+    /// charged for, and what `ALL_ATTRIBUTES` reports: the index's entry, or the whole
+    /// stored item wherever the table itself was read (a base-table read, or an index
+    /// read that fetched).
+    pub fn seen(&self) -> &Item {
+        match &self.entry {
+            Some(entry) if !self.fetched => entry,
+            _ => self.item,
+        }
+    }
+
+    /// The attributes the index HOLDS for this row, which is what
+    /// `ALL_PROJECTED_ATTRIBUTES` reports; on a base-table read the item is its own
+    /// projection.
+    pub fn projected(&self) -> &Item {
+        self.entry.as_ref().unwrap_or(self.item)
+    }
+}
+
+/// Where one row sits in the order a read walks, which is what a `LastEvaluatedKey`
+/// reports and an `ExclusiveStartKey` resumes from.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadPosition<'a> {
+    /// A base-table read walks the table's own primary-key order.
+    Table(&'a ItemKey),
+    /// An index read walks the order that index holds its entries in.
+    Index(IndexItemKey),
+}
+
+/// The place a page resumes from, read out of `ExclusiveStartKey` through the schema the
+/// read walks ([`resume_from`]).
+#[derive(Debug)]
+pub enum ReadResume {
+    Table(ItemKey),
+    Index(IndexItemKey),
+}
+
+impl ReadPosition<'_> {
+    /// Whether this row comes strictly PAST the place a previous page stopped at, in the
+    /// direction this read walks: "Use this value to start a new operation, EXCLUDING
+    /// this value in the new request" (`LastEvaluatedKey`), which for a descending read
+    /// is everything BELOW that place.
+    pub fn past(&self, resumed: &ReadResume, forward: bool) -> bool {
+        match (self, resumed) {
+            (Self::Table(key), ReadResume::Table(from)) => {
+                if forward {
+                    *key > from
+                } else {
+                    *key < from
+                }
+            }
+            (Self::Index(key), ReadResume::Index(from)) => {
+                if forward {
+                    key > from
+                } else {
+                    key < from
+                }
+            }
+            // A resume token is read through the same schema the read walks, so the two
+            // are always the same kind; a row is never skipped on a mismatch.
+            _ => true,
+        }
+    }
+}
+
+/// The place an `ExclusiveStartKey` resumes a read from, read back through the schema
+/// that read walks.
+///
+/// "The data type for ExclusiveStartKey must be String, Number or Binary. No set data
+/// types are allowed" — and for an index read the token is the index's key together with
+/// the table's, because that pair is what addresses one entry of an index.
+pub fn resume_from(
+    table: &Table,
+    index: Option<&SecondaryIndex<'_>>,
+    start: Option<&Item>,
+) -> Result<Option<ReadResume>, RequestError> {
+    match (start, index) {
+        (None, _) => Ok(None),
+        (Some(start), None) => Ok(Some(ReadResume::Table(table.key_of_start_key(start)?))),
+        (Some(start), Some(index)) => Ok(Some(ReadResume::Index(
+            table.index_key_of_start_key(index, start)?,
+        ))),
+    }
+}
+
+/// The key attributes a page reports as its `LastEvaluatedKey`: the table's primary key,
+/// or an index entry's own key beside it.
+pub fn evaluated_key(table: &Table, index: Option<&SecondaryIndex<'_>>, item: &Item) -> Item {
+    match index {
+        Some(index) => table.index_key_attributes(index, item),
+        None => table.key_attributes(item),
+    }
+}
+
+/// The `ConsumedCapacity` a read reports, billed to the index it was served from when it
+/// named one ([`consumed_index_capacity`]) and to the table otherwise
+/// ([`consumed_capacity`]).
+pub fn consumed_read_capacity(
+    requested: Option<&str>,
+    table_name: &str,
+    index: Option<&SecondaryIndex<'_>>,
+    units: f64,
+) -> Option<ConsumedCapacity> {
+    match index {
+        Some(index) => consumed_index_capacity(requested, table_name, index, units),
+        None => consumed_capacity(requested, table_name, units),
+    }
+}
+
+/// The `Items` a response carries for the rows its page matched, or `None` for a
+/// `COUNT`, which "returns the number of matching items, rather than the matching items
+/// themselves".
+///
+/// The projection is applied AFTER the filter, so an attribute the response does not
+/// carry still narrows the read.
+pub fn reported_items(selection: &Selection, matched: &[&Read<'_>]) -> Option<Vec<Item>> {
+    match selection {
+        Selection::Count => None,
+        Selection::AllAttributes => Some(matched.iter().map(|read| read.seen().clone()).collect()),
+        Selection::AllProjected => {
+            Some(matched.iter().map(|read| read.projected().clone()).collect())
+        }
+        Selection::Specific(paths) => Some(
+            matched
+                .iter()
+                .map(|read| project_paths(read.seen(), paths))
+                .collect(),
+        ),
+    }
+}

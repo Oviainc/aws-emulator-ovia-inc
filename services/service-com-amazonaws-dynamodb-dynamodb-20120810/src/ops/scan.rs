@@ -43,7 +43,12 @@
 //! store holds one copy of each item, so a scan of it always sees every completed write
 //! — except on a global secondary index, which does not support it and refuses the
 //! request. A `ProjectionExpression` path that reaches INSIDE an attribute (`a.b`,
-//! `a[1]`) is its own gap issue and is refused with the scaffold's 501.
+//! `a[1]`) is served like any other: it reports the value at that path wrapped in the
+//! containers the path steps through ([`crate::state::project_paths`]).
+//!
+//! Which index the request named, what each reported item is narrowed to and whether a
+//! read has to go on to the parent table are decided by the rules `Query` reads an index
+//! by too ([`crate::state::indexed_read`]).
 //!
 //! A table whose resource-based policy denies the caller `dynamodb:Scan` is
 //! answered `AccessDeniedException` instead of its items.
@@ -378,7 +383,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the legacy map it replaced ([`Filter`]); it is read BEFORE the store
         // is, so a filter the service would refuse is refused without reading anything.
         let filter = Filter::resolve(&input).map_err(lift)?;
-        let requested = requested_attributes(&input)?;
+        let requested = crate::state::requested_projection(
+            "ProjectionExpression",
+            input.projection_expression.as_deref(),
+            input.attributes_to_get.as_deref(),
+            input.expression_attribute_names.as_ref(),
+        )
+        .map_err(lift)?;
         // A substitution token has nothing to substitute into unless the request
         // carries an expression, so one supplied beside no expression at all is
         // refused rather than silently ignored.
@@ -402,9 +413,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which member names the index is a fact of the request, so what each reported
         // item carries is decided here too: the defaults differ between a table scan
         // and an index scan ([`resolve_selection`]).
-        let selection =
-            resolve_selection(input.select.as_deref(), requested, input.index_name.is_some())
-                .map_err(lift)?;
+        let selection = crate::state::resolve_selection(
+            input.select.as_deref(),
+            requested,
+            input.index_name.is_some(),
+        )
+        .map_err(lift)?;
         let segmentation = Segmentation::resolve(input.segment, input.total_segments)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         let consistent_read = input.consistent_read.unwrap_or(false);
@@ -420,47 +434,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Scan", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
-        // "The name of a secondary index to scan. This index can be any local secondary
-        // index or global secondary index" (`Scan$IndexName`): a name this table
-        // declares no index for is the request's own mistake, stated over the name it
-        // sent, and the table was resolved either way.
-        let index = match input.index_name.as_deref() {
-            Some(index_name) => Some(
-                table
-                    .secondary_index(index_name)
-                    .ok_or_else(|| lift(crate::state::unknown_index_named(index_name)))?,
-            ),
-            None => None,
-        };
-        // "The ConsistentRead parameter is not supported on global secondary indexes. If
-        // you scan a global secondary index with ConsistentRead set to true, you will
-        // receive a ValidationException" (`Scan$ConsistentRead`) — an input rule,
-        // decided before anything is read, so the caller is told to fix the request
-        // rather than to retry it.
-        if consistent_read && index.is_some_and(|index| index.global) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE,
-            ));
-        }
-        // A read of every item attribute can only be served from an index that projects
-        // them all, because "global secondary index queries cannot fetch attributes from
-        // the parent table" (`Scan$Select`).
-        if let Some(index) = index {
-            if index.global
-                && matches!(selection, Selection::AllAttributes)
-                && !index.projects_all()
-            {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    all_attributes_unprojected(index.name),
-                ));
-            }
-        }
+        // Which index this scan reads, with the two refusals that resolution carries —
+        // all three facts of the request, decided before anything is read
+        // ([`crate::state::resolve_index`]).
+        let index = crate::state::resolve_index(
+            table,
+            input.index_name.as_deref(),
+            consistent_read,
+            &selection,
+        )
+        .map_err(lift)?;
         // "If any of the requested attributes are not projected into the local secondary
         // index, DynamoDB fetches each of these attributes from the parent table"
         // (`Scan$Select`) — which is also what makes that read cost more, since what it
         // read is then the whole item rather than the index's entry.
-        let fetches_from_table = index.is_some_and(|index| {
-            !index.global && needs_unprojected(&index, &table.key_schema, &selection, &filter)
+        let fetches_from_table = index.as_ref().is_some_and(|index| {
+            !index.global
+                && crate::state::needs_unprojected(
+                    index,
+                    &table.key_schema,
+                    &selection,
+                    &filter.attributes(),
+                )
         });
 
         // The walk is over what this scan READS, in the order that reading has: the
@@ -470,11 +465,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // per STORED item, so its size is what the table HOLDS and not anything this
         // request chose; the entry each row is read as is built inside the page below,
         // where the page budget bounds it.
-        let candidates: Vec<(Position<'_>, &crate::state::Item)> = match index {
+        let candidates: Vec<(crate::state::ReadPosition<'_>, &crate::state::Item)> = match index {
             None => table
                 .items
                 .iter()
-                .map(|(key, item)| (Position::Table(key), item))
+                .map(|(key, item)| (crate::state::ReadPosition::Table(key), item))
                 .collect(),
             Some(index) => {
                 // An item the index does not cover has no entry to scan at all — a
@@ -492,22 +487,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 entries.sort_by(|(left, _), (right, _)| left.cmp(right));
                 entries
                     .into_iter()
-                    .map(|(position, item)| (Position::Index(position), item))
+                    .map(|(position, item)| (crate::state::ReadPosition::Index(position), item))
                     .collect()
             }
         };
-        // "The data type for ExclusiveStartKey must be String, Number or Binary. No
-        // set data types are allowed" — read back through the schema this scan walks,
-        // which for an index scan is the index's key together with the table's.
-        let resumed = match (input.exclusive_start_key.as_ref(), index) {
-            (None, _) => None,
-            (Some(start), None) => Some(Resume::Table(
-                table.key_of_start_key(start).map_err(lift)?,
-            )),
-            (Some(start), Some(index)) => Some(Resume::Index(
-                table.index_key_of_start_key(&index, start).map_err(lift)?,
-            )),
-        };
+        // Where a previous page stopped, read back through the schema this scan walks
+        // ([`crate::state::resume_from`]).
+        let resumed = crate::state::resume_from(
+            table,
+            index.as_ref(),
+            input.exclusive_start_key.as_ref(),
+        )
+        .map_err(lift)?;
 
         // Segment membership is decided from each row's position in that total order,
         // NOT from the position within one page, so a later page of the same segment
@@ -518,8 +509,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(position, _)| segmentation.owns(*position))
             .map(|(_, row)| row)
             // "Use this value to start a new operation, EXCLUDING this value in the
-            // new request" (`Scan$LastEvaluatedKey`).
-            .filter(|(position, _)| resumed.as_ref().is_none_or(|from| position.after(from)));
+            // new request" (`Scan$LastEvaluatedKey`). A scan always walks forward.
+            .filter(|(position, _)| {
+                resumed
+                    .as_ref()
+                    .is_none_or(|from| position.past(from, true))
+            });
 
         // "A single Scan operation first reads up to the maximum number of items set
         // (if using the Limit parameter) or a maximum of 1 MB of data" (the `Scan`
@@ -528,15 +523,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let limit = input
             .limit
             .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
-        let mut page: Vec<Read<'_>> = Vec::new();
+        let mut page: Vec<crate::state::Read<'_>> = Vec::new();
         let mut page_size: i64 = 0;
         let mut truncated = false;
         for (_, item) in evaluated {
-            let read = Read {
+            let read = crate::state::Read::new(
                 item,
-                entry: index.map(|index| index.entry(item, &table.key_schema)),
-                fetched: fetches_from_table,
-            };
+                index.as_ref(),
+                &table.key_schema,
+                fetches_from_table,
+            );
             let size = crate::state::item_size(read.seen());
             // The first row always fits, the way DynamoDB always returns at least
             // one item it read; after that the page stops BEFORE the row that would
@@ -563,17 +559,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last_evaluated_key = truncated
             .then(|| page.last())
             .flatten()
-            .map(|read| match index {
-                Some(index) => table.index_key_attributes(&index, read.item),
-                None => table.key_attributes(read.item),
-            });
+            .map(|read| crate::state::evaluated_key(table, index.as_ref(), read.item()));
         // "A filter expression is applied after a Scan finishes": every row the page
         // READ is scanned — and charged for — and the ones the filter does not match
         // are left out of the response. "ScannedCount [is] the number of items
         // evaluated, before any ScanFilter is applied"; with no filter, "Count is the
         // same as ScannedCount".
         let scanned_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
-        let mut matched: Vec<&Read<'_>> = Vec::with_capacity(page.len());
+        let mut matched: Vec<&crate::state::Read<'_>> = Vec::with_capacity(page.len());
         for read in &page {
             if filter.matches(read.seen()).map_err(lift)? {
                 matched.push(read);
@@ -582,35 +575,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let count = i32::try_from(matched.len()).unwrap_or(i32::MAX);
         // The projection is applied AFTER the filter, so an attribute the response does
         // not carry still narrows the scan.
-        let items = match &selection {
-            Selection::Count => None,
-            Selection::AllAttributes => {
-                Some(matched.iter().map(|read| read.seen().clone()).collect())
-            }
-            Selection::AllProjected => Some(
-                matched
-                    .iter()
-                    .map(|read| read.projected().clone())
-                    .collect(),
-            ),
-            Selection::Specific(names) => Some(
-                matched
-                    .iter()
-                    .map(|read| crate::state::project_attributes(read.seen(), names))
-                    .collect(),
-            ),
-        };
+        let items = crate::state::reported_items(&selection, &matched);
 
         let units = crate::state::read_capacity_units(page_size, consistent_read);
         let requested_capacity = input.return_consumed_capacity.as_deref();
         // Projected while the index this scan read is still borrowed from the table, so
         // what the response bills is decided before the table is reached for again.
-        let consumed_capacity = match index {
-            Some(index) => {
-                crate::state::consumed_index_capacity(requested_capacity, &name, &index, units)
-            }
-            None => crate::state::consumed_capacity(requested_capacity, &name, units),
-        };
+        let consumed_capacity = crate::state::consumed_read_capacity(
+            requested_capacity,
+            &name,
+            index.as_ref(),
+            units,
+        );
         // The read is ADMITTED against the read capacity the table is provisioned for:
         // the units it consumes are the ones this response bills — every item the page
         // scanned, filtered or not — and a read past that capacity is refused rather
@@ -637,226 +613,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_evaluated_key,
             consumed_capacity,
         })
-    }
-}
-
-/// How a strongly consistent scan of a GLOBAL secondary index is refused: "The
-/// ConsistentRead parameter is not supported on global secondary indexes. If you scan a
-/// global secondary index with ConsistentRead set to true, you will receive a
-/// ValidationException" (`Scan$ConsistentRead`). The index is not named: the rule holds
-/// for every global secondary index, so the refusal reports nothing of the table.
-const CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE: &str =
-    "Consistent reads are not supported on global secondary indexes";
-
-/// How a read of every item attribute FROM a global secondary index that projects only
-/// some of them is refused: "If you query or scan a global secondary index, you can only
-/// request attributes that are projected into the index. Global secondary index queries
-/// cannot fetch attributes from the parent table" (`Scan$Select`), so the request names
-/// an index whose projection cannot answer it.
-fn all_attributes_unprojected(index_name: &str) -> String {
-    format!(
-        "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported \
-         for global secondary index {index_name} because its projection type is not ALL"
-    )
-}
-
-/// Where one row sits in the order a scan walks, which is what an `ExclusiveStartKey`
-/// resumes strictly after.
-#[derive(Debug)]
-enum Position<'a> {
-    /// A base-table scan walks the table's own primary-key order.
-    Table(&'a crate::state::ItemKey),
-    /// An index scan walks the order that index holds its entries in.
-    Index(crate::state::IndexItemKey),
-}
-
-/// The place a page resumes from, read out of `ExclusiveStartKey` through the schema the
-/// scan walks.
-#[derive(Debug)]
-enum Resume {
-    Table(crate::state::ItemKey),
-    Index(crate::state::IndexItemKey),
-}
-
-impl Position<'_> {
-    /// Whether this row comes strictly AFTER the place a previous page stopped at.
-    fn after(&self, resumed: &Resume) -> bool {
-        match (self, resumed) {
-            (Self::Table(key), Resume::Table(from)) => *key > from,
-            (Self::Index(key), Resume::Index(from)) => key > from,
-            // A resume token is read through the same schema this scan walks, so the
-            // two are always the same kind; a row is never skipped on a mismatch.
-            _ => true,
-        }
-    }
-}
-
-/// One row a scan read: the stored item, and the entry the index it was read through
-/// holds for it (`None` on a base-table scan).
-#[derive(Debug)]
-struct Read<'a> {
-    item: &'a crate::state::Item,
-    entry: Option<crate::state::Item>,
-    /// Whether this read went on to the parent table for the attributes its index does
-    /// not project, which only a local secondary index can do.
-    fetched: bool,
-}
-
-impl Read<'_> {
-    /// The attributes this read SAW — what its filter is judged against, what it is
-    /// charged for, and what `ALL_ATTRIBUTES` reports: the index's entry, or the whole
-    /// stored item wherever the table itself was read (a base-table scan, or an index
-    /// read that fetched).
-    fn seen(&self) -> &crate::state::Item {
-        match &self.entry {
-            Some(entry) if !self.fetched => entry,
-            _ => self.item,
-        }
-    }
-
-    /// The attributes the index HOLDS for this row, which is what
-    /// `ALL_PROJECTED_ATTRIBUTES` reports; on a base-table scan the item is its own
-    /// projection.
-    fn projected(&self) -> &crate::state::Item {
-        self.entry.as_ref().unwrap_or(self.item)
-    }
-}
-
-/// What a `Scan` reports for each item its page selected.
-#[derive(Debug)]
-enum Selection {
-    /// "ALL_ATTRIBUTES - Returns all of the item attributes from the specified table or
-    /// index" (`Scan$Select`) — the default when a table is scanned.
-    AllAttributes,
-    /// "ALL_PROJECTED_ATTRIBUTES - Allowed only when querying an index. Retrieves all
-    /// attributes that have been projected into the index" — the default when an index
-    /// is scanned.
-    AllProjected,
-    /// "SPECIFIC_ATTRIBUTES - Returns only the attributes listed in
-    /// ProjectionExpression", which is also what naming a projection and no `Select` at
-    /// all asks for.
-    Specific(::std::collections::BTreeSet<String>),
-    /// "COUNT - Returns the number of matching items, rather than the matching items
-    /// themselves."
-    Count,
-}
-
-/// What each reported item carries, from the request's `Select` and the attributes its
-/// projection named.
-///
-/// "If neither Select nor ProjectionExpression are specified, DynamoDB defaults to
-/// ALL_ATTRIBUTES when accessing a table, and ALL_PROJECTED_ATTRIBUTES when accessing an
-/// index. You cannot use both Select and ProjectionExpression together in a single
-/// request, unless the value for Select is SPECIFIC_ATTRIBUTES" (`Scan$Select`), which
-/// is the whole of the rule below.
-fn resolve_selection(
-    select: Option<&str>,
-    requested: Option<::std::collections::BTreeSet<String>>,
-    on_index: bool,
-) -> Result<Selection, crate::state::RequestError> {
-    if let Some(value) = select {
-        if !SELECT_VALUES.contains(&value) {
-            return Err(crate::state::invalid_member(
-                "select",
-                Some(value),
-                &crate::state::enum_value_requirement(SELECT_VALUES),
-            ));
-        }
-    }
-    match select {
-        None => Ok(match requested {
-            Some(names) => Selection::Specific(names),
-            None if on_index => Selection::AllProjected,
-            None => Selection::AllAttributes,
-        }),
-        Some("SPECIFIC_ATTRIBUTES") => requested.map(Selection::Specific).ok_or_else(|| {
-            crate::state::RequestError::Validation(
-                "One or more parameter values were invalid: Select type SPECIFIC_ATTRIBUTES \
-                 requires the attributes to be listed in ProjectionExpression"
-                    .to_string(),
-            )
-        }),
-        // "If you use the ProjectionExpression parameter, then the value for Select can
-        // only be SPECIFIC_ATTRIBUTES. Any other value for Select will return an error."
-        Some(other) if requested.is_some() => Err(crate::state::RequestError::Validation(format!(
-            "One or more parameter values were invalid: Select type {other} is not supported \
-             when the attributes to return are listed; the only Select type that is, is \
-             SPECIFIC_ATTRIBUTES"
-        ))),
-        Some("ALL_ATTRIBUTES") => Ok(Selection::AllAttributes),
-        Some("COUNT") => Ok(Selection::Count),
-        Some("ALL_PROJECTED_ATTRIBUTES") if on_index => Ok(Selection::AllProjected),
-        Some(other) => Err(crate::state::RequestError::Validation(format!(
-            "One or more parameter values were invalid: Select type {other} is allowed only \
-             when an index is scanned"
-        ))),
-    }
-}
-
-/// Whether a read needs an attribute its index does not project, which is what sends it
-/// on to the parent table.
-///
-/// What it needs is what it REPORTS plus what its FILTER reads: a filter is judged
-/// against the item, so an attribute only the filter names is still read even though no
-/// response carries it.
-fn needs_unprojected(
-    index: &crate::state::SecondaryIndex<'_>,
-    table_key_schema: &[KeySchemaElement],
-    selection: &Selection,
-    filter: &Filter<'_>,
-) -> bool {
-    if index.projects_all() {
-        return false;
-    }
-    if matches!(selection, Selection::AllAttributes) {
-        return true;
-    }
-    let mut needed = filter.attributes();
-    if let Selection::Specific(names) = selection {
-        needed.extend(names.iter().cloned());
-    }
-    needed
-        .iter()
-        .any(|name| !index.projects(table_key_schema, name))
-}
-
-/// The attributes the request's PROJECTION names, or `None` when it names none at all —
-/// in which case "all attributes will be returned" (`Scan$ProjectionExpression`).
-///
-/// The two members are the same ask one generation apart: `AttributesToGet` is "a legacy
-/// parameter. Use ProjectionExpression instead" (that member's doc), so a request that
-/// states the projection both ways is refused the way the service refuses a request that
-/// states one thing twice, and either member is read into the one name set the reader
-/// projects by.
-fn requested_attributes(
-    input: &ScanInput,
-) -> Result<Option<::std::collections::BTreeSet<String>>, ScanError> {
-    let legacy = input
-        .attributes_to_get
-        .as_deref()
-        .filter(|names| !names.is_empty());
-    match (input.projection_expression.as_deref(), legacy) {
-        (Some(_), Some(_)) => Err(lift(crate::state::expression_conflict(
-            "AttributesToGet",
-            "ProjectionExpression",
-        ))),
-        (Some(expression), None) => crate::state::projection_expression_attributes(
-            "ProjectionExpression",
-            expression,
-            crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
-        )
-        .map_err(lift)?
-        .map(Some)
-        // The shared reader answers no name list for a path that reaches INSIDE an
-        // attribute, which this reader does not serve yet and says so rather than
-        // refusing a request the real service accepts.
-        .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::not_implemented(
-                "Scan with a ProjectionExpression path into an attribute",
-            )
-        }),
-        (None, Some(names)) => Ok(Some(names.iter().cloned().collect())),
-        (None, None) => Ok(None),
     }
 }
 

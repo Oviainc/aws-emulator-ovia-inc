@@ -20,11 +20,23 @@
 //! this crate has for it ([`crate::state::ParsedCondition`]), and it "does not allow
 //! key attributes".
 //!
-//! Secondary indexes, the legacy result filters (`QueryFilter`,
-//! `ConditionalOperator`) and projections are refused with the scaffold's 501 and
-//! filed as their own gap
-//! issues. `ConsistentRead` needs no handling beyond its effect on
-//! `ConsumedCapacity`: this store has one copy of each item.
+//! A query naming an `IndexName` reads one partition of that SECONDARY INDEX instead,
+//! in the index's own key order with the table's primary key breaking the tie: an item
+//! the index does not cover is not there to be read, and each entry carries the
+//! attributes the index projects. What each reported item is narrowed to is the
+//! request's `Select` and whichever projection member it named — `ProjectionExpression`
+//! with its `ExpressionAttributeNames` aliases, or the legacy `AttributesToGet` —
+//! applied AFTER the filter, so an attribute the response does not carry can still
+//! narrow the read. Which index was named, what the selection is and whether the read
+//! has to go on to the parent table are the rules `Scan` reads an index by too
+//! ([`crate::state::indexed_read`]).
+//!
+//! The legacy result filters (`QueryFilter`, `ConditionalOperator`) are refused with the
+//! scaffold's 501 and filed as their own gap issue — AFTER every rule above, so no
+//! refusal this operation models is pre-empted by it. `ConsistentRead` needs no handling
+//! beyond its effect on `ConsumedCapacity`, this store having one copy of each item,
+//! except on a global secondary index, which does not support it and refuses the
+//! request.
 //!
 //! A key-condition operand is held to the documented key-value limits
 //! ([`crate::state::Table::check_key_limits`]), and a table whose resource-based policy
@@ -372,36 +384,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        // A `ProjectionExpression` the request sends is VALIDATED whether or not the
-        // projection itself is served, for the reason `Scan` gives: whether the
-        // expression is one this service's language accepts is a fact of the request.
-        if let Some(expression) = input.projection_expression.as_deref() {
-            crate::state::projection_expression_attributes(
-                "ProjectionExpression",
-                expression,
-                crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
-            )
-            .map_err(lift)?;
-        }
-        if let Some(member) = unsupported_member(&input) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "Query with {member}"
-            )));
-        }
-        // "ALL_ATTRIBUTES - Returns all of the item attributes from the specified
-        // table" is the default for a table query; COUNT "returns the number of
-        // matching items, rather than the matching items themselves"
-        // (`Query$Select`). The projected forms need an index or a projection, which
-        // this slice does not serve.
-        let count_only = match input.select.as_deref() {
-            None | Some("ALL_ATTRIBUTES") => false,
-            Some("COUNT") => true,
-            Some(other) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                    "Query with Select {other}"
-                )))
-            }
-        };
+        // What each reported item carries is a fact of the REQUEST: the projection it
+        // states — in either member — read into the document paths it names, and the
+        // `Select` that narrowing has to agree with
+        // ([`crate::state::resolve_selection`]). Both are settled before any table is
+        // looked up, so a request that cannot hold together is refused as the client
+        // error it is.
+        let requested = crate::state::requested_projection(
+            PROJECTION_EXPRESSION,
+            input.projection_expression.as_deref(),
+            input.attributes_to_get.as_deref(),
+            input.expression_attribute_names.as_ref(),
+        )
+        .map_err(lift)?;
+        let selection = crate::state::resolve_selection(
+            input.select.as_deref(),
+            requested,
+            input.index_name.is_some(),
+        )
+        .map_err(lift)?;
+        let consistent_read = input.consistent_read.unwrap_or(false);
 
         let comparisons = key_comparisons(&input).map_err(lift)?;
         // "A filter expression is applied after a Query finishes, but before the
@@ -436,9 +438,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.key_condition_expression.as_deref(),
             ),
             ("FilterExpression", input.filter_expression.as_deref()),
-            ("ProjectionExpression", input.projection_expression.as_deref()),
+            (
+                PROJECTION_EXPRESSION,
+                input.projection_expression.as_deref(),
+            ),
         ])
         .map_err(lift)?;
+        // The legacy `QueryFilter` is the one member of this operation that is not
+        // served yet, and it is its own gap issue. The guard sits HERE, after every rule
+        // above: a request whose defect the service states as a `ValidationException` is
+        // answered that way whether or not it also carries this member.
+        if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "Query with QueryFilter",
+            ));
+        }
 
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
@@ -451,7 +465,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Query", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
-        let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
+        // Which index this query reads, with the refusals that resolution carries: a
+        // name the table declares no index for, a strongly consistent read of a global
+        // one, and a read of every attribute from an index that does not project them
+        // all ([`crate::state::resolve_index`]).
+        let index = crate::state::resolve_index(
+            table,
+            input.index_name.as_deref(),
+            consistent_read,
+            &selection,
+        )
+        .map_err(lift)?;
+        // The key schema the condition is read against is the one the query was pointed
+        // AT: "You must provide the name of the partition key attribute and a single
+        // value for that attribute" is the INDEX's partition key when the request names
+        // an index (`Query$KeyConditionExpression`).
+        let schema: &[KeySchemaElement] = index
+            .as_ref()
+            .map_or(table.key_schema.as_slice(), |index| index.key_schema);
+        let condition = KeyCondition::resolve(table, schema, comparisons).map_err(lift)?;
         // "A FilterExpression does not allow key attributes. You cannot define a
         // filter expression based on a partition key or a sort key": which attributes
         // the expression reads comes from the parsed tree, judged against the table's
@@ -469,29 +501,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "If any of the requested attributes are not projected into the local
+        // secondary index, DynamoDB fetches each of these attributes from the parent
+        // table" (`Query$Select`) — which is what makes that read cost what the whole
+        // item costs. What a read needs is what it reports plus what its filter reads.
+        let filter_attributes: ::std::collections::BTreeSet<String> = filter
+            .as_ref()
+            .map(|filter| filter.attribute_reads().into_keys().collect())
+            .unwrap_or_default();
+        let fetches_from_table = index.as_ref().is_some_and(|index| {
+            !index.global
+                && crate::state::needs_unprojected(
+                    index,
+                    &table.key_schema,
+                    &selection,
+                    &filter_attributes,
+                )
+        });
         // One partition's items are contiguous in the store and already in sort-key
-        // order, so this is a range scan rather than a table walk.
-        let lower = crate::state::ItemKey {
-            partition: condition.partition.clone(),
-            sort: None,
-        };
-        let mut matched: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
-        for (key, item) in table.items.range(lower..) {
-            if key.partition != condition.partition {
-                break;
+        // order, so a base-table query is a range scan rather than a table walk. An
+        // index's entries are ordered by the index's own key
+        // ([`crate::state::IndexItemKey`]), so they are selected by the attributes the
+        // condition names — an index entry's key values are the item's own — and then
+        // ordered by that key.
+        let mut rows: Vec<(crate::state::ReadPosition<'_>, &crate::state::Item)> = Vec::new();
+        match index.as_ref() {
+            None => {
+                let lower = crate::state::ItemKey {
+                    partition: condition.partition.clone(),
+                    sort: None,
+                };
+                for (key, item) in table.items.range(lower..) {
+                    if key.partition != condition.partition {
+                        break;
+                    }
+                    if condition.matches_sort(key.sort.as_ref()).map_err(lift)? {
+                        rows.push((crate::state::ReadPosition::Table(key), item));
+                    }
+                }
             }
-            if condition.matches(key).map_err(lift)? {
-                matched.push((key, item));
+            Some(index) => {
+                for (key, item) in &table.items {
+                    // An item the index does not cover has no entry to read at all — a
+                    // sparse index holds only the items that carry its key attributes.
+                    let Some(position) = table.index_item_key(index, key, item) else {
+                        continue;
+                    };
+                    if !condition.matches_entry(table, item).map_err(lift)? {
+                        continue;
+                    }
+                    rows.push((crate::state::ReadPosition::Index(position), item));
+                }
+                rows.sort_by(|(left, _), (right, _)| left.cmp(right));
             }
         }
 
         let forward = input.scan_index_forward.unwrap_or(true);
         if !forward {
-            matched.reverse();
+            rows.reverse();
         }
         if let Some(start) = input.exclusive_start_key.as_ref() {
-            let resumed = table.key_of_start_key(start).map_err(lift)?;
-            if resumed.partition != condition.partition {
+            // Read back through the schema this query walks, so a token that is not a
+            // key of that schema is the invalid resume token it is
+            // ([`crate::state::resume_from`]).
+            let resumed = crate::state::resume_from(table, index.as_ref(), Some(start))
+                .map_err(lift)?;
+            // A page resumes inside the partition the condition reads, whichever schema
+            // the query walks.
+            if !condition.starts_within(table, start) {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     "The provided starting key does not match the key condition's partition key",
                 ));
@@ -499,13 +576,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Use this value to start a new operation, EXCLUDING this value in the
             // new request" (`Query$LastEvaluatedKey`): resume strictly after the key
             // the previous page stopped on, in the direction being scanned.
-            matched.retain(|(key, _)| {
-                if forward {
-                    **key > resumed
-                } else {
-                    **key < resumed
-                }
-            });
+            if let Some(from) = resumed.as_ref() {
+                rows.retain(|(position, _)| position.past(from, forward));
+            }
         }
 
         // The page stops at the caller's `Limit`, and in any case at the service's
@@ -513,51 +586,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 1 MB of data" (`Query$Limit`'s doc and "Paginating table query results").
         // A request that names no Limit therefore cannot pull a whole partition into
         // one response, and the page is bounded BEFORE any item is cloned.
-        let available = matched.len();
+        let available = rows.len();
         let limit = input
             .limit
             .map_or(available, |limit| usize::try_from(limit).unwrap_or(0));
+        let mut page: Vec<crate::state::Read<'_>> = Vec::new();
         let mut page_size: i64 = 0;
-        let mut page = 0usize;
-        for (_, item) in matched.iter().take(limit) {
+        for (_, item) in rows.iter().take(limit) {
             // The first item always fits, the way DynamoDB always returns at least
             // one item it found.
-            if page > 0 && page_size >= MAX_PAGE_BYTES {
+            if !page.is_empty() && page_size >= MAX_PAGE_BYTES {
                 break;
             }
-            page_size = page_size.saturating_add(crate::state::item_size(item));
-            page += 1;
+            let read = crate::state::Read::new(
+                item,
+                index.as_ref(),
+                &table.key_schema,
+                fetches_from_table,
+            );
+            page_size = page_size.saturating_add(crate::state::item_size(read.seen()));
+            page.push(read);
         }
-        let truncated = available > page;
-        matched.truncate(page);
+        let truncated = available > page.len();
 
-        let last_evaluated_key = if truncated {
-            matched.last().map(|(_, item)| table.key_attributes(item))
-        } else {
-            None
-        };
-        let items: Vec<crate::state::Item> =
-            matched.iter().map(|(_, item)| (*item).clone()).collect();
+        // An index read reports the index's key beside the table's, because that pair
+        // is what addresses one entry of an index
+        // ([`crate::state::evaluated_key`]).
+        let last_evaluated_key = truncated
+            .then(|| page.last())
+            .flatten()
+            .map(|read| crate::state::evaluated_key(table, index.as_ref(), read.item()));
         // "A filter expression is applied after a Query finishes": every item the
         // page read is scanned — and charged for — and the ones the filter does not
         // match are left out of the response. "ScannedCount [is] the number of items
         // evaluated, before any QueryFilter is applied"; with no filter, "Count and
         // ScannedCount are the same" (`Query$Count`).
-        let scanned_count = i32::try_from(items.len()).unwrap_or(i32::MAX);
-        let mut kept: Vec<crate::state::Item> = Vec::with_capacity(items.len());
-        for item in items {
+        let scanned_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
+        let mut matched: Vec<&crate::state::Read<'_>> = Vec::with_capacity(page.len());
+        for read in &page {
             let keep = match &filter {
-                Some(filter) => filter.evaluate(Some(&item)).map_err(lift)?,
+                Some(filter) => filter.evaluate(Some(read.seen())).map_err(lift)?,
                 None => true,
             };
             if keep {
-                kept.push(item);
+                matched.push(read);
             }
         }
-        let count = i32::try_from(kept.len()).unwrap_or(i32::MAX);
+        let count = i32::try_from(matched.len()).unwrap_or(i32::MAX);
+        // The projection is applied AFTER the filter, so an attribute the response does
+        // not carry still narrows the read.
+        let items = crate::state::reported_items(&selection, &matched);
 
-        let units =
-            crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false));
+        let units = crate::state::read_capacity_units(page_size, consistent_read);
+        // Billed to the index this query read when it named one, which is where the
+        // units were spent.
+        let consumed_capacity = crate::state::consumed_read_capacity(
+            input.return_consumed_capacity.as_deref(),
+            &name,
+            index.as_ref(),
+            units,
+        );
         // The read is ADMITTED against the read capacity the table is provisioned for:
         // the units it consumes are the ones this response bills — every item the page
         // read, filtered or not — and a read past that capacity is refused rather than
@@ -577,15 +665,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(QueryOutput {
-            items: if count_only { None } else { Some(kept) },
+            items,
             count,
             scanned_count,
             last_evaluated_key,
-            consumed_capacity: crate::state::consumed_capacity(
-                input.return_consumed_capacity.as_deref(),
-                &name,
-                units,
-            ),
+            consumed_capacity,
         })
     }
 }
@@ -621,26 +705,8 @@ fn lift(error: crate::state::RequestError) -> QueryError {
     }
 }
 
-/// The first input member present that this slice does not serve, if any.
-fn unsupported_member(input: &QueryInput) -> Option<&'static str> {
-    if input.index_name.is_some() {
-        return Some("IndexName");
-    }
-    if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
-        return Some("QueryFilter");
-    }
-    if input.projection_expression.is_some() {
-        return Some("ProjectionExpression");
-    }
-    if input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|names| !names.is_empty())
-    {
-        return Some("AttributesToGet");
-    }
-    None
-}
+/// The input member a projection travels in, which is what its refusals name.
+const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
 
 /// A comparison one key condition makes against one attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,21 +752,46 @@ struct Comparison {
     operands: Vec<AttributeValue>,
 }
 
-/// The key conditions a `Query` runs, encoded against the table's key schema.
+/// The key conditions a `Query` runs, encoded against the key schema the query was
+/// pointed at — the table's own, or a secondary index's.
 struct KeyCondition {
+    /// The attribute the partition key value below belongs to, which is how a STORED
+    /// item's own value for it is found when the query reads an index.
+    partition_name: String,
     partition: crate::state::AttributeValueKey,
-    sort: Option<(Operator, Vec<crate::state::AttributeValueKey>)>,
+    sort: Option<SortCondition>,
+}
+
+/// The comparison a key condition states on the sort key of the schema it reads.
+struct SortCondition {
+    name: String,
+    operator: Operator,
+    operands: Vec<crate::state::AttributeValueKey>,
 }
 
 impl KeyCondition {
-    /// Bind the comparisons to the table's key attributes: exactly one equality on
-    /// the partition key, and at most one comparison on the sort key.
+    /// Bind the comparisons to the key attributes `schema` declares: exactly one
+    /// equality on the partition key, and at most one comparison on the sort key.
+    ///
+    /// The operands are held to the type the TABLE declared for the attribute they are
+    /// compared with ([`crate::state::Table::key_value`]), whichever schema names it, so
+    /// a value of another type than the key's declared one is refused before anything is
+    /// read.
     fn resolve(
         table: &crate::state::Table,
+        schema: &[KeySchemaElement],
         comparisons: Vec<Comparison>,
     ) -> Result<Self, crate::state::RequestError> {
-        let partition_name = table.partition_key_name().to_string();
-        let sort_name = table.sort_key_name().map(ToString::to_string);
+        // "HASH - partition key ... RANGE - sort key" (`KeySchemaElement$KeyType`): the
+        // one partition key the condition must cover, and the sort key it may.
+        let partition_name = schema
+            .iter()
+            .find(|element| element.key_type == "HASH")
+            .map_or(String::new(), |element| element.attribute_name.clone());
+        let sort_name = schema
+            .iter()
+            .find(|element| element.key_type != "HASH")
+            .map(|element| element.attribute_name.clone());
         let mut partition = None;
         let mut sort = None;
         // A comparison on an attribute that is NOT a key attribute is held back: which
@@ -749,7 +840,7 @@ impl KeyCondition {
                     )));
                 }
                 // A PREFIX is only meaningful for a string or binary sort key, and
-                // which type the sort key has is a fact of the TABLE rather than of
+                // which type the sort key has is a fact of the SCHEMA rather than of
                 // whatever happens to be stored under it — so the operand is refused
                 // here, before any item is read, rather than when one is compared.
                 if comparison.operator == Operator::BeginsWith {
@@ -763,7 +854,11 @@ impl KeyCondition {
                         }
                     }
                 }
-                sort = Some((comparison.operator, encoded));
+                sort = Some(SortCondition {
+                    name: comparison.attribute,
+                    operator: comparison.operator,
+                    operands: encoded,
+                });
             }
         }
         if non_key {
@@ -781,29 +876,82 @@ impl KeyCondition {
             });
         }
         let partition = partition.ok_or_else(|| missed_key_schema_element(&partition_name))?;
-        Ok(Self { partition, sort })
+        Ok(Self {
+            partition_name,
+            partition,
+            sort,
+        })
     }
 
-    /// Whether a stored key satisfies the sort-key comparison (its partition is
-    /// already known to match).
-    fn matches(&self, key: &crate::state::ItemKey) -> Result<bool, crate::state::RequestError> {
-        let Some((operator, operands)) = self.sort.as_ref() else {
+    /// Whether a sort key value satisfies the sort-key comparison (its partition is
+    /// already known to match). An item that carries no value for the sort key the
+    /// condition constrains satisfies no comparison on it.
+    fn matches_sort(
+        &self,
+        actual: Option<&crate::state::AttributeValueKey>,
+    ) -> Result<bool, crate::state::RequestError> {
+        let Some(sort) = self.sort.as_ref() else {
             return Ok(true);
         };
-        let Some(actual) = key.sort.as_ref() else {
+        let Some(actual) = actual else {
             return Ok(false);
         };
-        let first = &operands[0];
-        Ok(match operator {
+        let first = &sort.operands[0];
+        Ok(match sort.operator {
             Operator::Equal => actual == first,
             Operator::LessThan => actual < first,
             Operator::LessOrEqual => actual <= first,
             Operator::GreaterThan => actual > first,
             Operator::GreaterOrEqual => actual >= first,
-            Operator::Between => actual >= first && actual <= &operands[1],
+            Operator::Between => actual >= first && actual <= &sort.operands[1],
             Operator::BeginsWith => begins_with(actual, first)?,
         })
     }
+
+    /// Whether one STORED item satisfies this condition, read through the ATTRIBUTES the
+    /// condition names.
+    ///
+    /// That is how an entry of a secondary index is judged: the key values that order it
+    /// are the item's own attributes, not the primary key the item is stored under.
+    fn matches_entry(
+        &self,
+        table: &crate::state::Table,
+        item: &crate::state::Item,
+    ) -> Result<bool, crate::state::RequestError> {
+        let Some(partition) = stored_key_value(table, item, &self.partition_name) else {
+            return Ok(false);
+        };
+        if partition != self.partition {
+            return Ok(false);
+        }
+        let actual = self
+            .sort
+            .as_ref()
+            .and_then(|sort| stored_key_value(table, item, &sort.name));
+        self.matches_sort(actual.as_ref())
+    }
+
+    /// Whether an `ExclusiveStartKey` resumes inside the partition this condition reads:
+    /// the token carries the partition key of the schema the query walks, and a page
+    /// resumes within the partition it was reading.
+    fn starts_within(&self, table: &crate::state::Table, start: &crate::state::Item) -> bool {
+        stored_key_value(table, start, &self.partition_name).as_ref() == Some(&self.partition)
+    }
+}
+
+/// One key attribute of a stored item or of a key map, encoded the way the order
+/// compares it, or `None` when it is not carried: an item that leaves a key attribute
+/// out is not in the schema keyed by it at all.
+///
+/// Every stored key value was already held to the table's declared type for it when it
+/// was written, so encoding one cannot fail for a stored item.
+fn stored_key_value(
+    table: &crate::state::Table,
+    item: &crate::state::Item,
+    attribute: &str,
+) -> Option<crate::state::AttributeValueKey> {
+    item.get(attribute)
+        .and_then(|value| table.key_value(attribute, value).ok())
 }
 
 /// `begins_with (sortKeyName, :sortkeyval)` — "true if the sort key value begins

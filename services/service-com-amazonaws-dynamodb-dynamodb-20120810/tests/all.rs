@@ -99,6 +99,8 @@ mod partiql_statements;
 mod partiql_transactions;
 #[path = "all/provisioned_read_capacity.rs"]
 mod provisioned_read_capacity;
+#[path = "all/query_indexes_and_projections.rs"]
+mod query_indexes_and_projections;
 #[path = "all/refusal_contracts_and_expression_pre_images.rs"]
 mod refusal_contracts_and_expression_pre_images;
 
