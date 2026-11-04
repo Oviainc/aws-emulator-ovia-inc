@@ -16,7 +16,7 @@
 
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
     ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, TrustStoreRecord,
-    TRUST_STORE_CREATING,
+    APPLICATION_DNS_ID_DIGITS, TRUST_STORE_CREATING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::HashMap;
@@ -471,11 +471,19 @@ async fn the_provisioning_loop_is_persisted_and_read_back() {
         "case describe by arn: expected the created name, got {:?}",
         first_text(lb, "LoadBalancerName")
     );
-    assert_eq!(
-        first_text(lb, "DNSName"),
-        Some(format!("my-alb-{lb_id}.{REGION}.elb.amazonaws.com")),
-        "case describe by arn: expected the published DNS form, got {:?}",
-        first_text(lb, "DNSName")
+    // The host an Application Load Balancer publishes: its name, a decimal id of its own
+    // and the Region ahead of the `elb` label. The id is minted, so the FORM is what is
+    // asserted here; the per-family forms are tabled in `load_balancer_dns_name_form.rs`.
+    let dns_name = first_text(lb, "DNSName").unwrap_or_default();
+    let published_id = dns_name
+        .strip_prefix("my-alb-")
+        .and_then(|rest| rest.strip_suffix(&format!(".{REGION}.elb.amazonaws.com")))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        published_id.len() == APPLICATION_DNS_ID_DIGITS as usize
+            && published_id.chars().all(|c| c.is_ascii_digit()),
+        "case describe by arn: expected the published DNS form, got {dns_name:?}"
     );
     assert_eq!(
         first_text(lb, "Scheme").as_deref(),
@@ -807,14 +815,35 @@ async fn load_balancer_identity_follows_name_scheme_and_type() {
         seen_ids.push(id.clone());
 
         let internal_prefix = if scheme == "internal" { "internal-" } else { "" };
-        assert_eq!(
-            reply.text("DNSName"),
-            Some(format!(
-                "{internal_prefix}{name}-{id}.{REGION}.elb.amazonaws.com"
-            )),
-            "case {name}/{lb_type}/{scheme}: unexpected DNS name {:?}",
-            reply.text("DNSName")
-        );
+        // The host each family publishes: a Network or Gateway Load Balancer's carries the
+        // ARN's own id and the `elb` label ahead of the Region and states its scheme
+        // nowhere, an Application Load Balancer's a decimal id of its own with the Region
+        // ahead of that label and the `internal-` prefix on an internal one. The whole
+        // table of forms is `load_balancer_dns_name_form.rs`.
+        let expected_host = if lb_type == "application" {
+            None
+        } else {
+            Some(format!("{name}-{id}.elb.{REGION}.amazonaws.com"))
+        };
+        let dns_name = reply.text("DNSName").unwrap_or_default();
+        match expected_host {
+            Some(host) => assert_eq!(
+                dns_name, host,
+                "case {name}/{lb_type}/{scheme}: unexpected DNS name {dns_name:?}"
+            ),
+            None => {
+                let published_id = dns_name
+                    .strip_prefix(&format!("{internal_prefix}{name}-"))
+                    .and_then(|rest| rest.strip_suffix(&format!(".{REGION}.elb.amazonaws.com")))
+                    .unwrap_or_default();
+                assert!(
+                    published_id.len() == APPLICATION_DNS_ID_DIGITS as usize
+                        && published_id.chars().all(|c| c.is_ascii_digit())
+                        && published_id != id,
+                    "case {name}/{lb_type}/{scheme}: unexpected DNS name {dns_name:?}"
+                );
+            }
+        }
         assert_eq!(
             reply.text("Type").as_deref(),
             Some(lb_type),

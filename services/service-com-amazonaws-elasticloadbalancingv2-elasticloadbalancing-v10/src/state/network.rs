@@ -637,6 +637,53 @@ pub async fn resolve_security_groups(
     SecurityGroupLookup::Unknown
 }
 
+/// The name EC2 gives the security group every VPC comes with: "your VPC automatically
+/// comes with a default security group" named `default` (Amazon VPC User Guide, "Default
+/// security groups for your VPCs").
+const DEFAULT_SECURITY_GROUP_NAME: &str = "default";
+
+/// The id of the DEFAULT security group of `vpc_id` — the one EC2 creates with the VPC —
+/// or `None` when EC2 could not be asked or reports no such group.
+///
+/// Read with EC2's own filters (`vpc-id` and `group-name`) rather than by listing the
+/// account's groups, so the answer is the group EC2 itself calls the default one of that
+/// VPC. Nothing is invented for a VPC whose groups are not known: a caller that cannot
+/// resolve it attaches no group at all.
+pub async fn default_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+) -> Option<String> {
+    let in_vpc = ::aws_sdk_ec2::types::Filter::builder()
+        .name("vpc-id")
+        .values(vpc_id)
+        .build();
+    let named_default = ::aws_sdk_ec2::types::Filter::builder()
+        .name("group-name")
+        .values(DEFAULT_SECURITY_GROUP_NAME)
+        .build();
+    let answer = ec2(ctx, region)
+        .describe_security_groups()
+        .filters(in_vpc)
+        .filters(named_default)
+        .send()
+        .await;
+    match answer {
+        Ok(output) => output
+            .security_groups()
+            .iter()
+            .find_map(|group| group.group_id().map(str::to_string)),
+        Err(error) => {
+            ::tracing::debug!(
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the default security group of the VPC could not be resolved against EC2"
+            );
+            None
+        }
+    }
+}
+
 /// What EC2 says about the instances a request named as targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceTargets {

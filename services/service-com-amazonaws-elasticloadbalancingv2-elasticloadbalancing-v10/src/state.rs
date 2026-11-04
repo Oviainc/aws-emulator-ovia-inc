@@ -84,6 +84,22 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// enforced here, so the number a caller reads is the number it hits.
 pub const CAPACITY_UNITS_PER_LOAD_BALANCER: i32 = 3_000;
 
+/// How many capacity-reservation DECREASES an account may make for one load balancer in a
+/// day, which is the allowance `DecreaseRequestsRemaining` ("the amount of daily capacity
+/// decreases remaining") counts down from.
+///
+/// The figure the "Elastic Load Balancing endpoints and quotas" tables publish for
+/// capacity-reservation decreases per load balancer per day — a quota of the service, like
+/// [`CAPACITY_UNITS_PER_LOAD_BALANCER`] above, not a number taken from any one call. It is
+/// an allowance of the DAY rather than of a reservation, so it is reported for every load
+/// balancer — including one that reserves no minimum capacity and so has nothing to
+/// decrease yet.
+///
+/// Nothing in this emulator spends it: a decrease lowers a minimum capacity already
+/// reserved, and reserving one is what `ModifyCapacityReservation` refuses for this
+/// account, so the whole allowance is what every read reports.
+pub const DAILY_CAPACITY_DECREASES: i32 = 2;
+
 /// How many load balancers this store holds before `CreateLoadBalancer` refuses with
 /// the modelled `TooManyLoadBalancersException`.
 ///
@@ -335,7 +351,7 @@ impl LoadBalancerRecord {
             customer_owned_ipv4_pool: self.customer_owned_ipv4_pool.clone(),
             enforce_security_group_inbound_rules_on_private_link_traffic: self
                 .enforce_security_group_inbound_rules_on_private_link_traffic(),
-            enable_prefix_for_ipv6_source_nat: self.enable_prefix_for_ipv6_source_nat.clone(),
+            enable_prefix_for_ipv6_source_nat: Some(self.enable_prefix_for_ipv6_source_nat()),
             ipam_pools: self.ipam_pools_shape(),
         }
     }
@@ -362,6 +378,19 @@ impl LoadBalancerRecord {
             .map(|pool| IpamPools {
                 ipv4_ipam_pool_id: Some(pool),
             })
+    }
+
+    /// Whether an IPv6 prefix of each subnet is used for source NAT: what a caller set,
+    /// else the value the member's own documentation fixes as its default
+    /// ([`ENABLE_PREFIX_FOR_IPV6_SOURCE_NAT_DEFAULT`]).
+    ///
+    /// A member whose documentation states a default is carried AT that default from the
+    /// moment the resource exists, so every load balancer reports one and a client reading
+    /// it never has to supply the default itself.
+    pub fn enable_prefix_for_ipv6_source_nat(&self) -> String {
+        self.enable_prefix_for_ipv6_source_nat
+            .clone()
+            .unwrap_or_else(|| ENABLE_PREFIX_FOR_IPV6_SOURCE_NAT_DEFAULT.to_string())
     }
 
     /// Whether inbound security group rules are evaluated for PrivateLink traffic: what
@@ -1347,6 +1376,78 @@ pub fn canonical_hosted_zone_id(region: &str, family: LoadBalancerFamily) -> Opt
 /// sets it, from that member's own documentation: "The default is on."
 pub const PRIVATE_LINK_INBOUND_RULES_DEFAULT: &str = "on";
 
+/// The value `LoadBalancer$EnablePrefixForIpv6SourceNat` has until a caller sets it, from
+/// that member's own documentation: "The default value is `off`." One of the two values
+/// the model's `EnablePrefixForIpv6SourceNatEnum` names
+/// (`smithy_query(query="shape",shape="EnablePrefixForIpv6SourceNatEnum")`: `on`, `off`).
+pub const ENABLE_PREFIX_FOR_IPV6_SOURCE_NAT_DEFAULT: &str = "off";
+
+/// How many decimal digits the id in the host of an APPLICATION Load Balancer has, from
+/// the form that family's guide publishes
+/// (`my-load-balancer-1234567890.us-west-2.elb.amazonaws.com`) — see
+/// [`load_balancer_dns_name`].
+pub const APPLICATION_DNS_ID_DIGITS: u32 = 10;
+
+/// The host a load balancer publishes as its `DNSName` ("the public DNS name of the load
+/// balancer"), in the form Elastic Load Balancing publishes for the FAMILY it belongs to.
+///
+/// The two forms differ in three ways, and the family decides all three:
+///
+/// * an Application Load Balancer's host puts the Region ahead of the `elb` label —
+///   `<name>-<id>.<region>.elb.amazonaws.com`, as the Application Load Balancer guide
+///   publishes it (`my-load-balancer-1234567890.us-west-2.elb.amazonaws.com`) — while a
+///   Network or Gateway Load Balancer's puts them the other way round —
+///   `<name>-<id>.elb.<region>.amazonaws.com`, as those guides publish it
+///   (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`);
+/// * the id beside the name is a DECIMAL number for an Application Load Balancer
+///   ([`APPLICATION_DNS_ID_DIGITS`] digits), minted for the host alone and not the id its
+///   ARN carries, while a Network or Gateway Load Balancer's host carries the very
+///   hexadecimal id its own ARN does;
+/// * an INTERNAL Application Load Balancer's host carries
+///   [`RESERVED_LOAD_BALANCER_NAME_PREFIX`] ahead of the name — which is why that prefix
+///   is one no caller may begin a load balancer name with — while a Network or Gateway
+///   Load Balancer's host states its scheme nowhere: the published form for those families
+///   carries the name alone, and the host of an INTERNAL one of them carries no prefix
+///   either, so the name restriction is the Application form's and the reserved prefix is
+///   refused for every family only because a name is a name of any of them.
+///
+/// Each of the three was settled against the answers Elastic Load Balancing itself gave,
+/// one at a time: the `elb`-first order and the ARN's own id still left the host of an
+/// internal Network Load Balancer differing from the answered one, and the host matched
+/// only once the scheme prefix came off it — so the prefix's absence from these two
+/// families is read off that answer rather than inferred from the Application form.
+///
+/// `dns_id` is the id for the family, which
+/// [`ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State::dns_id`] answers.
+pub fn load_balancer_dns_name(
+    name: &str,
+    scheme: &str,
+    family: LoadBalancerFamily,
+    dns_id: &str,
+    region: &str,
+) -> String {
+    match family {
+        LoadBalancerFamily::Application => {
+            let prefix = if scheme == INTERNAL_SCHEME {
+                RESERVED_LOAD_BALANCER_NAME_PREFIX
+            } else {
+                ""
+            };
+            format!("{prefix}{name}-{dns_id}.{region}.elb.amazonaws.com")
+        }
+        LoadBalancerFamily::Network | LoadBalancerFamily::Gateway => {
+            format!("{name}-{dns_id}.elb.{region}.amazonaws.com")
+        }
+    }
+}
+
+/// Whether the published host of a load balancer of `family` carries a DECIMAL id minted
+/// for the host alone, rather than the hexadecimal id of its ARN — see
+/// [`load_balancer_dns_name`].
+pub fn dns_id_is_minted(family: LoadBalancerFamily) -> bool {
+    family == LoadBalancerFamily::Application
+}
+
 /// One load balancer attribute: which load balancers carry it, what it accepts, the
 /// value it reports until something sets it, and the value its documentation FIXES for
 /// some load balancers.
@@ -1732,6 +1833,38 @@ impl Refusal {
             Self::Validation(message) | Self::Configuration(message) => message,
         }
     }
+}
+
+/// The `EnablePrefixForIpv6SourceNatEnum` value that turns source NAT prefixes on, from
+/// that enum's own values (`off`, `on`).
+pub const SOURCE_NAT_PREFIX_ON: &str = "on";
+
+/// The `IpAddressType` an IPv6 source NAT prefix requires, from
+/// `EnablePrefixForIpv6SourceNat`'s documentation: "The IP address type must be
+/// dualstack."
+pub const DUALSTACK_ADDRESS_TYPE: &str = "dualstack";
+
+/// Whether a load balancer carrying `ip_address_type` can have the source NAT prefix
+/// `prefix` asks for, and — when it cannot — the rule it broke.
+///
+/// `EnablePrefixForIpv6SourceNat`'s own documentation pairs the two: "[Network Load
+/// Balancers with UDP listeners] Indicates whether to use an IPv6 prefix from each subnet
+/// for source NAT. The IP address type must be `dualstack`." One reading of that pairing,
+/// which `CreateLoadBalancer` and `SetSubnets` — the two operations that take the member —
+/// both apply, so a create cannot start a load balancer in a configuration the other would
+/// refuse to set.
+pub fn check_source_nat_prefix(
+    prefix: Option<&str>,
+    ip_address_type: &str,
+) -> Result<(), Refusal> {
+    if prefix == Some(SOURCE_NAT_PREFIX_ON) && ip_address_type != DUALSTACK_ADDRESS_TYPE {
+        return Err(Refusal::Configuration(format!(
+            "EnablePrefixForIpv6SourceNat can only be '{SOURCE_NAT_PREFIX_ON}' for a load \
+             balancer whose IP address type is '{DUALSTACK_ADDRESS_TYPE}', and this one is \
+             '{ip_address_type}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a load balancer of `family` can use `ip_address_type`, and — when it cannot —
@@ -2893,8 +3026,22 @@ impl TargetGroupRecord {
     /// port, or — for the modelled default [`TRAFFIC_PORT`] — the port the target
     /// receives traffic on.
     pub fn health_check_port_of(&self, target: &RegisteredTarget) -> Option<String> {
+        self.health_check_port_for(target.port)
+    }
+
+    /// The port a health check runs against for a target whose own traffic port is
+    /// `target_port` (`None` where the target names none and the group's own port stands
+    /// for it): the configured health-check port, or — for the modelled default
+    /// [`TRAFFIC_PORT`] — the port that target receives traffic on.
+    ///
+    /// Keyed on the PORT rather than on a registration, because what
+    /// `TargetHealthDescription$HealthCheckPort` reports ("the port to use to connect with
+    /// the target") follows from the group's health-check configuration and the target the
+    /// read was asked about — which every described target has, whether or not the group
+    /// holds a registration for it.
+    pub fn health_check_port_for(&self, target_port: Option<i32>) -> Option<String> {
         match self.health_check.port.as_deref() {
-            Some(TRAFFIC_PORT) | None => target.port.or(self.port).map(|p| p.to_string()),
+            Some(TRAFFIC_PORT) | None => target_port.or(self.port).map(|p| p.to_string()),
             Some(port) => Some(port.to_string()),
         }
     }
@@ -2936,10 +3083,15 @@ impl TargetGroupRecord {
     }
 
     /// The description of a target that is not registered with this group.
+    ///
+    /// It carries the same `HealthCheckPort` a registered target's does
+    /// ([`Self::health_check_port_for`]): the port is the group's health-check
+    /// configuration read against the target the request named, which an unregistered
+    /// target has as much as a registered one.
     pub fn unregistered_health_description(&self, target: &TargetDescription) -> TargetHealthDescription {
         TargetHealthDescription {
             target: Some(target.clone()),
-            health_check_port: None,
+            health_check_port: self.health_check_port_for(target.port),
             target_health: Some(TargetHealth {
                 state: Some("unused".to_string()),
                 reason: Some("Target.NotRegistered".to_string()),
@@ -3833,6 +3985,52 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
                 return id;
             }
         }
+    }
+
+    /// The id the DNS name of a load balancer of `family` carries beside its name, for a
+    /// load balancer whose ARN carries `arn_id`.
+    ///
+    /// Which of the two it is belongs to the published host form
+    /// ([`load_balancer_dns_name`], [`dns_id_is_minted`]): an Application Load Balancer's
+    /// host carries a decimal number minted for the host alone, belonging to no other load
+    /// balancer this store holds, while a Network or Gateway Load Balancer's carries the
+    /// very hexadecimal id its ARN does.
+    pub fn dns_id(&mut self, family: LoadBalancerFamily, arn_id: &str) -> String {
+        if dns_id_is_minted(family) {
+            return self.mint_dns_number();
+        }
+        arn_id.to_string()
+    }
+
+    /// A fresh decimal number for the published host of an Application Load Balancer,
+    /// carried by no load balancer this store holds.
+    ///
+    /// Minted the way [`Self::mint_id`] mints an ARN id — a per-store seed mixed with the
+    /// counter, never the counter itself — and reduced to the published width
+    /// ([`APPLICATION_DNS_ID_DIGITS`]) with its leading digit kept non-zero, so every host
+    /// carries a number of that width.
+    fn mint_dns_number(&mut self) -> String {
+        use std::hash::{BuildHasher, Hasher};
+        let floor = 10u64.pow(APPLICATION_DNS_ID_DIGITS - 1);
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            let mut hasher = self.id_seed.build_hasher();
+            hasher.write_u64(self.next_id);
+            let number = floor + hasher.finish() % (floor * 9);
+            let candidate = number.to_string();
+            if !self.dns_number_in_use(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Whether the DNS name of a load balancer this store holds already carries `number`
+    /// as the id beside its name.
+    fn dns_number_in_use(&self, number: &str) -> bool {
+        let label = format!("-{number}.");
+        self.load_balancers
+            .values()
+            .any(|lb| lb.dns_name.contains(&label))
     }
 
     /// Whether any load balancer, target group, listener or rule in the store already

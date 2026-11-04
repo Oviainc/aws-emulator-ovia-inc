@@ -45,6 +45,8 @@ mod listener_target_group_protocol_pairing;
 mod listener_tls_certificates;
 #[path = "all/load_balancer_attributes.rs"]
 mod load_balancer_attributes;
+#[path = "all/load_balancer_dns_name_form.rs"]
+mod load_balancer_dns_name_form;
 #[path = "all/load_balancer_input_rules.rs"]
 mod load_balancer_input_rules;
 #[path = "all/load_balancer_network_capacity_and_policy.rs"]
@@ -55,6 +57,8 @@ mod management_event_recording;
 mod provisioning_loop;
 #[path = "all/query_error_envelope.rs"]
 mod query_error_envelope;
+#[path = "all/reported_member_defaults.rs"]
+mod reported_member_defaults;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rule_deletion_and_condition_value_spellings.rs"]

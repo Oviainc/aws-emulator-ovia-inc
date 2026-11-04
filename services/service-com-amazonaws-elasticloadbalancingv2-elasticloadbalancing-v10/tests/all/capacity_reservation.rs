@@ -8,9 +8,11 @@
 //! * `DescribeCapacityReservation` reports the reservation the STORE holds for the load
 //!   balancer the request names, and nothing else: the instant a capacity-reservation
 //!   write last changed it — `None` until one does — and, for a load balancer that
-//!   reserves no minimum capacity, no capacity and no zone holding any. It is a reporting
-//!   operation, so two reads of one load balancer answer alike, a read changes nothing a
-//!   later read sees, and a write to one load balancer is invisible to every other.
+//!   reserves no minimum capacity, no capacity and no zone holding any, beside the
+//!   account's daily capacity-decrease allowance, which is an allowance of the day rather
+//!   than of a reservation. It is a reporting operation, so two reads of one load balancer
+//!   answer alike, a read changes nothing a later read sees, and a write to one load
+//!   balancer is invisible to every other.
 //! * `ModifyCapacityReservation` settles the ACCOUNT entitlement to configure minimum load
 //!   balancer capacity FIRST, before the capacity a request asks for is read and before the
 //!   load balancer is looked up: this account is not entitled, so every request that names
@@ -29,7 +31,9 @@ use crate::load_balancer_network_capacity_and_policy::{
     absent_load_balancer_arn, assert_refused, call_on,
 };
 use crate::provisioning_loop::{emulator, first_text, members, Reply, REGION};
-use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::CAPACITY_UNITS_PER_LOAD_BALANCER;
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
+    CAPACITY_UNITS_PER_LOAD_BALANCER, DAILY_CAPACITY_DECREASES,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The awsQuery error code of `OperationNotPermittedException`
@@ -91,11 +95,16 @@ async fn read_reservation(router: &MultiServiceRouter, case: &str, arn: &str) ->
 
 /// What a load balancer that reserves no minimum capacity reports, beside the instant of
 /// the last capacity-reservation write (`modified_at`).
+///
+/// `DecreaseRequestsRemaining` is NOT part of "nothing reserved": it is the account's
+/// allowance for the day ([`DAILY_CAPACITY_DECREASES`]), reported for every load balancer
+/// whether or not it reserves capacity, and nothing here spends it — the rows that walk
+/// every family are `reported_member_defaults.rs`.
 fn nothing_reserved(modified_at: Option<String>) -> Reported {
     Reported {
         modified_at,
         capacity_units: None,
-        decreases_remaining: None,
+        decreases_remaining: Some(DAILY_CAPACITY_DECREASES.to_string()),
         zones: Vec::new(),
     }
 }

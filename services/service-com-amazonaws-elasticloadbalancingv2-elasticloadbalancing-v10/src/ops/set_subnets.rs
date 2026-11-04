@@ -279,17 +279,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(refusal) = crate::state::check_ip_address_type(family, &ip_address_type) {
             return Err(refuse(refusal));
         }
-        // `EnablePrefixForIpv6SourceNat`: "[Network Load Balancers with UDP listeners]
-        // Indicates whether to use an IPv6 prefix from each subnet for source NAT. The IP
-        // address type must be dualstack."
-        if input.enable_prefix_for_ipv6_source_nat.as_deref() == Some(SOURCE_NAT_PREFIX_ON)
-            && ip_address_type != DUALSTACK_ADDRESS_TYPE
-        {
-            return Err(invalid_configuration(format!(
-                "EnablePrefixForIpv6SourceNat can only be '{SOURCE_NAT_PREFIX_ON}' for a load \
-                 balancer whose IP address type is '{DUALSTACK_ADDRESS_TYPE}', and this one is \
-                 '{ip_address_type}'"
-            )));
+        // `EnablePrefixForIpv6SourceNat`'s documented pairing with the address type, read
+        // once in `crate::state` and applied by `CreateLoadBalancer` too.
+        if let Err(refusal) = crate::state::check_source_nat_prefix(
+            input.enable_prefix_for_ipv6_source_nat.as_deref(),
+            &ip_address_type,
+        ) {
+            return Err(refuse(refusal));
         }
 
         // The subnets a load balancer is placed in are EC2's resources, and they are what
@@ -387,15 +383,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `EnablePrefixForIpv6SourceNatEnum` value that turns source NAT prefixes on, from
-/// that enum's own values (`off`, `on`).
-const SOURCE_NAT_PREFIX_ON: &str = "on";
-
-/// The `IpAddressType` an IPv6 source NAT prefix requires, from
-/// `EnablePrefixForIpv6SourceNat`'s documentation: "The IP address type must be
-/// dualstack."
-const DUALSTACK_ADDRESS_TYPE: &str = "dualstack";
 
 /// The modelled refusal for an ARN this store holds no load balancer for, with the
 /// message every operation addressing one load balancer answers

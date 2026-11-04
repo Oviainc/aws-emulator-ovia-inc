@@ -201,10 +201,10 @@ async fn the_health_read_reports_one_description_per_target_it_is_asked_about() 
     );
 
     // What one description must report: the target's id, the port a health check of it
-    // runs against (empty where none is reported), and the state and reason the stored
-    // registration implies. A registered target of a group NO load balancer forwards to has
-    // nothing checking it, and a target the group holds no registration for is reported as
-    // unregistered — both reason codes the model's `TargetHealthReasonEnum` declares.
+    // runs against, and the state and reason the stored registration implies. A registered
+    // target of a group NO load balancer forwards to has nothing checking it, and a target
+    // the group holds no registration for is reported as unregistered — both reason codes
+    // the model's `TargetHealthReasonEnum` declares.
     const NOT_IN_USE: (&str, &str) = ("unused", "Target.NotInUse");
     const NOT_REGISTERED: (&str, &str) = ("unused", "Target.NotRegistered");
     type Described<'a> = (&'a str, &'a str, (&'a str, &'a str));
@@ -253,10 +253,11 @@ async fn the_health_read_reports_one_description_per_target_it_is_asked_about() 
         ),
         (
             // A target the group holds no registration for is reported as that, not
-            // omitted and not refused.
+            // omitted and not refused — and it carries the port a health check of it would
+            // run against, which is the group's own port here.
             "a target that was never registered",
             vec![p("Targets.member.1.Id", "i-0dddddddddddddddd4")],
-            vec![("i-0dddddddddddddddd4", "", NOT_REGISTERED)],
+            vec![("i-0dddddddddddddddd4", "80", NOT_REGISTERED)],
             true,
         ),
     ];

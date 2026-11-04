@@ -9,7 +9,10 @@
 //! A load balancer this emulator holds reserves no minimum capacity — configuring one is
 //! what `ModifyCapacityReservation` refuses for this account, see that operation — so what
 //! is reported for one is "nothing reserved": no minimum capacity and no zone holding
-//! reserved capacity, beside the `LastModifiedTime` of the last write that touched it.
+//! reserved capacity, beside the `LastModifiedTime` of the last write that touched it and
+//! the account's daily capacity-decrease allowance
+//! ([`crate::state::DAILY_CAPACITY_DECREASES`]), which is an allowance of the day rather
+//! than of a reservation and so is reported for every load balancer.
 //!
 //! A reporting operation: it reads the store and writes nothing to it, and an ARN this
 //! store holds no load balancer for is the modelled `LoadBalancerNotFoundException`.
@@ -172,10 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: load_balancer
                 .capacity_reservation_modified_at
                 .map(::aws_smithy_types::DateTime::from),
-            // "The amount of daily capacity decreases remaining" is a budget of the
-            // reservation decreases a caller has made, and this load balancer reserves no
-            // minimum capacity to decrease, so there is no figure to report.
-            decrease_requests_remaining: None,
+            // "The amount of daily capacity decreases remaining": the account's daily
+            // allowance for this load balancer, which every load balancer carries whether
+            // or not it reserves capacity — see
+            // [`crate::state::DAILY_CAPACITY_DECREASES`].
+            decrease_requests_remaining: Some(crate::state::DAILY_CAPACITY_DECREASES),
             minimum_load_balancer_capacity: None,
             // No zone holds reserved capacity for a load balancer that reserves none.
             capacity_reservation_state: Some(Vec::new()),

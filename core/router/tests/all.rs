@@ -547,6 +547,10 @@ mod elbv2_subnet_vpc_membership;
 // appended at the tail of this file, for the reason the notes above give.
 #[path = "all/elbv2_certificate_in_use_by_acm.rs"]
 mod elbv2_certificate_in_use_by_acm;
+// Declared beside its sibling ELBv2 suites, in this span of the sorted list rather than
+// appended at the tail of this file, for the reason the notes above give.
+#[path = "all/elbv2_load_balancer_security_groups.rs"]
+mod elbv2_load_balancer_security_groups;
 // Declared beside the Classic/ELBv2 suites above, in this span of the sorted list rather
 // than in the appended tail, for the same reason: the tail is where every concurrently
 // landing router suite puts its line.

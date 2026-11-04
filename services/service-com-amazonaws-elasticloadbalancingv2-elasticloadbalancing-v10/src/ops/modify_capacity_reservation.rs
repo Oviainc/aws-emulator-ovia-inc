@@ -248,9 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .capacity_reservation_modified_at
                 .map(::aws_smithy_types::DateTime::from),
             // The reservation this call left behind, reported exactly as
-            // `DescribeCapacityReservation` reports it: nothing reserved, so no capacity,
-            // no zone holding any, and no decrease budget to spend.
-            decrease_requests_remaining: None,
+            // `DescribeCapacityReservation` reports it: nothing reserved, so no capacity
+            // and no zone holding any, beside the account's whole daily decrease
+            // allowance.
+            decrease_requests_remaining: Some(crate::state::DAILY_CAPACITY_DECREASES),
             minimum_load_balancer_capacity: None,
             capacity_reservation_state: Some(Vec::new()),
         })

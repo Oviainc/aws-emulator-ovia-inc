@@ -19,6 +19,12 @@
 //! `SetSubnets` and `SetIpAddressType` apply the same ones to a load balancer that
 //! already exists.
 //!
+//! What the create itself fills: the ARN and the `DNSName` the load balancer publishes —
+//! composed in the form its FAMILY publishes
+//! ([`crate::state::load_balancer_dns_name`]) — and, for an Application Load Balancer a
+//! request names no `SecurityGroups` for, the default security group of the VPC it is
+//! placed in ([`starting_security_groups`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -322,6 +328,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(refusal) = crate::state::check_ip_address_type(family, &ip_address_type) {
             return Err(refuse(refusal));
         }
+        // `EnablePrefixForIpv6SourceNat`'s documented pairing with the address type, read
+        // once in `crate::state` and applied by `SetSubnets` too — so a create cannot start
+        // a load balancer in a configuration that call would refuse to set.
+        if let Err(refusal) = crate::state::check_source_nat_prefix(
+            input.enable_prefix_for_ipv6_source_nat.as_deref(),
+            &ip_address_type,
+        ) {
+            return Err(refuse(refusal));
+        }
 
         let resolved_subnets = match crate::state::network::resolve_subnets(
             ctx,
@@ -405,6 +420,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(refusal);
         }
+        // The groups the load balancer STARTS with: the ones the request named, or — for a
+        // family whose load balancers always carry one — the default security group of the
+        // VPC it is placed in ([`starting_security_groups`]).
+        let security_groups = starting_security_groups(
+            ctx,
+            &region,
+            family,
+            vpc_id.as_deref(),
+            input.security_groups.as_deref().unwrap_or_default(),
+        )
+        .await;
 
         let mut candidate = LoadBalancerRecord {
             arn: String::new(),
@@ -426,14 +452,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 resolved_subnets.as_deref(),
             ),
-            security_groups: input.security_groups.clone().unwrap_or_default(),
+            security_groups,
             ip_address_type,
             customer_owned_ipv4_pool: input.customer_owned_ipv4_pool.clone(),
-            // Nothing has set either of these on a load balancer being created: the
-            // members that carry them belong to `SetSecurityGroups` and `SetSubnets`,
-            // and until one is called the documented default is what a read reports.
+            // Nothing has set this on a load balancer being created: the member that
+            // carries it belongs to `SetSecurityGroups`, and until it is called the
+            // documented default is what a read reports.
             enforce_security_group_inbound_rules_on_private_link_traffic: None,
-            enable_prefix_for_ipv6_source_nat: None,
+            // "[Network Load Balancers with UDP listeners] Indicates whether to use an
+            // IPv6 prefix from each subnet for source NAT": what the request named, which
+            // `SetSubnets` later changes. `None` until one of them names it, which is when
+            // the member's documented default is what a read reports
+            // ([`crate::state::LoadBalancerRecord::enable_prefix_for_ipv6_source_nat`]).
+            enable_prefix_for_ipv6_source_nat: input.enable_prefix_for_ipv6_source_nat.clone(),
             // "[Application Load Balancers] The IPAM pools to use with the load
             // balancer": what the request named, which `ModifyIpPools` later changes.
             ipv4_ipam_pool_id: input
@@ -495,7 +526,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("loadbalancer/{type_code}/{}/{id}", candidate.name),
         );
-        candidate.dns_name = dns_name(&candidate.name, &candidate.scheme, &id, &region);
+        candidate.dns_name = crate::state::load_balancer_dns_name(
+            &candidate.name,
+            &candidate.scheme,
+            family,
+            &guard.dns_id(family, &id),
+            &region,
+        );
         candidate.id = id;
 
         guard
@@ -594,15 +631,36 @@ async fn unusable_security_groups(
     }
 }
 
-/// The load balancer's DNS name, in the form AWS publishes:
-/// `<name>-<id>.<region>.elb.amazonaws.com`, prefixed `internal-` for an internal
-/// load balancer.
-fn dns_name(name: &str, scheme: &str, id: &str, region: &str) -> String {
-    let prefix = if scheme == "internal" {
-        "internal-"
-    } else {
-        ""
+/// The security groups a load balancer this request creates STARTS with: the ones the
+/// request named, and — for a family whose load balancers always carry a security group,
+/// when the request named none — the default security group of the VPC it is placed in.
+///
+/// "[Application Load Balancers] ... You must specify a security group for an Application
+/// Load Balancer" is a rule AWS itself fills for a request that names none: an Application
+/// Load Balancer is governed by a security group from the moment it exists, so the one it
+/// gets is the group EC2 created with the VPC its subnets are in. A Network Load Balancer
+/// may carry none, so one is never attached to it, and a Gateway Load Balancer carries no
+/// security group at all.
+///
+/// The group is EC2's resource, so it is READ from EC2 rather than assumed: a VPC that
+/// could not be resolved, or that EC2 reports no default group for, leaves the load
+/// balancer with the groups the request named (none) rather than with an invented id.
+async fn starting_security_groups(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    family: crate::state::LoadBalancerFamily,
+    vpc_id: Option<&str>,
+    named: &[String],
+) -> Vec<String> {
+    if !named.is_empty() || family != crate::state::LoadBalancerFamily::Application {
+        return named.to_vec();
+    }
+    let Some(vpc_id) = vpc_id else {
+        return Vec::new();
     };
-    format!("{prefix}{name}-{id}.{region}.elb.amazonaws.com")
+    crate::state::network::default_security_group(ctx, region, vpc_id)
+        .await
+        .into_iter()
+        .collect()
 }
 
