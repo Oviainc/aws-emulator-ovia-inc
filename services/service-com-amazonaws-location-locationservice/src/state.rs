@@ -36,6 +36,9 @@ pub struct ComAmazonawsLocationLocationserviceState {
     /// Route calculator resources by `CalculatorName`, ordered for the same reason
     /// as [`Self::trackers`].
     pub route_calculators: BTreeMap<String, RouteCalculator>,
+    /// Geofence collection resources by `CollectionName`, ordered for the same
+    /// reason as [`Self::trackers`].
+    pub geofence_collections: BTreeMap<String, GeofenceCollection>,
 }
 
 /// One tracker resource and everything stored under it.
@@ -74,6 +77,42 @@ pub struct RouteCalculator {
     pub tags: BTreeMap<String, String>,
     pub create_time: EpochMillis,
     pub update_time: EpochMillis,
+}
+
+/// One geofence collection resource and everything stored under it.
+#[derive(Debug, Clone)]
+pub struct GeofenceCollection {
+    pub name: String,
+    pub arn: String,
+    /// `DescribeGeofenceCollection` models `Description` as required, and the
+    /// member is `len 0..1000`, so an unset description is the empty string.
+    pub description: String,
+    /// The KMS customer managed key the collection was created with, if the create
+    /// request named one.
+    pub kms_key_id: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub create_time: EpochMillis,
+    pub update_time: EpochMillis,
+    /// The geofences held by this collection, keyed by `GeofenceId` and ordered for
+    /// the same reason as [`ComAmazonawsLocationLocationserviceState::trackers`].
+    /// `DescribeGeofenceCollection` reports `GeofenceCount` as this map's size, so
+    /// the count a read answers is however many geofences the collection holds.
+    pub geofences: BTreeMap<String, Geofence>,
+}
+
+/// One geofence stored under a collection: the members `GetGeofence` reports for
+/// it, with the boundary kept as the modelled `GeofenceGeometry` the geofence was
+/// put with.
+#[derive(Debug, Clone)]
+pub struct Geofence {
+    pub geofence_id: String,
+    pub geometry: crate::ops::types::GeofenceGeometry,
+    /// `GetGeofenceResponse$Status` — the geofence's evaluation status.
+    pub status: String,
+    pub create_time: EpochMillis,
+    pub update_time: EpochMillis,
+    /// `GeofenceProperties`: user-defined properties, `len 0..3`.
+    pub properties: BTreeMap<String, String>,
 }
 
 /// One stored device position sample.
@@ -128,6 +167,11 @@ pub const MAX_TRACKERS: usize = 1_000;
 /// once. `CreateRouteCalculator` refuses past it with the modelled
 /// `ServiceQuotaExceededException` rather than growing the store without limit.
 pub const MAX_ROUTE_CALCULATORS: usize = 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: geofence collection resources held at
+/// once. `CreateGeofenceCollection` refuses past it with the modelled
+/// `ServiceQuotaExceededException` rather than growing the store without limit.
+pub const MAX_GEOFENCE_COLLECTIONS: usize = 1_000;
 
 impl Tracker {
     /// Record `sample` in its device's history, keeping the history sorted ascending
@@ -258,6 +302,12 @@ pub fn tracker_arn(region: &str, name: &str) -> String {
 /// `CreateRouteCalculatorResponse$CalculatorArn` documents.
 pub fn route_calculator_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("geo", region, &format!("route-calculator/{name}"))
+}
+
+/// `arn:aws:geo:<region>:<account>:geofence-collection/<name>` — the format
+/// `CreateGeofenceCollectionResponse$CollectionArn` documents.
+pub fn geofence_collection_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("geo", region, &format!("geofence-collection/{name}"))
 }
 
 /// The data providers a route calculator can source traffic and road network data

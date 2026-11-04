@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGeofenceCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGeofenceCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGeofenceCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates and persists a geofence collection resource in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::geofence_collections`],
+//! keyed by `CollectionName`, and answers with the stored name, the generated ARN
+//! and the stored creation timestamp. A retired `PricingPlan` is a
+//! `ValidationException`; a name that already exists is a `ConflictException`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +135,20 @@ impl From<CreateGeofenceCollectionErrorModeled> for CreateGeofenceCollectionErro
     }
 }
 
+/// A member the request got wrong, stated the way this service states one: the
+/// sentence as `message`, the reason the model's enum has for a bad field value,
+/// and a `fieldList` entry naming the member and repeating the sentence.
+fn field_validation_failed(member: &str, why: String) -> CreateGeofenceCollectionErrorModeled {
+    CreateGeofenceCollectionErrorModeled::ValidationException(ValidationException {
+        message: why.clone(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why,
+        }],
+    })
+}
+
 /// The `CreateGeofenceCollection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -174,18 +185,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGeofenceCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGeofenceCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGeofenceCollection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGeofenceCollectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `PricingPlan` is deprecated and admits only one of its enum's values.
+        crate::state::validate_deprecated_pricing_plan(input.pricing_plan.as_deref())
+            .map_err(|why| field_validation_failed("PricingPlan", why))?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // A collection name is unique within an account, so creating one that
+        // already exists is a conflict rather than a silent overwrite.
+        if store.geofence_collections.contains_key(&input.collection_name) {
+            return Err(CreateGeofenceCollectionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Resource of type \"GeofenceCollection\" with name \"{}\" already exists.",
+                        input.collection_name
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Bound the store: refuse past the emulator's ceiling with the modelled
+        // quota error rather than growing without limit.
+        if store.geofence_collections.len() >= crate::state::MAX_GEOFENCE_COLLECTIONS {
+            return Err(
+                CreateGeofenceCollectionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of geofence collection resources ({}) has been reached.",
+                            crate::state::MAX_GEOFENCE_COLLECTIONS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let collection = crate::state::GeofenceCollection {
+            name: input.collection_name.clone(),
+            arn: crate::state::geofence_collection_arn(&region, &input.collection_name),
+            description: input.description.unwrap_or_default(),
+            kms_key_id: input.kms_key_id,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            create_time: now,
+            update_time: now,
+            // A new collection holds no geofences; the geofence writes
+            // (`PutGeofence`, `BatchPutGeofence`) are what fill this map.
+            geofences: ::std::collections::BTreeMap::new(),
+        };
+
+        let output = CreateGeofenceCollectionOutput {
+            collection_name: collection.name.clone(),
+            collection_arn: collection.arn.clone(),
+            create_time: crate::state::to_date_time(collection.create_time),
+        };
+        store
+            .geofence_collections
+            .insert(collection.name.clone(), collection);
+        Ok(output)
     }
 }

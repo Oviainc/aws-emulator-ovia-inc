@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGeofenceCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGeofenceCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGeofenceCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the geofence collection persisted under `CollectionName` in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::geofence_collections`]:
+//! its ARN, description, KMS key, tags, timestamps and the number of geofences it
+//! holds. A name no collection is stored under is a `ResourceNotFoundException`.
+//! A pure read — it writes nothing. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGeofenceCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGeofenceCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGeofenceCollection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeGeofenceCollectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        let collection = store
+            .geofence_collections
+            .get(&input.collection_name)
+            .ok_or_else(|| {
+                DescribeGeofenceCollectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Resource of type \"GeofenceCollection\" with name \"{}\" cannot be found.",
+                            input.collection_name
+                        ),
+                    },
+                )
+            })?;
+
+        Ok(DescribeGeofenceCollectionOutput {
+            collection_name: collection.name.clone(),
+            collection_arn: collection.arn.clone(),
+            description: collection.description.clone(),
+            // Both members are documented as fixed: PricingPlan "Always returns
+            // RequestBasedUsage", PricingPlanDataSource "Always returns an empty
+            // string".
+            pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
+            pricing_plan_data_source: Some(String::new()),
+            kms_key_id: collection.kms_key_id.clone(),
+            tags: if collection.tags.is_empty() {
+                // An empty tag set is reported as an absent member, not as an
+                // empty map.
+                None
+            } else {
+                Some(
+                    collection
+                        .tags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )
+            },
+            create_time: crate::state::to_date_time(collection.create_time),
+            update_time: crate::state::to_date_time(collection.update_time),
+            // "The number of geofences in the geofence collection": however many
+            // the collection holds, read from the store rather than assumed.
+            geofence_count: Some(collection.geofences.len() as i32),
+        })
     }
 }
