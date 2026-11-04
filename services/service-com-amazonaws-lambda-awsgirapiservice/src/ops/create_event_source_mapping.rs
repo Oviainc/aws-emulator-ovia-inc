@@ -14,7 +14,14 @@
 //! [`crate::state::names_event_source`] and
 //! [`crate::state::event_source_is_mappable_by_this_account`]). Anything else is refused
 //! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
-//! a source nothing could poll.
+//! a source nothing could poll — stating the ARN format the source service the value names
+//! is polled through, where it names one at all (see [`unrecognized_event_source`]).
+//!
+//! The two settings the model leaves optional because only SOME of those sources need them
+//! — the position a stream is read from, and the instant a position stated as a timestamp
+//! starts at — are required for the sources and the position that need them, and a request
+//! that leaves one out is refused as the request validation error it is (see
+//! [`absent_required_member`]).
 //!
 //! What the mapping may be asked to MEASURE is held to that same source:
 //! `EventSourceMappingMetricsConfig$Metrics` is "the metrics you want your event source
@@ -420,6 +427,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The Region the caller signed for: the one this account's resources live in, so
+        // it is the Region the ARNs this call mints carry and the one the ARN format a
+        // refusal states is written for.
+        let region = crate::state::request_region(ctx);
+
         // Each entry of that enumeration is a resource of ONE vendor namespace and ONE
         // resource type, in the account doing the mapping, so an ARN naming anything else
         // names nothing this mapping could poll however well formed it is.
@@ -431,12 +443,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             if !crate::state::names_event_source(&parsed) {
-                return Err(invalid_parameter(format!(
-                    "Unrecognized event source '{event_source}'. An event source mapping polls \
-                     an Amazon Kinesis data stream or stream consumer, an Amazon DynamoDB \
-                     stream, an Amazon Simple Queue Service queue, an Amazon Managed Streaming \
-                     for Apache Kafka cluster or VPC connection, an Amazon MQ broker or an \
-                     Amazon DocumentDB change stream"
+                return Err(invalid_parameter(unrecognized_event_source(
+                    parsed.vendor,
+                    event_source,
+                    &region,
                 )));
             }
             if !crate::state::event_source_is_mappable_by_this_account(&parsed) {
@@ -477,9 +487,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StartingPosition` is "Required for Amazon Kinesis and Amazon DynamoDB Stream
         // event sources".
         if shard_source && input.starting_position.is_none() {
-            return Err(invalid_parameter(format!(
-                "StartingPosition must be specified for the event source '{}'",
-                event_source_arn.as_deref().unwrap_or_default()
+            return Err(invalid_parameter(absent_required_member(
+                STARTING_POSITION_MEMBER,
             )));
         }
         if input.starting_position.as_deref() == Some(crate::state::STARTING_POSITION_AT_TIMESTAMP)
@@ -495,11 +504,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "With StartingPosition set to AT_TIMESTAMP, the time from which to start
             // reading. StartingPositionTimestamp cannot be in the future."
             let Some(timestamp) = input.starting_position_timestamp else {
-                return Err(invalid_parameter(
-                    "StartingPositionTimestamp must be specified when StartingPosition is \
-                     AT_TIMESTAMP"
-                        .to_string(),
-                ));
+                return Err(invalid_parameter(absent_required_member(
+                    STARTING_POSITION_TIMESTAMP_MEMBER,
+                )));
             };
             if timestamp.as_secs_f64() > ::aws_smithy_types::DateTime::from(now).as_secs_f64() {
                 return Err(invalid_parameter(
@@ -508,7 +515,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // Every mapping this store reports is first brought up to whatever the clock has
         // already made due, so a mapping whose deletion is due is gone before this call
@@ -712,7 +718,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             bisect_batch_on_function_error: input
                 .bisect_batch_on_function_error
                 .or_else(|| stream_source.then_some(false)),
-            tumbling_window_in_seconds: input.tumbling_window_in_seconds,
+            // "(Kinesis and DynamoDB Streams only) The duration in seconds of a
+            // processing window for DynamoDB and Kinesis Streams event sources. A value of
+            // 0 seconds indicates no tumbling window": a mapping on one of those two
+            // sources whose request stated no window has NO tumbling window, which is that
+            // duration rather than an unknown one, and no window at all is what the member
+            // means for every other source.
+            tumbling_window_in_seconds: input
+                .tumbling_window_in_seconds
+                .or_else(|| shard_source.then_some(NO_TUMBLING_WINDOW)),
             topics: input.topics.clone(),
             queues: input.queues.clone(),
             source_access_configurations: input.source_access_configurations.clone(),
@@ -788,6 +802,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(reported)
     }
+}
+
+/// `TumblingWindowInSeconds` for a mapping on one of the two sources that member applies
+/// to whose request stated none: "A value of 0 seconds indicates no tumbling window", and
+/// a mapping asked for without one HAS no tumbling window.
+const NO_TUMBLING_WINDOW: i32 = 0;
+
+/// The Smithy member names of the two settings this operation requires for the source and
+/// the position the request names, which the model leaves optional on the input: naming a
+/// member by the model's own name is what keeps the path a refusal states tied to the
+/// model.
+const STARTING_POSITION_MEMBER: &str = "StartingPosition";
+/// See [`STARTING_POSITION_MEMBER`].
+const STARTING_POSITION_TIMESTAMP_MEMBER: &str = "StartingPositionTimestamp";
+
+/// The account field of an ARN FORMAT: the twelve-digit example id an ARN written as a
+/// SHAPE carries, beside the placeholder names of its resource half, in every format AWS
+/// spells out. It is the account half of an example rather than an account anything lives
+/// in — which is why it is stated here instead of the account whose resources this emulator
+/// holds ([`::engine::emulator_account_id`], the id every ARN this service MINTS carries).
+const EXAMPLE_ACCOUNT_ID: &str = "123456789012";
+
+/// How this operation refuses a request that left out a member it requires for the event
+/// source or the starting position that request names.
+///
+/// Such a member is optional in the MODEL — it is required only for some of the sources the
+/// one operation serves — so nothing in the request walk can refuse it, and the refusal is
+/// still a statement about the REQUEST: AWS's request-validation envelope over the absent
+/// member, naming it by the lowerCamel member path of the model
+/// ([`::aws_smithy_schema_server::constraints::path`]) and stating the one requirement it
+/// broke, so tooling that reads the failing member out of a validation error finds it here
+/// too. The envelope and the clause are the framework's own rendering of an absent member,
+/// so this sentence cannot drift from the one a member the model DOES require is refused
+/// with; the final stop is how Lambda ends it.
+fn absent_required_member(member: &str) -> String {
+    let path = ::aws_smithy_schema_server::constraints::path::member(member);
+    format!(
+        "{}.",
+        ::aws_smithy_schema_server::missing_member_message(&path)
+    )
+}
+
+/// How a request whose `EventSourceArn` names nothing an event source mapping can poll is
+/// refused.
+///
+/// An ARN whose VENDOR is one of the source services that member enumerates DOES name a
+/// service a mapping polls, so what the value got wrong is the SHAPE of the resource: the
+/// refusal states the ARN format that service's pollable resource is addressed by
+/// ([`expected_event_source_resource`]), because the missing or extra segment is the only
+/// thing that tells the caller what to send instead. An ARN of any other vendor names no
+/// source service at all, so there is no one format to expect and the refusal lists the
+/// sources a mapping polls, which is that member's own enumeration.
+///
+/// What that format states is the SHAPE of the ARN rather than any one resource: the
+/// resource half is written with the placeholder names the format uses
+/// ([`expected_event_source_resource`]) and the account half with the example account id
+/// ([`EXAMPLE_ACCOUNT_ID`]), because neither names a resource of anybody's. The ONE field of
+/// it that is the caller's own is the Region, which the resources of a mapping's event source
+/// live in, so the example is written for the Region this request was made in.
+fn unrecognized_event_source(vendor: &str, event_source: &str, region: &str) -> String {
+    match expected_event_source_resource(vendor) {
+        Some(resource) => format!(
+            "Unrecognized event source. Expected arn of format \
+             arn:aws:{vendor}:{region}:{EXAMPLE_ACCOUNT_ID}:{resource}"
+        ),
+        None => format!(
+            "Unrecognized event source '{event_source}'. An event source mapping polls an \
+             Amazon Kinesis data stream or stream consumer, an Amazon DynamoDB stream, an \
+             Amazon Simple Queue Service queue, an Amazon Managed Streaming for Apache Kafka \
+             cluster or VPC connection, an Amazon MQ broker or an Amazon DocumentDB change \
+             stream"
+        ),
+    }
+}
+
+/// The RESOURCE field of the ARN that addresses the resource one source service is polled
+/// through, for each vendor namespace `EventSourceArn` enumerates — and `None` for a vendor
+/// that enumeration does not name.
+///
+/// One row per entry of that member's list, each written as that service writes the ARN of
+/// the resource the entry names: "Amazon Kinesis – The ARN of the data stream or a stream
+/// consumer", "Amazon DynamoDB Streams – The ARN of the stream" (the stream OF a table,
+/// hence the table's own resource field plus the stream segment), "Amazon Simple Queue
+/// Service – The ARN of the queue" (whose resource field is the queue's name), "Amazon
+/// Managed Streaming for Apache Kafka – The ARN of the cluster" (the VPC connection the
+/// same entry documents is its cross-account form rather than the shape a same-account
+/// mapping names), "Amazon MQ – The ARN of the broker" and "Amazon DocumentDB – The ARN of
+/// the DocumentDB change stream", which is an Amazon RDS cluster.
+///
+/// The placeholder names are the ones the format states for a shape rather than values of
+/// any resource, so the sentence reads the same whatever the caller sent.
+fn expected_event_source_resource(vendor: &str) -> Option<&'static str> {
+    Some(match vendor {
+        crate::state::EVENT_SOURCE_VENDOR_KINESIS => "stream/StreamName",
+        crate::state::EVENT_SOURCE_VENDOR_DYNAMODB => "table/TableName/stream/StreamId",
+        crate::state::EVENT_SOURCE_VENDOR_QUEUE => "QueueName",
+        crate::state::EVENT_SOURCE_VENDOR_KAFKA => "cluster/ClusterName/ClusterId",
+        crate::state::EVENT_SOURCE_VENDOR_MQ => "broker:BrokerName:BrokerId",
+        crate::state::EVENT_SOURCE_VENDOR_DOCUMENT_DB => "cluster:ClusterName",
+        _ => return None,
+    })
 }
 
 /// The modelled 400 this operation refuses a request it cannot satisfy with.
