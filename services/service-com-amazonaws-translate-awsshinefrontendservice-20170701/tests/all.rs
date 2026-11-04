@@ -15,6 +15,8 @@
 mod document_translation;
 #[path = "all/rejection_paths.rs"]
 mod rejection_paths;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/terminology_lifecycle.rs"]
