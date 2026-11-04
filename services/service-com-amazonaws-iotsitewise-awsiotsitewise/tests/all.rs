@@ -527,6 +527,12 @@ mod asset_composite_model;
 #[path = "all/hierarchy_label_resolution.rs"]
 mod hierarchy_label_resolution;
 
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
+#[path = "all/associate_assets_duplicate_sentence.rs"]
+mod associate_assets_duplicate_sentence;
+
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]
