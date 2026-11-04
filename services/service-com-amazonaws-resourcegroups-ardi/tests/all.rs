@@ -87,5 +87,7 @@ mod ungroup_after_configuration_change;
 mod ungroup_reported_removals;
 #[path = "all/ungroup_resources.rs"]
 mod ungroup_resources;
+#[path = "all/unsupported_target_message.rs"]
+mod unsupported_target_message;
 #[path = "all/update_group_query.rs"]
 mod update_group_query;
