@@ -32,6 +32,10 @@ use crate::ops::types::{
     ActError, ClientInfo, ResourceNotFoundException, ToolSpec, WorkflowExportConfig,
 };
 
+/// The AI models this service publishes. Service-managed, so the catalog is a published
+/// fact rather than part of the store below — see the module's own docs.
+pub mod model_catalog;
+
 /// The region an ARN carries when the request's SigV4 credential scope does not name a
 /// usable one (an unsigned in-process call, say). The `@pattern` on every ARN shape in
 /// this model requires a non-empty `[a-z0-9-]+` region segment, so there is no "no

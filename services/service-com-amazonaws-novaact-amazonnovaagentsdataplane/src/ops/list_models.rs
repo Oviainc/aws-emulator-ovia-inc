@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the models this service publishes, and the compatibility view of them that
+//! belongs to the client compatibility version the request carries.
+//!
+//! WHAT IS PUBLISHED AND WHAT IS COMPUTED. The catalog itself
+//! ([`crate::state::model_catalog`]) is the service's own: the model binds no operation
+//! that creates, updates or retires a model, so there is nothing a caller could have
+//! written and nothing of this service's store is read or written here. Everything that
+//! depends on the REQUEST is computed from it — `compatibilityInformation` echoes the
+//! caller's own `clientCompatibilityVersion`, and `supportedModelIds` holds exactly the
+//! published models that version reaches (the ones at or above their own
+//! `minimumCompatibilityVersion` whose lifecycle still admits use), so two callers at two
+//! versions are answered two compatibility views of the one catalog.
+//!
+//! ALIASES. Each published alias reports the model it currently points at
+//! (`latestModelId`) whoever asks, and a `resolvedModelId` only where THIS caller's
+//! version reaches that model: an alias resolves to the model the caller would actually
+//! run, and to nothing when the caller cannot run it.
+//!
+//! MESSAGE. `compatibilityInformation.message` carries additional information about
+//! compatibility requirements where there is any to give: a caller below every published
+//! model's minimum is told which version reaches one. A caller that already reaches a
+//! model needs no such note and gets none.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +162,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListModels"))
+        // No request metadata is read: the only request member this operation answers
+        // from is `clientCompatibilityVersion`, which is bound into `input`.
+        let _ = ctx;
+        // Models are service-managed — the model binds no operation that creates,
+        // updates or retires one — so the catalog below is a published fact and this
+        // service's store is neither read nor written here.
+        let _ = &self.engine;
+
+        // "The client compatibility version to filter models by compatibility": the one
+        // request member, and the whole of what makes this answer the caller's own.
+        let client_version = input.client_compatibility_version;
+        let model_summaries = crate::state::model_catalog::catalog();
+
+        // "A list of model IDs that are supported for the client compatibility version":
+        // the published models this caller's version reaches, in the order the catalog
+        // publishes them.
+        let supported_model_ids: Vec<String> = model_summaries
+            .iter()
+            .filter(|model| crate::state::model_catalog::usable_at(model, client_version))
+            .map(|model| model.model_id.clone())
+            .collect();
+
+        // "The resolved model ID after alias resolution" — resolution is the caller's,
+        // so an alias whose model this version cannot reach resolves to nothing while
+        // still reporting the model it points at.
+        let model_aliases = crate::state::model_catalog::aliases()
+            .into_iter()
+            .map(|alias| ModelAlias {
+                resolved_model_id: supported_model_ids
+                    .contains(&alias.latest_model_id)
+                    .then(|| alias.latest_model_id.clone()),
+                ..alias
+            })
+            .collect();
+
+        // The compatibility note, only where there is something to say: a caller below
+        // every published model's minimum cannot use the service at this version, so it
+        // is told the version that reaches one.
+        let message = if supported_model_ids.is_empty() {
+            crate::state::model_catalog::lowest_usable_compatibility_version().map(|lowest| {
+                format!(
+                    "Client compatibility version {client_version} supports no available model. \
+                     Upgrade the client to compatibility version {lowest} or later."
+                )
+            })
+        } else {
+            None
+        };
+
+        Ok(ListModelsOutput {
+            model_summaries,
+            model_aliases,
+            compatibility_information: CompatibilityInformation {
+                client_compatibility_version: client_version,
+                supported_model_ids,
+                message,
+            },
+        })
     }
 }
