@@ -14,6 +14,9 @@
 #[path = "all/data_catalog_lifecycle.rs"]
 mod data_catalog_lifecycle;
 
+#[path = "all/engine_run_bound.rs"]
+mod engine_run_bound;
+
 #[path = "all/query_execution_lifecycle.rs"]
 mod query_execution_lifecycle;
 

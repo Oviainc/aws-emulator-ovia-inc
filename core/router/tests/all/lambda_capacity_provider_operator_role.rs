@@ -4,26 +4,30 @@
 //!
 //! RULE: `CreateCapacityProvider` resolves the IAM role its `PermissionsConfig` names
 //! against this account's IAM records before it writes, and refuses the create with
-//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — when IAM reports a
-//! role whose trust policy does NOT let `lambda.amazonaws.com` perform `sts:AssumeRole`
-//! on it. The provider manages compute instances AS that role, so a role that does not
-//! let this service assume it cannot be the role a stored provider names.
+//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — when IAM ANSWERS that
+//! the role is one this service cannot manage compute as: this account's IAM holds no role
+//! under the name the ARN carries, or the role it does hold carries a trust policy that does
+//! NOT let `lambda.amazonaws.com` perform `sts:AssumeRole` on it. The provider manages
+//! compute instances AS that role, and the role is part of what the client provisions here,
+//! so neither an absent record nor a trust policy that withholds the assume can be the role
+//! a stored provider names.
 //!
-//! The refusal is grounded in a trust document IAM ANSWERED with: a role this account's
-//! IAM holds no record of, and a role of another account, are no evidence about the role
-//! the caller named, so both are served and stored as supplied — the same reading
-//! `all/lambda_execution_role_trust.rs` pins for a function's execution role.
+//! That ABSENT-record half is what separates this surface from a function's EXECUTION role,
+//! which `all/lambda_execution_role_trust.rs` pins to the weaker reading: an execution role
+//! is routinely provisioned out of band, so a name IAM holds nothing under says nothing about
+//! it, while this operation is recorded refusing an operator role that does not exist. A role
+//! of ANOTHER account is served by both: that account's IAM is not this emulator's to ask, so
+//! there is no answer to ground a refusal in.
 //!
 //! The refusal's message is wholly fixed text: it names neither the role nor which half of
 //! the question failed.
 //!
 //! The role is resolved against the ACCOUNT's IAM records, which is why this suite lives
 //! here: each role is created through the real `CreateRole` on the same engine that serves
-//! Lambda, so what the check reads is the document IAM persisted and not a copy. It is the
-//! same check `all/lambda_execution_role_trust.rs` pins for a function's execution role, so
-//! the rows here span what is particular to this one: whether IAM holds the role at all,
-//! whether the trust policy admits this service, and a role of ANOTHER account — about
-//! which this emulator's IAM can answer nothing, so nothing is refused.
+//! Lambda, so what the check reads is the document IAM persisted and not a copy. The rows
+//! span what is particular to this surface: whether IAM holds the role at all, whether the
+//! trust policy admits this service, and a role of ANOTHER account — about which this
+//! emulator's IAM can answer nothing, so nothing is refused.
 
 use std::sync::Arc;
 
@@ -238,16 +242,17 @@ fn rows() -> Vec<Row> {
             accepted: false,
         },
         Row {
-            // A name this account's IAM holds no role under is no evidence about the
-            // role the caller named — an operator role is normally provisioned outside
-            // the client that creates the provider — and a refusal has to be grounded in
-            // a trust document IAM answered with, which is the rule the sibling suite
-            // `lambda_execution_role_trust` pins for this service's execution role and
-            // the one `crate::state::execution_role_is_unassumable` implements. So this
-            // one is served, exactly as another account's role below is.
+            // "This account's IAM holds no role under that name" IS an answer about the
+            // role the caller named, because the role a provider manages compute as is
+            // part of what the client provisions here — and this operation is recorded
+            // refusing an operator role that does not exist. So it is refused, with the
+            // same fixed sentence as a role whose trust policy withholds the assume,
+            // which is the reading
+            // `crate::state::capacity_provider::operator_role_is_unassumable` implements
+            // and what separates it from this service's execution role.
             case: "a role this account's IAM holds none of",
             role: Role::AbsentFromIam,
-            accepted: true,
+            accepted: false,
         },
         Row {
             // Nothing is KNOWN about another account's role — its IAM is not this
