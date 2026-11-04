@@ -148,6 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// "defaults to current time if not specified", so a window added without one starts at
     /// the instant this call is served and a later read reports that instant.
     ///
+    /// An entry of `SloIds` that is no `ServiceLevelObjectiveId` at all refuses the WHOLE
+    /// request with the modelled `ValidationException`, rather than earning a per-item entry
+    /// ([`crate::ops::batch_get_service_level_objective_budget_report::slo_ids_violation`],
+    /// the one statement of that rule for both operations the model binds the list shape to).
+    ///
     /// A request whose EVERY id failed is answered with the modelled exception that id's
     /// failure earns on its own, rather than with an empty success: the output's `SloIds` is
     /// `@required` with a modelled minimum of 1 entry, so there is no such thing as a
@@ -169,6 +174,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `SloIds` targets a list of plain `String`, so an entry that is no
+        // `ServiceLevelObjectiveId` at all reaches this handler, and it is refused rather
+        // than reported for the reason that rule states
+        // (`crate::ops::batch_get_service_level_objective_budget_report::slo_ids_violation`,
+        // the one statement of it, which the sibling batch over the same shape refuses by
+        // too): this operation's per-item `Errors` entry identifies the id it is about by the
+        // `@required` `SloId`, which the model pattern-constrains to a well-formed SLO name or
+        // SLO ARN, so there is no way to state such an id in the response. Refused BEFORE any
+        // id is applied, so a request carrying one leaves every SLO's window set as it was.
+        if let Some(refusal) =
+            crate::ops::batch_get_service_level_objective_budget_report::slo_ids_violation(
+                &input.slo_ids,
+            )
+        {
+            return Err(BatchUpdateExclusionWindowsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
 
         let region = crate::state::region_of(ctx.parts());
         // Both lists are optional: a request carrying neither adds and removes nothing, so it

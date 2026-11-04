@@ -135,9 +135,9 @@ const ARN_PARTITIONS: [&str; 2] = ["aws", "aws-us-gov"];
 /// the full `ServiceLevelObjectiveArn`.
 ///
 /// `SloIds` targets a list of plain `String`
-/// (`smithy_query(shape="ServiceLevelObjectiveIds")`), so nothing before this handler holds
-/// its entries to that pattern — see [`is_slo_id`].
-const SLO_ID_PATTERN: &str = "^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$|\
+/// (`smithy_query(shape="ServiceLevelObjectiveIds")`), so nothing before a handler holds
+/// its entries to that pattern — see [`is_slo_id`] and [`slo_ids_violation`].
+pub const SLO_ID_PATTERN: &str = "^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$|\
      ^arn:(aws|aws-us-gov):application-signals:[^:]*:[^:]*:slo/\
      [0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$";
 
@@ -160,13 +160,44 @@ const SLO_ID_PATTERN: &str = "^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$|\
 /// names. Which resource that is — and so whether such an ARN resolves to a stored record or
 /// earns an `Errors` entry — is [`crate::state::slo_name_of`]'s rule, the store's one id
 /// resolution.
-fn is_slo_id(id: &str) -> bool {
+pub fn is_slo_id(id: &str) -> bool {
     if !id.starts_with("arn:") {
         return crate::state::well_formed_slo_name(id);
     }
     ::service_common::arn::parse_of(id, crate::state::SIGNING_NAME)
         .is_some_and(|arn| ARN_PARTITIONS.contains(&arn.partition))
         && crate::state::slo_name_in_arn(id).is_some_and(crate::state::well_formed_slo_name)
+}
+
+/// The `ValidationException` message a request whose `ServiceLevelObjectiveIds` carries an
+/// entry that is no `ServiceLevelObjectiveId` ([`is_slo_id`]) is refused with, and `None`
+/// when every entry is one.
+///
+/// The ONE statement of that rule for the whole crate, reached by BOTH operations the model
+/// binds `ServiceLevelObjectiveIds` to — this one and `BatchUpdateExclusionWindows` — so they
+/// cannot disagree about the same unvalidated member of the same shape. The list's member
+/// targets a plain `String` ([`SLO_ID_PATTERN`]), so such an entry reaches a handler, and it
+/// is refused rather than reported: each of those operations identifies a per-item failure by
+/// members the model pattern-constrains to a well-formed SLO name or SLO ARN (`Errors[].Name`
+/// and `Errors[].Arn` here, the `@required` `Errors[].SloId` there), so there is no way to
+/// state such an id in a response at all.
+///
+/// Refusing the whole request is also what keeps a batch's outcome statable: the ids it did
+/// process are reported in `SloIds`, which is itself a `ServiceLevelObjectiveIds`.
+///
+/// The refusal is worded by the service's one constraint-violation builder — member path and
+/// requirement, with no echo of the rejected value — so this constraint reads exactly like
+/// the same constraint enforced at the boundary for every other operation that takes an id.
+pub fn slo_ids_violation(slo_ids: &[String]) -> Option<String> {
+    slo_ids.iter().any(|id| !is_slo_id(id)).then(|| {
+        crate::state::validation_envelope(&[crate::state::constraint_clause(
+            "sloIds",
+            &format!(
+                "Member must satisfy regular expression pattern: {}",
+                crate::state::unanchored(SLO_ID_PATTERN)
+            ),
+        )])
+    })
 }
 
 /// The budget report of one stored SLO, as of the instant `at`, with `now` the instant the
@@ -268,23 +299,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `SloIds` targets a list of plain `String`, so an entry that is no
-        // `ServiceLevelObjectiveId` at all reaches this handler. It is refused rather than
-        // reported: an `Errors` entry identifies the id it is about by `Name` and `Arn`,
-        // both of which the model pattern-constrains to a well-formed SLO name and ARN, so
-        // there is no way to state such an id in the response. The refusal is worded by the
-        // service's one constraint-violation builder — member path and requirement, with no
-        // echo of the rejected value — so this constraint reads exactly like the same
-        // constraint enforced at the boundary for every other operation that takes an id.
-        if input.slo_ids.iter().any(|id| !is_slo_id(id)) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::validation_envelope(&[crate::state::constraint_clause(
-                    "sloIds",
-                    &format!(
-                        "Member must satisfy regular expression pattern: {}",
-                        crate::state::unanchored(SLO_ID_PATTERN)
-                    ),
-                )]),
-            ));
+        // `ServiceLevelObjectiveId` at all reaches this handler, and it is refused rather
+        // than reported for the reason the rule itself states ([`slo_ids_violation`], which
+        // the sibling batch over the same shape refuses by too).
+        if let Some(refusal) = slo_ids_violation(&input.slo_ids) {
+            return Err(BatchGetServiceLevelObjectiveBudgetReportErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
         }
 
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());

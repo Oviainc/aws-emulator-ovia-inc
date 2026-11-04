@@ -127,6 +127,8 @@ mod slo_goal_retention;
 mod slo_id_account_scope;
 #[path = "all/slo_id_spelling_identity.rs"]
 mod slo_id_spelling_identity;
+#[path = "all/slo_ids_id_form.rs"]
+mod slo_ids_id_form;
 #[path = "all/slo_indicator_required.rs"]
 mod slo_indicator_required;
 #[path = "all/slo_lifecycle.rs"]
