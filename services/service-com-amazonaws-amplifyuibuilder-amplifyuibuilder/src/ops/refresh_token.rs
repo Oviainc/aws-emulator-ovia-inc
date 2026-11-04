@@ -6,12 +6,12 @@
 //! for a provider, and the service answers with a NEW access token for that session plus
 //! the whole seconds it stays usable.
 //!
-//! The refresh token is the PROVIDER's, not this service's — nothing here issues one — so
-//! the session a refresh addresses is named by the request itself (provider, `clientId`,
-//! refresh token) and the access token it hands back is minted by the emulator's
-//! credential store and stored as that session's live token
-//! (`crate::state::ProviderTokenSession`). Every value in the response is read off that
-//! stored record.
+//! The refresh token is the PROVIDER's, or one `ExchangeCodeForToken` minted for the
+//! session it started — nothing here issues one — so the session a refresh addresses is
+//! named by the request itself (provider, `clientId`, refresh token) and the access token
+//! it hands back is minted by the emulator's credential store and stored as that session's
+//! live token (`crate::state::ProviderTokenSession`). Every value in the response is read
+//! off that stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -70,7 +70,15 @@
 //! ## Errors
 //!
 //! * `InvalidParameterException` (HTTP 400) — An invalid or out-of-range value was supplied
-//!   for the input parameter.
+//!   for the input parameter. This is also how a refresh token of no characters, which the
+//!   model admits, is refused.
+//! * `ServiceQuotaExceededException` (HTTP 402) — widened in through `extra_errors` (see
+//!   below): the shape is this service's own, and it is how this emulator refuses a
+//!   refresh past its own bound on the token-session store.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, and it is how an unreachable shared store, or a
+//!   credential store that minted no secret, is reported — a condition on this service's
+//!   own side rather than a refusal of the request.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -186,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Minted by the emulator's credential store, outside the store lock: a service
         // never constructs secret material itself.
-        let Some(access_token) = crate::state::mint_provider_access_token(ctx.credential_store())
+        let Some(access_token) = crate::state::mint_provider_token(ctx.credential_store())
         else {
             return Err(RefreshTokenErrorModeled::InternalServerException(
                 InternalServerException {

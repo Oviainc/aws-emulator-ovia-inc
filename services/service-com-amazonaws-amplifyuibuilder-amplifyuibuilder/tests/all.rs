@@ -65,6 +65,9 @@ mod page_token_cursor_bounds;
 #[path = "all/provider_token_refresh.rs"]
 mod provider_token_refresh;
 
+#[path = "all/provider_tokens.rs"]
+mod provider_tokens;
+
 #[path = "all/read_and_delete_scope_classes.rs"]
 mod read_and_delete_scope_classes;
 

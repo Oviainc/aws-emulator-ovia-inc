@@ -62,10 +62,17 @@
 //! store also holds one [`ProviderTokenSession`] per refresh token it has been
 //! called with: the access token that is currently live for that session, and the
 //! instant it stops being live. The access token is secret material, so it is
-//! minted by the emulator's credential store ([`mint_provider_access_token`]) and
+//! minted by the emulator's credential store ([`mint_provider_token`]) and
 //! never constructed here, and the record is released by
 //! [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::expire_provider_token_sessions`]
 //! once the clock has made that expiry due.
+//!
+//! `ExchangeCodeForToken` STARTS such a session: it mints the refresh token the
+//! session is named by ([`mint_provider_token`] mints both) as well as the session's
+//! first access token, and records the digest of the access code it was exchanged
+//! from ([`ProviderTokenSession::code_digest`]), which is what makes that code
+//! single-use while the session lives. There is ONE token store, so the session a
+//! refresh reads is the session an exchange started.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -227,6 +234,41 @@ pub const CODEGEN_JOB_QUOTA: usize = 1_000;
 /// `ListCodegenJobsLimit`, which the model constrains `@range(min: 1, max: 100)`
 /// and defaults to 100, so a request that names no page size asks for this many.
 pub const CODEGEN_JOB_PAGE_LIMIT: i32 = 100;
+
+// ---------------------------------------------------------------------------
+// The access code an exchange is made from: how it is held, and how it is refused.
+// ---------------------------------------------------------------------------
+
+/// The address a secret a token request carries is held under: the hex SHA-256
+/// digest of its text.
+///
+/// It is what lets the store recognise an access code it has already been given
+/// without retaining the code itself, which the model marks `@sensitive`. `sha2`
+/// does the hashing and `hex` the rendering, as for the ids this store mints.
+fn token_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The message of the refusal of an exchange this service will not grant a token
+/// for: the access code carries no characters, or it already started a session the
+/// store still holds.
+///
+/// ONE fixed literal for the class, like [`BLANK_REFRESH_TOKEN_MESSAGE`] and the
+/// other messages of this service, and it interpolates nothing: the code is
+/// `@sensitive`, so a refusal must not quote the value it rejected, and an OAuth
+/// 2.0 token endpoint tells a code that is unknown, blank or already spent apart no
+/// further either (RFC 6749 §5.2).
+pub const ACCESS_CODE_NOT_VALID_MESSAGE: &str = "The access code provided is not valid";
+
+/// The `InvalidParameterException` payload an exchange answers for an access code
+/// it will not grant a token for.
+pub fn access_code_not_valid() -> InvalidParameterException {
+    InvalidParameterException {
+        message: Some(ACCESS_CODE_NOT_VALID_MESSAGE.to_string()),
+    }
+}
 
 /// How a `ListComponents` page token is spelled, so a token this operation never
 /// issued can be told apart from one it did.
@@ -1149,7 +1191,19 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// [`Self::refresh_provider_token_session`].
     pub fn has_room_for_provider_token_session(&self, key: &ProviderTokenKey) -> bool {
         self.provider_token_sessions.contains_key(key)
-            || self.provider_token_sessions.len() < PROVIDER_TOKEN_SESSION_QUOTA
+            || self.has_room_for_another_provider_token_session()
+    }
+
+    /// Whether the store may hold ANOTHER session: what
+    /// [`PROVIDER_TOKEN_SESSION_QUOTA`] bounds.
+    ///
+    /// For a caller that is about to start a session the store cannot already
+    /// hold, so it has no key to ask about yet: an exchange, whose session is
+    /// named by a refresh token it has not minted. A refresh addresses a session
+    /// that may already be held, so it asks
+    /// [`Self::has_room_for_provider_token_session`] instead.
+    pub fn has_room_for_another_provider_token_session(&self) -> bool {
+        self.provider_token_sessions.len() < PROVIDER_TOKEN_SESSION_QUOTA
     }
 
     /// Make `access_token` the live access token of the session `key` names,
@@ -1164,16 +1218,65 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         access_token: String,
         now: SystemTime,
     ) -> &ProviderTokenSession {
+        self.put_provider_token_session(key, access_token, None, now)
+    }
+
+    /// Start the session an EXCHANGE of `code` grants: as
+    /// [`Self::refresh_provider_token_session`], and the session also records the
+    /// digest of that access code, which is what makes the code single-use while
+    /// the session lives.
+    pub fn start_exchanged_provider_token_session(
+        &mut self,
+        key: ProviderTokenKey,
+        access_token: String,
+        code: &str,
+        now: SystemTime,
+    ) -> &ProviderTokenSession {
+        self.put_provider_token_session(key, access_token, Some(token_digest(code)), now)
+    }
+
+    /// The one write over [`Self::provider_token_sessions`], shared by the
+    /// refresh and the exchange paths.
+    ///
+    /// A session the store already holds is REPLACED, but KEEPS the access code
+    /// it was exchanged from: a refresh hands out a new access token, and it does
+    /// not un-spend the code that started the session.
+    fn put_provider_token_session(
+        &mut self,
+        key: ProviderTokenKey,
+        access_token: String,
+        code_digest: Option<String>,
+        now: SystemTime,
+    ) -> &ProviderTokenSession {
         use std::collections::hash_map::Entry;
 
-        let session = ProviderTokenSession::new(&key, access_token, now);
+        let mut session = ProviderTokenSession::new(&key, access_token, now);
+        session.code_digest = code_digest;
         match self.provider_token_sessions.entry(key) {
             Entry::Occupied(mut held) => {
+                // A refresh carries no access code of its own, so the code the
+                // session was exchanged from stays spent for as long as the
+                // session lives.
+                if session.code_digest.is_none() {
+                    session.code_digest = held.get().code_digest.clone();
+                }
                 held.insert(session);
                 held.into_mut()
             }
             Entry::Vacant(empty) => empty.insert(session),
         }
+    }
+
+    /// Whether `code` already started a session of `provider` the store still
+    /// holds: an authorization code is single-use (RFC 6749 §4.1.2), so a second
+    /// exchange of one is refused rather than granting another token pair. Call
+    /// [`Self::expire_provider_token_sessions`] first, so a code whose session
+    /// has run out is spent no longer.
+    pub fn provider_code_already_exchanged(&self, provider: &str, code: &str) -> bool {
+        let digest = token_digest(code);
+        self.provider_token_sessions.values().any(|session| {
+            session.provider == provider && session.code_digest.as_deref() == Some(digest.as_str())
+        })
     }
 
     /// One candidate id: a version 4 UUID whose 122 free bits are the leading
@@ -1548,9 +1651,18 @@ pub struct ProviderTokenSession {
     /// The `clientId` the refreshing request named, if it named one.
     pub client_id: Option<String>,
     /// The access token currently live for the session. Minted by the emulator's
-    /// credential store (see [`mint_provider_access_token`]), never constructed
+    /// credential store (see [`mint_provider_token`]), never constructed
     /// here.
     pub access_token: String,
+    /// The digest of the access code the EXCHANGE that started this session was
+    /// made from, and `None` for a session a refresh started — a refresh carries
+    /// no code.
+    ///
+    /// A digest, not the code: the code is `@sensitive` and nothing ever needs it
+    /// back — recognising a code presented again is all this is for, which is what
+    /// makes an authorization code single-use while its session lives
+    /// ([`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::provider_code_already_exchanged`]).
+    pub code_digest: Option<String>,
     /// When this access token was handed back.
     pub issued_at: SystemTime,
     /// When it stops being live: [`PROVIDER_ACCESS_TOKEN_LIFETIME`] after
@@ -1580,6 +1692,7 @@ impl ProviderTokenSession {
             provider: key.0.clone(),
             client_id: key.1.clone(),
             access_token,
+            code_digest: None,
             issued_at: now,
             expires_at: now + PROVIDER_ACCESS_TOKEN_LIFETIME,
         }
@@ -1614,25 +1727,32 @@ impl ProviderTokenSession {
     }
 }
 
-/// A fresh third-party access token, or `None` when the credential store minted
-/// no secret to build one from.
+/// A fresh opaque provider token, or `None` when the credential store minted no
+/// secret to build one from.
 ///
-/// An access token is a secret handed to a caller, and nothing in a service may
-/// construct secret material itself, so it is drawn from the one component that
-/// generates secrets. It authenticates to the THIRD-PARTY provider and not to
-/// this emulator, so the credential is removed from the store again straight
-/// away: the caller gets the token, the emulator keeps no credential it would
-/// accept as SigV4, and nothing accumulates per call.
-pub fn mint_provider_access_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+/// One mint for both tokens a token operation hands back: the ACCESS token a
+/// refresh and an exchange answer with, and the REFRESH token an exchange issues
+/// to name the session it starts (called once per token, so the two an exchange
+/// hands back are two different secrets). A refresh issues none — it is presented
+/// one the caller already holds.
+///
+/// A token is a secret handed to a caller, and nothing in a service may construct
+/// secret material itself, so it is drawn from the one component that generates
+/// secrets: [`PROVIDER_ACCESS_TOKEN_CHARS`] characters of one credential's secret.
+/// It authenticates to the THIRD-PARTY provider and not to this emulator, so the
+/// credential is removed from the store again straight away: the caller gets the
+/// token, the emulator keeps no credential it would accept as SigV4, and nothing
+/// accumulates per call.
+pub fn mint_provider_token(store: &::emulator_server::CredentialStore) -> Option<String> {
     let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
-    let access_token: Option<String> = minted
+    let token: Option<String> = minted
         .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
         .map(|secret| secret.chars().take(PROVIDER_ACCESS_TOKEN_CHARS).collect());
     // Reclaimed on EVERY path: the token is not a credential of this emulator
     // (see above), so a mint that yielded no secret must not leave one behind
     // either.
     let _ = store.delete(&minted.id);
-    access_token
+    token
 }
 
 /// The message of the refusal of a token request whose refresh token carries no

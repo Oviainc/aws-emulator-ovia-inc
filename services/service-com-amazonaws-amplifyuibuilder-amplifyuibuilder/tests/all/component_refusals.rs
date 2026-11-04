@@ -17,9 +17,10 @@
 //!    and neither refusal changes the store.
 //! 3. No error response of one of this service's own modelled exceptions names its shape
 //!    on the wire: no `x-amzn-errortype` header and no `__type` / `code` / `Code` member,
-//!    so a client classifies the failure by status alone. The emulator's own signals — the
-//!    scaffold's 501 for an operation nobody has written — keep their name, because they
-//!    report something no AmplifyUIBuilder exception does.
+//!    so a client classifies the failure by status alone. The emulator's own signals keep
+//!    their name, because they report something no AmplifyUIBuilder exception does — which
+//!    is pinned by the unit tests in `src/service/untyped_errors.rs`, no operation of this
+//!    service being left for one to answer for.
 
 use std::sync::Arc;
 
@@ -472,8 +473,10 @@ async fn a_wrong_scope_id_is_told_apart_from_an_absent_one() {
 }
 
 /// Rule 3: across every refusal this service answers — each status class, each operation —
-/// the response names no error type; the scaffold's 501 for an unwritten operation still
-/// does, because it reports something no AmplifyUIBuilder exception reports.
+/// the response names no error type. The emulator's own 501 for an operation nobody has
+/// written still does, and keeps its name independently of any operation: every operation
+/// of this service is implemented now, so that half of the rule is pinned by the unit tests
+/// in `src/service/untyped_errors.rs` rather than by a row here.
 #[tokio::test]
 async fn no_modelled_refusal_names_its_error_type() {
     let router = emulator();
@@ -555,35 +558,11 @@ async fn no_modelled_refusal_names_its_error_type() {
         );
     }
 
-    // The emulator's own signal keeps its name: an operation nobody has written yet
-    // answers 501 `NotImplemented`, which no AmplifyUIBuilder exception stands for.
-    // `ExchangeCodeForToken` is one such operation today
-    // (`src/ops/exchange_code_for_token.rs` still carries the scaffold marker); when it is
-    // implemented, point this row at another operation that still carries one. The rule
-    // itself is pinned independently of any operation by the unit tests in
-    // `src/service/untyped_errors.rs`.
-    //
-    // The request has to satisfy the model first — `provider` is the `TokenProviders`
-    // value `figma` and the `@httpPayload` body carries the two members
-    // `ExchangeCodeForTokenRequestBody` requires
-    // (`smithy_query(query="operation", operation="ExchangeCodeForToken")`) — because a
-    // refusal the framework makes before the handler would never reach the scaffold.
-    let stub = call(
-        &router,
-        "POST",
-        "/tokens/figma",
-        Some(json!({"code": "an-access-code", "redirectUri": "https://example.test/callback"})),
-    )
-    .await;
-    assert_eq!(
-        stub.status, 501,
-        "ExchangeCodeForToken is still scaffolded, so it must answer 501, got {} with {:?}",
-        stub.status, stub.body
-    );
-    assert_eq!(
-        stub.body["__type"],
-        json!("NotImplemented"),
-        "the scaffold's 501 must keep its name, got {:?}",
-        stub.body
-    );
+    // No row for the emulator's own 501 any more: no operation of this service carries the
+    // scaffold marker (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/` is empty
+    // once `ExchangeCodeForToken` is implemented), so there is none to answer one. That the
+    // signal keeps its name — unlike this service's modelled exceptions, whose
+    // discriminator is stripped — is pinned by the unit tests in
+    // `src/service/untyped_errors.rs`, and the 501 a request naming no operation answers is
+    // covered by `tests/all/response_front_door.rs`.
 }

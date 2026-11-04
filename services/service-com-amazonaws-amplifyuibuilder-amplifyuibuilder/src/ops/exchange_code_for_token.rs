@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExchangeCodeForToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExchangeCodeForToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExchangeCodeForToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -70,7 +61,16 @@
 //! ## Errors
 //!
 //! * `InvalidParameterException` (HTTP 400) — An invalid or out-of-range value was supplied
-//!   for the input parameter.
+//!   for the input parameter. This is also how an access code of no characters, which the
+//!   model admits, and a code that already started a session the store holds, are refused.
+//! * `ServiceQuotaExceededException` (HTTP 402) — widened in through `extra_errors` (see
+//!   below): the shape is this service's own, and it is how this emulator refuses an
+//!   exchange past its own bound on the token-session store, as `PutMetadataFlag` refuses
+//!   a write past its bound on the metadata store.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, and it is how an unreachable shared store, or a
+//!   credential store that minted no secret, is reported — a condition on this service's
+//!   own side rather than a refusal of the request.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,10 +86,27 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplif
 // here — hence the `ExchangeCodeForTokenError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#ExchangeCodeForToken")]
+// `InternalServerException` and `ServiceQuotaExceededException` are widened in
+// through `extra_errors`, both shapes this SERVICE models and both declared in
+// `types/shared_types.rs`, exactly as `PutMetadataFlag` widens them in:
+//
+// * `InternalServerException` (HTTP 500) — an unreachable shared store, and a
+//   credential store that minted no secret, are server-side conditions rather
+//   than malformed requests.
+// * `ServiceQuotaExceededException` (HTTP 402) — every exchange starts a token
+//   session, so that store is bounded like the component and metadata stores
+//   (`crate::state::PROVIDER_TOKEN_SESSION_QUOTA`, the same bound `RefreshToken`
+//   reads), and past that bound an exchange is refused rather than growing the
+//   state without end.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#ExchangeCodeForToken",
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum ExchangeCodeForTokenErrorModeled {
+    InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,23 +155,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::EXCHANGE_CODE_FOR_TOKEN_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Grant a provider token for the access code the request carries.
+    ///
+    /// The access code is what the third-party provider handed the caller, and the
+    /// answer is the pair that exchange grants: the access token the caller uses
+    /// now, the whole seconds it stays usable, and the refresh token that names the
+    /// session from here on. Both are minted by the emulator's credential store — a
+    /// service never constructs secret material itself — and what is kept is the
+    /// session the pair belongs to ([`crate::state::ProviderTokenSession`]), the
+    /// same record `RefreshToken` reads and replaces the access token of, so the
+    /// refresh token this hands back is one a later refresh resolves to this very
+    /// session. The response is read off the stored session, so what the caller is
+    /// handed and what the store holds cannot differ.
+    ///
+    /// `redirectUri` is where the provider sent the caller back to. It belongs to
+    /// an authorization request made AT the provider, which this service holds
+    /// nothing of, so there is nothing here to compare it with; the model requires
+    /// it present, which the validating walk has already settled by the time this
+    /// runs.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExchangeCodeForToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExchangeCodeForTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExchangeCodeForToken"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable shared store is a server-side condition, not a
+            // refusal of a request that satisfied every modelled constraint.
+            return Err(ExchangeCodeForTokenErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder token store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `code` is `@required` but carries no `@length`, so the model admits a
+        // blank one: an access code of no characters names nothing to exchange,
+        // which is the invalid input parameter this operation models. The refusal
+        // quotes nothing — the member is `@sensitive`. `RefreshToken` refuses a
+        // blank refresh token in the same way.
+        if input.request.code.trim().is_empty() {
+            return Err(ExchangeCodeForTokenErrorModeled::InvalidParameterException(
+                crate::state::access_code_not_valid(),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The expiry the clock already owes, materialised before anything below
+        // reads the store: a session whose access token has run out holds neither
+        // its access code nor a place in the bound.
+        store.expire_provider_token_sessions(now);
+
+        // An authorization code is single-use (RFC 6749 §4.1.2), so a code that
+        // already started a session the store holds grants no second pair.
+        if store.provider_code_already_exchanged(&input.provider, &input.request.code) {
+            return Err(ExchangeCodeForTokenErrorModeled::InvalidParameterException(
+                crate::state::access_code_not_valid(),
+            )
+            .into());
+        }
+
+        // The bound, BEFORE anything is minted, so a refused exchange does no work
+        // on the credential store: the session an exchange starts is named by a
+        // refresh token minted below, so it is never one the store already holds.
+        if !store.has_room_for_another_provider_token_session() {
+            return Err(
+                ExchangeCodeForTokenErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this emulator already holds the maximum of {} live token sessions",
+                            crate::state::PROVIDER_TOKEN_SESSION_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Minted by the emulator's credential store, once the exchange is settled
+        // so a refused one mints nothing: the access token the caller uses now and
+        // the refresh token that names the session. Neither is constructed here.
+        // It happens under the store lock because the session is KEYED by the
+        // refresh token, and it adds no caller-driven work to the critical section.
+        let credentials = ctx.credential_store();
+        let (Some(access_token), Some(refresh_token)) = (
+            crate::state::mint_provider_token(credentials),
+            crate::state::mint_provider_token(credentials),
+        ) else {
+            return Err(ExchangeCodeForTokenErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("no provider token could be minted for this request".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The session the pair belongs to, named the way a refresh names one:
+        // `provider` is an `@httpLabel` targeting the `TokenProviders` enum, so the
+        // only values that reach here are the ones the model declares.
+        let key = (
+            input.provider,
+            input.request.client_id,
+            refresh_token.clone(),
+        );
+        let session = store.start_exchanged_provider_token_session(
+            key,
+            access_token,
+            &input.request.code,
+            now,
+        );
+        Ok(ExchangeCodeForTokenOutput {
+            access_token: session.access_token.clone(),
+            expires_in: session.expires_in(now),
+            refresh_token,
+        })
     }
 }
