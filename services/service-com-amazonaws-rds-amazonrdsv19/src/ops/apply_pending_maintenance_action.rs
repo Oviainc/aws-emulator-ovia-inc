@@ -74,6 +74,12 @@
 //!   while the cluster is in this state.
 //! * `InvalidDBInstanceStateFault` (HTTP 400) — The DB instance isn't in a valid state.
 //! * `ResourceNotFoundFault` (HTTP 404) — The specified resource ID was not found.
+//!
+//! Of those, `ResourceNotFoundFault` is deliberately never produced: Amazon RDS validates
+//! this operation's `ResourceIdentifier` as a PARAMETER VALUE, so an identifier that
+//! resolves to no resource of the account is refused with HTTP 400 and the Query API's
+//! `InvalidParameterValue` (see the handler). The two state faults need a maintenance
+//! action to be pending, and nothing in this service schedules one.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -141,14 +147,16 @@ fn check_value(member: &str, value: &str, allowed: &[&str]) -> Result<(), String
     ))
 }
 
-/// The resource NAME a `ResourceIdentifier` ends with: the last `:`-separated field of an
-/// RDS ARN (`arn:aws:rds:<region>:<account>:<type>:<name>` -> `<name>`), and the whole
-/// value when it carries none.
+/// The message Amazon RDS refuses a `ResourceIdentifier` that names no resource with: the
+/// fixed text, then the identifier the REQUEST carried, so the caller recognises the value
+/// it sent whatever shape that value had.
 ///
-/// RDS names the RESOURCE in this fault's message, not the ARN the caller passed, so the
-/// name is taken from the request rather than echoed whole.
-fn resource_name(resource: &str) -> &str {
-    resource.rsplit(':').next().unwrap_or(resource)
+/// The refusal is about the PARAMETER rather than about a resource that went missing: the
+/// member takes "the RDS Amazon Resource Name (ARN) of the resource that the pending
+/// maintenance action applies to", and a value this account has no resource for is a value
+/// this parameter does not accept.
+fn unknown_resource_message(resource_identifier: &str) -> String {
+    format!("Unknown resource: {resource_identifier}")
 }
 
 /// The `ApplyPendingMaintenanceAction` operation.
@@ -202,28 +210,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceIdentifier` is "the RDS Amazon Resource Name (ARN) of the resource that
         // the pending maintenance action applies to", so the request is resolved by ARN
-        // against what this service stores. RDS is regional: only the region the request
-        // was signed for is in scope, which is also the region a resource's own ARN names.
+        // against what this service stores — a DB cluster or a DB instance, the resources
+        // that carry pending maintenance actions at all. RDS is regional: only the region
+        // the request was signed for is in scope, which is also the region a resource's own
+        // ARN names.
         let resource = input.resource_identifier.trim().to_string();
         let resolved = store
-            .instances_in(&region)
+            .clusters_in(&region)
             .into_iter()
-            .find(|record| record.arn() == resource)
-            .map(|record| record.arn());
+            .map(|record| record.arn())
+            .chain(
+                store
+                    .instances_in(&region)
+                    .into_iter()
+                    .map(|record| record.arn()),
+            )
+            .find(|arn| *arn == resource);
+        // A value that resolves to no resource of this account is refused as the PARAMETER
+        // VALUE it is — HTTP 400 with the Query API's `InvalidParameterValue` — and not as a
+        // resource that went missing: this call acts on the resource its ARN names, so an
+        // ARN naming nothing (an identifier that is no ARN at all, an ARN of another region
+        // or of a resource that was never created) is a request the caller has to correct,
+        // never one to retry or to branch on as a 404.
         let Some(resource_arn) = resolved else {
-            return Err(
-                ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(
-                    ResourceNotFoundFault {
-                        message: Some(format!("Resource not found: {}", resource_name(&resource))),
-                    },
-                )
-                .into(),
-            );
+            return Err(ApplyPendingMaintenanceActionError::invalid_parameter_value(
+                unknown_resource_message(&resource),
+            ));
         };
 
         // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do
         // WITH it, so a request that names a resource this service does not hold is
-        // answered with the 404 above rather than with a complaint about those members.
+        // answered with the refusal above rather than with a complaint about those members.
         check_value("ApplyAction", &input.apply_action, &APPLY_ACTION_VALUES)
             .map_err(ApplyPendingMaintenanceActionError::validation)?;
         check_value("OptInType", &input.opt_in_type, &OPT_IN_TYPE_VALUES)

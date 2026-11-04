@@ -119,6 +119,8 @@ mod export_tasks;
 mod global_clusters;
 #[path = "all/lifecycle_poll_loops.rs"]
 mod lifecycle_poll_loops;
+#[path = "all/maintenance_action_resource_guard.rs"]
+mod maintenance_action_resource_guard;
 #[path = "all/management_event_recording.rs"]
 mod management_event_recording;
 #[path = "all/modify_custom_db_engine_version.rs"]

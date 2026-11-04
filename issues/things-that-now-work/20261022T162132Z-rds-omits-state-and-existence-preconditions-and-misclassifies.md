@@ -64,3 +64,28 @@ Cause 1: status expected 400, got 200; $.ErrorResponse: missing (expected {'Erro
 3. Replay task#3 of the same fixture: Action=DescribeDBSnapshots with a DBSnapshotIdentifier that does not exist returns 200 instead of 404 DBSnapshotNotFound.
 4. Replay rds-maintenance-and-account-attributes#task#3: Action=ApplyPendingMaintenanceAction with a ResourceIdentifier ARN naming no resource returns 404/ResourceNotFoundFault instead of 400/InvalidParameterValue.
 5. Replay rds-subnet-group-az-coverage-and-naming#task#13: Action=CreateDBSubnetGroup naming one non-existent subnet returns 400/DBSubnetGroupDoesNotCoverEnoughAZs instead of 400/InvalidParameterValue.
+
+## Resolution
+
+Causes 1, 2 and 3 are served:
+
+* Cause 1 — `CreateDBSnapshot` refuses a source instance whose stored status is not
+  `available` with `InvalidDBInstanceState` (400) and the sentence the service words for
+  that class.
+* Cause 2 — `DescribeDBSnapshots` answers `DBSnapshotNotFound` (404) for an identifier the
+  request's region holds no record of.
+* Cause 3 — `ApplyPendingMaintenanceAction` resolves its `ResourceIdentifier` against the
+  DB clusters and DB instances of the request's region and refuses a value that resolves to
+  neither as that parameter's value: 400 `InvalidParameterValue`, message
+  `Unknown resource: <the identifier the request sent>`.
+
+Cause 4 is DECLINED, and the two `rds|CreateDBSubnetGroup|4xx->4xx` keys in this report's
+front matter (`$.ErrorResponse.Error.Code` and `.Message`) remain unserved: deciding them
+needs the EC2 subnet inventory of the recording account. One recorded step of that fixture
+expects the "input subnets are invalid" parameter refusal for a well-formed subnet id that
+exists in no account, while another expects the Availability-Zone coverage fault for
+well-formed subnet ids that DO exist there and that EC2 placed in one zone. Which
+identifiers exist, and which zone each sits in, are values AWS generated inside that one
+account; no rule derives them from the request, so the two requests are indistinguishable
+to this emulator, which holds no subnets and derives a zone from the identifier. Serving
+both as recorded would mean writing those identifiers into the service.
