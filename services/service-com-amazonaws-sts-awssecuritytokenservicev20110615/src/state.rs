@@ -29,6 +29,12 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{Credentials, Tag};
 
+/// Which web identity a presented token stands for: the verification
+/// `AssumeRoleWithWebIdentity` makes of it, and the class a token it cannot federate is
+/// refused as. One concern, one file — it is the only thing in this service that reads a
+/// token against the key set its issuer publishes.
+pub mod web_identity;
+
 /// `AssumeRole`'s default session length: "By default, the value is set to `3600`
 /// seconds." (`AssumeRoleRequest$DurationSeconds`, this service's model).
 pub const ASSUME_ROLE_DEFAULT_DURATION_SECONDS: i32 = 3600;
@@ -1352,65 +1358,12 @@ pub fn web_identity_provider_name(issuer: &str) -> &str {
 /// provider for it, because the pools it issues for are the account's own.
 pub const COGNITO_IDENTITY_PROVIDER_NAME: &str = "cognito-identity.amazonaws.com";
 
-/// See [`web_identity_provider_name`]: the principals a trust-policy decision about a web
-/// identity is made for.
-#[must_use]
-pub fn web_identity_principals(issuer: &str) -> Vec<String> {
-    let provider = web_identity_provider_name(issuer);
-    vec![
-        provider.to_string(),
-        issuer.to_string(),
-        format!(
-            "arn:aws:iam::{}:oidc-provider/{provider}",
-            ::engine::emulator_account_id()
-        ),
-    ]
-}
-
-/// The condition keys an identity provider publishes about ONE of its tokens, for a trust
-/// policy's `Condition` to be decided against: `<provider>:aud` — "the intended audience
-/// (also known as client ID) of the web identity token" — `<provider>:sub`, the identity the
-/// token names, and one `<provider>:amr` pair per authentication method the issuance
-/// recorded, the multi-valued key a policy decides under one of IAM's set qualifiers. All of
-/// them are prefixed with the provider the token came from, as AWS names them, so a clause
-/// written for one provider never decides another's token.
-#[must_use]
-pub fn web_identity_condition_context(
-    identity: &::service_common::web_identity_tokens::IssuedWebIdentity,
-) -> Vec<(String, String)> {
-    let provider = web_identity_provider_name(&identity.issuer);
-    let mut context = vec![
-        (format!("{provider}:aud"), identity.audience.clone()),
-        (format!("{provider}:sub"), identity.subject.clone()),
-    ];
-    context.extend(
-        identity
-            .authentication_methods
-            .iter()
-            .map(|method| (format!("{provider}:amr"), method.clone())),
-    );
-    context
-}
-
-/// The keys [`web_identity_condition_context`] publishes, as the policy evaluator needs
-/// them: the keys whose absence means the token carried no such claim rather than this
-/// emulator not knowing the key.
-///
-/// `<provider>:amr` is among them only for an issuance that recorded authentication methods
-/// at all: an issuer that publishes no such claim publishes no such key either, so a clause
-/// written over it stays undecided and withholds the grant rather than reading as "the token
-/// carried none".
-#[must_use]
-pub fn web_identity_published_condition_keys(
-    identity: &::service_common::web_identity_tokens::IssuedWebIdentity,
-) -> Vec<String> {
-    let provider = web_identity_provider_name(&identity.issuer);
-    let mut keys = vec![format!("{provider}:aud"), format!("{provider}:sub")];
-    if !identity.authentication_methods.is_empty() {
-        keys.push(format!("{provider}:amr"));
-    }
-    keys
-}
+// The condition keys an identity provider publishes about ONE of its tokens, and the
+// principals a trust-policy decision about it is made for, live in
+// `web_identity::condition_context` / `web_identity::principals`, beside the verification
+// that reads the token: a key is named after the provider that issued the token and carries
+// a CLAIM of it, so publishing them is part of reading the token rather than a rule of its
+// own.
 
 /// The modelled character class a session tag's key and value must satisfy
 /// (`tagKeyType` / `tagValueType`, this service's model): letters, separators, numbers
@@ -1791,21 +1744,73 @@ pub fn mfa_challenge_failure(
     }
 }
 
-/// The SIZE, in bytes, of the serialized token one mint's session policies and session
-/// tags pack into.
+/// The PACKED SESSION TOKEN one mint's session policies and session tags serialize into:
+/// the artifact whose length the token budget applies to.
 ///
 /// "An Amazon Web Services conversion compresses the session policy document, session
 /// policy ARNs, and session tags into a packed binary format that has a separate limit"
-/// (`PackedPolicyTooLargeException`, this service's model), so the size is measured over
-/// exactly those three: the inline policy document, the managed policy ARNs it names, and
-/// each session tag's key and value. The emulator packs them without compressing, so the
-/// measured size is the bytes they occupy — which is the figure the refusal reports and
-/// the figure [`packed_policy_size`] is the percentage of.
+/// (`PackedPolicyTooLargeException`, this service's model), so the packed state is exactly
+/// those three — the inline policy document, the managed policy ARNs the request names, and
+/// each session tag's key and value — serialized as the members that carry them, and then
+/// encoded the way a token is carried, which is the form whose length is measured.
+///
+/// Measuring the TOKEN rather than adding up the field contents is what makes the figure
+/// track the request: a serialization carries its own framing per element, so ten tags and
+/// one tag of the same total content do not pack into the same token, and a byte added to a
+/// tag value moves the measured size. The emulator compresses nothing, so no caller's
+/// session state is ever admitted because it happened to compress well.
+///
+/// A request that carries no policy, no policy ARN and no session tag packs NO token at all
+/// — there is no session state to serialize — so its size is zero rather than the length of
+/// an empty document.
+#[must_use]
+pub fn packed_session_token(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> String {
+    let mut packed = serde_json::Map::new();
+    if let Some(policy) = policy {
+        packed.insert(
+            "Policy".to_string(),
+            serde_json::Value::String(policy.to_string()),
+        );
+    }
+    if !policy_arns.is_empty() {
+        packed.insert(
+            "PolicyArns".to_string(),
+            serde_json::Value::Array(
+                policy_arns
+                    .iter()
+                    .map(|arn| serde_json::json!({ "arn": arn }))
+                    .collect(),
+            ),
+        );
+    }
+    if !tags.is_empty() {
+        packed.insert(
+            "Tags".to_string(),
+            serde_json::Value::Array(
+                tags.iter()
+                    .map(|tag| serde_json::json!({ "Key": tag.key, "Value": tag.value }))
+                    .collect(),
+            ),
+        );
+    }
+    if packed.is_empty() {
+        return String::new();
+    }
+    let serialized = serde_json::Value::Object(packed).to_string();
+    ::base64::Engine::encode(&PACKED_TOKEN_CODEC, serialized)
+}
+
+/// The coder a packed session token is carried in: base64 as RFC 4648 §4 defines it,
+/// padded, which is the one coding every token this service hands a client travels in.
+const PACKED_TOKEN_CODEC: ::base64::engine::GeneralPurpose =
+    ::base64::engine::general_purpose::STANDARD;
+
+/// The SIZE, in bytes, of the packed session token one mint's session policies and session
+/// tags pack into ([`packed_session_token`]) — the figure the refusal reports and the figure
+/// [`packed_policy_size`] is the percentage of.
+#[must_use]
 pub fn packed_policy_bytes(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> usize {
-    let policy_bytes = policy.map_or(0, str::len);
-    let arn_bytes: usize = policy_arns.iter().map(String::len).sum();
-    let tag_bytes: usize = tags.iter().map(|tag| tag.key.len() + tag.value.len()).sum();
-    policy_bytes + arn_bytes + tag_bytes
+    packed_session_token(policy, policy_arns, tags).len()
 }
 
 /// The percentage of [`SESSION_TOKEN_SIZE_LIMIT`] a request's session policies and

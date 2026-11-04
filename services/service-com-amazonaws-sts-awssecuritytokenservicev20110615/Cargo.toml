@@ -31,8 +31,14 @@ sha2 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The tree's ONE evaluation of IAM policy documents against a request, which is how a
 # role's trust policy is read here: two services handed the same document must not
-# answer differently.
+# answer differently. `jwt::read` / `jwt::verify`: the ONE reading of a compact JWS and
+# the RFC 7515 §5.2 signature check a presented web identity token is verified by.
 service-common = { path = "../common" }
+# The Amazon Cognito user pools in the same shared engine: a pool is an identity provider
+# this emulator SERVES, so the key set its tokens are verified against is published in this
+# process (`src/state/web_identity.rs`). That service's own accessor is called rather than
+# copied, so a token is checked against the very key the pool's `jwks.json` endpoint serves.
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
 # The modelled character class a session tag's key and value must satisfy is a regular
 # expression over Unicode properties, so it is matched with a maintained regex engine
 # rather than by hand; see `src/state.rs`.

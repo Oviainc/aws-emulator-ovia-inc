@@ -1,28 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssumeRoleWithWebIdentity
-//! Federates a web identity into a role session: the presented token is validated here and,
-//! when it is one this emulator ISSUED, exchanged for a session of the role the request
-//! names — recorded in this service's registry like every other session, so
-//! `GetCallerIdentity` under the credential reports the assumed-role identity. The
-//! operation is ANONYMOUS (`auth: []`, `optionalAuth`), so it is served to a caller holding
-//! no Amazon Web Services credential at all — see `crate::service` for how such a request
-//! is attributed to this service.
+//! Federates a web identity into a role session: the presented token is VERIFIED and, when
+//! the provider the account registered for its issuer really issued it, exchanged for a
+//! session of the role the request names — recorded in this service's registry like every
+//! other session, so `GetCallerIdentity` under the credential reports the assumed-role
+//! identity. The operation is ANONYMOUS (`auth: []`, `optionalAuth`), so it is served to a
+//! caller holding no Amazon Web Services credential at all — see `crate::service` for how
+//! such a request is attributed to this service.
 //!
-//! What decides the answer is the token:
+//! What decides the answer is the token, verified in the order a verifier decides it
+//! (`crate::state::web_identity`, which holds the whole of that reading):
 //!
 //! * a value that is not a compact JSON Web Token is `InvalidIdentityToken`;
 //! * a token whose expiry has passed is `ExpiredTokenException`, whatever its signature;
-//! * a token this emulator did not issue is `InvalidIdentityToken`. Accepting one would mean
-//!   verifying its signature against the key set its issuer publishes at the issuer's own
-//!   endpoint, and this emulator fetches nothing from outside itself, so it holds no
-//!   issuer's verification key — the condition AWS answers with that same error. What it
-//!   CAN establish is that the token is one it issued, which is the registry
+//! * a token NOTHING signed — RFC 7519 §6's unsecured form — is `InvalidIdentityToken`
+//!   stating that unsigned JWTs are not accepted, which is a different answer from a
+//!   signature that failed to check out and from a key that could not be read;
+//! * a token whose issuer the account registered no OpenID Connect provider for is
+//!   `InvalidIdentityToken` naming that issuer;
+//! * a token of a registered issuer is checked against the key set that issuer publishes:
+//!   an issuer this emulator SERVES publishes its key set in this same process (an Amazon
+//!   Cognito user pool), so the signature is verified against it and the token is accepted
+//!   when it checks out and `InvalidIdentityToken` when it does not. An issuer OUTSIDE the
+//!   emulator publishes its keys where this emulator never reaches, so no key can be
+//!   retrieved for it and the answer is the key-retrieval refusal AWS words for exactly
+//!   that condition;
+//! * a token this emulator ITSELF issued is resolved from the registry
 //!   `service_common::web_identity_tokens` holds (written by the Amazon Cognito Identity
-//!   `GetOpenIdToken` / `GetOpenIdTokenForDeveloperIdentity` that minted it);
-//! * a token it did issue is exchanged, provided the role's trust policy admits the
-//!   issuer for `sts:AssumeRoleWithWebIdentity` with the audience and subject the token
-//!   carries; otherwise `AccessDenied`.
+//!   `GetOpenIdToken` / `GetOpenIdTokenForDeveloperIdentity` that minted it), which is the
+//!   evidence it has in place of a signature of its own;
+//! * a token it accepts is exchanged, provided the role's trust policy admits the issuer
+//!   for `sts:AssumeRoleWithWebIdentity` with the audience and subject the token carries;
+//!   otherwise `AccessDenied`.
 //!
 //! `ProviderId` names "the fully qualified host component of the domain name of the OAuth
 //! 2.0 identity provider" and is read NOWHERE here: it describes an OAuth 2.0 access
@@ -347,7 +357,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The TOKEN is what this caller is, and it is decided first: the recorded behaviour
         // of a well-formed but nonexistent `RoleArn` presented with an unreadable token is
         // the token's refusal, not the role's.
-        let identity = self.web_identity(&input.web_identity_token, now)?;
+        let web_identity = crate::state::web_identity::resolve(
+            &*self.engine,
+            &input.web_identity_token,
+            now,
+        )
+        .map_err(refuse_token)?;
 
         // The role ARN decides the account the session belongs to and the role name the
         // assumed-role ARN carries. Its length and character set are modelled, but being
@@ -407,11 +422,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing is assumed that the account does not hold and no trust policy admits.
         // The principals a trust policy names for a web identity are the issuer's own
         // spellings, and the condition keys are the ones that issuer publishes about the
-        // token — see `crate::state::web_identity_principals` /
-        // `web_identity_condition_context`.
-        let principals = crate::state::web_identity_principals(&identity.issuer);
-        let context = crate::state::web_identity_condition_context(&identity);
-        let published = crate::state::web_identity_published_condition_keys(&identity);
+        // token — its claims, named after the provider (`crate::state::web_identity`).
+        let principals = crate::state::web_identity::principals(&web_identity.identity.issuer);
+        let context = crate::state::web_identity::condition_context(&web_identity);
+        let published = crate::state::web_identity::published_condition_keys(&web_identity);
         let published: Vec<&str> = published.iter().map(String::as_str).collect();
         let admitted = role.as_ref().is_some_and(|role| {
             role.trust_policy_admits(
@@ -508,9 +522,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The three facts the token itself carries, as the issuance recorded them:
             // "the value of the `iss` field", the client id the token was issued for, and
             // "the value returned by the identity provider as the token's `sub` claim".
-            provider: Some(identity.issuer),
-            audience: Some(identity.audience),
-            subject_from_web_identity_token: Some(identity.subject),
+            provider: Some(web_identity.identity.issuer),
+            audience: Some(web_identity.identity.audience),
+            subject_from_web_identity_token: Some(web_identity.identity.subject),
             // "The value of the source identity that is returned in the JSON web token
             // (JWT) from the identity provider": a claim of the token, and the tokens this
             // emulator issues carry none.
@@ -528,176 +542,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const WEB_IDENTITY_NOT_AUTHORIZED_MESSAGE: &str =
     "Not authorized to perform sts:AssumeRoleWithWebIdentity";
 
-/// The claim a token carries its expiry in: "the expiration time on or after which the
-/// JWT MUST NOT be accepted for processing", a NumericDate (RFC 7519 §4.1.4), which an
-/// OpenID Connect ID token is required to carry.
-const EXPIRY_CLAIM: &str = "exp";
-
-/// The claim a token carries its ISSUER in — "the principal that issued the JWT" (RFC 7519
-/// §4.1.1) — which an OpenID Connect ID token carries as the issuer's URL. It is what
-/// decides which provider's keys and which condition keys a token is read against.
-const ISSUER_CLAIM: &str = "iss";
-
-/// How AWS words the refusal of a value that is not a readable identity token, including
-/// one that carries no expiry at all: an ID token is a JSON Web Token, and an OAuth 2.0
-/// ACCESS token presented in its place is the mistake the sentence names.
-const UNREADABLE_TOKEN_MESSAGE: &str =
-    "The ID Token provided is not a valid JWT. (You may see this error if you sent an \
-     Access Token)";
-
-/// How AWS words the refusal of a token of valid form whose signature it could not check:
-/// the verifying key lives at the issuer's own key-set endpoint, and the verifier could
-/// not retrieve it.
-const UNVERIFIABLE_TOKEN_MESSAGE: &str =
-    "Couldn't retrieve verification key from your identity provider, please reference \
-     AssumeRoleWithWebIdentity documentation for requirements";
-
-impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AssumeRoleWithWebIdentity<Eng> {
-    /// The identity `presented` stands for, or the modelled failure AWS answers for a token
-    /// that stands for none.
-    ///
-    /// What the registry holds is the issuances THIS emulator made, so a token in it is one
-    /// whose issuer is this emulator — the evidence it has in place of a signature checked
-    /// against an issuer's published key. Anything else is classified by
-    /// [`Self::refuse_token`].
-    fn web_identity(
-        &self,
-        presented: &str,
-        now: ::std::time::SystemTime,
-    ) -> Result<::service_common::web_identity_tokens::IssuedWebIdentity, AssumeRoleWithWebIdentityError>
-    {
-        let issued = crate::state::issued_web_identity_tokens(&*self.engine)
-            .and_then(|registry| registry.lock().issued(presented, now).cloned());
-        match issued {
-            Some(issued) => Ok(issued),
-            None => Err(self.refuse_token(presented, now)),
-        }
-    }
-
-    /// Why `presented` is not a web identity this emulator can federate, as the modelled
-    /// failure AWS answers for it.
-    ///
-    /// The classes, in the order a verifier decides them — the form of the value, what its
-    /// claims say, which provider issued it, and whether the token is one it can trust:
-    ///
-    /// 1. not a compact JSON Web Token at all (`service_common::jwt`, the tree's one
-    ///    reading of one), or a token carrying no readable `exp` claim, which an ID token
-    ///    is required to carry: `InvalidIdentityToken`, HTTP 400.
-    /// 2. a token whose `exp` is at or before `now`: `ExpiredTokenException`, HTTP 400. An
-    ///    expired token is expired WHATEVER its signature, so the claim is read from a
-    ///    token nothing signed too (`jwt::read_unsecured`) and this decision is taken
-    ///    before the signature is considered. The message states both instants as the
-    ///    NumericDate seconds the claim is written in — the clock's and the token's own, so
-    ///    the caller can see by how much it missed.
-    /// 3. a token whose `iss` names an identity provider the ACCOUNT has not registered:
-    ///    `InvalidIdentityToken`, HTTP 400, naming the issuer the token claims. An OpenID
-    ///    Connect provider is registered with `iam:CreateOpenIDConnectProvider`, which is
-    ///    what tells the account's roles that the issuer may be trusted at all, and the
-    ///    Amazon Cognito Identity issuer needs no registration because every account's
-    ///    Cognito identity pools are issued by it. Read from IAM's own provider records in
-    ///    the same engine, so registering a provider is what makes its tokens resolvable.
-    /// 4. anything else: `InvalidIdentityToken`, HTTP 400, because the token is not one
-    ///    this emulator issued and it cannot establish that the registered issuer did. A
-    ///    JWS is verified against the key its issuer publishes at that issuer's key-set
-    ///    endpoint; this emulator makes no request outside itself, so it holds no issuer's
-    ///    verification key, and a token whose signature nobody checked must not be
-    ///    federated into credentials. AWS answers this same error when the verification key
-    ///    cannot be retrieved.
-    fn refuse_token(
-        &self,
-        presented: &str,
-        now: ::std::time::SystemTime,
-    ) -> AssumeRoleWithWebIdentityError {
-        let invalid = |message: String| {
-            AssumeRoleWithWebIdentityErrorModeled::InvalidIdentityTokenException(
-                InvalidIdentityTokenException {
-                    message: Some(message),
-                },
-            )
-            .into()
-        };
-        let Ok(token) = ::service_common::jwt::read_unsecured(presented) else {
-            return invalid(UNREADABLE_TOKEN_MESSAGE.to_string());
-        };
-        let Some(expiry) = token.claims.get(EXPIRY_CLAIM).and_then(numeric_date) else {
-            return invalid(UNREADABLE_TOKEN_MESSAGE.to_string());
-        };
-        let at = unix_seconds(now);
-        if at >= expiry {
-            return AssumeRoleWithWebIdentityErrorModeled::ExpiredTokenException(
-                ExpiredTokenException {
-                    message: Some(format!(
-                        "Token expired: current date/time {at} must be before the expiration \
-                         date/time {expiry}"
-                    )),
-                },
-            )
-            .into();
-        }
-        let issuer = token.claim_str(ISSUER_CLAIM).unwrap_or_default().trim();
-        if issuer.is_empty() {
-            // An OpenID Connect ID token is required to name the principal that issued it
-            // (RFC 7519 §4.1.1), and a token naming none cannot be read against any
-            // provider's keys or condition keys at all.
-            return invalid(UNREADABLE_TOKEN_MESSAGE.to_string());
-        }
-        if !self.account_registered_issuer(issuer) {
-            return invalid(format!(
-                "No OpenIDConnect provider found in your account for {issuer}"
-            ));
-        }
-        invalid(UNVERIFIABLE_TOKEN_MESSAGE.to_string())
-    }
-
-    /// Whether the ACCOUNT can resolve `issuer` as an identity provider at all.
-    ///
-    /// Two ways it can: the account registered an IAM OpenID Connect provider for that
-    /// issuer — `iam:CreateOpenIDConnectProvider` keys one by the ARN its URL derives
-    /// ([`crate::state::web_identity_provider_name`] drops the scheme the same way) — or
-    /// the issuer is Amazon Cognito Identity's own, which every account's identity pools
-    /// are issued by and which is registered nowhere.
-    fn account_registered_issuer(&self, issuer: &str) -> bool {
-        let provider = crate::state::web_identity_provider_name(issuer);
-        if provider.is_empty() {
-            return false;
-        }
-        if provider == crate::state::COGNITO_IDENTITY_PROVIDER_NAME {
-            return true;
-        }
-        crate::state::iam_state(&*self.engine).is_some_and(|iam| {
-            iam.lock()
-                .open_id_connect_providers
-                .values()
-                .any(|record| crate::state::web_identity_provider_name(&record.url) == provider)
-        })
-    }
-}
-
-/// `at` as whole seconds since the Unix epoch, the unit a token's expiry claim is written
-/// in (RFC 7519 §2's NumericDate).
-fn unix_seconds(at: ::std::time::SystemTime) -> i64 {
-    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
-        .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
-}
-
-/// A claim written as RFC 7519 §2's NumericDate, in whole seconds.
+/// The modelled failure AWS answers for a token that stands for no web identity, and the
+/// sentence it states it with.
 ///
-/// A NumericDate is "a JSON numeric value representing the number of seconds from
-/// 1970-01-01T00:00:00Z UTC until the specified UTC date/time, ignoring leap seconds"
-/// where "non-integer values can be used" (§2) — an issuer that writes a fractional
-/// instant has written a valid one, so it is read and truncated to the whole seconds the
-/// refusal states. A claim that is not a JSON number at all is no NumericDate and reads
-/// as absent.
-fn numeric_date(value: &::serde_json::Value) -> Option<i64> {
-    if let Some(seconds) = value.as_i64() {
-        return Some(seconds);
+/// The CLASSES are decided by the verification itself
+/// ([`crate::state::web_identity::resolve`]); this is only which modelled error each class
+/// travels as. A token the clock has run out on is `ExpiredToken` / HTTP 400 — the one class
+/// with an error of its own — and every other class is `InvalidIdentityToken` / HTTP 400,
+/// told apart by the fixed text its class carries: a token nothing signed, a signature that
+/// did not check out, an issuer the account registered no provider for, a verification key
+/// that could not be retrieved, and a value that is no token at all.
+fn refuse_token(defect: crate::state::web_identity::TokenDefect) -> AssumeRoleWithWebIdentityError {
+    let message = Some(defect.message());
+    match defect {
+        crate::state::web_identity::TokenDefect::Expired { .. } => {
+            AssumeRoleWithWebIdentityErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                message,
+            })
+        }
+        _ => AssumeRoleWithWebIdentityErrorModeled::InvalidIdentityTokenException(
+            InvalidIdentityTokenException { message },
+        ),
     }
-    let seconds = value.as_f64()?;
-    if !seconds.is_finite() {
-        return None;
-    }
-    // A float-to-integer cast saturates at the integer's bounds rather than wrapping, so
-    // an instant beyond them reads as the nearest representable one.
-    Some(seconds.trunc() as i64)
+    .into()
 }
+
+// Why a presented value is not a web identity this emulator can federate, and the identity
+// a token it CAN federate names — the verification itself — live in
+// `crate::state::web_identity`: resolving a token means reading it against the key set its
+// issuer publishes, which is a question about the account's providers rather than about this
+// operation's inputs, and the handler above states only which modelled error each class it
+// answers travels as.

@@ -14,10 +14,14 @@
 //!
 //! RULE (the token): the presented web identity is classified by the token itself, in the
 //! order a verifier decides it — a value that is not a readable JSON Web Token (or carries
-//! no expiry claim) is `InvalidIdentityToken` / HTTP 400; a token whose expiry has passed is
-//! `ExpiredTokenException` / HTTP 400; and a token of valid form is still
-//! `InvalidIdentityToken` because its signature can only be checked against the key set its
-//! issuer publishes, which this emulator fetches from nowhere.
+//! no expiry or issuer claim) is `InvalidIdentityToken` / HTTP 400; a token whose expiry has
+//! passed is `ExpiredTokenException` / HTTP 400; a token NOTHING signed is
+//! `InvalidIdentityToken` saying unsigned JWTs are not accepted; a token naming an issuer the
+//! account registered no provider for is `InvalidIdentityToken` naming that issuer; and a
+//! signed token of a resolvable issuer is verified against the key set that issuer publishes
+//! — which for an issuer OUTSIDE this emulator cannot be retrieved at all, the one class the
+//! key-retrieval message is worded for. `web_identity_verification.rs` owns the rows where
+//! the key set IS readable, because the issuer is a user pool this emulator serves.
 //!
 //! The rows differ along what those rules generalise over: for routing, which signal the
 //! request carries and which path and method it uses; for the token, its segment structure,
@@ -38,7 +42,7 @@ const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 /// One UNSIGNED awsQuery call: the request a client with no Amazon Web Services credential
 /// makes, carrying no `Authorization` header at all and addressed only by the emulator's
 /// own authority.
-async fn unsigned_call(
+pub(crate) async fn unsigned_call(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(&str, String)],
@@ -63,7 +67,7 @@ async fn unsigned_call(
 }
 
 /// One base64url segment, unpadded, as a compact JWS carries it (RFC 7515 §2).
-fn segment(value: &str) -> String {
+pub(crate) fn segment(value: &str) -> String {
     aws_smithy_types::base64::encode(value)
         .trim_end_matches('=')
         .replace('+', "-")
@@ -106,6 +110,9 @@ fn role_arn() -> String {
 const UNREADABLE_TOKEN_MESSAGE: &str =
     "The ID Token provided is not a valid JWT. (You may see this error if you sent an \
      Access Token)";
+
+/// How AWS words the refusal of a token NOTHING signed: RFC 7519 §6's unsecured JWT.
+const UNSIGNED_TOKEN_MESSAGE: &str = "We don't accept unsigned JWTs";
 
 /// How AWS words the refusal of a token whose signature it could not check.
 const UNVERIFIABLE_TOKEN_MESSAGE: &str =
@@ -162,8 +169,8 @@ async fn an_unsigned_assume_role_with_web_identity_is_classified_by_its_token() 
             UNREADABLE_TOKEN_MESSAGE.to_string(),
         ),
         (
-            // RFC 7519 §6's unsecured JWT: it declares no signature, so there is none to
-            // verify — and that is a signature failure, not an unreadable value.
+            // RFC 7519 §6's unsecured JWT: nothing signed it, which is its own refusal and
+            // not the one for a key that could not be read.
             "the unsecured algorithm, unexpired, from the Cognito issuer",
             format!(
                 "{}.{}.",
@@ -171,7 +178,7 @@ async fn an_unsigned_assume_role_with_web_identity_is_classified_by_its_token() 
                 segment(&unexpired(COGNITO_ISSUER))
             ),
             "InvalidIdentityToken",
-            UNVERIFIABLE_TOKEN_MESSAGE.to_string(),
+            UNSIGNED_TOKEN_MESSAGE.to_string(),
         ),
         (
             // The expiry decides before the signature does: an expired token is expired
@@ -188,6 +195,8 @@ async fn an_unsigned_assume_role_with_web_identity_is_classified_by_its_token() 
             format!("must be before the expiration date/time {expired_at}"),
         ),
         (
+            // An empty signature segment is the same unsecured form: nothing signed it,
+            // whatever its header names.
             "an empty signature segment, unexpired, from the Cognito issuer",
             format!(
                 "{}.{}.",
@@ -195,7 +204,7 @@ async fn an_unsigned_assume_role_with_web_identity_is_classified_by_its_token() 
                 segment(&unexpired(COGNITO_ISSUER))
             ),
             "InvalidIdentityToken",
-            UNVERIFIABLE_TOKEN_MESSAGE.to_string(),
+            UNSIGNED_TOKEN_MESSAGE.to_string(),
         ),
         (
             // An OpenID Connect ID token is required to carry an expiry.

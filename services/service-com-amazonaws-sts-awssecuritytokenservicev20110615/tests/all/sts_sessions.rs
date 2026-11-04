@@ -17,6 +17,8 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 use smithy_server_runtime::MultiServiceRouter;
 use sts::state::{ComAmazonawsStsAwssecuritytokenservicev20110615State as StsState, Identity, Session, SessionKind};
 
+use super::packed_policy_budget::packed_token_bytes;
+
 /// The account every long-term key of this emulator lives in.
 pub(crate) fn emulator_account() -> String {
     engine::emulator_account_id().to_string()
@@ -565,6 +567,20 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
         "x".repeat(4100)
     );
 
+    // The percentage of the 4,096-byte packed token budget a serialized session state of
+    // this many bytes takes up, rounded up as the service reports it
+    // (`packed_policy_budget` owns the measurement itself).
+    let percent_of_budget = |packed: usize| {
+        i32::try_from(packed.saturating_mul(100).div_ceil(4096)).expect("a percentage fits")
+    };
+    let packed_small_policy =
+        percent_of_budget(packed_token_bytes(Some(&small_policy), &[], &[]));
+    let packed_one_tag = percent_of_budget(packed_token_bytes(
+        None,
+        &[],
+        &[("team".to_string(), "platform".to_string())],
+    ));
+
     // One row: case name, action, the extra form parameters, and the expected status,
     // error `<Code>` and `PackedPolicySize`.
     type PolicyCase = (
@@ -597,7 +613,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            Some(1),
+            Some(packed_small_policy),
         ),
         (
             "assume-role, tags only",
@@ -610,7 +626,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            Some(1),
+            Some(packed_one_tag),
         ),
         (
             "assume-role, a policy past its plaintext limit",
@@ -680,7 +696,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            Some(1),
+            Some(packed_small_policy),
         ),
         (
             "federation-token, a policy that is not JSON",

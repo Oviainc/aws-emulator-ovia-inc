@@ -15602,6 +15602,7 @@ dependencies = [
  "http",
  "regex",
  "serde_json",
+ "service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-common",
  "sha2 0.10.9",

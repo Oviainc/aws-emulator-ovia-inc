@@ -64,3 +64,6 @@ mod trust_policy_convergence;
 
 #[path = "all/web_identity_federation.rs"]
 mod web_identity_federation;
+
+#[path = "all/web_identity_verification.rs"]
+mod web_identity_verification;

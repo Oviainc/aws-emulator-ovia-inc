@@ -25,7 +25,7 @@
 //! pattern) are rows among them.
 
 use super::malformed_session_policy::decode_xml_text;
-use super::packed_policy_budget::policy_of;
+use super::packed_policy_budget::{packed_token_bytes, policy_of};
 use super::sts_sessions::{call, element, emulator, member, seed_demo_role, LONG_TERM_KEY};
 
 /// The role every row mints against, seeded in the IAM store of the shared engine.
@@ -126,11 +126,13 @@ async fn an_inline_policy_over_its_plaintext_limit_is_refused_before_anything_is
             true,
         ),
         (
-            // Two bytes per character: the limit is on CHARACTERS, so this is within it
-            // even though it occupies more bytes than the limit.
-            "assume-role, a multi-byte policy at the plaintext limit",
+            // Two bytes per character: the limit is on CHARACTERS, so a document of 1,500
+            // of them is within it even though it occupies 2,963 bytes — more than the
+            // limit would admit if it counted bytes — and its packed token still fits the
+            // separate byte budget, which is the other rule.
+            "assume-role, a multi-byte policy within the plaintext limit",
             "AssumeRole",
-            multibyte_policy_of(MAX_PLAINTEXT_CHARS),
+            multibyte_policy_of(1_500),
             false,
         ),
         (
@@ -189,13 +191,13 @@ async fn an_inline_policy_over_its_plaintext_limit_is_refused_before_anything_is
                  {body}",
                 policy.chars().count()
             );
+            let packed = packed_token_bytes(Some(&policy), &[], &[]);
             let reported = member(case, &body, "PackedPolicySize");
             assert_eq!(
                 reported,
-                percent_of_budget(policy.len()).to_string(),
-                "case {case:?}: expected {} packed bytes as a percentage of the budget, got \
-                 {reported:?} in {body}",
-                policy.len()
+                percent_of_budget(packed).to_string(),
+                "case {case:?}: expected {packed} packed bytes as a percentage of the budget, got \
+                 {reported:?} in {body}"
             );
         }
     }
@@ -280,20 +282,22 @@ async fn every_mint_reports_the_packed_size_it_measured() {
         Vec<(&'static str, String)>,
         usize,
     );
+    let one_tag = [(tag_key.to_string(), tag_value.to_string())];
+    let one_arn = [managed_arn.to_string()];
     let rows: Vec<PackedRow> = vec![
         ("assume-role, nothing packed at all", "AssumeRole", vec![], 0),
         (
             "assume-role, an inline policy only",
             "AssumeRole",
             vec![("Policy", policy.clone())],
-            policy.len(),
+            packed_token_bytes(Some(&policy), &[], &[]),
         ),
         (
             // The recorded case: managed policy ARNs and no inline policy.
             "assume-role, a managed policy ARN only",
             "AssumeRole",
             vec![("PolicyArns.member.1.arn", managed_arn.to_string())],
-            managed_arn.len(),
+            packed_token_bytes(None, &one_arn, &[]),
         ),
         (
             "assume-role, a session tag only",
@@ -302,7 +306,7 @@ async fn every_mint_reports_the_packed_size_it_measured() {
                 ("Tags.member.1.Key", tag_key.to_string()),
                 ("Tags.member.1.Value", tag_value.to_string()),
             ],
-            tag_key.len() + tag_value.len(),
+            packed_token_bytes(None, &[], &one_tag),
         ),
         (
             "assume-role, a policy, an ARN and a tag together",
@@ -313,7 +317,7 @@ async fn every_mint_reports_the_packed_size_it_measured() {
                 ("Tags.member.1.Key", tag_key.to_string()),
                 ("Tags.member.1.Value", tag_value.to_string()),
             ],
-            policy.len() + managed_arn.len() + tag_key.len() + tag_value.len(),
+            packed_token_bytes(Some(&policy), &one_arn, &one_tag),
         ),
         (
             "federation-token, nothing packed at all",
@@ -325,7 +329,7 @@ async fn every_mint_reports_the_packed_size_it_measured() {
             "federation-token, an inline policy only",
             "GetFederationToken",
             vec![("Policy", policy.clone())],
-            policy.len(),
+            packed_token_bytes(Some(&policy), &[], &[]),
         ),
         (
             "federation-token, a managed policy ARN and a tag",
@@ -335,7 +339,7 @@ async fn every_mint_reports_the_packed_size_it_measured() {
                 ("Tags.member.1.Key", tag_key.to_string()),
                 ("Tags.member.1.Value", tag_value.to_string()),
             ],
-            managed_arn.len() + tag_key.len() + tag_value.len(),
+            packed_token_bytes(None, &one_arn, &one_tag),
         ),
     ];
 
