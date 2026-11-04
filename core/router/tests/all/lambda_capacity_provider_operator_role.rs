@@ -4,10 +4,15 @@
 //!
 //! RULE: `CreateCapacityProvider` resolves the IAM role its `PermissionsConfig` names
 //! against this account's IAM records before it writes, and refuses the create with
-//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — unless IAM reports a
-//! role whose trust policy lets `lambda.amazonaws.com` perform `sts:AssumeRole` on it. The
-//! provider manages compute instances AS that role, so a role the account does not hold, or
-//! one that does not let this service assume it, cannot be the role a stored provider names.
+//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — when IAM reports a
+//! role whose trust policy does NOT let `lambda.amazonaws.com` perform `sts:AssumeRole`
+//! on it. The provider manages compute instances AS that role, so a role that does not
+//! let this service assume it cannot be the role a stored provider names.
+//!
+//! The refusal is grounded in a trust document IAM ANSWERED with: a role this account's
+//! IAM holds no record of, and a role of another account, are no evidence about the role
+//! the caller named, so both are served and stored as supplied — the same reading
+//! `all/lambda_execution_role_trust.rs` pins for a function's execution role.
 //!
 //! The refusal's message is wholly fixed text: it names neither the role nor which half of
 //! the question failed.
@@ -233,9 +238,16 @@ fn rows() -> Vec<Row> {
             accepted: false,
         },
         Row {
+            // A name this account's IAM holds no role under is no evidence about the
+            // role the caller named — an operator role is normally provisioned outside
+            // the client that creates the provider — and a refusal has to be grounded in
+            // a trust document IAM answered with, which is the rule the sibling suite
+            // `lambda_execution_role_trust` pins for this service's execution role and
+            // the one `crate::state::execution_role_is_unassumable` implements. So this
+            // one is served, exactly as another account's role below is.
             case: "a role this account's IAM holds none of",
             role: Role::AbsentFromIam,
-            accepted: false,
+            accepted: true,
         },
         Row {
             // Nothing is KNOWN about another account's role — its IAM is not this

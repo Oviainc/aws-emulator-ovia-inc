@@ -60,7 +60,15 @@
 
 pub mod authorization;
 pub mod connector_delivery;
+pub mod connector_plane;
+pub mod remote_storage;
 pub mod sftp_target;
+pub mod workflow_runs;
+
+/// One run of a workflow, and the store the runs live in: they are their own concern,
+/// in [`workflow_runs`], and re-exported here so every reader of this module's state
+/// names them the way it always has.
+pub use workflow_runs::WorkflowExecution;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -76,13 +84,6 @@ use crate::ops::types::{
     SftpPortWithOptions, Tag, UpdateConnectorEgressConfig, WebAppUnits, WorkflowDetails,
     WorkflowStep,
 };
-
-/// The file location and the session details an execution record reports, named through
-/// their module rather than added to the shared `use` list above: that list is edited by
-/// every change this crate's services make, and an execution record is the only reader
-/// of these two shapes.
-use crate::ops::types::FileLocation as ExecutionFileLocation;
-use crate::ops::types::ServiceMetadata as ExecutionServiceMetadata;
 
 /// The region used for an ARN when the request carries no SigV4 credential scope to
 /// read one from. Matches the region the emulator's generated SDK profile uses.
@@ -1852,6 +1853,51 @@ pub fn resolve_sftp_connector_config(requested: SftpConnectorConfig) -> SftpConn
     }
 }
 
+/// Apply the `SftpConfig` an update NAMES onto the SFTP settings the connector already
+/// has.
+///
+/// An update MODIFIES the members it names and leaves the others as they stand, which
+/// is the rule the documented provisioning sequence requires: `TrustedHostKeys` is
+/// "optional for `CreateConnector`. If not provided, you can use `TestConnection` to
+/// retrieve the server host key during the initial connection attempt, and subsequently
+/// update the connector with the observed host key" — so an update that names only that
+/// key must leave the connector the credential it already had, otherwise the very
+/// sequence the model documents leaves the connector unusable. The same rule
+/// [`merge_connector_egress_config`] and [`merge_protocol_details`] follow for the other
+/// nested configuration this service holds.
+///
+/// `MaxConcurrentConnections` is the one member the model gives a default (`@default(1)`),
+/// so an omitted one arrives AS that default and cannot be told from a value the caller
+/// chose: an update that names nothing above it therefore leaves the setting as it
+/// stands. The create-time resolution runs over the result, so the stored settings stay
+/// fully materialised.
+pub fn merge_sftp_connector_config(
+    stored: Option<&SftpConnectorConfig>,
+    requested: SftpConnectorConfig,
+) -> SftpConnectorConfig {
+    let Some(stored) = stored else {
+        return resolve_sftp_connector_config(requested);
+    };
+    resolve_sftp_connector_config(SftpConnectorConfig {
+        user_secret_id: requested
+            .user_secret_id
+            .or_else(|| stored.user_secret_id.clone()),
+        trusted_host_keys: requested
+            .trusted_host_keys
+            .or_else(|| stored.trusted_host_keys.clone()),
+        ordered_user_secret_version_stages: requested
+            .ordered_user_secret_version_stages
+            .or_else(|| stored.ordered_user_secret_version_stages.clone()),
+        max_concurrent_connections: if requested.max_concurrent_connections
+            > DEFAULT_MAX_CONCURRENT_CONNECTIONS
+        {
+            requested.max_concurrent_connections
+        } else {
+            stored.max_concurrent_connections
+        },
+    })
+}
+
 // -----------------------------------------------------------------------------
 // Testing an SFTP connector's connection
 // -----------------------------------------------------------------------------
@@ -2177,12 +2223,10 @@ impl ConnectorTransfer {
                     .flatten();
                 ConnectorFileTransferResult {
                     file_path: file_path.clone(),
-                    status_code: reported
-                        .as_ref()
-                        .map_or_else(
-                            || TRANSFER_STATUS_QUEUED.to_string(),
-                            |outcome| outcome.status_code.clone(),
-                        ),
+                    status_code: reported.as_ref().map_or_else(
+                        || TRANSFER_STATUS_QUEUED.to_string(),
+                        |outcome| outcome.status_code.clone(),
+                    ),
                     failure_code: reported.as_ref().and_then(|o| o.failure_code.clone()),
                     failure_message: reported.and_then(|o| o.failure_message),
                 }
@@ -3168,74 +3212,6 @@ impl WebAppCustomization {
     }
 }
 
-/// One workflow execution's custom-step callbacks, keyed by `(WorkflowId,
-/// ExecutionId)`.
-///
-/// A custom workflow step hands its target resource an `ExecutionId`, a `WorkflowId`
-/// and a `Token`, and the step stays pending until `SendWorkflowStepState` reports an
-/// outcome for that token. An execution exists only while a workflow runs over an
-/// uploaded file, so this is the state that callback is resolved against — and the
-/// record `ListExecutions` projects one `ListedExecution` from.
-#[derive(Debug, Clone, Default)]
-pub struct WorkflowExecution {
-    pub workflow_id: String,
-    pub execution_id: String,
-    /// "the file location when the execution begins" (`ListedExecution`
-    /// `InitialFileLocation`) — the uploaded file the run started on. `None` for a run
-    /// recorded with no file location, which reports none rather than an empty
-    /// structure.
-    pub initial_file_location: Option<ExecutionFileLocation>,
-    /// "the session details that are associated with a workflow": the server, user and
-    /// session the upload that started this run arrived on. `None` when the record
-    /// carries none.
-    pub service_metadata: Option<ExecutionServiceMetadata>,
-    /// The outcome reported for each pending custom step, by the `Token` that step was
-    /// handed: `None` until its callback arrives, then the `CustomStepStatus` it
-    /// carried. A token this map does not hold addresses no custom step of this
-    /// execution.
-    pub step_states: BTreeMap<String, Option<String>>,
-}
-
-impl WorkflowExecution {
-    /// The `ExecutionStatus` a reader reports for this run, DERIVED from the custom-step
-    /// callbacks recorded on it rather than stored — like `UserCount`, so it cannot go
-    /// stale when a callback arrives.
-    ///
-    /// The custom-step callbacks are the WHOLE of what a run waits on: a custom step is
-    /// the one step type that hands its target a `Token` and stays pending until
-    /// `SendWorkflowStepState` reports an outcome for it, while every other
-    /// `WorkflowStepType` (`COPY`, `TAG`, `DELETE`, `DECRYPT`) is applied by the service
-    /// itself with nothing to wait for. So:
-    ///
-    /// * a step that reported `FAILURE` is the "exception encountered" the
-    ///   `ExecutionStatus` value `EXCEPTION` names;
-    /// * a run whose every custom step has reported `SUCCESS` has nothing left to wait
-    ///   for, so it is `COMPLETED` — vacuously so for a run with no custom step at all,
-    ///   which is a workflow of non-custom steps alone;
-    /// * otherwise a step is still pending and the run is `IN_PROGRESS`.
-    ///
-    /// `HANDLING_EXCEPTION` is never reported: it is the window a run spends executing
-    /// its `OnExceptionSteps`, and this emulator executes no step, so no record it holds
-    /// is inside that window.
-    pub fn reported_status(&self) -> &'static str {
-        let reported_failure = self
-            .step_states
-            .values()
-            .any(|outcome| outcome.as_deref() == Some(CUSTOM_STEP_STATUS_FAILURE));
-        let every_step_succeeded = self
-            .step_states
-            .values()
-            .all(|outcome| outcome.as_deref() == Some(CUSTOM_STEP_STATUS_SUCCESS));
-        if reported_failure {
-            EXECUTION_STATUS_EXCEPTION
-        } else if every_step_succeeded {
-            EXECUTION_STATUS_COMPLETED
-        } else {
-            EXECUTION_STATUS_IN_PROGRESS
-        }
-    }
-}
-
 /// The first documented step requirement a submitted step LIST violates, worded as the
 /// refusal states it — `None` when every step satisfies them.
 ///
@@ -3557,63 +3533,6 @@ impl ComAmazonawsTransferTransferserviceState {
             .range((Bound::Included(lower), Bound::Unbounded))
             .take_while(move |((sid, _), _)| sid == server_id)
             .map(|(_, host_key)| host_key)
-    }
-
-    /// The executions stored for `workflow_id`, in `ListExecutions` paging order.
-    ///
-    /// A RANGE scan over that workflow's contiguous run of the execution map, on the
-    /// same rule as [`Self::users_of`].
-    pub fn executions_of<'a>(
-        &'a self,
-        workflow_id: &'a str,
-    ) -> impl Iterator<Item = &'a WorkflowExecution> + 'a {
-        use ::std::ops::Bound;
-        let lower = (workflow_id.to_string(), String::new());
-        self.workflow_executions
-            .range((Bound::Included(lower), Bound::Unbounded))
-            .take_while(move |((wid, _), _)| wid == workflow_id)
-            .map(|(_, execution)| execution)
-    }
-
-    /// Whether `workflow_id` can take another execution, RECLAIMING finished runs when
-    /// a bound has been reached.
-    ///
-    /// The execution store is bounded twice — per workflow
-    /// ([`MAX_EXECUTIONS_PER_WORKFLOW`]) and in total ([`MAX_STORED_EXECUTIONS`]) — so
-    /// a caller that keeps uploading cannot grow it without end. At a bound, the runs
-    /// whose custom-step callbacks have FINISHED are released first: `DescribeExecution`
-    /// "only returns details for in-progress workflows", so a finished run is a record
-    /// nothing addresses any more, and releasing it is what lets the next upload run.
-    /// `false` when even that leaves no room, and then no execution is started: a
-    /// record the store cannot hold is not written, exactly as every other `MAX_*` bound
-    /// in this module refuses rather than growing.
-    ///
-    /// Called by the one writer that starts a run
-    /// ([`connector_delivery`]), under the same lock the record is
-    /// inserted through.
-    pub fn take_execution_capacity(&mut self, workflow_id: &str) -> bool {
-        if !self.has_execution_capacity(workflow_id) {
-            self.workflow_executions
-                .retain(|_, execution| execution.reported_status() == EXECUTION_STATUS_IN_PROGRESS);
-        }
-        self.has_execution_capacity(workflow_id)
-    }
-
-    /// Whether both execution bounds have room for one more run of `workflow_id`.
-    fn has_execution_capacity(&self, workflow_id: &str) -> bool {
-        self.workflow_executions.len() < MAX_STORED_EXECUTIONS
-            && self.executions_of(workflow_id).count() < MAX_EXECUTIONS_PER_WORKFLOW
-    }
-
-    /// Release every execution of `workflow_id`.
-    ///
-    /// A deleted workflow has no runs: an execution is addressed by its
-    /// `(WorkflowId, ExecutionId)` pair, so once the workflow is gone nothing can
-    /// resolve one of its records, and `DeleteWorkflow` releases them with it — the
-    /// same rule `DeleteConnector` follows for a connector's accepted transfers.
-    pub fn release_executions_of(&mut self, workflow_id: &str) {
-        self.workflow_executions
-            .retain(|(wid, _), _| wid != workflow_id);
     }
 
     /// Whether `server_id` can take another host key, i.e. is below

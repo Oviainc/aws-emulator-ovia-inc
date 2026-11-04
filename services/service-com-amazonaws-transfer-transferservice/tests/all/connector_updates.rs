@@ -227,15 +227,22 @@ async fn an_update_replaces_the_members_it_names_and_leaves_the_rest() {
             }),
         ),
         (
-            "an SftpConfig that leaves MaxConcurrentConnections out takes its documented \
-             default of 1, with no trusted host key at all",
+            "an SftpConfig that names only the user secret MODIFIES that member and \
+             leaves the rest of the configuration as it stands, which is what the \
+             documented host-key provisioning sequence needs",
             json!({"SftpConfig": {"UserSecretId": "sftp-partner-credentials"}}),
             json!({
-                // Compared exactly: the trusted host keys and secret version stages the
-                // previous row set are gone with the configuration they belonged to.
+                // Compared exactly: the trusted host keys, the secret version stages and
+                // the concurrency the previous row set are all still there, because this
+                // update names none of them.
                 "SftpConfig": {
                     "UserSecretId": "sftp-partner-credentials",
-                    "MaxConcurrentConnections": 1,
+                    "MaxConcurrentConnections": 5,
+                    "TrustedHostKeys": [
+                        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==",
+                        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=",
+                    ],
+                    "OrderedUserSecretVersionStages": ["AWSCURRENT", "AWSPREVIOUS"],
                 },
             }),
         ),

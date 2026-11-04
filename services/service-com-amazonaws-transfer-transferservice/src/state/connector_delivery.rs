@@ -49,7 +49,7 @@ use crate::state::sftp_target;
 /// store bounds in [`crate::state`]: a delivery that is still running when it elapses
 /// is given up on rather than held open, and the files it never reported on stay
 /// `QUEUED`, because nothing transferred them.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const DELIVERY_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How many deliveries this process may have in flight at once.
 ///
@@ -59,7 +59,7 @@ const DELIVERY_DEADLINE: Duration = Duration::from_secs(60);
 /// `StartFileTransfer` cannot spawn tasks without end. An accepted transfer that finds
 /// every permit taken is not delivered and says so in the log, which leaves its files
 /// `QUEUED` — the same outcome as an endpoint nothing can connect to.
-const MAX_IN_FLIGHT_DELIVERIES: usize = 8;
+pub(crate) const MAX_IN_FLIGHT_DELIVERIES: usize = 8;
 
 /// How many deliveries are in flight right now; see [`MAX_IN_FLIGHT_DELIVERIES`].
 static IN_FLIGHT_DELIVERIES: ::std::sync::atomic::AtomicUsize =
@@ -68,12 +68,12 @@ static IN_FLIGHT_DELIVERIES: ::std::sync::atomic::AtomicUsize =
 /// One task's claim on an in-flight permit, released when the task ends — including
 /// when it ends by panicking, by timing out or by being dropped at runtime shutdown,
 /// because the release is a `Drop`.
-struct DeliveryPermit;
+pub(crate) struct DeliveryPermit;
 
 impl DeliveryPermit {
     /// Claim a permit, or `None` when [`MAX_IN_FLIGHT_DELIVERIES`] are already in
     /// flight.
-    fn claim() -> Option<Self> {
+    pub(crate) fn claim() -> Option<Self> {
         IN_FLIGHT_DELIVERIES
             .try_update(
                 ::std::sync::atomic::Ordering::SeqCst,
@@ -330,7 +330,7 @@ async fn transfer_one(
 }
 
 /// The failed outcome an S3 answer earns: the code and message that answer carried.
-fn failure<E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata>(
+pub(crate) fn failure<E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata>(
     error: &E,
 ) -> st::ConnectorFileOutcome {
     st::ConnectorFileOutcome::failed(
@@ -377,7 +377,7 @@ fn remote_destination(
 /// Amazon S3 bucket or EFS path" the user sees its own, so the remote path IS the
 /// storage path — and only within the user's own home directory, the one tree that
 /// user can write to.
-fn user_path_target(user: &st::User, remote_path: &str) -> Option<String> {
+pub(crate) fn user_path_target(user: &st::User, remote_path: &str) -> Option<String> {
     if user.home_directory_type.as_deref() == Some(st::HOME_DIRECTORY_TYPE_LOGICAL) {
         return logical_target(&user.home_directory_mappings, remote_path);
     }
@@ -413,10 +413,12 @@ fn is_within(directory: &str, path: &str) -> bool {
 /// example, `amzn-s3-demo-bucket/myfile.txt`", and the same `/bucket/key` form is what
 /// a path on a Transfer Family server's S3 domain resolves to; a leading slash is part
 /// of neither. `None` for a path that names no object (no key at all).
+///
+/// Read through [`super::remote_storage::object_path`], the ONE parse every connector
+/// path of this service becomes an object address through, so a path this accepts is
+/// one that stays inside the bucket it names.
 pub fn split_storage_path(path: &str) -> Option<(String, String)> {
-    let trimmed = path.trim_start_matches('/');
-    let (bucket, key) = trimmed.split_once('/')?;
-    (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
+    super::remote_storage::object_path(path).map(|object| (object.bucket, object.key))
 }
 
 /// One `CUSTOM` step of a started execution, and what it is invoked with.
@@ -623,7 +625,7 @@ async fn invoke_custom_step(
 /// An Amazon S3 client over the IN-PROCESS callback into this same emulator: the
 /// storage a transfer reads from and writes to is this emulator's own, so the transfer
 /// never leaves the process. Same client policy as [`lambda_client`].
-fn s3_client(
+pub(crate) fn s3_client(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_s3::Client {

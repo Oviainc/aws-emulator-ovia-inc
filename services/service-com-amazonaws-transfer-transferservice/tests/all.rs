@@ -123,6 +123,16 @@ mod connector_deletion;
 // where every concurrent change inserts. Fold it into the list once the churn settles.
 #[path = "all/certificate_import.rs"]
 mod certificate_import;
+// `connector_remote_operations` is declared HERE rather than in its alphabetical place
+// beside the other `connector_*` suites, for the reason the notes above record: the
+// sorted list is where every concurrent change inserts. Fold it into the list once the
+// churn settles.
+#[path = "all/connector_remote_operations.rs"]
+mod connector_remote_operations;
+// `connector_plane`, likewise: the provisioning update that brings a connector into
+// service.
+#[path = "all/connector_plane.rs"]
+mod connector_plane;
 // `connector_gated_workflow` is declared HERE rather than beside the other
 // `connector_*` suites, for the reason the notes above record: the sorted list is where
 // every concurrent change inserts. Fold it into the list once the churn settles.

@@ -177,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
-
         // The connector is the resource the request is addressed at, so it is resolved
         // FIRST: a `ConnectorId` the store does not hold is not found — never a service
         // fault, and never a failed test. The record is taken out from under the lock,

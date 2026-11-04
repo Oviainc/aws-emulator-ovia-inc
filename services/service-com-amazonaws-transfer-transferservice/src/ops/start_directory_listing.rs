@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDirectoryListing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDirectoryListing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDirectoryListing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts a directory listing for a STORED connector and answers the `ListingId` it is
+//! recorded under, with the name of the file the results are written to: "the naming
+//! convention for the output file is connector-ID-listing-ID.json", which is what the
+//! modelled `OutputFileName` pattern `^c-([0-9a-f]{17})-[0-9a-zA-Z./-]+.json$` spells.
+//! A `ConnectorId` the store does not hold is not found.
+//!
+//! Both paths are paths on their own side of the connection — the directory to list on
+//! the remote server, and "the path (bucket and prefix) in Amazon S3 storage to store
+//! the results" — and a relative one names nothing, so it is refused with the modelled
+//! `InvalidRequestException` (400) on the same rule `StartRemoteMove` applies.
+//!
+//! The listing itself runs against the endpoint the connector's `Url` names, on a task
+//! of its own (`crate::state::connector_plane`), exactly as an accepted transfer does:
+//! where that endpoint is an SFTP server this emulator serves, it lists "all files and
+//! directories in the remote directory (up to the maximum value), but […] not files or
+//! folders in sub-directories", writes the documented document to the output file, and
+//! the record reports the TERMINAL status of the listing. An endpoint outside this
+//! emulator is one nothing can connect to, so nothing is attempted and the record stays
+//! `QUEUED`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +190,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDirectoryListing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDirectoryListingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDirectoryListing"))
+        use crate::state as st;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            StartDirectoryListingErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let now = ::std::time::Instant::now();
+
+        let mut guard = state.lock();
+
+        // The connector is resolved FIRST: it is the resource the request is addressed
+        // at, and a `ConnectorId` the store does not hold is not found.
+        let Some(connector) = guard.connectors.get(&input.connector_id) else {
+            return Err(st::not_found(
+                StartDirectoryListingErrorModeled::ResourceNotFoundException(
+                    st::unknown_connector(&input.connector_id),
+                ),
+            ));
+        };
+        let sftp_config = connector.sftp_config.clone();
+        let connector_url = connector.url.clone();
+
+        // Each path is resolved from the root of the storage it belongs to, so a
+        // relative one names no directory there.
+        for (member, path) in [
+            ("RemoteDirectoryPath", &input.remote_directory_path),
+            ("OutputDirectoryPath", &input.output_directory_path),
+        ] {
+            if !st::is_absolute_remote_path(path) {
+                return Err(StartDirectoryListingErrorModeled::InvalidRequestException(
+                    st::remote_path_must_be_absolute(member),
+                )
+                .into());
+            }
+        }
+
+        // The per-connector record set is BOUNDED, exactly as it is for a transfer.
+        if !guard.connector_has_transfer_capacity(&input.connector_id) {
+            return Err(
+                StartDirectoryListingErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(format!(
+                            "this emulator already holds the maximum of {} accepted \
+                             transfers for one connector",
+                            st::MAX_TRANSFERS_PER_CONNECTOR
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The directory the listing addresses is the one path this operation acts on, so
+        // it is the one whose status the record carries.
+        let listing_id = guard.accept_connector_transfer(
+            &input.connector_id,
+            vec![input.remote_directory_path.clone()],
+            now,
+        );
+        drop(guard);
+
+        // "This is a combination of the connector ID and the listing ID" — built once,
+        // here, so the name the call answers is the name the results are written under.
+        let output_file_name = format!("{}-{listing_id}.json", input.connector_id);
+
+        // The listing itself runs against the endpoint the connector names, on a task of
+        // its own, exactly as an accepted transfer does. An AS2 connector configures no
+        // SFTP endpoint, so there is no remote directory to list.
+        if let Some(sftp_config) = sftp_config {
+            st::connector_plane::spawn(
+                ctx,
+                state.clone(),
+                st::connector_plane::RemoteOperation {
+                    region: st::request_region(ctx.parts()),
+                    connector_id: input.connector_id,
+                    operation_id: listing_id.clone(),
+                    url: connector_url,
+                    sftp_config,
+                    work: st::connector_plane::RemoteWork::Listing {
+                        remote_directory_path: input.remote_directory_path,
+                        output_directory_path: input.output_directory_path,
+                        output_file_name: output_file_name.clone(),
+                        max_items: input.max_items,
+                    },
+                },
+            );
+        }
+
+        Ok(StartDirectoryListingOutput {
+            listing_id,
+            output_file_name,
+        })
     }
 }

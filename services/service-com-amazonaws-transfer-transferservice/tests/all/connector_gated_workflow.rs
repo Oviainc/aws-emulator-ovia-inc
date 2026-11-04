@@ -53,14 +53,14 @@ use crate::harness::{
 
 /// `Status`'s two documented values ("Returns OK for successful test, or ERROR if the
 /// test fails").
-const STATUS_OK: &str = "OK";
+pub(crate) const STATUS_OK: &str = "OK";
 const STATUS_ERROR: &str = "ERROR";
 
 /// `TransferTableStatus` values (`smithy_query(query="shape",
 /// shape="TransferTableStatus")` -> `[QUEUED, IN_PROGRESS, COMPLETED, FAILED]`).
-const QUEUED: &str = "QUEUED";
-const COMPLETED: &str = "COMPLETED";
-const FAILED: &str = "FAILED";
+pub(crate) const QUEUED: &str = "QUEUED";
+pub(crate) const COMPLETED: &str = "COMPLETED";
+pub(crate) const FAILED: &str = "FAILED";
 
 /// `ExecutionStatus` values this suite asserts (the enum is
 /// `[IN_PROGRESS, COMPLETED, EXCEPTION, HANDLING_EXCEPTION]`).
@@ -68,7 +68,7 @@ const IN_PROGRESS: &str = "IN_PROGRESS";
 
 /// Wait out the span an accepted transfer takes before its outcome is reported,
 /// whatever `src/state.rs` sets it to.
-const PAST_TRANSFER_SPAN: Duration =
+pub(crate) const PAST_TRANSFER_SPAN: Duration =
     st::CONNECTOR_TRANSFER_SPAN.saturating_add(SETTLE_MARGIN);
 
 /// Wait out the span a server spends `STARTING` after `CreateServer`.
@@ -82,13 +82,13 @@ const CUSTOM_STEP_TARGET: &str = "arn:aws:lambda:us-east-1:000000000000:function
 
 /// The bytes the transferred file holds, so a delivered file can be compared with its
 /// source rather than merely counted.
-const FILE_BODY: &[u8] = b"col-a,col-b\n1,2\n";
+pub(crate) const FILE_BODY: &[u8] = b"col-a,col-b\n1,2\n";
 
 /// One generated SSH key pair, as the suite hands it around: the OpenSSH private key a
 /// secret holds and the public half a user is created with.
-struct KeyPair {
-    private: String,
-    public: String,
+pub(crate) struct KeyPair {
+    pub(crate) private: String,
+    pub(crate) public: String,
 }
 
 /// A real Ed25519 key pair, produced by the OpenSSH key-format crate — so what the
@@ -138,7 +138,7 @@ fn secrets_manager(emulator: &Emulator) -> aws_sdk_secretsmanager::Client {
 }
 
 /// An Amazon S3 client over the emulator's own in-process callback.
-fn s3(emulator: &Emulator) -> aws_sdk_s3::Client {
+pub(crate) fn s3(emulator: &Emulator) -> aws_sdk_s3::Client {
     let callback = emulator.callback();
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -159,21 +159,21 @@ fn s3(emulator: &Emulator) -> aws_sdk_s3::Client {
 
 /// The SFTP endpoint of a Transfer Family server: a server is reached at
 /// `<server-id>.server.transfer.<region>.amazonaws.com`.
-fn server_endpoint(server_id: &str) -> String {
+pub(crate) fn server_endpoint(server_id: &str) -> String {
     format!("sftp://{server_id}.server.transfer.{REGION}.amazonaws.com")
 }
 
 /// One emulated target: a bucket, an `ONLINE` SFTP server whose host key the test
 /// generated, and one user of it holding a key pair the test generated.
-struct Target {
-    emulator: Emulator,
-    bucket: String,
-    server_id: String,
-    user_name: String,
+pub(crate) struct Target {
+    pub(crate) emulator: Emulator,
+    pub(crate) bucket: String,
+    pub(crate) server_id: String,
+    pub(crate) user_name: String,
     /// The public half of the server's host key — what a connection to it presents.
-    host_key: String,
+    pub(crate) host_key: String,
     /// The user's key pair: the private half is what a secret holds.
-    user_key: KeyPair,
+    pub(crate) user_key: KeyPair,
 }
 
 impl Target {
@@ -233,7 +233,7 @@ impl Target {
 
     /// The target every rule but the `LOGICAL` row uses: the user's home directory is
     /// the bucket root, which is the `PATH` form.
-    async fn with_home_at_bucket_root() -> Self {
+    pub(crate) async fn with_home_at_bucket_root() -> Self {
         let target = Self::stand_up("PATH", "", Value::Null).await;
         let home = format!("/{}", target.bucket);
         Self::stand_up("PATH", &home, Value::Null).await
@@ -241,7 +241,7 @@ impl Target {
 
     /// Store one secret holding `{"Username": ..., "PrivateKey": ...}` and answer its
     /// ARN — the document an SFTP connector's `UserSecretId` names.
-    async fn store_secret(&self, name: &str, user_name: &str, private_key: &str) -> String {
+    pub(crate) async fn store_secret(&self, name: &str, user_name: &str, private_key: &str) -> String {
         let value = json!({"Username": user_name, "PrivateKey": private_key}).to_string();
         secrets_manager(&self.emulator)
             .create_secret()
@@ -256,7 +256,12 @@ impl Target {
     }
 
     /// Create a connector against this target's endpoint and answer its `ConnectorId`.
-    async fn create_connector(&self, case: &str, sftp_config: Value, url: Option<&str>) -> String {
+    pub(crate) async fn create_connector(
+        &self,
+        case: &str,
+        sftp_config: Value,
+        url: Option<&str>,
+    ) -> String {
         let request = json!({
             "AccessRole": ROLE,
             "Url": url.map_or_else(|| server_endpoint(&self.server_id), str::to_string),
@@ -276,7 +281,7 @@ impl Target {
     }
 
     /// Put one object into the bucket.
-    async fn put_object(&self, key: &str, body: &'static [u8]) {
+    pub(crate) async fn put_object(&self, key: &str, body: &'static [u8]) {
         s3(&self.emulator)
             .put_object()
             .bucket(&self.bucket)
@@ -288,7 +293,7 @@ impl Target {
     }
 
     /// The bytes stored at `key`, or `None` when the bucket holds no such object.
-    async fn object(&self, key: &str) -> Option<Vec<u8>> {
+    pub(crate) async fn object(&self, key: &str) -> Option<Vec<u8>> {
         let answer = s3(&self.emulator)
             .get_object()
             .bucket(&self.bucket)
@@ -300,7 +305,7 @@ impl Target {
     }
 
     /// One `TestConnection`.
-    async fn test_connection(&self, connector_id: &str) -> Answer {
+    pub(crate) async fn test_connection(&self, connector_id: &str) -> Answer {
         self.emulator
             .call("TestConnection", json!({"ConnectorId": connector_id}))
             .await
@@ -859,7 +864,7 @@ impl Delivery {
 }
 
 /// Every result of one accepted transfer, in submission order.
-async fn results(target: &Target, connector_id: &str, transfer_id: &str) -> Vec<Value> {
+pub(crate) async fn results(target: &Target, connector_id: &str, transfer_id: &str) -> Vec<Value> {
     let answer = target
         .emulator
         .call(

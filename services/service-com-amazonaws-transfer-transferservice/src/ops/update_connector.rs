@@ -219,12 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| stored.as2_config.clone());
         // Resolved HERE, as at create time, so the stored settings stay fully
         // materialised and the requirements below are judged against what a reader
-        // reports.
-        let next_sftp_config = input
-            .sftp_config
-            .clone()
-            .map(st::resolve_sftp_connector_config)
-            .or_else(|| stored.sftp_config.clone());
+        // reports. An `SftpConfig` the request names MODIFIES the settings the connector
+        // already has, member by member (`state::merge_sftp_connector_config`), which is
+        // what the documented sequence of probing for the server's host key and then
+        // updating the connector with it requires.
+        let next_sftp_config = match input.sftp_config.clone() {
+            Some(requested) => Some(st::merge_sftp_connector_config(
+                stored.sftp_config.as_ref(),
+                requested,
+            )),
+            None => stored.sftp_config.clone(),
+        };
         let next_egress_config = match input.egress_config.clone() {
             Some(requested) => {
                 match st::merge_connector_egress_config(stored.egress_config.as_ref(), requested) {

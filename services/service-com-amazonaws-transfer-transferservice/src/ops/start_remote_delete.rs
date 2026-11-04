@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRemoteDelete
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRemoteDelete`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRemoteDelete::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts a delete for a STORED connector and answers the `DeleteId` it is recorded
+//! under. A `ConnectorId` the store does not hold is not found, which is what
+//! distinguishes a missing connector from a service fault.
+//!
+//! `DeletePath` is "the absolute path of the file or directory to delete": a relative
+//! path names no file on the remote server, so it is refused with the modelled
+//! `InvalidRequestException` (400) before anything is recorded, on the same rule
+//! `StartRemoteMove` applies to its own two path members.
+//!
+//! The delete itself runs against the endpoint the connector's `Url` names, on a task
+//! of its own (`crate::state::connector_plane`), exactly as an accepted transfer does:
+//! where that endpoint is an SFTP server this emulator serves, the path is absent
+//! afterwards and the record reports the TERMINAL status of the path the delete
+//! addressed. An endpoint outside this emulator is one nothing can connect to, so
+//! nothing is attempted and the path stays `QUEUED`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +158,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRemoteDelete` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRemoteDeleteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRemoteDelete"))
+        use crate::state as st;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            StartRemoteDeleteErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let now = ::std::time::Instant::now();
+
+        let mut guard = state.lock();
+
+        // The connector is resolved FIRST: it is the resource the request is addressed
+        // at, and a `ConnectorId` the store does not hold is not found.
+        let Some(connector) = guard.connectors.get(&input.connector_id) else {
+            return Err(st::not_found(
+                StartRemoteDeleteErrorModeled::ResourceNotFoundException(st::unknown_connector(
+                    &input.connector_id,
+                )),
+            ));
+        };
+        let sftp_config = connector.sftp_config.clone();
+        let connector_url = connector.url.clone();
+
+        // The path is a documented ABSOLUTE path on the remote server; a relative one
+        // names nothing there.
+        if !st::is_absolute_remote_path(&input.delete_path) {
+            return Err(StartRemoteDeleteErrorModeled::InvalidRequestException(
+                st::remote_path_must_be_absolute("DeletePath"),
+            )
+            .into());
+        }
+
+        // The per-connector record set is BOUNDED, exactly as it is for a transfer.
+        if !guard.connector_has_transfer_capacity(&input.connector_id) {
+            return Err(StartRemoteDeleteErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} accepted transfers \
+                         for one connector",
+                        st::MAX_TRANSFERS_PER_CONNECTOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The path the delete addresses is the one path this operation acts on ("you
+        // can only specify one path per call to this operation"), so it is the one
+        // whose status the record carries.
+        let delete_id = guard.accept_connector_transfer(
+            &input.connector_id,
+            vec![input.delete_path.clone()],
+            now,
+        );
+        drop(guard);
+
+        // The delete itself runs against the endpoint the connector names, on a task of
+        // its own, exactly as an accepted transfer does. An AS2 connector configures no
+        // SFTP endpoint, so there is none to delete anything on.
+        if let Some(sftp_config) = sftp_config {
+            st::connector_plane::spawn(
+                ctx,
+                state.clone(),
+                st::connector_plane::RemoteOperation {
+                    region: st::request_region(ctx.parts()),
+                    connector_id: input.connector_id,
+                    operation_id: delete_id.clone(),
+                    url: connector_url,
+                    sftp_config,
+                    work: st::connector_plane::RemoteWork::Delete {
+                        delete_path: input.delete_path,
+                    },
+                },
+            );
+        }
+
+        Ok(StartRemoteDeleteOutput { delete_id })
     }
 }

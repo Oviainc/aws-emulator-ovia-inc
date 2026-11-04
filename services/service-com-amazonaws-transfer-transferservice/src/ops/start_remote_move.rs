@@ -12,10 +12,12 @@
 //! server, so it is refused with the modelled `InvalidRequestException` (400) before
 //! anything is recorded, naming the member that carried it.
 //!
-//! The move itself happens on the partner's REMOTE SFTP server, an outbound connection
-//! this emulator never makes — so the accepted request stays `QUEUED`, like every other
-//! operation a connector accepts (`crate::state::ConnectorTransfer`), and nothing here
-//! reports a file as moved.
+//! The move itself runs against the endpoint the connector's `Url` names, on a task of
+//! its own ([`crate::state::connector_delivery`]), exactly as an accepted transfer
+//! does: where that endpoint is an SFTP server this emulator serves, the source path is
+//! absent afterwards and the target holds what it held, and the record reports the
+//! TERMINAL status of the file the move addressed. An endpoint outside this emulator is
+//! one nothing can connect to, so nothing is attempted and the file stays `QUEUED`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,28 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             StartRemoteMoveErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
+        let now = ::std::time::Instant::now();
 
         let mut guard = state.lock();
 
         // The connector is resolved FIRST: it is the resource the request is addressed
         // at, and a `ConnectorId` the store does not hold is not found.
-        if !guard.connectors.contains_key(&input.connector_id) {
+        let Some(connector) = guard.connectors.get(&input.connector_id) else {
             return Err(st::not_found(
                 StartRemoteMoveErrorModeled::ResourceNotFoundException(st::unknown_connector(
                     &input.connector_id,
                 )),
             ));
-        }
+        };
+        let sftp_config = connector.sftp_config.clone();
+        let connector_url = connector.url.clone();
 
-        // Both paths are documented ABSOLUTE paths on the remote server; a relative one
-        // names no file there.
+        // Both paths are documented ABSOLUTE paths on the remote server; a relative
+        // one names no file there.
         for (member, path) in [
             ("SourcePath", &input.source_path),
             ("TargetPath", &input.target_path),
@@ -214,10 +217,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation"), so it is the one file whose status the record carries.
         let move_id = guard.accept_connector_transfer(
             &input.connector_id,
-            vec![input.source_path],
-            ::std::time::Instant::now(),
+            vec![input.source_path.clone()],
+            now,
         );
         drop(guard);
+
+        // The move itself runs against the endpoint the connector names, on a task of
+        // its own, exactly as an accepted transfer does: this call answers the
+        // identifier its result is read back through and does not wait for the file to
+        // move. An AS2 connector configures no SFTP endpoint, so there is none to move
+        // anything on.
+        if let Some(sftp_config) = sftp_config {
+            st::connector_plane::spawn(
+                ctx,
+                state.clone(),
+                st::connector_plane::RemoteOperation {
+                    region: st::request_region(ctx.parts()),
+                    connector_id: input.connector_id,
+                    operation_id: move_id.clone(),
+                    url: connector_url,
+                    sftp_config,
+                    work: st::connector_plane::RemoteWork::Move {
+                        source_path: input.source_path,
+                        target_path: input.target_path,
+                    },
+                },
+            );
+        }
 
         Ok(StartRemoteMoveOutput { move_id })
     }
