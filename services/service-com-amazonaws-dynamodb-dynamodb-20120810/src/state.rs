@@ -8666,7 +8666,7 @@ fn same_members<'v, T: 'v, K: Ord>(
         return false;
     }
     let mut mine: Vec<K> = left.iter().map(&key).collect();
-    let mut theirs: Vec<K> = right.iter().map(&key).collect();
+    let mut theirs: Vec<K> = right.iter().map(key).collect();
     mine.sort_unstable();
     theirs.sort_unstable();
     mine == theirs

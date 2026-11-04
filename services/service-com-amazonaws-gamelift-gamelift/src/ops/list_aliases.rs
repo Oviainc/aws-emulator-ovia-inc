@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the aliases this service holds, narrowed by the filters the request carries
+//! and served one page at a time, so every alias it reports is the one stored record
+//! `CreateAlias` persisted and `DescribeAlias` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +156,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let invalid = |message: String| -> Self::Error {
+            ListAliasesErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAliasesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "Retrieves all aliases for this Amazon Web Services account. You can filter the
+        // result set by alias name and/or routing strategy type." Each filter the request
+        // carries narrows the collection by that member of the STORED record; an absent
+        // filter narrows nothing ("To retrieve all aliases, leave this parameter empty").
+        // `RoutingStrategyType` is a modelled enum, so a value outside it is refused by
+        // the boundary walk before this handler runs.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAliases"))
+        // The listing is per ACCOUNT, not per Region: this store holds the one account's
+        // aliases (see `MAX_ALIASES_PER_ACCOUNT`), and every read of an alias serves the
+        // same record whatever Region the request named, so narrowing by the request's
+        // Region here would hide aliases `DescribeAlias` still reports.
+        let aliases: Vec<Alias> = state
+            .aliases_in_order()
+            .into_iter()
+            .filter(|alias| {
+                input
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| alias.name == name)
+                    && input.routing_strategy_type.as_deref().is_none_or(|kind| {
+                        alias.routing_strategy.r#type.as_deref() == Some(kind)
+                    })
+            })
+            .map(crate::state::AliasRecord::to_modelled)
+            .collect();
+
+        // "Use the pagination parameters to retrieve results in sequential pages": the
+        // page resumes at the boundary the previous call's token names, and a token this
+        // collection did not issue is no offset into it.
+        let Some((page, next_token)) = crate::state::paginate(
+            crate::state::PageKind::Aliases,
+            &aliases,
+            input.limit,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(invalid(
+                "NextToken is not a pagination token this service issued.".to_string(),
+            ));
+        };
+        Ok(ListAliasesOutput {
+            aliases: Some(page),
+            next_token,
+        })
     }
 }

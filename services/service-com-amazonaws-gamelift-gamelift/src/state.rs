@@ -490,6 +490,8 @@ pub fn id_and_arn(value: &str, region: &str, kind: &str) -> (String, String) {
 /// refuses a token another minted, instead of reading it as an offset into its own set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageKind {
+    /// `ListAliases`.
+    Aliases,
     /// `DescribeFleetAttributes`.
     Fleets,
     /// `DescribeGameSessions`.
@@ -510,6 +512,7 @@ impl PageKind {
     /// The discriminator this collection's tokens carry.
     const fn tag(self) -> char {
         match self {
+            Self::Aliases => 'a',
             Self::Fleets => 'f',
             Self::GameSessions => 'g',
             Self::GameSessionQueues => 'q',
@@ -2781,6 +2784,23 @@ impl ComAmazonawsGameliftGameliftState {
         } else {
             self.aliases.get(id_or_arn)
         }
+    }
+
+    /// Every stored alias, oldest first, so a paginated walk is stable across calls.
+    ///
+    /// `ListAliases` documents that "returned aliases are not listed in any particular
+    /// order", so any total order serves it; a stable one is what lets a `NextToken`
+    /// resume where the previous page ended instead of skipping or repeating a record.
+    /// "Alias names do not need to be unique" while ids are, so the id breaks a tie
+    /// between two aliases created at the same instant.
+    pub fn aliases_in_order(&self) -> Vec<&AliasRecord> {
+        let mut aliases: Vec<&AliasRecord> = self.aliases.values().collect();
+        aliases.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.alias_id.cmp(&right.alias_id))
+        });
+        aliases
     }
 
     /// The build a `BuildIdOrArn` names, or `None` when no stored build matches it.
