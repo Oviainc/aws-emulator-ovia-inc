@@ -40,7 +40,7 @@
 use crate::provisioning_loop::{
     account, action, call, create_http_target_group, emulator, first_text, members, p, Reply, REGION,
 };
-use crate::target_group_attributes_and_modification::unescaped;
+use crate::target_group_attributes_and_modification::{create_target_group, unescaped};
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeMap;
 
@@ -1085,10 +1085,13 @@ async fn the_certificate_list_round_trips_through_add_describe_and_remove() {
 }
 
 /// One load balancer family under test: the `Type` to create, the listener fields its
-/// listener takes, and the attributes a fresh listener of it must report.
+/// listener takes, the target group its listener forwards to — a load balancer serves only
+/// target groups carrying the kind of traffic it does — and the attributes a fresh listener
+/// of it must report.
 struct Family {
     lb_type: &'static str,
     listener: Vec<(String, String)>,
+    target_group: &'static [(&'static str, &'static str)],
     defaults: &'static [(&'static str, &'static str)],
 }
 
@@ -1103,12 +1106,12 @@ struct Family {
 #[tokio::test]
 async fn listener_attributes_default_and_accept_only_their_documented_domain() {
     let (router, _engine) = emulator();
-    let tg_arn = create_http_target_group(&router, "listener-attributes-tg").await;
 
     let families = [
         Family {
             lb_type: "application",
             listener: vec![p("Protocol", "HTTP"), p("Port", "80")],
+            target_group: &[("Protocol", "HTTP"), ("Port", "80"), ("VpcId", "vpc-12345678")],
             // An Application Load Balancer listener's attribute collection is the
             // response-header set: the server header, which the listener allows until a
             // caller removes it, and the ten header values, which the collection carries
@@ -1145,6 +1148,7 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
         Family {
             lb_type: "network",
             listener: vec![p("Protocol", "TCP"), p("Port", "80")],
+            target_group: &[("Protocol", "TCP"), ("Port", "80"), ("VpcId", "vpc-12345678")],
             // "tcp.idle_timeout.seconds ... The default is 350 seconds."
             defaults: &[("tcp.idle_timeout.seconds", "350")],
         },
@@ -1152,6 +1156,7 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
             lb_type: "gateway",
             // "You can't specify a protocol for a Gateway Load Balancer."
             listener: Vec::new(),
+            target_group: &[("Protocol", "GENEVE"), ("Port", "6081"), ("VpcId", "vpc-12345678")],
             defaults: &[
                 ("send_tcp_reset.on_idle_timeout.enabled", "false"),
                 ("tcp.idle_timeout.seconds", "350"),
@@ -1165,6 +1170,12 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
             &router,
             &format!("attributes-{}-lb", family.lb_type),
             family.lb_type,
+        )
+        .await;
+        let tg_arn = create_target_group(
+            &router,
+            &format!("attributes-{}-tg", family.lb_type),
+            family.target_group,
         )
         .await;
         let listener = create_listener(

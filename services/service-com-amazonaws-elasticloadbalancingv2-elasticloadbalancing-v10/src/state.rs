@@ -37,10 +37,11 @@ pub use certificate_consumers::{certificate_association_directory, record_certif
 mod vpc_topology;
 
 use crate::ops::types::{
-    Action, AvailabilityZone, Certificate, IpamPools, Listener, ListenerAttribute, LoadBalancer,
-    LoadBalancerAddress, LoadBalancerAttribute, LoadBalancerState, Matcher, Rule, RuleCondition,
-    RuleTransform, SubnetMapping, TargetDescription, TargetGroup, TargetGroupAttribute,
-    TargetHealth, TargetHealthDescription, TrustStore,
+    Action, AvailabilityZone, Certificate, ForwardActionConfig, IpamPools, Listener,
+    ListenerAttribute, LoadBalancer, LoadBalancerAddress, LoadBalancerAttribute, LoadBalancerState,
+    Matcher, MutualAuthenticationAttributes, Rule, RuleCondition, RuleTransform, SubnetMapping,
+    TargetDescription, TargetGroup, TargetGroupAttribute, TargetGroupTuple, TargetHealth,
+    TargetHealthDescription, TrustStore,
 };
 
 /// How long after the call that starts it a load balancer owes its move out of
@@ -772,6 +773,61 @@ pub fn terminates_tls(protocol: Option<&str>) -> bool {
     protocol.is_some_and(|value| TLS_TERMINATING_PROTOCOLS.contains(&value))
 }
 
+/// The protocol a listener's MUTUAL AUTHENTICATION configuration belongs to, from the
+/// bracket the model puts on the member wherever it is set:
+/// `CreateListenerInput$MutualAuthentication` and `ModifyListenerInput$MutualAuthentication`
+/// are both documented "[HTTPS listeners] The mutual authentication configuration
+/// information". Narrower than [`TLS_TERMINATING_PROTOCOLS`]: a TLS listener terminates TLS
+/// but carries no client-certificate handling.
+pub const MUTUAL_AUTHENTICATION_PROTOCOL: &str = "HTTPS";
+
+/// The client certificate handling method a listener is carried at when nothing configured
+/// one, from `MutualAuthenticationAttributes$Mode`'s own documentation: "Options are `off`,
+/// `passthrough` or `verify`. The default value is `off`."
+pub const DEFAULT_MUTUAL_AUTHENTICATION_MODE: &str = "off";
+
+/// Whether a listener on `protocol` carries a mutual authentication configuration at all
+/// ([`MUTUAL_AUTHENTICATION_PROTOCOL`]).
+pub fn handles_client_certificates(protocol: Option<&str>) -> bool {
+    protocol == Some(MUTUAL_AUTHENTICATION_PROTOCOL)
+}
+
+/// How a refusal about a listener's protocol brackets NAMES what it judged, for a listener
+/// that names no protocol as well as for one that does. One phrasing for every such
+/// refusal, so the certificate bracket and the mutual authentication bracket cannot drift
+/// on how they name the listener they judged.
+pub fn named_listener(protocol: Option<&str>) -> String {
+    match protocol {
+        Some(value) => format!("{value} listeners"),
+        None => "a listener with no protocol".to_string(),
+    }
+}
+
+/// Enforce the bracket the model puts on a listener's MUTUAL AUTHENTICATION: the member
+/// belongs to the listeners [`MUTUAL_AUTHENTICATION_PROTOCOL`] names and to no other, so a
+/// request configuring client certificate handling on a listener of any other protocol is
+/// refused rather than accepted and dropped.
+///
+/// Judged against the protocol the call LEAVES the listener on, by the create that first
+/// sets the configuration and by the modification that replaces it. The model states the
+/// bracket in the member's own documentation and declares no error shape for it, so the
+/// refusal is this service's own input validation (`400` `ValidationError`) with a message
+/// naming the member and the protocol it was judged against — exactly as the default
+/// certificate's bracket is stated.
+pub fn check_mutual_authentication(
+    protocol: Option<&str>,
+    mutual_authentication: Option<&MutualAuthenticationAttributes>,
+) -> Result<(), String> {
+    if mutual_authentication.is_none() || handles_client_certificates(protocol) {
+        return Ok(());
+    }
+    Err(format!(
+        "MutualAuthentication cannot be specified for {}: the mutual authentication \
+         configuration applies only to {MUTUAL_AUTHENTICATION_PROTOCOL} listeners",
+        named_listener(protocol)
+    ))
+}
+
 /// How many certificates one listener's certificate list holds before
 /// `AddListenerCertificates` refuses with the modelled `TooManyCertificatesException`.
 /// The emulator's own bound, as [`LOAD_BALANCER_QUOTA`]: the list lives on the listener
@@ -868,6 +924,24 @@ pub fn downgrades_to_http(listener_protocol: Option<&str>, actions: &[Action]) -
 /// The refusal such a redirect earns. Fixed text: the rule is about the two protocols
 /// themselves, so there is nothing of the request to name in it.
 pub const HTTPS_TO_HTTP_REDIRECT_MESSAGE: &str = "You cannot redirect HTTPS to HTTP.";
+
+/// The refusal a request pairing a listener with a target group of another kind of traffic
+/// earns, naming every target group that does not pair with it — the only thing the caller
+/// can act on.
+///
+/// Elastic Load Balancing's own wording for this refusal, which the recorded
+/// `IncompatibleProtocols` answer to such a create states: `The listener and the following
+/// target groups have incompatible protocols: <arn>` — the sentence fixed, the target groups
+/// read off the request.
+pub fn incompatible_protocols_message<'a>(
+    target_group_arns: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let named: Vec<&str> = target_group_arns.into_iter().collect();
+    format!(
+        "The listener and the following target groups have incompatible protocols: {}",
+        named.join(", ")
+    )
+}
 
 /// Every listener attribute this service models, with the load balancer families whose
 /// listeners carry it, the values it accepts and the value it is carried at until a write
@@ -3193,6 +3267,10 @@ pub struct ListenerRecord {
     pub list_certificate_arns: Vec<String>,
     pub default_actions: Vec<Action>,
     pub alpn_policy: Vec<String>,
+    /// The MUTUAL AUTHENTICATION the listener was configured with, as the create or the
+    /// modification that set it carried it, and `None` for a listener nothing configured it
+    /// on. A listener outside [`MUTUAL_AUTHENTICATION_PROTOCOL`] carries none at all.
+    pub mutual_authentication: Option<MutualAuthenticationAttributes>,
     pub attributes: HashMap<String, String>,
     pub tags: HashMap<String, String>,
     /// The resource id of this listener's DEFAULT rule, minted with the listener: every
@@ -3214,6 +3292,11 @@ impl ListenerRecord {
             && self.ssl_policy == other.ssl_policy
             && sorted(&self.certificate_arns) == sorted(&other.certificate_arns)
             && self.alpn_policy == other.alpn_policy
+            // The client certificate handling is one of the listener's settings, so two
+            // listeners differing only in it are not "the same settings": they are compared
+            // by what each is EFFECTIVELY under, so a request naming the mode the service
+            // defaults is the idempotent repeat of one that named none.
+            && self.effective_mutual_authentication() == other.effective_mutual_authentication()
             && action_summary(&self.default_actions) == action_summary(&other.default_actions)
     }
 
@@ -3238,8 +3321,49 @@ impl ListenerRecord {
             ssl_policy: self.ssl_policy.clone(),
             default_actions: Some(reported_actions(&self.default_actions)),
             alpn_policy: Some(self.alpn_policy.clone()),
-            mutual_authentication: None,
+            // A WRITE answers with the listener it left behind as the request configured
+            // it, so the member is there when a request set it and absent when none did;
+            // a READ answers the listener's effective configuration
+            // ([`Self::described_shape`]). The record holds a configuration only for a
+            // listener the member belongs to — the write that sets it refuses it on any
+            // other, and the modification that moves a listener off that protocol clears
+            // it — so there is nothing to mask here.
+            mutual_authentication: self.mutual_authentication.clone(),
         }
+    }
+
+    /// This listener as a READ of it reports it: [`Self::to_shape`] carrying the mutual
+    /// authentication the listener EFFECTIVELY handles client certificates under
+    /// ([`Self::effective_mutual_authentication`]).
+    pub fn described_shape(&self) -> Listener {
+        Listener {
+            mutual_authentication: self.effective_mutual_authentication(),
+            ..self.to_shape()
+        }
+    }
+
+    /// The mutual authentication this listener EFFECTIVELY handles client certificates
+    /// under: the configuration it was given, with every setting the configuration left
+    /// out carried at the value the service carries it at — the mode a listener nothing
+    /// configured mTLS on handles client certificates under being
+    /// [`DEFAULT_MUTUAL_AUTHENTICATION_MODE`].
+    ///
+    /// A listener the member does not belong to has none at all
+    /// ([`handles_client_certificates`]).
+    pub fn effective_mutual_authentication(&self) -> Option<MutualAuthenticationAttributes> {
+        if !self.handles_client_certificates() {
+            return None;
+        }
+        let mut effective = self.mutual_authentication.clone().unwrap_or_default();
+        if effective.mode.is_none() {
+            effective.mode = Some(DEFAULT_MUTUAL_AUTHENTICATION_MODE.to_string());
+        }
+        Some(effective)
+    }
+
+    /// Whether this listener carries a mutual authentication configuration at all.
+    pub fn handles_client_certificates(&self) -> bool {
+        handles_client_certificates(self.protocol.as_deref())
     }
 
     /// Whether this listener terminates TLS, and so carries certificates at all.
@@ -3413,7 +3537,63 @@ const KEEP_QUERY: &str = "#{query}";
 /// without it is reported — and served — carrying it.
 pub const DEFAULT_FIXED_RESPONSE_CONTENT_TYPE: &str = "text/plain";
 
-/// One action as a read reports it: a redirect's unmodified components answered as the
+/// The `ActionTypeEnum` value of the action that passes a request to a target group —
+/// "Specify only when `Type` is `forward`" brackets both spellings of the target groups it
+/// distributes among.
+pub const FORWARD_ACTION_TYPE: &str = "forward";
+
+/// The weight a forward action's target group is DISTRIBUTED AT when the configuration
+/// named none. `TargetGroupTuple$Weight` is "[t]he weight. The range is 0 to 999", and the
+/// weights of a forward's groups are relative to one another, so one group carried at the
+/// weight the service defaults takes every request the action matches — which is what a
+/// forward to a single target group does.
+pub const DEFAULT_TARGET_GROUP_WEIGHT: i32 = 1;
+
+/// Whether target group stickiness is on for a forward action whose configuration did not
+/// turn it on: `TargetGroupStickinessConfig$Enabled` "[i]ndicates whether target group
+/// stickiness is enabled", and a forward distributes each request on its own until a
+/// request enables it.
+pub const DEFAULT_TARGET_GROUP_STICKINESS: bool = false;
+
+/// A forward action's `ForwardConfig` as a read reports it: the target groups it
+/// distributes among, each carried at the weight the configuration gave it or at
+/// [`DEFAULT_TARGET_GROUP_WEIGHT`], and the stickiness the configuration gave it or
+/// [`DEFAULT_TARGET_GROUP_STICKINESS`]. `None` for a forward action naming no target group
+/// at all, which has no distribution to report.
+///
+/// `Action$TargetGroupArn` and `ForwardActionConfig$TargetGroups` are TWO SPELLINGS of one
+/// forward's distribution — "Specify only when `Type` is `forward` and you want to route to
+/// a single target group. To route to multiple target groups, you must use `ForwardConfig`
+/// instead", and "[i]f you specify both `ForwardConfig` and `TargetGroupArn`, you can
+/// specify only one target group using `ForwardConfig` and it must be the same target group
+/// specified in `TargetGroupArn`" — so the configuration is read off whichever spelling the
+/// request carried.
+fn reported_forward_config(action: &Action) -> Option<ForwardActionConfig> {
+    let mut config = action.forward_config.clone().unwrap_or_default();
+    let mut groups = config.target_groups.take().unwrap_or_default();
+    if groups.is_empty() {
+        groups.push(TargetGroupTuple {
+            target_group_arn: Some(action.target_group_arn.clone()?),
+            weight: None,
+        });
+    }
+    for group in &mut groups {
+        if group.weight.is_none() {
+            group.weight = Some(DEFAULT_TARGET_GROUP_WEIGHT);
+        }
+    }
+    config.target_groups = Some(groups);
+    let mut stickiness = config.target_group_stickiness_config.take().unwrap_or_default();
+    if stickiness.enabled.is_none() {
+        stickiness.enabled = Some(DEFAULT_TARGET_GROUP_STICKINESS);
+    }
+    config.target_group_stickiness_config = Some(stickiness);
+    Some(config)
+}
+
+/// One action as a read reports it: a forward's distribution answered under BOTH spellings
+/// the model gives it, with the weight and the stickiness the service carries it at
+/// ([`reported_forward_config`]), a redirect's unmodified components answered as the
 /// keywords that retain them ([`KEEP_PROTOCOL`] and the rest), a fixed response's content
 /// type answered as the one the service defaults when the action named none
 /// ([`DEFAULT_FIXED_RESPONSE_CONTENT_TYPE`]), every other action exactly as it was given.
@@ -3424,6 +3604,20 @@ pub const DEFAULT_FIXED_RESPONSE_CONTENT_TYPE: &str = "text/plain";
 /// [`reported_condition`] does for a condition's two spellings.
 fn reported_action(action: &Action) -> Action {
     let mut reported = action.clone();
+    if reported.r#type == FORWARD_ACTION_TYPE {
+        if let Some(config) = reported_forward_config(&reported) {
+            // A forward to a SINGLE target group is reported under the single-group
+            // spelling too, whichever one the request carried; a forward distributing
+            // among several has no single-group spelling, so that member stays absent for
+            // it.
+            if reported.target_group_arn.is_none() {
+                if let [only] = config.target_groups.as_deref().unwrap_or_default() {
+                    reported.target_group_arn = only.target_group_arn.clone();
+                }
+            }
+            reported.forward_config = Some(config);
+        }
+    }
     if let Some(config) = reported.fixed_response_config.as_mut() {
         if config.content_type.is_none() {
             config.content_type = Some(DEFAULT_FIXED_RESPONSE_CONTENT_TYPE.to_string());
@@ -3707,6 +3901,47 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
         let mut records: Vec<&ListenerRecord> = self.listeners.values().collect();
         records.sort_by(|a, b| a.arn.cmp(&b.arn));
         records
+    }
+
+    /// Every target group an action list forwards to whose traffic the load balancer
+    /// `load_balancer_arn` does not serve, in the order the actions name them.
+    ///
+    /// A load balancer and the target groups its listeners forward to must carry the same
+    /// KIND of traffic: `TargetGroup$Protocol` pairs each protocol with the load balancer
+    /// it belongs to — "For Application Load Balancers, the supported protocols are HTTP
+    /// and HTTPS. For Network Load Balancers, the supported protocols are TCP, TLS, UDP,
+    /// TCP_UDP, QUIC, and TCP_QUIC. … For Gateway Load Balancers, the supported protocol is
+    /// GENEVE" ([`protocol_family`]) — so forwarding to a target group of another kind is a
+    /// pairing no load balancer can serve. The operation that made it answers the modelled
+    /// `IncompatibleProtocolsException`, worded as [`incompatible_protocols_message`] does.
+    ///
+    /// Judged wherever an action is ATTACHED to a listener — the create and the
+    /// modification of a listener's default actions, and of a rule's — so one reading of
+    /// that pairing serves them all. A target group this store does not hold is passed
+    /// over: that one is the modelled `TargetGroupNotFoundException` instead, and so is a
+    /// load balancer it does not hold `LoadBalancerNotFoundException`.
+    pub fn incompatible_target_groups(
+        &self,
+        load_balancer_arn: &str,
+        actions: &[Action],
+    ) -> Vec<String> {
+        let Some(load_balancer) = self.load_balancers.get(load_balancer_arn) else {
+            return Vec::new();
+        };
+        let family = load_balancer.family();
+        let mut incompatible = Vec::new();
+        for target_group_arn in action_target_group_arns(actions) {
+            let Some(group) = self.target_groups.get(&target_group_arn) else {
+                continue;
+            };
+            // A `lambda` target group carries no protocol, so there is no pairing to
+            // judge: it is reached by an Application Load Balancer, which is what
+            // [`protocol_family`] reads a group with no protocol as.
+            if group.family() != family && !incompatible.contains(&target_group_arn) {
+                incompatible.push(target_group_arn);
+            }
+        }
+        incompatible
     }
 
     /// Record that `load_balancer_arn` forwards to `target_group_arn`.

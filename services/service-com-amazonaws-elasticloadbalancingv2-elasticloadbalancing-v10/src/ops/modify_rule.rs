@@ -268,6 +268,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // And only to one carrying the kind of traffic the load balancer this rule's
+        // listener belongs to serves, exactly as the actions a rule is created with may
+        // ([`crate::state`]).
+        let incompatible =
+            guard.incompatible_target_groups(&listener.load_balancer_arn, &updated.actions);
+        if !incompatible.is_empty() {
+            return Err(ModifyRuleErrorModeled::IncompatibleProtocolsException(
+                IncompatibleProtocolsException {
+                    message: Some(crate::state::incompatible_protocols_message(
+                        incompatible.iter().map(String::as_str),
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(record) = guard.rule_record_mut(&input.rule_arn) else {
             // Resolved above under this same lock, so nothing can have released it.
             return Err(rule_not_found(&input.rule_arn));

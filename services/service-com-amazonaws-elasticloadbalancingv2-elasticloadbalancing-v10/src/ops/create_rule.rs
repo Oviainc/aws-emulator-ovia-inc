@@ -271,6 +271,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // And only to one carrying the kind of traffic the load balancer this rule's
+        // listener belongs to serves, exactly as that listener's own default actions may
+        // ([`crate::state`]).
+        let incompatible = guard.incompatible_target_groups(&load_balancer_arn, &input.actions);
+        if !incompatible.is_empty() {
+            return Err(CreateRuleErrorModeled::IncompatibleProtocolsException(
+                IncompatibleProtocolsException {
+                    message: Some(crate::state::incompatible_protocols_message(
+                        incompatible.iter().map(String::as_str),
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The bound on what one load balancer's rules grow to, enforced before the
         // insert: past it the emulator answers the modelled quota error instead of
         // growing without end.

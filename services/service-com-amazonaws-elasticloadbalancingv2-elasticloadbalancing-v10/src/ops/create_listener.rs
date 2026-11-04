@@ -244,6 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request alone.
         check_default_certificate(input.protocol.as_deref(), input.certificates.as_deref())?;
 
+        // And so does the client certificate handling, bracketed to its own protocol: a
+        // request configuring it on any other listener is refused rather than accepted
+        // with the configuration dropped.
+        crate::state::check_mutual_authentication(
+            input.protocol.as_deref(),
+            input.mutual_authentication.as_ref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // The certificate the request names is RESOLVED: a value that is no certificate
         // ARN names no certificate of the account, so no listener is created for it.
         if let Some(arn) =
@@ -285,6 +294,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             default_actions: input.default_actions.clone(),
             alpn_policy: input.alpn_policy.clone().unwrap_or_default(),
+            // "[HTTPS listeners] The mutual authentication configuration information" —
+            // kept as the request configured it, so a read of the listener answers the
+            // client-certificate handling it was created with rather than one made up per
+            // call ([`crate::state::ListenerRecord::effective_mutual_authentication`]).
+            mutual_authentication: input.mutual_authentication.clone(),
             attributes: std::collections::HashMap::new(),
             tags: input
                 .tags
@@ -330,6 +344,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // And only to one carrying the kind of traffic this load balancer serves: the
+        // pairing of a load balancer with its target groups' protocols is judged wherever
+        // an action is attached to a listener ([`crate::state`]).
+        let incompatible = guard.incompatible_target_groups(
+            &candidate.load_balancer_arn,
+            &candidate.default_actions,
+        );
+        if !incompatible.is_empty() {
+            return Err(CreateListenerErrorModeled::IncompatibleProtocolsException(
+                IncompatibleProtocolsException {
+                    message: Some(crate::state::incompatible_protocols_message(
+                        incompatible.iter().map(String::as_str),
+                    )),
+                },
+            )
+            .into());
         }
 
         // One listener per port on a load balancer: the same settings are the
@@ -429,10 +461,7 @@ fn check_default_certificate(
     let terminates_tls = crate::state::terminates_tls(protocol);
     // How the refusal names what it judged, for a listener that names no protocol as
     // well as for one that does.
-    let listener = match protocol {
-        Some(value) => format!("{value} listeners"),
-        None => "a listener with no protocol".to_string(),
-    };
+    let listener = crate::state::named_listener(protocol);
 
     // The COUNT is judged before the protocol bracket and before the entries: how many
     // certificate ARNs one call may carry does not depend on which listener the request

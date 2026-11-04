@@ -180,7 +180,7 @@ pub struct JwtValidationActionAdditionalClaim {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elasticloadbalancingv2#MutualAuthenticationAttributes")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MutualAuthenticationAttributes {
     pub mode: Option<String>,
     pub trust_store_arn: Option<String>,

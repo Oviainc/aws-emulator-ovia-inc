@@ -29,6 +29,8 @@ mod certificate_resolution_and_redirect_protocol;
 mod declared_action_set;
 #[path = "all/describe_input_bounds.rs"]
 mod describe_input_bounds;
+#[path = "all/forward_action_config_and_mutual_authentication.rs"]
+mod forward_action_config_and_mutual_authentication;
 #[path = "all/input_rejection_classes.rs"]
 mod input_rejection_classes;
 #[path = "all/ip_targets.rs"]
@@ -37,6 +39,8 @@ mod ip_targets;
 mod listener_lifecycle_certificates_and_rules;
 #[path = "all/listener_rules.rs"]
 mod listener_rules;
+#[path = "all/listener_target_group_protocol_pairing.rs"]
+mod listener_target_group_protocol_pairing;
 #[path = "all/listener_tls_certificates.rs"]
 mod listener_tls_certificates;
 #[path = "all/load_balancer_attributes.rs"]

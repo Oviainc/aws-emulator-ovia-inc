@@ -208,7 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )?;
 
         Ok(DescribeListenersOutput {
-            listeners: Some(page.iter().map(|record| record.to_shape()).collect()),
+            // A READ answers the listener's effective configuration, mutual authentication
+            // included: the one a write's own reply echoes back as the request configured
+            // it ([`crate::state::ListenerRecord::described_shape`]).
+            listeners: Some(page.iter().map(|record| record.described_shape()).collect()),
             next_marker,
         })
     }

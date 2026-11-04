@@ -121,7 +121,7 @@ const SOURCE_IP_FIELD: &str = "source-ip";
 /// the client elsewhere, and the one that passes the request to a target group.
 const FIXED_RESPONSE_ACTION: &str = "fixed-response";
 const REDIRECT_ACTION: &str = "redirect";
-const FORWARD_ACTION: &str = "forward";
+const FORWARD_ACTION: &str = crate::state::FORWARD_ACTION_TYPE;
 
 /// The status a load balancer answers while it is still coming up: it is publishing a
 /// name, and its listeners are not yet serving traffic on it.
