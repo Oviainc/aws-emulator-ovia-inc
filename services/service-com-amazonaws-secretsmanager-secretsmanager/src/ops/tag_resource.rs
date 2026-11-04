@@ -176,14 +176,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. The tags this request SENDS travel with the
+        // decision, so a grant conditioned on a mandated tag admits only a write that
+        // carries it.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none().request_tags(Some(&input.tags)),
         )?;
         // Bound the request's own list FIRST, before anything walks it and
         // before the store lock is taken: `TagListType` declares no maximum

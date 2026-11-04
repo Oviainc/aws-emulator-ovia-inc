@@ -168,14 +168,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. Whether this write keeps the public-policy
+        // check on travels with the decision, so a grant conditioned on it admits only
+        // the write that asks for the check it names.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none().flag(
+                crate::state::condition_keys::BLOCK_PUBLIC_POLICY_KEY,
+                input.block_public_policy,
+            ),
         )?;
         // The document has to be a policy document before anything is stored:
         // "The resource policy has syntax errors."

@@ -16,8 +16,9 @@
 //!
 //! The resource is the secret the request names, by the ARN the account holds it under —
 //! whichever form of `SecretId` the request carried (the name, the full ARN, the partial
-//! ARN) — and nothing at all for an action that addresses no secret, whose refusal
-//! therefore states no resource clause.
+//! ARN) — the NAME a create carries, since a secret the create never made has no ARN of
+//! this account to name, and nothing at all for an action that addresses no secret, whose
+//! refusal therefore states no resource clause.
 //!
 //! The user, the role, their policies and the session live in the IAM and STS stores of the
 //! SAME shared engine, so the documents under test are the ones `iam:PutUserPolicy` and
@@ -53,16 +54,16 @@ const REGION: &str = "us-west-2";
 
 /// The error code an identity-based authorization refusal carries, as the AWS "Common
 /// Errors" table names it.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The status this service answers that refusal with: awsJson1_1 discriminates a failure by
 /// the error type in the body, so a denial travels with the ordinary client-error status.
-const ACCESS_DENIED_STATUS: u16 = 400;
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 400;
 
 /// The access key id of the account's own published credential, as every other suite in this
 /// crate signs with it: a key neither STS nor IAM holds a record for, which is the position
 /// AWS account root credentials are in.
-const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// The IAM user that signs with its OWN long-term access key — the principal the recorded
 /// case mints with `iam:CreateUser` and `iam:CreateAccessKey` and attaches no policy to —
@@ -72,7 +73,7 @@ const USER_KEY_ID: &str = "AKIAEXAMPLEUSERKEY01";
 
 /// The assumed-role session the other rows sign with, the role it is a session of, and the
 /// session's own name.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 const ROLE: &str = "secretsmanager-reader";
 const SESSION: &str = "secrets-session";
 
@@ -84,11 +85,11 @@ const SESSION_SECONDS: i32 = 3_600;
 
 /// The value the seeded secret holds, so an ALLOWED read is asserted on the material it
 /// serves rather than on its status alone.
-const SECRET_VALUE: &str = "the-stored-credential";
+pub(crate) const SECRET_VALUE: &str = "the-stored-credential";
 
 /// A router serving this service beside the IAM and STS services, over ONE shared engine, so
 /// the user, the session and the policies the cases seed are the ones those services hold.
-fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -110,7 +111,7 @@ fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 ///
 /// The same wire shape every other suite of this crate uses, with the access key id as a
 /// parameter: it is what names the principal the request speaks for.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -145,7 +146,7 @@ async fn call_as(
 }
 
 /// The `__type` discriminator of an awsJson1_1 error body, without its namespace.
-fn error_code(parsed: &Value) -> String {
+pub(crate) fn error_code(parsed: &Value) -> String {
     let raw = parsed
         .get("__type")
         .and_then(Value::as_str)
@@ -154,7 +155,7 @@ fn error_code(parsed: &Value) -> String {
 }
 
 /// The `message` of an error body, under either casing the envelope may carry it in.
-fn error_message(parsed: &Value) -> String {
+pub(crate) fn error_message(parsed: &Value) -> String {
     parsed
         .get("message")
         .or_else(|| parsed.get("Message"))
@@ -172,7 +173,7 @@ fn user_arn() -> String {
 }
 
 /// The principal ARN the seeded session speaks for — what a refusal must name.
-fn session_arn() -> String {
+pub(crate) fn session_arn() -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{ROLE}/{SESSION}",
         ::engine::emulator_account_id()
@@ -181,7 +182,7 @@ fn session_arn() -> String {
 
 /// The ARN the account holds the role under, which is the identity whose policies an
 /// assumed-role session's request is judged on.
-fn role_arn() -> String {
+pub(crate) fn role_arn() -> String {
     format!(
         "arn:aws:iam::{}:role/{ROLE}",
         ::engine::emulator_account_id()
@@ -220,7 +221,7 @@ fn given_user_key(engine: &Arc<engine::InMemoryEngine>) {
 
 /// Record the role and the assumed-role session [`SESSION_KEY_ID`] speaks for, as
 /// `iam:CreateRole` and `sts:AssumeRole` record them.
-fn given_session(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn given_session(engine: &Arc<engine::InMemoryEngine>) {
     let now = SystemTime::now();
     let account = ::engine::emulator_account_id();
     let role_arn = role_arn();
@@ -289,7 +290,7 @@ fn given_user_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Val
 }
 
 /// The same, for the role behind the session — what `iam:PutRolePolicy` does.
-fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
+pub(crate) fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
     let store = iam::service_state(&**engine).expect("the IAM store");
     let mut store = store.lock();
     store.role_inline_policies.remove(&iam::name_key(ROLE));
@@ -415,9 +416,8 @@ enum Addressed {
     /// Nothing: the action reports the account, generates a password, or selects the
     /// secrets it answers for, rather than addressing one.
     NoResource,
-    /// The secret a create allocates — the name it carries plus the six characters the
-    /// create mints, which only the create itself knows — so the clause is asserted as the
-    /// prefix the ARN of a secret of that name starts with.
+    /// The secret a create would have created, by the NAME the request carried: a secret
+    /// the create never made has no ARN of this account to name.
     CreatedSecret,
 }
 
@@ -472,7 +472,7 @@ fn request_body(operation: &str, secret: &str, created: &str) -> Value {
 
 /// Create one secret with the account's own credential, which this gate serves, and return
 /// the ARN the account holds it under.
-async fn given_secret(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn given_secret(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call_as(
         router,
         ACCOUNT_KEY_ID,
@@ -532,7 +532,7 @@ fn assert_refused(case: &str, status: u16, answer: &Value, denial: &Denial<'_>) 
             format!("User: {principal} is not authorized to perform: {action} {reason}"),
             "case {case:?}: expected IAM's wording with no resource clause, got {message:?}"
         ),
-        Addressed::Secret => assert_eq!(
+        Addressed::Secret | Addressed::CreatedSecret => assert_eq!(
             message,
             format!(
                 "User: {principal} is not authorized to perform: {action} on resource: {arn} \
@@ -540,18 +540,6 @@ fn assert_refused(case: &str, status: u16, answer: &Value, denial: &Denial<'_>) 
             ),
             "case {case:?}: expected IAM's wording naming the secret, got {message:?}"
         ),
-        Addressed::CreatedSecret => {
-            // The ARN a create allocates ends in the six characters it mints, which no
-            // caller can predict, so the clause is asserted up to them.
-            let opening = format!(
-                "User: {principal} is not authorized to perform: {action} on resource: {arn}-"
-            );
-            assert!(
-                message.starts_with(&opening) && message.ends_with(&reason),
-                "case {case:?}: expected IAM's wording naming the secret being created \
-                 ({opening}… {reason}), got {message:?}"
-            );
-        }
     }
 }
 
@@ -648,13 +636,11 @@ async fn every_operation_is_authorized_against_its_own_action_and_resource() {
             given_role_policy(&engine, document.as_ref());
 
             let created = format!("created-{index}");
-            // The resource a refusal names: the stored secret's ARN, the prefix of the ARN
-            // a create allocates, or nothing at all.
+            // The resource a refusal names: the stored secret's ARN, the NAME a create
+            // carried, or nothing at all.
             let named = match addressed {
                 Addressed::Secret => arn.clone(),
-                Addressed::CreatedSecret => {
-                    format!("arn:aws:secretsmanager:{REGION}:{account}:secret:{created}")
-                }
+                Addressed::CreatedSecret => created.clone(),
                 Addressed::NoResource => String::new(),
             };
 

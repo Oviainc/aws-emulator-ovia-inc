@@ -54,17 +54,31 @@
 //! * an operation carrying a `SecretId` is judged against that secret's ARN
 //!   ([`secret_resource`]);
 //! * `CreateSecret` against the ARN of the secret it is about to create, which it allocates
-//!   before it stores anything;
+//!   before it stores anything — while its refusal names the NAME the request carried,
+//!   because a secret the create never made has no ARN of this account to name
+//!   ([`authorize_create`]);
 //! * an operation that addresses no secret of its own — the account-wide list, the password
 //!   generator, the batched read that selects by filter — against the resource IAM writes
 //!   for such a request ([`ANY_RESOURCE`]), and the refusal of one states no resource
 //!   clause, because there is nothing to name.
 //!
-//! The secretsmanager condition keys (`aws:RequestTag`, `aws:ResourceTag`,
-//! `secretsmanager:VersionStage`) are NOT part of the request handed to the shared
-//! evaluation here: a statement whose `Condition` this gate cannot decide never grants and
-//! never stops denying, which is that evaluation's fail-closed reading of an undecided
-//! clause.
+//! The condition keys the request and the addressed secret populate TRAVEL with the request
+//! handed to the shared evaluation ([`crate::state::condition_keys`]), so a statement
+//! qualified by one of them is decided rather than left undecided: a conditioned `Allow`
+//! permits exactly the requests that satisfy it, and a conditioned `Deny` refuses exactly
+//! those. A clause over a key this service does not model is still undecided, where that
+//! evaluation's fail-closed reading takes over — such a statement never grants and never
+//! stops denying.
+//!
+//! The decision is taken on the UNION of the two kinds of document AWS evaluates together:
+//! the caller's identity-based policies and the addressed secret's own resource-based
+//! policy, which `PutResourcePolicy` stored. An explicit `Deny` in either refuses; an
+//! `Allow` in either is a grant, so a principal holding no identity-based permissions at all
+//! is served a secret whose policy names it; with neither the request falls to IAM's
+//! default deny. A statement that names the ACCOUNT rather than the caller delegates to the
+//! account's own identity-based policies rather than granting, so the account spellings
+//! ([`::service_common::iam_authorization::account_principals`]) decide a `Deny` and never
+//! make a grant on their own.
 //!
 //! An operation whose documentation requires FURTHER permissions beyond its own action —
 //! the batched read's `secretsmanager:GetSecretValue` on each secret it answers for, a
@@ -96,6 +110,7 @@ use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_s
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use crate::scaffolded::AccessDeniedException;
+use crate::state::condition_keys::Conditions;
 
 /// The resource an action that is not resource-scoped is judged against, as IAM writes it
 /// for such a request.
@@ -135,43 +150,118 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Result<(), AccessDeniedException> {
+    authorize_with(engine, ctx, operation, resource, Conditions::none())
+}
+
+/// [`authorize`] for a request that publishes condition keys of its own: `conditions` are
+/// the keys its members populate ([`crate::state::condition_keys`]), which the statements'
+/// `Condition` blocks are decided against.
+///
+/// The resource a request of this shape addresses is not a stored secret — an account-wide
+/// action addresses nothing — so no resource-based policy takes part in the decision.
+pub fn authorize_with<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+    conditions: Conditions,
+) -> Result<(), AccessDeniedException> {
+    decide(engine, ctx, operation, resource, resource, &conditions, None)
+}
+
+/// [`authorize_with`] for a CREATE, which addresses the secret it is about to create:
+/// judged against the ARN that create allocates ([`created_secret_arn`]) and refused naming
+/// the `name` the request carries.
+///
+/// The decision is made against the ARN because that is what a statement's `Resource`
+/// element matches, while what the refusal NAMES is the secret the request named — the name
+/// it carries, because a secret the create never made has no ARN of its own, so there is no
+/// resource of this account to name.
+///
+/// A create addresses a secret that does not exist yet, so no resource-based policy takes
+/// part in the decision.
+pub fn authorize_create<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+    name: &str,
+    conditions: Conditions,
+) -> Result<(), AccessDeniedException> {
+    decide(engine, ctx, operation, resource, name, &conditions, None)
+}
+
+/// Whether the documents in force let this request perform `action` on `resource`.
+///
+/// `reported` is what a refusal NAMES as the resource, which is the resource the request
+/// addressed as the request spelled it; `resource_policy` is the addressed secret's own
+/// stored policy, when it carries one, and `conditions` the condition keys the request and
+/// that secret populate. The rule is IAM's own order, over the union of the two kinds of
+/// document — see the module docs.
+fn decide<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+    reported: &str,
+    conditions: &Conditions,
+    resource_policy: Option<&str>,
+) -> Result<(), AccessDeniedException> {
     let action = format!("{ACTION_PREFIX}:{operation}");
     let caller = caller(engine, ctx);
+    let refusal = |reason: &str| not_authorized(&caller.arn, &action, reported, reason);
     // The principal spellings travel with the request because that is what a statement's
-    // `Principal` element would be matched against; an identity-based document states no
-    // such element, so the decision below rests on the action and the resource. (The
-    // resource-based policy a secret may carry is a SECOND decision, which this gate does
-    // not take: it grants access the identity-based documents do not, and the operations
-    // that own the stored policy are where it is read.)
-    let request = iam::Request::new(&action, resource, &caller.principals);
-    let identity_said = iam::identity_decision(&caller.documents, &request);
-    // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
+    // `Principal` element is matched against; an identity-based document states no such
+    // element, so for those documents the decision rests on the action, the resource and
+    // the conditions. The caller's OWN spellings are what a GRANT is decided under, because
+    // a statement naming the account delegates rather than grants.
+    let granting = iam::Request::new(&action, resource, &caller.principals)
+        .with_context(conditions.values())
+        .with_published_keys(conditions.published());
+    // Every spelling, the account's included: a statement that DENIES the account denies
+    // each of its principals.
+    let mut named = caller.principals.clone();
+    named.extend(iam::account_principals(&caller.arn));
+    let denying = iam::Request::new(&action, resource, &named)
+        .with_context(conditions.values())
+        .with_published_keys(conditions.published());
+
+    // An explicit `Deny` in the SECRET's own policy refuses whatever any grant says —
+    // including the account's own credential, which the rest of this gate does not bound.
+    if resource_policy.is_some_and(|document| {
+        iam::resource_decision(document, &denying) == Decision::Denied
+    }) {
+        return Err(refusal("with an explicit deny in a resource-based policy"));
+    }
+    let identity_said = iam::identity_decision(&caller.documents, &granting);
+    // Taken before any grant is read, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
     // emulator cannot read, which only lifts the DEFAULT deny of a request no readable
     // statement allows (see the module docs).
     if identity_said == Decision::Denied {
-        return Err(not_authorized(
-            &caller.arn,
-            &action,
-            resource,
-            "with an explicit deny in an identity-based policy",
-        ));
+        return Err(refusal("with an explicit deny in an identity-based policy"));
+    }
+    // A grant in the secret's own policy names this principal directly, and "a permissions
+    // boundary does not limit the permissions granted to the entity by a resource-based
+    // policy that names it as a principal" (IAM, permissions boundaries): such a grant
+    // stands on its own, so a principal holding no identity-based policy at all is served.
+    if resource_policy.is_some_and(|document| {
+        iam::resource_decision(document, &granting) == Decision::Allowed
+    }) {
+        return Ok(());
     }
     let granted =
         iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
     if !granted {
-        return Err(not_authorized(
-            &caller.arn,
-            &action,
-            resource,
-            &format!("because no identity-based policy allows the {action} action"),
-        ));
+        return Err(refusal(&format!(
+            "because no identity-based policy allows the {action} action"
+        )));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy
     // can grant" (IAM, permissions boundaries): a grant the boundary does not also allow
     // is not a permission the principal has. The account's own credential carries none.
     if let Some(boundary) = &caller.boundary {
-        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &granting) {
             Decision::Allowed => return Ok(()),
             // An explicit deny is a fact about the boundary document, so the refusal names
             // it; a boundary that merely states nothing withheld the grant the
@@ -181,13 +271,14 @@ pub fn authorize<Eng: Send + Sync + 'static>(
                 format!("because no permissions boundary allows the {action} action")
             }
         };
-        return Err(not_authorized(&caller.arn, &action, resource, &reason));
+        return Err(refusal(&reason));
     }
     Ok(())
 }
 
 /// Authorize a request that addresses the secret `secret_id` names, judged against that
-/// secret's ARN ([`secret_resource`]).
+/// secret's ARN ([`secret_resource`]) and against that secret's own stored resource-based
+/// policy.
 ///
 /// The one call site shape for every operation of this service that carries a `SecretId`,
 /// so no two of them can judge the same request against different resources.
@@ -197,8 +288,78 @@ pub fn authorize_secret<Eng: Send + Sync + 'static>(
     operation: &str,
     secret_id: Option<&str>,
 ) -> Result<(), AccessDeniedException> {
-    let resource = secret_resource(engine, ctx, secret_id);
-    authorize(engine, ctx, operation, &resource)
+    authorize_secret_with(engine, ctx, operation, secret_id, Conditions::none())
+}
+
+/// [`authorize_secret`] for a request that publishes condition keys of its own.
+///
+/// `conditions` are the keys the request's OWN members populate; the keys the ADDRESSED
+/// secret populates — its tags, and the `SecretId` the request named it by — are added
+/// here, from the one store read this gate already makes, so no operation collects them
+/// twice.
+pub fn authorize_secret_with<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    secret_id: Option<&str>,
+    conditions: Conditions,
+) -> Result<(), AccessDeniedException> {
+    let addressed = addressed_secret(engine, ctx, secret_id);
+    let mut conditions = conditions.text(
+        crate::state::condition_keys::SECRET_ID_KEY,
+        secret_id.filter(|id| !id.is_empty()),
+    );
+    conditions.add_resource_tags(&addressed.tags);
+    decide(
+        engine,
+        ctx,
+        operation,
+        &addressed.arn,
+        &addressed.arn,
+        &conditions,
+        addressed.policy.as_deref(),
+    )
+}
+
+/// What the store holds about the secret a request addresses, read ONCE: the ARN the
+/// request is judged against, the tags that populate the resource-tag condition keys and
+/// the resource-based policy that may itself grant the call.
+#[derive(Debug, Clone, Default)]
+struct AddressedSecret {
+    arn: String,
+    tags: Vec<crate::state::StoredTag>,
+    policy: Option<String>,
+}
+
+/// Read what the store holds about the secret `secret_id` names.
+///
+/// A READ of this service's own store, taken before the decision and under its own
+/// short-lived guard: nothing is written, so what a later caller sees is unchanged. A
+/// `SecretId` this account holds no secret for carries no tags and no policy, and is judged
+/// against the ARN that id spells ([`secret_resource`]).
+fn addressed_secret<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    secret_id: Option<&str>,
+) -> AddressedSecret {
+    let Some(secret_id) = secret_id.filter(|id| !id.is_empty()) else {
+        return AddressedSecret {
+            arn: ANY_RESOURCE.to_string(),
+            ..AddressedSecret::default()
+        };
+    };
+    let held = crate::state::service_state(engine).and_then(|state| {
+        let store = state.lock();
+        store.get(secret_id).map(|secret| AddressedSecret {
+            arn: secret.arn.clone(),
+            tags: secret.tags.clone(),
+            policy: secret.resource_policy.clone(),
+        })
+    });
+    held.unwrap_or_else(|| AddressedSecret {
+        arn: unheld_secret_arn(ctx, secret_id),
+        ..AddressedSecret::default()
+    })
 }
 
 /// The ARN the secret a `SecretId` names is judged against.
@@ -215,25 +376,22 @@ pub fn authorize_secret<Eng: Send + Sync + 'static>(
 ///
 /// `None`, for an operation whose `SecretId` is optional and absent, is judged against
 /// [`ANY_RESOURCE`]: no secret is named, so there is none to judge against.
-///
-/// A READ of this service's own store, taken before the decision and under its own
-/// short-lived guard: nothing is written, so what a later caller sees is unchanged.
 #[must_use]
 pub fn secret_resource<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     secret_id: Option<&str>,
 ) -> String {
-    let Some(secret_id) = secret_id.filter(|id| !id.is_empty()) else {
-        return ANY_RESOURCE.to_string();
-    };
-    let held = crate::state::service_state(engine).and_then(|state| {
-        let store = state.lock();
-        store.get(secret_id).map(|secret| secret.arn.clone())
-    });
-    if let Some(arn) = held {
-        return arn;
-    }
+    addressed_secret(engine, ctx, secret_id).arn
+}
+
+/// The ARN a `SecretId` this account holds no secret for is judged against: itself when it
+/// is an ARN of this service already, else the ARN a secret of that name would carry in the
+/// Region the caller signed for.
+fn unheld_secret_arn(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    secret_id: &str,
+) -> String {
     if ::service_common::arn::is_resource_arn_of(secret_id, ACTION_PREFIX) {
         return secret_id.to_string();
     }
@@ -263,7 +421,8 @@ pub fn secret_arn(region: &str, name: &str) -> String {
 /// — else a fresh one, the name plus the six random characters a secret's ARN ends in.
 ///
 /// Allocating it before the decision is what lets a create be judged against the secret it
-/// is about to create, which is the resource the action is taken on; nothing is stored by
+/// is about to create, which is the resource the action is taken on, and is why a policy
+/// scoping a create states the characters it ends in as a wildcard; nothing is stored by
 /// reading it.
 #[must_use]
 pub fn created_secret_arn<Eng: Send + Sync + 'static>(
@@ -290,8 +449,9 @@ pub fn created_secret_arn<Eng: Send + Sync + 'static>(
 /// The refusal IAM states an authorization failure with: who was refused, which action,
 /// on which resource, and which of IAM's two rules refused it. Every value in it comes
 /// from the request and from the stored policies — the principal from the credential the
-/// request presented, the action from the operation it named, the resource from the ARN it
-/// addressed.
+/// request presented, the action from the operation it named, the resource from what the
+/// request addressed, as the request spelled it (see [`authorize_create`] for the one
+/// request that addresses a resource carrying no ARN yet).
 ///
 /// An action that addresses no resource of its own is judged against [`ANY_RESOURCE`], and
 /// the sentence states no resource clause for it: there is nothing to name.

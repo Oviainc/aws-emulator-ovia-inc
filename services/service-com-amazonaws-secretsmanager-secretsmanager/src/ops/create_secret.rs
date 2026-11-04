@@ -369,8 +369,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         // IAM authorizes every call to this service against the caller's
         // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows creates nothing.
-        crate::state::authorization::authorize(&*self.engine, ctx, Self::NAME, &arn)?;
+        // caller no policy allows creates nothing. The members this create states —
+        // the name, the description, the encryption key, the tags it attaches and the
+        // Regions it replicates to — travel with the decision, so a grant conditioned
+        // on a mandated tag admits only a create that carries it.
+        crate::state::authorization::authorize_create(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &arn,
+            &input.name,
+            crate::state::condition_keys::Conditions::none()
+                .text(
+                    crate::state::condition_keys::NAME_KEY,
+                    Some(input.name.as_str()),
+                )
+                .text(
+                    crate::state::condition_keys::DESCRIPTION_KEY,
+                    input.description.as_deref(),
+                )
+                .text(
+                    crate::state::condition_keys::KMS_KEY_ID_KEY,
+                    input.kms_key_id.as_deref(),
+                )
+                .request_tags(input.tags.as_deref())
+                .replica_regions(input.add_replica_regions.as_deref())
+                .flag(
+                    crate::state::condition_keys::FORCE_OVERWRITE_REPLICA_KEY,
+                    Some(input.force_overwrite_replica_secret),
+                ),
+        )?;
 
         // "Either SecretString or SecretBinary must have a value, but not both."
         if input.secret_string.is_some() && input.secret_binary.is_some() {

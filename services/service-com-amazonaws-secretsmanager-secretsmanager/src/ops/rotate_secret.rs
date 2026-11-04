@@ -207,14 +207,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. The rotation function this call configures
+        // travels with the decision, so a grant scoped to one function admits only a
+        // rotation through it.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none().text(
+                crate::state::condition_keys::ROTATION_LAMBDA_ARN_KEY,
+                input.rotation_lambda_arn.as_deref(),
+            ),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let mut store = state.lock();

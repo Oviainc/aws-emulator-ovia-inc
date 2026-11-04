@@ -38,6 +38,10 @@ pub mod envelope;
 /// anything.
 pub mod authorization;
 
+/// The IAM condition keys a request and the secret it addresses populate, which the
+/// gate above decides a statement's `Condition` against.
+pub mod condition_keys;
+
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
 

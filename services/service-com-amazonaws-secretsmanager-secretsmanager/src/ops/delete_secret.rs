@@ -183,14 +183,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. The two members that decide how irreversible
+        // this delete is travel with the decision, so a guardrail written over them
+        // fires on exactly the shapes it names.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none()
+                .flag(
+                    crate::state::condition_keys::FORCE_DELETE_KEY,
+                    input.force_delete_without_recovery,
+                )
+                .count(
+                    crate::state::condition_keys::RECOVERY_WINDOW_KEY,
+                    input.recovery_window_in_days,
+                ),
         )?;
         // "You can't use both this parameter and ForceDeleteWithoutRecovery in
         // the same call."

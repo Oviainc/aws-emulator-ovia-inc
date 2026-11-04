@@ -207,9 +207,20 @@ async fn attached_policy_round_trips_byte_for_byte() {
         ("one-allow-statement", policy_for("arn:aws:iam::123456789012:root")),
         (
             "statement-object-not-list",
+            // The `Statement` element as ONE statement rather than a list, which
+            // is the form this row varies. Its `Action` names one action of this
+            // service rather than every action, because the document a secret
+            // carries is EVALUATED on each later call: a `Deny` of `*` to every
+            // principal would refuse the reads below, which is the lockout such
+            // a document really is rather than anything about its form.
             json!({
                 "Version": "2012-10-17",
-                "Statement": {"Effect": "Deny", "Principal": "*", "Action": "*", "Resource": "*"}
+                "Statement": {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": "*"
+                }
             })
             .to_string(),
         ),

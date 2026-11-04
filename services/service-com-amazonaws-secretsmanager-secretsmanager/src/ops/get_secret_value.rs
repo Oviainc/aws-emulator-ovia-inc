@@ -200,14 +200,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. The version the request names travels with the
+        // decision, so a grant scoped to one staging label admits a read of that label
+        // and nothing else.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none()
+                .text(
+                    crate::state::condition_keys::VERSION_ID_KEY,
+                    input.version_id.as_deref(),
+                )
+                .text(
+                    crate::state::condition_keys::VERSION_STAGE_KEY,
+                    input.version_stage.as_deref(),
+                ),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         // What the answer is built from, read under the store's guard and carried

@@ -63,8 +63,8 @@
 //!
 //! A statement's `Condition` is evaluated only for the keys the caller puts in the
 //! [`Request::context`] it passes (`rum:alias`, say, which CloudWatch RUM documents for
-//! `PutRumEvents`) and only for the string, ARN, boolean, date and existence operators
-//! below, each
+//! `PutRumEvents`) and only for the string, ARN, boolean, numeric, date and existence
+//! operators below, each
 //! of which may carry IAM's `IfExists` suffix ([`IF_EXISTS_SUFFIX`]), under which a key the
 //! request models and carries no value for holds instead of refusing. A clause this CAN decide is
 //! part of whether its statement applies at all, whichever effect the statement states: a
@@ -130,8 +130,8 @@
 //! element as a plain non-match: a refusal is never weakened on a value this evaluation
 //! could not establish.
 
-/// The string condition operators this evaluator decides. Everything else — the numeric,
-/// date and IP operators — leaves the statement undecided (see the module
+/// The string condition operators this evaluator decides. Everything else — the IP
+/// operators — leaves the statement undecided (see the module
 /// docs). Each of them may be written under a set qualifier; see [`split_set_qualifier`].
 const STRING_OPERATORS: &[&str] = &[
     "StringEquals",
@@ -211,6 +211,37 @@ fn instant(text: &str) -> Option<i64> {
 /// access based on comparing a key to `true` or `false`". The two literals are compared
 /// case-insensitively, which is how a document may spell them.
 const BOOL_OPERATOR: &str = "Bool";
+
+/// The numeric condition operators this evaluator decides: "numeric condition operators let
+/// you construct `Condition` elements that restrict access based on comparing a key to an
+/// integer or decimal value". Like the string operators, each may be written under a set
+/// qualifier and with the `IfExists` suffix.
+///
+/// Both sides are read as NUMBERS ([`number`]) rather than as text, so the spellings of one
+/// figure compare equal (`30`, `30.0`, `3e1`) — which is what a key whose value is a count
+/// or a size is compared by, and a document may state either side as a JSON number or as
+/// its quoted text.
+const NUMERIC_OPERATORS: &[&str] = &[
+    "NumericEquals",
+    "NumericNotEquals",
+    "NumericLessThan",
+    "NumericLessThanEquals",
+    "NumericGreaterThan",
+    "NumericGreaterThanEquals",
+];
+
+/// The number `text` names, or `None` when it names none — which is what leaves a numeric
+/// comparison against it not holding.
+///
+/// Read as a binary floating-point value, which carries every integer a condition key of
+/// this service tree can name (a count of days, a size in bytes, an age in seconds) exactly;
+/// a value that is not finite names no figure to compare, so `inf` and `NaN` name none.
+fn number(text: &str) -> Option<f64> {
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|parsed| parsed.is_finite())
+}
 
 /// The suffix that makes a comparison hold where the request carries no value for the key:
 /// "you can add `IfExists` to the end of any condition operator name except the `Null`
@@ -1123,6 +1154,7 @@ fn conditions_hold(
             operator == BOOL_OPERATOR
                 || STRING_OPERATORS.contains(&operator)
                 || ARN_OPERATORS.contains(&operator)
+                || NUMERIC_OPERATORS.contains(&operator)
                 || DATE_OPERATORS.contains(&operator)
         };
         for (key, expected) in keys {
@@ -1132,7 +1164,7 @@ fn conditions_hold(
                 .filter(|(known, _)| known.eq_ignore_ascii_case(key))
                 .map(|(_, value)| value.as_str())
                 .collect();
-            let expected = super::iam_trust_policy::json_strings(expected);
+            let expected = clause_values(expected);
             // Whether the request MODELS this key at all, which is what makes an absent
             // value mean "the request carries none" rather than "this emulator does not
             // know".
@@ -1165,7 +1197,7 @@ fn conditions_hold(
             // request carries no value for cannot be compared at all, which leaves the
             // statement undecided.
             let Some(expected) = expected
-                .into_iter()
+                .iter()
                 .map(|value| expand(value, request))
                 .collect::<Option<Vec<Expanded>>>()
             else {
@@ -1215,6 +1247,30 @@ fn conditions_hold(
         }
     }
     decidable.then_some(held)
+}
+
+/// The values one condition clause states for a key: the strings it names, and the TEXT of
+/// a scalar it states unquoted.
+///
+/// IAM's policy grammar writes a condition value as a string, and a document may equally
+/// state a numeric or a boolean one as the JSON number or boolean that names it ("Bool":
+/// {"aws:SecureTransport": true}) — the same value, so the two spellings decide alike. A
+/// composite value (an object, a list of lists) names none.
+fn clause_values(value: &::serde_json::Value) -> Vec<String> {
+    match value {
+        ::serde_json::Value::Array(many) => many.iter().filter_map(scalar_text).collect(),
+        one => scalar_text(one).into_iter().collect(),
+    }
+}
+
+/// The text a scalar JSON value names, or `None` for a value that is not one.
+fn scalar_text(value: &::serde_json::Value) -> Option<String> {
+    match value {
+        ::serde_json::Value::String(text) => Some(text.clone()),
+        ::serde_json::Value::Number(number) => Some(number.to_string()),
+        ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 /// Whether the request DECLARES that it models `key`: its own name is published, or a
@@ -1298,6 +1354,17 @@ fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
     // epoch and ISO 8601 spellings of one moment compare equal. A side that names no
     // instant at all is compared against nothing, so the positive spelling does not hold
     // on it — and the negated one, which holds exactly where its sibling does not, does.
+    // Both sides as NUMBERS: a numeric clause compares the figure each side names, so the
+    // spellings of one figure compare equal. A side that names no figure at all is compared
+    // against nothing, so the positive spelling does not hold on it — and the negated one,
+    // which holds exactly where its sibling does not, does.
+    let any_number = |ordered: fn(f64, f64) -> bool| {
+        number(actual).is_some_and(|reached| {
+            expected
+                .iter()
+                .any(|value| number(&value.text()).is_some_and(|stated| ordered(reached, stated)))
+        })
+    };
     let any_instant = |ordered: fn(i64, i64) -> bool| {
         instant(actual).is_some_and(|reached| {
             expected
@@ -1316,6 +1383,12 @@ fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
         // positive spellings are documented as doing the same comparison.
         "ArnEquals" | "ArnLike" => any_like(),
         "ArnNotEquals" | "ArnNotLike" => !any_like(),
+        "NumericEquals" => any_number(|reached, stated| reached == stated),
+        "NumericNotEquals" => !any_number(|reached, stated| reached == stated),
+        "NumericLessThan" => any_number(|reached, stated| reached < stated),
+        "NumericLessThanEquals" => any_number(|reached, stated| reached <= stated),
+        "NumericGreaterThan" => any_number(|reached, stated| reached > stated),
+        "NumericGreaterThanEquals" => any_number(|reached, stated| reached >= stated),
         "DateEquals" => any_instant(|reached, stated| reached == stated),
         "DateNotEquals" => !any_instant(|reached, stated| reached == stated),
         "DateLessThan" => any_instant(|reached, stated| reached < stated),
@@ -1666,6 +1739,105 @@ mod tests {
             ));
             let request =
                 Request::new("rum:PutRumEvents", RESOURCE, &held).with_context(&context);
+            let reached = identity_decision(&[document], &request);
+            assert_eq!(
+                reached, expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+    }
+
+    /// RULE: the numeric operators compare the FIGURE each side names, so a clause over a
+    /// count- or size-valued key holds exactly where the comparison it writes holds of the
+    /// value the request carries, in either side's spelling of that figure.
+    #[test]
+    fn a_numeric_condition_compares_the_figure_each_side_names() {
+        // (case, the value the request carries for the key, the `Condition` element, the
+        // decision it must reach). The rows differ along what the rule generalises over:
+        // the comparison, which side of the bound the value is, the boundary itself, the
+        // spelling of each figure, and a value that names no figure at all.
+        let rows: [(&str, &str, &str, Decision); 12] = [
+            (
+                "NumericEquals on the very figure the request carries",
+                "30",
+                "{\"NumericEquals\":{\"svc:count\":\"30\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "NumericEquals on another figure",
+                "30",
+                "{\"NumericEquals\":{\"svc:count\":\"7\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "NumericNotEquals on another figure",
+                "30",
+                "{\"NumericNotEquals\":{\"svc:count\":\"7\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "NumericLessThan, with the value below the bound",
+                "7",
+                "{\"NumericLessThan\":{\"svc:count\":\"30\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "NumericLessThan, with the value AT the bound",
+                "30",
+                "{\"NumericLessThan\":{\"svc:count\":\"30\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "NumericLessThanEquals, with the value at the bound",
+                "30",
+                "{\"NumericLessThanEquals\":{\"svc:count\":\"30\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "NumericGreaterThan, with the value above the bound",
+                "31",
+                "{\"NumericGreaterThan\":{\"svc:count\":\"30\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "NumericGreaterThanEquals, with the value at the bound",
+                "30",
+                "{\"NumericGreaterThanEquals\":{\"svc:count\":\"30\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "a decimal bound the integer value is under",
+                "30",
+                "{\"NumericLessThan\":{\"svc:count\":\"30.5\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "the same figure spelled as a JSON number rather than as text",
+                "30",
+                "{\"NumericEquals\":{\"svc:count\":30}}",
+                Decision::Allowed,
+            ),
+            (
+                "the same figure in another spelling on each side",
+                "30.0",
+                "{\"NumericEquals\":{\"svc:count\":\"3e1\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "a value that names no figure at all",
+                "thirty",
+                "{\"NumericLessThan\":{\"svc:count\":\"30\"}}",
+                Decision::NotStated,
+            ),
+        ];
+        let held = principals();
+        for (case, carried, condition, expected) in rows {
+            let context = [("svc:count".to_string(), carried.to_string())];
+            let document = identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"rum:PutRumEvents\",\"Resource\":\"*\",\
+                 \"Condition\":{condition}}}"
+            ));
+            let request = Request::new("rum:PutRumEvents", RESOURCE, &held).with_context(&context);
             let reached = identity_decision(&[document], &request);
             assert_eq!(
                 reached, expected,

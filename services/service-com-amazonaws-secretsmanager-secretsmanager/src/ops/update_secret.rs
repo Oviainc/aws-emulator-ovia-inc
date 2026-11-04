@@ -239,14 +239,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. The members this update states travel with the
+        // decision, so a grant scoped to one encryption key admits only an update onto
+        // that key.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none()
+                .text(
+                    crate::state::condition_keys::DESCRIPTION_KEY,
+                    input.description.as_deref(),
+                )
+                .text(
+                    crate::state::condition_keys::KMS_KEY_ID_KEY,
+                    input.kms_key_id.as_deref(),
+                ),
         )?;
         // "Either SecretBinary or SecretString must have a value, but not both."
         // (`UpdateSecretRequest$SecretString`, this service's Smithy model.) A

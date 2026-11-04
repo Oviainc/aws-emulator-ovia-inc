@@ -156,14 +156,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM authorizes every call to this service against the caller's
-        // identity-based policies BEFORE the operation reads or writes anything, so a
-        // caller no policy allows is refused rather than served.
-        crate::state::authorization::authorize_secret(
+        // IAM authorizes every call to this service against the policies in force —
+        // the caller's identity-based ones and the secret's own resource-based policy —
+        // BEFORE the operation reads or writes anything, so a caller no policy allows
+        // is refused rather than served. The Regions this call replicates to, and
+        // whether it overwrites what it finds there, travel with the decision.
+        crate::state::authorization::authorize_secret_with(
             &*self.engine,
             ctx,
             Self::NAME,
             Some(input.secret_id.as_str()),
+            crate::state::condition_keys::Conditions::none()
+                .replica_regions(Some(&input.add_replica_regions))
+                .flag(
+                    crate::state::condition_keys::FORCE_OVERWRITE_REPLICA_KEY,
+                    Some(input.force_overwrite_replica_secret),
+                ),
         )?;
         // Bound the request itself before anything walks or stores it:
         // `AddReplicaRegionListType` declares no maximum length, and no secret
