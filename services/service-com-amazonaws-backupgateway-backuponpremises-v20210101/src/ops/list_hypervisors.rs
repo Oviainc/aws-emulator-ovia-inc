@@ -186,15 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // `MaxResults` caps the page, but the SERVER caps it too: the model gives
-        // `MaxResults` a minimum of 1 and no maximum and declares no default page size,
-        // so a request that names none gets `DEFAULT_PAGE_SIZE` and one that asks for
-        // more than `MAX_PAGE_SIZE` gets that — no single response carries the whole
-        // store, and the rest is reached through `NextToken`. The `max(1)` is
-        // belt-and-braces: the modelled range is refused before `handle` runs.
-        let limit = input.max_results.map_or(crate::state::DEFAULT_PAGE_SIZE, |max| {
-            (max.max(1) as usize).min(crate::state::MAX_PAGE_SIZE)
-        });
+        // The page size is the service's one page rule — see `state::page_limit`.
+        let limit = crate::state::page_limit(input.max_results);
 
         // One clock reading for the whole page, so two records of the same page cannot
         // report their state as of two different instants.

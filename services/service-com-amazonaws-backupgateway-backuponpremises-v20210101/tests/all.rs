@@ -75,6 +75,8 @@ mod minted_resource_id_form;
 mod missing_resource_refusal_is_one_answer;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
+#[path = "all/page_size_is_one_rule.rs"]
+mod page_size_is_one_rule;
 #[path = "all/page_token_provenance.rs"]
 mod page_token_provenance;
 #[path = "all/page_token_query_identity.rs"]

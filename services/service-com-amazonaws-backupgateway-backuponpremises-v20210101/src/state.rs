@@ -828,6 +828,26 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// See [`DEFAULT_PAGE_SIZE`].
 pub const MAX_PAGE_SIZE: usize = 100;
 
+/// The page size a listing serves for the `MaxResults` a request named:
+/// [`DEFAULT_PAGE_SIZE`] when it named none, and otherwise the size it asked for, floored
+/// at one record and capped at [`MAX_PAGE_SIZE`].
+///
+/// Every list operation of this service pages by this one rule, so it is computed here —
+/// beside the two bounds it reads — rather than restated by each listing handler: nothing
+/// about it is resource-specific, and the paging core ([`Page`]) already relies on it, its
+/// doc recording that the `limit` a page is cut with is the caller's `MaxResults` ALREADY
+/// clamped. This is what clamps it.
+///
+/// The floor is belt-and-braces: `MaxResults` is modelled with a minimum of 1 and no
+/// maximum, so a smaller value is refused at the boundary before a handler runs, and a
+/// page of no records — which would carry a token on for ever without handing out a
+/// record — cannot be asked for.
+pub fn page_limit(max_results: Option<i32>) -> usize {
+    max_results.map_or(DEFAULT_PAGE_SIZE, |max| {
+        (max.max(1) as usize).min(MAX_PAGE_SIZE)
+    })
+}
+
 /// The whole `ValidationException$Message` every paginated listing of this service answers
 /// a `NextToken` it never issued with.
 ///
@@ -1906,8 +1926,8 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// the page starts at the next key AFTER it — so a record created, or deleted,
     /// between two pages changes what the second page holds without ever repeating or
     /// skipping a record that stayed put. `limit` is the caller's `MaxResults` already
-    /// clamped to [`MAX_PAGE_SIZE`] by the handler, so no request can make one response
-    /// carry the whole store.
+    /// resolved by [`page_limit`], so no request can make one response carry the whole
+    /// store.
     pub fn page_of_gateways(
         &self,
         region: &str,
@@ -2784,8 +2804,8 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
 /// `after` is the key the previous page ended on (resolved from a `NextToken`), and the
 /// page starts at the next key AFTER it — so a record created, or deleted, between two
 /// pages changes what the second page holds without ever repeating or skipping a record
-/// that stayed put. `limit` is the caller's `MaxResults` already clamped to
-/// [`MAX_PAGE_SIZE`] by the handler, so no request can make one response carry a whole
+/// that stayed put. `limit` is the caller's `MaxResults` already resolved by
+/// [`page_limit`], so no request can make one response carry a whole
 /// store. A record of another region is not part of the listing at all
 /// ([`arn_is_in_region`]): the filter is applied before the page is cut, so a page holds
 /// up to `limit` records OF THAT REGION and promises a successor only while one remains.
