@@ -419,6 +419,12 @@ impl ComAmazonawsSsmAmazonssmState {
             .get(&(region.to_string(), ops_item_id.to_string()))
     }
 
+    /// The same OpsItem, to write it — its tags, say.
+    pub fn ops_item_mut(&mut self, region: &str, ops_item_id: &str) -> Option<&mut OpsItemRecord> {
+        self.ops_items
+            .get_mut(&(region.to_string(), ops_item_id.to_string()))
+    }
+
     /// The OpsItem `region` already holds open under `dedup`, or `None` when it holds
     /// none: an OpsItem that has been resolved or closed is finished work, so a create
     /// carrying its dedup string opens a new OpsItem rather than colliding with it.

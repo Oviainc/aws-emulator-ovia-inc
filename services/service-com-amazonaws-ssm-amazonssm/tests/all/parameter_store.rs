@@ -60,15 +60,21 @@ const MAX_VERSIONS: usize = 100;
 
 /// A router with just this service mounted on a fresh engine.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// The same router, beside the engine it is mounted on — for a suite that must seed a
+/// record no operation of this service creates yet.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still reads the SigV4
     // credential scope below, which is where a stored parameter's Region comes from.
     router.set_request_authentication(false);
     router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// A router with this service AND KMS mounted on one shared engine.

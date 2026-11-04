@@ -49,6 +49,8 @@ mod parameters_by_path;
 mod published_documents;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/run_command.rs"]
 mod run_command;
 #[path = "all/secure_string_decryption.rs"]

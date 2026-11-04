@@ -122,6 +122,10 @@ pub mod ops_items;
 /// `GetServiceSetting` reports and `UpdateServiceSetting`/`ResetServiceSetting` modify.
 pub mod service_settings;
 
+/// The one tag set each resource this store holds carries, and how a tag request
+/// addresses it.
+pub mod tagging;
+
 use service_settings::ServiceSettingRecord;
 
 use crate::ops::types::{
@@ -2480,15 +2484,7 @@ impl DocumentRecord {
             default_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
             document_format: Some(self.document_format.clone()),
             target_type: self.target_type.clone(),
-            tags: (!self.tags.is_empty()).then(|| {
-                self.tags
-                    .iter()
-                    .map(|(key, value)| Tag {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
-                    .collect()
-            }),
+            tags: (!self.tags.is_empty()).then(|| tagging::to_tag_list(&self.tags)),
             attachments_information: (!self.attachment_names.is_empty()).then(|| {
                 self.attachment_names
                     .iter()
@@ -2766,6 +2762,12 @@ impl ComAmazonawsSsmAmazonssmState {
         self.documents.get(&(region.to_string(), name.to_string()))
     }
 
+    /// The same document, to write it — its tags, say.
+    pub fn document_mut(&mut self, region: &str, name: &str) -> Option<&mut DocumentRecord> {
+        self.documents
+            .get_mut(&(region.to_string(), name.to_string()))
+    }
+
     /// The document Systems Manager publishes under `name`, as it is reached through
     /// `region`'s endpoint, or `None` when the catalogue holds none of that name.
     ///
@@ -2931,6 +2933,12 @@ impl ComAmazonawsSsmAmazonssmState {
     pub fn managed_node(&self, region: &str, id: &str) -> Option<&ManagedNodeRecord> {
         self.managed_nodes
             .get(&(region.to_string(), id.to_string()))
+    }
+
+    /// The same node, to write it — its tags, say.
+    pub fn managed_node_mut(&mut self, region: &str, id: &str) -> Option<&mut ManagedNodeRecord> {
+        self.managed_nodes
+            .get_mut(&(region.to_string(), id.to_string()))
     }
 
     /// Every managed node `region` holds, in ascending node-id order, as
@@ -3533,15 +3541,7 @@ impl ActivationRecord {
             expiration_date: Some(::aws_smithy_types::DateTime::from(self.expiration_date)),
             expired: self.is_expired(now),
             created_date: Some(::aws_smithy_types::DateTime::from(self.created_date)),
-            tags: (!self.tags.is_empty()).then(|| {
-                self.tags
-                    .iter()
-                    .map(|(key, value)| Tag {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
-                    .collect()
-            }),
+            tags: (!self.tags.is_empty()).then(|| tagging::to_tag_list(&self.tags)),
         }
     }
 

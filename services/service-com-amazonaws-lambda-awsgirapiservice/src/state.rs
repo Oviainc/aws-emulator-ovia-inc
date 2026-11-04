@@ -969,16 +969,16 @@ pub const ROLE_NOT_ASSUMABLE_MESSAGE: &str =
 /// creates the function, so this emulator's IAM holding no record of it says nothing about
 /// the role itself, and the create is served. A refusal has to be grounded in a trust
 /// document IAM answered with, never assumed from an absent record.
+/// The whole question — which role of this account the value names, what IAM answers
+/// about it, and whether the trust policy it carries admits a service principal — is
+/// the ONE reading every service that resolves a caller-supplied execution role shares
+/// (`service_common::iam_role`), so this crate states only WHICH principal has to be
+/// admitted, WHICH operations ask, and that a role no record is held for is served.
 pub async fn execution_role_is_unassumable(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
 ) -> bool {
-    // The whole question — which role of this account the value names, what IAM answers
-    // about it, and whether the trust policy it carries admits a service principal — is
-    // the ONE reading every service that resolves a caller-supplied execution role shares
-    // (`service_common::iam_role`), so this crate states only WHICH principal has to be
-    // admitted, WHICH operations ask, and that a role no record is held for is served.
     ::service_common::iam_role::held_role_is_unassumable(
         ctx,
         region,

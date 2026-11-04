@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTagsToResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTagsToResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Tag a resource this service holds — the writing half of the tag plane. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTagsToResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Adds or overwrites one or more tags for the specified resource": the request names a
+//! resource by `(ResourceType, ResourceId)`, that pair resolves to the one record the
+//! Region holds for it ([`crate::state::tagging`]), and the submitted tags are merged into
+//! that record's own tag set — a key the resource already carries takes the submitted
+//! value rather than appearing twice. What this writes is therefore what
+//! `ListTagsForResource` reports, what `RemoveTagsFromResource` drops, and, for a
+//! document, what `DescribeDocument` reports beside the rest of the document.
+//!
+//! An id naming no resource the Region holds is the modelled `InvalidResourceId`, and a
+//! merge that would take the resource past the documented maximum number of tags is
+//! `TooManyTagsError` — which writes none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -174,17 +179,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTagsToResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsToResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTagsToResource"))
+        // request metadata.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddTagsToResourceErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the tag store is unavailable".to_string()),
+            })
+        })?;
+
+        // A resource lives in the Region its endpoint names, which is the signed
+        // credential scope's — so an id is resolved against that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `InvalidResourceId` carries NO message member at all, so the error code is the
+        // whole of what this refusal says: "The resource ID isn't valid. Verify that you
+        // entered the correct ID and try again."
+        let Some(held) = store.resource_tags_mut(&region, &input.resource_type, &input.resource_id)
+        else {
+            return Err(
+                AddTagsToResourceErrorModeled::InvalidResourceId(InvalidResourceId {}).into(),
+            );
+        };
+
+        crate::state::tagging::merge_tags(held, &input.tags).map_err(|_| {
+            // "The Targets parameter includes too many tags. Remove one or more tags and
+            // try the command again." — messageless in the model too.
+            AddTagsToResourceErrorModeled::TooManyTagsError(TooManyTagsError {})
+        })?;
+
+        Ok(AddTagsToResourceOutput {})
     }
 }

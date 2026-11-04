@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the tags a resource this service holds carries — the reading half of the tag
+//! plane. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Returns a list of the tags assigned to the specified resource": the request names a
+//! resource by `(ResourceType, ResourceId)`, exactly as `AddTagsToResource` does, that
+//! pair resolves to the one record the Region holds for it ([`crate::state::tagging`]),
+//! and the report is that record's own tag set — so what a tag write persisted is what
+//! this reads back, and a resource nothing has tagged reports the empty list it holds.
+//!
+//! An id naming no resource the Region holds is the modelled `InvalidResourceId`. This
+//! operation only reports: it writes nothing, so two reads of one resource answer alike.
 //!
 //! ## Shape of an operation
 //!
@@ -147,17 +149,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // request metadata.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the tag store is unavailable".to_string()),
+            })
+        })?;
+
+        // A resource lives in the Region its endpoint names, which is the signed
+        // credential scope's — so an id is resolved against that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // `InvalidResourceId` carries NO message member at all, so the error code is the
+        // whole of what this refusal says: "The resource ID isn't valid. Verify that you
+        // entered the correct ID and try again."
+        let Some(held) = store.resource_tags(&region, &input.resource_type, &input.resource_id)
+        else {
+            return Err(
+                ListTagsForResourceErrorModeled::InvalidResourceId(InvalidResourceId {}).into(),
+            );
+        };
+
+        // A resource that carries no tags carries the EMPTY list, which is what a
+        // resolved resource reports: the member is present and holds nothing.
+        Ok(ListTagsForResourceOutput {
+            tag_list: Some(crate::state::tagging::to_tag_list(held)),
+        })
     }
 }
