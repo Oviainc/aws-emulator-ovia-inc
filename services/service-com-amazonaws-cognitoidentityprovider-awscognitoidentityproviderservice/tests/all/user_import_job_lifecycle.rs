@@ -285,9 +285,22 @@ async fn a_created_job_is_stored_and_read_back_as_created() {
             .unwrap_or_else(|| panic!("case {case:?}: a job must carry a minted JobId, got {job}"))
             .to_string();
         // `UserImportJobIdType`: pattern ^import-[0-9a-zA-Z-]+$, length 1..55.
+        // Amazon Cognito mints the id as `import-` followed by a FIXED-WIDTH
+        // token of mixed-case alphanumerics (`"JobId": "import-TZqNQvDRnW"` in
+        // the API reference's import-job examples), so the token's width and
+        // charset are asserted, not just the prefix: a client that persists or
+        // validates the id against the service's own form rejects another shape.
+        let token = job_id.strip_prefix("import-").unwrap_or_else(|| {
+            panic!("case {case:?}: expected a JobId of the modelled form import-<token>, got {job_id:?}")
+        });
+        assert_eq!(
+            token.len(),
+            10,
+            "case {case:?}: expected the minted token to be 10 characters wide, got {job_id:?}"
+        );
         assert!(
-            job_id.starts_with("import-") && job_id.len() > "import-".len(),
-            "case {case:?}: expected a JobId of the modelled form import-<id>, got {job_id:?}"
+            token.chars().all(|c| c.is_ascii_alphanumeric()),
+            "case {case:?}: expected the minted token to carry only mixed-case alphanumerics, got {job_id:?}"
         );
         assert!(
             (1..=55).contains(&job_id.len())

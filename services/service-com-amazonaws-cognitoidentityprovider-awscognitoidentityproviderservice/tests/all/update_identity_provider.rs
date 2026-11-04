@@ -244,17 +244,26 @@ impl UpdateCase {
     }
 
     /// What the updated provider must render for `ProviderDetails`: the submitted map,
-    /// and the stored one when the update left the member out.
+    /// and the stored one when the update left the member out, either way completed by
+    /// the entries the provider's type resolves
+    /// ([`super::identity_provider_type_defaults`]).
     fn expected_details(&self) -> Value {
-        object(self.details.as_ref().unwrap_or(&self.stored.details))
+        super::identity_provider_type_defaults::resolved_details(
+            self.stored.provider_type,
+            &object(self.details.as_ref().unwrap_or(&self.stored.details)),
+        )
     }
 
-    /// Likewise `AttributeMapping`.
+    /// Likewise `AttributeMapping`, completed by the mapping of the type's own subject
+    /// claim.
     fn expected_attribute_mapping(&self) -> Value {
-        object(
-            self.attribute_mapping
-                .as_ref()
-                .unwrap_or(&self.stored.attribute_mapping),
+        super::identity_provider_type_defaults::resolved_attribute_mapping(
+            self.stored.provider_type,
+            &object(
+                self.attribute_mapping
+                    .as_ref()
+                    .unwrap_or(&self.stored.attribute_mapping),
+            ),
         )
     }
 
@@ -724,7 +733,10 @@ async fn a_detail_map_that_resolves_every_endpoint_is_accepted() {
         .await;
         assert_eq!(
             updated["IdentityProvider"]["ProviderDetails"],
-            object(&details),
+            super::identity_provider_type_defaults::resolved_details(
+                provider_type,
+                &object(&details)
+            ),
             "case {label:?}: the submitted detail map must be what the provider now holds, got {updated}"
         );
     }
@@ -786,7 +798,10 @@ async fn an_absent_pool_or_provider_name_is_a_400() {
     .await;
     assert_eq!(
         read["IdentityProvider"]["ProviderDetails"],
-        object(&oidc_details("auth.example.com")),
+        super::identity_provider_type_defaults::resolved_details(
+            stored.provider_type,
+            &object(&oidc_details("auth.example.com"))
+        ),
         "a refused update of another pool or provider must leave this one as it was, got {read}"
     );
 }

@@ -119,6 +119,8 @@ mod group_membership;
 mod group_role_claims;
 #[path = "all/identity_provider_lifecycle.rs"]
 mod identity_provider_lifecycle;
+#[path = "all/identity_provider_type_defaults.rs"]
+mod identity_provider_type_defaults;
 #[path = "all/initiate_auth.rs"]
 mod initiate_auth;
 #[path = "all/input_validation_refusal_wording.rs"]

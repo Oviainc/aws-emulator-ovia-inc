@@ -5921,6 +5921,37 @@ pub struct IdentityProvider {
 }
 
 impl IdentityProvider {
+    /// Fill in, for this provider's `ProviderType`, every configuration entry
+    /// Amazon Cognito resolves itself: the detail keys and the subject-claim
+    /// mapping a create or update request does not have to state because the
+    /// service knows them from the type of IdP.
+    ///
+    /// The model documents them per type as the difference between its
+    /// `ProviderDetails` "create or update request" example and the "describe
+    /// response" example beside it
+    /// (`smithy_query(query="doc",shape="CreateIdentityProviderRequest",member="ProviderDetails")`),
+    /// so a provider of a type whose endpoints the service knows renders them
+    /// whether or not the request carried them. A stated key is never
+    /// overwritten: what the request carries is this IdP's configuration, and
+    /// the defaults only complete it.
+    ///
+    /// Seeded into the STORED provider, so every later read renders the same
+    /// configuration as the create that stored it.
+    pub fn seed_provider_type_defaults(&mut self) {
+        for (key, value) in
+            provider_type_detail_defaults(&self.provider_type, &self.provider_details)
+        {
+            self.provider_details
+                .entry(key.to_string())
+                .or_insert(value);
+        }
+        if let Some(claim) = provider_type_subject_claim(&self.provider_type) {
+            self.attribute_mapping
+                .entry(USERNAME_ATTRIBUTE.to_string())
+                .or_insert_with(|| claim.to_string());
+        }
+    }
+
     /// The modelled view of this provider, rendered from what is stored.
     pub fn to_identity_provider_type(&self) -> IdentityProviderType {
         IdentityProviderType {
@@ -5935,6 +5966,160 @@ impl IdentityProvider {
             last_modified_date: Some(to_date_time(self.last_modified_date)),
         }
     }
+}
+
+/// The `IdentityProviderTypeType` values whose configuration Amazon Cognito
+/// resolves itself — the endpoints the IdP is reached at and the claim its subject
+/// arrives in — named one by one because that configuration is per type. They are
+/// values of the catalog `crate::ops::types::IDENTITY_PROVIDER_TYPE_TYPE_VALUES`
+/// carries; the one it carries beside them, a SAML IdP, resolves nothing from its
+/// type (see [`provider_type_detail_defaults`]).
+pub const PROVIDER_TYPE_FACEBOOK: &str = "Facebook";
+/// A Google IdP, one of the values [`PROVIDER_TYPE_FACEBOOK`] documents.
+pub const PROVIDER_TYPE_GOOGLE: &str = "Google";
+/// A Login with Amazon IdP, one of the values [`PROVIDER_TYPE_FACEBOOK`] documents.
+pub const PROVIDER_TYPE_LOGIN_WITH_AMAZON: &str = "LoginWithAmazon";
+/// A Sign in with Apple IdP, one of the values [`PROVIDER_TYPE_FACEBOOK`] documents.
+pub const PROVIDER_TYPE_SIGN_IN_WITH_APPLE: &str = "SignInWithApple";
+/// An OpenID Connect IdP, one of the values [`PROVIDER_TYPE_FACEBOOK`] documents.
+pub const PROVIDER_TYPE_OIDC: &str = "OIDC";
+
+/// The user pool attribute a federated sign-in populates from the IdP's subject:
+/// an `AttributeMappingType` key, "a user pool attribute as the key of the
+/// key-value pair, and the IdP attribute claim name as the value"
+/// (`CreateIdentityProvider.AttributeMapping` in this service's model).
+const USERNAME_ATTRIBUTE: &str = "username";
+
+/// The `ProviderDetails` key stating which Facebook Graph API version an IdP of
+/// that type is reached at (`ProviderDetails` in this service's model).
+const FACEBOOK_API_VERSION_KEY: &str = "api_version";
+
+/// The IdP claim Amazon Cognito maps to the pool's [`USERNAME_ATTRIBUTE`] for a
+/// provider of `provider_type` when the request maps nothing to it: that IdP's
+/// own subject claim — `sub` for the OpenID Connect providers and the two social
+/// providers that are OIDC ones, and the social provider's own user-id claim
+/// otherwise.
+///
+/// `None` for a SAML IdP: a SAML assertion's subject arrives in whatever claim
+/// the IdP's metadata names, so there is none to assume.
+fn provider_type_subject_claim(provider_type: &str) -> Option<&'static str> {
+    match provider_type {
+        PROVIDER_TYPE_FACEBOOK => Some("id"),
+        PROVIDER_TYPE_LOGIN_WITH_AMAZON => Some("user_id"),
+        PROVIDER_TYPE_GOOGLE | PROVIDER_TYPE_SIGN_IN_WITH_APPLE | PROVIDER_TYPE_OIDC => {
+            Some("sub")
+        }
+        _ => None,
+    }
+}
+
+/// Every `ProviderDetails` entry Amazon Cognito resolves for a provider of
+/// `provider_type` itself, given the entries the request `stated`.
+///
+/// The model documents them per IdP type as the difference between its
+/// `ProviderDetails` "create or update request" example and the "describe
+/// response" example beside it: the endpoints of a named social IdP, whose
+/// locators the service knows, and the `attributes_url_add_attributes` flag
+/// saying whether the attribute request appends the attributes it asks for.
+///
+/// A SAML IdP resolves none here: the entries its describe response carries
+/// beyond the request — the binding URIs and the active encryption certificate —
+/// are read from the IdP's own metadata document, which is the IdP's to serve and
+/// not this service's to invent.
+fn provider_type_detail_defaults(
+    provider_type: &str,
+    stated: &HashMap<String, String>,
+) -> Vec<(&'static str, String)> {
+    match provider_type {
+        // Every Facebook Graph endpoint is versioned by the `api_version` the
+        // request states, so the three locators are built from it.
+        PROVIDER_TYPE_FACEBOOK => {
+            let version = facebook_api_version_segment(stated);
+            vec![
+                (
+                    "attributes_url",
+                    format!("https://graph.facebook.com/{version}/me?fields="),
+                ),
+                ("attributes_url_add_attributes", "true".to_string()),
+                (
+                    "authorize_url",
+                    format!("https://www.facebook.com/{version}/dialog/oauth"),
+                ),
+                ("token_request_method", "GET".to_string()),
+                (
+                    "token_url",
+                    format!("https://graph.facebook.com/{version}/oauth/access_token"),
+                ),
+            ]
+        }
+        PROVIDER_TYPE_GOOGLE => owned_details(&[
+            (
+                "attributes_url",
+                "https://people.googleapis.com/v1/people/me?personFields=",
+            ),
+            ("attributes_url_add_attributes", "true"),
+            ("authorize_url", "https://accounts.google.com/o/oauth2/v2/auth"),
+            ("oidc_issuer", "https://accounts.google.com"),
+            ("token_request_method", "POST"),
+            ("token_url", "https://www.googleapis.com/oauth2/v4/token"),
+        ]),
+        PROVIDER_TYPE_LOGIN_WITH_AMAZON => owned_details(&[
+            ("attributes_url", "https://api.amazon.com/user/profile"),
+            ("attributes_url_add_attributes", "false"),
+            ("authorize_url", "https://www.amazon.com/ap/oa"),
+            ("token_request_method", "POST"),
+            ("token_url", "https://api.amazon.com/auth/o2/token"),
+        ]),
+        PROVIDER_TYPE_SIGN_IN_WITH_APPLE => owned_details(&[
+            ("attributes_url_add_attributes", "false"),
+            ("authorize_url", "https://appleid.apple.com/auth/authorize"),
+            ("oidc_issuer", "https://appleid.apple.com"),
+            ("token_request_method", "POST"),
+            ("token_url", "https://appleid.apple.com/auth/token"),
+        ]),
+        PROVIDER_TYPE_OIDC => owned_details(&[("attributes_url_add_attributes", "false")]),
+        _ => Vec::new(),
+    }
+}
+
+/// Owned default values from borrowed ones, so a type's table reads as the model
+/// documents it.
+fn owned_details(entries: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+    entries
+        .iter()
+        .map(|(key, value)| (*key, (*value).to_string()))
+        .collect()
+}
+
+/// The Facebook Graph API version an IdP of that type is reached at: the
+/// `api_version` the request stated, or [`FACEBOOK_DEFAULT_API_VERSION`] when it
+/// stated none. Every Graph locator carries it as the first segment of its path.
+fn facebook_api_version_segment(stated: &HashMap<String, String>) -> &str {
+    stated_detail(stated, FACEBOOK_API_VERSION_KEY).unwrap_or(FACEBOOK_DEFAULT_API_VERSION)
+}
+
+/// The Facebook Graph API version an IdP of that type is reached at when the
+/// request states no [`FACEBOOK_API_VERSION_KEY`] of its own: the version Amazon
+/// Cognito substitutes for a Facebook IdP configured without one, which is a
+/// version of Facebook's own API rather than anything this service's model fixes
+/// (the model's `ProviderDetails` example states an `api_version` of its own, so
+/// it documents no default). It therefore moves as that API advances — the value
+/// here is the one Amazon Cognito substituted when this was written — while a
+/// request that states a version of its own is always served that version.
+const FACEBOOK_DEFAULT_API_VERSION: &str = "v21.0";
+
+/// The value a `ProviderDetails` map states for `key`, or `None` when it carries
+/// no such key or carries it with nothing in it: a key with an empty value states
+/// nothing.
+fn stated_detail<'details>(
+    details: &'details HashMap<String, String>,
+    key: &str,
+) -> Option<&'details str> {
+    details
+        .get(key)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Every language `LinksType`'s key admits, in the order its target
@@ -8576,12 +8761,20 @@ fn new_cloud_front_domain() -> String {
     format!("d{}.cloudfront.net", random_token(13))
 }
 
-/// A fresh `JobId` for a user import job: `import-` followed by a v4 UUID,
-/// which satisfies the modelled pattern `^import-[0-9a-zA-Z-]+$` and length
-/// 1..55.
+/// A fresh `JobId` for a user import job: `import-` followed by a fixed-width
+/// token of [`USER_IMPORT_JOB_TOKEN_LEN`] mixed-case alphanumerics, the shape
+/// Amazon Cognito's own job ids carry (`"JobId": "import-TZqNQvDRnW"` in the API
+/// reference's examples for this service's import-job operations), which
+/// satisfies the modelled pattern `^import-[0-9a-zA-Z-]+$` and length 1..55.
 pub fn new_user_import_job_id() -> String {
-    format!("import-{}", new_uuid())
+    format!(
+        "import-{}",
+        random_alphanumeric_token(USER_IMPORT_JOB_TOKEN_LEN)
+    )
 }
+
+/// How many characters the token of a minted [`new_user_import_job_id`] carries.
+const USER_IMPORT_JOB_TOKEN_LEN: usize = 10;
 
 /// Whether `job_id` could be a `JobId` at all: the modelled pattern
 /// `^import-[0-9a-zA-Z-]+$` and length 1..55
@@ -8802,6 +8995,38 @@ fn random_token(len: usize) -> String {
     token.truncate(len);
     token
 }
+
+/// `len` random characters of [`ALPHANUMERIC_ALPHABET`], drawn from the same
+/// randomness [`random_token`] draws on: each byte of a v4 UUID, read as the hex
+/// pair it is rendered as, picks one character of the alphabet. A byte past the
+/// last whole multiple of the alphabet is DROPPED rather than folded, so no
+/// character is drawn more often than another.
+fn random_alphanumeric_token(len: usize) -> String {
+    let alphabet = ALPHANUMERIC_ALPHABET.len();
+    // The byte values that leave the draw uniform: the ones below the last whole
+    // multiple of the alphabet's size.
+    let drawable = 256 - 256 % alphabet;
+    let mut token = String::with_capacity(len);
+    while token.len() < len {
+        let hex = random_token(len.saturating_sub(token.len()).saturating_mul(4));
+        for pair in hex.as_bytes().chunks(2) {
+            let drawn = ::std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .map(usize::from)
+                .filter(|drawn| *drawn < drawable);
+            if let Some(drawn) = drawn {
+                token.push(char::from(ALPHANUMERIC_ALPHABET[drawn % alphabet]));
+            }
+        }
+    }
+    token.truncate(len);
+    token
+}
+
+/// The 62 characters a mixed-case alphanumeric token is drawn from.
+const ALPHANUMERIC_ALPHABET: &[u8; 62] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 /// What one sign-in's tokens are built from, read from the stored pool, app
 /// client and user under the state lock before any token is minted.

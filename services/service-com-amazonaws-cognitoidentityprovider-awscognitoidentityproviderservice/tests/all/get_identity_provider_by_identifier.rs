@@ -242,7 +242,10 @@ async fn an_identifier_resolves_to_the_stored_provider_that_carries_it() {
         );
         assert_eq!(
             provider["ProviderDetails"],
-            object(&case.details),
+            super::identity_provider_type_defaults::resolved_details(
+                case.provider_type,
+                &object(&case.details)
+            ),
             "case {label:?}: the resolved provider renders its stored details, got {provider}"
         );
         assert_eq!(

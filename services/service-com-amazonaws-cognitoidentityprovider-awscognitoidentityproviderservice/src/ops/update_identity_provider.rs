@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // BEFORE anything is written: a refused update leaves the stored provider exactly
         // as it was.
         if let Some(details) = input.provider_details {
-            if provider.provider_type == OIDC_PROVIDER_TYPE {
+            if provider.provider_type == crate::state::PROVIDER_TYPE_OIDC {
                 resolve_oidc_endpoints(&details)?;
             }
             provider.provider_details = details;
@@ -229,6 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(acr_mapping) = input.acr_mapping {
             provider.acr_mapping = Some(acr_mapping);
         }
+        // The configuration this IdP's type resolves itself completes the
+        // submitted members again, so an update that replaces the detail map or
+        // the attribute mapping does not leave the provider without the
+        // endpoints and the subject claim its type carries.
+        provider.seed_provider_type_defaults();
 
         // The provider was modified, so its last-modified instant advances.
         provider.last_modified_date = now;
@@ -240,11 +245,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `ProviderType` whose endpoints Amazon Cognito resolves from an OpenID Connect
-/// discovery document, one of the values
-/// [`super::types::IDENTITY_PROVIDER_TYPE_TYPE_VALUES`] lists.
-const OIDC_PROVIDER_TYPE: &str = "OIDC";
 
 /// The detail key naming the OIDC issuer whose discovery document carries the endpoints
 /// a request does not state (`ProviderDetails` in this service's model).

@@ -7,10 +7,14 @@
 //! the pool already holds is refused with `DuplicateProviderException`; an
 //! unknown `UserPoolId` with `ResourceNotFoundException`.
 //!
-//! `ProviderDetails` is a free-form map in the model, so it is stored exactly as
-//! submitted: which keys each `ProviderType` requires is not expressed anywhere
-//! in this service's model, and refusing a detail map is deliberately left to
-//! the issue that cites that rule for `UpdateIdentityProvider`.
+//! `ProviderDetails` is a free-form map in the model, so what the request states
+//! is stored exactly as submitted; the entries Amazon Cognito resolves for the
+//! submitted `ProviderType` itself — the endpoints of a named social IdP and the
+//! claim its subject arrives in — complete it
+//! (`crate::state::IdentityProvider::seed_provider_type_defaults`). Which keys a
+//! `ProviderType` REQUIRES is not expressed anywhere in this service's model, so
+//! refusing a detail map is deliberately left to the issue that cites that rule
+//! for `UpdateIdentityProvider`.
 //!
 //! ## Shape of an operation
 //!
@@ -232,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 // Stored first, then rendered from the stored record, so the
                 // response is exactly what a later read sees.
-                let stored = slot.insert(crate::state::IdentityProvider {
+                let mut provider = crate::state::IdentityProvider {
                     user_pool_id: pool_id,
                     provider_name: input.provider_name.clone(),
                     provider_type: input.provider_type.clone(),
@@ -249,7 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     acr_mapping: input.acr_mapping.clone(),
                     creation_date: now,
                     last_modified_date: now,
-                });
+                };
+                // The configuration this IdP's type resolves itself — the
+                // endpoints of a named social provider and the claim its subject
+                // arrives in — completes what the request stated, so the stored
+                // provider is a configuration a client can federate with.
+                provider.seed_provider_type_defaults();
+                let stored = slot.insert(provider);
                 Ok(CreateIdentityProviderOutput {
                     identity_provider: stored.to_identity_provider_type(),
                 })

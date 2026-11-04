@@ -8,12 +8,13 @@
 //!
 //! The rule under test: a created identity provider is keyed by (`UserPoolId`,
 //! `ProviderName`), it renders `UserPoolId`, `ProviderName`, `ProviderType`,
-//! `ProviderDetails`, `AttributeMapping` and `IdpIdentifiers` exactly as
-//! submitted (empty when the request set none) beside the `AcrMapping` only an
-//! IdP created with one carries and the instant it was created, a second
-//! provider under a name the pool already holds is refused and leaves the stored
-//! one untouched, and an absent pool or provider name is a 400. Each table row
-//! names the case it asserts.
+//! `ProviderDetails`, `AttributeMapping` and `IdpIdentifiers` as submitted (empty
+//! when the request set none), completed by the configuration the submitted
+//! `ProviderType` resolves ([`super::identity_provider_type_defaults`]), beside
+//! the `AcrMapping` only an IdP created with one carries and the instant it was
+//! created, a second provider under a name the pool already holds is refused and
+//! leaves the stored one untouched, and an absent pool or provider name is a 400.
+//! Each table row names the case it asserts.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -139,12 +140,26 @@ impl ProviderCase {
     }
 
     /// What the stored provider must render for `AttributeMapping`: the submitted
-    /// mapping, and an empty map when the request set none.
+    /// mapping (an empty one when the request set none), completed by the mapping
+    /// of the submitted type's own subject claim.
     fn expected_attribute_mapping(&self) -> Value {
-        match &self.attribute_mapping {
+        let submitted = match &self.attribute_mapping {
             Some(mapping) => object(mapping),
             None => json!({}),
-        }
+        };
+        super::identity_provider_type_defaults::resolved_attribute_mapping(
+            self.provider_type,
+            &submitted,
+        )
+    }
+
+    /// Likewise `ProviderDetails`: the submitted map, completed by the entries
+    /// the submitted type resolves.
+    fn expected_details(&self) -> Value {
+        super::identity_provider_type_defaults::resolved_details(
+            self.provider_type,
+            &object(&self.details),
+        )
     }
 
     /// What the stored provider must render for `IdpIdentifiers`: the submitted
@@ -306,13 +321,13 @@ async fn a_created_identity_provider_round_trips_through_stored_state() {
         );
         assert_eq!(
             provider["ProviderDetails"],
-            object(&case.details),
-            "case {label:?}: the stored details must be the submitted ones, got {provider}"
+            case.expected_details(),
+            "case {label:?}: the stored details must be the submitted ones completed by the type's own, got {provider}"
         );
         assert_eq!(
             provider["AttributeMapping"],
             case.expected_attribute_mapping(),
-            "case {label:?}: the stored attribute mapping must be the submitted one, got {provider}"
+            "case {label:?}: the stored attribute mapping must be the submitted one completed by the type's subject claim, got {provider}"
         );
         assert_eq!(
             provider["IdpIdentifiers"],
