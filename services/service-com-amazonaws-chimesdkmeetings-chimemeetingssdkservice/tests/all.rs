@@ -15,6 +15,8 @@
 mod attendee_capabilities;
 #[path = "all/batch_update_attendee_capabilities_except.rs"]
 mod batch_update_attendee_capabilities_except;
+#[path = "all/capability_refusal_message.rs"]
+mod capability_refusal_message;
 #[path = "all/create_meeting_with_attendees.rs"]
 mod create_meeting_with_attendees;
 #[path = "all/delete_meeting_idempotence.rs"]

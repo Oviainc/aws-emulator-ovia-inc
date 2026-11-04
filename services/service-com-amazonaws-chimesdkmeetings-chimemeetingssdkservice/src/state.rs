@@ -552,6 +552,10 @@ pub fn default_capabilities(features: Option<&MeetingFeaturesConfiguration>) -> 
 /// 2. `Content:MaxResolution:None` — the same for `AttendeeCapabilities:Content`.
 /// 3. "You can't set `content` capabilities to `SendReceive` or `Receive` unless you also
 ///    set `video` capabilities to `SendReceive` or `Receive`."
+///
+/// Each of the three answers with the sentence the service serves for that error class —
+/// fixed text naming the capability member and the rule, with nothing of the request
+/// spliced into it, so one rule always reads the same however it was broken.
 pub fn capability_problem(
     capabilities: &AttendeeCapabilities,
     features: Option<&MeetingFeaturesConfiguration>,
@@ -559,29 +563,58 @@ pub fn capability_problem(
     if video_max_resolution(features) == RESOLUTION_NONE
         && sends_or_receives(&capabilities.video)
     {
-        return Some(format!(
-            "Capabilities.Video is {}, but the meeting was created with \
-             MeetingFeatures.Video.MaxResolution None, which admits only {CAPABILITY_NONE}",
-            capabilities.video
+        return Some(max_resolution_none_problem(
+            VIDEO_CAPABILITY_MEMBER,
+            VIDEO_FEATURE_MEMBER,
         ));
     }
     if content_max_resolution(features) == RESOLUTION_NONE
         && sends_or_receives(&capabilities.content)
     {
-        return Some(format!(
-            "Capabilities.Content is {}, but the meeting was created with \
-             MeetingFeatures.Content.MaxResolution None, which admits only {CAPABILITY_NONE}",
-            capabilities.content
+        return Some(max_resolution_none_problem(
+            CONTENT_CAPABILITY_MEMBER,
+            CONTENT_FEATURE_MEMBER,
         ));
     }
     if receives(&capabilities.content) && !receives(&capabilities.video) {
-        return Some(format!(
-            "Capabilities.Content {} requires Capabilities.Video to be \
-             {CAPABILITY_SEND_RECEIVE} or {CAPABILITY_RECEIVE}, not {}",
-            capabilities.content, capabilities.video
-        ));
+        return Some(content_needs_video_problem());
     }
     None
+}
+
+/// How the capability member one of the two `MaxResolution` rules is about is named in that
+/// rule's refusal: the attendee's capability in lower case, then the meeting feature in the
+/// `MeetingFeatures` member's own case.
+const VIDEO_CAPABILITY_MEMBER: &str = "video";
+const VIDEO_FEATURE_MEMBER: &str = "Video";
+const CONTENT_CAPABILITY_MEMBER: &str = "content";
+const CONTENT_FEATURE_MEMBER: &str = "Content";
+
+/// How a meeting whose `MeetingFeatures` maximum resolution for one axis is `None` refuses
+/// a request asking to send or receive that medium.
+///
+/// The sentence is FIXED text for this error class: nothing from the request is in it, not
+/// the rejected capability value and not either id. Only which axis it is about varies
+/// (the `Video` and `Content` forms of the same sentence), which is why both callers reach
+/// it through the member names rather than composing prose of their own.
+fn max_resolution_none_problem(capability_member: &str, feature_member: &str) -> String {
+    format!(
+        "Attendee's {capability_member} capability must be {CAPABILITY_NONE} if MeetingFeatures \
+         is configured with {feature_member}:MaxResolution:{RESOLUTION_NONE}"
+    )
+}
+
+/// How content reception without video reception is refused.
+///
+/// Fixed text as well: it names the two capability members and the two admissible values
+/// generically, and interpolates nothing from the request.
+fn content_needs_video_problem() -> String {
+    format!(
+        "Attendee's {VIDEO_CAPABILITY_MEMBER} capability must be set to either \
+         {CAPABILITY_SEND_RECEIVE} or {CAPABILITY_RECEIVE} when setting \
+         {CONTENT_CAPABILITY_MEMBER} capability to {CAPABILITY_SEND_RECEIVE} or \
+         {CAPABILITY_RECEIVE}."
+    )
 }
 
 /// The `MeetingArn` of a meeting: `arn:aws:chime:<MediaRegion>:<account>:meeting/<id>`,
