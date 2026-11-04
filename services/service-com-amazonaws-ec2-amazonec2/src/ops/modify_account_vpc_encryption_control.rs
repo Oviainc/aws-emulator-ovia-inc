@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyAccountVpcEncryptionControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyAccountVpcEncryptionControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyAccountVpcEncryptionControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyAccountVpcEncryptionControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyAccountVpcEncryptionControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyAccountVpcEncryptionControl"))
+        use crate::ops::describe_account_vpc_encryption_control::account_configuration::{
+            ConfigurationPatch, EXCLUDABLE_RESOURCES, ExcludableResource,
+            account_vpc_encryption_control_mode, exclusion_state_input,
+            require_account_configuration,
+        };
+        use crate::state::invalid_parameter_value;
+        use std::time::{Instant, SystemTime};
+
+        // The configuration this writes is "the account-level" one, which names no
+        // Region, so this operation reads nothing off the request's metadata.
+        let _ = ctx;
+
+        // Every enumerated member is read against its modelled catalog BEFORE anything is
+        // written, so the word stored is the catalog's own and never the request's text —
+        // and a request carrying a value no catalog holds changes nothing at all. The
+        // framework's boundary validator already refuses such a value before this handler
+        // runs (`tests/all/account_vpc_encryption_control.rs` pins both that refusal and
+        // the readings below), so each refusal here is the backstop for a member whose
+        // catalog the model stops declaring, not the path a bad request ordinarily takes.
+        let mode = match input.mode.as_deref() {
+            None => None,
+            Some(requested) => match account_vpc_encryption_control_mode(requested) {
+                Some(mode) => Some(mode),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Value ({requested}) for parameter mode is invalid. \
+                         Valid values are {valid}",
+                        valid = ACCOUNT_VPC_ENCRYPTION_CONTROL_MODE_VALUES.join(", "),
+                    )));
+                }
+            },
+        };
+
+        let mut patch = ConfigurationPatch {
+            mode,
+            ..ConfigurationPatch::default()
+        };
+        for resource in EXCLUDABLE_RESOURCES {
+            let requested = match resource {
+                ExcludableResource::InternetGateway => input.internet_gateway.as_deref(),
+                ExcludableResource::EgressOnlyInternetGateway => {
+                    input.egress_only_internet_gateway.as_deref()
+                }
+                ExcludableResource::NatGateway => input.nat_gateway.as_deref(),
+                ExcludableResource::VirtualPrivateGateway => {
+                    input.virtual_private_gateway.as_deref()
+                }
+                ExcludableResource::VpcPeering => input.vpc_peering.as_deref(),
+                ExcludableResource::Lambda => input.lambda.as_deref(),
+                ExcludableResource::VpcLattice => input.vpc_lattice.as_deref(),
+                ExcludableResource::ElasticFileSystem => input.elastic_file_system.as_deref(),
+            };
+            let Some(requested) = requested else {
+                continue;
+            };
+            let Some(excluded) = exclusion_state_input(requested) else {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter {member} is invalid. \
+                     Valid values are {valid}",
+                    member = resource.request_member(),
+                    valid = VPC_ENCRYPTION_CONTROL_EXCLUSION_STATE_INPUT_VALUES.join(", "),
+                )));
+            };
+            patch.exclusions[resource.index()] = Some(excluded);
+        }
+
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`ModifyAccountVpcEncryptionControlRequest$DryRun`): answered after the request
+        // has been read and before the first write, so a dry run reports what the request
+        // would have done without doing any of it. This emulator models no principal
+        // permissions, so `UnauthorizedOperation` — the other outcome the member
+        // documents — cannot arise.
+        if input.dry_run == Some(true) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let configuration = require_account_configuration(&*self.engine)?;
+        let mut configuration = configuration.lock();
+        // The write, and the configuration as it stands the instant it was made: the moves
+        // this modify starts are still owed, so what it answers carries the transitional
+        // states a caller reading straight afterwards also sees.
+        let view = configuration.apply(&patch, Instant::now(), SystemTime::now());
+        Ok(ModifyAccountVpcEncryptionControlOutput {
+            account_vpc_encryption_control: Some(view),
+        })
     }
 }

@@ -422,6 +422,12 @@ mod ec2_query_error_envelope_operations;
 mod create_public_ipv4_pool;
 #[path = "all/address_transfers.rs"]
 mod address_transfers;
+// The account's VPC Encryption Control configuration: the mode and the per-resource
+// exclusions `ModifyAccountVpcEncryptionControl` records, and what
+// `DescribeAccountVpcEncryptionControl` reports back out of that one store — including the
+// transitional states the moves it starts pass through.
+#[path = "all/account_vpc_encryption_control.rs"]
+mod account_vpc_encryption_control;
 #[path = "all/allowed_images_settings.rs"]
 mod allowed_images_settings;
 #[path = "all/application_status.rs"]

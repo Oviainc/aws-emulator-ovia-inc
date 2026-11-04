@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountVpcEncryptionControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountVpcEncryptionControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountVpcEncryptionControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +59,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The account's VPC Encryption Control configuration: the store this operation reports
+/// and `ModifyAccountVpcEncryptionControl` writes, and the one projection of it both
+/// answer from.
+///
+/// A child module of this operation rather than another field of [`crate::state`], for
+/// the reason its own header gives.
+///
+/// The `#[path]` is explicit because this file is itself declared with one (`ops/mod.rs`
+/// is generated into `$OUT_DIR` and declares every operation by absolute path), so a bare
+/// `mod` item here would resolve against `src/ops/` — where a `.rs` file is read as an
+/// operation of this service.
+#[path = "describe_account_vpc_encryption_control/account_configuration.rs"]
+pub mod account_configuration;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,18 +141,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountVpcEncryptionControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountVpcEncryptionControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountVpcEncryptionControl"))
+        use account_configuration::require_account_configuration;
+        use std::time::Instant;
+
+        // The configuration this reports is "for your account", which names no Region, so
+        // this operation reads nothing off the request's metadata.
+        let _ = ctx;
+
+        // `DryRun` documents two outcomes: "if you have the required permissions, the
+        // error response is DryRunOperation. Otherwise, it is UnauthorizedOperation"
+        // (`DescribeAccountVpcEncryptionControlRequest$DryRun`). This emulator models no
+        // principal permissions — the framework verifies a request's signature and no
+        // operation of this crate evaluates IAM — so every caller is one that holds them
+        // and only the first outcome can be answered. It is answered ahead of the read:
+        // a dry run reports nothing about the account's configuration.
+        if input.dry_run == Some(true) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let configuration = require_account_configuration(&*self.engine)?;
+        let configuration = configuration.lock();
+        // REPORTING ONLY: the configuration as of this instant, derived rather than
+        // written, so two reports in a row answer the same words and an account that has
+        // never modified it is told it is in its default state.
+        Ok(DescribeAccountVpcEncryptionControlOutput {
+            account_vpc_encryption_control: Some(configuration.view_at(Instant::now())),
+        })
     }
 }
