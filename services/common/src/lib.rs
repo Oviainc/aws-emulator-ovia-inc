@@ -357,6 +357,10 @@ pub mod json_reference_path;
 /// caller-supplied string, for every service that has to decide whether a value is a token
 /// at all before it reads a claim out of it.
 pub mod jwt;
+/// The ONE bounded evaluation of a caller-written JSONata expression, for every service
+/// whose API carries one — so the ceilings that confine an engine evaluating a caller's
+/// text are stated, and met, in one place rather than per service.
+pub mod jsonata;
 pub mod lex;
 pub mod management_events;
 /// The ONE reading of the JSON Schema document a gateway model carries, and the two

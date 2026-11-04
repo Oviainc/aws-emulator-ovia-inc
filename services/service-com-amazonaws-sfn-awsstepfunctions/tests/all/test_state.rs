@@ -265,13 +265,15 @@ async fn test_state_answers_what_the_single_state_produced() {
             error: Some("States.Runtime"),
         },
         StateCase {
-            case: "a JSONata state is not evaluated",
-            definition: r#"{"Type":"Pass","QueryLanguage":"JSONata","End":true}"#,
-            input: Some("{}"),
-            status: "FAILED",
-            output: None,
+            // A JSONata state is evaluated here as it is in an execution: its
+            // `Output` is the document the state puts out.
+            case: "a JSONata state is evaluated",
+            definition: r#"{"Type":"Pass","QueryLanguage":"JSONata","Output":"{% { 'sum': $states.input.a + $states.input.b } %}","End":true}"#,
+            input: Some(r#"{"a":2,"b":3}"#),
+            status: "SUCCEEDED",
+            output: Some(r#"{"sum":5}"#),
             next_state: None,
-            error: Some("States.Runtime"),
+            error: None,
         },
         StateCase {
             case: "a path that selects no value fails the state",

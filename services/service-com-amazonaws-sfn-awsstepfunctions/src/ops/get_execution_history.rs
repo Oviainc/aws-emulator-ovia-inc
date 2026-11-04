@@ -417,20 +417,31 @@ fn projected(
             return event;
         }
         if event_type.ends_with(STATE_EXITED_SUFFIX) {
+            // "Map of variable name and value as a serialized JSON representation":
+            // the variables in scope as the state left, which a JSONata state's
+            // `Assign` writes. A state that left none assigned reports neither
+            // member, since there is nothing to report under them.
+            let assigned: std::collections::HashMap<String, String> = stored
+                .details
+                .assigned_variables
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
             event.state_exited_event_details = Some(StateExitedEventDetails {
                 name,
                 // "The JSON output data of the state": what the state EMITTED, which
                 // is its post-processing result — `ResultSelector`, `ResultPath` and
-                // `OutputPath` already applied — as the walk recorded it.
+                // `OutputPath`, or a JSONata state's `Output`, already applied — as
+                // the walk recorded it.
                 output: data(stored.details.output.clone()),
                 output_details: included
                     .clone()
                     .filter(|_| with_data && stored.details.output.is_some()),
-                // A JSONata-mode definition's `Assign` is not interpreted (see
-                // `crate::state::asl`), so no state assigns a variable and there is
-                // nothing to report under either member.
-                assigned_variables: None,
-                assigned_variables_details: None,
+                assigned_variables: (!assigned.is_empty()).then(|| assigned.clone()),
+                // "Indicates whether assigned variables were truncated in the
+                // response. Always false for API calls."
+                assigned_variables_details: (!assigned.is_empty())
+                    .then_some(AssignedVariablesDetails { truncated: false }),
             });
             return event;
         }

@@ -563,6 +563,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let state = state.clone();
             let state_input = state_input.clone();
             let mock = mock.clone();
+            let variables = variables.clone();
             tokio::task::spawn_blocking(move || {
                 asl::test_state(&asl::StateTest {
                     name: &name,
@@ -573,6 +574,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     context_override: context_override.as_ref(),
                     mock: mock.as_ref(),
                     retries_taken,
+                    variables: variables.as_ref(),
                 })
             })
             .await
@@ -610,18 +612,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input: inspection.input,
                 after_input_path: inspection.after_input_path,
                 after_parameters: inspection.after_parameters,
+                after_arguments: inspection.after_arguments,
                 result: inspection.result,
                 after_result_selector: inspection.after_result_selector,
                 after_result_path: inspection.after_result_path,
                 // "JSON string that contains the set of workflow variables after
                 // execution of the state. The set will include variables assigned in
-                // the state and variables set up as test state input." Nothing this
-                // emulator runs assigns one or READS one: `Assign` is a member it does
-                // not interpret, so a state carrying it is not run at all, and a
-                // variable reference is no path this interpreter resolves, so a state
-                // reading one fails with `States.Runtime` rather than running without
-                // it. The set after the state is therefore the set the request set up.
-                variables: variables.as_ref().map(Value::to_string),
+                // the state and variables set up as test state input." The walk is
+                // handed the request's own set and reports it back with whatever the
+                // state's `Assign` wrote into it; a state that assigned none, tested
+                // without a set of its own, has none to report.
+                variables: inspection
+                    .variables
+                    .or_else(|| variables.as_ref().map(Value::to_string)),
                 error_details,
                 ..InspectionData::default()
             }

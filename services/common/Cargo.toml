@@ -68,6 +68,19 @@ serde_json_path = "0.7"
 # Not a pure-Rust elliptic-curve stack, whose `crypto-bigint` this repository's dependency
 # audit blocks (RUSTSEC-2026-0387).
 ring = "0.17"
+# `jsonata`: the JSONata interpreter the services whose API carries a caller-written
+# JSONata expression evaluate it with — the Amazon States Language's JSONata mode
+# today, and the B2BI mapping template once its own containment of the same engine
+# moves here — so the engine is reached through one bounded seam rather than per
+# service. An execution substrate, which is why that module states and enforces the
+# ceilings that confine it; `default-features = false`, since nothing it turns on by
+# default is needed. Pinned EXACTLY: the parse shapes the module reads a refused
+# construct off are this version's.
+jsonata-rs = { version = "=0.3.4", default-features = false }
+# The arena `jsonata-rs` allocates its parsed expression and its values into: one per
+# evaluation, dropped with it. Pinned EXACTLY for the same reason — the memory ceiling of
+# an evaluation is enforced through this crate's allocation limit.
+bumpalo = "=3.20.3"
 
 [lints]
 workspace = true

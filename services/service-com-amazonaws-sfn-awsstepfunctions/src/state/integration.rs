@@ -2227,6 +2227,29 @@ fn one_component(value: &str, member: &str, component: Component) -> Result<Stri
 /// version qualifier are written with (`:`, `$`).
 const URI_COMPONENT_PUNCTUATION: &[u8] = b"-._~:$";
 
+/// Stop every job a walk started and then ABANDONED.
+///
+/// A `Parallel` branch's run-a-job task starts a job and parks at it, and a SIBLING
+/// branch can fail while that job is still running: the state has failed, so no task
+/// is waiting at the job any more — and the job is work of another service, so it is
+/// stopped through the stopping call its own integration names, in the Region the
+/// starting call was made in. The same crossing of the service boundary `StopExecution`
+/// makes for a job the execution it stops was parked at, for the same reason: a job
+/// nothing will resolve is not left running.
+///
+/// What the invoked service answers changes nothing here: the task's own outcome is
+/// already the failure of the state around it.
+pub async fn stop_abandoned(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    abandoned: &[crate::state::PlannedJob],
+) {
+    for job in abandoned {
+        let (call, request) = stopping(job.api, job.job, &job.job_id, &job.naming);
+        let _answered = call_api(callback, region, &call, &request).await;
+    }
+}
+
 /// Make one integration call and read what the service answered.
 ///
 /// Public, because the calls a run-a-job pattern is made of besides the one the walk

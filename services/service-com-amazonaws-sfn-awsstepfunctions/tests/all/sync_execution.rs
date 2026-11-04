@@ -210,12 +210,15 @@ async fn a_sync_start_answers_the_outcome_the_definition_computed() {
             least_millis: 0,
         },
         SyncCase {
-            case: "a JSONata definition is not evaluated",
-            definition: r#"{"QueryLanguage":"JSONata","StartAt":"A","States":{"A":{"Type":"Pass","End":true}}}"#,
-            input: Some("{}"),
-            status: "FAILED",
-            output: None,
-            error: Some("States.Runtime"),
+            // Both query languages are evaluated, so a JSONata definition RUNS here
+            // too: its one `Pass` carries the input through, which is what a
+            // JSONata state with no `Output` puts out.
+            case: "a JSONata definition is evaluated",
+            definition: r#"{"QueryLanguage":"JSONata","StartAt":"A","States":{"A":{"Type":"Pass","Output":"{% { 'doubled': $states.input.n * 2 } %}","End":true}}}"#,
+            input: Some(r#"{"n":21}"#),
+            status: "SUCCEEDED",
+            output: Some(r#"{"doubled":42}"#),
+            error: None,
             least_millis: 0,
         },
         SyncCase {

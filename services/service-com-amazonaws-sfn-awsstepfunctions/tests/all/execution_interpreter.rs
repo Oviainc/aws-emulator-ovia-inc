@@ -400,18 +400,10 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
             expected: Expected::Failure("States.Runtime"),
         },
         RunCase {
-            case: "a JSONata definition",
-            definition: r#"{"QueryLanguage":"JSONata","StartAt":"A","States":{"A":{"Type":"Pass","End":true}}}"#,
-            input: "{}",
-            expected: Expected::Failure("States.Runtime"),
-        },
-        RunCase {
-            case: "a JSONata state inside a JSONPath definition",
-            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","QueryLanguage":"JSONata","End":true}}}"#,
-            input: "{}",
-            expected: Expected::Failure("States.Runtime"),
-        },
-        RunCase {
+            // Both query languages are evaluated now, so a JSONata definition RUNS —
+            // the rows that pin what each language computes live in
+            // `tests/all/jsonata_states.rs`.
+            //
             // "A States.Runtime error isn't retriable, and will always cause the
             // execution to fail. A retry or catch on States.ALL won't catch
             // States.Runtime errors."

@@ -146,6 +146,9 @@ async fn resolve<Eng: Send + Sync + 'static>(
     let reply = asl::JobReply {
         state_name: task.state_name.clone(),
         state_input: task.state_input.clone(),
+        // The concurrent states that state is nested inside, as the parked record
+        // kept them: the continuation re-enters them to reach it.
+        frames: task.frames.clone(),
         outcome,
     };
 
@@ -239,6 +242,10 @@ async fn resolve<Eng: Send + Sync + 'static>(
     let Ok(Some(planned)) = interpreted else {
         return;
     };
+    // A job this continuation STARTED and then abandoned is stopped through its own
+    // integration, as a start's own is: no job is left running behind a task that
+    // will never finish. Done with no store of this service locked.
+    integration::stop_abandoned(callback, &region, &planned.abandoned).await;
 
     // Phase 3, under the lock again: record it. Everything is re-read, because the
     // execution could have been stopped while the walk ran.

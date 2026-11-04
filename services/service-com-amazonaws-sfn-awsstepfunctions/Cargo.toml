@@ -10,6 +10,11 @@ build = "build.rs"
 engine = { workspace = true }
 # `query_error_envelope`: the one statement, shared by every emulated service, of the
 # response header a response names the request it answers in.
+# `jsonata`: the shared bounded seam onto the maintained JSONata interpreter, which
+# states and enforces the ceilings that confine an engine evaluating a caller's own
+# text — how this crate evaluates the other query language the Amazon States
+# Language's `QueryLanguage` member selects, rather than through a hand-written subset
+# or a call site of that engine here.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

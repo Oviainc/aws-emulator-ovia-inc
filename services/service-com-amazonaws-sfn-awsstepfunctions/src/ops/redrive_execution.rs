@@ -362,6 +362,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::INTERPRETER_UNAVAILABLE,
             ));
         };
+        // A job the re-run STARTED and then abandoned is stopped through its own
+        // integration, as a start's own is: no job is left running behind a task that
+        // will never finish. Done with no store of this service locked.
+        crate::state::integration::stop_abandoned(
+            ctx.callback(),
+            &crate::state::arn_region(&machine_arn),
+            &planned.abandoned,
+        )
+        .await;
 
         // Phase 3, under the lock again: record it. Every check is re-made, because
         // the execution could have been redriven or its state machine deleted while

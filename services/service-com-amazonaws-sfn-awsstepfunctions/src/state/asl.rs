@@ -4,9 +4,12 @@
 //!
 //! ASL is Step Functions' own definition language; no crates.io crate runs it, so
 //! the walk below is written here, over `serde_json` — the maintained parser for the
-//! JSON the language is written in — and [`serde_json_path`], the maintained RFC
-//! 9535 implementation of JSONPath, which is the query language every `*Path` member
-//! and every `"<name>.$"` payload-template key is written in.
+//! JSON the language is written in — and the two query languages its `QueryLanguage`
+//! member selects between, each evaluated by the maintained implementation of it:
+//! [`serde_json_path`], the RFC 9535 implementation of JSONPath, which is the
+//! language every `*Path` member and every `"<name>.$"` payload-template key is
+//! written in, and [`super::jsonata`] for JSONata, which is the language a JSONata
+//! state's `Output`, `Assign`, `Arguments`, `Items` and `Condition` are written in.
 //!
 //! ## What is executed, and what is not
 //!
@@ -14,8 +17,12 @@
 //! not faked: `Pass`, `Wait`, `Choice`, `Succeed`, `Fail`, `Map` (inline and
 //! Distributed) and `Parallel`, together with the data-flow members that decide what
 //! each of them reads and writes (`InputPath`, `Parameters`, `ItemSelector`,
-//! `ItemsPath`, `ResultSelector`, `ResultPath`, `OutputPath`), the context object
-//! (`$$`), the intrinsic functions, `Retry` and `Catch`.
+//! `ItemsPath`, `ResultSelector`, `ResultPath`, `OutputPath`, and the `Arguments`,
+//! `Output` and `Assign` of a JSONata state), the context object
+//! (`$$`), the intrinsic functions, `Retry` and `Catch`. A state is evaluated in the
+//! query language IT declares, else the one its definition does, so a JSONata state
+//! anywhere in a JSONPath machine — inside a `Parallel` branch or a `Map`'s
+//! processor included — is evaluated with that language's semantics.
 //!
 //! A `Task` state's work is RUN too, in the one way this process can run each kind:
 //!
@@ -54,9 +61,7 @@
 //!   a run-a-job pattern over an integration whose job cannot be reported or
 //!   stopped, a `Resource` naming no integration at all;
 //! * a Distributed Map's `ItemReader`, `ItemBatcher` and `ResultWriter`, which read
-//!   and write an S3 dataset;
-//! * a JSONata-mode definition (`QueryLanguage: "JSONata"`) and the members that
-//!   only exist in that mode (`Assign`, `Arguments`, `Output`).
+//!   and write an S3 dataset.
 //!
 //! Reaching one of those ends the execution in the service's own failure state:
 //! `FAILED`, with the ASL-documented [`RUNTIME_ERROR`] name and a cause that says
@@ -173,6 +178,14 @@ pub const TOLERATED_FAILURE_ERROR: &str = "States.ExceedToleratedFailureThreshol
 /// The ASL predefined error name for an execution that ran longer than the
 /// `TimeoutSeconds` its definition declares ("States.Timeout").
 pub const TIMEOUT_ERROR: &str = "States.Timeout";
+
+/// The ASL predefined error name for an expression that could not be evaluated
+/// ("States.QueryEvaluationError — the JSONata expression evaluation failed").
+///
+/// It is the name a JSONata state's own `Output`, `Assign`, `Arguments`, `Items` or
+/// `Condition` fails with, so a definition's `Retry` and `Catch` can answer for it by
+/// name exactly as they answer for a failed task.
+pub const QUERY_EVALUATION_ERROR: &str = "States.QueryEvaluationError";
 
 /// The refusal an EXPRESS workflow answers a `Task` state that asks for the
 /// run-a-job (`.sync`) integration pattern with.
@@ -361,13 +374,15 @@ pub const STATE_TYPES: &[&str] = &[
 /// execution with [`RUNTIME_ERROR`].
 pub const EXECUTED_STATE_TYPES: &[&str] = STATE_TYPES;
 
-/// The query language this interpreter evaluates. ASL's `QueryLanguage` member
-/// selects between it and JSONata; a JSONata definition is not run.
+/// One of the two query languages ASL's `QueryLanguage` member selects between,
+/// evaluated by [`serde_json_path`]: the language every `*Path` member and every
+/// `"<name>.$"` payload-template key is written in, and the one a definition that
+/// declares no `QueryLanguage` is written in.
 pub const JSONPATH: &str = "JSONPath";
 
-/// The other query language ASL's `QueryLanguage` member selects: its expressions
-/// are not evaluated here, but a definition written in it is still VALIDATED,
-/// because its members are the ones the language declares rather than JSONPath's.
+/// The other query language `QueryLanguage` selects: its expressions are evaluated
+/// by [`super::jsonata`], and its members are the ones that language declares rather
+/// than JSONPath's.
 pub const JSONATA: &str = "JSONata";
 
 /// The two query languages `QueryLanguage` selects between, at the definition
@@ -545,17 +560,130 @@ const INTEGRATION_TASK_MEMBERS: &[&str] = &[
 ];
 
 /// The first member of `state` this emulator does not execute, if any.
-fn unexecutable_member(state_type: &str, state: &Map<String, Value>) -> Option<String> {
-    let allowed = match state_type {
+///
+/// `language` is the query language the state is written in, which decides WHICH set
+/// of data-flow members it may carry: a JSONata state reads and writes its data
+/// through the members of that language ([`jsonata_members`]) and a JSONPath one
+/// through the `*Path` family and the payload templates.
+fn unexecutable_member(
+    state_type: &str,
+    state: &Map<String, Value>,
+    language: &str,
+) -> Option<String> {
+    let activity = super::names_an_activity(task_resource(state));
+    let allowed = match (language, state_type) {
+        (JSONATA, _) => jsonata_members(state_type, activity),
         // The two kinds of `Task` work carry different members, and the `Resource`
         // is what says which kind this state is.
-        "Task" if !super::names_an_activity(task_resource(state)) => INTEGRATION_TASK_MEMBERS,
+        (_, "Task") if !activity => INTEGRATION_TASK_MEMBERS,
         _ => executable_members(state_type),
     };
     state
         .keys()
         .find(|member| !allowed.contains(&member.as_str()))
         .cloned()
+}
+
+/// The members a state written in JSONata may carry.
+///
+/// The language's own data-flow members replace JSONPath's: `Arguments` is the request
+/// a `Task` builds (`Parameters`), `Items` the array a `Map` iterates (`ItemsPath`),
+/// a `Choice` rule's `Condition` its test (`Variable` and the comparators) and
+/// `Output` what a state puts out (`ResultSelector`, `ResultPath`, `OutputPath`) —
+/// beside `Assign`, which every type may carry and which only this language has. The
+/// `*Path` family and the payload templates belong to the other language
+/// ([`JSONPATH_ONLY_MEMBERS`]), which is what a definition carrying one is refused
+/// for at create time.
+fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'static str] {
+    match state_type {
+        "Pass" => &["Type", "Comment", "QueryLanguage", "Assign", "Output", "Next", "End"],
+        "Wait" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "Output",
+            "Seconds",
+            "Timestamp",
+            "Next",
+            "End",
+        ],
+        "Choice" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "Output",
+            "Choices",
+            "Default",
+        ],
+        "Succeed" => &["Type", "Comment", "QueryLanguage", "Assign", "Output"],
+        "Fail" => &["Type", "Comment", "QueryLanguage", "Error", "Cause"],
+        // An ACTIVITY task's work is a worker's, so it carries the heartbeat an
+        // integration call cannot owe and no `Catch` — the same split
+        // [`executable_members`] makes for the other language, for the same reasons.
+        "Task" if activity => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "Output",
+            "Resource",
+            "Arguments",
+            "TimeoutSeconds",
+            "HeartbeatSeconds",
+            "Retry",
+            "Next",
+            "End",
+        ],
+        "Task" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "Output",
+            "Resource",
+            "Arguments",
+            "TimeoutSeconds",
+            "Retry",
+            "Catch",
+            "Next",
+            "End",
+        ],
+        "Map" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "Output",
+            "Items",
+            "ItemSelector",
+            "ItemProcessor",
+            "Iterator",
+            "MaxConcurrency",
+            "Retry",
+            "Catch",
+            "ToleratedFailureCount",
+            "ToleratedFailurePercentage",
+            "Label",
+            "Next",
+            "End",
+        ],
+        "Parallel" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Assign",
+            "Output",
+            "Arguments",
+            "Branches",
+            "Retry",
+            "Catch",
+            "Next",
+            "End",
+        ],
+        _ => &[],
+    }
 }
 
 /// The `Resource` a `Task` state names, as the text the language writes it as — the
@@ -695,6 +823,12 @@ pub struct Run {
     /// that carries this reached no terminal status either: what the execution is
     /// waiting for is that job finishing.
     pub parked: Option<ParkedJob>,
+    /// The jobs this walk started and then ABANDONED: a job a `Parallel` branch
+    /// started that the state around it failed before the job could finish, so no
+    /// task is waiting at it any more. The caller STOPS each one through its own
+    /// integration's stopping call, so a job this emulator cannot resolve is not left
+    /// running behind an execution that has already failed.
+    pub abandoned: Vec<ParkedJob>,
     /// The Map Run each Distributed Map state the walk entered started, in the order
     /// they were entered.
     pub map_runs: Vec<StartedMapRun>,
@@ -787,6 +921,37 @@ pub struct ParkedJob {
     /// how long the job may stay unfinished, because the task is not finished until
     /// it is.
     pub timeout_seconds: Option<u64>,
+    /// The concurrent states the parked task is nested INSIDE, outermost first, and
+    /// empty for a task at the top level of the definition.
+    ///
+    /// A `Parallel` branch is walked inside its state's own turn, so a task that
+    /// parks inside one parks the whole execution: what resumes it has to re-enter
+    /// that `Parallel` and carry on in the branch that parked, with the branches that
+    /// had already finished keeping what they produced. Each frame is one such level
+    /// ([`ParkedFrame`]).
+    pub frames: Vec<ParkedFrame>,
+}
+
+/// One concurrent state a parked task is nested inside: the `Parallel` state, which
+/// of its branches the task is in, and what the OTHER branches produced before the
+/// walk parked.
+///
+/// It is what lets the walk that continues the execution re-enter the state without
+/// running anything twice: the branches that finished are not walked again (their
+/// results stand, and their events are already in the history), and the branch that
+/// parked carries on from the state that parked it.
+#[derive(Debug, Clone)]
+pub struct ParkedFrame {
+    /// The `Parallel` state's own name, as the state list that declares it spells it.
+    pub state_name: String,
+    /// The RAW input that state was entered with, so the walk that re-enters it sees
+    /// the data it saw.
+    pub state_input: Value,
+    /// Which branch of it the task that parked is in.
+    pub branch: usize,
+    /// What each branch produced, in branch order, with no value at `branch`: the
+    /// branch that parked has produced nothing yet.
+    pub done: Vec<Option<Value>>,
 }
 
 /// What the job an execution was PARKED at ended as, which is the result of the state
@@ -801,6 +966,9 @@ pub struct JobReply {
     pub state_name: String,
     /// The RAW input that state was entered with, as the parked record carries it.
     pub state_input: String,
+    /// The concurrent states that state is nested inside, as the parked record
+    /// carries them ([`ParkedJob::frames`]).
+    pub frames: Vec<ParkedFrame>,
     /// What the job ended as.
     pub outcome: Result<Value, Failure>,
 }
@@ -953,6 +1121,17 @@ fn named(error: &str, cause: String) -> Failure {
     }
 }
 
+/// A JSONata template of a state that was not evaluated, under the ASL error name
+/// for the class the refusal belongs to: the language's data-limit failure for a
+/// template that outgrew what a state may carry, and
+/// [`QUERY_EVALUATION_ERROR`] for every expression that was not evaluated.
+fn jsonata_failure(refusal: super::jsonata::Refusal) -> Failure {
+    match refusal {
+        super::jsonata::Refusal::TooLarge(why) => named(DATA_LIMIT_ERROR, why),
+        super::jsonata::Refusal::NotEvaluated(why) => named(QUERY_EVALUATION_ERROR, why),
+    }
+}
+
 /// What one state's turn produced.
 struct StateStep {
     /// The state's output, which is the next state's input.
@@ -960,6 +1139,13 @@ struct StateStep {
     /// The offset into the run at which the state finished.
     at: Duration,
     next: Next,
+}
+
+/// What a `Choice` state decided: the state it transitions to, and the output the
+/// rule that matched declared, for a JSONata rule that declares one.
+struct Chosen {
+    next: String,
+    output: Option<Value>,
 }
 
 /// Where the walk goes after a state.
@@ -980,6 +1166,10 @@ struct Branch {
     outcome: Result<Value, Failure>,
     /// The offset into the run at which the branch ended.
     end: Duration,
+    /// Whether the branch SUSPENDED rather than ending: one of its states started the
+    /// job of a run-a-job integration ([`Interpreter::parked`]), so the branch has no
+    /// result yet and the state that encloses it has none either.
+    suspended: bool,
 }
 
 /// One unit of a state's CONCURRENT work — a `Parallel` branch, or one iteration of a
@@ -1042,6 +1232,10 @@ struct MapPlan<'a> {
     start_at: &'a str,
     /// `ItemSelector`, or the legacy `Parameters` form of it.
     selector: Option<&'a Value>,
+    /// The query language the `Map` state itself is written in, which its own members
+    /// — its `ItemSelector` included — are evaluated in. A state of the processor
+    /// declares its own.
+    language: &'static str,
     /// Whether the processor declares `"Mode": "DISTRIBUTED"`.
     distributed: bool,
     /// How many items run at once; `0` is `MaxConcurrency`'s documented "no limit".
@@ -3092,8 +3286,8 @@ const RESERVED_TERMS: &[&str] = &["states"];
 ///
 /// The definition is parsed with `serde_json`, whose own recursion limit bounds
 /// how deep the walk below can go; the extraction of the `$name` terms from one
-/// expression is lexical, which is why it needs no expression parser (and there
-/// is no maintained Rust crate that parses JSONata).
+/// expression is lexical, which is why no expression parser is needed for it —
+/// evaluating one is [`super::jsonata`]'s business, not this report's.
 pub fn variable_references(definition: &str) -> BTreeMap<String, Vec<String>> {
     let mut references = BTreeMap::new();
     let Ok(document) = serde_json::from_str::<Value>(definition) else {
@@ -3453,21 +3647,22 @@ fn interpret(
             false,
         );
     };
-    if let Some(language) = document.get("QueryLanguage").and_then(Value::as_str) {
-        if language != JSONPATH {
+    // The query language the definition is written in, which every state inherits
+    // unless it declares one of its own: both of the languages `QueryLanguage`
+    // selects between are evaluated ([`super::jsonata`] for JSONata), so a definition
+    // declaring either is RUN. A value that is neither is no query language the
+    // language defines, which `validate` refuses at create time and the walk reports
+    // here for a definition stored before it did.
+    let language = match declared_language(document.get("QueryLanguage")) {
+        Ok(Some(declared)) => declared,
+        Ok(None) => JSONPATH,
+        Err(why) => {
             return (
-                failed(
-                    Vec::new(),
-                    Duration::ZERO,
-                    runtime(format!(
-                        "the definition is written in '{language}', and this emulator evaluates \
-                         only '{JSONPATH}' definitions, so nothing was run for it"
-                    )),
-                ),
+                failed(Vec::new(), Duration::ZERO, runtime(why)),
                 false,
             );
         }
-    }
+    };
     let input_value: Value = match serde_json::from_str(input) {
         Ok(value) => value,
         Err(why) => {
@@ -3491,19 +3686,39 @@ fn interpret(
     // execution's input. A state the definition no longer declares — the state machine
     // an execution started through an unqualified ARN has been updated since — is no
     // step to continue from, so such a walk is an attempt of its own.
-    let (reply, job_reply, start_at, first_input) = match entry {
+    let (reply, job_reply, resume_frames, start_at, first_input) = match entry {
         Entry::Reply(reply, state_input) => {
             let state_name = reply.state_name.clone();
-            (Some(reply), None, state_name, state_input)
+            (Some(reply), None, Vec::new(), state_name, state_input)
         }
+        // A job the task of a `Parallel` BRANCH started is answered one level in:
+        // the walk re-enters the concurrent states the parked record names, outermost
+        // first, and the frames are what it picks up at each of them
+        // ([`ParkedFrame`]).
         Entry::Job(reply, state_input) => {
-            let state_name = reply.state_name.clone();
-            (None, Some(reply), state_name, state_input)
+            let frames = reply.frames.clone();
+            match frames.first() {
+                Some(frame) => {
+                    let state_name = frame.state_name.clone();
+                    let state_input = frame.state_input.clone();
+                    (None, Some(reply), frames, state_name, state_input)
+                }
+                None => {
+                    let state_name = reply.state_name.clone();
+                    (None, Some(reply), Vec::new(), state_name, state_input)
+                }
+            }
         }
         Entry::At(state_name, state_input) if states.contains_key(&state_name) => {
-            (None, None, state_name, state_input)
+            (None, None, Vec::new(), state_name, state_input)
         }
-        Entry::At(..) | Entry::Start => (None, None, start_at.to_string(), input_value.clone()),
+        Entry::At(..) | Entry::Start => (
+            None,
+            None,
+            Vec::new(),
+            start_at.to_string(),
+            input_value.clone(),
+        ),
     };
 
     // The document the CALLER supplied to this walk, as they wrote it: what every
@@ -3526,6 +3741,11 @@ fn interpret(
         tasks,
         waiting: None,
         parked: None,
+        abandoned: Vec::new(),
+        // The concurrent states this walk has to re-enter to reach the state a job's
+        // outcome answers; empty for every other walk.
+        resume_frames,
+        map_depth: 0,
         map_runs: Vec::new(),
         map_runs_entered: 0,
         reply,
@@ -3540,6 +3760,12 @@ fn interpret(
         express: context.express,
         // Set by the walk, if a state of the definition fails.
         failed_at: None,
+        // The query language the definition declares, which a state inherits unless
+        // it declares one of its own.
+        language,
+        // A run has assigned nothing where it starts.
+        variables: BTreeMap::new(),
+        assigned: BTreeMap::new(),
         // The execution's own input, as the caller wrote it: a state's data that IS
         // that document is echoed in the caller's bytes rather than re-encoded.
         supplied: supplied.clone(),
@@ -3553,6 +3779,7 @@ fn interpret(
     );
     let mut waiting = interpreter.waiting.take();
     let mut parked = interpreter.parked.take();
+    let abandoned = std::mem::take(&mut interpreter.abandoned);
     let mut steps = interpreter.steps;
     // One execution's Map Runs are reported "in the order their states were entered",
     // which is the position each one carries. A nested Distributed Map inside another's
@@ -3627,22 +3854,25 @@ fn interpret(
                     map_run
                 })
                 .collect();
-            return (
-                terminal(
-                    kept,
-                    remaining,
-                    super::EVENT_EXECUTION_TIMED_OUT,
-                    super::EXECUTION_STATUS_TIMED_OUT,
-                    None,
-                    Some(TIMEOUT_ERROR.to_string()),
-                    Some(format!(
-                        "the execution ran for longer than the {seconds} seconds its definition's \
-                         'TimeoutSeconds' allows"
-                    )),
-                )
-                .with_map_runs(kept_map_runs),
-                applied,
-            );
+            let mut timed_out = terminal(
+                kept,
+                remaining,
+                super::EVENT_EXECUTION_TIMED_OUT,
+                super::EXECUTION_STATUS_TIMED_OUT,
+                None,
+                Some(TIMEOUT_ERROR.to_string()),
+                Some(format!(
+                    "the execution ran for longer than the {seconds} seconds its definition's \
+                     'TimeoutSeconds' allows"
+                )),
+            )
+            .with_map_runs(kept_map_runs);
+            // The execution ended at the timeout, so a job it had started is waited
+            // for by nothing: it is the caller's to stop, like a job a failed state
+            // abandoned.
+            timed_out.abandoned = abandoned;
+            timed_out.abandoned.extend(parked);
+            return (timed_out, applied);
         }
     }
 
@@ -3665,6 +3895,7 @@ fn interpret(
                 elapsed: end,
                 waiting,
                 parked,
+                abandoned,
                 map_runs,
                 // A run that is WAITING failed at nothing: what happens next is a
                 // worker's reply or the job finishing.
@@ -3687,6 +3918,12 @@ fn interpret(
     // The unsuccessful step this walk stopped at, for the redrive that continues the
     // execution from it.
     run.stopped_at = interpreter.failed_at;
+    // A job the walk started and then abandoned — and the one it had parked at, where
+    // the execution went on to fail anyway — is the caller's to STOP: the task that
+    // started it will never finish, so the job it started is not left running behind
+    // it.
+    run.abandoned = abandoned;
+    run.abandoned.extend(parked);
     (run, applied)
 }
 
@@ -3796,7 +4033,9 @@ fn terminal(
         // A run that reached a terminal event is waiting for nothing.
         waiting: None,
         parked: None,
-        // Set by `interpret`, which is where the walk's own frame is in scope.
+        // Set by `interpret`, which is where the walk's own frame is in scope — as
+        // `stopped_at` and the Map Runs are.
+        abandoned: Vec::new(),
         stopped_at: None,
         // Set by `run`, which is where the walk's Map Runs are in scope.
         map_runs: Vec::new(),
@@ -3906,6 +4145,19 @@ struct Interpreter<'tasks> {
     /// the execution waits at that state until the job finishes. Set at most once,
     /// because the walk stops at the state that set it.
     parked: Option<ParkedJob>,
+    /// The jobs this walk started and then ABANDONED, because the concurrent state
+    /// around the task that started one failed before the job could finish: what
+    /// [`Run::abandoned`] reports, for the caller to stop.
+    abandoned: Vec<ParkedJob>,
+    /// The concurrent states the walk has to re-enter to reach the task a job's
+    /// outcome answers, outermost first ([`ParkedJob::frames`]): taken level by level
+    /// as the walk descends into them, so each one is applied by the state it names.
+    resume_frames: Vec<ParkedFrame>,
+    /// How many `Map` ITERATIONS the walk is currently inside, which is what refuses
+    /// a run-a-job task there: a `Map` counts its items as they finish and starts a
+    /// child execution per item, and an iteration parked at a job has finished
+    /// nothing, so the task is not run rather than run as though its job had ended.
+    map_depth: usize,
     /// The Map Run every Distributed Map state this walk entered started, each with
     /// the position of its state among the Map states this walk ENTERED
     /// ([`Interpreter::map_runs_entered`]).
@@ -3949,6 +4201,23 @@ struct Interpreter<'tasks> {
     /// is recorded as the state that encloses it, because that is the step of the
     /// definition the execution stopped at.
     failed_at: Option<RedriveStep>,
+    /// The query language the DEFINITION declares, which every state is evaluated in
+    /// unless it declares one of its own ([`Interpreter::language_of`]).
+    language: &'static str,
+    /// The variables the run has assigned, which a JSONata expression reads under
+    /// each one's own name (`$total`).
+    ///
+    /// A nested state machine — a `Map` iteration, a `Parallel` branch — sees what
+    /// reaching its enclosing state assigned and its own assignments do not outlive
+    /// it ([`Interpreter::nested_walk`]), which is how the language scopes them.
+    variables: BTreeMap<String, Value>,
+    /// What the state the walk is IN has assigned, as the event it is left by reports
+    /// them: "map of variable name and value as a serialized JSON representation".
+    ///
+    /// Only the state's OWN assignments, not the scope around them — which is what
+    /// the member reports — so it is written by that state's `Assign` and taken by the
+    /// event the state is left by ([`Interpreter::push_exited`]).
+    assigned: BTreeMap<String, String>,
     /// The document the CALLER supplied, with the bytes they wrote it as: what
     /// [`Interpreter::echo`] echoes instead of re-encoding.
     supplied: Supplied,
@@ -4028,6 +4297,9 @@ impl Interpreter<'_> {
 
     /// Walk a NESTED state list — a `Map` iteration or a `Parallel` branch — one
     /// level deeper, refusing a definition that nests past [`MAX_NESTING_DEPTH`].
+    ///
+    /// `iteration` is whether the nested list is one `Map` ITEM's, which is what a
+    /// run-a-job task inside it is refused by ([`Interpreter::map_depth`]).
     fn nested_walk(
         &mut self,
         states: &Map<String, Value>,
@@ -4035,6 +4307,7 @@ impl Interpreter<'_> {
         input: Value,
         at: Duration,
         scope: &Scope,
+        iteration: bool,
     ) -> Branch {
         if self.depth >= MAX_NESTING_DEPTH {
             return Branch {
@@ -4043,14 +4316,26 @@ impl Interpreter<'_> {
                      {MAX_NESTING_DEPTH} levels deep this emulator runs, so nothing was run for it"
                 ))),
                 end: at,
+                suspended: false,
             };
         }
         self.depth += 1;
+        if iteration {
+            self.map_depth += 1;
+        }
         // A nested machine's states carry their OWN retry counts; the enclosing
         // state's is not theirs.
         let enclosing = std::mem::take(&mut self.retry_count);
+        // And their own VARIABLES: a nested machine's states read what reaching the
+        // state that declares it assigned, and what they assign does not outlive the
+        // machine, which is how the language scopes an `Assign`.
+        let enclosing_variables = self.variables.clone();
         let branch = self.walk(states, start_at, input, at, scope);
+        self.variables = enclosing_variables;
         self.retry_count = enclosing;
+        if iteration {
+            self.map_depth -= 1;
+        }
         self.depth -= 1;
         branch
     }
@@ -4073,6 +4358,7 @@ impl Interpreter<'_> {
                 return Branch {
                     outcome: Err(failure),
                     end: at,
+                    suspended: false,
                 };
             }
             if self.budget == 0 {
@@ -4082,6 +4368,7 @@ impl Interpreter<'_> {
                          transitions this emulator runs, so it was stopped"
                     ))),
                     end: at,
+                    suspended: false,
                 };
             }
             self.budget -= 1;
@@ -4091,6 +4378,7 @@ impl Interpreter<'_> {
                         "state '{name}' is not declared by the state machine"
                     ))),
                     end: at,
+                    suspended: false,
                 };
             };
             // The raw input of the state about to run, kept for the one use a
@@ -4114,6 +4402,7 @@ impl Interpreter<'_> {
                     return Branch {
                         outcome: Err(fault.failure),
                         end: fault.at,
+                        suspended: false,
                     };
                 }
             };
@@ -4127,6 +4416,7 @@ impl Interpreter<'_> {
                 return Branch {
                     outcome: Err(failure),
                     end: at,
+                    suspended: false,
                 };
             }
             match step.next {
@@ -4134,17 +4424,19 @@ impl Interpreter<'_> {
                     return Branch {
                         outcome: Ok(current),
                         end: at,
+                        suspended: false,
                     };
                 }
-                // The state scheduled an activity task: the walk stops here, and
-                // `run` reports the task rather than an outcome. Only a TOP-LEVEL
-                // state suspends (see [`Interpreter::activity_task_state`]), so no
-                // enclosing `Map` iteration or `Parallel` branch can be left holding
-                // a half-finished walk.
+                // The state scheduled an activity task, or started the job of a
+                // run-a-job integration: the walk stops here, and `run` reports what
+                // it is waiting for rather than an outcome. A nested list reports the
+                // suspension to the state that encloses it, which is what parks a
+                // `Parallel` branch at the job one of its states started.
                 Next::Suspended => {
                     return Branch {
                         outcome: Ok(current),
                         end: at,
+                        suspended: true,
                     };
                 }
                 Next::Named(next) => name = next,
@@ -4181,21 +4473,13 @@ impl Interpreter<'_> {
             ))
             .at(at));
         }
-        if let Some(member) = unexecutable_member(state_type, state) {
+        let language = self.language_of(state).map_err(|why| runtime(why).at(at))?;
+        if let Some(member) = unexecutable_member(state_type, state, language) {
             return Err(runtime(format!(
                 "state '{name}' carries the member '{member}', which this emulator does not \
                  interpret, so nothing was run for it"
             ))
             .at(at));
-        }
-        if let Some(language) = state.get("QueryLanguage").and_then(Value::as_str) {
-            if language != JSONPATH {
-                return Err(runtime(format!(
-                    "state '{name}' is written in '{language}', and this emulator evaluates only \
-                     '{JSONPATH}' states, so nothing was run for it"
-                ))
-                .at(at));
-            }
         }
 
         let context = self.context_for(scope, name, at);
@@ -4211,14 +4495,21 @@ impl Interpreter<'_> {
                 // INPUT. `Result` is the state's RESULT, so a state that declares
                 // both reports its `Result`, computed over the input `Parameters`
                 // built. With neither, the result is the effective input unchanged.
-                let payload = match state.get("Parameters") {
-                    Some(template) => payload_template(template, &effective, &context)
-                        .map_err(|failure| failure.at(at))?,
-                    None => effective,
+                // Both members are JSONPath's: a JSONata `Pass` produces no result of
+                // its own, so what it puts out is its `Output` over its own input.
+                let result = match language {
+                    JSONATA => None,
+                    _ => {
+                        let payload = match state.get("Parameters") {
+                            Some(template) => payload_template(template, &effective, &context)
+                                .map_err(|failure| failure.at(at))?,
+                            None => effective.clone(),
+                        };
+                        Some(state.get("Result").cloned().unwrap_or(payload))
+                    }
                 };
-                let result = state.get("Result").cloned().unwrap_or(payload);
                 let value = self
-                    .place_result(state, &raw, result, &context, false)
+                    .produced(state, language, &raw, &effective, result, &context, false)
                     .map_err(|failure| failure.at(at))?;
                 self.push_exited("PassStateExited", name, at, &value);
                 Ok(StateStep {
@@ -4230,11 +4521,11 @@ impl Interpreter<'_> {
             "Wait" => {
                 self.push_entered("WaitStateEntered", name, at, &raw);
                 let waited = self
-                    .wait_duration(state, &effective, &context, at)
+                    .wait_duration(state, language, &effective, &context, at)
                     .map_err(|why| runtime(format!("state '{name}': {why}")).at(at))?;
                 let at = at + waited;
                 let value = self
-                    .output_value(state, effective, &context)
+                    .produced(state, language, &raw, &effective, None, &context, false)
                     .map_err(|failure| failure.at(at))?;
                 self.push_exited("WaitStateExited", name, at, &value);
                 Ok(StateStep {
@@ -4245,23 +4536,29 @@ impl Interpreter<'_> {
             }
             "Choice" => {
                 self.push_entered("ChoiceStateEntered", name, at, &raw);
-                let next = self
-                    .choose(state, &effective, &context)
+                let chosen = self
+                    .choose(state, language, &effective, &context)
                     .map_err(|failure| failure.at(at))?;
-                let value = self
-                    .output_value(state, effective, &context)
-                    .map_err(|failure| failure.at(at))?;
+                // "Output ... you can also specify Output in a Choice rule": the rule
+                // that MATCHED decides the state's output where it declares one, and
+                // the state's own `Output` otherwise.
+                let value = match chosen.output {
+                    Some(value) => value,
+                    None => self
+                        .produced(state, language, &raw, &effective, None, &context, false)
+                        .map_err(|failure| failure.at(at))?,
+                };
                 self.push_exited("ChoiceStateExited", name, at, &value);
                 Ok(StateStep {
                     value,
                     at,
-                    next: Next::Named(next),
+                    next: Next::Named(chosen.next),
                 })
             }
             "Succeed" => {
                 self.push_entered("SucceedStateEntered", name, at, &raw);
                 let value = self
-                    .output_value(state, effective, &context)
+                    .produced(state, language, &raw, &effective, None, &context, false)
                     .map_err(|failure| failure.at(at))?;
                 self.push_exited("SucceedStateExited", name, at, &value);
                 Ok(StateStep {
@@ -4274,19 +4571,226 @@ impl Interpreter<'_> {
                 self.push_entered("FailStateEntered", name, at, &raw);
                 // A `Fail` state ends the execution with the error and cause it
                 // declares, both of which ASL leaves optional and either of which
-                // may instead be read from the state's input through a `*Path`.
+                // may instead be read from the state's input — through a `*Path` in
+                // JSONPath, through an expression in the member itself in JSONata.
                 let error = self
-                    .fail_member(state, "Error", "ErrorPath", &effective, &context)
+                    .fail_member(state, language, "Error", "ErrorPath", &effective, &context)
                     .map_err(|failure| failure.at(at))?;
                 let cause = self
-                    .fail_member(state, "Cause", "CausePath", &effective, &context)
+                    .fail_member(state, language, "Cause", "CausePath", &effective, &context)
                     .map_err(|failure| failure.at(at))?;
                 Err(Failure { error, cause }.at(at))
             }
-            "Map" => self.map_state(name, state, raw, effective, &context, at),
-            "Task" => self.task_state(name, state, raw, effective, &context, at),
+            "Map" => self.map_state(name, state, language, raw, effective, &context, at),
+            "Task" => self.task_state(name, state, language, raw, effective, &context, at),
             // `Parallel` is the only type left: the list above is exhaustive.
-            _ => self.parallel_state(name, state, raw, effective, &context, at),
+            _ => self.parallel_state(name, state, language, raw, effective, &context, at),
+        }
+    }
+
+    /// The query language one state is evaluated in: the one it declares, else the
+    /// one the definition does.
+    ///
+    /// The `Err` is a `QueryLanguage` that names no query language the Amazon States
+    /// Language defines, which `validate` refuses at create time.
+    fn language_of(&self, state: &Map<String, Value>) -> Result<&'static str, String> {
+        Ok(declared_language(state.get("QueryLanguage"))?.unwrap_or(self.language))
+    }
+
+    /// The bindings a JSONata expression of this state is evaluated with.
+    fn bindings<'b>(
+        &'b self,
+        input: &'b Value,
+        context: &'b Value,
+        result: Option<&'b Value>,
+        error_output: Option<&'b Value>,
+    ) -> super::jsonata::Bindings<'b> {
+        super::jsonata::Bindings {
+            input,
+            context,
+            result,
+            error_output,
+            variables: &self.variables,
+        }
+    }
+
+    /// What the expressions of ONE visit to a state may build and evaluate: the
+    /// allowance is per visit, and it is spent against this interpretation's own
+    /// deadline, so neither the member count of a template nor the time its
+    /// expressions take is left to the definition.
+    fn jsonata_budget(&self) -> super::jsonata::Budget {
+        super::jsonata::Budget::new(self.deadline)
+    }
+
+    /// What a state PUTS OUT, in the query language it is written in.
+    ///
+    /// JSONPath places the state's result through `ResultSelector`, `ResultPath` and
+    /// `OutputPath`; JSONata evaluates the state's `Assign` and then its `Output`.
+    /// One seam for both, so every state type's output follows the rule of the
+    /// language that state is written in.
+    ///
+    /// `result` is what the state's own work produced, and `None` for a state that
+    /// produces none and carries its input through (a `Pass`, a `Wait`, a `Choice`, a
+    /// `Succeed`).
+    #[allow(clippy::too_many_arguments)]
+    fn produced(
+        &mut self,
+        state: &Map<String, Value>,
+        language: &'static str,
+        raw: &Value,
+        effective: &Value,
+        result: Option<Value>,
+        context: &Value,
+        with_selector: bool,
+    ) -> Result<Value, Failure> {
+        if language == JSONATA {
+            return self.jsonata_output(state, effective, result.as_ref(), None, context);
+        }
+        match result {
+            Some(result) => self.place_result(state, raw, result, context, with_selector),
+            None => self.output_value(state, effective.clone(), context),
+        }
+    }
+
+    /// A JSONata state's `Assign`, and then the `Output` those assignments feed.
+    ///
+    /// "Assign ... store values in variables": the assignments are evaluated FIRST,
+    /// so a variable this state assigns is in scope for its own `Output`, and they
+    /// outlive the state — which is what a later state reads them through. A state
+    /// that declares no `Output` puts out what its work produced, and its own input
+    /// where its work produced nothing.
+    ///
+    /// A state that FAILS assigns nothing: where the `Output` those assignments feed
+    /// cannot be built, the scope is put back as the state found it, so the states
+    /// after a caught failure read what reaching the failed state had assigned and no
+    /// more — and the event the state is left by reports no assignment of its own.
+    fn jsonata_output(
+        &mut self,
+        state: &Map<String, Value>,
+        input: &Value,
+        result: Option<&Value>,
+        error_output: Option<&Value>,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        // ONE allowance for the `Assign` and the `Output` it feeds: they are the
+        // expressions of one template, so they spend from the same budget.
+        let mut budget = self.jsonata_budget();
+        let scope = self.variables.clone();
+        let assigned = self.assigned.clone();
+        let produced = self
+            .jsonata_assign(state, input, result, error_output, context, &mut budget)
+            .and_then(|()| match state.get("Output") {
+                None => Ok(result.cloned().unwrap_or_else(|| input.clone())),
+                Some(template) => {
+                    let rendered = {
+                        let bindings = self.bindings(input, context, result, error_output);
+                        super::jsonata::render(template, &bindings, &mut budget)
+                    };
+                    rendered.map_err(jsonata_failure)
+                }
+            });
+        if produced.is_err() {
+            self.variables = scope;
+            self.assigned = assigned;
+        }
+        produced
+    }
+
+    /// Apply the `Assign` of a state, a `Choice` rule or a `Catch` catcher.
+    ///
+    /// Each member is one variable, and they are evaluated in order, so an assignment
+    /// reads the ones written before it. All of them spend from the ONE budget the
+    /// visit was given, so a state cannot assign more than what a state's document
+    /// may carry however many variables it declares.
+    #[allow(clippy::too_many_arguments)]
+    fn jsonata_assign(
+        &mut self,
+        node: &Map<String, Value>,
+        input: &Value,
+        result: Option<&Value>,
+        error_output: Option<&Value>,
+        context: &Value,
+        budget: &mut super::jsonata::Budget,
+    ) -> Result<(), Failure> {
+        let Some(assignments) = node.get(ASSIGN_MEMBER) else {
+            return Ok(());
+        };
+        let assignments = assignments.as_object().ok_or_else(|| {
+            runtime(format!("'{ASSIGN_MEMBER}' must be a JSON object of variables"))
+        })?;
+        // The variables are built on a copy and installed once: an assignment that
+        // fails leaves the scope as the state found it, so no later state reads half
+        // of one state's assignments.
+        let mut variables = self.variables.clone();
+        let mut assigned = BTreeMap::new();
+        for (variable, template) in assignments {
+            let value = {
+                let bindings = super::jsonata::Bindings {
+                    input,
+                    context,
+                    result,
+                    error_output,
+                    variables: &variables,
+                };
+                super::jsonata::render(template, &bindings, budget).map_err(jsonata_failure)?
+            };
+            // A variable is a document the execution retains and a later state reads,
+            // so it is measured against the same ceiling every document this walk
+            // produces is measured against.
+            measure_payload(&value, &format!("the variable '{variable}'"))?;
+            assigned.insert(variable.clone(), value.to_string());
+            variables.insert(variable.clone(), value);
+        }
+        self.variables = variables;
+        // What THIS state assigned, for the event it is left by: a state that assigns
+        // nothing reports nothing, whatever the scope around it holds.
+        self.assigned.extend(assigned);
+        Ok(())
+    }
+
+    /// A field that is either one JSONata expression or the literal it is written as,
+    /// for a state written in that language; the literal itself for a JSONPath state.
+    fn literal(
+        &self,
+        language: &'static str,
+        node: &Value,
+        input: &Value,
+        context: &Value,
+    ) -> Result<Option<Value>, Failure> {
+        if language != JSONATA {
+            return Ok(Some(node.clone()));
+        }
+        let bindings = self.bindings(input, context, None, None);
+        super::jsonata::field(node, &bindings, &mut self.jsonata_budget())
+            .map_err(jsonata_failure)
+    }
+
+    /// The document a `Task` state hands its work.
+    ///
+    /// "Parameters ... Used to create a collection of key-value pairs that will be
+    /// passed as input" — the member is `Arguments` in JSONata and `Parameters` in
+    /// JSONPath, and a state that declares neither hands its work its own effective
+    /// input.
+    fn task_request(
+        &self,
+        state: &Map<String, Value>,
+        language: &'static str,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        match language {
+            JSONATA => match state.get("Arguments") {
+                Some(template) => {
+                    let bindings = self.bindings(effective, context, None, None);
+                    super::jsonata::render(template, &bindings, &mut self.jsonata_budget())
+                        .map_err(jsonata_failure)
+                }
+                None => Ok(effective.clone()),
+            },
+            _ => match state.get("Parameters") {
+                Some(template) => payload_template(template, effective, context),
+                None => Ok(effective.clone()),
+            },
         }
     }
 
@@ -4305,10 +4809,12 @@ impl Interpreter<'_> {
     /// A walk CONTINUING from a worker's reply to this state's task applies that reply
     /// here instead of suspending: the reply is the state's result, so the state's own
     /// result-side data flow places it and the walk goes on to its `Next`.
+    #[allow(clippy::too_many_arguments)]
     fn activity_task_state(
         &mut self,
         name: &str,
         state: &Map<String, Value>,
+        language: &'static str,
         raw: &Value,
         effective: Value,
         context: &Value,
@@ -4339,20 +4845,18 @@ impl Interpreter<'_> {
         // `*Path` forms are reference paths into — not from the `Parameters` document
         // built below.
         let timeout_seconds = self
-            .task_seconds(state, "TimeoutSeconds", &effective, context)
+            .task_seconds(state, language, "TimeoutSeconds", &effective, context)
             .map_err(|failure| failure.at(at))?;
         let heartbeat_seconds = self
-            .task_seconds(state, "HeartbeatSeconds", &effective, context)
+            .task_seconds(state, language, "HeartbeatSeconds", &effective, context)
             .map_err(|failure| failure.at(at))?;
         // "Parameters ... Used to create a collection of key-value pairs that will be
-        // passed as input": the document the template builds IS what the worker is
-        // handed, and without one the state's effective input is.
-        let input = match state.get("Parameters") {
-            Some(template) => {
-                payload_template(template, &effective, context).map_err(|failure| failure.at(at))?
-            }
-            None => effective,
-        };
+        // passed as input" — `Arguments` in JSONata: the document the template builds
+        // IS what the worker is handed, and without one the state's effective input
+        // is.
+        let input = self
+            .task_request(state, language, &effective, context)
+            .map_err(|failure| failure.at(at))?;
         self.push_entered("TaskStateEntered", name, at, raw);
         self.push("ActivityScheduled", name, at);
         // A worker has already answered THIS state's task: the reply is that task's
@@ -4372,7 +4876,15 @@ impl Interpreter<'_> {
             });
             self.push("ActivitySucceeded", name, at);
             let value = self
-                .place_result(state, raw, reply.result, context, true)
+                .produced(
+                    state,
+                    language,
+                    raw,
+                    &effective,
+                    Some(reply.result),
+                    context,
+                    true,
+                )
                 .map_err(|failure| failure.at(at))?;
             self.push_exited("TaskStateExited", name, at, &value);
             let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
@@ -4402,13 +4914,14 @@ impl Interpreter<'_> {
     fn task_seconds(
         &self,
         state: &Map<String, Value>,
+        language: &'static str,
         member: &str,
         input: &Value,
         context: &Value,
     ) -> Result<Option<u64>, Failure> {
         let path_member = format!("{member}Path");
         let declared = match (state.get(member), state.get(path_member.as_str())) {
-            (Some(declared), _) => Some(declared.clone()),
+            (Some(declared), _) => self.literal(language, declared, input, context)?,
             (None, Some(Value::String(path))) => Some(expression(path, input, context)?),
             (None, Some(other)) => {
                 return Err(runtime(format!(
@@ -4515,7 +5028,8 @@ impl Interpreter<'_> {
     /// The event a state records when it is LEFT, carrying the data that state EMITTED:
     /// "the JSON output data of the state", which is the document the state's own
     /// result-side data flow produced — `ResultSelector`, then `ResultPath`, then
-    /// `OutputPath` — and is the next state's input.
+    /// `OutputPath`, or a JSONata state's `Output` — and is the next state's input,
+    /// beside the variables that are in scope as it leaves.
     fn push_exited(
         &mut self,
         event_type: &'static str,
@@ -4524,12 +5038,18 @@ impl Interpreter<'_> {
         output: &Value,
     ) {
         let output = self.echo(output);
+        // "Map of variable name and value as a serialized JSON representation": what
+        // the state being left ASSIGNED, which is what a caller reads a JSONata
+        // state's `Assign` back through. A state that assigned none reports no map at
+        // all, whatever the scope around it holds.
+        let assigned_variables = std::mem::take(&mut self.assigned);
         self.push_detailed(
             event_type,
             state_name,
             after,
             super::EventDetails {
                 output: Some(output),
+                assigned_variables,
                 ..super::EventDetails::default()
             },
         );
@@ -4611,7 +5131,9 @@ impl Interpreter<'_> {
         &mut self,
         name: &str,
         state: &Map<String, Value>,
+        language: &'static str,
         raw: &Value,
+        effective: &Value,
         work: (&str, &str),
         outcome: Result<Value, Failure>,
         context: &Value,
@@ -4627,7 +5149,7 @@ impl Interpreter<'_> {
                 details.output = Some(result.to_string());
                 self.push_detailed(super::EVENT_TASK_SUCCEEDED, name, at, details);
                 let value = self
-                    .place_result(state, raw, result, context, true)
+                    .produced(state, language, raw, effective, Some(result), context, true)
                     .map_err(|failure| failure.at(at))?;
                 self.push_exited("TaskStateExited", name, at, &value);
                 let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
@@ -4635,7 +5157,16 @@ impl Interpreter<'_> {
             }
             Err(failure) => {
                 self.push_task_failure(name, resource_type, action, &failure, at);
-                self.catch_or_fail((name, "TaskStateExited"), state, raw, failure, context, at)
+                self.catch_or_fail(
+                    (name, "TaskStateExited"),
+                    state,
+                    language,
+                    raw,
+                    effective,
+                    failure,
+                    context,
+                    at,
+                )
             }
         }
     }
@@ -4732,19 +5263,26 @@ impl Interpreter<'_> {
     }
 
     /// A `Fail` state's `Error`/`Cause`, from the literal member or from its `*Path`.
+    ///
+    /// In JSONata the member itself carries the expression — "you can use JSONata
+    /// expressions in Error and Cause" — so there is no `*Path` form to read.
     fn fail_member(
         &self,
         state: &Map<String, Value>,
+        language: &'static str,
         member: &str,
         path_member: &str,
         input: &Value,
         context: &Value,
     ) -> Result<Option<String>, Failure> {
         if let Some(literal) = state.get(member) {
-            let text = literal.as_str().ok_or_else(|| {
+            let evaluated = self
+                .literal(language, literal, input, context)?
+                .unwrap_or(Value::Null);
+            let text = evaluated.as_str().map(str::to_string).ok_or_else(|| {
                 runtime(format!("a 'Fail' state's '{member}' must be a string"))
             })?;
-            return Ok(Some(text.to_string()));
+            return Ok(Some(text));
         }
         match state.get(path_member) {
             None => Ok(None),
@@ -4776,12 +5314,17 @@ impl Interpreter<'_> {
     fn wait_duration(
         &self,
         state: &Map<String, Value>,
+        language: &'static str,
         input: &Value,
         context: &Value,
         at: Duration,
     ) -> Result<Duration, String> {
+        let evaluated = |node: &Value| -> Result<Option<Value>, String> {
+            self.literal(language, node, input, context)
+                .map_err(|failure| failure.cause.unwrap_or_default())
+        };
         let seconds = match (state.get("Seconds"), state.get("SecondsPath")) {
-            (Some(seconds), _) => Some(seconds.clone()),
+            (Some(seconds), _) => evaluated(seconds)?,
             (None, Some(Value::String(path))) => Some(
                 expression(path, input, context)
                     .map_err(|failure| failure.cause.unwrap_or_default())?,
@@ -4805,7 +5348,7 @@ impl Interpreter<'_> {
         }
 
         let timestamp = match (state.get("Timestamp"), state.get("TimestampPath")) {
-            (Some(timestamp), _) => Some(timestamp.clone()),
+            (Some(timestamp), _) => evaluated(timestamp)?,
             (None, Some(Value::String(path))) => Some(
                 expression(path, input, context)
                     .map_err(|failure| failure.cause.unwrap_or_default())?,
@@ -4844,12 +5387,19 @@ impl Interpreter<'_> {
     // -----------------------------------------------------------------------
 
     /// The state the first matching choice rule names, or the `Default`.
+    ///
+    /// Each rule is tested in the language the state is written in: a `Variable` and
+    /// one of the comparators in JSONPath, a boolean `Condition` expression in
+    /// JSONata. A JSONata rule may also carry an `Assign` and an `Output` of its own,
+    /// which are the matching rule's — so they are applied here, where the rule that
+    /// matched is known.
     fn choose(
-        &self,
+        &mut self,
         state: &Map<String, Value>,
+        language: &'static str,
         input: &Value,
         context: &Value,
-    ) -> Result<String, Failure> {
+    ) -> Result<Chosen, Failure> {
         let choices = state
             .get("Choices")
             .and_then(Value::as_array)
@@ -4874,15 +5424,55 @@ impl Interpreter<'_> {
             let rule = rule.as_object().ok_or_else(|| {
                 runtime("every member of 'Choices' must be a JSON object".to_string())
             })?;
-            if condition_matches(rule, input, context)? {
-                let next = rule.get("Next").and_then(Value::as_str).ok_or_else(|| {
-                    runtime("a top-level choice rule must carry a string 'Next'".to_string())
-                })?;
-                return Ok(next.to_string());
+            let matched = match language {
+                JSONATA => {
+                    let condition = rule.get("Condition").ok_or_else(|| {
+                        runtime(format!(
+                            "a 'Choice' rule written in '{JSONATA}' must carry a 'Condition'"
+                        ))
+                    })?;
+                    let bindings = self.bindings(input, context, None, None);
+                    super::jsonata::condition(condition, &bindings, &mut self.jsonata_budget())
+                        .map_err(jsonata_failure)?
+                }
+                _ => condition_matches(rule, input, context)?,
+            };
+            if !matched {
+                continue;
             }
+            let next = rule.get("Next").and_then(Value::as_str).ok_or_else(|| {
+                runtime("a top-level choice rule must carry a string 'Next'".to_string())
+            })?;
+            // The rule that matched is the one whose own `Assign` and `Output` apply;
+            // a JSONPath rule carries neither. Both spend from one allowance, as a
+            // state's own `Assign` and `Output` do.
+            let output = match language {
+                JSONATA => {
+                    let mut budget = self.jsonata_budget();
+                    self.jsonata_assign(rule, input, None, None, context, &mut budget)?;
+                    match rule.get("Output") {
+                        Some(template) => {
+                            let bindings = self.bindings(input, context, None, None);
+                            Some(
+                                super::jsonata::render(template, &bindings, &mut budget)
+                                    .map_err(jsonata_failure)?,
+                            )
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            return Ok(Chosen {
+                next: next.to_string(),
+                output,
+            });
         }
         match state.get("Default").and_then(Value::as_str) {
-            Some(default) => Ok(default.to_string()),
+            Some(default) => Ok(Chosen {
+                next: default.to_string(),
+                output: None,
+            }),
             None => Err(named(
                 NO_CHOICE_ERROR,
                 "no choice rule matched the state's input and the state declares no 'Default'"
@@ -4910,10 +5500,12 @@ impl Interpreter<'_> {
     /// and `Catch` apply to it exactly as they apply to a `Map`'s or a `Parallel`'s
     /// work — and what no call is made for is not faked, but reported as the failure
     /// it is.
+    #[allow(clippy::too_many_arguments)]
     fn task_state(
         &mut self,
         name: &str,
         state: &Map<String, Value>,
+        language: &'static str,
         raw: Value,
         effective: Value,
         context: &Value,
@@ -4923,7 +5515,8 @@ impl Interpreter<'_> {
         // that path records its own, and the work there is a worker's rather than a
         // call this emulator makes.
         if super::names_an_activity(task_resource(state)) {
-            return self.activity_task_state(name, state, &raw, effective, context, at);
+            return self
+                .activity_task_state(name, state, language, &raw, effective, context, at);
         }
         self.push_entered("TaskStateEntered", name, at, &raw);
         let resource = state.get("Resource").and_then(Value::as_str).ok_or_else(|| {
@@ -4958,11 +5551,11 @@ impl Interpreter<'_> {
         // and reading it as a whole number of seconds is what makes converting it to
         // a `Duration` total for every value a caller can write.
         let within = self
-            .task_seconds(state, "TimeoutSeconds", &effective, context)
+            .task_seconds(state, language, "TimeoutSeconds", &effective, context)
             .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?
             .map(Duration::from_secs);
         let heartbeat = self
-            .task_seconds(state, "HeartbeatSeconds", &effective, context)
+            .task_seconds(state, language, "HeartbeatSeconds", &effective, context)
             .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?;
         // The job a run-a-job integration started has ENDED: what it ended as is this
         // state's own outcome, so the state reports it instead of starting the job a
@@ -4980,26 +5573,63 @@ impl Interpreter<'_> {
             return self.finished_job(
                 name,
                 state,
+                language,
                 &raw,
+                &effective,
                 (&resource_type, &action),
                 ended.outcome,
                 context,
                 at,
             );
         }
-        // A nested state list is walked to its own end inside the enclosing state's
-        // turn, so there is nowhere for one of its states to park: a `Map` iteration
-        // or a `Parallel` branch that would start a job is not run, rather than run
-        // as though the job had already finished.
-        if call.job.is_some() && self.depth > 0 {
+        // A `Map` ITERATION is walked to its own end inside the enclosing state's
+        // turn, and what the Map Run around it reports — the items it has finished,
+        // the child execution each item ran as — is counted as those iterations
+        // finish, which an iteration parked at a job has not done. So a run-a-job
+        // task inside one is not run, rather than run as though the job had already
+        // finished; a `Parallel` BRANCH parks, because a branch reports nothing until
+        // it ends ([`ParkedFrame`]).
+        if call.job.is_some() && self.map_depth > 0 {
             return Err(self.task_fault(
                 name,
                 &resource_type,
                 &action,
                 runtime(format!(
-                    "state '{name}' starts a run-a-job integration inside a 'Map' iteration or a \
-                     'Parallel' branch, which this emulator does not park at, so nothing was run \
-                     for it"
+                    "state '{name}' starts a run-a-job integration inside a 'Map' iteration, \
+                     which this emulator does not park at, so nothing was run for it"
+                )),
+                at,
+            ));
+        }
+        // One execution parks at ONE job: the record that holds it names the state
+        // that started it, and the poll that resolves it resumes that one state. A
+        // second concurrent job is therefore not started either.
+        if call.job.is_some() && self.parked.is_some() {
+            return Err(self.task_fault(
+                name,
+                &resource_type,
+                &action,
+                runtime(format!(
+                    "state '{name}' starts a second run-a-job integration while this execution \
+                     is already parked at one, which this emulator does not park at, so nothing \
+                     was run for it"
+                )),
+                at,
+            ));
+        }
+        // A walk CONTINUING from a job that has ENDED has not reached the state that
+        // job belongs to yet, so a task that would start a job here is one the attempt
+        // this continues already started — the state machine has been updated under
+        // the execution since. It is not started a second time.
+        if call.job.is_some() && self.job_reply.is_some() {
+            return Err(self.task_fault(
+                name,
+                &resource_type,
+                &action,
+                runtime(format!(
+                    "state '{name}' would start the job of a run-a-job integration again while \
+                     this execution is being continued from one that has ended, so nothing was \
+                     run for it"
                 )),
                 at,
             ));
@@ -5020,15 +5650,12 @@ impl Interpreter<'_> {
             // This attempt's own request reads `$$.State.RetryCount`, so the payload
             // template is rendered with the context of the attempt it is on.
             let attempt_context = with_retry_count(context, me.retry_count);
-            let request = match state.get("Parameters") {
-                Some(template) => match payload_template(template, &effective, &attempt_context) {
-                    Ok(request) => request,
-                    Err(failure) => {
-                        me.push_task_failure(name, &resource_type, &action, &failure, at);
-                        return (Err(failure), at);
-                    }
-                },
-                None => effective.clone(),
+            let request = match me.task_request(state, language, &effective, &attempt_context) {
+                Ok(request) => request,
+                Err(failure) => {
+                    me.push_task_failure(name, &resource_type, &action, &failure, at);
+                    return (Err(failure), at);
+                }
             };
             // Each attempt hands the work over and starts it again, so each writes
             // its own pair of events, carrying the document THAT attempt built and
@@ -5135,6 +5762,10 @@ impl Interpreter<'_> {
                         submitted: result.clone(),
                         at,
                         timeout_seconds: within.map(|within| within.as_secs()),
+                        // Filled in as the walk unwinds: each concurrent state the
+                        // suspension passes through records its own frame
+                        // ([`Interpreter::run_branches`]).
+                        frames: Vec::new(),
                     });
                 }
                 (Ok(result), None) => {
@@ -5160,7 +5791,7 @@ impl Interpreter<'_> {
             }),
             Ok(result) => {
                 let value = self
-                    .place_result(state, &raw, result, context, true)
+                    .produced(state, language, &raw, &effective, Some(result), context, true)
                     .map_err(|failure| failure.at(end))?;
                 self.push_exited("TaskStateExited", name, end, &value);
                 Ok(StateStep {
@@ -5174,7 +5805,9 @@ impl Interpreter<'_> {
             Err(failure) => self.catch_or_fail(
                 (name, "TaskStateExited"),
                 state,
+                language,
                 &raw,
+                &effective,
                 failure,
                 context,
                 end,
@@ -5186,10 +5819,12 @@ impl Interpreter<'_> {
     // Map
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn map_state(
         &mut self,
         name: &str,
         state: &Map<String, Value>,
+        language: &'static str,
         raw: Value,
         effective: Value,
         context: &Value,
@@ -5202,7 +5837,7 @@ impl Interpreter<'_> {
         let entered = self.map_runs_entered;
         self.map_runs_entered = self.map_runs_entered.saturating_add(1);
         let items = self
-            .map_items(name, state, &effective, context)
+            .map_items(name, state, language, &effective, context)
             .map_err(|failure| failure.at(at))?;
         let (processor, distributed) = map_processor(name, state).map_err(|failure| failure.at(at))?;
         let (processor_states, processor_start) =
@@ -5223,15 +5858,30 @@ impl Interpreter<'_> {
             states: processor_states,
             start_at: processor_start,
             selector: state.get("ItemSelector").or_else(|| state.get("Parameters")),
+            language,
             distributed,
             concurrency: self
-                .number_member(state, "MaxConcurrency", &effective, context, 0.0)
+                .number_member(state, language, "MaxConcurrency", &effective, context, 0.0)
                 .map_err(|failure| failure.at(at))? as usize,
             tolerated_count: self
-                .number_member(state, "ToleratedFailureCount", &effective, context, 0.0)
+                .number_member(
+                    state,
+                    language,
+                    "ToleratedFailureCount",
+                    &effective,
+                    context,
+                    0.0,
+                )
                 .map_err(|failure| failure.at(at))? as u64,
             tolerated_percentage: self
-                .number_member(state, "ToleratedFailurePercentage", &effective, context, 0.0)
+                .number_member(
+                    state,
+                    language,
+                    "ToleratedFailurePercentage",
+                    &effective,
+                    context,
+                    0.0,
+                )
                 .map_err(|failure| failure.at(at))?,
             tolerance_declared: ["ToleratedFailureCount", "ToleratedFailureCountPath",
                 "ToleratedFailurePercentage", "ToleratedFailurePercentagePath"]
@@ -5310,7 +5960,7 @@ impl Interpreter<'_> {
         match outcome {
             Ok(results) => {
                 let value = self
-                    .place_result(state, &raw, results, context, true)
+                    .produced(state, language, &raw, &effective, Some(results), context, true)
                     .map_err(|failure| failure.at(end))?;
                 self.push_exited("MapStateExited", name, end, &value);
                 Ok(StateStep {
@@ -5321,16 +5971,36 @@ impl Interpreter<'_> {
                         .map_err(|failure| failure.at(end))?,
                 })
             }
-            Err(failure) => {
-                self.catch_or_fail(
-                    (name, "MapStateExited"),
-                    state,
-                    &raw,
-                    failure,
-                    context,
-                    end,
-                )
+            Err(failure) => self.catch_or_fail(
+                (name, "MapStateExited"),
+                state,
+                language,
+                &raw,
+                &effective,
+                failure,
+                context,
+                end,
+            ),
+        }
+    }
+
+    /// One `Map` state's `ItemSelector`, in the query language that state is written
+    /// in: a payload template in JSONPath, a template of JSONata expressions in
+    /// JSONata.
+    fn render_selector(
+        &self,
+        language: &'static str,
+        template: &Value,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        match language {
+            JSONATA => {
+                let bindings = self.bindings(effective, context, None, None);
+                super::jsonata::render(template, &bindings, &mut self.jsonata_budget())
+                    .map_err(jsonata_failure)
             }
+            _ => payload_template(template, effective, context),
         }
     }
 
@@ -5340,11 +6010,20 @@ impl Interpreter<'_> {
         &self,
         name: &str,
         state: &Map<String, Value>,
+        language: &'static str,
         effective: &Value,
         context: &Value,
     ) -> Result<Vec<Value>, Failure> {
         let selected = match state.get("Items") {
-            Some(items) => payload_template(items, effective, context)?,
+            // "Items — an array, or a JSONata expression that evaluates to an array":
+            // the member is the array itself in either language, and in JSONata it may
+            // be the expression that produces one.
+            Some(items) => match language {
+                JSONATA => self
+                    .literal(language, items, effective, context)?
+                    .unwrap_or(Value::Null),
+                _ => payload_template(items, effective, context)?,
+            },
             None => match state.get("ItemsPath") {
                 None => effective.clone(),
                 Some(Value::String(path)) => select(path, effective, context)?,
@@ -5433,7 +6112,7 @@ impl Interpreter<'_> {
                     map_item: Some(map_item),
                 };
                 let item_input = match plan.selector {
-                    Some(template) => match payload_template(template, effective, &item_context) {
+                    Some(template) => match self.render_selector(plan.language, template, effective, &item_context) {
                         Ok(value) => value,
                         Err(failure) => return (Err(failure), batch_end),
                     },
@@ -5490,6 +6169,7 @@ impl Interpreter<'_> {
                     item_input,
                     batch_start,
                     &scope,
+                    true,
                 );
                 if let Some(enclosing) = enclosing_context {
                     self.base_context = enclosing;
@@ -5626,10 +6306,12 @@ impl Interpreter<'_> {
     // Parallel
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn parallel_state(
         &mut self,
         name: &str,
         state: &Map<String, Value>,
+        language: &'static str,
         raw: Value,
         effective: Value,
         context: &Value,
@@ -5664,26 +6346,39 @@ impl Interpreter<'_> {
             plan.branches
                 .push(states_of(branch, &label).map_err(|failure| failure.at(at))?);
         }
+        // The frame of the parked record this state's own name: a walk CONTINUING an
+        // execution whose job has ended re-enters the `Parallel` the task was parked
+        // inside, and this is where it picks up what that record kept. It is taken
+        // once, by the first attempt: a later RETRY of this state starts its branches
+        // again, exactly as the service re-runs every branch of a retried `Parallel`.
+        let mut resume = match self.resume_frames.first() {
+            Some(frame) if frame.state_name == name => Some(self.resume_frames.remove(0)),
+            _ => None,
+        };
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
             // Every attempt at this state starts its branches, so every attempt
             // writes its own `ParallelStateStarted` and the event of the outcome
             // those branches reached.
             me.push(super::EVENT_PARALLEL_STATE_STARTED, name, at);
-            // "Parameters ... The effective input each branch receives." It is
-            // re-evaluated per attempt, because this attempt's own members read
-            // `$$.State.RetryCount`.
+            // "Parameters ... The effective input each branch receives" —
+            // `Arguments` in JSONata. It is re-evaluated per attempt, because this
+            // attempt's own members read `$$.State.RetryCount`.
             let context = with_retry_count(context, me.retry_count);
-            let branch_input = match state.get("Parameters") {
-                Some(template) => match payload_template(template, &effective, &context) {
-                    Ok(value) => value,
-                    Err(failure) => {
-                        me.push(super::EVENT_PARALLEL_STATE_FAILED, name, at);
-                        return (Err(failure), at);
-                    }
-                },
-                None => effective.clone(),
+            let branch_input = match me.task_request(state, language, &effective, &context) {
+                Ok(value) => value,
+                Err(failure) => {
+                    me.push(super::EVENT_PARALLEL_STATE_FAILED, name, at);
+                    return (Err(failure), at);
+                }
             };
-            let (outcome, end) = me.run_branches(&plan, &branch_input, at);
+            let (outcome, end) =
+                me.run_branches(&plan, name, &raw, &branch_input, at, resume.take());
+            // A branch that PARKED leaves the state with no outcome at all, so the
+            // state records neither of the events an outcome is reported by: what
+            // happens next is the job finishing.
+            if me.parked.is_some() {
+                return (outcome, end);
+            }
             let event = if outcome.is_ok() {
                 super::EVENT_PARALLEL_STATE_SUCCEEDED
             } else {
@@ -5693,9 +6388,17 @@ impl Interpreter<'_> {
             (outcome, end)
         });
         match outcome {
+            // One of the branches is parked at the job its own run-a-job task
+            // started: the walk stops here and the execution waits for that job,
+            // exactly as it does for a task at the top level of the definition.
+            Ok(value) if self.parked.is_some() => Ok(StateStep {
+                value,
+                at: end,
+                next: Next::Suspended,
+            }),
             Ok(results) => {
                 let value = self
-                    .place_result(state, &raw, results, context, true)
+                    .produced(state, language, &raw, &effective, Some(results), context, true)
                     .map_err(|failure| failure.at(end))?;
                 self.push_exited("ParallelStateExited", name, end, &value);
                 Ok(StateStep {
@@ -5709,7 +6412,9 @@ impl Interpreter<'_> {
             Err(failure) => self.catch_or_fail(
                 (name, "ParallelStateExited"),
                 state,
+                language,
                 &raw,
+                &effective,
                 failure,
                 context,
                 end,
@@ -5729,24 +6434,87 @@ impl Interpreter<'_> {
     /// "If any branch fails ... the entire Parallel state is considered to have
     /// failed", and it failed at the instant that branch did: the branches that were
     /// still running are STOPPED there ([`Interpreter::abort_units`]), so no state of
-    /// a surviving branch is entered after the state the Parallel failed with.
-    fn run_branches(&mut self, plan: &ParallelPlan<'_>, input: &Value, at: Duration) -> Attempt {
-        let mut results = Vec::with_capacity(plan.branches.len());
+    /// a surviving branch is entered after the state the Parallel failed with. A
+    /// branch that had PARKED at a job when that happened is stopped too, which is
+    /// what [`Interpreter::abandoned`] carries.
+    ///
+    /// One branch may SUSPEND, at the job a run-a-job task of it started: the state
+    /// has no result then, so the walk reports the suspension by way of
+    /// [`Interpreter::parked`] and records the frame that lets the continuation
+    /// re-enter this state ([`ParkedFrame`]). `resume` is that frame, for the walk
+    /// that is continuing: the branches it names as finished are not walked again.
+    #[allow(clippy::too_many_arguments)]
+    fn run_branches(
+        &mut self,
+        plan: &ParallelPlan<'_>,
+        state_name: &str,
+        state_input: &Value,
+        input: &Value,
+        at: Duration,
+        resume: Option<ParkedFrame>,
+    ) -> Attempt {
+        let count = plan.branches.len();
+        // What each branch produced, in branch order: a continuation starts from the
+        // results the parked record carries, so a branch that had already finished is
+        // not walked a second time and nothing it did happens twice.
+        let mut done: Vec<Option<Value>> = match &resume {
+            Some(frame) if frame.done.len() == count => frame.done.clone(),
+            _ => vec![None; count],
+        };
+        // The array the branches are building is bounded as it GROWS, so a
+        // continuation starts the count at what the branches it is NOT walking again
+        // already produced: the ceiling then covers the whole of this state's result
+        // and not only the branch that resumed.
         let mut results_bytes = 0usize;
+        for value in done.iter().flatten() {
+            match measure_payload(value, "a 'Parallel' branch") {
+                Ok(bytes) => results_bytes = results_bytes.saturating_add(bytes),
+                Err(failure) => return (Err(failure), at),
+            }
+        }
         let mut end = at;
         // Where each branch's own events begin in this walk's list, so a branch the
         // state's failure aborted can be cut back to the instant it failed.
-        let mut units: Vec<Unit> = Vec::with_capacity(plan.branches.len());
+        let mut units: Vec<Unit> = Vec::with_capacity(count);
         let mut failed: Option<(Failure, Duration)> = None;
-        for (states, start_at) in &plan.branches {
+        let mut suspended: Option<usize> = None;
+        for (index, (states, start_at)) in plan.branches.iter().enumerate() {
+            if done.get(index).is_some_and(Option::is_some) {
+                continue;
+            }
+            // The branch that PARKED carries on from the state that parked it, with
+            // the data that state was entered with: the states before it already ran,
+            // and their events are already in the execution's history.
+            let resumed = resume
+                .as_ref()
+                .filter(|frame| frame.branch == index)
+                .and_then(|_| self.resume_entry());
+            let (start_state, branch_input) = match resumed {
+                Some((state, state_input)) => (state, state_input),
+                None => ((*start_at).to_string(), input.clone()),
+            };
             let from = self.steps.len();
             let map_runs_from = self.map_runs.len();
-            let branch = self.nested_walk(states, start_at, input.clone(), at, &Scope::default());
+            let branch = self.nested_walk(
+                states,
+                &start_state,
+                branch_input,
+                at,
+                &Scope::default(),
+                false,
+            );
             units.push(Unit {
                 from,
                 map_runs_from,
                 aborted: None,
             });
+            if branch.suspended {
+                // The branch is parked at a job: it has produced nothing yet, and the
+                // state cannot have a result until it does.
+                end = end.max(branch.end);
+                suspended = Some(index);
+                continue;
+            }
             match branch.outcome {
                 Ok(value) => {
                     match measure_payload(&value, "a 'Parallel' branch") {
@@ -5767,7 +6535,9 @@ impl Interpreter<'_> {
                         );
                     }
                     end = end.max(branch.end);
-                    results.push(value);
+                    if let Some(slot) = done.get_mut(index) {
+                        *slot = Some(value);
+                    }
                 }
                 // The state failed with the error of the branch that failed FIRST,
                 // which is the one whose failure stopped the others.
@@ -5778,11 +6548,51 @@ impl Interpreter<'_> {
                 }
             }
         }
-        let Some((failure, when)) = failed else {
-            return (Ok(Value::Array(results)), end);
-        };
-        self.abort_units(when, &units);
-        (Err(failure), when)
+        if let Some((failure, when)) = failed {
+            // A branch of this state failed, so the state has failed — and a sibling
+            // parked at a job is not waited for any longer: the job it started is
+            // ABANDONED, which is what stops it.
+            if let Some(parked) = self.parked.take() {
+                self.abandoned.push(parked);
+            }
+            self.abort_units(when, &units);
+            return (Err(failure), when);
+        }
+        if let Some(branch) = suspended {
+            // The frame this state contributes to the parked record: which branch is
+            // parked, and what the others produced, so the continuation re-enters
+            // this state without re-running any of them.
+            if let Some(parked) = self.parked.as_mut() {
+                parked.frames.insert(
+                    0,
+                    ParkedFrame {
+                        state_name: state_name.to_string(),
+                        state_input: state_input.clone(),
+                        branch,
+                        done,
+                    },
+                );
+            }
+            // The state has no result: `parallel_state` reads the parked record and
+            // suspends there, so this value is never placed.
+            return (Ok(Value::Null), end);
+        }
+        let results: Vec<Value> = done.into_iter().map(Option::unwrap_or_default).collect();
+        (Ok(Value::Array(results)), end)
+    }
+
+    /// Where the concurrent unit that PARKED carries on from, for a walk continuing
+    /// an execution whose job has ended: the next concurrent state down, else the
+    /// state that started the job itself.
+    fn resume_entry(&self) -> Option<(String, Value)> {
+        if let Some(frame) = self.resume_frames.first() {
+            return Some((frame.state_name.clone(), frame.state_input.clone()));
+        }
+        let reply = self.job_reply.as_ref()?;
+        Some((
+            reply.state_name.clone(),
+            serde_json::from_str(&reply.state_input).unwrap_or(Value::Null),
+        ))
     }
 
     /// Stop the branches or iterations of a state that has FAILED, at the instant
@@ -5944,11 +6754,14 @@ impl Interpreter<'_> {
     ///
     /// `left` is the event the state records when a catcher takes over, so a caught
     /// state's history pairs the event it was entered with.
+    #[allow(clippy::too_many_arguments)]
     fn catch_or_fail(
         &mut self,
         caught: (&str, &'static str),
         state: &Map<String, Value>,
+        language: &'static str,
         raw: &Value,
+        effective: &Value,
         failure: Failure,
         context: &Value,
         at: Duration,
@@ -5973,10 +6786,17 @@ impl Interpreter<'_> {
             };
             // "When a state reports an error and it matches a catcher, the state's
             // output is the error output", placed through the catcher's own
-            // `ResultPath`.
-            let value = self
-                .place_result(catcher, raw, failure.payload(), context, true)
-                .map_err(|failure| failure.at(at))?;
+            // `ResultPath` — or, in JSONata, through the catcher's own `Output` and
+            // `Assign`, which are the two places `$states.errorOutput` is in scope.
+            let error_output = failure.payload();
+            let value = match language {
+                JSONATA => self
+                    .jsonata_output(catcher, effective, None, Some(&error_output), context)
+                    .map_err(|failure| failure.at(at))?,
+                _ => self
+                    .place_result(catcher, raw, error_output, context, true)
+                    .map_err(|failure| failure.at(at))?,
+            };
             self.push_exited(left, name, at, &value);
             return Ok(StateStep {
                 value,
@@ -5991,6 +6811,7 @@ impl Interpreter<'_> {
     fn number_member(
         &self,
         state: &Map<String, Value>,
+        language: &'static str,
         member: &str,
         input: &Value,
         context: &Value,
@@ -5998,7 +6819,9 @@ impl Interpreter<'_> {
     ) -> Result<f64, Failure> {
         let path_member = format!("{member}Path");
         let value = match (state.get(member), state.get(&path_member)) {
-            (Some(value), _) => value.clone(),
+            (Some(value), _) => self
+                .literal(language, value, input, context)?
+                .unwrap_or(Value::Null),
             (None, Some(Value::String(path))) => expression(path, input, context)?,
             (None, Some(other)) => {
                 return Err(runtime(format!(
@@ -7432,6 +8255,15 @@ pub struct Inspection {
     pub after_input_path: Option<String>,
     /// "The effective input after Step Functions applies the Parameters filter."
     pub after_parameters: Option<String>,
+    /// "The input after Step Functions applies an Arguments filter. This event will
+    /// only be present when QueryLanguage for the state machine or individual states
+    /// is set to JSONata" — the JSONata-mode member the other language's
+    /// `afterParameters` corresponds to.
+    pub after_arguments: Option<String>,
+    /// "JSON string that contains the set of workflow variables after execution of
+    /// the state", for a state that assigned any: the `Assign` of a JSONata state is
+    /// what writes them.
+    pub variables: Option<String>,
     /// "The state's raw result."
     pub result: Option<String>,
     /// "The effective result after Step Functions applies the ResultSelector filter."
@@ -7549,6 +8381,10 @@ pub struct StateTest<'a> {
     /// have occurred for the state's Retry that applies to the mocked error", which
     /// is what decides whether the state's failure is still RETRIABLE.
     pub retries_taken: u64,
+    /// "JSON object literal that sets variables used in the state under test. Object
+    /// keys are the variable names and values are the variable values": the scope the
+    /// state's own expressions read, before its `Assign` writes to it.
+    pub variables: Option<&'a Value>,
 }
 
 /// Run the ONE state `test` names over its input and report what it produced.
@@ -7604,6 +8440,11 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         tasks: &super::integration::Unserved,
         waiting: None,
         parked: None,
+        // `TestState` tests one state, so there is no concurrent state around it to
+        // park inside and no job of its own to abandon.
+        abandoned: Vec::new(),
+        resume_frames: Vec::new(),
+        map_depth: 0,
         // `TestState` starts nothing: it reports what one state computes, and the
         // Map Runs a Distributed Map starts — and the child executions its items run
         // as — belong to an execution.
@@ -7623,6 +8464,26 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // `TestState` redrives nothing: the step a redrive would continue from
         // belongs to an execution.
         failed_at: None,
+        // The state under test is written in the language it declares; there is no
+        // definition around it to inherit one from, so the other language's default
+        // stands in for the absent member.
+        language: JSONPATH,
+        // "The set will include variables assigned in the state and variables set up
+        // as test state input": the request's own set is what the state's expressions
+        // read, and its `Assign` writes into it.
+        variables: test
+            .variables
+            .and_then(Value::as_object)
+            .map(|variables| {
+                variables
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // Nothing has been assigned BY the state under test yet; what the request set
+        // up is the scope around it.
+        assigned: BTreeMap::new(),
         // The request's own input is the caller's document here, so what the trial
         // reports of it is the bytes the request carried.
         supplied: Supplied {
@@ -7641,16 +8502,22 @@ impl Interpreter<'_> {
         let context = self.context_for(&Scope::default(), test.name, Duration::ZERO);
 
         if let Some(language) = state.get("QueryLanguage").and_then(Value::as_str) {
-            if language != JSONPATH {
+            if !QUERY_LANGUAGES.contains(&language) {
                 return Trial::failed(
                     inspection,
                     runtime(format!(
-                        "{SINGLE_STATE_LABEL} is written in '{language}', and this emulator \
-                         evaluates only '{JSONPATH}' states, so nothing was run for it"
+                        "{SINGLE_STATE_LABEL} declares the query language '{}', which is not one \
+                         of {}, so nothing was run for it",
+                        echoed(language),
+                        QUERY_LANGUAGES.join(", ")
                     )),
                 );
             }
         }
+        let language = match self.language_of(state) {
+            Ok(language) => language,
+            Err(why) => return Trial::failed(inspection, runtime(why)),
+        };
         // A member this emulator does not interpret changes what the state does, so
         // the state is not run for it — the rule the walk applies at every state. A
         // MOCKED state is exempt: the members that describe the invocation the mock
@@ -7658,7 +8525,7 @@ impl Interpreter<'_> {
         // type this emulator does not run at all is reported by `produce` as the
         // invocation it is, not as a member.
         if test.mock.is_none() && EXECUTED_STATE_TYPES.contains(&state_type) {
-            if let Some(member) = unexecutable_member(state_type, state) {
+            if let Some(member) = unexecutable_member(state_type, state, language) {
                 return Trial::failed(
                     inspection,
                     runtime(format!(
@@ -7668,57 +8535,104 @@ impl Interpreter<'_> {
                 );
             }
         }
-        // The input side: `InputPath`, then the `Parameters` payload template.
+        // The input side: `InputPath`, then the `Parameters` payload template — or, in
+        // JSONata, the `Arguments` the state hands its work. "Not populated when the
+        // QueryLanguage is JSONata" is why each stage is reported only for the
+        // language that has it.
         let effective = match self.input_value(state, raw, &context) {
             Ok(value) => value,
-            Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+            Err(failure) => return self.classify(test, language, raw, &context, failure, inspection),
         };
-        inspection.after_input_path = Some(effective.to_string());
+        if language != JSONATA {
+            inspection.after_input_path = Some(effective.to_string());
+        }
         let templated = TEMPLATED_STATE_TYPES.contains(&state_type);
-        let after_parameters = match state.get("Parameters").filter(|_| templated) {
-            Some(template) => match payload_template(template, &effective, &context) {
+        let after_parameters = match templated {
+            true => match self.task_request(state, language, &effective, &context) {
                 Ok(value) => value,
-                Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+                Err(failure) => {
+                    return self.classify(test, language, raw, &context, failure, inspection)
+                }
             },
-            None => effective.clone(),
+            false => effective.clone(),
         };
         if templated {
-            inspection.after_parameters = Some(after_parameters.to_string());
+            match language {
+                JSONATA => inspection.after_arguments = Some(after_parameters.to_string()),
+                _ => inspection.after_parameters = Some(after_parameters.to_string()),
+            }
         }
 
         // A `Choice` state's transition is what the state DOES, and the walk decides
         // it before the state's output is built, so a rule that cannot be evaluated
         // is what such a state fails with.
         let chosen = if state_type == "Choice" {
-            match self.choose(state, &effective, &context) {
-                Ok(next) => Some(next),
-                Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+            match self.choose(state, language, &effective, &context) {
+                Ok(chosen) => Some(chosen),
+                Err(failure) => {
+                    return self.classify(test, language, raw, &context, failure, inspection)
+                }
             }
         } else {
             None
         };
 
-        let produced = self.produce(state, state_type, &after_parameters, &effective, &context, test.mock);
+        let produced = self.produce(
+            state,
+            state_type,
+            language,
+            &after_parameters,
+            &effective,
+            &context,
+            test.mock,
+        );
         let placed = match produced {
-            Ok(Some(result)) => {
-                self.place_recorded(state, state_type, raw, result, &context, &mut inspection)
-            }
-            Ok(None) => self.output_value(state, effective.clone(), &context),
+            Ok(result) => match language {
+                // A JSONata state's output is its `Output`, over the variables its
+                // own `Assign` has just written; there are no result-side filters to
+                // record stages for.
+                JSONATA => {
+                    if let Some(result) = result.as_ref() {
+                        inspection.result = Some(result.to_string());
+                    }
+                    self.jsonata_output(state, &effective, result.as_ref(), None, &context)
+                }
+                _ => match result {
+                    Some(result) => self.place_recorded(
+                        state,
+                        state_type,
+                        raw,
+                        result,
+                        &context,
+                        &mut inspection,
+                    ),
+                    None => self.output_value(state, effective.clone(), &context),
+                },
+            },
             Err(failure) => Err(failure),
         };
         let output = match placed {
             Ok(output) => output,
-            Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+            Err(failure) => return self.classify(test, language, raw, &context, failure, inspection),
         };
         // The document the state produced is measured here, at the state that
         // produced it, against what a state's output may carry — as the walk measures
         // every state's.
         if let Err(failure) = measure_payload(&output, SINGLE_STATE_LABEL) {
-            return self.classify(test, raw, &context, failure, inspection);
+            return self.classify(test, language, raw, &context, failure, inspection);
         }
+        // A JSONata `Choice` rule that declares an `Output` of its own decides the
+        // state's output, exactly as it does in the walk.
+        let output = chosen
+            .as_ref()
+            .and_then(|chosen| chosen.output.clone())
+            .unwrap_or(output);
+        inspection.variables = self.assigned_variables();
 
         let next_state = match chosen {
-            Some(next) => Some(next),
+            // The rule that matched names the next state; a JSONata rule may also
+            // declare the state's own output.
+            Some(chosen) => Some(chosen.next),
             None if TERMINAL_STATE_TYPES.contains(&state_type) => None,
             None if state.get("End").and_then(Value::as_bool) == Some(true) => None,
             // A single state's `Next` names a state no definition around it declares,
@@ -7729,13 +8643,30 @@ impl Interpreter<'_> {
         Trial::succeeded(Some(self.echo(&output)), next_state, inspection)
     }
 
+    /// The variables this walk has assigned, as the one JSON document `TestState`
+    /// reports them through — `None` where nothing assigned any, so the member is
+    /// absent rather than an empty object.
+    fn assigned_variables(&self) -> Option<String> {
+        if self.variables.is_empty() {
+            return None;
+        }
+        let variables: Map<String, Value> = self
+            .variables
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Some(Value::Object(variables).to_string())
+    }
+
     /// The RAW result the state's own work produced: the document the result-side
     /// filters place, `None` for a state that produces no result of its own (its
     /// effective input is what `OutputPath` reads), or the failure it ended in.
+    #[allow(clippy::too_many_arguments)]
     fn produce(
         &mut self,
         state: &Map<String, Value>,
         state_type: &str,
+        language: &'static str,
         after_parameters: &Value,
         effective: &Value,
         context: &Value,
@@ -7751,18 +8682,23 @@ impl Interpreter<'_> {
         match state_type {
             // "Parameters ... Used to create a collection of key-value pairs that
             // will be passed as input": it transforms the state's effective INPUT,
-            // while `Result` is the state's RESULT — the rule the walk applies.
-            "Pass" => Ok(Some(
-                state
-                    .get("Result")
-                    .cloned()
-                    .unwrap_or_else(|| after_parameters.clone()),
-            )),
+            // while `Result` is the state's RESULT — the rule the walk applies. A
+            // JSONata `Pass` has no `Result`: what it puts out is its `Output`, so it
+            // produces no result of its own.
+            "Pass" => match language {
+                JSONATA => Ok(None),
+                _ => Ok(Some(
+                    state
+                        .get("Result")
+                        .cloned()
+                        .unwrap_or_else(|| after_parameters.clone()),
+                )),
+            },
             // A `Wait` state produces no result of its own. Its members are still
             // evaluated, so a malformed one is reported as the failure it is, but
             // nothing sleeps for the span it declares.
             "Wait" => {
-                self.wait_duration(state, effective, context, Duration::ZERO)
+                self.wait_duration(state, language, effective, context, Duration::ZERO)
                     .map_err(|why| runtime(format!("{SINGLE_STATE_LABEL}: {why}")))?;
                 Ok(None)
             }
@@ -7770,8 +8706,10 @@ impl Interpreter<'_> {
             // A `Fail` state ends with the error and cause it declares, either of
             // which ASL may instead read from the state's input through a `*Path`.
             "Fail" => {
-                let error = self.fail_member(state, "Error", "ErrorPath", effective, context)?;
-                let cause = self.fail_member(state, "Cause", "CausePath", effective, context)?;
+                let error =
+                    self.fail_member(state, language, "Error", "ErrorPath", effective, context)?;
+                let cause =
+                    self.fail_member(state, language, "Cause", "CausePath", effective, context)?;
                 Err(Failure { error, cause })
             }
             // Every remaining type's work is an invocation this process does not
@@ -7816,8 +8754,9 @@ impl Interpreter<'_> {
     /// the first retrier whose `ErrorEquals` names the error decides, and `Catch` is
     /// consulted only once no retrier has an attempt left.
     fn classify(
-        &self,
+        &mut self,
         test: &StateTest<'_>,
+        language: &'static str,
         raw: &Value,
         context: &Value,
         failure: Failure,
@@ -7862,8 +8801,20 @@ impl Interpreter<'_> {
             };
             // "When a state reports an error and it matches a catcher, the state's
             // output is the error output", placed through the catcher's own
-            // `ResultPath`.
-            let output = match self.place_result(catcher, raw, failure.payload(), context, true) {
+            // `ResultPath` — or, in JSONata, through its own `Output`, which is one
+            // of the two places `$states.errorOutput` is in scope.
+            let error_output = failure.payload();
+            let effective = match self.input_value(state, raw, context) {
+                Ok(effective) => effective,
+                Err(failure) => return Trial::failed(inspection, failure),
+            };
+            let output = match language {
+                JSONATA => {
+                    self.jsonata_output(catcher, &effective, None, Some(&error_output), context)
+                }
+                _ => self.place_result(catcher, raw, error_output, context, true),
+            };
+            let output = match output {
                 Ok(output) => output,
                 Err(failure) => return Trial::failed(inspection, failure),
             };

@@ -1293,6 +1293,10 @@ pub struct JobTask {
     pub parked_at: SystemTime,
     /// `TimeoutSeconds` of the state that started it, when it declares one.
     pub timeout_seconds: Option<u64>,
+    /// The concurrent states that state is nested inside, as the walk recorded them
+    /// ([`asl::ParkedJob::frames`]): what the walk continuing this execution
+    /// re-enters to reach the parked state.
+    pub frames: Vec<asl::ParkedFrame>,
     /// The bytes the store counts for this record, as every other record's are.
     pub retained_bytes: usize,
 }
@@ -1324,6 +1328,25 @@ fn naming_bytes(naming: &integration::JobNaming) -> usize {
         .sum()
 }
 
+/// The bytes the concurrent frames of a parked job hold: each one keeps the name of
+/// its state, the data that state was entered with and what the branches that had
+/// finished produced, all of which are a caller's documents.
+fn frames_bytes(frames: &[asl::ParkedFrame]) -> usize {
+    frames
+        .iter()
+        .map(|frame| {
+            std::mem::size_of::<asl::ParkedFrame>()
+                + frame.state_name.len()
+                + frame.state_input.to_string().len()
+                + frame
+                    .done
+                    .iter()
+                    .map(|done| done.as_ref().map_or(0, |value| value.to_string().len()))
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
 /// The job a planned run parked at, ready for the store to record: this is
 /// [`asl::ParkedJob`] with the walk's offset turned into an instant against the
 /// execution's own start.
@@ -1338,6 +1361,8 @@ pub struct PlannedJob {
     pub naming: integration::JobNaming,
     pub parked_at: SystemTime,
     pub timeout_seconds: Option<u64>,
+    /// See [`JobTask::frames`].
+    pub frames: Vec<asl::ParkedFrame>,
 }
 
 impl PlannedJob {
@@ -1350,6 +1375,7 @@ impl PlannedJob {
             + self.state_input.len()
             + self.job_id.len()
             + naming_bytes(&self.naming)
+            + frames_bytes(&self.frames)
             // The two history events resolving the job appends to the execution
             // waiting at it: the one that reports the job's outcome and the one the
             // execution ends on.
@@ -1464,6 +1490,11 @@ pub struct EventDetails {
     pub index: Option<i32>,
     /// How many items a `Map` state is iterating.
     pub length: Option<i32>,
+    /// "Map of variable name and value as a serialized JSON representation": the
+    /// variables in scope when a state was LEFT, for a state whose own `Assign`
+    /// wrote any. Empty where none are, so the member is absent rather than an empty
+    /// map.
+    pub assigned_variables: BTreeMap<String, String>,
 }
 
 impl EventDetails {
@@ -1477,6 +1508,11 @@ impl EventDetails {
             + text(&self.worker_name)
             + text(&self.error)
             + text(&self.cause)
+            + self
+                .assigned_variables
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
     }
 
     /// The detail an activity task's event carries, from the task itself.
@@ -1536,6 +1572,12 @@ pub enum StartedAlready {
 
 /// The terminal result [`asl::run`] already computed for an execution, owed to the
 /// clock: it becomes the execution's reported status at `due_at` and not before.
+///
+/// The `events` it carries are owed ONE BY ONE rather than all at once: each is
+/// stamped at the instant it happened, so an event whose instant has passed is
+/// reported while the execution is still running
+/// ([`Execution::advance_history`]) and only the event the attempt ENDS on —
+/// stamped at `due_at` — waits for the outcome itself.
 #[derive(Debug, Clone)]
 pub struct PendingOutcome {
     pub due_at: SystemTime,
@@ -1543,6 +1585,8 @@ pub struct PendingOutcome {
     pub output: Option<String>,
     pub error: Option<String>,
     pub cause: Option<String>,
+    /// The events of this attempt that the history does not hold yet, in the order
+    /// the walk numbered them.
     pub events: Vec<HistoryEvent>,
 }
 
@@ -1846,6 +1890,42 @@ impl Execution {
             // so remembering one can never take the store past [`MAX_STORE_BYTES`]
             // and a read never grows what the store accounts for.
             + MAX_HISTORY_PAGE_CURSORS * std::mem::size_of::<HistoryPageCursor>()
+    }
+
+    /// Materialise the events of a still-owed outcome whose own instants the clock
+    /// has already passed.
+    ///
+    /// A walk computes the whole run at once, and the events it produced are stamped
+    /// at the instant each one happened — a state entered before the run's `Wait`
+    /// states have elapsed happened BEFORE the outcome the run reaches is due. So the
+    /// history an execution reports is every event whose own timestamp has passed,
+    /// not only the events of an execution that has finished: an execution parked in a
+    /// long `Wait` reports the states it has entered, exactly as the service's own
+    /// history does while the execution is still running.
+    ///
+    /// The events are moved in order and only as a PREFIX, so an event is reported
+    /// once it and every event before it is due: the stored history stays in the order
+    /// the walk numbered it, and no event names a predecessor the history does not
+    /// carry. The event the attempt ENDS on is stamped at the outcome's own instant,
+    /// so it is never moved here — [`Execution::apply_pending`] writes it with the
+    /// status it reports.
+    fn advance_history(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let due = pending
+            .events
+            .iter()
+            .take_while(|event| event.timestamp <= now)
+            .count();
+        if due == 0 {
+            return;
+        }
+        // [`MAX_HISTORY_EVENTS`] bounds the stored history whoever appends to it, so
+        // the prefix is taken against the room that is left and the rest stays owed.
+        let room = MAX_HISTORY_EVENTS.saturating_sub(self.history.len());
+        let moved: Vec<HistoryEvent> = pending.events.drain(..due.min(room)).collect();
+        self.history.extend(moved);
     }
 
     /// Apply the outcome the clock now owes.
@@ -2347,10 +2427,13 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             let Some(execution) = self.executions.get_mut(&arn) else {
                 continue;
             };
-            let Some(pending) = execution.pending.as_ref() else {
+            let Some(due_at) = execution.pending.as_ref().map(|pending| pending.due_at) else {
                 continue;
             };
-            if pending.due_at > now {
+            if due_at > now {
+                // The outcome is still owed, but the events the walk produced before
+                // it are not: each one is reported from its own instant on.
+                execution.advance_history(now);
                 still_pending.push(arn);
                 continue;
             }
@@ -2937,6 +3020,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             region: region.to_string(),
             parked_at: planned.parked_at,
             timeout_seconds: planned.timeout_seconds,
+            frames: planned.frames,
             retained_bytes: 0,
         };
         task.retained_bytes = std::mem::size_of::<JobTask>()
@@ -2945,6 +3029,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             + task.state_input.len()
             + task.job_id.len()
             + naming_bytes(&task.naming)
+            + frames_bytes(&task.frames)
             + task.region.len();
         self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);
         self.job_tasks.insert(execution_arn.to_string(), task);
@@ -6857,6 +6942,12 @@ pub struct Planned {
     pub waiting: Option<PlannedActivityTask>,
     /// The job of a run-a-job integration the walk parked at.
     pub parked: Option<PlannedJob>,
+    /// The jobs the walk STARTED and then abandoned, which the operation that planned
+    /// the run stops through each one's own integration
+    /// ([`integration::stop_abandoned`]): the task that started one will never
+    /// finish, because the concurrent state around it failed, so the job is not left
+    /// running behind it.
+    pub abandoned: Vec<PlannedJob>,
     /// The Map Run every Distributed Map state the walk entered started, with the
     /// offsets the walk reported turned into instants.
     pub map_runs: Vec<PlannedMapRun>,
@@ -7139,6 +7230,9 @@ pub fn plan_task_failure(
         }),
         waiting: None,
         parked: None,
+        // Nothing was walked here, so no job was started and none abandoned: this
+        // plan is the closure of a task the clock closed.
+        abandoned: Vec::new(),
         map_runs: Vec::new(),
         // The attempt stopped at the state that scheduled the task, which the caller
         // records from the task itself.
@@ -7162,6 +7256,12 @@ fn plan_from_run(
     previous_event_id: i64,
 ) -> Planned {
     let stopped_at = run.stopped_at.take();
+    // The jobs the walk started and abandoned, with the walk's offsets turned into
+    // instants exactly as the parked one's is: the caller stops each of them.
+    let abandoned: Vec<PlannedJob> = std::mem::take(&mut run.abandoned)
+        .into_iter()
+        .map(|job| planned_job(job, start))
+        .collect();
     let opened: Vec<HistoryEvent> = opening
         .map(|event_type| HistoryEvent {
             id: previous_event_id + 1,
@@ -7313,6 +7413,7 @@ fn plan_from_run(
             pending: None,
             waiting: Some(scheduled),
             parked: None,
+            abandoned,
             map_runs,
             stopped_at,
         };
@@ -7328,17 +7429,8 @@ fn plan_from_run(
             opening: history,
             pending: None,
             waiting: None,
-            parked: Some(PlannedJob {
-                state_name: parked.state_name,
-                state_input: parked.raw_input.to_string(),
-                job: parked.job,
-                api: parked.api,
-                parsed_output: parked.parsed_output,
-                job_id: parked.job_id,
-                naming: parked.naming,
-                parked_at: after(start, parked.at),
-                timeout_seconds: parked.timeout_seconds,
-            }),
+            parked: Some(planned_job(parked, start)),
+            abandoned,
             map_runs,
             stopped_at,
         };
@@ -7355,8 +7447,27 @@ fn plan_from_run(
         }),
         waiting: None,
         parked: None,
+        abandoned,
         map_runs,
         stopped_at,
+    }
+}
+
+/// One job a walk started, ready for the store to record or for the caller to stop:
+/// [`asl::ParkedJob`] with the walk's offset turned into an instant against the
+/// execution's own start.
+fn planned_job(parked: asl::ParkedJob, start: SystemTime) -> PlannedJob {
+    PlannedJob {
+        state_name: parked.state_name,
+        state_input: parked.raw_input.to_string(),
+        job: parked.job,
+        api: parked.api,
+        parsed_output: parked.parsed_output,
+        job_id: parked.job_id,
+        naming: parked.naming,
+        parked_at: after(start, parked.at),
+        timeout_seconds: parked.timeout_seconds,
+        frames: parked.frames,
     }
 }
 
@@ -7411,6 +7522,7 @@ pub mod asl;
 pub mod encryption;
 pub mod integration;
 mod json_diagnostic;
+pub mod jsonata;
 pub mod run_a_job;
 pub mod task_authorization;
 

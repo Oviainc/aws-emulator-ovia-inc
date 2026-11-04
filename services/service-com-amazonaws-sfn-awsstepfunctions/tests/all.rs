@@ -79,6 +79,8 @@ mod history_event_provenance;
 mod integration_member_names;
 #[path = "all/json_parse_diagnostics.rs"]
 mod json_parse_diagnostics;
+#[path = "all/jsonata_states.rs"]
+mod jsonata_states;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
 #[path = "all/map_run_failure_budget.rs"]
@@ -89,6 +91,8 @@ mod map_run_updates;
 mod map_runs;
 #[path = "all/nested_type_discriminator.rs"]
 mod nested_type_discriminator;
+#[path = "all/parallel_run_a_job.rs"]
+mod parallel_run_a_job;
 #[path = "all/refusal_message_fidelity.rs"]
 mod refusal_message_fidelity;
 #[path = "all/refusal_message_wording.rs"]
@@ -101,6 +105,8 @@ mod resource_tags;
 mod response_request_id;
 #[path = "all/run_a_job_pattern_calls.rs"]
 mod run_a_job_pattern_calls;
+#[path = "all/running_execution_history.rs"]
+mod running_execution_history;
 #[path = "all/sdk_response_envelope.rs"]
 mod sdk_response_envelope;
 #[path = "all/send_task_failure.rs"]
