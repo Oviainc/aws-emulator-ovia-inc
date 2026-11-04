@@ -25,8 +25,9 @@ use crate::client_token_scope::await_collection_active;
 use crate::collection_lifecycle::{at, call, emulator, text, CLIENT_ERROR};
 use crate::encryption_indexes_and_tagging::active_collection;
 
-/// `CollectionStatus$UPDATING` — the non-terminal status an accepted update leaves the
-/// collection in (`smithy_query(query="shape", shape="CollectionStatus")`).
+/// `CollectionStatus$UPDATING` — the non-terminal status an update that RECONFIGURES the
+/// collection (its vector-search acceleration) leaves it in
+/// (`smithy_query(query="shape", shape="CollectionStatus")`).
 const UPDATING: &str = "UPDATING";
 
 /// `CollectionStatus$ACTIVE` — "Collection resource is ready to use", the only status a
@@ -114,6 +115,15 @@ async fn an_update_collection_token_spent_again_serves_the_collection_the_reques
         let router = emulator();
         let case = row.case;
         let token = "one-spent-update-collection-token";
+        // The status an accepted update of this row's member leaves behind: `vectorOptions`
+        // reconfigures what the collection runs, so it is reported `UPDATING` until the
+        // clock settles it; a `description` or `deletionProtection` write is complete when
+        // the call answers, so the collection keeps its `ACTIVE`.
+        let expected_status = if row.member == "vectorOptions" {
+            UPDATING
+        } else {
+            ACTIVE
+        };
 
         let first_name = "token-scope-first";
         let second_name = "token-scope-second";
@@ -142,8 +152,9 @@ async fn an_update_collection_token_spent_again_serves_the_collection_the_reques
         );
         assert_eq!(
             text(&detail, "status"),
-            UPDATING,
-            "case {what}: an accepted update reports the transient {UPDATING}, got {detail}"
+            expected_status,
+            "case {what}: an accepted update of {} reports {expected_status}, got {detail}",
+            row.member
         );
         let settled_first = await_collection_active(&router, &what, &first_id).await;
 
@@ -170,8 +181,8 @@ async fn an_update_collection_token_spent_again_serves_the_collection_the_reques
         );
         assert_eq!(
             text(&detail, "status"),
-            UPDATING,
-            "case {what}: the write was applied, so it reports {UPDATING}, got {detail}"
+            expected_status,
+            "case {what}: the write was applied, so it reports {expected_status}, got {detail}"
         );
 
         // The STORE agrees: each collection holds its own change and nothing of the
@@ -272,13 +283,16 @@ async fn a_spent_update_collection_token_cannot_answer_for_a_collection_it_does_
         "case CreateCollection(refused-scope-creating): expected 200, got {status} {code} with {answer}"
     );
     let creating_id = text(at(&answer, "createCollectionDetail"), "id");
-    // Starting an update without a token leaves this one mid-update, which is the state a
-    // second writer collides with. Both non-terminal rows are addressed immediately below,
-    // before the clock makes their transitions due.
+    // Starting an update that RECONFIGURES this one leaves it mid-update, which is the
+    // state a second writer collides with. Both non-terminal rows are addressed immediately
+    // below, before the clock makes their transitions due.
     accepted(
         &router,
         "the collection taken into UPDATING",
-        json!({ "id": updating_id, "description": "a write already in flight" }),
+        json!({
+            "id": updating_id,
+            "vectorOptions": { "ServerlessVectorAcceleration": "ENABLED" },
+        }),
     )
     .await;
 

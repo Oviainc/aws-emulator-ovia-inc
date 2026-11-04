@@ -1080,8 +1080,8 @@ async fn tags_round_trip_and_a_deleted_collection_cannot_be_tagged() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateCollection: the members it applies, the transient status it leaves, and
-// the conflict a second writer gets.
+// UpdateCollection: the members it applies, the status it leaves the collection
+// in, and what the next writer gets.
 // ---------------------------------------------------------------------------
 
 /// One row of the update table: the members the request names, and what the collection
@@ -1158,9 +1158,15 @@ async fn an_update_applies_the_members_it_names_and_leaves_the_rest() {
         let id = text(&collection, "id");
         let created = at(&collection, "createdDate").as_i64().unwrap_or_default();
 
-        let mut request = members;
+        // `vectorOptions` is the one member that reconfigures what the collection RUNS, so
+        // it is the one that leaves the collection in the non-terminal `UPDATING`;
+        // `description` and `deletionProtection` rewrite what the record remembers, which
+        // is done when the call answers, so the collection keeps the `ACTIVE` it was in.
+        let reconfigures = members.get("vectorOptions").is_some();
+        let expected_status = if reconfigures { "UPDATING" } else { "ACTIVE" };
+        let mut request = members.clone();
         request["id"] = json!(id.clone());
-        let (status, code, answer) = call(&router, "UpdateCollection", request).await;
+        let (status, code, answer) = call(&router, "UpdateCollection", request.clone()).await;
         assert_eq!(
             status, 200,
             "case UpdateCollection({case}): expected 200, got {status} {code} with {answer}"
@@ -1168,8 +1174,8 @@ async fn an_update_applies_the_members_it_names_and_leaves_the_rest() {
         let detail = at(&answer, "updateCollectionDetail").clone();
         assert_eq!(
             text(&detail, "status"),
-            "UPDATING",
-            "case UpdateCollection({case}): the update reports the transient UPDATING, got {detail}"
+            expected_status,
+            "case UpdateCollection({case}): expected the update to report {expected_status}, got {detail}"
         );
         assert_eq!(
             (text(&detail, "id"), text(&detail, "name")),
@@ -1186,19 +1192,30 @@ async fn an_update_applies_the_members_it_names_and_leaves_the_rest() {
             "case UpdateCollection({case}): lastModifiedDate is the write instant, got {detail}"
         );
 
-        // A second writer while the first update is still outstanding is the modelled
-        // conflict, never another code.
-        let (status, code, answer) = call(
-            &router,
-            "UpdateCollection",
-            json!({ "id": id.clone(), "description": "a concurrent write" }),
-        )
-        .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (CLIENT_ERROR, "ConflictException"),
-            "case UpdateCollection({case}, concurrent writer): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
-        );
+        // A second writer while a RECONFIGURING update is still outstanding is the modelled
+        // conflict, never another code. A metadata-only update leaves nothing outstanding,
+        // so the very next write is accepted instead — repeating the row's own members, so
+        // what the collection must report below is unchanged either way.
+        if reconfigures {
+            let (status, code, answer) = call(
+                &router,
+                "UpdateCollection",
+                json!({ "id": id.clone(), "description": "a concurrent write" }),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (CLIENT_ERROR, "ConflictException"),
+                "case UpdateCollection({case}, concurrent writer): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+            );
+        } else {
+            let (status, code, answer) = call(&router, "UpdateCollection", request).await;
+            assert_eq!(
+                status, 200,
+                "case UpdateCollection({case}, the next write): a metadata-only update leaves the \
+                 collection writable, got {status} {code} with {answer}"
+            );
+        }
 
         // The collection settles back to ACTIVE on its own, carrying what the update
         // applied — and what it did not name is what the create left.

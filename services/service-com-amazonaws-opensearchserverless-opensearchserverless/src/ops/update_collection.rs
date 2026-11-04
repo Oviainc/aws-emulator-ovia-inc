@@ -2,9 +2,12 @@
 
 //! @op UpdateCollection
 //! IMPLEMENTED: applies the members the request names (`description`, `vectorOptions`,
-//! `deletionProtection`) to the `CollectionRecord` stored under the requested id, moves it
-//! to the non-terminal `UPDATING` status — from which it settles back to `ACTIVE` once the
-//! clock makes that due — and answers `updateCollectionDetail` from the stored record. A
+//! `deletionProtection`) to the `CollectionRecord` stored under the requested id and answers
+//! `updateCollectionDetail` from the stored record. A request that only rewrites what the
+//! record REMEMBERS (`description`, `deletionProtection`) lands inside the call and leaves
+//! the collection in the settled status it already had; one that RECONFIGURES the collection
+//! (`vectorOptions`, its vector-search acceleration) moves it to the non-terminal `UPDATING`
+//! status, from which it settles back to `ACTIVE` once the clock makes that due. A
 //! collection that is not `ACTIVE` (one being created, deleted, or already mid-update) is
 //! refused with `ConflictException`, which is what a second concurrent writer gets.
 //!
@@ -222,9 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // A collection can only be updated from the state it is "ready to use" in: one
-        // still being created, already being deleted, or mid-update is the state conflict
-        // `ConflictException` describes — which is also what the LOSER of two concurrent
-        // updates gets, since the winner leaves the collection in `UPDATING`.
+        // still being created, already being deleted, or still being reconfigured by an
+        // earlier update is the state conflict `ConflictException` describes.
         if record.status != crate::state::COLLECTION_ACTIVE {
             return Err(
                 UpdateCollectionErrorModeled::ConflictException(ConflictException {
@@ -240,6 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let updated_at = crate::state::now_epoch_millis();
+        // Whether this request changes what the collection RUNS or only what the stored
+        // record REMEMBERS about it. `vectorOptions` is the one member that reconfigures
+        // the collection — it "specifies whether serverless vector acceleration is enabled
+        // for the collection" — so the service has work to do for it and reports the
+        // collection `UPDATING` until that work falls due. `description` and
+        // `deletionProtection` are control-plane metadata of the record itself, so such an
+        // update is complete when the call answers and the collection keeps the settled
+        // status it was in.
+        let reconfigures_collection = input.vector_options.is_some();
         let Some(record) = store.collections.get_mut(&input.id) else {
             return Err(UpdateCollectionErrorModeled::ValidationException(
                 ValidationException {
@@ -259,7 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(protection) = input.deletion_protection {
             record.deletion_protection = protection;
         }
-        record.begin_update(updated_at);
+        if reconfigures_collection {
+            record.begin_update(updated_at);
+        } else {
+            record.apply_metadata_update(updated_at);
+        }
         let detail = record.update_detail();
         if let Some(token) = input.client_token.as_deref() {
             let id = input.id.clone();

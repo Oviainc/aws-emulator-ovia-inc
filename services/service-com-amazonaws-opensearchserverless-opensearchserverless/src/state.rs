@@ -752,9 +752,24 @@ impl CollectionRecord {
         self.purge_at.is_some_and(|due_at| now >= due_at)
     }
 
-    /// Accept an update of this collection: report it `UPDATING` from now, settling back
-    /// to `ACTIVE` once the clock makes that due. `CollectionStatus` models `UPDATING`
-    /// beside `ACTIVE` for exactly this span.
+    /// Accept an update that only rewrites what this record REMEMBERS about the collection
+    /// — its `description` and its `deletionProtection` setting.
+    ///
+    /// Nothing the collection RUNS changes, so the service has nothing to bring up or tear
+    /// down for it: the write lands inside the call, the collection keeps the settled
+    /// status it already had, and only `lastModifiedDate` moves. That is what leaves the
+    /// collection usable by the operations that require a settled status — `DeleteCollection`
+    /// above all — on the very next call.
+    pub fn apply_metadata_update(&mut self, updated_at: i64) {
+        self.last_modified_date = updated_at;
+    }
+
+    /// Accept an update that RECONFIGURES the collection itself — its vector-search
+    /// acceleration, the one member of an update request that changes what the collection
+    /// runs rather than what this record remembers about it: report it `UPDATING`
+    /// ("Updating collection resource") from now, settling back to `ACTIVE` once the clock
+    /// makes that due. `CollectionStatus` models `UPDATING` beside `ACTIVE` for exactly
+    /// this span.
     pub fn begin_update(&mut self, updated_at: i64) {
         self.begin_transition(COLLECTION_UPDATING, COLLECTION_ACTIVE);
         self.last_modified_date = updated_at;

@@ -33,8 +33,8 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 /// The status a collection is "ready to use" in (`CollectionStatus$ACTIVE`).
 const ACTIVE: &str = "ACTIVE";
 
-/// `CollectionStatus$UPDATING`, the status `UpdateCollection` leaves behind until the clock
-/// settles it back.
+/// `CollectionStatus$UPDATING`, the status an update that RECONFIGURES the collection (its
+/// vector-search acceleration) leaves behind until the clock settles it back.
 const UPDATING: &str = "UPDATING";
 
 /// `CollectionStatus$DELETING`, the status an accepted deletion leaves until the purge.
@@ -65,7 +65,7 @@ async fn drive_into(router: &MultiServiceRouter, id: &str, status: &str, case: &
     let (operation, request) = match status {
         UPDATING => (
             "UpdateCollection",
-            json!({ "id": id, "description": "touched" }),
+            json!({ "id": id, "vectorOptions": { "ServerlessVectorAcceleration": "ENABLED" } }),
         ),
         DELETING => ("DeleteCollection", json!({ "id": id })),
         other => panic!("case {case}: no operation in this crate leaves a collection {other}"),

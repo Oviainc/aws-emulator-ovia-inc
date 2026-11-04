@@ -214,11 +214,12 @@ async fn every_tagging_operation_serves_a_resource_whose_deletion_was_not_accept
     served(&router, &active_arn, "an ACTIVE collection").await;
 
     // And while an accepted UPDATE is still in flight, which is another non-terminal
-    // status that is not `DELETING`.
+    // status that is not `DELETING`. `vectorOptions` is the member that reconfigures the
+    // collection, so it is the update that leaves one in flight.
     let (status, code, answer) = call(
         &router,
         "UpdateCollection",
-        json!({ "id": creating_id, "description": "tagged mid-update" }),
+        json!({ "id": creating_id, "vectorOptions": { "ServerlessVectorAcceleration": "ENABLED" } }),
     )
     .await;
     assert_eq!(
