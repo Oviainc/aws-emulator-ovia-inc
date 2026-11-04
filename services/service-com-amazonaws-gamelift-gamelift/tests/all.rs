@@ -31,6 +31,8 @@ mod custom_location_deletion;
 mod error_message_templates;
 #[path = "all/fleet_attributes.rs"]
 mod fleet_attributes;
+#[path = "all/game_session_placement_cancellation.rs"]
+mod game_session_placement_cancellation;
 #[path = "all/game_session_placements.rs"]
 mod game_session_placements;
 #[path = "all/game_session_queue_removal.rs"]

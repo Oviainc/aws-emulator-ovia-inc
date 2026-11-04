@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopGameSessionPlacement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopGameSessionPlacement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopGameSessionPlacement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the placement request out of the queue that was processing it and moves the ONE
+//! stored placement record to `CANCELLED` with the instant it was canceled as its end
+//! time, so this response and every later read of the placement
+//! (`DescribeGameSessionPlacement`) are served from that one record, and [`crate::state`]'s
+//! placement progression no longer works on it.
+//!
+//! Only a placement the queue is still working on can be taken out of it: an id no
+//! placement is stored under is the modelled `NotFoundException`, and a placement a game
+//! session has already been started for, or one the queue has already finished with, is
+//! the modelled `InvalidRequestException` — the session that was started outlives the
+//! request, which the caller cleans up with `TerminateGameSession`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +154,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopGameSessionPlacement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopGameSessionPlacementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopGameSessionPlacement"))
+        use crate::state::{PLACEMENT_STATUS_CANCELLED, PLACEMENT_STATUS_PENDING};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StopGameSessionPlacementErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        // The queue's attempts at placing the session and its timeout are each due at an
+        // instant, whether or not anybody calls, so the clock is applied before this call
+        // decides what the placement's status is: a session the queue had already been
+        // owed is one this call finds already created.
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // One lookup of the one stored record: the conditions below are read off it and
+        // the cancellation is written to it.
+        let Some(placement) = state.game_session_placements.get_mut(&input.placement_id) else {
+            return Err(StopGameSessionPlacementErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::placement_not_found_message(
+                        &input.placement_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "This operation results in an InvalidRequestException (400) error if a game
+        // session has already been created for this placement": that session keeps running
+        // once it is started, so the request cannot be withdrawn — "you can clean up an
+        // unneeded game session by calling TerminateGameSession".
+        if let Some(game_session_id) = placement.game_session_id.clone() {
+            return Err(
+                StopGameSessionPlacementErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Game session {game_session_id} has already been created for game \
+                             session placement {}; it cannot be cancelled.",
+                            placement.placement_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Cancels a game session placement that's in PENDING status": a placement the
+        // queue has already finished with is no longer in the queue to be removed from,
+        // and the status it ended in is what it keeps.
+        if placement.status != PLACEMENT_STATUS_PENDING {
+            return Err(
+                StopGameSessionPlacementErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Game session placement {} is in {} status and cannot be cancelled.",
+                            placement.placement_id, placement.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "This operation removes the placement request from the queue and moves the
+        // GameSessionPlacement to CANCELLED status" — which is what takes it out of the
+        // queue's progression — with the "time stamp indicating when this request was
+        // completed, canceled, or timed out".
+        placement.status = PLACEMENT_STATUS_CANCELLED.to_string();
+        placement.end_time = Some(now);
+        // Report the STORED placement, so this response and every later describe of it can
+        // only agree. A canceled placement started no game session, so it carries none of
+        // the connection information a fulfilled one reads off its session.
+        Ok(StopGameSessionPlacementOutput {
+            game_session_placement: Some(placement.to_modelled(None)),
+        })
     }
 }

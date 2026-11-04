@@ -113,6 +113,10 @@ pub const PLACEMENT_STATUS_PENDING: &str = "PENDING";
 /// placement request is updated with connection information for the game session (IP
 /// address and port)."
 pub const PLACEMENT_STATUS_FULFILLED: &str = "FULFILLED";
+/// `GameSessionPlacementState` a placement a caller stopped ends in:
+/// StopGameSessionPlacement's doc — "this operation removes the placement request from the
+/// queue and moves the `GameSessionPlacement` to `CANCELLED` status."
+pub const PLACEMENT_STATUS_CANCELLED: &str = "CANCELLED";
 /// `GameSessionPlacementState` a placement ends in when no destination of its queue could
 /// host the session: StartGameSessionPlacement's doc — "Amazon GameLift Servers continues
 /// to retry each placement request until it reaches the queue's timeout setting. If a

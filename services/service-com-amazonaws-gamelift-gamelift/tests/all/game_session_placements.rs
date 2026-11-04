@@ -18,7 +18,7 @@ use crate::hosting_loop::{
 };
 
 /// The placement `DescribeGameSessionPlacement` reports for `placement_id`.
-async fn describe_placement(gamelift: &GameLift, placement_id: &str) -> Value {
+pub(crate) async fn describe_placement(gamelift: &GameLift, placement_id: &str) -> Value {
     let described = gamelift
         .ok(
             "DescribeGameSessionPlacement",
@@ -30,7 +30,7 @@ async fn describe_placement(gamelift: &GameLift, placement_id: &str) -> Value {
 
 /// Create a queue named `name` whose destinations are `destinations`, in placement
 /// preference order.
-async fn queue_with(gamelift: &GameLift, name: &str, destinations: &[String]) -> String {
+pub(crate) async fn queue_with(gamelift: &GameLift, name: &str, destinations: &[String]) -> String {
     gamelift
         .ok(
             "CreateGameSessionQueue",
