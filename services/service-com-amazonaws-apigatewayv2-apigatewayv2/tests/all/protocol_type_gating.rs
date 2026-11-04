@@ -493,9 +493,16 @@ async fn an_http_api_takes_exactly_the_integration_types_that_are_not_websocket_
         });
         // "MOCK: for integrating the route or method request with API Gateway as a
         // 'loopback' endpoint without invoking any backend", so it is the one type that
-        // names no endpoint; every other type needs one.
+        // names no endpoint; every other type needs one. `AWS` and `AWS_PROXY` integrate
+        // "with an AWS service action", so their URI names the resource that action runs
+        // on — an ARN — while `HTTP`/`HTTP_PROXY` take "a fully-qualified URL"
+        // (`Integration$IntegrationUri`).
         if *integration_type != "MOCK" {
-            request["integrationUri"] = json!("https://example.com/upstream");
+            request["integrationUri"] = if matches!(*integration_type, "AWS" | "AWS_PROXY") {
+                json!("arn:aws:lambda:eu-west-1:000000000000:function:handler")
+            } else {
+                json!("https://example.com/upstream")
+            };
         }
 
         let (status, body) = call(

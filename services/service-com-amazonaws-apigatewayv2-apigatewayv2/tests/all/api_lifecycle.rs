@@ -520,15 +520,17 @@ async fn create_api_refuses_a_request_the_protocol_type_does_not_allow() {
 async fn quick_create_mints_the_catch_all_route_with_the_api() {
     let emulator = emulator();
 
-    // `RouteKey` absent -> "$default"; `RouteKey` given -> that key. Both need a Target.
+    // `RouteKey` absent -> "$default"; `RouteKey` given -> that key. Both need a Target,
+    // and either route is the one quick create minted with the api, so API Gateway
+    // manages it (`Route$ApiGatewayManaged`).
     let cases = [
-        ("default route key", None, "$default", true),
-        ("explicit route key", Some("GET /items"), "GET /items", false),
+        ("default route key", None, "$default"),
+        ("explicit route key", Some("GET /items"), "GET /items"),
     ];
 
-    for (label, route_key, expect_key, expect_managed) in cases {
+    for (label, route_key, expect_key) in cases {
         let mut request = json!({
-            "name": format!("quick-create-{expect_managed}"),
+            "name": format!("quick-create-{expect_key}"),
             "protocolType": "HTTP",
             "target": "https://example.com/upstream"
         });
@@ -587,8 +589,9 @@ async fn quick_create_mints_the_catch_all_route_with_the_api() {
         );
         assert_eq!(
             items[0]["apiGatewayManaged"].as_bool(),
-            Some(expect_managed),
-            "case {label:?}: only the $default route quick create mints is API-Gateway-managed, got {routes}"
+            Some(true),
+            "case {label:?}: the route quick create mints with the api is \
+             API-Gateway-managed, got {routes}"
         );
     }
 }

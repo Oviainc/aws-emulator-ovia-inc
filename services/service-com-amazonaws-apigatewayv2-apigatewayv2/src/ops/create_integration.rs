@@ -444,10 +444,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specifies the format of the payload sent to an integration. Required for HTTP
         // APIs" (`CreateIntegration$PayloadFormatVersion`). The requirement is the
         // CREATE's: a record of an HTTP api always carries one afterwards, so a later
-        // patch does not have to resend it.
+        // patch does not have to resend it. The sentence is API Gateway's own for this
+        // refusal, which names the member and the resource it is required for.
         if is_http && input.payload_format_version.is_none() {
             return Err(bad_request(
-                "PayloadFormatVersion is required for HTTP APIs.",
+                "PayloadFormatVersion is a required parameter for integration",
             ));
         }
 

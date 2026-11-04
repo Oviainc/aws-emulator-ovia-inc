@@ -278,9 +278,9 @@ struct PayloadRow {
 }
 
 /// A `PayloadFormatVersion` the integration type does not support is refused with one
-/// template naming the pair that cannot hold together, on the create AND on the update:
-/// the rows span the integration type, the protocol of the api that holds it, and the
-/// version asked for.
+/// template naming the member and the value the request sent for it, on the create AND on
+/// the update: the rows span the integration type, the protocol of the api that holds it,
+/// and the version asked for.
 #[tokio::test]
 async fn an_unsupported_payload_format_version_is_refused_naming_the_version_and_the_type() {
     let rows = [
@@ -343,10 +343,7 @@ async fn an_unsupported_payload_format_version_is_refused_naming_the_version_and
             row.protocol_type,
         )
         .await;
-        let expected = format!(
-            "PayloadFormatVersion {} is not supported for integration of type {}",
-            row.version, row.integration_type
-        );
+        let expected = format!("Unsupported PayloadFormatVersion: {}", row.version);
 
         // The create leg: the refused version never reaches the store.
         let mut request = row.extra.clone();

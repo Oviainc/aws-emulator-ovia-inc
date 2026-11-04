@@ -193,9 +193,9 @@ async fn quick_create_produces_the_integration_route_and_default_stage() {
         );
         assert_eq!(
             route.get("apiGatewayManaged"),
-            Some(&json!(row.route_key == DEFAULT_ROUTE_KEY)),
-            "case {case:?}: only the $default route quick create mints is \
-             API-Gateway-managed, got {route}"
+            Some(&json!(true)),
+            "case {case:?}: the route quick create mints with the api is \
+             API-Gateway-managed whatever RouteKey it carries, got {route}"
         );
         let target = as_str(&route, "target");
         let integration_id = target

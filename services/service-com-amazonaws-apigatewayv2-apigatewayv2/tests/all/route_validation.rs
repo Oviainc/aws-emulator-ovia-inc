@@ -10,7 +10,9 @@
 //!   authorizer its `AuthorizerId` names — and a request naming one the api cannot
 //!   resolve is "not valid, for example, the input is incomplete or incorrect":
 //!   `BadRequestException` (400, `smithy_query(query="operation",
-//!   operation="CreateRoute")`), with nothing created.
+//!   operation="CreateRoute")`), with nothing created. A value that is not of the target
+//!   FORM at all is refused by the same error with its own sentence; the whole class of
+//!   target forms is `route_target_forms`'s table.
 //! * **A path position that is a variable has one name.** Two route keys of one api and
 //!   method that agree on every earlier segment cannot declare differently named path
 //!   variables at the same position, because a request matching both would have to bind
@@ -215,6 +217,16 @@ async fn a_route_whose_reference_its_api_cannot_resolve_is_refused_and_creates_n
             // The target is resolved first, so its refusal is the one reported.
             "Unable to find route target of type integrations with ID abc1234".to_string(),
         ),
+        (
+            "a target of a form that addresses no integration",
+            json!({ "routeKey": "GET /not-a-reference", "target": "integrations" }),
+            // A value that is not `integrations/{IntegrationId}` is not a target at all,
+            // so it is refused on its FORM before any id is resolved — the rule
+            // `route_target_forms` holds over the whole class.
+            "Unexpected or malformed target in route null. Correct format should be \
+             integrations/<integration_id>."
+                .to_string(),
+        ),
     ];
 
     for (case, request, expect_message) in &refused {
@@ -244,8 +256,7 @@ async fn a_route_whose_reference_its_api_cannot_resolve_is_refused_and_creates_n
         );
     }
 
-    // The same requests with references this api CAN resolve are created, and so is a
-    // target of a form that references no integration at all.
+    // The same requests with references this api CAN resolve are created.
     let accepted = [
         (
             "a target naming this api's integration",
@@ -270,10 +281,6 @@ async fn a_route_whose_reference_its_api_cannot_resolve_is_refused_and_creates_n
                 "authorizationType": "JWT",
                 "authorizerId": authorizer_id
             }),
-        ),
-        (
-            "a target of a form that addresses no integration",
-            json!({ "routeKey": "GET /not-a-reference", "target": "integrations" }),
         ),
         (
             "no references at all",

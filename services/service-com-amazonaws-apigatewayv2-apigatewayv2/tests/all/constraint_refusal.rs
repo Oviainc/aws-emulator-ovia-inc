@@ -300,7 +300,15 @@ async fn every_published_value_of_a_constrained_member_is_accepted() {
                 "timeoutInMillis": timeout
             });
             if *integration_type != "MOCK" {
-                request["integrationUri"] = json!("https://example.com/upstream");
+                // "AWS: for integrating the route or method request with an AWS service
+                // action" and the same clause on AWS_PROXY: those two name the resource
+                // the action runs on, so their URI is an ARN, while HTTP/HTTP_PROXY take
+                // "a fully-qualified URL" (`Integration$IntegrationUri`).
+                request["integrationUri"] = if matches!(*integration_type, "AWS" | "AWS_PROXY") {
+                    json!("arn:aws:lambda:eu-west-1:000000000000:function:handler")
+                } else {
+                    json!("https://example.com/upstream")
+                };
             }
             if on_http {
                 request["payloadFormatVersion"] = json!("1.0");

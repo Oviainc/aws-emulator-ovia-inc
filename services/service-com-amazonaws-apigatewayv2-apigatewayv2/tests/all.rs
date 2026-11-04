@@ -169,6 +169,8 @@ mod route_response_lifecycle;
 mod route_response_update;
 #[path = "all/route_settings_deletion.rs"]
 mod route_settings_deletion;
+#[path = "all/route_target_forms.rs"]
+mod route_target_forms;
 #[path = "all/route_update.rs"]
 mod route_update;
 #[path = "all/route_validation.rs"]

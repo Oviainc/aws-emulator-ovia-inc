@@ -204,6 +204,16 @@ fn stated_violation(violation: &Violation) -> Option<String> {
         ("priority", ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)) => {
             Some(crate::state::routing_rule_priority_range_message())
         }
+        // `CreateIntegration$IntegrationType`, the `@required` member that targets the
+        // `IntegrationType` enum. A value OUTSIDE that enum names no integration type
+        // this service can read, exactly as an absent member does, so both are refused
+        // with the one sentence that names the member and what it is required for
+        // ([`crate::state::INTEGRATION_TYPE_REQUIRED`]) rather than with the generic
+        // constraint clause.
+        (
+            "integrationType",
+            ViolationKind::MissingRequiredMember | ViolationKind::EnumValue(_),
+        ) => Some(crate::state::INTEGRATION_TYPE_REQUIRED.to_string()),
         _ => None,
     }
 }

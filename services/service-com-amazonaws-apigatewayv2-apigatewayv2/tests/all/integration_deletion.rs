@@ -229,8 +229,10 @@ fn removable_rows() -> Vec<Removable> {
             api: websocket_api("delete-socket-api"),
             integration: json!({ "integrationType": "MOCK" }),
             route_key: "$connect",
-            // A target of any other form references no integration of this api.
-            target: |_| Some("integrations".to_string()),
+            // A route with no target at all references no integration of this api: a
+            // target it DID carry would have to name one
+            // (`integrations/{IntegrationId}`), which is what the sibling rows cover.
+            target: |_| None,
         },
     ]
 }

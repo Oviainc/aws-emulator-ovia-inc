@@ -517,7 +517,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 route_id.clone(),
                 crate::state::Route {
                     route_id,
-                    api_gateway_managed: route_key == DEFAULT_ROUTE_KEY,
+                    // Quick create mints this route WITH the api, so API Gateway owns it
+                    // whatever key it carries: "If you created an API using quick create,
+                    // the $default route is managed by API Gateway"
+                    // (`Route$ApiGatewayManaged`) describes the route quick create makes
+                    // when the request named no `RouteKey`, which is the only route it
+                    // ever makes — a request naming one replaces that key ("this value
+                    // replaces the route key of the quick create route",
+                    // `UpdateApi$RouteKey`) rather than asking for a route of the
+                    // caller's own.
+                    api_gateway_managed: true,
                     route_key,
                     target: Some(format!(
                         "{}{integration_id}",
