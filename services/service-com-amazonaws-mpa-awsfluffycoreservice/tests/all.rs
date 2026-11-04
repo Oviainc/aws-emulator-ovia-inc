@@ -47,6 +47,8 @@ mod identity_source_arn_addressing;
 mod identity_source_deletion;
 #[path = "all/identity_source_detail.rs"]
 mod identity_source_detail;
+#[path = "all/identity_source_id_form.rs"]
+mod identity_source_id_form;
 #[path = "all/identity_source_in_use_by_pending_update.rs"]
 mod identity_source_in_use_by_pending_update;
 #[path = "all/identity_source_region.rs"]

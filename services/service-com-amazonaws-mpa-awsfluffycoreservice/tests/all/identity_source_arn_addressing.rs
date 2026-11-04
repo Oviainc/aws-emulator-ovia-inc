@@ -6,9 +6,9 @@
 //! The rule under test: a request member documented to carry the Amazon Resource Name of
 //! one kind of resource addresses only ARNs of that kind, so a value that is not an ARN
 //! this service could have minted for that kind names no such resource whatever the store
-//! holds and is refused as the malformed-ARN class
-//! (`ValidationException`, 400, [`state::INVALID_ARN_MESSAGE`]) — before the account
-//! boundary and before any lookup — whichever operation reads the member. Neither the
+//! holds and is refused with the sentence that names the member it rejected
+//! (`ValidationException`, 400, [`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`]) — before
+//! the account boundary and before any lookup — whichever operation reads the member. Neither the
 //! member's modelled constraints (`String`, `@length(max: 1000)`, no `@pattern`, from
 //! `smithy_query(query="shape",shape="DeleteIdentitySourceRequest,GetIdentitySourceRequest")`)
 //! nor the operation's own error set changes which values address a resource: the two
@@ -163,6 +163,17 @@ fn addresses_no_identity_source() -> Vec<(&'static str, String)> {
             source_arn("aws", REGION, account, "ids~1"),
         ),
         (
+            // An identity-source id is minted by this service, so a value outside that
+            // form is no id this service could have issued (`identity_source_id_form.rs`
+            // tables the form itself).
+            "a resource id outside the form this service mints ids in",
+            source_arn("aws", REGION, account, "0f5e0119-ab78-418e-b630-3b421ab2fd6f"),
+        ),
+        (
+            "a resource id spanning the resource-id character class",
+            source_arn("aws", REGION, account, "Ids.000_000-9"),
+        ),
+        (
             // `@length(max: 1000)`: the longest value a conforming request can carry.
             "a value at the member's maximum that is no ARN",
             "x".repeat(1000),
@@ -194,9 +205,9 @@ fn addresses_an_absent_identity_source() -> Vec<(&'static str, String)> {
             source_arn("aws-us-gov", "us-gov-west-1", account, "ids-000000000001"),
         ),
         (
-            // `[a-zA-Z0-9._-]+` is the whole resource-id class.
-            "an id spanning the resource-id character class",
-            source_arn("aws", REGION, account, "Ids.000_000-9"),
+            // The body of a minted id is letters and digits.
+            "an id whose body carries letters",
+            source_arn("aws", REGION, account, "ids-a1b2c3"),
         ),
         (
             // `@length(max: 1000)`: an ARN padded in its id to the member's maximum.
@@ -232,8 +243,8 @@ async fn a_value_addressing_no_identity_source_is_refused_as_malformed_by_every_
             );
             assert_eq!(
                 text(&body, "Message"),
-                state::INVALID_ARN_MESSAGE,
-                "case {case:?} on {op:?}: expected the malformed-ARN message, got {body:?}"
+                state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE,
+                "case {case:?} on {op:?}: expected the member-named refusal, got {body:?}"
             );
             assert_eq!(
                 stored(&harness, &value),

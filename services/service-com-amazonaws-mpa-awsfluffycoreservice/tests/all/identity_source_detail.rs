@@ -5,15 +5,16 @@
 //! The rule under test: an ARN-addressed read resolves its ARN only as an ARN of the
 //! resource kind that member addresses, and answers out of the stored record —
 //!
-//! * a value that is not an ARN of this service's `identity-source` resource names no
-//!   identity source whatever the store holds, so it is the malformed-ARN class this
-//!   service answers with one sentence ([`state::INVALID_ARN_MESSAGE`],
-//!   `ValidationException`, 400);
+//! * a value that is not an ARN of this service's `identity-source` resource — or one
+//!   whose resource id is not an identity-source id this service could have minted —
+//!   names no identity source whatever the store holds, so it is refused with the sentence
+//!   that names the member it rejected
+//!   ([`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`], `ValidationException`, 400);
 //! * an identity-source ARN outside the caller's account is `AccessDeniedException`
 //!   (403), decided before the source is resolved;
-//! * an identity-source ARN of the caller's that the store holds no record for is
-//!   `ResourceNotFoundException` (404) with this service's one not-found sentence
-//!   ([`state::RESOURCE_NOT_FOUND_MESSAGE`]);
+//! * an identity-source ARN of the caller's whose id IS in that form and that the store
+//!   holds no record for is `ResourceNotFoundException` (404) with this service's one
+//!   not-found sentence ([`state::RESOURCE_NOT_FOUND_MESSAGE`]);
 //! * otherwise every reported member is the stored record's, so this read and
 //!   `ListIdentitySources` cannot disagree about one source, and reading twice changes
 //!   nothing a later caller sees.
@@ -409,9 +410,11 @@ async fn a_get_reports_the_status_the_clock_owes() {
     }
 }
 
-/// A value that is not an ARN of this service's identity-source resource names no identity
-/// source at all, so it is the malformed-ARN class: `ValidationException` (400) with
-/// [`state::INVALID_ARN_MESSAGE`], decided before anything is looked up.
+/// A value that is not an ARN of this service's identity-source resource — or one whose
+/// resource id is not an identity-source id this service could have minted — names no
+/// identity source at all, so it is refused as the value that addresses none:
+/// `ValidationException` (400) with [`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`],
+/// decided before anything is looked up.
 #[tokio::test]
 async fn an_arn_that_names_no_identity_source_is_refused_as_malformed() {
     let harness = Harness::new();
@@ -482,6 +485,21 @@ async fn an_arn_that_names_no_identity_source_is_refused_as_malformed() {
             "a resource id outside the id character class",
             format!("arn:aws:mpa:{REGION}:{account}:identity-source/ids~1"),
         ),
+        (
+            // An identity-source id is minted by this service, so a value outside that
+            // form is no id this service could have issued (`identity_source_id_form.rs`
+            // tables the form itself).
+            "a uuid-shaped resource id",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/0f5e0119-ab78-418e-b630-3b421ab2fd6f"),
+        ),
+        (
+            "a word as the resource id",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/nonexistent"),
+        ),
+        (
+            "a dotted resource id",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/identity.source.1"),
+        ),
     ];
 
     for (case, value) in rows {
@@ -497,8 +515,8 @@ async fn an_arn_that_names_no_identity_source_is_refused_as_malformed() {
         );
         assert_eq!(
             text(&body, "Message"),
-            state::INVALID_ARN_MESSAGE,
-            "case {case:?}: expected the malformed-ARN message, got {body:?}"
+            state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE,
+            "case {case:?}: expected the member-named refusal, got {body:?}"
         );
     }
 
@@ -510,9 +528,9 @@ async fn an_arn_that_names_no_identity_source_is_refused_as_malformed() {
     );
 }
 
-/// An identity-source ARN of the caller's that the store holds no record for is
-/// `ResourceNotFoundException` (404) with this service's one not-found sentence — whatever
-/// form the id takes.
+/// An identity-source ARN of the caller's whose id IS in the form this service mints and
+/// that the store holds no record for is `ResourceNotFoundException` (404) with this
+/// service's one not-found sentence.
 #[tokio::test]
 async fn an_identity_source_arn_with_no_record_is_not_found() {
     let harness = Harness::new();
@@ -524,7 +542,7 @@ async fn an_identity_source_arn_with_no_record_is_not_found() {
         .expect("the resource id of a minted ARN")
         .to_string();
 
-    // (case, region, resource id). Rows differ along the FORM of an id the store never
+    // (case, region, resource id). Rows differ along the body of an id the store never
     // minted and along the region the ARN names.
     let rows: Vec<(&str, &str, String)> = vec![
         (
@@ -533,15 +551,14 @@ async fn an_identity_source_arn_with_no_record_is_not_found() {
             "ids-000000009999".to_string(),
         ),
         (
-            "a uuid-shaped id",
+            "the shortest body the minted form admits",
             REGION,
-            "0f5e0119-ab78-418e-b630-3b421ab2fd6f".to_string(),
+            "ids-1".to_string(),
         ),
-        ("a word", REGION, "nonexistent".to_string()),
         (
-            "a dotted id",
+            "a minted-form id whose body carries letters",
             REGION,
-            "identity.source.1".to_string(),
+            "ids-a1b2c3".to_string(),
         ),
         (
             // The ARN carries the region the source lives in, so the caller's own id in

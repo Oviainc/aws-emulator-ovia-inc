@@ -13,17 +13,20 @@
 //! The ARN is resolved in the namespace an identity source lives in, and the answer is
 //! decided in this order:
 //!
-//! * A value that is not an identity source's ARN
-//!   ([`crate::state::is_identity_source_arn`]) addresses no identity source at all —
-//!   another service's namespace, another resource kind of this service, or a value that is
-//!   not a well-formed ARN of this service at all — so it is refused with the one sentence
-//!   this service answers the malformed-ARN class with ([`crate::state::invalid_arn`]):
-//!   `ValidationException` (400). The member carries no ARN `@pattern` of its own here
+//! * A value that addresses no identity source
+//!   ([`crate::state::addresses_identity_source`]) names none at all — another service's
+//!   namespace, another resource kind of this service, a value that is not a well-formed
+//!   ARN of this service, or an identity-source ARN of this service whose resource id is
+//!   not an identity-source id this service could have minted
+//!   ([`crate::state::is_identity_source_id`]) — so it is refused with the sentence that
+//!   NAMES the member it rejected ([`crate::state::invalid_identity_source_arn`]):
+//!   `ValidationException` (400), decided before the account boundary and before anything
+//!   is looked up. The member carries no ARN `@pattern` of its own here
 //!   (`length(max: 1000)` only), so this handler is where that class is refused; on the
 //!   ARN-addressed reads whose member DOES carry one (`GetApprovalTeam$Arn`,
 //!   `GetPolicyVersion$PolicyVersionArn`) the framework's boundary refuses it and
-//!   [`crate::service`] words it with that same sentence, so this service answers one ARN
-//!   that names no resource of the kind asked for one way.
+//!   [`crate::service`] words it, so this service answers one ARN that names no resource
+//!   of the kind asked for one way.
 //! * An ARN outside the caller's own account is refused with `AccessDeniedException` (403)
 //!   BEFORE the source is resolved ([`crate::state::authorize_resource_arn`]), the same
 //!   boundary every ARN-addressed operation of this service applies, so the answer to a
@@ -38,7 +41,7 @@
 //! a value out of the request — it is the cross-account check above.
 //!
 //! `DeleteIdentitySource` reads the same member and screens it with the same grammar
-//! ([`crate::state::is_identity_source_arn`]): the member ADDRESSES an identity source on
+//! ([`crate::state::addresses_identity_source`]): the member ADDRESSES an identity source on
 //! both operations, so a value that addresses none is the malformed-ARN class on both. The
 //! two part only AFTER the address is resolved: this read answers
 //! `ResourceNotFoundException` for an identity-source ARN this store holds nothing under,
@@ -201,13 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // `IdentitySourceArn` carries no ARN `@pattern` here, so the malformed-ARN class
-        // is refused by this handler with the one sentence this service answers it with
-        // (`crate::state::invalid_arn`, 400). A value that is not an identity source's own
-        // ARN addresses no identity source, so it is refused as that class rather than
-        // looked up and reported absent.
-        if !crate::state::is_identity_source_arn(&input.identity_source_arn) {
+        // is refused by this handler, with the sentence that names the member it rejected
+        // (`crate::state::invalid_identity_source_arn`, 400). A value that is not an ARN
+        // this service could have minted for an identity source — including one whose
+        // resource id is not an identity-source id of this service — addresses no identity
+        // source, so it is refused as that class rather than looked up and reported absent.
+        if !crate::state::addresses_identity_source(&input.identity_source_arn) {
             return Err(GetIdentitySourceErrorModeled::ValidationException(
-                crate::state::invalid_arn(),
+                crate::state::invalid_identity_source_arn(),
             )
             .into());
         }

@@ -14,17 +14,19 @@
 //! a deletion.
 //!
 //! * `IdentitySourceArn` carries no ARN `@pattern` of its own here (`length(max: 1000)`
-//!   only), so the malformed-ARN class is decided FIRST by this handler, against the
-//!   grammar the member ADDRESSES ([`crate::state::is_identity_source_arn`]): a value
-//!   that is not an ARN this service could have minted for an identity source — another
-//!   service's namespace, another resource kind of this service, a partition outside the
-//!   `aws` family, an account that is not twelve digits, a missing resource id, or no ARN
-//!   at all — names no identity source whatever this store holds, so it is refused with
-//!   the one sentence this service answers that class with
-//!   ([`crate::state::invalid_arn`]): `ValidationException` (400), never reported as a
-//!   deletion that was carried out. The screen is the one `get_identity_source.rs`
-//!   applies to the same member, so this service answers one value that addresses no
-//!   identity source one way whichever operation is asked.
+//!   only), so the malformed-ARN class is decided FIRST by this handler, against what the
+//!   member ADDRESSES ([`crate::state::addresses_identity_source`]): a value that is not
+//!   an ARN this service could have minted for an identity source — another service's
+//!   namespace, another resource kind of this service, a partition outside the
+//!   `aws` family, an account that is not twelve digits, a missing resource id, a resource
+//!   id that is not an identity-source id of this service
+//!   ([`crate::state::is_identity_source_id`]), or no ARN at all — names no identity
+//!   source whatever this store holds, so it is refused with the sentence that NAMES the
+//!   member it rejected ([`crate::state::invalid_identity_source_arn`]):
+//!   `ValidationException` (400), never reported as a deletion that was carried out. The
+//!   screen is the one `get_identity_source.rs` applies to the same member, so this
+//!   service answers one value that addresses no identity source one way whichever
+//!   operation is asked.
 //! * The account boundary is decided next, before the source is resolved: an
 //!   identity-source ARN outside the caller's own account is refused with
 //!   `AccessDeniedException` (403) ([`crate::state::authorize_resource_arn`]), so an
@@ -220,14 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // `IdentitySourceArn` carries no ARN `@pattern` here, so the malformed-ARN class
-        // is refused by this handler with the one sentence this service answers it with
-        // (`crate::state::invalid_arn`, 400) rather than by the boundary. A value that is
-        // not an identity source's own ARN addresses no identity source, so it is refused
-        // as that class rather than reported as a delete that was carried out — the same
-        // screen `get_identity_source.rs` applies to the same member.
-        if !crate::state::is_identity_source_arn(&input.identity_source_arn) {
+        // is refused by this handler, with the sentence that names the member it rejected
+        // (`crate::state::invalid_identity_source_arn`, 400), rather than by the boundary.
+        // A value that is not an ARN this service could have minted for an identity source
+        // — including one whose resource id is not an identity-source id of this service —
+        // addresses no identity source, so it is refused as that class rather than reported
+        // as a delete that was carried out: the same screen `get_identity_source.rs`
+        // applies to the same member.
+        if !crate::state::addresses_identity_source(&input.identity_source_arn) {
             return Err(DeleteIdentitySourceErrorModeled::ValidationException(
-                crate::state::invalid_arn(),
+                crate::state::invalid_identity_source_arn(),
             )
             .into());
         }

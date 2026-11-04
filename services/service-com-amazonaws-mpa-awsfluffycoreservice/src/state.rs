@@ -230,6 +230,9 @@
 //!   carry an Amazon Resource Name and does not is refused with, raised by a handler for
 //!   a member the model gives no ARN `@pattern` and by `crate::service`'s refusal seam
 //!   ([`is_malformed_arn_violation`]) for the members it does.
+//! * [`invalid_identity_source_arn`] / [`INVALID_IDENTITY_SOURCE_ARN_MESSAGE`] — the one
+//!   message the two operations ADDRESSED BY an identity source's ARN refuse a value that
+//!   addresses none with ([`addresses_identity_source`]); it names the member it rejected.
 //! * [`reserved_tag_key`] — the one message every path that WRITES tags refuses a key in
 //!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]), raised
 //!   through the one ordered tag-write gate [`tag_write_breach`] below, which is also
@@ -2398,32 +2401,80 @@ pub fn session_arn(region: &str, team_name: &str, seq: u64) -> String {
     )
 }
 
+/// The prefix every identity-source id this service mints carries: an identity-source id
+/// is ONE token of this service's own, not a caller-supplied name, and
+/// [`identity_source_arn`] is where it is written.
+pub const IDENTITY_SOURCE_ID_PREFIX: &str = "ids-";
+
 /// ARN of an identity source, in the form the `IdentitySource` resource's own `arn`
 /// template fixes (`identity-source/{IdentitySourceArn}`):
 /// `arn:aws:mpa:<region>:<account>:identity-source/<id>`.
 ///
 /// The identifier carries no modelled pattern, so its form is this emulator's: the
-/// store's creation counter, zero-padded, so an id is never reused and ARN order and
-/// creation order agree.
+/// [`IDENTITY_SOURCE_ID_PREFIX`] prefix and then the store's creation counter,
+/// zero-padded, so an id is never reused and ARN order and creation order agree. This is
+/// the one place that form is written, and [`is_identity_source_id`] is the one place it
+/// is read, so what this service mints and what it accepts cannot drift apart.
 #[must_use]
 pub fn identity_source_arn(region: &str, seq: u64) -> String {
     ::engine::emulator_arn(
         "mpa",
         region,
-        &format!("{IDENTITY_SOURCE_RESOURCE}/ids-{seq:012}"),
+        &format!("{IDENTITY_SOURCE_RESOURCE}/{IDENTITY_SOURCE_ID_PREFIX}{seq:012}"),
     )
 }
 
 /// Whether `arn` is an ARN of this service's identity-source resource
-/// ([`is_service_resource_arn`] for [`IDENTITY_SOURCE_RESOURCE`]) — the kind of ARN the
-/// `IdentitySourceArn` members ADDRESS.
+/// ([`is_service_resource_arn`] for [`IDENTITY_SOURCE_RESOURCE`]) — the GRAMMAR an
+/// `IdentitySourceArn` takes, with no claim about the form of its resource id.
 ///
-/// A value that is not one names no identity source whatever this store holds, so the
-/// read addressed by it answers the malformed-ARN class ([`invalid_arn`]) rather than
-/// reporting a lookup that found nothing.
+/// A value that is not one names no identity source whatever this store holds, so a member
+/// that should carry one is refused rather than resolved: `PrimaryIdentitySourceArn`, which
+/// REFERENCES the identity source an approver authenticates through, with the service-wide
+/// malformed-ARN sentence ([`malformed_approver_identity_source`]). The two operations
+/// ADDRESSED BY an identity source's ARN screen the id as well
+/// ([`addresses_identity_source`]).
 #[must_use]
 pub fn is_identity_source_arn(arn: &str) -> bool {
     is_service_resource_arn(arn, IDENTITY_SOURCE_RESOURCE)
+}
+
+/// Whether `id` is an identity-source id of this service: the
+/// [`IDENTITY_SOURCE_ID_PREFIX`] prefix and then a non-empty body of letters and digits
+/// — the one token [`identity_source_arn`] mints, with no second separator in it.
+///
+/// An identity-source id is MINTED BY THIS SERVICE (nothing in any request names one), so
+/// a value outside this form is not an id this service could ever have issued: an
+/// otherwise well-formed identity-source ARN carrying one (a bare UUID, a word, a dotted
+/// name) addresses no identity source and is refused as malformed rather than looked up.
+#[must_use]
+pub fn is_identity_source_id(id: &str) -> bool {
+    id.strip_prefix(IDENTITY_SOURCE_ID_PREFIX).is_some_and(|body| {
+        !body.is_empty() && body.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+/// Whether `arn` ADDRESSES an identity source of this service: an identity-source ARN of
+/// this service ([`is_identity_source_arn`]) whose resource id is an identity-source id of
+/// this service ([`is_identity_source_id`]).
+///
+/// The screen both operations that take an `IdentitySourceArn` in their URI label apply,
+/// so `GetIdentitySource` and `DeleteIdentitySource` cannot disagree about which values
+/// name an identity source at all. A value this answers `false` for is refused with
+/// [`invalid_identity_source_arn`] (400) before the account boundary and before any
+/// lookup.
+#[must_use]
+pub fn addresses_identity_source(arn: &str) -> bool {
+    is_identity_source_arn(arn) && arn_resource_id(arn).is_some_and(is_identity_source_id)
+}
+
+/// The id an ARN's resource field carries after the resource kind: the segment after its
+/// last `/`, or `None` for a resource field that carries no `/` at all.
+fn arn_resource_id(arn: &str) -> Option<&str> {
+    arn.splitn(6, ':')
+        .nth(5)?
+        .rsplit_once('/')
+        .map(|(_, id)| id)
 }
 
 /// The id of the IAM Identity Center instance an `IdcInstanceArn` names: the segment
@@ -4188,6 +4239,27 @@ pub const INVALID_ARN_MESSAGE: &str = "Invalid Resource Arn";
 pub fn invalid_arn() -> ValidationException {
     ValidationException {
         message: INVALID_ARN_MESSAGE.to_string(),
+    }
+}
+
+/// The one message this service refuses an `IdentitySourceArn` that addresses no identity
+/// source with.
+///
+/// `ValidationException$Message` is `@required` and the model fixes no text for it, so the
+/// rule is RECORDED behaviour: the refusal of the member that ADDRESSES an identity source
+/// NAMES that member, so a caller sending several ARN-valued members can tell which one
+/// was rejected. The whole sentence is fixed text — nothing in it comes from the request,
+/// and the rejected value is not echoed.
+pub const INVALID_IDENTITY_SOURCE_ARN_MESSAGE: &str = "Invalid IdentitySourceArn.";
+
+/// The `ValidationException` (400) an `IdentitySourceArn` that addresses no identity
+/// source ([`addresses_identity_source`]) is refused with:
+/// [`INVALID_IDENTITY_SOURCE_ARN_MESSAGE`]. Raised by both operations that read the
+/// member, so they cannot word one refusal two ways.
+#[must_use]
+pub fn invalid_identity_source_arn() -> ValidationException {
+    ValidationException {
+        message: INVALID_IDENTITY_SOURCE_ARN_MESSAGE.to_string(),
     }
 }
 

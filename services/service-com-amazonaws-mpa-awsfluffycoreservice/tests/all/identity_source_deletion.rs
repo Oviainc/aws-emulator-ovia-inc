@@ -12,8 +12,8 @@
 //! authenticate through is `ConflictException` (409); an ARN outside the caller's account
 //! is `AccessDeniedException` (403), decided before the source is resolved; and a value
 //! that is not an ARN of this service's identity-source resource — the kind of ARN the
-//! member addresses — is `ValidationException` (400), decided before the account boundary
-//! and before anything is looked up.
+//! member addresses, down to the form of the resource id — is `ValidationException` (400),
+//! decided before the account boundary and before anything is looked up.
 //!
 //! The tables below span that class along what the rule generalises over: the stored
 //! source's status when the delete is issued (`CREATING` and `ACTIVE`, the two statuses a
@@ -333,10 +333,10 @@ async fn deleting_an_identity_source_that_is_not_stored_changes_nothing() {
 
     let account = engine::emulator_account_id();
     // (case, the ARN asked for). Every row IS an ARN of this service's identity-source
-    // resource in the caller's OWN account — the only values that reach the lookup at all —
-    // and differs along what the store holds nothing under: an id never minted, a region
-    // nothing was created in, the whole resource-id character class, and the longest id a
-    // conforming request can carry.
+    // resource in the caller's OWN account, carrying an id in the form this service mints —
+    // the only values that reach the lookup at all — and differs along what the store holds
+    // nothing under: an id never minted, a region nothing was created in, an id body of
+    // letters and digits, and the longest id a conforming request can carry.
     let rows: [(&str, String); 5] = [
         (
             "an identity-source id this account never minted",
@@ -347,10 +347,10 @@ async fn deleting_an_identity_source_that_is_not_stored_changes_nothing() {
             format!("arn:aws:mpa:eu-west-1:{account}:identity-source/ids-000000000001"),
         ),
         (
-            // `[a-zA-Z0-9._-]+` is the resource-id class this service's ARN patterns
-            // declare (`ApprovalTeamArn`'s own pattern).
-            "an id spanning the resource-id character class",
-            format!("arn:aws:mpa:{REGION}:{account}:identity-source/Ids.000_000-9"),
+            // The id's body is letters and digits, the class the form this service mints
+            // admits (`identity_source_id_form.rs` tables the form itself).
+            "a minted-form id whose body carries letters",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/ids-a1b2c3"),
         ),
         (
             // `aws(-[^:]+)?` in the same pattern admits every suffixed partition.
@@ -585,9 +585,10 @@ async fn an_identity_source_outside_the_callers_account_is_denied_before_resolut
 
 /// `IdentitySourceArn` carries no ARN pattern of its own (`length(max: 1000)` only), so a
 /// value that is not an ARN of this service's identity-source resource — the kind of ARN
-/// the member addresses — is refused by this service's malformed-ARN rule:
-/// `ValidationException` (400) with [`state::INVALID_ARN_MESSAGE`], decided before the
-/// account boundary and before anything is looked up.
+/// the member addresses, down to the form of its resource id — is refused with the
+/// sentence that names the member it rejected:
+/// `ValidationException` (400) with [`state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE`],
+/// decided before the account boundary and before anything is looked up.
 #[tokio::test]
 async fn a_malformed_identity_source_arn_is_refused() {
     let harness = Harness::new();
@@ -598,7 +599,7 @@ async fn a_malformed_identity_source_arn_is_refused() {
     // `arn:<partition>:mpa:<region>:<account>:identity-source/<id>` the value misses: the
     // ARN syntax itself, the partition, the service namespace, the region, the account,
     // the resource kind and the resource id.
-    let rows: [(&str, String); 18] = [
+    let rows: [(&str, String); 20] = [
         ("no colons at all", "not-an-arn".to_string()),
         (
             "an identity source's id, not its ARN",
@@ -672,6 +673,19 @@ async fn a_malformed_identity_source_arn_is_refused() {
             "a resource id outside the id character class",
             format!("arn:aws:mpa:{REGION}:{account}:identity-source/ids~1"),
         ),
+        (
+            // An identity-source id is minted by this service, so a value outside that
+            // form is no id this service could have issued.
+            "a uuid-shaped resource id",
+            format!(
+                "arn:aws:mpa:{REGION}:{account}:identity-source/\
+                 0f5e0119-ab78-418e-b630-3b421ab2fd6f"
+            ),
+        ),
+        (
+            "a resource id spanning the resource-id character class",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/Ids.000_000-9"),
+        ),
     ];
 
     for (case, value) in rows {
@@ -687,8 +701,8 @@ async fn a_malformed_identity_source_arn_is_refused() {
         );
         assert_eq!(
             text(&body, "Message"),
-            state::INVALID_ARN_MESSAGE,
-            "case {case:?}: expected the malformed-ARN message, got {body:?}"
+            state::INVALID_IDENTITY_SOURCE_ARN_MESSAGE,
+            "case {case:?}: expected the member-named refusal, got {body:?}"
         );
     }
 
