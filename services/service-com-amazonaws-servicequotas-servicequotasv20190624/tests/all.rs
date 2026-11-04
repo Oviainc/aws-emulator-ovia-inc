@@ -55,6 +55,8 @@ mod default_quota_rows_under_aws_codes;
 mod error_envelope;
 #[path = "all/history_filter_chain.rs"]
 mod history_filter_chain;
+#[path = "all/integrated_service_display_names.rs"]
+mod integrated_service_display_names;
 #[path = "all/no_such_quota_wording.rs"]
 mod no_such_quota_wording;
 #[path = "all/no_such_service_wording.rs"]

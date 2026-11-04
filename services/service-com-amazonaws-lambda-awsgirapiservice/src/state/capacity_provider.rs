@@ -118,31 +118,32 @@ pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
      and permissions and try again.";
 
 /// Whether IAM ANSWERED that `operator_role_arn` is a role this service cannot manage a
-/// provider's compute as: this account's IAM holds no role under the name the ARN carries,
-/// or the trust policy of the role it does hold does not let this service assume it — the
+/// provider's compute as: this account's IAM HOLDS a role under the name the ARN carries,
+/// and the trust policy of that stored role does not let this service assume it — the
 /// create is then refused with [`OPERATOR_ROLE_INVALID_MESSAGE`] and nothing is stored.
 ///
-/// "This account's IAM holds no role under that name" IS an answer about the role the
-/// caller named here, because the role a provider manages compute as is part of what the
-/// client provisions in this account, and this operation is recorded refusing an operator
-/// role that does not exist. That is what separates this reading from the one a function's
-/// EXECUTION role takes ([`super::execution_role_is_unassumable`]), where an absent record
-/// is evidence about this emulator's store rather than about the role: an execution role is
-/// routinely provisioned out of band. Both are readings of the ONE shared question
-/// (`service_common::iam_role`), so neither restates which role of this account an ARN
-/// names, how IAM is asked, or how a trust document is read.
+/// It is the reading of the ONE shared question (`service_common::iam_role`) a function's
+/// EXECUTION role takes as well ([`super::execution_role_is_unassumable`]), and the one the
+/// cross-service suite `core/router/tests/all/lambda_capacity_provider_operator_role.rs`
+/// pins over its table of trust documents: a name this account's IAM holds no role under is
+/// evidence about this emulator's store rather than about the role the caller named — the
+/// role a provider manages compute as is normally provisioned outside the client that
+/// creates the provider — so a refusal has to be grounded in a trust document IAM answered
+/// with. Neither reading restates which role of this account an ARN names, how IAM is
+/// asked, or how a trust document is read.
 ///
 /// `false` — do not refuse — wherever nothing is KNOWN: a value that names no role of THIS
-/// account (another account's IAM is not this emulator's to ask), an emulator with no IAM
-/// mounted to ask at all, and an answer this emulator could not read. The principal that has
-/// to be admitted is the one a function's execution role admits
+/// account (another account's IAM is not this emulator's to ask), a name this account's IAM
+/// holds no role under, an emulator with no IAM mounted to ask at all, and an answer this
+/// emulator could not read. The principal that has to be admitted is the one a function's
+/// execution role admits
 /// ([`super::EXECUTION_ROLE_PRINCIPAL`]): this service is what assumes both.
 pub async fn operator_role_is_unassumable(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     operator_role_arn: &str,
 ) -> bool {
-    ::service_common::iam_role::role_is_unassumable(
+    ::service_common::iam_role::held_role_is_unassumable(
         ctx,
         region,
         operator_role_arn,

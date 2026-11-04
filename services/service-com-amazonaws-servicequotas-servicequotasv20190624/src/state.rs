@@ -3296,7 +3296,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // account-wide.
         service(
             "b2bi",
-            "AWS B2B Data Interchange",
+            "B2B Data Interchange",
             // The VALUE is documented: b2bi's own `CreateProfile` states "You can have
             // up to five customer profiles, each representing a distinct private
             // network", and the b2bi emulator enforces exactly this number. No
@@ -4368,9 +4368,26 @@ pub(crate) fn vcpu_group_classes() -> impl Iterator<Item = &'static str> {
 /// 1..63, pattern `^[a-zA-Z][a-zA-Z0-9-]{1,63}$`), which `tests/all/
 /// default_quota_catalog.rs` pins over the whole table.
 ///
+/// THE RULE ABOUT THE SECOND HALF OF A PAIR. A row's `ServiceName` is the display
+/// name the integrated-service inventory reports FOR THAT CODE, as it reports it:
+///
+/// * it is that code's own name, never a neighbouring code's — two codes of one
+///   product family (`autoscaling`/`autoscaling-plans`, `connect`/`connect-campaigns`,
+///   `cloudwatch`/`monitoring`) each carry their own;
+/// * it is reproduced verbatim, including a prefix the inventory omits, the case it
+///   uses for a product name and a parenthesised code, rather than normalised into
+///   the console's product name;
+/// * it is NEVER the `ServiceCode` echoed back, except for a code whose display name
+///   no source available here states (the tail of this table) — a stand-in that the
+///   name of no AWS product, and no string derived from the code, could replace
+///   faithfully.
+///
 /// This is the catalog's ONE source: [`seed_services`] builds the `ListServices`
 /// listing from it and nothing else decides which codes exist, so the set of codes
-/// that list and the set that resolve can never drift apart.
+/// that list and the set that resolve can never drift apart — and
+/// `ComAmazonawsServicequotasServicequotasv20190624State::service_name` reads this
+/// one table for every `ServiceQuota.ServiceName` the quota listings report, so the
+/// display name a client discovers here is the one every later row carries.
 ///
 /// The order here is only for reading; the catalog is stored in a `BTreeMap`, so
 /// `ListServices` pages it in `ServiceCode` order whatever order this table is in.
@@ -4399,17 +4416,25 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("athena", "Amazon Athena"),
     ("auditmanager", "AWS Audit Manager"),
     ("autoscaling", "Amazon EC2 Auto Scaling"),
-    ("autoscaling-plans", "AWS Auto Scaling"),
+    // The scaling-plan service's own display name, which is NOT the one the
+    // `autoscaling` code carries: a code's `ServiceName` is its own service's name,
+    // never a neighbouring code's.
+    ("autoscaling-plans", "AWS Auto Scaling Plans"),
     ("aws-marketplace", "AWS Marketplace"),
-    ("b2bi", "AWS B2B Data Interchange"),
+    // Listed under the product name alone: the inventory carries no `AWS` prefix on
+    // this code's display name.
+    ("b2bi", "B2B Data Interchange"),
     ("backup", "AWS Backup"),
     ("batch", "AWS Batch"),
     ("bedrock", "Amazon Bedrock"),
+    ("bedrock-agentcore", "Amazon Bedrock AgentCore"),
+    ("bedrock-websearch", "Amazon Bedrock Web Search"),
     ("braket", "Amazon Braket"),
     ("cases", "Amazon Connect Cases"),
     ("cassandra", "Amazon Keyspaces (for Apache Cassandra)"),
     ("chime", "Amazon Chime"),
     ("cleanrooms", "AWS Clean Rooms"),
+    ("cleanrooms-ml", "AWS Clean Rooms ML"),
     ("cloud9", "AWS Cloud9"),
     ("cloudformation", "AWS CloudFormation"),
     ("cloudfront", "Amazon CloudFront"),
@@ -4417,7 +4442,11 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("cloudsearch", "Amazon CloudSearch"),
     ("cloudshell", "AWS CloudShell"),
     ("cloudtrail", "AWS CloudTrail"),
-    ("cloudwatch", "Amazon CloudWatch"),
+    // Amazon CloudWatch itself is integrated under the `monitoring` code (its API's
+    // own endpoint prefix); the `cloudwatch` code names the CloudWatch Omni plane,
+    // which is the display name the inventory reports for it.
+    ("cloudwatch", "Amazon CloudWatch Omni"),
+    ("cloudwatchpredictions", "Amazon CloudWatch Anomaly Detection"),
     ("codeartifact", "AWS CodeArtifact"),
     ("codebuild", "AWS CodeBuild"),
     ("codecatalyst", "Amazon CodeCatalyst"),
@@ -4433,7 +4462,9 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("comprehendmedical", "Amazon Comprehend Medical"),
     ("config", "AWS Config"),
     ("connect", "Amazon Connect"),
-    ("connect-campaigns", "Amazon Connect Outbound Campaigns"),
+    // The inventory reports this one with the product name in lower case after the
+    // service's own name, which is the string this catalog publishes for it.
+    ("connect-campaigns", "Amazon Connect outbound campaigns"),
     ("controltower", "AWS Control Tower"),
     ("databrew", "AWS Glue DataBrew"),
     ("dataexchange", "AWS Data Exchange"),
@@ -4700,16 +4731,20 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("agent-registry", "AWS Agent Registry"),
     ("aidevops", "AWS DevOps Agent"),
     ("aiops", "Amazon AI Operations"),
+    // The inventory names this one with the code it is integrated under spelled out
+    // after the product name, which is the whole string it reports as the display
+    // name.
+    ("airflow-serverless", "Amazon MWAA Serverless (airflow-serverless)"),
+    ("aws-mcp", "AWS MCP"),
+    // The display name the inventory reports for this code is another service's code
+    // rather than a product name. It is still the `ServiceName` of this code, so it
+    // is published as reported rather than tidied into a product name.
+    ("axis", "sagemaker-geospatial"),
     // AWS's catalog reports these service codes too, but this emulator has no
     // published display name it can cite for them (they are recent launches). The
     // code is reported as the name rather than inventing one: `ServiceCode` — the
     // member every other operation keys on, and the one the model constrains — stays
     // exactly AWS's, and nothing downstream reads `ServiceName`.
-    ("airflow-serverless", "airflow-serverless"),
-    ("aws-mcp", "aws-mcp"),
-    ("axis", "axis"),
-    ("bedrock-websearch", "bedrock-websearch"),
-    ("cloudwatchpredictions", "cloudwatchpredictions"),
     ("eks-mcp", "eks-mcp"),
     ("elemental-inference", "elemental-inference"),
     ("health-agent", "health-agent"),

@@ -564,7 +564,7 @@ async fn the_b2bi_profile_quota_publishes_the_documented_limit() {
     );
     assert_eq!(
         profiles["ServiceName"],
-        json!("AWS B2B Data Interchange"),
+        json!("B2B Data Interchange"),
         "case b2bi: the catalogue must name the service, got {profiles}"
     );
     assert_eq!(
