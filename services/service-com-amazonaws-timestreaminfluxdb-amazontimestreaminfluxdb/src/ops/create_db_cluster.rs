@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDbCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDbCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a Timestream for InfluxDB cluster and the DB instances its nodes are.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDbCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A cluster is a COMPOSITE resource: this handler provisions one DB instance per node
+//! of the composition its DB parameter group describes, into the same store every
+//! DB-instance operation reads, and the cluster reaches `AVAILABLE` only once those
+//! nodes have.
 //!
 //! ## Shape of an operation
 //!
@@ -219,18 +216,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDbCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDbClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDbCluster"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateDbClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+
+        // The store is bounded: past the emulator's own cardinality bound a create is
+        // refused with the modelled quota error instead of growing the state without end.
+        if state.db_clusters.len() >= st::DB_CLUSTER_QUOTA {
+            return Err(CreateDbClusterErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the maximum of {} DB clusters this emulator stores has been \
+                         reached",
+                        st::DB_CLUSTER_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // DB cluster names are unique per customer and PER REGION (see `name` in the
+        // modeled contract above), so a second create under a live name in the same
+        // region conflicts, while the same name in another region is a new cluster.
+        if let Some(existing_id) = state.db_cluster_id_for_name(&region, &input.name) {
+            return Err(CreateDbClusterErrorModeled::ConflictException(ConflictException {
+                message: format!("DB cluster {} already exists", input.name),
+                resource_id: existing_id.clone(),
+                resource_type: st::RESOURCE_TYPE_DB_CLUSTER.to_string(),
+            })
+            .into());
+        }
+
+        // `dbParameterGroupIdentifier` is the id of the group to assign to the cluster,
+        // and the input references the DB parameter group resource — so a create naming
+        // a group nothing resolves is refused rather than configured by nothing. A
+        // service-managed group is one this account and Region has without anyone
+        // creating it, so it resolves too.
+        let parameters = match input.db_parameter_group_identifier.as_deref() {
+            None => None,
+            Some(identifier) => Some(match st::service_managed_db_parameter_group(identifier) {
+                Some(group) => group.parameters.clone(),
+                None => match state.db_parameter_groups.get(identifier) {
+                    Some(group) => group.parameters.clone(),
+                    None => {
+                        return Err(CreateDbClusterErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: format!("DB parameter group {identifier} not found"),
+                                resource_id: identifier.to_string(),
+                                resource_type: st::RESOURCE_TYPE_DB_PARAMETER_GROUP.to_string(),
+                            },
+                        )
+                        .into())
+                    }
+                },
+            }),
+        };
+
+        // The engine, the default port and the node composition all follow from the
+        // parameters of the group applied to the cluster. The id is minted before the
+        // node set because each node's service-generated name carries it; a create
+        // refused below stores nothing, it only leaves the id sequence advanced.
+        let engine_type = st::engine_type(parameters.as_ref());
+        let cluster_configuration = st::cluster_configuration(parameters.as_ref());
+        let id = state.mint_db_cluster_id(&input.name, &region);
+        let nodes = st::cluster_nodes(&input.name, &id, &cluster_configuration);
+
+        // A cluster's nodes are DB instances in the same bounded store, so the same
+        // bound refuses a cluster the store has no room for.
+        if state.db_instances.len() + nodes.len() > st::DB_INSTANCE_QUOTA {
+            return Err(CreateDbClusterErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the maximum of {} DB instances for this account and Region has \
+                         been reached",
+                        st::DB_INSTANCE_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every node's name is a DB instance name, and those are unique per customer and
+        // per region too. Checked for all of them BEFORE anything is stored, so a
+        // refused create persists neither the cluster nor part of its node set.
+        for node in &nodes {
+            if let Some(existing_id) = state.db_instance_id_for_name(&region, &node.name) {
+                return Err(CreateDbClusterErrorModeled::ConflictException(ConflictException {
+                    message: format!("DB instance {} already exists", node.name),
+                    resource_id: existing_id.clone(),
+                    resource_type: st::RESOURCE_TYPE_DB_INSTANCE.to_string(),
+                })
+                .into());
+            }
+        }
+
+        let (endpoint, reader_endpoint) = st::db_cluster_endpoints(&input.name, &id, &region);
+        let mut cluster = st::DbCluster {
+            arn: st::db_cluster_arn(&region, &id),
+            endpoint,
+            reader_endpoint,
+            influx_auth_parameters_secret_arn: st::influx_auth_parameters_secret_arn(&region, &id),
+            // A freshly created cluster is provisioning; the clock settles it to
+            // AVAILABLE one transition span after the nodes it provisions are ready.
+            status: st::CLUSTER_STATUS_CREATING.to_string(),
+            settles_at: Some(now + st::CLUSTER_TRANSITION_SPAN),
+            created_at: now,
+            name: input.name.clone(),
+            region: region.clone(),
+            // Absent a choice the cluster is of the only type the model declares.
+            deployment_type: input
+                .deployment_type
+                .unwrap_or_else(|| st::CLUSTER_DEPLOYMENT_TYPE_READ_REPLICAS.to_string()),
+            db_instance_type: input.db_instance_type,
+            network_type: input.network_type,
+            db_storage_type: input.db_storage_type,
+            allocated_storage: input
+                .allocated_storage
+                .unwrap_or(st::DEFAULT_ALLOCATED_STORAGE),
+            port: input.port.unwrap_or_else(|| st::default_port(engine_type)),
+            engine_type: engine_type.to_string(),
+            publicly_accessible: input.publicly_accessible,
+            db_parameter_group_identifier: input.db_parameter_group_identifier.clone(),
+            effective_db_parameter_group_identifier: input.db_parameter_group_identifier,
+            vpc_subnet_ids: input.vpc_subnet_ids,
+            vpc_security_group_ids: input.vpc_security_group_ids,
+            // Absent a choice the cluster recovers from a primary-node failure itself.
+            failover_mode: input
+                .failover_mode
+                .unwrap_or_else(|| st::FAILOVER_MODE_AUTOMATIC.to_string()),
+            cluster_configuration,
+            log_delivery_configuration: input.log_delivery_configuration,
+            maintenance_schedule: input.maintenance_schedule,
+            db_backup_configurations: input.db_backup_configurations,
+            kms_key_id: input.kms_key_id,
+            username: input.username,
+            organization: input.organization,
+            bucket: input.bucket,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            db_instance_ids: Vec::new(),
+            id: id.clone(),
+        };
+
+        // Provision the cluster's nodes: real DB instances in the shared store, each
+        // carrying the cluster it belongs to and the roles it takes in it. They are all
+        // started here, so the whole node level settles over one span.
+        for node in &nodes {
+            let node_id = state.mint_db_instance_id(&node.name, &region);
+            let record = cluster.node_instance(node, &node_id, now);
+            state.claim_db_instance_name(&region, &node.name, node_id.clone());
+            cluster.db_instance_ids.push(node_id.clone());
+            state.db_instances.insert(node_id, record);
+        }
+
+        let output = CreateDbClusterOutput {
+            db_cluster_id: Some(cluster.id.clone()),
+            db_cluster_status: Some(cluster.status.clone()),
+        };
+        state.claim_db_cluster_name(&region, &cluster.name, id.clone());
+        state.db_clusters.insert(id, cluster);
+        Ok(output)
     }
 }

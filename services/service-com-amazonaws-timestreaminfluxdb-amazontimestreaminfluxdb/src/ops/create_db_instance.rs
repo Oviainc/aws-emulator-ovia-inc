@@ -346,6 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             organization: input.organization,
             bucket: input.bucket,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // This operation creates a standalone DB instance: one that belongs to no
+            // DB cluster and so takes no role in one.
+            cluster: None,
             id: id.clone(),
         };
 

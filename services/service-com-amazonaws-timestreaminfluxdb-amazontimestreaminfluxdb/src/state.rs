@@ -17,6 +17,13 @@ use crate::ops::types::{
     InfluxDBv3EnterpriseParameters, LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
 };
 
+/// The DB-cluster records and the helpers the cluster operations share. A cluster
+/// provisions the DB instances its nodes are, so its slice of the state lives beside
+/// this one and reaches the same [`DbInstance`] records.
+mod clusters;
+
+pub use clusters::*;
+
 /// `Status` values this service's records use, each one a member of
 /// `crate::ops::types::STATUS_VALUES` (the modelled `Status` enum).
 pub const STATUS_CREATING: &str = "CREATING";
@@ -128,9 +135,31 @@ pub struct DbInstance {
     pub organization: Option<String>,
     pub bucket: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// What this instance is inside the DB cluster that provisioned it, or `None` for a
+    /// standalone instance that belongs to no cluster.
+    pub cluster: Option<DbInstanceClusterRole>,
     pub created_at: SystemTime,
     /// When the clock owes this record its settle to `AVAILABLE`; `None` once settled.
     pub settles_at: Option<SystemTime>,
+}
+
+/// A DB instance's place in the DB cluster that provisioned it: which cluster, and the
+/// roles the instance takes in it.
+#[derive(Debug, Clone)]
+pub struct DbInstanceClusterRole {
+    pub db_cluster_id: String,
+    /// The roles this instance takes, each one a member of
+    /// `crate::ops::types::INSTANCE_MODE_VALUES` (the modelled `InstanceMode` enum).
+    /// Never empty.
+    pub instance_modes: Vec<String>,
+}
+
+impl DbInstanceClusterRole {
+    /// The single role `instanceMode` reports: the instance's first role, where
+    /// `instanceModes` reports every one of them.
+    pub fn instance_mode(&self) -> Option<String> {
+        self.instance_modes.first().cloned()
+    }
 }
 
 impl DbInstance {
@@ -176,19 +205,30 @@ impl DbInstance {
     /// the backup operations, which are not implemented, so this emulator reports no
     /// time for a backup nothing has scheduled.
     fn backup_configurations_output(&self) -> Option<Vec<DbBackupConfigurationOutput>> {
-        self.db_backup_configurations.as_ref().map(|configs| {
-            configs
-                .iter()
-                .map(|config| DbBackupConfigurationOutput {
-                    r#type: config.r#type.clone(),
-                    retention_days: config.retention_days,
-                    enabled: config.enabled,
-                    custom_schedule: config.custom_schedule.clone(),
-                    next_automated_backup_time: None,
-                })
-                .collect()
-        })
+        backup_configurations_output(&self.db_backup_configurations)
     }
+}
+
+/// The stored backup configurations of a resource as the output list shape.
+///
+/// `nextAutomatedBackupTime` stays absent: scheduling automated backups belongs to the
+/// backup operations, which are not implemented, so this emulator reports no time for a
+/// backup nothing has scheduled.
+pub fn backup_configurations_output(
+    configurations: &Option<Vec<DbBackupConfiguration>>,
+) -> Option<Vec<DbBackupConfigurationOutput>> {
+    configurations.as_ref().map(|configs| {
+        configs
+            .iter()
+            .map(|config| DbBackupConfigurationOutput {
+                r#type: config.r#type.clone(),
+                retention_days: config.retention_days,
+                enabled: config.enabled,
+                custom_schedule: config.custom_schedule.clone(),
+                next_automated_backup_time: None,
+            })
+            .collect()
+    })
 }
 
 /// The four DB-instance operations whose output shapes are the same full record.
@@ -226,11 +266,21 @@ macro_rules! db_instance_record_projections {
                         influx_auth_parameters_secret_arn: Some(
                             self.influx_auth_parameters_secret_arn.clone(),
                         ),
-                        // A standalone DB instance belongs to no cluster, so it has no
-                        // cluster id and no in-cluster role to report.
-                        db_cluster_id: None,
-                        instance_mode: None,
-                        instance_modes: None,
+                        // An instance a DB cluster provisioned reports that cluster and
+                        // the roles it takes in it; a standalone instance belongs to no
+                        // cluster, so it reports neither.
+                        db_cluster_id: self
+                            .cluster
+                            .as_ref()
+                            .map(|cluster| cluster.db_cluster_id.clone()),
+                        instance_mode: self
+                            .cluster
+                            .as_ref()
+                            .and_then(DbInstanceClusterRole::instance_mode),
+                        instance_modes: self
+                            .cluster
+                            .as_ref()
+                            .map(|cluster| cluster.instance_modes.clone()),
                         maintenance_schedule: self.maintenance_schedule.clone(),
                         // No maintenance has run and none is scheduled by this slice.
                         last_maintenance_time: None,
@@ -528,6 +578,16 @@ pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     pub db_parameter_group_names: BTreeMap<(String, String), String>,
     /// Monotonic sequence mixed into every minted parameter-group `id`.
     pub db_parameter_group_seq: u64,
+    /// Live DB clusters by their service-generated `id`. Ordered, so `ListDbClusters`
+    /// pages deterministically.
+    pub db_clusters: BTreeMap<String, DbCluster>,
+    /// `(region, name)` -> `id`: the uniqueness index behind `ConflictException` on a
+    /// duplicate cluster name. The key carries the region because the rule the model
+    /// documents is "DB cluster names must be unique per customer and per region", so
+    /// the same name in two regions is two clusters.
+    pub db_cluster_names: BTreeMap<(String, String), String>,
+    /// Monotonic sequence mixed into every minted cluster `id`.
+    pub db_cluster_seq: u64,
 }
 
 impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {

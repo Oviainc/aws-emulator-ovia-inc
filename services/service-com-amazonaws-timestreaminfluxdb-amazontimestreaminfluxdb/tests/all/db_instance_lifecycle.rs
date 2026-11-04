@@ -1150,7 +1150,9 @@ async fn the_operations_outside_this_slice_still_answer_501() {
     for (operation, body) in [
         ("RebootDbInstance", json!({ "identifier": "abc" })),
         ("ListDbClusters", json!({})),
-        ("GetDbCluster", json!({ "dbClusterId": "abc" })),
+        // `GetDbCluster` is implemented beside `CreateDbCluster`; the cluster
+        // operations still scaffolded are these.
+        ("ListDbInstancesForCluster", json!({ "dbClusterId": "abc" })),
         ("ListDbBackups", json!({})),
     ] {
         let (status, answer) = call(&router, operation, body).await;
