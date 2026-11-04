@@ -181,9 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// requested window (else the last hour), most recent first. Each one is reported at the
     /// minute it was recorded for — `InstrumentationStatusEvent.Time` is "the time when the
     /// status was reported, rounded to the nearest minute" — which is also the instant the
-    /// window selects it by. The configuration itself is resolved under the identity the
-    /// request names — a `LocationIdentifier` is "either full code location or a pre-computed
-    /// hash" — and an identity that names no stored configuration is the modelled
+    /// window selects it by, so the window this read DERIVES for itself is stated at that same
+    /// granularity and "the last hour" therefore covers every event reported inside it,
+    /// including one reported in the minute this call falls in (see
+    /// [`crate::state::status_event_window`]). The configuration itself is resolved under the
+    /// identity the request names — a `LocationIdentifier` is "either full code location or a
+    /// pre-computed hash" — and an identity that names no stored configuration is the modelled
     /// `ResourceNotFoundException`; a stored configuration nothing has reported for has an
     /// empty event list, which is not an error.
     async fn handle(

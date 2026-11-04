@@ -143,6 +143,8 @@ mod slo_writer_constraint_wording;
 mod state_roundtrip;
 #[path = "all/stated_instant_rendering.rs"]
 mod stated_instant_rendering;
+#[path = "all/status_event_default_window.rs"]
+mod status_event_default_window;
 #[path = "all/tag_attachment.rs"]
 mod tag_attachment;
 #[path = "all/tag_count_rule.rs"]

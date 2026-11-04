@@ -5361,6 +5361,17 @@ fn paired_member_refusal(absent_member_path: &str, present_member_path: &str) ->
 /// one of them names no window, and neither does one whose window ends before it begins.
 /// `Err` carries the refusal such a request earns.
 ///
+/// A window the REQUEST names is the pair of instants it named, compared exactly as given. The
+/// default window is this read's OWN, derived from its clock, so it is derived in the domain
+/// the events it selects are held at: an event is held at the whole minute nearest the instant
+/// its report named ([`status_event_minute`]), so the default window runs from the minute
+/// nearest an hour ago to the minute nearest now. That is what makes "the last hour" cover
+/// every event whose report named an instant inside it — the held minute is monotone in the
+/// reported instant, so a report in the hour is held no later than the minute nearest now —
+/// including a report of the minute this call falls in, whose minute can be the boundary
+/// AHEAD of the call. Deriving the end as the bare instant instead would leave an event just
+/// reported outside "the last hour" until the clock reached its minute.
+///
 /// Both refusals are worded through the service's one constraint-violation builder
 /// ([`constraint_clause`], under [`validation_envelope`]), so a constraint the model cannot
 /// express and is therefore enforced here names its member path and its requirement exactly
@@ -5374,14 +5385,16 @@ pub fn status_event_window(
     // nanoseconds within them, the same pair the history is keyed by — so one precision model
     // governs the window and the events it selects.
     match (start, end) {
-        (None, None) => Ok((
-            DateTime::from_secs_and_nanos(
-                now.secs()
-                    .saturating_sub(STATUS_EVENT_DEFAULT_WINDOW.as_secs() as i64),
-                now.subsec_nanos(),
-            ),
-            *now,
-        )),
+        (None, None) => {
+            let (end_secs, end_nanos) = status_event_minute(now);
+            Ok((
+                DateTime::from_secs_and_nanos(
+                    end_secs.saturating_sub(STATUS_EVENT_DEFAULT_WINDOW.as_secs() as i64),
+                    end_nanos,
+                ),
+                DateTime::from_secs_and_nanos(end_secs, end_nanos),
+            ))
+        }
         (Some(start), Some(end))
             if status_event_instant(end) >= status_event_instant(start) =>
         {
