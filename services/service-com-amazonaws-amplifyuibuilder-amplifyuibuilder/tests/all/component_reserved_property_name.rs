@@ -12,6 +12,14 @@
 //! `Component$properties`, `$overrides`, `$bindingProperties` and `$collectionProperties`;
 //! `ComponentChild$properties`, at every depth of `children`; and
 //! `ComponentVariant$variantValues` and `$overrides`.
+//!
+//! The fixed rows below span those maps one by one. Because the rule is a refusal that
+//! holds for any payload putting the key in one of them, it is also driven over GENERATED
+//! payloads — random map contents, variant lists and `children` trees — so no tree shape,
+//! list position or nesting depth is left to a hand-written row. The last suite pins the
+//! other side of the rule: a map the model states it for is the only place the key is
+//! refused, so the identically named key in `events` or in a component's own `tags` is an
+//! ordinary key and is stored.
 
 use std::sync::Arc;
 
@@ -208,7 +216,8 @@ fn pointer_of(path: &str) -> String {
     pointer
 }
 
-/// The map a component reports at `path`, or `Null` when it reports none there.
+/// The map a component — a reported one, or the payload a request carried — holds at
+/// `path`, or `Null` when it holds none there.
 fn map_at(component: &Value, path: &str) -> Value {
     component
         .pointer(&pointer_of(path))
@@ -413,6 +422,385 @@ async fn a_reserved_key_is_refused_on_an_update_too() {
         assert_eq!(
             map_at(&get(&router, &id).await.body, path),
             patched,
+            "case {case:?}: GetComponent must report the {path} the update stored"
+        );
+    }
+}
+
+/// How many generated payloads the generated suite judges. Bounded, so this stays a test
+/// rather than a soak.
+const GENERATED_CASES: usize = 48;
+
+/// The base every generated case's seed is derived from, so the suite judges the same
+/// payloads on every run and a reported failure is reproducible.
+const GENERATOR_SEED: u64 = 0x5eed_1234_abcd_ef01;
+
+/// The seeded generator the cases below draw their payloads from: SplitMix64, the mixing
+/// function a 64-bit seed is expanded with.
+///
+/// Written here rather than taken from a generator crate on purpose: a dev-dependency
+/// moves this crate's `Cargo.toml` and the workspace `Cargo.lock`, the two files every
+/// other fix also moves, and this change has to land against a mainline that advances
+/// between submits. Eight lines of arithmetic, nothing on disk, and the seed is a constant
+/// every assertion message names. The same choice is made for the same reason in
+/// `service-com-amazonaws-b2bi-b2bi/tests/all/generate_mapping.rs`.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A value in `0..bound` — every bound here is tiny, so the modulo bias cannot affect
+    /// whether the rule under test holds.
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+}
+
+/// The map shapes the rule covers, as the model targets them
+/// (`smithy_query(query="shape",shape="ComponentProperties,ComponentOverrides,ComponentBindingProperties,ComponentCollectionProperties,ComponentVariantValues")`).
+/// Which one a generated map is decides what an entry in it looks like, so a generated
+/// payload is one the service deserializes and its answer is about the KEY alone.
+#[derive(Clone, Copy, Debug)]
+enum MapKind {
+    /// `ComponentProperties`: each value is a `ComponentProperty`.
+    Properties,
+    /// `ComponentOverrides`: each value is a `ComponentOverridesValue`, a map of strings.
+    Overrides,
+    /// `ComponentBindingProperties`: each value is a `ComponentBindingPropertiesValue`.
+    BindingProperties,
+    /// `ComponentCollectionProperties`: each value is a `ComponentDataConfiguration`,
+    /// whose `model` member is required.
+    CollectionProperties,
+    /// `ComponentVariantValues`: each value is a plain string.
+    VariantValues,
+}
+
+impl MapKind {
+    /// One entry's value, of the shape this map's value member targets.
+    fn entry_value(self, nth: usize) -> Value {
+        match self {
+            MapKind::Properties => json!({"value": format!("value-{nth}")}),
+            MapKind::Overrides => json!({"color": format!("color-{nth}")}),
+            MapKind::BindingProperties => {
+                json!({"type": "String", "defaultValue": format!("default-{nth}")})
+            }
+            MapKind::CollectionProperties => json!({"model": format!("Model{nth}")}),
+            MapKind::VariantValues => json!(format!("variant-{nth}")),
+        }
+    }
+}
+
+/// A map of `kind` carrying ordinary property names only: the base a generated case then
+/// puts one reserved key into.
+fn allowed_map(kind: MapKind, rng: &mut SplitMix64) -> Value {
+    let mut map = serde_json::Map::new();
+    for nth in 0..1 + rng.below(3) {
+        map.insert(format!("p{nth}"), kind.entry_value(nth));
+    }
+    Value::Object(map)
+}
+
+/// A generated `children` list `depth` levels deep, and the path of every
+/// `ComponentChild$properties` map in it, relative to the payload holding the list.
+///
+/// How many siblings a level carries and how deeply the payload nests them is what the
+/// rule generalises over, so both are generated rather than written out.
+fn generated_children(
+    rng: &mut SplitMix64,
+    prefix: &str,
+    depth: usize,
+) -> (Value, Vec<(String, MapKind)>) {
+    let mut maps = Vec::new();
+    let mut children = Vec::new();
+    if depth > 0 {
+        for index in 0..1 + rng.below(2) {
+            let path = format!("{prefix}children[{index}]");
+            let properties = allowed_map(MapKind::Properties, rng);
+            maps.push((format!("{path}.properties"), MapKind::Properties));
+            let (nested, nested_maps) = generated_children(rng, &format!("{path}."), depth - 1);
+            let nested = if nested_maps.is_empty() {
+                None
+            } else {
+                maps.extend(nested_maps);
+                Some(nested)
+            };
+            children.push(child(&format!("Child{index}"), properties, nested));
+        }
+    }
+    (Value::Array(children), maps)
+}
+
+/// A generated payload, and the path of every map in it the rule covers.
+struct Generated {
+    /// The members a create or an update carries.
+    members: Value,
+    /// Every rule-covered map the payload holds, by the path the service names it at.
+    maps: Vec<(String, MapKind)>,
+}
+
+/// One generated payload: the component's own maps, a generated `variants` list and a
+/// generated `children` tree, all carrying ordinary property names.
+fn generated_payload(rng: &mut SplitMix64) -> Generated {
+    let mut members = json!({});
+    let mut maps = Vec::new();
+
+    for (member, kind) in [
+        ("properties", MapKind::Properties),
+        ("overrides", MapKind::Overrides),
+        ("bindingProperties", MapKind::BindingProperties),
+    ] {
+        members[member] = allowed_map(kind, rng);
+        maps.push((member.to_string(), kind));
+    }
+    // `collectionProperties` is the one of the four a payload may leave out.
+    if rng.below(2) == 0 {
+        members["collectionProperties"] = allowed_map(MapKind::CollectionProperties, rng);
+        maps.push((
+            "collectionProperties".to_string(),
+            MapKind::CollectionProperties,
+        ));
+    }
+
+    let mut variants = Vec::new();
+    for index in 0..rng.below(4) {
+        // Both `ComponentVariant` members are optional, so a generated variant carries
+        // either, both or neither.
+        let mut variant = json!({});
+        if rng.below(10) < 7 {
+            variant["variantValues"] = allowed_map(MapKind::VariantValues, rng);
+            maps.push((
+                format!("variants[{index}].variantValues"),
+                MapKind::VariantValues,
+            ));
+        }
+        if rng.below(10) < 7 {
+            variant["overrides"] = allowed_map(MapKind::Overrides, rng);
+            maps.push((format!("variants[{index}].overrides"), MapKind::Overrides));
+        }
+        variants.push(variant);
+    }
+    members["variants"] = Value::Array(variants);
+
+    let depth = rng.below(4);
+    let (children, child_maps) = generated_children(rng, "", depth);
+    if !child_maps.is_empty() {
+        members["children"] = children;
+        maps.extend(child_maps);
+    }
+
+    Generated { members, maps }
+}
+
+/// `members` with the reserved key added to the map it holds at `path`.
+fn with_reserved_key_at(members: &Value, path: &str, kind: MapKind) -> Value {
+    let mut members = members.clone();
+    let map = members
+        .pointer_mut(&pointer_of(path))
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| panic!("the generated payload must hold a map at {path}"));
+    map.insert(RESERVED_PROPERTY_NAME.to_string(), kind.entry_value(0));
+    members
+}
+
+/// Over generated payloads, the reserved key is refused wherever one of the rule's maps
+/// holds it — at any depth of `children`, any position of `variants`, in a map of any
+/// size — and the same payload without it is accepted and reported back from the store,
+/// on the create and on the update alike.
+#[tokio::test]
+async fn the_reserved_key_is_refused_in_a_generated_payload() {
+    for index in 0..GENERATED_CASES {
+        // One seed per case, from the fixed base: the payloads differ case to case and
+        // repeat run to run, and every assertion message carries the seed that built the
+        // case it failed on.
+        let seed = GENERATOR_SEED ^ index as u64;
+        let mut rng = SplitMix64(seed);
+        let generated = generated_payload(&mut rng);
+        let (path, kind) = generated.maps[rng.below(generated.maps.len())].clone();
+        let case = format!("seed {seed}, case {index}: the reserved key in {path} ({kind:?})");
+        let reserved = with_reserved_key_at(&generated.members, &path, kind);
+        let router = emulator();
+
+        // The member the refusal must name: the input member holding the payload, then
+        // the path of the map inside it, so a superstring of the path does not satisfy it.
+        let named_by_the_create = format!("componentToCreate.{path}");
+        let named_by_the_update = format!("updatedComponent.{path}");
+
+        let refused = create(&router, with_members(minimal_create("Generated"), &reserved)).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case}: the create must be refused, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert!(
+            refused.message().contains(&named_by_the_create)
+                && refused.message().contains(RESERVED_PROPERTY_NAME),
+            "case {case}: the refusal must name {named_by_the_create} and the reserved key, got \
+             {:?}",
+            refused.message()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "",
+            "case {case}: a refusal must name no error type, got {:?}",
+            refused.body
+        );
+        let listed = list(&router).await;
+        assert!(
+            listed_ids(&listed).is_empty(),
+            "case {case}: a refused create must store nothing, got {:?}",
+            listed.body
+        );
+
+        // The same payload without the reserved key: accepted, and every rule-covered map
+        // in it reported back exactly as sent.
+        let created = create(
+            &router,
+            with_members(minimal_create("Generated"), &generated.members),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: only the reserved key is refused, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created.id();
+        for (stored_path, _) in &generated.maps {
+            assert_eq!(
+                map_at(&created.body, stored_path),
+                map_at(&generated.members, stored_path),
+                "case {case}: the created component's {stored_path} must be what the create \
+                 carried"
+            );
+        }
+
+        // An update may not introduce the key either, and a refused update leaves the
+        // stored record exactly as the create left it.
+        let stored = get(&router, &id).await.body;
+        let refused = update(&router, &id, reserved.clone()).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case}: the update must be refused, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert!(
+            refused.message().contains(&named_by_the_update)
+                && refused.message().contains(RESERVED_PROPERTY_NAME),
+            "case {case}: the refusal must name {named_by_the_update} and the reserved key, got \
+             {:?}",
+            refused.message()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "",
+            "case {case}: a refusal must name no error type, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            get(&router, &id).await.body,
+            stored,
+            "case {case}: a refused update must leave the stored component alone"
+        );
+
+        // A second generated payload, carrying no reserved key, merges and reads back: the
+        // refusal above is about the key, not about the members the patch carries.
+        let patch = generated_payload(&mut rng);
+
+        let patched = update(&router, &id, patch.members.clone()).await;
+        assert_eq!(
+            patched.status, 200,
+            "case {case}: a patch without the reserved key must be accepted, got {} with {:?}",
+            patched.status, patched.body
+        );
+        let read_back = get(&router, &id).await.body;
+        for (patched_path, _) in &patch.maps {
+            assert_eq!(
+                map_at(&read_back, patched_path),
+                map_at(&patch.members, patched_path),
+                "case {case}: GetComponent must report the {patched_path} the update stored"
+            );
+        }
+    }
+}
+
+/// The maps of a component payload the model documents NO reserved-name rule for, from
+/// `smithy_query(query="shape",shape="Component,ComponentChild")`: `Component$events`,
+/// `ComponentChild$events` and `Component$tags`. Each row is the case name, the path of
+/// the map, the members putting the identically named key in it, and whether
+/// `UpdateComponentData` carries that member at all.
+fn rows_outside_the_rule() -> Vec<(&'static str, &'static str, Value, bool)> {
+    vec![
+        (
+            "the component's own events",
+            "events",
+            json!({"events": {RESERVED_PROPERTY_NAME: {"action": "Amplify.Navigation"}}}),
+            true,
+        ),
+        (
+            "a child's events",
+            "children[0].events",
+            json!({"children": [{
+                "componentType": "Text",
+                "name": "Child",
+                "properties": {"heading": {"value": "ok"}},
+                "events": {RESERVED_PROPERTY_NAME: {"action": "Amplify.Navigation"}},
+            }]}),
+            true,
+        ),
+        (
+            "the component's own tags",
+            "tags",
+            json!({"tags": {RESERVED_PROPERTY_NAME: "yes"}}),
+            false,
+        ),
+    ]
+}
+
+/// A key named like the reserved property is an ordinary key in a map the model states no
+/// rule for: it is stored and reported rather than refused, so the rule reaches exactly
+/// the maps the model documents it for and no further.
+#[tokio::test]
+async fn an_identically_named_key_is_kept_where_the_rule_does_not_reach() {
+    for (case, path, members, on_update) in rows_outside_the_rule() {
+        let router = emulator();
+
+        let created = create(&router, with_members(minimal_create("Outside"), &members)).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: a key named like the reserved property is ordinary in {path}, got {} \
+             with {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            map_at(&created.body, path),
+            map_at(&members, path),
+            "case {case:?}: the created component's {path} must be what the create carried"
+        );
+        let id = created.id();
+        assert_eq!(
+            map_at(&get(&router, &id).await.body, path),
+            map_at(&members, path),
+            "case {case:?}: GetComponent must report the {path} the create stored"
+        );
+
+        if !on_update {
+            continue;
+        }
+        let patched_id = create(&router, minimal_create("OutsideUpdated")).await.id();
+        let patched = update(&router, &patched_id, members.clone()).await;
+        assert_eq!(
+            patched.status, 200,
+            "case {case:?}: an update may carry that key in {path}, got {} with {:?}",
+            patched.status, patched.body
+        );
+        assert_eq!(
+            map_at(&get(&router, &patched_id).await.body, path),
+            map_at(&members, path),
             "case {case:?}: GetComponent must report the {path} the update stored"
         );
     }
