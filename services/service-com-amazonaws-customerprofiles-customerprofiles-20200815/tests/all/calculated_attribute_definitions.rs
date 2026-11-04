@@ -41,13 +41,18 @@ const STATISTICS: [&str; 9] = [
 /// The sentence the service refuses a create of an already-existing calculated attribute
 /// with: fixed text whose only variable part is the contested name, taken from the
 /// request's `{CalculatedAttributeName}` path label.
-fn exists_message(name: &str) -> String {
+pub(crate) fn exists_message(name: &str) -> String {
     format!("Calculated attribute definition with name {name} already exists")
 }
 
 /// `CreateCalculatedAttributeDefinition` over the wire:
 /// `POST /domains/{DomainName}/calculated-attributes/{CalculatedAttributeName}`.
-async fn create(emulator: &Emulator, domain: &str, name: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create(
+    emulator: &Emulator,
+    domain: &str,
+    name: &str,
+    body: Value,
+) -> (u16, Value) {
     emulator
         .post(
             &format!("/domains/{domain}/calculated-attributes/{name}"),
@@ -58,7 +63,7 @@ async fn create(emulator: &Emulator, domain: &str, name: &str, body: Value) -> (
 
 /// `GetCalculatedAttributeDefinition` over the wire:
 /// `GET /domains/{DomainName}/calculated-attributes/{CalculatedAttributeName}`.
-async fn get(emulator: &Emulator, domain: &str, name: &str) -> (u16, Value) {
+pub(crate) async fn get(emulator: &Emulator, domain: &str, name: &str) -> (u16, Value) {
     emulator
         .send(
             "GET",
@@ -70,7 +75,7 @@ async fn get(emulator: &Emulator, domain: &str, name: &str) -> (u16, Value) {
 
 /// `ListCalculatedAttributeDefinitions` over the wire:
 /// `GET /domains/{DomainName}/calculated-attributes`, with any query string appended.
-async fn list(emulator: &Emulator, domain: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn list(emulator: &Emulator, domain: &str, query: &str) -> (u16, Value) {
     emulator
         .send(
             "GET",
@@ -82,7 +87,7 @@ async fn list(emulator: &Emulator, domain: &str, query: &str) -> (u16, Value) {
 
 /// The `CalculatedAttributeName`s a `ListCalculatedAttributeDefinitions` response reports,
 /// in the order it reported them.
-fn item_names(body: &Value) -> Vec<String> {
+pub(crate) fn item_names(body: &Value) -> Vec<String> {
     body.get("Items")
         .and_then(Value::as_array)
         .map(|items| {
@@ -102,7 +107,7 @@ fn item_names(body: &Value) -> Vec<String> {
 /// An `AttributeDetails`: the attribute items named in the expression, and the expression
 /// itself, which follows the structure `AttributeDetails$Expression` documents
 /// (`{ObjectTypeName.AttributeName}`).
-fn attribute_details(object_type: &str, attributes: &[&str]) -> Value {
+pub(crate) fn attribute_details(object_type: &str, attributes: &[&str]) -> Value {
     json!({
         "Attributes": attributes
             .iter()
@@ -117,7 +122,7 @@ fn attribute_details(object_type: &str, attributes: &[&str]) -> Value {
 }
 
 /// The smallest request the model accepts: the two required body members.
-fn definition(statistic: &str) -> Value {
+pub(crate) fn definition(statistic: &str) -> Value {
     json!({
         "AttributeDetails": attribute_details("Orders", &["Amount"]),
         "Statistic": statistic,

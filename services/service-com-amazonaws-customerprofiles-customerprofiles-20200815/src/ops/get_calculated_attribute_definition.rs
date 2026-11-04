@@ -181,9 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .calculated_attributes
             .get(&input.calculated_attribute_name)
             .ok_or_else(|| {
-                not_found(format!(
-                    "The calculated attribute {} does not exist in domain {}",
-                    input.calculated_attribute_name, input.domain_name
+                not_found(crate::state::calculated_attribute_not_found(
+                    &input.calculated_attribute_name,
                 ))
             })?;
 

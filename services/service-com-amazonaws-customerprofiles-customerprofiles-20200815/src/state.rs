@@ -1591,6 +1591,17 @@ pub fn recommender_schema_not_found(domain_name: &str, recommender_schema_name: 
     )
 }
 
+/// The `ResourceNotFoundException` message for a calculated attribute definition a domain
+/// does not hold, as the service words that refusal: the fixed sentence naming the
+/// resource kind and "not found", whose only variable part is the name the request's
+/// `{CalculatedAttributeName}` label carried. It is the sibling of the already-exists
+/// sentence `CreateCalculatedAttributeDefinition` refuses a held name with, and shared by
+/// every operation addressing one definition, so the same absent name reads the same
+/// whichever of them was called.
+pub fn calculated_attribute_not_found(calculated_attribute_name: &str) -> String {
+    format!("Calculated attribute definition with name {calculated_attribute_name} not found")
+}
+
 /// One recommender schema's `RecommenderSchemaArn`: this service's ARN namespace, the
 /// region the schema was created in, and the domain-scoped resource path the schema is
 /// addressed by — the same path its operations are bound to.

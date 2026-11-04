@@ -15,6 +15,8 @@
 mod batch_get_profile;
 #[path = "all/calculated_attribute_definitions.rs"]
 mod calculated_attribute_definitions;
+#[path = "all/delete_calculated_attribute_definition.rs"]
+mod delete_calculated_attribute_definition;
 #[path = "all/delete_profile_object_type.rs"]
 mod delete_profile_object_type;
 #[path = "all/domain_profile_lifecycle.rs"]
