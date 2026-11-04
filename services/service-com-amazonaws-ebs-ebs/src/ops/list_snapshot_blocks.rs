@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
             .unwrap_or(0);
 
-        let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
+        let Some(snapshot) = store
+            .snapshots
+            .get(&input.snapshot_id)
+            .filter(|snapshot| snapshot.is_readable())
+        else {
             // A value that is not even shaped like a snapshot id is a malformed
             // parameter, not a snapshot the service does not hold.
             if !crate::state::is_well_formed_snapshot_id(&input.snapshot_id) {
@@ -204,6 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
+            // The READ path sees only a snapshot whose content is final
+            // ([`crate::state::Snapshot::is_readable`]): a snapshot still being written,
+            // and one its `Timeout` cancelled, resolve to nothing here exactly as an id
+            // no snapshot was ever minted for does. Reporting one of those as an empty
+            // 200 would say the snapshot exists and holds no block, which is how a caller
+            // decides a half-written snapshot is complete.
             return Err(not_found(crate::state::snapshot_not_found_message(
                 &input.snapshot_id,
             )));

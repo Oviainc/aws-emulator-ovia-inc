@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared rule for naming the operation a request ADDRESSES from its own `@http`
+# binding, which is how the routes whose `@required` header/query members the REST router
+# keys on are served (see `src/service.rs`).
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -27,6 +31,12 @@ sha2 = { workspace = true }
 # Snapshot ids are lowercase hex (`^snap-[0-9a-f]+$`), and so is every opaque token this
 # service mints for a caller to hand back in a URI query.
 hex = { workspace = true }
+# `StartSnapshot` resolves the `KmsKeyArn` it is given through the KMS endpoint of this
+# same emulator, over the in-process transport the operation callback hands out.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The request identifier a relayed dependent-service refusal names, for an answer that
+# carried none of its own.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

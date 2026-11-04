@@ -20,6 +20,11 @@
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `e…` span are both regions concurrently landing suites add
+// their line to.
+#[path = "all/ebs_start_snapshot_resolves_its_kms_key.rs"]
+mod ebs_start_snapshot_resolves_its_kms_key;
+// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `s…` span (where every sqs suite lands) are both regions
 // concurrently landing suites add their line to.
 #[path = "all/sqs_queue_policy_governs_cross_service_delivery.rs"]

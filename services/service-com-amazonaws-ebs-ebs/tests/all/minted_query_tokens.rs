@@ -28,8 +28,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::snapshot_block_loop::{
-    block_bytes, checksum, list_blocks, listed_blocks, router, send, start_snapshot,
-    write_snapshot, Reply, BLOCK_SIZE,
+    block_bytes, checksum, complete_snapshot, list_blocks, listed_blocks, router, send,
+    start_snapshot, write_snapshot, Reply, BLOCK_SIZE,
 };
 
 /// Whether every byte of `value` is unreserved in a URI (RFC 3986 §2.3: `ALPHA / DIGIT /
@@ -101,6 +101,9 @@ const FIXTURES: &[Fixture] = &[
 
 /// Store `fixture`'s blocks and return the id of the snapshot whose tokens are under
 /// test: the written snapshot itself, or the child that inherited its blocks.
+///
+/// A child is sealed before it is read: the read path sees only a snapshot whose content
+/// is final, and the child wrote nothing of its own, so its `ChangedBlocksCount` is zero.
 async fn stored_snapshot(router: &MultiServiceRouter, fixture: &Fixture) -> String {
     let parent = write_snapshot(router, fixture.case, fixture.volume_size, fixture.blocks).await;
     if !fixture.inherited {
@@ -118,12 +121,21 @@ async fn stored_snapshot(router: &MultiServiceRouter, fixture: &Fixture) -> Stri
         started.status,
         String::from_utf8_lossy(&started.body)
     );
-    started
+    let child = started
         .json()
         .get("SnapshotId")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
-        .to_string()
+        .to_string();
+    let sealed = complete_snapshot(router, &child, 0).await;
+    assert_eq!(
+        sealed.status, 202,
+        "case {:?}: CompleteSnapshot on the child must answer 202, got {} with body {}",
+        fixture.case,
+        sealed.status,
+        String::from_utf8_lossy(&sealed.body)
+    );
+    child
 }
 
 /// `GetSnapshotBlock` with `query` used as the request's query string EXACTLY as given, so

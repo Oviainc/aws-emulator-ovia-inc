@@ -812,7 +812,16 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
              must be absent where the snapshot has none, got {body}"
         );
 
-        // Round trip: the snapshot the create reported is the one a read observes.
+        // Round trip: the snapshot the create reported is the one a read observes. The
+        // read path sees a snapshot only once its content is final, so the snapshot is
+        // sealed first — with a count of zero, which is what was written to it.
+        let sealed = complete_snapshot(&router, &snapshot_id, 0).await;
+        assert_eq!(
+            sealed.status, 202,
+            "case {case:?}: CompleteSnapshot must answer 202, got {} with body {}",
+            sealed.status,
+            String::from_utf8_lossy(&sealed.body)
+        );
         let listed = list_blocks(&router, &snapshot_id, "").await;
         assert_eq!(
             listed.status, 200,
@@ -849,7 +858,12 @@ async fn refusals_carry_the_modelled_error_and_status() {
         .map(|(_, token)| token.clone())
         .expect("the sealed snapshot lists its block");
 
-    // A second, still-pending snapshot, so a token from another snapshot can be tried.
+    // A second sealed snapshot, so a token minted for one snapshot can be tried against
+    // another READABLE one: a token that names no block of the snapshot it is presented
+    // with is the token refusal, which only a snapshot the read path can see can report.
+    let other_sealed = write_snapshot(&router, "second refusal fixture", 1, &[(0, 98)]).await;
+
+    // A second, still-pending snapshot, so a write can be refused against one.
     let pending = start_snapshot(&router, &serde_json::json!({ "VolumeSize": 1 })).await;
     let pending_id = pending
         .json()
@@ -957,8 +971,12 @@ async fn refusals_carry_the_modelled_error_and_status() {
                 &checksum(&block_bytes(6)),
             )
             .await,
-            400,
-            "ValidationException",
+            // The payload is excluded from the request's signature and the checksum
+            // header is what binds it, so a payload that is not the one the checksum
+            // was computed over is the signing-integrity refusal, not a flat input
+            // error. Asserted in full in `payload_checksum_integrity.rs`.
+            403,
+            "InvalidSignatureException",
         ),
         (
             "CompleteSnapshot with a count that disagrees with the blocks written",
@@ -974,7 +992,7 @@ async fn refusals_carry_the_modelled_error_and_status() {
         ),
         (
             "GetSnapshotBlock with a BlockToken belonging to another snapshot",
-            get_block(&router, &pending_id, 0, &sealed_token).await,
+            get_block(&router, &other_sealed, 0, &sealed_token).await,
             400,
             "ValidationException",
         ),
@@ -1036,8 +1054,15 @@ async fn refusals_carry_the_modelled_error_and_status() {
         );
     }
 
-    // The refused writes left nothing behind: the pending snapshot still holds exactly
-    // the one block that succeeded.
+    // The refused writes left nothing behind: the pending snapshot, once sealed, holds
+    // exactly the one block that succeeded. (Sealing is what makes it readable at all.)
+    let sealed_pending = complete_snapshot(&router, &pending_id, 1).await;
+    assert_eq!(
+        sealed_pending.status, 202,
+        "case \"refused writes\": CompleteSnapshot must answer 202, got {} with body {}",
+        sealed_pending.status,
+        String::from_utf8_lossy(&sealed_pending.body)
+    );
     let still = listed_blocks(&list_blocks(&router, &pending_id, "").await);
     let still_indexes: Vec<i32> = still.iter().map(|(index, _)| *index).collect();
     assert_eq!(
@@ -1156,15 +1181,67 @@ async fn a_child_snapshot_starts_from_a_copy_of_the_parent_blocks() {
         child_reply.json()
     );
 
+    // `ChangedBlocksCount` is "The number of blocks that were written to the snapshot",
+    // and the blocks a child inherited were not written to it: one new block written to
+    // the child is a count of ONE, whatever the parent contributed. Sealing it is also
+    // what makes the child readable, so the inherited blocks are observed afterwards.
+    let new_bytes = block_bytes(13);
+    let new_checksum = checksum(&new_bytes);
+    let written_reply =
+        put_block(&router, &child, 9, new_bytes.clone(), BLOCK_SIZE, &new_checksum).await;
+    assert_eq!(
+        written_reply.status, 201,
+        "case \"child\": writing a new block to the child must answer 201, got {} with body {}",
+        written_reply.status,
+        String::from_utf8_lossy(&written_reply.body)
+    );
+    let sealed = complete_snapshot(&router, &child, 1).await;
+    assert_eq!(
+        sealed.status, 202,
+        "case \"child\": CompleteSnapshot must count only the blocks written to the child, got {} with body {}",
+        sealed.status,
+        String::from_utf8_lossy(&sealed.body)
+    );
+    assert_eq!(
+        sealed.json().get("Status").and_then(serde_json::Value::as_str),
+        Some("pending"),
+        "case \"child\": the acknowledgement must report the status the seal was applied to, got {}",
+        sealed.json()
+    );
+    assert_eq!(
+        member(&complete_snapshot(&router, &child, 1).await, "Status"),
+        "completed",
+        "case \"child\": a later call must read the sealed status back off the record"
+    );
+
     let child_blocks = listed_blocks(&list_blocks(&router, &child, "").await);
     let child_indexes: Vec<i32> = child_blocks.iter().map(|(index, _)| *index).collect();
-    let parent_indexes: Vec<i32> = parent_blocks.iter().map(|(index, _)| *index).collect();
+    let mut expected_indexes: Vec<i32> = parent_blocks.iter().map(|(index, _)| *index).collect();
+    expected_indexes.push(9);
+    expected_indexes.sort_unstable();
     assert_eq!(
-        child_indexes, parent_indexes,
-        "case \"child\": the child must start from the parent's block indexes, got {child_indexes:?}"
+        child_indexes, expected_indexes,
+        "case \"child\": the child must hold the parent's block indexes plus the one written to it, got {child_indexes:?}"
     );
 
     for (block_index, child_token) in &child_blocks {
+        if *block_index == 9 {
+            // The block written to the CHILD, not inherited: it reads back its own bytes.
+            let fetched = get_block(&router, &child, 9, child_token).await;
+            assert_eq!(
+                fetched.status, 200,
+                "case \"child\": GetSnapshotBlock at the written index must answer 200, got {} with body {}",
+                fetched.status,
+                String::from_utf8_lossy(&fetched.body)
+            );
+            assert!(
+                fetched.body == new_bytes,
+                "case \"child\": the block written to the child must read back its own bytes; got {} bytes with checksum {:?}",
+                fetched.body.len(),
+                checksum(&fetched.body)
+            );
+            continue;
+        }
         let parent_token = parent_blocks
             .iter()
             .find(|(index, _)| index == block_index)
@@ -1193,37 +1270,6 @@ async fn a_child_snapshot_starts_from_a_copy_of_the_parent_blocks() {
             checksum(&fetched.body)
         );
     }
-
-    // `ChangedBlocksCount` is "The number of blocks that were written to the snapshot",
-    // and the blocks a child inherited were not written to it: one new block written to
-    // the child is a count of ONE, whatever the parent contributed.
-    let new_bytes = block_bytes(13);
-    let new_checksum = checksum(&new_bytes);
-    let written = put_block(&router, &child, 9, new_bytes, BLOCK_SIZE, &new_checksum).await;
-    assert_eq!(
-        written.status, 201,
-        "case \"child\": writing a new block to the child must answer 201, got {} with body {}",
-        written.status,
-        String::from_utf8_lossy(&written.body)
-    );
-    let sealed = complete_snapshot(&router, &child, 1).await;
-    assert_eq!(
-        sealed.status, 202,
-        "case \"child\": CompleteSnapshot must count only the blocks written to the child, got {} with body {}",
-        sealed.status,
-        String::from_utf8_lossy(&sealed.body)
-    );
-    assert_eq!(
-        sealed.json().get("Status").and_then(serde_json::Value::as_str),
-        Some("pending"),
-        "case \"child\": the acknowledgement must report the status the seal was applied to, got {}",
-        sealed.json()
-    );
-    assert_eq!(
-        member(&complete_snapshot(&router, &child, 1).await, "Status"),
-        "completed",
-        "case \"child\": a later call must read the sealed status back off the record"
-    );
 }
 
 /// A listing is a read: repeating it, and fetching through the tokens it handed out,
@@ -1252,33 +1298,59 @@ async fn reading_a_snapshot_does_not_change_what_a_later_caller_sees() {
 }
 
 /// "If the specified block contains data, the existing data is overwritten": rewriting an
-/// index replaces the bytes, keeps exactly one block and one token for that index, and
-/// serves the NEW bytes through the token already handed out.
+/// index leaves exactly one block at that index, holding the bytes of the LAST write,
+/// under one token.
+///
+/// The rewrites are observed after the snapshot is sealed, because that is when the read
+/// path can see it at all, and sealing is also what ends the writes: each row is therefore
+/// its own snapshot, rewritten its own number of times.
 #[tokio::test]
 async fn rewriting_a_block_index_replaces_the_bytes_and_keeps_one_token() {
-    let router = router();
-    let started = start_snapshot(&router, &serde_json::json!({ "VolumeSize": 1 })).await;
-    let snapshot_id = started
-        .json()
-        .get("SnapshotId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    // Rows differ in how many times the index is rewritten and in the bytes each write
+    // carries, so the rule is asserted over a sequence of rewrites rather than one write.
+    let cases: &[(&str, &[u8])] = &[
+        ("written once", &[71]),
+        ("rewritten once", &[71, 72]),
+        ("rewritten twice", &[71, 72, 73]),
+    ];
 
-    // Rows differ in the bytes written over the same index, so the rule is asserted over
-    // a sequence of rewrites rather than a single one.
-    let seeds: &[u8] = &[71, 72, 73];
-    let mut first_token = String::new();
-    for (rewrite, seed) in seeds.iter().enumerate() {
-        let case = format!("rewrite {rewrite} with seed {seed}");
-        let data = block_bytes(*seed);
-        let expected = checksum(&data);
-        let written = put_block(&router, &snapshot_id, 0, data.clone(), BLOCK_SIZE, &expected).await;
+    for (case, seeds) in cases {
+        let router = router();
+        let started = start_snapshot(&router, &serde_json::json!({ "VolumeSize": 1 })).await;
+        let snapshot_id = started
+            .json()
+            .get("SnapshotId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        for seed in *seeds {
+            let data = block_bytes(*seed);
+            let expected = checksum(&data);
+            let written =
+                put_block(&router, &snapshot_id, 0, data.clone(), BLOCK_SIZE, &expected).await;
+            assert_eq!(
+                written.status, 201,
+                "case {case:?}: PutSnapshotBlock with seed {seed} must answer 201, got {} with body {}",
+                written.status,
+                String::from_utf8_lossy(&written.body)
+            );
+            assert_eq!(
+                written.header("x-amz-Checksum"),
+                expected,
+                "case {case:?}: the write must report the checksum of the bytes it stored, got {:?}",
+                written.header("x-amz-Checksum")
+            );
+        }
+
+        // One block was written, however many times it was rewritten, so the seal's count
+        // is one.
+        let sealed = complete_snapshot(&router, &snapshot_id, 1).await;
         assert_eq!(
-            written.status, 201,
-            "case {case:?}: PutSnapshotBlock must answer 201, got {} with body {}",
-            written.status,
-            String::from_utf8_lossy(&written.body)
+            sealed.status, 202,
+            "case {case:?}: CompleteSnapshot must answer 202, got {} with body {}",
+            sealed.status,
+            String::from_utf8_lossy(&sealed.body)
         );
 
         let listed = listed_blocks(&list_blocks(&router, &snapshot_id, "").await);
@@ -1292,17 +1364,10 @@ async fn rewriting_a_block_index_replaces_the_bytes_and_keeps_one_token() {
             .first()
             .map(|(_, token)| token.clone())
             .expect("the snapshot lists its one block");
-        if rewrite == 0 {
-            first_token = token.clone();
-        } else {
-            assert_eq!(
-                token, first_token,
-                "case {case:?}: a rewritten index must keep one token, got {token:?}"
-            );
-        }
 
-        // The token handed out before the rewrite serves the bytes stored NOW.
-        let fetched = get_block(&router, &snapshot_id, 0, &first_token).await;
+        // The bytes of the LAST write are the ones stored.
+        let last = block_bytes(*seeds.last().expect("every row writes at least once"));
+        let fetched = get_block(&router, &snapshot_id, 0, &token).await;
         assert_eq!(
             fetched.status, 200,
             "case {case:?}: GetSnapshotBlock must answer 200, got {} with body {}",
@@ -1310,14 +1375,14 @@ async fn rewriting_a_block_index_replaces_the_bytes_and_keeps_one_token() {
             String::from_utf8_lossy(&fetched.body)
         );
         assert!(
-            fetched.body == data,
+            fetched.body == last,
             "case {case:?}: GetSnapshotBlock must return the bytes stored by the latest write; got {} bytes with checksum {:?}",
             fetched.body.len(),
             checksum(&fetched.body)
         );
         assert_eq!(
             fetched.header("x-amz-Checksum"),
-            expected,
+            checksum(&last),
             "case {case:?}: the checksum must be the one computed over the stored bytes, got {:?}",
             fetched.header("x-amz-Checksum")
         );
@@ -1369,7 +1434,15 @@ async fn starting_more_snapshots_than_the_store_holds_is_refused_with_a_quota_er
         refused.error_code()
     );
 
-    // The refusal did not disturb what was already stored.
+    // The refusal did not disturb what was already stored. Sealing the first snapshot is
+    // what makes it readable: the read path sees only a snapshot whose content is final.
+    let sealed = complete_snapshot(&router, &first_id, 0).await;
+    assert_eq!(
+        sealed.status, 202,
+        "case \"one past the cap\": CompleteSnapshot must answer 202, got {} with body {}",
+        sealed.status,
+        String::from_utf8_lossy(&sealed.body)
+    );
     let listed = list_blocks(&router, &first_id, "").await;
     assert_eq!(
         listed.status, 200,

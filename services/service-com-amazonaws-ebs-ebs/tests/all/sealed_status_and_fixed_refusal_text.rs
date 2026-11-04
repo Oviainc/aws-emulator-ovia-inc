@@ -195,11 +195,15 @@ async fn completing_a_snapshot_applies_the_seal_every_later_reader_then_sees() {
 }
 
 /// RULE 2: the request DECLARES how many bytes of block data it carries, so a payload
-/// that does not deliver them leaves the service with no block to judge: the declared
+/// that does not deliver them leaves the service with no block to store: the declared
 /// block data could not be read, which is refused HTTP 400 `ValidationException` with
 /// `Reason` `INVALID_PARAMETER_VALUE` and the fixed sentence for a failed read, naming no
 /// byte count. `INVALID_BLOCK` stays with a block that WAS read and is then rejected on
 /// its content.
+///
+/// Every row presents the checksum OF THE BYTES IT SENDS, so the request's integrity
+/// binding holds and the declared length is what is left to judge: the binding is judged
+/// first, and `payload_checksum_integrity.rs` asserts that.
 #[tokio::test]
 async fn an_unreadable_block_payload_is_refused_as_a_bad_parameter() {
     let router = router();
@@ -223,13 +227,14 @@ async fn an_unreadable_block_payload_is_refused_as_a_bad_parameter() {
         let case = format!("a payload of {length} bytes against a declared {BLOCK_SIZE}");
         let mut payload = full.clone();
         payload.resize(*length, 0);
+        let sent_checksum = checksum(&payload);
         let reply = put_block(
             &router,
             &snapshot_id,
             0,
             payload,
             BLOCK_SIZE,
-            &full_checksum,
+            &sent_checksum,
         )
         .await;
         assert_eq!(
@@ -258,22 +263,16 @@ async fn an_unreadable_block_payload_is_refused_as_a_bad_parameter() {
     }
 
     // A block that IS read in full and then rejected on its content keeps the content
-    // reason: the two members of the enum must stay distinguishable. Rows differ along
-    // what makes the read block unacceptable.
-    let other_checksum = checksum(&block_bytes(52));
-    let content_cases: &[(&str, i32, String)] = &[
-        (
-            "a checksum that does not match the bytes read",
-            0,
-            other_checksum,
-        ),
-        (
-            // A 1 GiB volume addresses block indexes 0..2048 (1 GiB / 524288).
-            "an index outside the snapshot's volume",
-            2048,
-            full_checksum.clone(),
-        ),
-    ];
+    // reason: the two members of the enum must stay distinguishable. (A payload whose
+    // CHECKSUM does not match is not in this table: the checksum header is the request's
+    // integrity binding, so a mismatch is the signing-integrity refusal rather than a
+    // validation reason at all — `payload_checksum_integrity.rs` asserts it.)
+    let content_cases: &[(&str, i32, String)] = &[(
+        // A 1 GiB volume addresses block indexes 0..2048 (1 GiB / 524288).
+        "an index outside the snapshot's volume",
+        2048,
+        full_checksum.clone(),
+    )];
     for (case, block_index, checksum_value) in content_cases {
         let reply = put_block(
             &router,

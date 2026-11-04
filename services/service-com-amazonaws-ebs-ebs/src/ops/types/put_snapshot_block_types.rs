@@ -23,6 +23,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ebs-ebs.json");
 // ADDITIONAL rule about an id's shape (`crate::state::is_well_formed_snapshot_id`, which
 // the model does not express) is judged in the handler, reached only by a value the
 // boundary already accepted.
+// The three HEADER-bound members the model marks `@required` keep their non-`Option`
+// types: a request that omits one is refused BEFORE deserialization, by the guard this
+// service's `service.rs` routes the operation behind, because the generated REST route
+// declines such a request and the router would otherwise answer it as an operation the
+// emulator does not serve. Reaching this handler therefore means all three arrived.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.ebs#PutSnapshotBlockRequest",
     skip_validation = ["ChecksumAlgorithm", "Checksum", "Progress"]

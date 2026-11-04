@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+pub mod kms_reference;
+
 /// The block size, in bytes, of every snapshot this service creates.
 ///
 /// `PutSnapshotBlockRequest$DataLength` documents "Currently, the only supported size
@@ -212,6 +214,19 @@ impl Snapshot {
     /// snapshot must be in the pending state".
     pub fn accepts_writes(&self) -> bool {
         self.status == SnapshotStatus::Pending
+    }
+
+    /// Whether the READ path — the operations that report a snapshot's blocks — can see
+    /// this snapshot at all.
+    ///
+    /// Only a snapshot whose content is final is visible to a read: `CompleteSnapshot`
+    /// "seals and completes the snapshot after all of the required blocks of data have
+    /// been written to it", and until it has run the snapshot is still being assembled,
+    /// while a snapshot its `Timeout` cancelled was never assembled. A read of either
+    /// resolves nothing, which is the snapshot not-found refusal — not an empty listing,
+    /// which would say the snapshot exists and holds no block.
+    pub fn is_readable(&self) -> bool {
+        self.status == SnapshotStatus::Completed
     }
 }
 
@@ -422,6 +437,46 @@ pub fn invalid_block_token_message(block_token: &str) -> String {
 /// a different refusal (a `ValidationException` naming the state).
 pub fn snapshot_not_found_message(snapshot_id: &str) -> String {
     format!("The snapshot '{snapshot_id}' does not exist.")
+}
+
+/// The message `PutSnapshotBlock` answers with when the request carries no
+/// `x-amz-Checksum` at all.
+///
+/// FIXED and request-independent: the block payload is excluded from the request's
+/// SigV4 signature (`PutSnapshotBlock` is `@unsignedPayload`) and that header is what
+/// binds the payload to it, so a request without one carries no block the service can
+/// accept and the refusal names the missing binding rather than echoing anything the
+/// request did carry.
+pub const MISSING_CHECKSUM_MESSAGE: &str = "Missing checksum for request payload";
+
+/// The message this service answers with when a member the model marks `@required` is
+/// absent from the request, for ANY operation and member.
+///
+/// The framework's own `ValidationException` envelope — `1 validation error detected:
+/// Value null at '<member>' failed to satisfy constraint: Member must not be null` —
+/// rendered by the same helper the request boundary uses, so an absent member the
+/// SERVICE reports is worded exactly as one the boundary reports; only the envelope it
+/// travels in differs, and this one carries the modelled `Message`/`Reason` a client
+/// reads. The path is the member's name lower-camelled, which is the casing that
+/// envelope uses.
+pub fn absent_required_member_message(smithy_member_name: &str) -> String {
+    ::aws_smithy_schema_server::missing_member_message(
+        &::aws_smithy_schema_server::constraints::path::member(smithy_member_name),
+    )
+}
+
+/// The message `PutSnapshotBlock` answers with when the checksum the request presented
+/// for its block payload is not the checksum of the bytes that arrived.
+///
+/// A request-derived template naming BOTH values: the one computed over the received
+/// payload and the one the request supplied in `x-amz-Checksum` (the member's
+/// `@httpHeader` binding), so a caller can tell a corrupted upload from a checksum it
+/// computed over the wrong bytes.
+pub fn checksum_mismatch_message(computed: &str, supplied: &str) -> String {
+    format!(
+        "The value passed in as x-amz-Checksum does not match the computed checksum. \
+         Computed checksum: {computed} expected checksum: {supplied}"
+    )
 }
 
 /// The message this service answers with when a request asks for a checksum algorithm

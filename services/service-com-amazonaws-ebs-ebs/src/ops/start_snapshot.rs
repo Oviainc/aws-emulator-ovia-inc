@@ -146,6 +146,7 @@ use super::types::*;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use crate::state::kms_reference::{self, request_region, KeyReference};
 use crate::state::{
     expiry_from_timeout, fingerprint_hex_sha256, invalid_volume_size_message,
     is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
@@ -231,11 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
-        let now = SystemTime::now();
-        let mut store = state.lock();
-        store.apply_due_transitions(now);
-
+        // Judged before anything is read or created, and in this order: the request's own
+        // parameters first, then the resource it references in ANOTHER service.
+        //
         // `VolumeSize`: "The maximum size is 65536 GiB (64 TiB)." The model carries only
         // the minimum, so the documented maximum is refused here, with the service's own
         // request-derived template for the refusal.
@@ -256,6 +255,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE.to_string(),
             ));
         }
+
+        // `KmsKeyArn` is a reference to a KEY ANOTHER SERVICE holds, and all the model
+        // constrains is the ARN's form, so the reference is resolved through that service
+        // before this one creates a snapshot that claims to be encrypted under it. A key
+        // the dependency does not hold is the dependent-service refusal
+        // (`INVALID_DEPENDENCY_REQUEST`), carrying the answer that service gave — see
+        // `crate::state::kms_reference`, which also says why an emulator with no KMS
+        // mounted accepts the reference as given.
+        if let Some(kms_key_arn) = input.kms_key_arn.as_deref() {
+            let region = request_region(ctx);
+            if let KeyReference::Refused(message) =
+                kms_reference::resolve_key(ctx, &region, kms_key_arn).await
+            {
+                return Err(validation("INVALID_DEPENDENCY_REQUEST", message));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
 
         // `ClientToken` idempotency: the same token replays the original answer, a
         // different request under the same token is the modeled `ConflictException`.

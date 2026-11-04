@@ -177,6 +177,68 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `InvalidSignatureException` error shape.
+static INVALID_SIGNATURE_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidSignatureException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InvalidSignatureException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the two shapes above: it
+/// is not in any service's model, so it must not collide with a modeled one.
+pub static INVALID_SIGNATURE_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidSignatureException",
+        "smithy.framework",
+        "InvalidSignatureException",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_SIGNATURE_EXCEPTION_MESSAGE],
+);
+
+/// The payload of an `InvalidSignatureException`: which part of the request's integrity
+/// binding did not hold.
+#[derive(Debug, Clone)]
+pub struct InvalidSignatureException {
+    pub message: String,
+}
+
+impl InvalidSignatureException {
+    /// An `InvalidSignatureException` carrying `message`.
+    ///
+    /// Say which value the request presented and which one the request's own bytes
+    /// produce: the caller has to decide from this text alone whether to re-sign the
+    /// request or to send the payload again.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidSignatureException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvalidSignatureException: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvalidSignatureException {}
+
+impl SerializableStruct for InvalidSignatureException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INVALID_SIGNATURE_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +258,19 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request's INTEGRITY binding did not hold: the value the request presented
+    /// for the bytes it carried is not the value those bytes produce. Renders as HTTP
+    /// 403 with the error code `InvalidSignatureException`.
+    ///
+    /// This is the signing layer's class, not a service's: it is what an operation
+    /// whose payload is excluded from the SigV4 signature (`@unsignedPayload`) answers
+    /// when the header that binds the payload to the signature disagrees with the
+    /// payload — the caller is known and the request is well formed, but the bytes are
+    /// not the ones that were signed for. No service model declares the shape, which is
+    /// why it lives on this wrapper (see the module docs), and the distinction is
+    /// load-bearing: a client re-signs or re-sends on the signing class and merely
+    /// reports a `ValidationException`.
+    InvalidSignatureException(InvalidSignatureException),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +296,16 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request as one whose payload integrity does not hold, with HTTP 403
+    /// `InvalidSignatureException`.
+    ///
+    /// Reach for this ONLY where the request's own integrity binding failed — see the
+    /// variant's docs. Everything else about a request's content is a validation
+    /// failure and takes [`Self::validation`] or the service's modeled client error.
+    pub fn invalid_signature(message: impl Into<String>) -> Self {
+        Self::InvalidSignatureException(InvalidSignatureException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +314,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::InvalidSignatureException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +327,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::InvalidSignatureException(e) => e.source(),
         }
     }
 }
@@ -255,6 +342,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::InvalidSignatureException(e) => e,
         }
     }
 
@@ -263,6 +351,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::InvalidSignatureException(_) => &INVALID_SIGNATURE_EXCEPTION_SCHEMA,
         }
     }
 
@@ -275,6 +364,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::InvalidSignatureException(_) => "InvalidSignatureException",
         }
     }
 
@@ -287,6 +377,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // The signing layer's status for a request whose integrity binding does not
+            // hold: the caller is authenticated, so this is neither a 400 about the
+            // request's shape nor a 401.
+            Self::InvalidSignatureException(_) => 403,
         }
     }
 
@@ -299,6 +393,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::InvalidSignatureException(_) => None,
         }
     }
 }

@@ -40,10 +40,54 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use aws_smithy_schema::Schema;
+use smithy_server_runtime::{http, ErasedOperation, Operation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+mod required_members;
+
+use required_members::{Binding, RequiredMember, RequiresMembers};
+
+use crate::ops::complete_snapshot::CompleteSnapshot;
+use crate::ops::get_snapshot_block::GetSnapshotBlock;
+use crate::ops::put_snapshot_block::PutSnapshotBlock;
+
+/// `PutSnapshotBlock`'s required members, in the order it judges them: the `Checksum`
+/// that binds the unsigned block payload to the request first — a request without one
+/// carries no block this service can accept, whatever else it left out — then the
+/// algorithm that computed it, then the length it declares. Wire names from
+/// `smithy_query(query="operation",operation="PutSnapshotBlock")`.
+static PUT_SNAPSHOT_BLOCK_REQUIRED: &[RequiredMember] = &[
+    RequiredMember {
+        member: "Checksum",
+        binding: Binding::Header("x-amz-Checksum"),
+        stated: Some(crate::state::MISSING_CHECKSUM_MESSAGE),
+    },
+    RequiredMember {
+        member: "ChecksumAlgorithm",
+        binding: Binding::Header("x-amz-Checksum-Algorithm"),
+        stated: None,
+    },
+    RequiredMember {
+        member: "DataLength",
+        binding: Binding::Header("x-amz-Data-Length"),
+        stated: None,
+    },
+];
+
+/// `GetSnapshotBlock`'s one required member: the token that names the block to read.
+static GET_SNAPSHOT_BLOCK_REQUIRED: &[RequiredMember] = &[RequiredMember {
+    member: "BlockToken",
+    binding: Binding::Query("blockToken"),
+    stated: None,
+}];
+
+/// `CompleteSnapshot`'s one required member: the count the seal is checked against.
+static COMPLETE_SNAPSHOT_REQUIRED: &[RequiredMember] = &[RequiredMember {
+    member: "ChangedBlocksCount",
+    binding: Binding::Header("x-amz-ChangedBlocksCount"),
+    stated: None,
+}];
 
 /// The `com-amazonaws-ebs-ebs` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,15 +96,37 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The three operations whose model requires a header or query member, each behind
+    /// the guard that answers an absent one — see [`required_members`] for why they are
+    /// held here rather than reached through the generated routing table.
+    complete_snapshot: RequiresMembers<CompleteSnapshot<Eng>>,
+    put_snapshot_block: RequiresMembers<PutSnapshotBlock<Eng>>,
+    get_snapshot_block: RequiresMembers<GetSnapshotBlock<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
+    ///
+    /// The three guarded operations are constructed from the SAME shared engine, so a
+    /// request served through one of them reads and writes the one store every other
+    /// operation of this service uses.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            complete_snapshot: RequiresMembers::new(
+                CompleteSnapshot::new(Arc::clone(&engine)),
+                COMPLETE_SNAPSHOT_REQUIRED,
+            ),
+            put_snapshot_block: RequiresMembers::new(
+                PutSnapshotBlock::new(Arc::clone(&engine)),
+                PUT_SNAPSHOT_BLOCK_REQUIRED,
+            ),
+            get_snapshot_block: RequiresMembers::new(
+                GetSnapshotBlock::new(engine),
+                GET_SNAPSHOT_BLOCK_REQUIRED,
+            ),
         }
     }
 }
@@ -87,12 +153,47 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The three operations whose model requires a header or query member are named
+        // HERE, by the request's method and path, and served behind the guard that answers
+        // an absent one.
+        //
+        // The generated routing table cannot name them for such a request: a REST route
+        // also carries its operation's `@required` header and query members and declines
+        // a request missing one, which is how two operations sharing a method and URI
+        // template are told apart. This model has no such pair, so the method and path
+        // already name the operation — and the request is that operation's, with an input
+        // error, rather than a request for an operation the emulator does not serve.
+        // `required_members` states the rule and what the guard answers.
+        //
+        // No method or URI template is written out: each candidate is matched through the
+        // shared reader (`service_common::addresses_modeled_http_route`, which exists for
+        // exactly this case) against the route its OWN input schema's `@http` binding
+        // gives it, so this seam cannot drift from the model and an operation can only
+        // ever serve the route the model binds to it. Which operations belong here is the
+        // one thing a schema cannot say — the routing table hands back erased operations —
+        // so the three are named, and they are exactly the ones
+        // `smithy_query(query="operation",…)` reports a `@required` header or query member
+        // for; `StartSnapshot`, `ListSnapshotBlocks` and `ListChangedBlocks` declare none,
+        // so nothing can stop the table from naming them.
+        //
+        // Every other request resolves through the generated table exactly as before.
+        let held: [(&'static Schema, &dyn ErasedOperation); 3] = [
+            (
+                <CompleteSnapshot<Eng> as Operation>::INPUT_SCHEMA,
+                &self.complete_snapshot,
+            ),
+            (
+                <PutSnapshotBlock<Eng> as Operation>::INPUT_SCHEMA,
+                &self.put_snapshot_block,
+            ),
+            (
+                <GetSnapshotBlock<Eng> as Operation>::INPUT_SCHEMA,
+                &self.get_snapshot_block,
+            ),
+        ];
+        held.into_iter()
+            .find(|(schema, _)| service_common::addresses_modeled_http_route(req, schema))
+            .map(|(_, operation)| operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

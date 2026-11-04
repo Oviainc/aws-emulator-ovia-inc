@@ -197,7 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due, which was owed whether or not anybody read.
         store.apply_due_transitions(now);
 
-        let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
+        // The READ path sees only a snapshot whose content is final
+        // ([`crate::state::Snapshot::is_readable`]): one still being written, and one its
+        // `Timeout` cancelled, resolve to nothing here exactly as an id no snapshot was
+        // ever minted for does, and all three are the one refusal.
+        let readable = store
+            .snapshots
+            .get(&input.snapshot_id)
+            .filter(|snapshot| snapshot.is_readable());
+        let Some(snapshot) = readable else {
             // A value that is not even shaped like a snapshot id is a malformed
             // parameter, not a snapshot the service does not hold.
             if !is_well_formed_snapshot_id(&input.snapshot_id) {
