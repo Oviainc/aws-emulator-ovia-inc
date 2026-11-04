@@ -64,6 +64,36 @@ impl Logs {
         operation: &str,
         body: &Value,
     ) -> (u16, Value) {
+        let (status, _headers, payload) = self.call_raw_in_region(region, operation, body).await;
+        let parsed = if payload.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&payload).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// One RAW exchange: the status, the response headers and the body bytes exactly as the
+    /// service answered them.
+    ///
+    /// Every other call here reads the body as JSON. One operation's answer is not JSON —
+    /// `StartLiveTail` serves `application/vnd.amazon.eventstream` frames — so its suite
+    /// reads the bytes and the content type through this.
+    pub async fn call_raw(
+        &self,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, http::HeaderMap, bytes::Bytes) {
+        self.call_raw_in_region(REGION, operation, body).await
+    }
+
+    /// [`Logs::call_raw`], with the credential scope naming `region`.
+    pub async fn call_raw_in_region(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, http::HeaderMap, bytes::Bytes) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -82,12 +112,8 @@ impl Logs {
             .expect("a valid request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
+        let headers = response.headers().clone();
+        (status, headers, response.into_body())
     }
 
     /// Call one operation that must succeed, returning its response body.

@@ -7693,6 +7693,7 @@ dependencies = [
  "aws-sdk-kinesis",
  "aws-sdk-lambda",
  "aws-sdk-s3",
+ "aws-smithy-eventstream 0.60.21",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",

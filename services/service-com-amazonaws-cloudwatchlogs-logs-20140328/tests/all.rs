@@ -113,6 +113,8 @@ mod insights_queries;
 mod integrations;
 #[path = "all/list_anomalies.rs"]
 mod list_anomalies;
+#[path = "all/live_tail_sessions.rs"]
+mod live_tail_sessions;
 #[path = "all/log_anomaly_detector_removal.rs"]
 mod log_anomaly_detector_removal;
 #[path = "all/log_anomaly_detector_updates.rs"]

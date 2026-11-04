@@ -64,6 +64,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Decodes one `application/vnd.amazon.eventstream` frame, so the live-tail suite reads
+# `StartLiveTail`'s response the way an SDK's event-stream decoder does.
+aws-smithy-eventstream = "0.60"
 # The CloudWatch metric store an ingested log event publishes into, so a test can read
 # back the datapoints this service's metric filters extracted. Already a dependency of
 # `src/`; an integration test reaches it only through this list.

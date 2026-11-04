@@ -118,6 +118,7 @@ pub mod put_subscription_filter_types;
 pub mod put_syslog_configuration_types;
 pub mod put_transformer_types;
 pub mod shared_types;
+pub mod start_live_tail_types;
 pub mod start_query_types;
 pub mod stop_query_types;
 pub mod tag_log_group_types;
@@ -340,6 +341,8 @@ pub use put_syslog_configuration_types::*;
 pub use put_transformer_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use start_live_tail_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use start_query_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

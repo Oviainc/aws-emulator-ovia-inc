@@ -19,4 +19,16 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: GetLogObject — unsupported shape construct: operation 'GetLogObject' has a @streaming event-stream output member, which needs wire framing the generator does not emit
-// SKIPPED: StartLiveTail — unsupported shape construct: operation 'StartLiveTail' has a @streaming event-stream output member, which needs wire framing the generator does not emit
+
+The operation below was skipped for the same reason — a `@streaming` event-stream
+OUTPUT member — and is now HAND-AUTHORED, so it is no longer unwired: it has its own
+file in `src/ops/`, the shapes its request and its two events need are in
+`src/ops/types/start_live_tail_types.rs`, the `vnd.amazon.eventstream` framing is the
+shared `service_common::event_stream`, and `src/service.rs` routes a request to it
+through `Service::override_operation` — which the router consults BEFORE the generated
+routing table, whose shim for a `@streaming`-output operation declines the request.
+
+`GetLogObject` above is NOT implemented and still answers the framework's "modeled but
+not served" response.
+
+// HAND-AUTHORED: StartLiveTail — src/ops/start_live_tail.rs
