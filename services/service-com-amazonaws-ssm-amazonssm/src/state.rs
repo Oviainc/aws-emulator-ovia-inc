@@ -86,6 +86,15 @@
 //! and everything a read reports — the status, the version, who created it and when —
 //! comes from what the create persisted.
 //!
+//! Then the **patch baselines** Patch Manager holds ([`patch_baselines`]):
+//! `CreatePatchBaseline` mints one the account owns, keyed by `(region, baseline id)`,
+//! `RegisterDefaultPatchBaseline` records a baseline as the default for the operating
+//! system it applies to and `GetDefaultPatchBaseline` reports what is recorded. A
+//! baseline nobody created is not the only one an account holds: Systems Manager
+//! PREDEFINES one per supported operating system
+//! ([`patch_baselines::PREDEFINED_BASELINES`]), which is the default until a register says
+//! otherwise — so every operating system has a default and the read invents none.
+//!
 //! Then the **resource data sync configurations** ([`resource_data_syncs`]), keyed by
 //! `(region, sync name)`: `CreateResourceDataSync` persists one,
 //! `ListResourceDataSync` reports what a Region holds, `UpdateResourceDataSync`
@@ -125,6 +134,10 @@ pub mod resource_policies;
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
 pub mod ops_items;
+
+/// The patch baselines Patch Manager holds, the ones Systems Manager predefines, and
+/// which of them is the default for an operating system.
+pub mod patch_baselines;
 
 /// The resource data sync configurations this service holds: the record a create
 /// persists, the configuration rules it is held to, and how a listing, an update and a
@@ -3010,6 +3023,30 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// `DeleteResourcePolicy` removes from.
     pub resource_policies: resource_policies::ResourcePolicyStore,
 
+    /// Every patch baseline the account created, keyed by `(region, baseline id)`: a
+    /// baseline is reached through the endpoint of the Region it was created in and is
+    /// identified there by the id the create minted
+    /// ([`patch_baselines::mint_baseline_id`]). A `BTreeMap` so a listing walks a stable,
+    /// total order. The baselines Systems Manager PREDEFINES hold no entry here and are
+    /// resolved from the catalogue instead
+    /// ([`ComAmazonawsSsmAmazonssmState::resolve_patch_baseline`]), so the store holds the
+    /// account's own baselines and invents none.
+    pub patch_baselines: BTreeMap<(String, String), patch_baselines::PatchBaselineRecord>,
+
+    /// How many patch baseline ids this store has minted, which is what the next mint is
+    /// drawn from ([`ComAmazonawsSsmAmazonssmState::next_patch_baseline_id`]) — so two
+    /// baselines of one store never carry one id.
+    pub patch_baseline_sequence: u64,
+
+    /// The default patch baseline of each operating system, keyed by
+    /// `(region, operating system)`: "Systems Manager supports creating multiple default
+    /// patch baselines. For example, you can create a default patch baseline for each
+    /// operating system" (`GetDefaultPatchBaseline`). The value is how the registered
+    /// baseline is NAMED (`patch_baselines::ResolvedBaseline::reference`). An operating
+    /// system nothing has registered a baseline for holds no entry and is reported from
+    /// the predefined catalogue instead.
+    pub default_patch_baselines: BTreeMap<(String, String), String>,
+
     /// Every resource data sync configuration, keyed by `(region, sync name)`: a sync is
     /// created through one Region's endpoint and its name is unique within that Region. A
     /// `BTreeMap` so a listing walks a stable, total order — ascending by sync name
@@ -3033,6 +3070,9 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),
+            patch_baselines: BTreeMap::new(),
+            patch_baseline_sequence: 0,
+            default_patch_baselines: BTreeMap::new(),
             resource_data_syncs: BTreeMap::new(),
         }
     }
@@ -3996,6 +4036,34 @@ pub fn minted_uuid(seed_nanos: u128, counter: u64) -> String {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.finalize()[..16]);
     ::service_common::uuid_from_random_bytes(bytes)
+}
+
+/// This service's ONE minter of an opaque identifier of the form `<prefix><hex digits>`:
+/// the Sha256 of a mint counter and an instant, rendered as `digits` lowercase hex digits
+/// behind `prefix`.
+///
+/// Every id this service mints in that form goes through here — an `OpsItemId`
+/// ([`ops_items::mint_ops_item_id`]), a `BaselineId`
+/// ([`patch_baselines::mint_baseline_id`]) — so the digest and the rendering are written
+/// once and each caller states only the prefix and the digit count its modelled pattern
+/// requires.
+///
+/// `sequence` is the number of ids that minter has handed out and `at` an instant of the
+/// store's own, so two ids of one store differ, consecutive ones are unrelated, and the
+/// value is not a count a caller can read off the wire. Nothing of the request is in it.
+pub fn minted_prefixed_hex_id(prefix: &str, digits: usize, sequence: u64, at: SystemTime) -> String {
+    use ::sha2::Digest;
+
+    let nanos = at
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    let mut rendered = ::hex::encode(hasher.finalize());
+    rendered.truncate(digits);
+    format!("{prefix}{rendered}")
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the

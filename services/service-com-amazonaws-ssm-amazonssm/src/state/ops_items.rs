@@ -26,9 +26,7 @@
 //!   `OpsItemAlreadyExistsException` reports.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use sha2::{Digest, Sha256};
+use std::time::SystemTime;
 
 use super::{ComAmazonawsSsmAmazonssmState, ARN_SERVICE};
 use crate::ops::types::{OpsItem, OpsItemDataValue, OpsItemNotification, RelatedOpsItem};
@@ -276,23 +274,12 @@ pub fn dedup_string(operational_data: &BTreeMap<String, OpsItemDataValue>) -> Op
 /// Mint an OpsItem id in the form the modelled `OpsItemId` pattern requires:
 /// `oi-` followed by [`OPS_ITEM_ID_HEX_DIGITS`] lowercase hex digits.
 ///
-/// The digits are the leading bytes of a digest of the store's own mint counter and the
-/// instant of the create, so two OpsItems of one store never carry one id and an id
-/// carries nothing from the request that created it.
+/// Through the crate's one minter of a prefixed hex identifier
+/// ([`super::minted_prefixed_hex_id`]): the digits are the leading bytes of a digest of
+/// the store's own mint counter and the instant of the create, so two OpsItems of one
+/// store never carry one id and an id carries nothing from the request that created it.
 pub fn mint_ops_item_id(sequence: u64, at: SystemTime) -> String {
-    let nanos = at
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(sequence.to_be_bytes());
-    hasher.update(nanos.to_be_bytes());
-    let digest = hasher.finalize();
-    let digits = OPS_ITEM_ID_HEX_DIGITS / 2;
-    format!(
-        "{OPS_ITEM_ID_PREFIX}{}",
-        ::hex::encode(&digest[..digits])
-    )
+    super::minted_prefixed_hex_id(OPS_ITEM_ID_PREFIX, OPS_ITEM_ID_HEX_DIGITS, sequence, at)
 }
 
 /// One OpsItem as the store holds it.
@@ -476,6 +463,8 @@ impl ComAmazonawsSsmAmazonssmState {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use super::*;
     use crate::ops::types::OPS_ITEM_STATUS_VALUES;
 

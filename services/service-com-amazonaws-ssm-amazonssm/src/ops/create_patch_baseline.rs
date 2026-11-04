@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mint one patch baseline the account owns — the create of this service's patch
+//! baseline slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything the create supplies is persisted in the one store in
+//! [`crate::state::patch_baselines`], under the `BaselineId` this call mints, at the
+//! endpoint's own Region; the members a create leaves out are held at the defaults their
+//! own documentation states. A create carrying an idempotency token a baseline of this
+//! Region already holds reports THAT baseline rather than minting a second one, and is
+//! refused with `IdempotentParameterMismatch` when it supplies different members under
+//! the same token.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +203,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePatchBaseline"))
+        // Every member's length, pattern and value set — the name, the operating system,
+        // the patch lists, the compliance levels — is a MODELLED constraint the
+        // centralized walk has already refused anything outside of, and `Name` is present
+        // by the same walk.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let mut record = crate::state::patch_baselines::PatchBaselineRecord {
+            // Replaced by the minted id below, once this create is known to be a create.
+            baseline_id: String::new(),
+            region: region.clone(),
+            name: input.name,
+            // "Defines the operating system the patch baseline applies to. The default
+            // value is WINDOWS."
+            operating_system: input.operating_system.unwrap_or_else(|| {
+                crate::state::patch_baselines::DEFAULT_OPERATING_SYSTEM.to_string()
+            }),
+            global_filters: input.global_filters,
+            approval_rules: input.approval_rules,
+            approved_patches: input.approved_patches.unwrap_or_default(),
+            // "The default value is UNSPECIFIED."
+            approved_patches_compliance_level: input.approved_patches_compliance_level.unwrap_or_else(
+                || {
+                    crate::state::patch_baselines::DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL
+                        .to_string()
+                },
+            ),
+            // "The default value is false."
+            approved_patches_enable_non_security: input
+                .approved_patches_enable_non_security
+                .unwrap_or(
+                    crate::state::patch_baselines::DEFAULT_APPROVED_PATCHES_ENABLE_NON_SECURITY,
+                ),
+            rejected_patches: input.rejected_patches.unwrap_or_default(),
+            // "This is the default action if no option is specified."
+            rejected_patches_action: input.rejected_patches_action.unwrap_or_else(|| {
+                crate::state::patch_baselines::DEFAULT_REJECTED_PATCHES_ACTION.to_string()
+            }),
+            description: input.description,
+            sources: input.sources.unwrap_or_default(),
+            available_security_updates_compliance_status: input
+                .available_security_updates_compliance_status,
+            client_token: input.client_token,
+            tags: crate::state::to_btree_map(input.tags),
+            created_date: now,
+            // Nothing has updated the baseline yet, so it was last written when it was
+            // created.
+            modified_date: now,
+        };
+
+        // "User-provided idempotency token": a retry of one create reports the baseline
+        // that create already minted, and the same token carrying different members is
+        // another call rather than a retry.
+        if let Some(token) = record.client_token.clone() {
+            if let Some(held) = store.patch_baseline_with_client_token(&region, &token) {
+                if held.creation_fingerprint() != record.creation_fingerprint() {
+                    return Err(
+                        CreatePatchBaselineErrorModeled::IdempotentParameterMismatch(
+                            IdempotentParameterMismatch {
+                                message: Some(
+                                    crate::state::patch_baselines::IDEMPOTENT_PARAMETER_MISMATCH
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(CreatePatchBaselineOutput {
+                    baseline_id: Some(held.baseline_id.clone()),
+                });
+            }
+        }
+
+        // The store is BOUNDED: past the emulator's own ceiling a create is refused
+        // rather than admitting another record, through the modelled refusal for exactly
+        // that. The ceiling is what stops the one baseline map growing for as long as
+        // creates keep arriving, and the message says whose ceiling it is.
+        if !store.can_hold_another_patch_baseline() {
+            return Err(
+                CreatePatchBaselineErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(
+                            crate::state::patch_baselines::patch_baseline_ceiling_message(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id is the SERVICE's to choose: no input member carries one.
+        record.baseline_id = store.next_patch_baseline_id(now);
+        let baseline_id = record.baseline_id.clone();
+        store.insert_patch_baseline(record);
+
+        // "The ID of the created patch baseline": the id this call minted, which is the
+        // key the baseline is now held under.
+        Ok(CreatePatchBaselineOutput {
+            baseline_id: Some(baseline_id),
+        })
     }
 }

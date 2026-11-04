@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterDefaultPatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterDefaultPatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Record one patch baseline as the default for the operating system it applies to — the
+//! write half of this service's default patch baseline slice. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterDefaultPatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The baseline the request names is resolved against the one store in
+//! [`crate::state::patch_baselines`] first: a baseline the account created in this
+//! endpoint's Region, or one Systems Manager predefined, named by its own id or by its
+//! full ARN. What is recorded is the default of THAT baseline's operating system, which
+//! is what `GetDefaultPatchBaseline` then reports for it. An id that is well formed but
+//! names no baseline reachable here is refused with `DoesNotExistException`
+//! ([`crate::state::patch_baselines::PATCH_BASELINE_NOT_FOUND`]), and a value
+//! that could never name one — an ARN of another service, account or Region — with
+//! `InvalidResourceId`; both write nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +152,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterDefaultPatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterDefaultPatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterDefaultPatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A value that could never name a baseline held at this endpoint — an ARN of
+        // another service, of another account or of another Region, or one whose resource
+        // is not a patch baseline at all — is not an id this service can look anything up
+        // by. `InvalidResourceId` carries NO message member at all, so the error code is
+        // the whole of what it reports.
+        if store.patch_baseline_query(&region, &input.baseline_id).is_none() {
+            return Err(
+                RegisterDefaultPatchBaselineErrorModeled::InvalidResourceId(InvalidResourceId {})
+                    .into(),
+            );
+        }
+
+        // "The ID of the patch baseline that should be the default patch baseline": a
+        // baseline the account created here, or one Systems Manager predefined, named
+        // either by its own id or by its full ARN. One that resolves to nothing exists
+        // nowhere, so nothing becomes the default and nothing is written.
+        let resolved = store
+            .resolve_patch_baseline(&region, &input.baseline_id)
+            .ok_or_else(|| {
+                RegisterDefaultPatchBaselineErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::patch_baselines::PATCH_BASELINE_NOT_FOUND.to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        // "Defines the default patch baseline for the relevant operating system": the
+        // relevant one is the operating system the resolved baseline applies to, so a
+        // register replaces the default of that operating system alone and leaves every
+        // other operating system's default as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterDefaultPatchBaseline"))
+        // The defaults map is bounded, because the Region a default is recorded under
+        // comes from the request's own credential scope: a register that would record a
+        // default for a Region and operating system the store does not already hold is
+        // refused past the emulator's own total and writes nothing, while a register that
+        // replaces a default already held always goes through. The refusal is this crate's
+        // channel for a refusal this operation models no error for — its modelled set
+        // carries no limit error — and its message names the ceiling as the emulator's own,
+        // the way this crate's other total guards report theirs.
+        store
+            .register_default_patch_baseline(&region, &resolved)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(RegisterDefaultPatchBaselineOutput {
+            // "The ID of the default patch baseline", named the way every read of it
+            // names it: its own id for a baseline the account created, and the full ARN
+            // for one Systems Manager predefined.
+            baseline_id: Some(resolved.reference),
+        })
     }
 }

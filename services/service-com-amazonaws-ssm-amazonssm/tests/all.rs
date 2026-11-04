@@ -17,6 +17,8 @@ mod document_content;
 mod document_versions;
 #[path = "all/cloud_connectors.rs"]
 mod cloud_connectors;
+#[path = "all/default_patch_baselines.rs"]
+mod default_patch_baselines;
 #[path = "all/documents.rs"]
 mod documents;
 #[path = "all/hybrid_activations.rs"]

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDefaultPatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDefaultPatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the default patch baseline of one operating system — the read half of this
+//! service's default patch baseline slice. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDefaultPatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it reports is what `RegisterDefaultPatchBaseline` recorded for that operating
+//! system at this endpoint's Region, or the baseline Systems Manager predefines for it
+//! when nothing has registered one, read out of the one store in
+//! [`crate::state::patch_baselines`]. A read writes nothing, so what a later caller sees
+//! is unchanged by it.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +145,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDefaultPatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDefaultPatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDefaultPatchBaseline"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDefaultPatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // "If you don't specify an operating system value, the default patch baseline for
+        // Windows is returned." `OperatingSystem` is a modelled enum, so a value outside
+        // its set is refused by the boundary walk before this handler runs.
+        let operating_system = input
+            .operating_system
+            .unwrap_or_else(|| crate::state::patch_baselines::DEFAULT_OPERATING_SYSTEM.to_string());
+
+        // A read: the store is only read, so what a register persisted — or the baseline
+        // Systems Manager predefines for this operating system while nothing has
+        // registered one — is what this reports, and a later caller sees the same.
+        let default = state
+            .lock()
+            .default_patch_baseline(&region, &operating_system)
+            .ok_or_else(|| {
+                GetDefaultPatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                    message: Some(format!(
+                        "no patch baseline is held for the operating system {operating_system}"
+                    )),
+                })
+            })?;
+
+        Ok(GetDefaultPatchBaselineOutput {
+            // "The ID of the default patch baseline": its own id for a baseline the
+            // account created, and the full ARN for one Systems Manager predefined, which
+            // is the spelling a register of that baseline takes.
+            baseline_id: Some(default.reference),
+            // "The operating system for the returned patch baseline", which is the one
+            // the baseline it reports applies to.
+            operating_system: Some(default.operating_system),
+        })
     }
 }
