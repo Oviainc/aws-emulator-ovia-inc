@@ -87,6 +87,8 @@ mod connection_not_found;
 mod connection_updates;
 #[path = "all/crawler_deletion.rs"]
 mod crawler_deletion;
+#[path = "all/crawler_deletion_scope.rs"]
+mod crawler_deletion_scope;
 #[path = "all/crawler_event_queue.rs"]
 mod crawler_event_queue;
 #[path = "all/crawler_listing.rs"]
