@@ -122,9 +122,13 @@ async fn data_set_fixture(
 
 /// Every member `expected` carries is present in `actual` with the same value, lists
 /// compared element-wise and in order. A response may carry MORE members than the
-/// request did — the model gives several topic members a default — so containment, not
-/// equality, is what "the stored definition reads back" means.
-fn json_contains(expected: &Value, actual: &Value) -> bool {
+/// request did — the model gives several topic members a default, and the service fills
+/// a created child resource's ARN — so containment, not equality, is what "the stored
+/// definition reads back" means.
+///
+/// `pub(crate)` because every suite in this test target compares a stored definition the
+/// same way; a sibling suite reuses this one rather than keeping its own copy.
+pub(crate) fn json_contains(expected: &Value, actual: &Value) -> bool {
     match (expected, actual) {
         (Value::Object(expected), Value::Object(actual)) => expected
             .iter()

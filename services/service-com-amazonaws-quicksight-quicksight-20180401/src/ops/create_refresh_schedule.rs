@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRefreshSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRefreshSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRefreshSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRefreshSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRefreshScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRefreshSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRefreshScheduleErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let schedule = input.schedule;
+
+        // `ScheduleId` identifies the schedule inside its data set, so an empty one
+        // names nothing.
+        if schedule.schedule_id.is_empty() {
+            return Err(
+                CreateRefreshScheduleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some("ScheduleId must not be empty.".to_string()),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `RefreshType` and `Interval` are modelled enums: only a member of each names
+        // a refresh type or an interval. The catalogs are the generated ones, straight
+        // from the model.
+        if !INGESTION_TYPE_VALUES.contains(&schedule.refresh_type.as_str()) {
+            return Err(
+                CreateRefreshScheduleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "RefreshType must be one of {}; got {}.",
+                            INGESTION_TYPE_VALUES.join(", "),
+                            schedule.refresh_type
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let interval = schedule.schedule_frequency.interval.clone();
+        if !REFRESH_INTERVAL_VALUES.contains(&interval.as_str()) {
+            return Err(
+                CreateRefreshScheduleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Interval must be one of {}; got {interval}.",
+                            REFRESH_INTERVAL_VALUES.join(", ")
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The sub-hourly intervals refresh a window of rows rather than the whole data
+        // set, so the model supports them only for an incremental refresh.
+        if crate::state::INCREMENTAL_ONLY_REFRESH_INTERVALS.contains(&interval.as_str())
+            && schedule.refresh_type != crate::state::INGESTION_TYPE_INCREMENTAL_REFRESH
+        {
+            return Err(
+                CreateRefreshScheduleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The {interval} interval is only supported for incremental refreshes."
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The model states `RefreshOnDay` is required for the weekly and monthly
+        // intervals: those two schedule a refresh on ONE day of their period, so a
+        // schedule on them that names no day schedules nothing.
+        if crate::state::REFRESH_ON_DAY_REQUIRED_INTERVALS.contains(&interval.as_str())
+            && schedule.schedule_frequency.refresh_on_day.is_none()
+        {
+            return Err(
+                CreateRefreshScheduleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "RefreshOnDay is required for the {interval} refresh interval."
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::refresh_schedule_arn(
+            &region,
+            &input.aws_account_id,
+            &input.data_set_id,
+            &schedule.schedule_id,
+        );
+
+        let mut store = state.lock();
+
+        // A refresh schedule refreshes ONE data set, so it can only be created on a
+        // data set this account holds.
+        if !store.data_sets.contains_key(&(
+            input.aws_account_id.clone(),
+            input.data_set_id.clone(),
+        )) {
+            return Err(CreateRefreshScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Data set with ID {} not found.",
+                        input.data_set_id
+                    )),
+                    resource_type: Some("DATA_SET".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let key = (
+            input.aws_account_id.clone(),
+            input.data_set_id.clone(),
+            schedule.schedule_id.clone(),
+        );
+        if store.refresh_schedules.contains_key(&key) {
+            return Err(CreateRefreshScheduleErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The refresh schedule with ID {} already exists.",
+                        schedule.schedule_id
+                    )),
+                    // `ExceptionResourceType` has no member naming a refresh schedule,
+                    // so the resource this error is about cannot be named here.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let existing = store.refresh_schedules_in(&input.aws_account_id, &input.data_set_id);
+        if existing.len() >= crate::state::MAX_REFRESH_SCHEDULES_PER_DATA_SET {
+            return Err(CreateRefreshScheduleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You can create up to {} different schedules for a single dataset.",
+                        crate::state::MAX_REFRESH_SCHEDULES_PER_DATA_SET
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The model documents each sub-daily interval as usable for one schedule per
+        // data set, so a second schedule on the same interval exceeds that allowance.
+        if crate::state::SINGLE_SCHEDULE_REFRESH_INTERVALS.contains(&interval.as_str())
+            && existing
+                .iter()
+                .any(|record| record.schedule_frequency.interval == interval)
+        {
+            return Err(CreateRefreshScheduleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The {interval} interval can only be used for one schedule per dataset."
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The total-records ceiling is what bounds this process: both halves of the
+        // store key come from the request, so a per-data-set allowance alone would be
+        // reset by varying the data set id.
+        if store.refresh_schedules.len() >= crate::state::MAX_REFRESH_SCHEDULES {
+            return Err(CreateRefreshScheduleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} refresh schedules.",
+                        crate::state::MAX_REFRESH_SCHEDULES
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        store.refresh_schedules.insert(
+            key,
+            crate::state::RefreshScheduleRecord {
+                arn: arn.clone(),
+                schedule_id: schedule.schedule_id.clone(),
+                schedule_frequency: schedule.schedule_frequency,
+                start_after_date_time: schedule.start_after_date_time,
+                refresh_type: schedule.refresh_type,
+            },
+        );
+
+        Ok(CreateRefreshScheduleOutput {
+            arn: Some(arn),
+            schedule_id: Some(schedule.schedule_id),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

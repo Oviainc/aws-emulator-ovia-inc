@@ -18,7 +18,8 @@ use crate::ops::types::{
     DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
     DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, Folder,
     IAMPolicyAssignment, InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn,
-    PerformanceConfiguration, PhysicalTable, ResourcePermission,
+    PerformanceConfiguration, PhysicalTable, RefreshFrequency, RefreshSchedule,
+    ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
     SslProperties, Tag, Theme, ThemeConfiguration, ThemeVersion, TopicDetails,
     VpcConnectionProperties,
@@ -37,6 +38,11 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     pub data_sets: HashMap<(String, String), DataSetRecord>,
     /// Ingestions by `(AwsAccountId, DataSetId, IngestionId)`.
     pub ingestions: HashMap<(String, String, String), IngestionRecord>,
+    /// Refresh schedules by `(AwsAccountId, DataSetId, ScheduleId)`.
+    ///
+    /// A refresh schedule is a child of one data set, and its `ScheduleId` is only
+    /// unique inside that data set, so the data set it refreshes is part of its key.
+    pub refresh_schedules: HashMap<(String, String, String), RefreshScheduleRecord>,
     /// Q topics by `(AwsAccountId, TopicId)`.
     pub topics: HashMap<(String, String), TopicRecord>,
     /// Themes by `(AwsAccountId, ThemeId)`.
@@ -129,6 +135,39 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             .keys()
             .filter(|(account, _)| account == aws_account_id)
             .count()
+    }
+
+    /// One data set's refresh schedules, ordered by `ScheduleId` — the order a
+    /// refresh-schedule read iterates in.
+    pub fn refresh_schedules_in(
+        &self,
+        aws_account_id: &str,
+        data_set_id: &str,
+    ) -> Vec<&RefreshScheduleRecord> {
+        let mut records: Vec<&RefreshScheduleRecord> = self
+            .refresh_schedules
+            .iter()
+            .filter(|((account, data_set, _), _)| {
+                account == aws_account_id && data_set == data_set_id
+            })
+            .map(|(_, record)| record)
+            .collect();
+        records.sort_by(|left, right| left.schedule_id.cmp(&right.schedule_id));
+        records
+    }
+
+    /// The refresh schedule `data_set_id` holds under `schedule_id`, if any.
+    pub fn refresh_schedule(
+        &self,
+        aws_account_id: &str,
+        data_set_id: &str,
+        schedule_id: &str,
+    ) -> Option<&RefreshScheduleRecord> {
+        self.refresh_schedules.get(&(
+            aws_account_id.to_string(),
+            data_set_id.to_string(),
+            schedule_id.to_string(),
+        ))
     }
 
     /// How many themes `aws_account_id` holds — what [`MAX_THEMES_PER_ACCOUNT`] is
@@ -706,6 +745,63 @@ pub const INGESTION_STATUS_COMPLETED: &str = "COMPLETED";
 /// opposed to one a refresh schedule started.
 pub const INGESTION_REQUEST_SOURCE_MANUAL: &str = "MANUAL";
 
+/// A stored refresh schedule: the `RefreshSchedule` a create persisted under one data
+/// set, which is what every later refresh-schedule read reports.
+///
+/// The submitted frequency is held whole rather than split into its members: a read
+/// returns that same structure, so storing it is what makes the read report the
+/// schedule the create was given.
+#[derive(Debug, Clone)]
+pub struct RefreshScheduleRecord {
+    pub arn: String,
+    pub schedule_id: String,
+    pub schedule_frequency: RefreshFrequency,
+    pub start_after_date_time: Option<DateTime>,
+    pub refresh_type: String,
+}
+
+impl RefreshScheduleRecord {
+    /// The modelled `RefreshSchedule` structure this record describes. The `Arn` is
+    /// the one the service minted for the schedule, not whatever the create's input
+    /// carried there.
+    pub fn to_refresh_schedule(&self) -> RefreshSchedule {
+        RefreshSchedule {
+            schedule_id: self.schedule_id.clone(),
+            schedule_frequency: self.schedule_frequency.clone(),
+            start_after_date_time: self.start_after_date_time,
+            refresh_type: self.refresh_type.clone(),
+            arn: Some(self.arn.clone()),
+        }
+    }
+}
+
+/// How many refresh schedules one data set may hold: the model documents that up to 5
+/// different schedules can be created for a single dataset.
+pub const MAX_REFRESH_SCHEDULES_PER_DATA_SET: usize = 5;
+
+/// The TOTAL number of refresh schedules this emulator holds, across every data set —
+/// the process bound, for the same reason as [`MAX_DATA_SOURCES`].
+pub const MAX_REFRESH_SCHEDULES: usize = 10_000;
+
+/// The `RefreshInterval` members a data set may only hold ONE schedule of: the model
+/// documents, for each of these intervals, that it can only be used for one schedule
+/// per dataset. The longer intervals carry no such restriction.
+pub const SINGLE_SCHEDULE_REFRESH_INTERVALS: &[&str] = &["MINUTE15", "MINUTE30", "HOURLY"];
+
+/// The `RefreshInterval` members only an incremental refresh may use: the model
+/// documents, for each of these intervals, that it is only supported for incremental
+/// refreshes.
+pub const INCREMENTAL_ONLY_REFRESH_INTERVALS: &[&str] = &["MINUTE15", "MINUTE30"];
+
+/// The `RefreshInterval` members a schedule must name a `RefreshOnDay` for: the model
+/// states that value is required for the weekly and monthly refresh intervals, which are
+/// the two that refresh on ONE day of their period.
+pub const REFRESH_ON_DAY_REQUIRED_INTERVALS: &[&str] = &["WEEKLY", "MONTHLY"];
+
+/// The `IngestionType` member naming a partial refresh of a data set's rows (model
+/// enum `com.amazonaws.quicksight#IngestionType`).
+pub const INGESTION_TYPE_INCREMENTAL_REFRESH: &str = "INCREMENTAL_REFRESH";
+
 /// A stored Q topic: what `CreateTopic` persisted, which is what every later topic
 /// read reports.
 ///
@@ -1103,6 +1199,22 @@ pub fn ingestion_arn(
         region,
         aws_account_id,
         &format!("dataset/{data_set_id}/ingestion/{ingestion_id}"),
+    )
+}
+
+/// The ARN of one data set's refresh schedule:
+/// `.../dataset/<DataSetId>/refresh-schedule/<ScheduleId>` — a refresh schedule is a
+/// child of the data set it refreshes, so its ARN is scoped by that data set.
+pub fn refresh_schedule_arn(
+    region: &str,
+    aws_account_id: &str,
+    data_set_id: &str,
+    schedule_id: &str,
+) -> String {
+    quicksight_arn(
+        region,
+        aws_account_id,
+        &format!("dataset/{data_set_id}/refresh-schedule/{schedule_id}"),
     )
 }
 

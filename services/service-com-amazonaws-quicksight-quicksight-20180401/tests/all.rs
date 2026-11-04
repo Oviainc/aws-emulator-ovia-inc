@@ -21,6 +21,8 @@ mod describe_namespace;
 mod iam_policy_assignment_lifecycle;
 #[path = "all/namespace_lifecycle.rs"]
 mod namespace_lifecycle;
+#[path = "all/refresh_schedule_lifecycle.rs"]
+mod refresh_schedule_lifecycle;
 #[path = "all/search_data_sets.rs"]
 mod search_data_sets;
 #[path = "all/state_roundtrip.rs"]
