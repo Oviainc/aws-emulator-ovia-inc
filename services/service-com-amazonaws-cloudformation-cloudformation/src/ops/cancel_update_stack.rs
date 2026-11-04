@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelUpdateStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelUpdateStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelUpdateStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: cancels the UPDATE in flight on a stack — the stack rolls that update back
+//! and reverts to the previous stack configuration, putting back in the services that own
+//! its resources whatever the update had already changed there, so it reaches
+//! `UPDATE_ROLLBACK_COMPLETE`. A stack with no update in flight is refused rather than
+//! moved.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +70,27 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::status;
+
+/// The message CloudFormation answers when `CancelUpdateStack` names a stack whose current
+/// status is not one an update can be cancelled from.
+///
+/// "You can cancel only stacks that are in the UPDATE_IN_PROGRESS state": that is the one
+/// state the call can be made from, since it is the only one with an update in flight to
+/// cancel. Entirely FIXED text, the same shape as the sibling refusal
+/// [`crate::state::CANNOT_CONTINUE_UPDATE_ROLLBACK`]: it names the operation that cannot be
+/// called and nothing of the stack it was called against — the stack's id and the status it
+/// is really in are this run's own state, and `DescribeStacks` is what reports them.
+pub const CANNOT_CANCEL_UPDATE_STACK: &str =
+    "CancelUpdateStack cannot be called from current stack status";
+
+/// The `StackStatusReason` a cancelled update and the rollback it owes carry: the update
+/// did not go through because the CALLER ended it.
+///
+/// A stack in a failed or rolling-back status has to say what put it there, and for this
+/// one the cause is the cancellation itself rather than anything a resource or an owning
+/// service answered.
+pub const UPDATE_CANCELLED_BY_USER: &str = "Stack update cancelled by user.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -162,18 +179,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelUpdateStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelUpdateStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelUpdateStack"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no update to cancel, and nothing
+            // was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CancelUpdateStack",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        // A stack name or id names a stack only in the Region the request was signed for:
+        // the same name in another Region is another stack, and this call must not cancel
+        // ITS update.
+        let request_region = crate::state::request_region(ctx.parts());
+        // Whether this stack has an update to cancel depends on the status it is in, so a
+        // rollback the failure of an earlier update already made due is carried out first:
+        // it was owed at the instant that update failed, whether or not anybody called
+        // (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // calls that put the previous configuration back run after it, and each of those
+        // reaches another service's own handler, which takes that service's lock.
+        {
+            let mut store = state.lock();
+            store.settle(now);
+
+            let Some(previous) = store
+                .resolve(&request_region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
+                ));
+            };
+            // "You can cancel only stacks that are in the UPDATE_IN_PROGRESS state": a
+            // stack in any other status has no update in flight for this call to end, so it
+            // is refused and the stack is left exactly where it is. An update whose
+            // completion the clock has already made due is one of those — `settle` above is
+            // what materialised it — so the gate is read off the status the stack holds NOW
+            // together with the transition it still owes.
+            if previous.status != status::UPDATE_IN_PROGRESS || previous.pending.is_none() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    CANNOT_CANCEL_UPDATE_STACK,
+                ));
+            }
+            // "A unique identifier for this CancelUpdateStack request": a token an
+            // operation on this stack already claimed names THAT operation, so presenting it
+            // here is the duplicate submission the modelled `TokenAlreadyExistsException`
+            // refuses, before the update is touched.
+            if let Some(message) = crate::state::reused_client_request_token(
+                previous,
+                input.client_request_token.as_deref(),
+            ) {
+                return Err(CancelUpdateStackErrorModeled::TokenAlreadyExistsException(
+                    TokenAlreadyExistsException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+
+            // Resolved again for the write, this time mutably, in the Region the request is
+            // signed for.
+            let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
+                ));
+            };
+            // "All events initiated by a given stack operation are assigned the same client
+            // request token": the rollback this call opens is driven by THIS request, so its
+            // events carry the token the request named where it named one.
+            if let Some(token) = &input.client_request_token {
+                stack.client_request_token = Some(token.clone());
+            }
+            // The update is over at this instant: it did not go through, so whatever it was
+            // waiting at it will not proceed, and the attempt is recorded as one that failed
+            // with the cancellation as its reason.
+            stack.fail_transition(
+                now,
+                status::UPDATE_FAILED,
+                UPDATE_CANCELLED_BY_USER.to_string(),
+            );
+            // ..."the stack rolls back the update and reverts to the previous stack
+            // configuration": the revision the update replaced goes back onto the stack, the
+            // deployment that update staged is abandoned, and what it had already changed in
+            // the services that own the resources becomes work this stack owes them — the
+            // one path a failed update's own rollback takes, so a cancelled update and a
+            // failed one are rolled back alike, down to a caller that asked for the failed
+            // state to be kept (`DisableRollback`) getting it.
+            stack.begin_owed_update_rollback(now, UPDATE_CANCELLED_BY_USER.to_string());
+        }
+
+        // Putting the previous configuration back is the rollback's own work in the services
+        // that own the resources, and it is performed through the ONE path every rollback
+        // this service owes goes through — with the store unlocked, and before the
+        // rollback's own terminal status falls due.
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
+        Ok(CancelUpdateStackOutput)
     }
 }

@@ -31,6 +31,8 @@ mod bucket_metrics_and_lifecycle_configurations;
 mod bucket_notification_configuration;
 #[path = "all/callback_signature.rs"]
 mod callback_signature;
+#[path = "all/cancelled_update.rs"]
+mod cancelled_update;
 #[path = "all/cdk_metadata_resource_type.rs"]
 mod cdk_metadata_resource_type;
 #[path = "all/change_set_hooks.rs"]
