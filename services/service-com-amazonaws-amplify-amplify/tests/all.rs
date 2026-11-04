@@ -17,6 +17,8 @@ mod app_branch_lifecycle;
 mod app_branch_projection;
 #[path = "all/app_branch_updates.rs"]
 mod app_branch_updates;
+#[path = "all/backend_environment_listing.rs"]
+mod backend_environment_listing;
 #[path = "all/backend_environments.rs"]
 mod backend_environments;
 #[path = "all/branch_deletion_visibility.rs"]

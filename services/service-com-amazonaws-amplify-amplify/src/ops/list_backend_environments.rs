@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBackendEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBackendEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBackendEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -91,16 +82,25 @@ use super::types::*;
 // `ListBackendEnvironmentsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplify-amplify.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListBackendEnvironmentsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplify#ListBackendEnvironments")]
+// The operation's MODELED errors, widened by `NotFoundException`.
+//
+// `extra_errors` is deliberate, and is the same widening `ListBranches`,
+// `ListWebhooks`, `ListDomainAssociations` and `ListJobs` take: this operation takes
+// `appId` as an @httpLabel, so a request can name an app that does not exist, and the
+// only honest answer is the same 404 every other app-scoped operation gives. The
+// model's error union for THIS operation omits the shape (the service declares it,
+// and `GetBackendEnvironment`, `CreateBackendEnvironment` and `GetApp` all list it),
+// so the widening keeps one rule across the resource instead of inventing a second
+// one here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplify#ListBackendEnvironments",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListBackendEnvironmentsErrorModeled {
     BadRequestException(BadRequestException),
     InternalFailureException(InternalFailureException),
+    NotFoundException(NotFoundException),
     UnauthorizedException(UnauthorizedException),
 }
 
@@ -153,20 +153,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBackendEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBackendEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBackendEnvironments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBackendEnvironmentsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the Amplify emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // Every `nextToken` this operation issues is an `environmentName`, so a token
+        // that could not be one was never issued by this service: refuse it instead of
+        // serving an arbitrary suffix of the collection for it.
+        if let Some(token) = input.next_token.as_deref() {
+            if !is_environment_name(token) {
+                return Err(ListBackendEnvironmentsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some("Invalid nextToken".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A pure read, scoped to ONE app: the environments are read out of that app's
+        // own map, so no other app's environment can appear in the page, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let app = store.apps.get(&input.app_id).ok_or_else(|| {
+            ListBackendEnvironmentsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+
+        // `environmentName` is an optional FILTER over the collection, not an address:
+        // it is modelled on the request while `NotFoundException` is not modelled on
+        // this result, so a name no environment of this app carries narrows the page to
+        // nothing rather than refusing the call. The filter is applied BEFORE paging, so
+        // the page bound and the `nextToken` describe the filtered collection.
+        let selected = app.backend_environments.iter().filter(|(name, _)| {
+            input
+                .environment_name
+                .as_deref()
+                .is_none_or(|wanted| name.as_str() == wanted)
+        });
+
+        let (backend_environments, next_token) = crate::state::page(
+            selected.map(|(environment_name, stored)| (environment_name.clone(), stored.clone())),
+            input.next_token.as_deref(),
+            crate::state::page_size(input.max_results, MAX_RESULTS),
+        );
+
+        Ok(ListBackendEnvironmentsOutput {
+            backend_environments,
+            next_token,
+        })
     }
+}
+
+/// The largest page `ListBackendEnvironments` serves, and the page it serves a caller
+/// that set no bound: `maxResults` is modelled `range 0..50`
+/// (`smithy_query(query="operation",operation="ListBackendEnvironments")`).
+const MAX_RESULTS: usize = 50;
+
+/// Could `value` be an `environmentName`? `EnvironmentName` is modelled
+/// `length 1..255, pattern ^(?s).+$`
+/// (`smithy_query(query="operation",operation="ListBackendEnvironments")`), which
+/// admits any non-empty text up to 255 characters, while `NextToken` admits up to
+/// 2000 — so a longer or an empty token is one this service cannot have issued.
+///
+/// A token naming an environment that has since been DELETED still satisfies this and
+/// is still honoured — the scan resumes at the next name — so a page boundary survives
+/// a concurrent delete, which is the behaviour a paging client depends on.
+fn is_environment_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 255
 }
