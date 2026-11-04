@@ -47,6 +47,8 @@ mod delete_token_replay;
 mod effective_lifecycle_policy;
 #[path = "all/encryption_indexes_and_tagging.rs"]
 mod encryption_indexes_and_tagging;
+#[path = "all/index_create_retry_precedence.rs"]
+mod index_create_retry_precedence;
 #[path = "all/index_delete.rs"]
 mod index_delete;
 #[path = "all/index_name_rule.rs"]

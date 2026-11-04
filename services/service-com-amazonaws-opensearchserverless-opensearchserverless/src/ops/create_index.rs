@@ -2,11 +2,12 @@
 
 //! @op CreateIndex
 //! IMPLEMENTED: stores an `IndexRecord` on the `CollectionRecord` the requested
-//! collection id names, so `GetIndex` reports the schema back. Refuses an id that names
-//! no collection (`ResourceNotFoundException`), a collection that is not `ACTIVE`
-//! (`ConflictException`), an index name the service's own documented rule rejects
-//! (`ValidationException`), a name already taken by an index with a different schema
-//! (`ConflictException`), and a create past
+//! collection id names, so `GetIndex` reports the schema back. `@idempotent`: a repeat of
+//! an accepted create answers the index it already made. Refuses an id that names
+//! no collection (`ResourceNotFoundException`), an index name the service's own documented
+//! rule rejects (`ValidationException`), a name already taken by an index with a different
+//! schema (`ConflictException`), and — only where a NEW index would be added — a
+//! collection that is not `ACTIVE` (`ConflictException`) and a create past
 //! [`crate::state::MAX_INDEXES_PER_COLLECTION`] (`ValidationException`).
 //!
 //! ## Shape of an operation
@@ -194,27 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // An index lives in the collection's data plane, which exists once the collection
-        // is "ready to use" (`CollectionStatus$ACTIVE`'s own documentation) — so a
-        // collection still being created, updated or deleted cannot take one yet. That is
-        // the state conflict `ConflictException` describes.
-        if collection.status != crate::state::COLLECTION_ACTIVE {
-            return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Collection with ID {} is in status {} and cannot take an index; it must be {}",
-                    input.id,
-                    collection.status,
-                    crate::state::COLLECTION_ACTIVE
-                )),
-            })
-            .into());
-        }
-
+        // The name this request addresses is resolved FIRST, before any guard that
+        // constrains adding one: `CreateIndex` is `@idempotent`, so a repeat of a create
+        // this service already accepted is answered with the index that create made, and
+        // only a request that would add a NEW index is held to the conditions for adding
+        // one. A request whose name is already taken adds nothing, so neither the
+        // collection's status nor the per-collection cap below can refuse it.
         if let Some(existing) = collection.indexes.get(&input.index_name) {
-            // `CreateIndex` is `@idempotent`, so a repeat of the SAME create answers the
-            // index it already made rather than conflicting with it; a different schema
-            // under a name already taken is a genuinely different request, which is the
-            // conflict `ConflictException` describes.
+            // A repeat of the SAME create answers the index it already made rather than
+            // conflicting with it; a different schema under a name already taken is a
+            // genuinely different request, which is the conflict `ConflictException`
+            // describes.
             if existing.index_schema == input.index_schema {
                 return Ok(CreateIndexOutput {});
             }
@@ -222,6 +213,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(format!(
                     "An index with name '{}' already exists in the collection with ID {}.",
                     input.index_name, input.id
+                )),
+            })
+            .into());
+        }
+
+        // An index lives in the collection's data plane, which exists once the collection
+        // is "ready to use" (`CollectionStatus$ACTIVE`'s own documentation) — so a
+        // collection still being created, updated or deleted cannot take a NEW one yet.
+        // That is the state conflict `ConflictException` describes.
+        if collection.status != crate::state::COLLECTION_ACTIVE {
+            return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Collection with ID {} is in status {} and cannot take an index; it must be {}",
+                    input.id,
+                    collection.status,
+                    crate::state::COLLECTION_ACTIVE
                 )),
             })
             .into());

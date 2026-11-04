@@ -54,7 +54,7 @@ async fn read_index(
 }
 
 /// Create one index, asserting the create was accepted.
-async fn create_index(
+pub(crate) async fn create_index(
     router: &smithy_server_runtime::MultiServiceRouter,
     id: &str,
     index_name: &str,

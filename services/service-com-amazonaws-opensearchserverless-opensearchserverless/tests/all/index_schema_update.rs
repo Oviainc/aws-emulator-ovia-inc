@@ -40,7 +40,7 @@ fn index_not_found_message(index_name: &str, id: &str) -> String {
 }
 
 /// The `indexSchema` `GetIndex` reports for `index_name`, asserting the read succeeded.
-async fn stored_schema(
+pub(crate) async fn stored_schema(
     router: &smithy_server_runtime::MultiServiceRouter,
     id: &str,
     index_name: &str,

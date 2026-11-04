@@ -153,7 +153,7 @@ async fn create_collection(router: &MultiServiceRouter, body: Value) -> Value {
 }
 
 /// The `CollectionDetail` `BatchGetCollection` reports for `id`, or `Value::Null`.
-async fn read_collection(router: &MultiServiceRouter, id: &str) -> Value {
+pub(crate) async fn read_collection(router: &MultiServiceRouter, id: &str) -> Value {
     let (status, code, answer) = call(router, "BatchGetCollection", json!({ "ids": [id] })).await;
     assert_eq!(
         status, 200,
