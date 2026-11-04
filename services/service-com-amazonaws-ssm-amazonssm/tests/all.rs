@@ -51,6 +51,8 @@ mod parameters_batch;
 mod parameters_by_path;
 #[path = "all/published_documents.rs"]
 mod published_documents;
+#[path = "all/resource_data_syncs.rs"]
+mod resource_data_syncs;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tags.rs"]

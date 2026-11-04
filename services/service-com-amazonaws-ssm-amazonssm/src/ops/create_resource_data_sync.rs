@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceDataSync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceDataSync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Persist a resource data sync configuration — the write half of this service's
+//! resource data sync slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceDataSync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is reported by `ListResourceDataSync`, changed by
+//! `UpdateResourceDataSync` and removed by `DeleteResourceDataSync`; all four reach the
+//! one store in [`crate::state::resource_data_syncs`]. The sync is held at the Region
+//! whose endpoint created it, under the `SyncName` the request chose: that name is unique
+//! within the Region, so a second create of one is refused with
+//! `ResourceDataSyncAlreadyExistsException` and changes nothing.
+//!
+//! `SyncType` defaults to `SyncToDestination` ("The default value is SyncToDestination"),
+//! and the configuration rules the docs state over `SyncType`, `S3Destination` and
+//! `SyncSource` together are checked by
+//! [`crate::state::resource_data_syncs::configuration_rejection`] — a configuration
+//! outside them is refused with `ResourceDataSyncInvalidConfigurationException` and
+//! persists nothing. `SyncCreatedTime` and `SyncLastModifiedTime` are both when this call
+//! ran; every other member a listing reports is what this request supplied. The store is
+//! bounded ([`crate::state::resource_data_syncs::MAX_RESOURCE_DATA_SYNCS`]): a create
+//! past that ceiling is refused with `ResourceDataSyncCountExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +179,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceDataSync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceDataSyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceDataSync"))
+        use crate::state::resource_data_syncs::{
+            addressed_sync_type, configuration_rejection, sync_ceiling_message,
+            ResourceDataSyncRecord,
+        };
+
+        // Every member's own length — the sync name, the sync type, the bucket name, the
+        // prefix, the KMS key ARN, the source regions — is a MODELLED constraint the
+        // centralized walk has already refused anything outside of, and the members each
+        // structure requires are present by the same walk.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateResourceDataSyncErrorModeled::InternalServerError(InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                })
+                .into(),
+            );
+        };
+
+        // "The default value is SyncToDestination" (the `SyncType` doc), so a create that
+        // names no type creates a sync of that one — read through the one helper every
+        // operation of this slice reads an omitted `SyncType` through.
+        let sync_type = addressed_sync_type(input.sync_type.as_deref()).to_string();
+        // Which member has to be present for which sync type, and the value sets the
+        // docs name for the source: a configuration outside them cannot be synchronized,
+        // so it is refused rather than persisted.
+        if let Some(why) = configuration_rejection(
+            &sync_type,
+            input.s3_destination.as_ref(),
+            input.sync_source.as_ref(),
+        ) {
+            return Err(
+                CreateResourceDataSyncErrorModeled::ResourceDataSyncInvalidConfigurationException(
+                    ResourceDataSyncInvalidConfigurationException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "A sync configuration with the same name already exists": the name is the
+        // sync's identity within its Region, so a create of a name already held leaves
+        // what is held exactly as it was.
+        if store.resource_data_sync(&region, &input.sync_name).is_some() {
+            return Err(
+                CreateResourceDataSyncErrorModeled::ResourceDataSyncAlreadyExistsException(
+                    ResourceDataSyncAlreadyExistsException {
+                        sync_name: Some(input.sync_name),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is BOUNDED: past the emulator's own ceiling a create is refused
+        // rather than admitting another record, through the modelled refusal for exactly
+        // that ("You have exceeded the allowed maximum sync configurations"). The message
+        // says whose ceiling it is.
+        if !store.can_hold_another_resource_data_sync() {
+            return Err(
+                CreateResourceDataSyncErrorModeled::ResourceDataSyncCountExceededException(
+                    ResourceDataSyncCountExceededException {
+                        message: Some(sync_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.insert_resource_data_sync(ResourceDataSyncRecord {
+            name: input.sync_name,
+            region,
+            sync_type,
+            s3_destination: input.s3_destination,
+            sync_source: input.sync_source,
+            created_time: now,
+            // Nothing has changed the sync yet, so it was last changed when it was
+            // created.
+            last_modified_time: now,
+        });
+
+        // `CreateResourceDataSyncResult` carries no member at all: the sync is addressed
+        // by the name the caller chose, so there is nothing for the create to report back.
+        Ok(CreateResourceDataSyncOutput {})
     }
 }

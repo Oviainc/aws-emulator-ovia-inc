@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceDataSync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceDataSync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the resource data sync configurations a Region holds — the read half of this
+//! service's resource data sync slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceDataSync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It reports what `CreateResourceDataSync` persisted, what `UpdateResourceDataSync`
+//! changed and nothing `DeleteResourceDataSync` removed: the one store in
+//! [`crate::state::resource_data_syncs`], read at the Region this request was signed for.
+//!
+//! `SyncType` "view[s] a list of resource data syncs according to the sync type", so a
+//! listing reports the syncs of ONE type: the one the request names, or the documented
+//! default `SyncToDestination` for a request that names none
+//! ([`crate::state::resource_data_syncs::addressed_sync_type`]). A type outside the two
+//! the docs name is no type a sync can carry, so it is refused with
+//! `ResourceDataSyncInvalidConfigurationException`. The page is bounded by `MaxResults`
+//! and the token a full page hands out is the NAME of the sync the next page starts at,
+//! so a resume is a position in the store's own total order rather than an offset into a
+//! list that may have changed between two pages; a token no sync name could take was not
+//! issued here and is refused with `InvalidNextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +165,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceDataSync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceDataSyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceDataSync"))
+        use crate::state::resource_data_syncs::{
+            addressed_sync_type, is_sync_name, page_size, sync_type_rejection,
+        };
+        use crate::state::INVALID_NEXT_TOKEN;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResourceDataSyncErrorModeled::InternalServerError(InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                })
+                .into(),
+            );
+        };
+
+        // A listing reports the syncs of ONE type: the one the request names, or the
+        // documented default for a request that names none. A type outside the two the
+        // docs name is no type a sync can carry, so the listing it asks for cannot be
+        // served.
+        let requested_type = addressed_sync_type(input.sync_type.as_deref());
+        if let Some(why) = sync_type_rejection(requested_type) {
+            return Err(
+                ListResourceDataSyncErrorModeled::ResourceDataSyncInvalidConfigurationException(
+                    ResourceDataSyncInvalidConfigurationException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        let page_size =
+            page_size(input.max_results).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token is the name of the sync the next page starts at, so a value no sync
+        // name could take was not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_sync_name(token) => Some(token),
+            Some(_) => {
+                return Err(ListResourceDataSyncErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Systems Manager is regional: a sync is reported through the endpoint it was
+        // created at, which is the Region this request was signed for. The store yields
+        // that Region's syncs in ascending sync-name order, which is what makes the
+        // resume cursor total.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let mut items = Vec::new();
+        let mut next_token = None;
+        for (name, record) in store.resource_data_syncs_in_region(&region) {
+            if resume_from.is_some_and(|from| name < from) {
+                continue;
+            }
+            if record.sync_type != requested_type {
+                continue;
+            }
+            if items.len() == page_size {
+                // The page is full and a sync is still waiting: hand the caller the name
+                // it resumes at, so the next request continues where this one stopped.
+                next_token = Some(name.to_string());
+                break;
+            }
+            items.push(record.to_item());
+        }
+
+        Ok(ListResourceDataSyncOutput {
+            resource_data_sync_items: Some(items),
+            next_token,
+        })
     }
 }
+

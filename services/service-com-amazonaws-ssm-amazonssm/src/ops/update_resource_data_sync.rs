@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResourceDataSync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResourceDataSync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replace the source of a resource data sync configuration — the update half of this
+//! service's resource data sync slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResourceDataSync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It changes what `CreateResourceDataSync` persisted in the one store in
+//! [`crate::state::resource_data_syncs`], at the Region this request was signed for, so a
+//! later `ListResourceDataSync` reports the source this call carried and a
+//! `SyncLastModifiedTime` of when it ran. `SyncSource` is `@required` here and is the
+//! whole of what an update carries, so it replaces the stored source outright.
+//!
+//! "This API operation only supports a resource data sync that was created with a
+//! SyncFromSource SyncType", so an update of any other type is refused with
+//! `ResourceDataSyncInvalidConfigurationException`; so is a source outside the rules
+//! [`crate::state::resource_data_syncs::source_rejection`] states, and so is a change of
+//! the sync's account options, which "you can't change" once the sync exists — the source
+//! type is what names them. A name the Region holds no sync of that type under is refused
+//! with `ResourceDataSyncNotFoundException`, and every refusal leaves the store as it was.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +157,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResourceDataSync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceDataSyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResourceDataSync"))
+        use crate::state::resource_data_syncs::{
+            source_rejection, sync_not_found_message, SYNC_TYPE_FROM_SOURCE,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateResourceDataSyncErrorModeled::InternalServerError(InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                })
+                .into(),
+            );
+        };
+        let invalid_configuration = |why: String| -> UpdateResourceDataSyncError {
+            UpdateResourceDataSyncErrorModeled::ResourceDataSyncInvalidConfigurationException(
+                ResourceDataSyncInvalidConfigurationException { message: Some(why) },
+            )
+            .into()
+        };
+
+        // "The supported SyncType is SyncFromSource" (the `SyncType` doc): a sync of any
+        // other type carries no source for an update to replace.
+        if input.sync_type != SYNC_TYPE_FROM_SOURCE {
+            return Err(invalid_configuration(format!(
+                "The sync type {} is not supported. The supported SyncType is \
+                 {SYNC_TYPE_FROM_SOURCE}.",
+                input.sync_type
+            )));
+        }
+        // The value sets the source docs name, checked the same way a create's source is.
+        if let Some(why) = source_rejection(&input.sync_source) {
+            return Err(invalid_configuration(why));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(record) = store
+            .resource_data_sync_mut(&region, &input.sync_name)
+            .filter(|record| record.sync_type == input.sync_type)
+        else {
+            return Err(
+                UpdateResourceDataSyncErrorModeled::ResourceDataSyncNotFoundException(
+                    ResourceDataSyncNotFoundException {
+                        message: Some(sync_not_found_message(&input.sync_name, &input.sync_type)),
+                        sync_name: Some(input.sync_name),
+                        sync_type: Some(input.sync_type),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "After you create a resource data sync for a Region, you can't change the
+        // account options for that sync" — the doc's own example of those options is
+        // "Include only the current account" against "Include all accounts from my
+        // Organizations configuration", which is the source TYPE, so an update that
+        // names another one is refused rather than rewriting the sync into a different
+        // kind of sync. WITHIN one source type the sources are what an update exists to
+        // change: which Regions it aggregates, whether future ones join it, and which
+        // units of the SAME organization it reads.
+        let held_source_type = record
+            .sync_source
+            .as_ref()
+            .map(|source| source.source_type.clone());
+        if held_source_type.is_some_and(|held| held != input.sync_source.source_type) {
+            return Err(invalid_configuration(format!(
+                "The account options of a resource data sync can't be changed. The sync \
+                 {} can't be updated to the source type {}; delete it and create a new \
+                 one instead.",
+                input.sync_name, input.sync_source.source_type
+            )));
+        }
+
+        record.apply_update(input.sync_source, now);
+
+        // `UpdateResourceDataSyncResult` carries no member: what the update persisted is
+        // what a later listing reports.
+        Ok(UpdateResourceDataSyncOutput {})
     }
 }

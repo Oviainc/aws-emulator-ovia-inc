@@ -86,6 +86,12 @@
 //! and everything a read reports — the status, the version, who created it and when —
 //! comes from what the create persisted.
 //!
+//! Then the **resource data sync configurations** ([`resource_data_syncs`]), keyed by
+//! `(region, sync name)`: `CreateResourceDataSync` persists one,
+//! `ListResourceDataSync` reports what a Region holds, `UpdateResourceDataSync`
+//! replaces the source of one and `DeleteResourceDataSync` removes it, so whatever a
+//! write persisted is what a later listing reports.
+//!
 //! Last is the account's **service settings** ([`service_settings`]):
 //! `GetServiceSetting` reports one, `UpdateServiceSetting` overwrites it and
 //! `ResetServiceSetting` restores the value its service team provisioned. The settings an
@@ -119,6 +125,11 @@ pub mod resource_policies;
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
 pub mod ops_items;
+
+/// The resource data sync configurations this service holds: the record a create
+/// persists, the configuration rules it is held to, and how a listing, an update and a
+/// delete address one.
+pub mod resource_data_syncs;
 
 /// The account-level settings the Systems Manager service teams provision, which
 /// `GetServiceSetting` reports and `UpdateServiceSetting`/`ResetServiceSetting` modify.
@@ -2998,6 +3009,13 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// — the one store `PutResourcePolicy` writes, `GetResourcePolicies` reads and
     /// `DeleteResourcePolicy` removes from.
     pub resource_policies: resource_policies::ResourcePolicyStore,
+
+    /// Every resource data sync configuration, keyed by `(region, sync name)`: a sync is
+    /// created through one Region's endpoint and its name is unique within that Region. A
+    /// `BTreeMap` so a listing walks a stable, total order — ascending by sync name
+    /// within one Region — and can resume a page from the name it stopped at rather than
+    /// from an offset. See [`resource_data_syncs`].
+    pub resource_data_syncs: BTreeMap<(String, String), resource_data_syncs::ResourceDataSyncRecord>,
 }
 
 impl Default for ComAmazonawsSsmAmazonssmState {
@@ -3015,6 +3033,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),
+            resource_data_syncs: BTreeMap::new(),
         }
     }
 }
