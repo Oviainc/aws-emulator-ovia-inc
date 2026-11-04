@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT: it answers the resource-based policy document held on the pipeline the ARN
+//! names, as `PutResourcePolicy` stored it. Every pipeline that exists has a document: a
+//! pipeline nothing was attached to, and one whose policy was removed, answer the EMPTY
+//! document, which is why this service models a not-found contract for a resource that
+//! does not exist and none for an unattached policy.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        // The only write a report may make: the transition the clock already owes.
+        store.settle(now);
+
+        // `ResourceArn` is `@length(46, 76)` with the pipeline-ARN pattern, so a malformed
+        // ARN was already refused; an ARN no stored pipeline carries names no resource
+        // whose policy could be read.
+        let stored = store
+            .pipeline_by_arn(&input.resource_arn)
+            .ok_or_else(not_found)?;
+
+        Ok(GetResourcePolicyOutput {
+            // Answered from the record rather than echoed from the request: the ARN this
+            // reports is the one the stored pipeline carries.
+            resource_arn: Some(stored.pipeline_arn.clone()),
+            // The document the record holds: the attached one byte for byte, or the empty
+            // document when nothing is attached.
+            policy: Some(stored.resource_policy_document()),
+        })
     }
+}
+
+/// The ARN names no stored pipeline — HTTP 404 `ResourceNotFoundException`.
+///
+/// The text is this read's own and wholly fixed: it discloses neither the ARN the request
+/// carried nor anything else about the account's pipelines.
+fn not_found() -> GetResourcePolicyError {
+    GetResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("The pipeline could not be found".to_string()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> GetResourcePolicyError {
+    GetResourcePolicyErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }

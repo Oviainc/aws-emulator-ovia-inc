@@ -275,6 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption_at_rest_options: input.encryption_at_rest_options,
             pipeline_role_arn: input.pipeline_role_arn,
             tags,
+            // A new pipeline carries no resource-based policy: one is attached only by a
+            // later `PutResourcePolicy`.
+            resource_policy: None,
         };
         store.pipelines.insert(pipeline_name.clone(), record);
 

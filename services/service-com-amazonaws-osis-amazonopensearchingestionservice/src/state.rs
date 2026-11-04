@@ -83,6 +83,14 @@ pub const MAX_PIPELINES: usize = 1_000;
 /// process's memory without bound.
 pub const MAX_TAGS_PER_PIPELINE: usize = 50;
 
+/// The resource-based policy document of a resource nothing is attached to: the empty
+/// JSON object.
+///
+/// A read of a resource's policy answers a document for every resource that exists, so
+/// "no policy" is the empty document rather than an absent member. It is also the
+/// shortest value `ResourcePolicy`'s `@length(2, 204800)` admits.
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
+
 /// A status change the clock owes a pipeline: where it lands, and when.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
@@ -117,9 +125,30 @@ pub struct StoredPipeline {
     pub encryption_at_rest_options: Option<EncryptionAtRestOptions>,
     pub pipeline_role_arn: Option<String>,
     pub tags: Vec<Tag>,
+    /// The resource-based policy document attached to this pipeline, or `None` while the
+    /// pipeline carries none.
+    ///
+    /// A resource policy belongs to the resource it is attached to, so it lives on the
+    /// pipeline record rather than in a second map beside it: one write
+    /// (`PutResourcePolicy`) and one read (`GetResourcePolicy`) answer from the same
+    /// record, and deleting the pipeline takes its policy with it.
+    pub resource_policy: Option<String>,
 }
 
 impl StoredPipeline {
+    /// The resource-based policy document of this pipeline, as a read reports it.
+    ///
+    /// Every pipeline that exists HAS a policy document: a pipeline nothing was ever
+    /// attached to, and one whose policy was removed, both have the EMPTY document
+    /// ([`EMPTY_RESOURCE_POLICY`]) rather than none, which is why this service models no
+    /// not-found contract for an unattached policy — only for a resource that does not
+    /// exist.
+    pub fn resource_policy_document(&self) -> String {
+        self.resource_policy
+            .clone()
+            .unwrap_or_else(|| EMPTY_RESOURCE_POLICY.to_string())
+    }
+
     /// Materialise the transition the clock already owes this pipeline.
     ///
     /// This is the ONLY write a reporting operation makes: the change was owed at this

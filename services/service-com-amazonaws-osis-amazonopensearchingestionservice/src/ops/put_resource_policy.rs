@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A WRITE: it attaches the submitted resource-based policy document to the pipeline the
+//! ARN names, replacing whatever that pipeline carried (the operation is `@idempotent`),
+//! and answers the ARN and the document it stored. A document that is not a JSON policy
+//! document is refused and nothing is attached, so a later `GetResourcePolicy` reports
+//! exactly the last document this operation accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // The document is checked BEFORE the resource is resolved and before anything is
+        // written: a policy that is not a JSON policy document cannot be attached to any
+        // pipeline, so the request is refused on its own terms and the stored policy —
+        // whatever it was — is left exactly as it was.
+        if !is_policy_document(&input.policy) {
+            return Err(invalid_policy());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // `ResourceArn` is `@length(46, 76)` with the pipeline-ARN pattern, so a malformed
+        // ARN was already refused; an ARN no stored pipeline carries names no resource to
+        // attach a policy to.
+        let stored = store
+            .pipeline_by_arn_mut(&input.resource_arn)
+            .ok_or_else(not_found)?;
+
+        // One policy per resource, so the write REPLACES the document the pipeline
+        // carried; the operation is `@idempotent`, and storing the submitted document
+        // verbatim is what makes repeating the same call leave the same state.
+        stored.resource_policy = Some(input.policy);
+
+        Ok(PutResourcePolicyOutput {
+            // Both members are read back out of the record the write just made, so this
+            // answer cannot drift from what `GetResourcePolicy` reports.
+            resource_arn: Some(stored.pipeline_arn.clone()),
+            policy: Some(stored.resource_policy_document()),
+        })
     }
+}
+
+/// Whether `policy` is a resource-based policy document: a single JSON object.
+///
+/// `ResourcePolicy`'s own doc is "The resource-based policy document in JSON format", and
+/// an IAM-style policy document is an object (its `Version` / `Statement` members), so a
+/// document that does not parse as JSON, or parses as a JSON value that is not an object,
+/// is not one. The text is parsed with the JSON parser the crate already depends on
+/// rather than inspected by hand, so acceptance follows the grammar and not a guess about
+/// the shape of the recorded input.
+fn is_policy_document(policy: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(policy)
+        .is_ok_and(|document| document.is_object())
+}
+
+/// The submitted document is not a resource policy — HTTP 400 `ValidationException`.
+///
+/// Wholly fixed text: it names neither the member nor the document, because the parse
+/// diagnosis is internal to the service and the document may carry the caller's own
+/// principals.
+fn invalid_policy() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ValidationException(ValidationException {
+        message: Some("Invalid resource policy.".to_string()),
+    })
+    .into()
+}
+
+/// The ARN names no stored pipeline — HTTP 404 `ResourceNotFoundException`.
+///
+/// The text is this operation's own and wholly fixed: it discloses neither the ARN the
+/// request carried nor anything else about the account's pipelines.
+fn not_found() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("The pipeline could not be found".to_string()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }

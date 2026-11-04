@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A WRITE: it removes the resource-based policy from the pipeline the ARN names and
+//! answers no members, leaving the pipeline with the empty policy document a resource
+//! nothing is attached to has. The operation is `@idempotent`: removing a policy a
+//! pipeline does not carry leaves the same state as removing one it does, so it is not an
+//! error, while an ARN that names no pipeline is.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // `ResourceArn` is `@length(46, 76)` with the pipeline-ARN pattern, so a malformed
+        // ARN was already refused; an ARN no stored pipeline carries names no resource to
+        // remove a policy from.
+        let stored = store
+            .pipeline_by_arn_mut(&input.resource_arn)
+            .ok_or_else(not_found)?;
+
+        // Idempotent: the record ends with no attached policy — the empty document a
+        // later read reports — whether or not it carried one, so a repeated removal is
+        // neither an error nor a second state.
+        stored.resource_policy = None;
+
+        // `DeleteResourcePolicyResponse` models no members: the removal itself is the whole
+        // answer, and a later `GetResourcePolicy` is what reports it.
+        Ok(DeleteResourcePolicyOutput {})
     }
+}
+
+/// The ARN names no stored pipeline — HTTP 404 `ResourceNotFoundException`.
+///
+/// The text is this operation's own and wholly fixed: it discloses neither the ARN the
+/// request carried nor anything else about the account's pipelines.
+fn not_found() -> DeleteResourcePolicyError {
+    DeleteResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("The pipeline could not be found".to_string()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> DeleteResourcePolicyError {
+    DeleteResourcePolicyErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }
