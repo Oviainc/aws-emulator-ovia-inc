@@ -2,9 +2,9 @@
 
 //! @op ListManagedInsightRules
 //! Reports the managed Contributor Insights rules available for one Amazon Web Services
-//! resource — the templates this account's catalog publishes for it, each carrying the rule
-//! enabled from it when one is enabled — page by page. Implemented here, and the ONLY file to
-//! touch for this operation.
+//! resource — the templates the catalog publishes for that KIND of resource, each carrying the
+//! rule enabled from it when one is enabled — page by page. Implemented here, and the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 ListManagedInsightRulesErrorModeled::InvalidNextToken(InvalidNextToken {
-                    message: Some("NextToken is not a token this service issued".into()),
+                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
                 })
             })?),
         };
@@ -208,16 +208,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let available = store.managed_rules_available_for(&input.resource_arn);
         // The cursor is the template name the next page starts at. A listing reports at most
         // ONE entry per template available for the resource, so the template name identifies
-        // the entry and orders the listing on its own — which is what keeps a token this
-        // service issued pointing at the same entry when a rule is later enabled from that
-        // template, rather than at a position that moved under the caller.
+        // the entry — and the entries and their order depend only on what the catalog
+        // publishes, not on what has been enabled, so a token this service issued keeps
+        // pointing at the same entry when a rule is later enabled from that template or the
+        // rule enabled from it is deleted.
         let cursors: Vec<&str> = available
             .iter()
             .map(|reported| reported.template_name)
             .collect();
         let from = match start_at.as_deref() {
             None => 0,
-            Some(cursor) => cursors.partition_point(|at| *at < cursor),
+            // A token naming a template this listing no longer reports names no further entry:
+            // the page is empty and the paging ends, rather than starting over.
+            Some(cursor) => cursors
+                .iter()
+                .position(|at| *at == cursor)
+                .unwrap_or(cursors.len()),
         };
         let next_token = cursors
             .get(from.saturating_add(page_size))
@@ -233,19 +239,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // using PutManagedInsightRules." (`ManagedRuleDescription$TemplateName`)
                 template_name: Some(reported.template_name.to_string()),
                 // "If a managed rule is enabled, this is the ARN for the related Amazon Web
-                // Services resource." (`ManagedRuleDescription$ResourceARN`) — so the resource
-                // is reported for a template a rule HAS been enabled from, and a template that
-                // is merely available for the resource carries none.
-                resource_arn: reported.rule.map(|_| input.resource_arn.clone()),
+                // Services resource." (`ManagedRuleDescription$ResourceARN`) — every
+                // description of this listing is ABOUT the resource the request named, so each
+                // carries it, whether or not a rule has been enabled from the template.
+                resource_arn: Some(input.resource_arn.clone()),
                 // "Describes the state of a managed rule. If present, it contains
                 // information about the Contributor Insights rule that contains
                 // information about the related Amazon Web Services resource."
-                // (`ManagedRuleDescription$RuleState`) — present only when a rule has been
-                // enabled from the template, and then it is that rule's own name and the state
-                // the store holds it in, whichever operation last moved that state.
-                rule_state: reported.rule.map(|(name, stored)| ManagedRuleState {
-                    rule_name: name.clone(),
-                    state: stored.rule.state.clone(),
+                // (`ManagedRuleDescription$RuleState`) — the state's two members are the
+                // enabled RULE's own name and state, so a template a rule has been enabled
+                // from reports them (with whichever state the store holds the rule in,
+                // whatever operation last moved it) and a template nothing has enabled
+                // reports a state naming neither.
+                rule_state: Some(match reported.rule {
+                    Some((name, stored)) => {
+                        ReportedManagedRuleState::OfTheEnabledRule(ManagedRuleState {
+                            rule_name: name.clone(),
+                            state: stored.rule.state.clone(),
+                        })
+                    }
+                    None => ReportedManagedRuleState::OfNoRule,
                 }),
             })
             .collect();
@@ -266,3 +279,13 @@ const MIN_MAX_RESULTS: usize = 1;
 
 /// `MaxResults`'s modelled maximum (range 1..500).
 const MAX_MAX_RESULTS: usize = 500;
+
+/// How CloudWatch words this operation's refusal of a `NextToken` it did not issue: one fixed
+/// sentence, coded for the condition the way this operation's other refusals are
+/// (`crate::state::INVALID_RESOURCE_ARN`), and carrying nothing of the request — neither the
+/// token nor which part of it was unreadable.
+///
+/// This is the wording MEASURED for this operation. The refusal's wording is per operation —
+/// `ListMetricStreams` states its own and `GetMetricData` answers an EMPTY message — so neither
+/// is copied onto the other.
+const INVALID_NEXT_TOKEN_MESSAGE: &str = "INVALID_TOKEN: Unsupported token version.";

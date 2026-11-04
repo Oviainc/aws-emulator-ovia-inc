@@ -215,17 +215,22 @@ async fn every_enabled_managed_rule_is_reported_for_its_own_resource() {
             // Another resource holds no RULE of it: the row's template is published for the
             // vendor and resource type of the row's resource, so it is available for the other
             // DynamoDB table exactly when the row's resource is a DynamoDB table too — and
-            // there it carries neither a resource nor a rule state, because nothing enabled it.
+            // there its state names no rule, because nothing enabled it.
+            let other_arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Other";
             let other = ok(
                 &router,
                 "ListManagedInsightRules",
-                &json!({"ResourceARN": "arn:aws:dynamodb:us-east-1:123456789012:table/Other"}),
+                &json!({"ResourceARN": other_arn}),
             )
             .await;
             let available_for_other: Vec<Value> = if resource_arn.starts_with("arn:aws:dynamodb:")
                 && resource_arn.contains(":table/")
             {
-                vec![json!({"TemplateName": template})]
+                vec![json!({
+                    "TemplateName": template,
+                    "ResourceARN": other_arn,
+                    "RuleState": {},
+                })]
             } else {
                 Vec::new()
             };
@@ -233,7 +238,7 @@ async fn every_enabled_managed_rule_is_reported_for_its_own_resource() {
                 descriptions(&other),
                 available_for_other,
                 "case {case:?}: a resource no rule was enabled for must report only the \
-                 templates available for it, with no rule state, got {other}"
+                 templates available for it, each naming no rule in its state, got {other}"
             );
             let again = ok(
                 &router,
@@ -469,7 +474,7 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
 }
 
 #[tokio::test]
-async fn a_resource_arn_that_is_not_an_arn_is_refused_and_enables_nothing() {
+async fn a_resource_arn_that_is_not_an_arn_is_reported_about_that_member() {
     // Rows differ along which part of the ARN form is broken: the literal first field, a
     // missing field, and an empty partition, vendor or resource — the fields an ARN cannot
     // omit (`services/common/src/arn.rs`).
@@ -497,24 +502,28 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_and_enables_nothing() {
     for (case, resource_arn) in &cases {
         let router = build_router();
 
-        let (status, body) = call(
+        // `PutManagedInsightRules` is a partial-failure batch: the entry is reported back on
+        // the HTTP 200 rather than failing the whole call, so the other entries of the same
+        // request are still enabled. "If the operation could not process one of the rules, the
+        // following data is returned for each of those rules." (`PartialFailure`)
+        let put = ok(
             &router,
             "PutManagedInsightRules",
             &json!({"ManagedRules": [managed_rule("Rule-A", resource_arn, None)]}),
         )
         .await;
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "InvalidParameterValueException"),
-            "case {case:?}: expected PutManagedInsightRules to refuse the ARN with HTTP 400 \
-             InvalidParameterValueException, got {status} with {body}"
+            put.get("Failures").and_then(Value::as_array).cloned(),
+            Some(vec![json!({
+                "FailureResource": "Rule-A",
+                "ExceptionType": "InvalidParameterException",
+                "FailureCode": "TEMPLATE_NAME",
+                "FailureDescription": "Invalid ARN.",
+            })]),
+            "case {case:?}: expected the entry reported back about a value that is not an ARN, \
+             got {put}"
         );
-        assert_eq!(
-            error_message(&body),
-            INVALID_ARN_MESSAGE,
-            "case {case:?}: expected the service's wording for an invalid ARN, got {body}"
-        );
-        // A refused request enables nothing: no Contributor Insights rule exists at all.
+        // A reported entry enables nothing: no Contributor Insights rule exists at all.
         let described = ok(&router, "DescribeInsightRules", &json!({})).await;
         assert_eq!(
             described
@@ -522,9 +531,11 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_and_enables_nothing() {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0),
-            "case {case:?}: a refused request must enable no rule, got {described}"
+            "case {case:?}: a reported entry must enable no rule, got {described}"
         );
 
+        // The READ takes the ARN as its own required parameter rather than as one entry of a
+        // batch, so a value that is not an ARN is the whole request's fault.
         let (status, body) = call(
             &router,
             "ListManagedInsightRules",
@@ -624,7 +635,7 @@ async fn more_tags_than_a_rule_may_carry_are_refused() {
         .map(|description| {
             (
                 member(description, "TemplateName"),
-                description.get("RuleState").is_some(),
+                description.pointer("/RuleState/RuleName").is_some(),
             )
         })
         .collect();

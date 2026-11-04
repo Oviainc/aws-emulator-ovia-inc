@@ -433,8 +433,9 @@ async fn a_managed_rule_is_deleted_by_the_same_operation() {
             "case {case:?}: the template stays published, got {listed}"
         );
         let rule_state = listed["ManagedRules"][0].get("RuleState");
-        assert!(
-            rule_state.is_none_or(Value::is_null),
+        assert_eq!(
+            rule_state.and_then(|state| state.get("RuleName")),
+            None,
             "case {case:?}: no rule is enabled from the template any more, got {listed}"
         );
     }

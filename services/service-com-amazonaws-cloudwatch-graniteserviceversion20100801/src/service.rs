@@ -186,6 +186,34 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 ),
             ))) as Box<dyn ErasedOperation>,
         );
+        // The two managed Contributor Insights rule operations state a refusal about ONE
+        // request member in CloudWatch's coded form, which includes a required member the
+        // request left out entirely ([`missing_required_member_refusal`]) — a class the
+        // service-wide seam cannot word, because it cannot see which operation was called.
+        overridden.add_operation(
+            "ListManagedInsightRules",
+            Box::new(QueryCompatibleErrors::new(Metering::new(
+                Arc::clone(&engine),
+                JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::list_managed_insight_rules::ListManagedInsightRules::new(
+                        Arc::clone(&engine),
+                    ),
+                    coded_member_fault,
+                ),
+            ))) as Box<dyn ErasedOperation>,
+        );
+        overridden.add_operation(
+            "PutManagedInsightRules",
+            Box::new(QueryCompatibleErrors::new(Metering::new(
+                Arc::clone(&engine),
+                JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::put_managed_insight_rules::PutManagedInsightRules::new(
+                        Arc::clone(&engine),
+                    ),
+                    coded_member_fault,
+                ),
+            ))) as Box<dyn ErasedOperation>,
+        );
         Self {
             metered: QueryCompatibleErrors::new(Metering::new(
                 Arc::clone(&engine),
@@ -266,6 +294,43 @@ fn empty_required_value_refusal(
     Some(Refused {
         code: MISSING_PARAMETER.shape_name.to_string(),
         message: crate::state::parameter_required_message(&crate::state::query_parameter_path(
+            &violation.path,
+        )),
+    })
+}
+
+/// The refusal policy of the managed Contributor Insights rule operations: a required member
+/// the request did not supply at all, worded the way those operations word a refusal about one
+/// request member ([`missing_required_member_refusal`]), and nothing else — every other class
+/// keeps the service-wide wording behind it ([`the_service_wide_wording`]).
+fn coded_member_fault(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    violations.iter().find_map(missing_required_member_refusal)
+}
+
+/// The refusal of a required member the request did not supply AT ALL, or `None` when
+/// `violation` is not one.
+///
+/// The class is the missing-parameter fault ([`MISSING_PARAMETER`], "An input parameter that is
+/// required is missing") — the same one a required member supplied EMPTY is answered under
+/// ([`empty_required_value_refusal`]), because a member the request omitted is a parameter it
+/// supplied no value for — and the sentence is the coded form the Contributor Insights
+/// operations state a refusal about one member in
+/// ([`crate::state::missing_parameter_message`]), naming the member in the spelling this
+/// service's refusals name a request member by.
+///
+/// Keyed on the CLASS of violation and nothing else — a member the model declares required that
+/// the request carried no value for — so it holds for every required member of the operations
+/// mounted with this policy, at any depth: the resource a managed-rule listing is asked about
+/// is the recorded case.
+fn missing_required_member_refusal(
+    violation: &aws_smithy_schema_server::Violation,
+) -> Option<Refused> {
+    let aws_smithy_schema_server::ViolationKind::MissingRequiredMember = violation.kind else {
+        return None;
+    };
+    Some(Refused {
+        code: MISSING_PARAMETER.shape_name.to_string(),
+        message: crate::state::missing_parameter_message(&crate::state::query_parameter_path(
             &violation.path,
         )),
     })
@@ -470,23 +535,40 @@ fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Op
 
 /// Whether `violation` broke a constraint this service does NOT enforce on the wire.
 ///
-/// A metric NAMESPACE is the one such member of this service: `Namespace` is modelled
-/// `@pattern "^[^:]"`, and the service accepts a namespace whatever character it begins with —
-/// the only namespace space it refuses a publish into is the one AWS reserves for its own
-/// services' metrics (`crate::ops::put_metric_data`'s own check, which no model constraint
-/// expresses). A client publishing into a leading-colon namespace is SERVED by AWS and can
-/// then read the series back, so refusing the request here would make the data plane unusable
-/// for a namespace AWS holds data in.
+/// Two such members, both of them values the service reads rather than values it refuses:
 ///
-/// It is keyed on the member and the CLASS of violation alone — a pattern broken by the
-/// namespace of a METRIC ([`is_metric_namespace`]) — so it holds for the namespace a query
-/// names inside a `MetricDataQuery` as well as for the one a publish states at the top of its
-/// request.
+/// * a metric NAMESPACE: `Namespace` is modelled `@pattern "^[^:]"`, and the service accepts a
+///   namespace whatever character it begins with — the only namespace space it refuses a
+///   publish into is the one AWS reserves for its own services' metrics
+///   (`crate::ops::put_metric_data`'s own check, which no model constraint expresses). A client
+///   publishing into a leading-colon namespace is SERVED by AWS and can then read the series
+///   back, so refusing the request here would make the data plane unusable for a namespace AWS
+///   holds data in.
+/// * a managed rule's TEMPLATE NAME: `TemplateName` is modelled `@pattern`, and
+///   `PutManagedInsightRules` resolves the name against the catalog instead of refusing the
+///   request for its SHAPE — a name no template answers to is reported back in that call's
+///   `Failures`, per entry, on the HTTP 200 ("If the operation could not process one of the
+///   rules, the following data is returned for each of those rules.", `PartialFailure`), which
+///   is what keeps the other entries of the same batch enabled.
+///
+/// Each is keyed on the member and the CLASS of violation alone — a pattern broken by the
+/// namespace of a METRIC ([`is_metric_namespace`]) or by the template name of a MANAGED RULE
+/// ([`is_managed_rule_template_name`]) — so each holds wherever that member is submitted: for
+/// the namespace, inside a `MetricDataQuery` as well as at the top of a publish; for the
+/// template name, at any position of the `ManagedRules` array.
 fn is_unenforced_constraint(violation: &aws_smithy_schema_server::Violation) -> bool {
     matches!(
         violation.kind,
         aws_smithy_schema_server::ViolationKind::Pattern(_)
-    ) && is_metric_namespace(&violation.path)
+    ) && (is_metric_namespace(&violation.path)
+        || is_managed_rule_template_name(&violation.path))
+}
+
+/// Whether `path` points at the `TemplateName` of a `ManagedRule` entry — at any position of
+/// the array, which is where the validating walk puts the element's index.
+fn is_managed_rule_template_name(path: &str) -> bool {
+    let mut segments = path.split('.');
+    segments.next() == Some("managedRules") && path.ends_with(".templateName")
 }
 
 /// Whether `path` points at the namespace of a METRIC, which is the only member this service

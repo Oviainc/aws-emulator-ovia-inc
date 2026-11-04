@@ -52,10 +52,10 @@ use ::serde_json::{Map, Value};
 
 use crate::ops::types::{
     ActionConfiguration, AlarmHistoryItem, AnomalyDetector, CompositeAlarm, Dimension,
-    EvaluationCriteria, EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm,
-    MetricAlarm, MetricDataQuery, MetricMathAnomalyDetector, OTelEnrichmentMetricSelector,
-    PartialFailure, ResourceNotFoundException, ScheduledQueryConfiguration,
-    SingleMetricAnomalyDetector, Tag, WarmUpConfiguration,
+    EvaluationCriteria, EvaluationWindow, GetMetricStreamOutput, LogAlarm, MetricAlarm,
+    MetricDataQuery, MetricMathAnomalyDetector, OTelEnrichmentMetricSelector,
+    ResourceNotFoundException, ScheduledQueryConfiguration, SingleMetricAnomalyDetector, Tag,
+    WarmUpConfiguration,
 };
 
 /// The action notifications an alarm state transition owes, and how they are delivered to
@@ -69,6 +69,13 @@ pub mod alarm_evaluation;
 /// events ingested into the log groups a rule names, and the report `GetInsightRuleReport`
 /// answers from what that evaluation collected.
 pub mod insight_rules;
+
+/// The Contributor Insights rule RECORDS this store holds, and the managed-rule catalog a
+/// managed rule is enabled from. Re-exported below, so a handler reaches them as
+/// `crate::state::…` like every other part of this store.
+pub mod insight_rule_records;
+
+pub use insight_rule_records::*;
 
 /// The metric math expression language a `MetricDataQuery$Expression` carries, parsed and
 /// evaluated over the series this store holds.
@@ -1339,113 +1346,6 @@ pub struct StoredMetricStream {
     pub tags: Vec<Tag>,
 }
 
-/// A stored Contributor Insights rule: the modelled shape `DescribeInsightRules` reports,
-/// plus the tags `PutInsightRule` accepted (no [`InsightRule`] member carries them).
-#[derive(Debug, Clone, Default)]
-pub struct StoredInsightRule {
-    /// The rule as `DescribeInsightRules` reports it.
-    pub rule: InsightRule,
-    /// The rule's `Definition` as the evaluation READS it ([`insight_rules::LogRuleDefinition`]),
-    /// or `None` for a definition that is not a log rule this emulator evaluates (a managed
-    /// rule's, which names no log group and no contribution).
-    ///
-    /// Derived from `rule.definition` by the write that stored the rule, so an ingest decides
-    /// which rules collect from a log group without re-reading the definition TEXT of every
-    /// rule the store holds — the first factor of an ingest's cost
-    /// ([`insight_rules::State::rules_collecting_from`]).
-    pub collection: Option<insight_rules::LogRuleDefinition>,
-    /// What the log events this rule has evaluated contributed — what `GetInsightRuleReport`
-    /// reports from ([`insight_rules`]). A rule collects them while it is ENABLED, as the
-    /// events arrive, so this is empty for a rule nothing has been ingested for yet.
-    pub observations: Vec<insight_rules::ContributorObservation>,
-    /// The tags the rule was created with.
-    pub tags: Vec<Tag>,
-    /// What this rule was enabled from, for a rule `PutManagedInsightRules` created;
-    /// `None` for one a caller wrote with `PutInsightRule`.
-    pub managed: Option<ManagedRuleOrigin>,
-}
-
-/// What a managed Contributor Insights rule was enabled from: the template
-/// `PutManagedInsightRules` named, and the Amazon Web Services resource whose data the rule
-/// collects.
-///
-/// `ListManagedInsightRules` reports the pair back as the `TemplateName` and `ResourceARN` of
-/// its description ("The template name for the managed rule. Used to enable managed rules
-/// using `PutManagedInsightRules`.", `ManagedRuleDescription$TemplateName`; "If a managed rule
-/// is enabled, this is the ARN for the related Amazon Web Services resource.",
-/// `ManagedRuleDescription$ResourceARN`), which is why it is kept beside the rule rather than
-/// derived back out of it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ManagedRuleOrigin {
-    /// The managed-rule template the rule was enabled from.
-    pub template_name: String,
-    /// The ARN of the resource the rule collects data for.
-    pub resource_arn: String,
-}
-
-/// One managed Contributor Insights rule template this account can enable a rule from.
-///
-/// "The template name for the managed Contributor Insights rule, as returned by
-/// `ListManagedInsightRules`." (`ManagedRule$TemplateName`) — the template a caller names is one
-/// the SERVICE publishes for a kind of resource ("When you enable a managed rule, you create a
-/// Contributor Insights rule that collects data from Amazon Web Services services.",
-/// `PutManagedInsightRules`), so a template is held as the name it is published under and the
-/// resources it collects data for, and nothing a caller sends adds one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedRuleTemplate {
-    /// The name the template is published under, which a `ManagedRule` entry names it by.
-    pub template_name: String,
-    /// The ARN vendor whose resources this template collects data for — the third field of
-    /// their ARNs (`::service_common::arn::Arn::vendor`).
-    pub resource_vendor: String,
-    /// The resource type inside that vendor the template applies to
-    /// (`::service_common::arn::Arn::resource_type`), or `None` when it applies to every
-    /// resource the vendor holds.
-    pub resource_type: Option<String>,
-}
-
-impl ManagedRuleTemplate {
-    /// The template published under `template_name` for every resource of the same vendor and
-    /// type as `resource_arn`, or `None` when `resource_arn` is not an ARN.
-    #[must_use]
-    pub fn for_resource(template_name: &str, resource_arn: &str) -> Option<Self> {
-        let arn = parse_resource_arn(resource_arn)?;
-        Some(Self {
-            template_name: template_name.to_string(),
-            resource_vendor: arn.vendor.to_string(),
-            resource_type: Some(arn.resource_type().to_string()),
-        })
-    }
-
-    /// Whether this template is one of the managed rules available for `resource_arn`: the
-    /// ARN's vendor is the one the template collects data for, and its resource type is the one
-    /// the template applies to when the template names a type at all.
-    #[must_use]
-    pub fn available_for(&self, resource_arn: &str) -> bool {
-        parse_resource_arn(resource_arn).is_some_and(|arn| {
-            self.resource_vendor == arn.vendor
-                && self
-                    .resource_type
-                    .as_deref()
-                    .is_none_or(|resource_type| resource_type == arn.resource_type())
-        })
-    }
-}
-
-/// One managed rule `ListManagedInsightRules` reports for a resource: the template it is
-/// available from, and the Contributor Insights rule enabled from that template when one is
-/// enabled for the resource.
-#[derive(Debug, Clone, Copy)]
-pub struct AvailableManagedRule<'a> {
-    /// The template the rule is (or would be) enabled from.
-    pub template_name: &'a str,
-    /// The rule enabled from the template for this resource — its name and record — or `None`
-    /// when the template is available but nothing has enabled it: "If present, it contains
-    /// information about the Contributor Insights rule that contains information about the
-    /// related Amazon Web Services resource." (`ManagedRuleDescription$RuleState`)
-    pub rule: Option<(&'a String, &'a StoredInsightRule)>,
-}
-
 /// A stored dashboard: the `DashboardBody` document `PutDashboard` was given, when that
 /// write happened, and the tags the dashboard was created with.
 ///
@@ -1955,22 +1855,16 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub metric_streams: HashMap<MetricStreamKey, StoredMetricStream>,
     /// Contributor Insights rules by rule name.
     pub insight_rules: HashMap<String, StoredInsightRule>,
-    /// The managed Contributor Insights rule templates this account can enable rules from, as
-    /// the service publishes them.
+    /// The managed Contributor Insights rule templates THIS ACCOUNT publishes, beside the ones
+    /// the service itself publishes (`insight_rule_records`'s own catalog).
     ///
     /// The catalog is the SERVICE's side of `ManagedRule$TemplateName` ("as returned by
-    /// `ListManagedInsightRules`"): a caller names a template, it never adds one. It starts
-    /// EMPTY, which is the state the recorded service answers from for every resource this
-    /// emulator can hold — `ListManagedInsightRules` reports no available managed rule for a
-    /// live DynamoDB table or a live CloudWatch alarm, and every template name tried for either
-    /// is answered "could not find template" — so a `PutManagedInsightRules` entry is reported
-    /// back among the rules that could not be enabled until a template of that name is
-    /// published for the entry's resource through [`Self::publish_managed_rule_template`].
-    ///
-    /// An empty catalog therefore says that THIS emulator publishes no managed-rule template,
-    /// not that no template exists anywhere: a template enters the catalog through that seam,
-    /// for the vendor and resource type it collects data for, when a service this emulator
-    /// serves publishes one.
+    /// `ListManagedInsightRules`"): a caller names a template, it never adds one. This half
+    /// starts EMPTY and a template enters it through
+    /// [`Self::publish_managed_rule_template`], for the vendor and resource type it collects
+    /// data for, when a service this emulator serves publishes one — so a
+    /// `PutManagedInsightRules` entry naming a resource kind neither half publishes a template
+    /// of that name for is reported back among the rules that could not be enabled.
     pub managed_rule_templates: Vec<ManagedRuleTemplate>,
     /// Anomaly detection models by their unique identifier
     /// ([`AnomalyDetectorForm::detector_id`]), which is what identifies the metric and
@@ -2697,250 +2591,6 @@ pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;
 /// their number has to be finite. Reaching it evicts the history whose NEWEST item is the
 /// oldest, the same direction retention ages history out in, so recent reads stay exact.
 pub const MAX_ALARM_HISTORIES: usize = 10_000;
-
-/// The schema NAME every Contributor Insights rule a caller creates is written against: "For
-/// rules that you create, this is always `{"Name": "CloudWatchLogRule", "Version": 1}`. For
-/// managed rules, this is `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`).
-pub const INSIGHT_RULE_SCHEMA_NAME: &str = "CloudWatchLogRule";
-
-/// The version both schema names are at — the one the member's documented value states. See
-/// [`INSIGHT_RULE_SCHEMA_NAME`].
-pub const INSIGHT_RULE_SCHEMA_VERSION: u64 = 1;
-
-/// A rule's schema as `InsightRule$Schema` carries it: the schema's name and version, joined
-/// by `/`.
-///
-/// `InsightRuleSchema` is a plain string, and the member's documented value
-/// (`{"Name": …, "Version": …}`) is the schema that string NAMES rather than the text of it —
-/// so what goes on the wire is the compact pair, which is what lets a client tell a rule it
-/// wrote from a rule the service manages by reading the name before the `/`.
-#[must_use]
-pub fn insight_rule_schema(schema_name: &str) -> String {
-    format!("{schema_name}/{INSIGHT_RULE_SCHEMA_VERSION}")
-}
-
-/// The same schema as the JSON object a rule DEFINITION states it with
-/// (`InsightRule$Definition`, "the definition of the rule, as a JSON object").
-///
-/// Built from the same name and version the wire form is ([`insight_rule_schema`]), so the
-/// schema a definition declares and the one the rule reports cannot drift apart.
-#[must_use]
-pub fn insight_rule_schema_document(schema_name: &str) -> ::serde_json::Value {
-    ::serde_json::json!({"Name": schema_name, "Version": INSIGHT_RULE_SCHEMA_VERSION})
-}
-
-/// A Contributor Insights rule that is evaluating log events: "The state of the rule. Valid
-/// values are ENABLED and DISABLED." (`PutInsightRuleInput$RuleState`)
-pub const INSIGHT_RULE_ENABLED: &str = "ENABLED";
-
-/// A Contributor Insights rule that is not evaluating log events
-/// (`PutInsightRuleInput$RuleState`).
-pub const INSIGHT_RULE_DISABLED: &str = "DISABLED";
-
-/// The `ExceptionType` a batch Contributor Insights rule operation reports a well-formed name
-/// it holds no rule for under: "The type of error." (`PartialFailure$ExceptionType`) — the
-/// name addresses a rule that is not there, which is the resource-not-found class and not a
-/// fault in the value itself, reported per entry rather than as a refusal of the whole
-/// request.
-const INSIGHT_RULE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
-
-/// The `FailureCode` beside it: "The code of the error." (`PartialFailure$FailureCode`) —
-/// which member of the entry the failure is about, here the rule name the request carried.
-const INSIGHT_RULE_NAME_FAILURE_CODE: &str = "RULE_NAME";
-
-/// How CloudWatch states that one of the names it was given is not a rule this store holds:
-/// fixed text around the name the request carried, ended as a sentence.
-///
-/// One wording for every operation that answers for a name no rule answers to — the batch
-/// operations report it as a `Failures` entry's description and `GetInsightRuleReport` as its
-/// `ResourceNotFoundException` message, so the two cannot drift apart.
-pub fn unknown_insight_rule(rule_name: &str) -> String {
-    format!("Rule {rule_name} does not exist.")
-}
-
-/// The one `Failures` entry a batch Contributor Insights rule operation reports for a name
-/// this store holds no rule for: "An array listing the rules that could not be deleted."
-/// (`DeleteInsightRulesOutput$Failures`), worded and coded identically whichever of those
-/// operations was called, so the entry is built here once.
-fn unknown_insight_rule_failure(rule_name: &str) -> PartialFailure {
-    PartialFailure {
-        failure_resource: Some(rule_name.to_string()),
-        exception_type: Some(INSIGHT_RULE_NOT_FOUND_EXCEPTION.to_string()),
-        failure_code: Some(INSIGHT_RULE_NAME_FAILURE_CODE.to_string()),
-        failure_description: Some(unknown_insight_rule(rule_name)),
-    }
-}
-
-/// How CloudWatch states that a request named no Contributor Insights rule at all.
-///
-/// "An array of the rule names to delete." (`DeleteInsightRulesInput$RuleNames`, required) — an
-/// array carrying no entry names nothing to act on, which this service refuses as a bad value
-/// for `RuleNames` rather than as a change it applied to nothing.
-pub const EMPTY_RULE_NAMES: &str = "EMPTY_RULE_NAMES: RuleNames cannot be an empty array.";
-
-/// The granularity a Contributor Insights rule's contributor data is aggregated at, and so the
-/// step every `Period` a report may be asked at is a multiple of: one minute.
-///
-/// A rule folds the log events its groups receive into per-minute contributor data, so the
-/// `Period` a report's datapoints are aggregated over ("The period, in seconds, to use for the
-/// statistics in the InsightRuleMetricDatapoint results.",
-/// `GetInsightRuleReportInput$Period`) is a whole number of minutes: there is no finer fold to
-/// report from.
-pub const INSIGHT_RULE_PERIOD_STEP_SECS: i32 = 60;
-
-/// The widest `Period` a Contributor Insights report may be asked at: one day, the span
-/// Contributor Insights keeps a rule's contributor data over. See
-/// [`INSIGHT_RULE_PERIOD_STEP_SECS`].
-pub const MAX_INSIGHT_RULE_PERIOD_SECS: i32 = 86_400;
-
-/// Why `period` is not a granularity a Contributor Insights report can be aggregated at, or
-/// `None` when it is.
-///
-/// The `Period` member is modelled only as `range 1..`, so the granularities Contributor
-/// Insights actually folds its contributor data at are held here: a multiple of
-/// [`INSIGHT_RULE_PERIOD_STEP_SECS`], from that step up to
-/// [`MAX_INSIGHT_RULE_PERIOD_SECS`]. The refusal names the condition by its CODE and states
-/// the whole accepted set, the way this service's other Contributor Insights refusals do
-/// ([`EMPTY_RULE_NAMES`]), and carries nothing of the value that was asked for.
-#[must_use]
-pub fn insight_rule_period_error(period: i32) -> Option<String> {
-    let aggregatable = (INSIGHT_RULE_PERIOD_STEP_SECS..=MAX_INSIGHT_RULE_PERIOD_SECS)
-        .contains(&period)
-        && period % INSIGHT_RULE_PERIOD_STEP_SECS == 0;
-    (!aggregatable).then(|| {
-        format!(
-            "INVALID_PERIOD: A Period must be a multiple of {INSIGHT_RULE_PERIOD_STEP_SECS} \
-             seconds, from {INSIGHT_RULE_PERIOD_STEP_SECS} to {MAX_INSIGHT_RULE_PERIOD_SECS}."
-        )
-    })
-}
-
-/// How CloudWatch states the same thing for the operations that MOVE a rule's state
-/// (`EnableInsightRules`, `DisableInsightRules`).
-///
-/// Those operations read their `RuleNames` as the set of rule states to write — "The state of
-/// the rule. Valid values are ENABLED and DISABLED." (`PutInsightRuleInput$RuleState`) — so an
-/// empty array is refused as the empty set of states it asks for, under the same
-/// `InvalidParameterValueException`. Shared so neither of them can word it differently from
-/// the other.
-pub const EMPTY_RULE_STATES: &str = "EMPTY_RULE_STATES: RuleStates cannot be an empty array.";
-
-/// The schema NAME a managed Contributor Insights rule is written against: "For managed rules,
-/// this is `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) — the schema of a
-/// rule `PutManagedInsightRules` enabled, which is why `PutInsightRule` refuses a definition
-/// carrying it ("You cannot edit these rules with PutInsightRule",
-/// `PutManagedInsightRules`).
-pub const MANAGED_INSIGHT_RULE_SCHEMA_NAME: &str = "ServiceLogRule";
-
-/// The name the managed Contributor Insights rule enabled from `template_name` for
-/// `resource_arn` takes.
-///
-/// Derived from the pair rather than minted per call, so enabling the same template for the
-/// same resource twice names the SAME rule — which is what lets a second call re-enable the
-/// rule the first one created: "If a previously created managed rule is currently disabled, a
-/// subsequent call to this API will re-enable it." (`PutManagedInsightRules`).
-///
-/// The resource's own field of the ARN identifies it within the account and Region the request
-/// is answered in, so that field is what the name carries beside the template. The result is
-/// held inside `InsightRuleName`'s modelled 1..128 length and `^[\x20-\x7E]+$` pattern: a
-/// character the pattern does not allow stands in as `-`, and an over-long name is cut to the
-/// maximum.
-pub fn managed_insight_rule_name(template_name: &str, resource_arn: &str) -> String {
-    let resource = parse_resource_arn(resource_arn).map_or(resource_arn, |arn| arn.resource);
-    let name: String = format!("{template_name}-{resource}")
-        .chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '-' })
-        .take(MAX_INSIGHT_RULE_NAME_LEN)
-        .collect();
-    name
-}
-
-/// `InsightRuleName`'s modelled maximum length, which a derived rule name is held inside.
-const MAX_INSIGHT_RULE_NAME_LEN: usize = 128;
-
-/// The managed-rule template `stored` was enabled from, or the empty string for a rule a
-/// caller created with `PutInsightRule` — which orders the unmanaged rules before every
-/// managed one, and is never reported.
-pub fn template_name_of(stored: &StoredInsightRule) -> &str {
-    stored
-        .managed
-        .as_ref()
-        .map_or("", |origin| origin.template_name.as_str())
-}
-
-/// `value`'s ARN fields, or `None` when `value` is not a well-formed Amazon Resource Name.
-///
-/// A member documented as "The ARN of an Amazon Web Services resource"
-/// (`ManagedRule$ResourceARN`, `ListManagedInsightRulesInput$ResourceARN`) is modelled only as
-/// a 1..1024 string, so what makes it an ARN is read here — through the one shared parse, the
-/// same one the alarm actions are read with.
-pub fn parse_resource_arn(value: &str) -> Option<::service_common::arn::Arn<'_>> {
-    ::service_common::arn::parse(value)
-}
-
-/// How CloudWatch states that a `ResourceARN` is not the ARN of an Amazon Web Services
-/// resource, or `None` when it is one.
-///
-/// The sentence is the service's own for this error class and names no value: the caller
-/// renders it through whichever parameter fault its own model declares.
-pub fn resource_arn_error(value: &str) -> Option<String> {
-    parse_resource_arn(value)
-        .is_none()
-        .then(|| INVALID_RESOURCE_ARN.to_string())
-}
-
-/// CloudWatch's wording for a `ResourceARN` that is not an ARN.
-pub const INVALID_RESOURCE_ARN: &str = "INVALID_RESOURCE_ARN: Invalid ARN.";
-
-/// The resource types this service's OWN ARN namespace addresses, each as the token an ARN of
-/// such a resource carries before the resource's own name
-/// (`::service_common::arn::Arn::resource_type`).
-///
-/// "The ARN format of an alarm is arn:aws:cloudwatch:Region:account-id:alarm:alarm-name The
-/// ARN format of a Contributor Insights rule is
-/// arn:aws:cloudwatch:Region:account-id:insight-rule/insight-rule-name The ARN format of a
-/// dashboard is arn:aws:cloudwatch::account-id:dashboard/dashboard-name The ARN format of a
-/// metric stream is arn:aws:cloudwatch:Region:account-id:metric-stream/metric-stream-name"
-/// (`TagResourceInput$ResourceARN`); a dataset is addressed "in the format
-/// arn:aws:cloudwatch:Region:account-id:dataset/dataset-id" (`GetDatasetInput$DatasetIdentifier`)
-/// and an alarm mute rule as `arn:aws:cloudwatch:[REGION]:123456789012:alarm-mute-rule:*`
-/// (`PutAlarmMuteRule`).
-const ARN_RESOURCE_TYPES: [&str; 6] = [
-    "alarm",
-    "alarm-mute-rule",
-    "dashboard",
-    "dataset",
-    "insight-rule",
-    "metric-stream",
-];
-
-/// Whether `value` addresses an Amazon Web Services resource, as against being well formed as
-/// an ARN while addressing nothing.
-///
-/// An ARN's resource field opens with the resource TYPE, and only the service that owns the
-/// ARN's vendor field defines which types it has — so a value in THIS service's namespace is
-/// held to the resource types this service addresses ([`ARN_RESOURCE_TYPES`]), each carrying a
-/// non-empty id of a resource of that type (the same thing [`parse_taggable_arn`] requires of
-/// the ARNs it reads), while a value in another vendor's namespace is that vendor's to judge:
-/// this service cannot enumerate another's resources, and treating them as unaddressed would
-/// reject the resources of the very services whose data a managed rule collects.
-pub fn addresses_resource(value: &str) -> bool {
-    parse_resource_arn(value).is_some_and(|arn| {
-        arn.vendor != ARN_NAMESPACE
-            || ARN_RESOURCE_TYPES.iter().any(|resource_type| {
-                ::service_common::arn::resource_id_of_type(value, resource_type)
-                    .is_some_and(|id| !id.is_empty())
-            })
-    })
-}
-
-/// The largest number of Contributor Insights rules this in-memory store holds.
-///
-/// A capacity bound, not an AWS quota: the rule records live in this process's memory, so
-/// their number has to be finite. `PutInsightRule` answers its modelled `LimitExceededException`
-/// ("The operation exceeded one or more limits.") rather than growing without limit once it is
-/// reached; updating a rule that already exists adds none, so it is unaffected.
-pub const MAX_INSIGHT_RULES: usize = 10_000;
 
 /// How many tags one CloudWatch resource may carry: "You can associate as many as 50 tags
 /// with a rule." (`PutInsightRuleInput$Tags`) — the same 50 every taggable resource of this
@@ -3683,176 +3333,6 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         referrers.sort();
         referrers.dedup();
         referrers
-    }
-
-    /// The managed Contributor Insights rules this store holds for `resource_arn`, as
-    /// (rule name, rule) pairs ordered by template name and then rule name.
-    ///
-    /// "The managed rules that are available for the specified Amazon Web Services resource."
-    /// (`ListManagedInsightRulesOutput$ManagedRules`) — a managed rule belongs to the resource
-    /// its `PutManagedInsightRules` call named, so the resource is what selects them, and the
-    /// order is total so one page of a listing follows the previous one.
-    pub fn managed_insight_rules_for(
-        &self,
-        resource_arn: &str,
-    ) -> Vec<(&String, &StoredInsightRule)> {
-        let mut rules: Vec<(&String, &StoredInsightRule)> = self
-            .insight_rules
-            .iter()
-            .filter(|(_, stored)| {
-                stored
-                    .managed
-                    .as_ref()
-                    .is_some_and(|origin| origin.resource_arn == resource_arn)
-            })
-            .collect();
-        rules.sort_unstable_by(|(left_name, left), (right_name, right)| {
-            template_name_of(left)
-                .cmp(template_name_of(right))
-                .then_with(|| left_name.cmp(right_name))
-        });
-        rules
-    }
-
-    /// Publish `template` into this account's managed-rule catalog, replacing a template
-    /// already published under the same name for the same resources.
-    ///
-    /// The seam the SERVICE side of the catalog is written through: "The template name for the
-    /// managed Contributor Insights rule, as returned by `ListManagedInsightRules`."
-    /// (`ManagedRule$TemplateName`) — a caller names a published template, so nothing a
-    /// `PutManagedInsightRules` request carries reaches this.
-    pub fn publish_managed_rule_template(&mut self, template: ManagedRuleTemplate) {
-        match self.managed_rule_templates.iter_mut().find(|held| {
-            held.template_name == template.template_name
-                && held.resource_vendor == template.resource_vendor
-                && held.resource_type == template.resource_type
-        }) {
-            Some(held) => *held = template,
-            None => self.managed_rule_templates.push(template),
-        }
-    }
-
-    /// The published template `template_name` names for `resource_arn`, or `None` when the
-    /// catalog publishes no template of that name for that resource.
-    ///
-    /// Exact match on the name: a template is named as it is published, so a name that differs
-    /// in case or punctuation names a different template — and, when none is published under
-    /// it, no template at all.
-    pub fn managed_rule_template(
-        &self,
-        template_name: &str,
-        resource_arn: &str,
-    ) -> Option<&ManagedRuleTemplate> {
-        self.managed_rule_templates.iter().find(|template| {
-            template.template_name == template_name && template.available_for(resource_arn)
-        })
-    }
-
-    /// Every managed rule available for `resource_arn`: ONE entry per template the catalog
-    /// publishes for it or a rule is enabled from, carrying that rule when one is enabled,
-    /// ordered by template name.
-    ///
-    /// "The managed rules that are available for the specified Amazon Web Services resource."
-    /// (`ListManagedInsightRulesOutput$ManagedRules`) — available is what the catalog publishes
-    /// for the resource, and whether a rule has been enabled from a template is what its
-    /// `RuleState` says ("If present, it contains information about the Contributor Insights
-    /// rule…", `ManagedRuleDescription$RuleState`). A rule whose template the catalog no longer
-    /// publishes is still reported: the rule exists.
-    ///
-    /// One entry per template is what makes the template name identify the entry — which is
-    /// what a listing's page token is, so it has to hold however the store got into its current
-    /// shape. A resource holds at most one rule per template by construction (the rule's name
-    /// is derived from the (template, resource) pair, so enabling the same template again names
-    /// the same rule), and a second rule that reached the same template anyway is reported
-    /// once, under the first of them in rule-name order.
-    pub fn managed_rules_available_for(&self, resource_arn: &str) -> Vec<AvailableManagedRule<'_>> {
-        let enabled = self.managed_insight_rules_for(resource_arn);
-        let mut available: Vec<AvailableManagedRule<'_>> = Vec::new();
-        for (name, stored) in &enabled {
-            let template_name = template_name_of(stored);
-            if available
-                .iter()
-                .any(|reported| reported.template_name == template_name)
-            {
-                continue;
-            }
-            available.push(AvailableManagedRule {
-                template_name,
-                rule: Some((*name, *stored)),
-            });
-        }
-        for template in &self.managed_rule_templates {
-            let name = template.template_name.as_str();
-            if template.available_for(resource_arn)
-                && !available
-                    .iter()
-                    .any(|reported| reported.template_name == name)
-            {
-                available.push(AvailableManagedRule {
-                    template_name: name,
-                    rule: None,
-                });
-            }
-        }
-        available.sort_by(|left, right| left.template_name.cmp(right.template_name));
-        available
-    }
-
-    /// Move every Contributor Insights rule `rule_names` names to `rule_state`, reporting back
-    /// one entry per name this store holds no rule for.
-    ///
-    /// "An array listing the rules that could not be disabled."
-    /// (`DisableInsightRulesOutput$Failures`) — a name no rule answers to is reported as an
-    /// entry of that array and the rest of the request still takes effect, rather than the
-    /// whole call failing. "This array is empty if the API operation was successful for all
-    /// the rules specified in the request." (`PartialFailure`)
-    ///
-    /// The state a rule moves to is the only thing that differs between the operations that
-    /// enable and disable rules, so the walk lives here and neither can drift from the other.
-    /// Naming a rule that already holds the state asks for no change and is not a failure: the
-    /// operations say what a rule's state BECOMES.
-    pub fn set_insight_rule_state(
-        &mut self,
-        rule_names: &[String],
-        rule_state: &str,
-    ) -> Vec<PartialFailure> {
-        let mut failures: Vec<PartialFailure> = Vec::new();
-        for rule_name in rule_names {
-            match self.insight_rules.get_mut(rule_name) {
-                Some(stored) => stored.rule.state = rule_state.to_string(),
-                None => failures.push(unknown_insight_rule_failure(rule_name)),
-            }
-        }
-        failures
-    }
-
-    /// Remove every Contributor Insights rule `rule_names` names, reporting back one entry per
-    /// name this store holds no rule for.
-    ///
-    /// "Permanently deletes the specified Contributor Insights rules."
-    /// (`DeleteInsightRules`) — the rule and everything stored with it (its definition, its
-    /// state and its tags) go away, so a later read reports no such rule. "An array listing the
-    /// rules that could not be deleted." (`DeleteInsightRulesOutput$Failures`) is reported the
-    /// same way the state operations report theirs: per name, with the rest of the request
-    /// still taking effect.
-    ///
-    /// The names a request carries are the SET of rules it deletes, so a name it repeats is
-    /// deleted once and is not a failure the second time — the same way naming a rule twice
-    /// asks the state operations for one state. A rule `PutManagedInsightRules` enabled is
-    /// removed by the same walk: "The rules can be enabled, disabled, and deleted using
-    /// EnableInsightRules, DisableInsightRules, and DeleteInsightRules."
-    /// (`PutManagedInsightRules`).
-    pub fn delete_insight_rules(&mut self, rule_names: &[String]) -> Vec<PartialFailure> {
-        let mut deleted: HashSet<&String> = HashSet::new();
-        let mut failures: Vec<PartialFailure> = Vec::new();
-        for rule_name in rule_names {
-            if self.insight_rules.remove(rule_name).is_some() {
-                deleted.insert(rule_name);
-            } else if !deleted.contains(rule_name) {
-                failures.push(unknown_insight_rule_failure(rule_name));
-            }
-        }
-        failures
     }
 
     /// Materialise the anomaly-detector training the clock has already made due.

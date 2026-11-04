@@ -31,7 +31,7 @@ pub struct ListManagedInsightRulesOutput {
 pub struct ManagedRuleDescription {
     pub template_name: Option<String>,
     pub resource_arn: Option<String>,
-    pub rule_state: Option<ManagedRuleState>,
+    pub rule_state: Option<ReportedManagedRuleState>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.cloudwatch#ManagedRuleState")]
@@ -39,5 +39,55 @@ pub struct ManagedRuleDescription {
 pub struct ManagedRuleState {
     pub rule_name: String,
     pub state: String,
+}
+
+/// The `RuleState` a `ManagedRuleDescription` carries: the state of the rule enabled from the
+/// template, or NO state for a template nothing has enabled.
+///
+/// Both members of `ManagedRuleState` are `@required` and `@clientOptional` at once
+/// (`smithy_query(query="shape",shape="ManagedRuleState",model_path="services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/smithy-model/com-amazonaws-cloudwatch-graniteserviceversion20100801.json")`):
+/// they are the ENABLED RULE's own name and state, and a client reads them as optional because
+/// a listing reports a state for a template nothing has enabled as well — where there is no
+/// rule for either member to be about, so the state carries neither. [`ManagedRuleState`] holds
+/// the required form, both members always, so the OTHER case is this type's second variant and
+/// the member is written through here: the shape is the model's either way, and only which of
+/// its members the answer carries differs.
+#[derive(Debug, Clone)]
+pub enum ReportedManagedRuleState {
+    /// The name and state of the Contributor Insights rule enabled from the template.
+    OfTheEnabledRule(ManagedRuleState),
+    /// No rule is enabled from the template, so the state names none.
+    OfNoRule,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportedManagedRuleState {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::OfTheEnabledRule(state) => {
+                ::aws_smithy_schema::serde::SerializableStruct::serialize_members(state, serializer)
+            }
+            Self::OfNoRule => Ok(()),
+        }
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ReportedManagedRuleState {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        <ManagedRuleState as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+            deserializer,
+        )
+        .map(Self::OfTheEnabledRule)
+    }
+}
+
+impl ::std::default::Default for ReportedManagedRuleState {
+    fn default() -> Self {
+        Self::OfNoRule
+    }
 }
 

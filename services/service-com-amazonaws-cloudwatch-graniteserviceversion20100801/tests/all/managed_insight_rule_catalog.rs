@@ -2,16 +2,20 @@
 
 //! Cover for the catalog side of the managed Contributor Insights rules: WHICH template a
 //! `PutManagedInsightRules` entry may name, and what the operation answers for one it cannot
-//! find.
+//! resolve.
 //!
-//! The rule under test: **a `ManagedRule` entry's `TemplateName` names a template the service
+//! The rule under test: **a `ManagedRule` entry's `TemplateName` names a template the catalog
 //! publishes for that entry's resource** — "The template name for the managed Contributor
 //! Insights rule, as returned by `ListManagedInsightRules`." (`ManagedRule$TemplateName`) — so
-//! an entry naming a template the catalog does not publish is one the operation could not
+//! an entry the catalog cannot resolve a managed rule for is one the operation could not
 //! process: it is reported back on the HTTP 200 as exactly one `PartialFailure` about the
 //! template name and enables nothing ("If the operation could not process one of the rules, the
 //! following data is returned for each of those rules.", `PartialFailure`), while the entries of
-//! the same request that DO name a published template are enabled.
+//! the same request that DO name a published template are enabled. Which CLASS the entry carries
+//! follows the stage the resolution stopped at: a template name no published template answers to
+//! is not found, a resource whose vendor publishes no managed rule at all is the service's own
+//! failure, and a resource of a published vendor that no template applies to is reported about
+//! the ARN.
 //!
 //! Rows differ along what the rule generalises over: how the name misses the catalog (nothing
 //! published at all, a published name in another case, a published template of another vendor or
@@ -44,8 +48,8 @@ fn failures(body: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The entry CloudWatch reports for an entry whose template it cannot find: the submitted
-/// template name as the `FailureResource`, and fixed text for the rest of it.
+/// The entry CloudWatch reports for an entry whose template NAME no published template answers
+/// to: the submitted template name as the `FailureResource`, and fixed text for the rest of it.
 fn template_not_found(template_name: &str) -> Value {
     json!({
         "FailureResource": template_name,
@@ -53,6 +57,34 @@ fn template_not_found(template_name: &str) -> Value {
         "FailureCode": "TEMPLATE_NAME",
         "FailureDescription": "Could not find template with the specified templateName.",
     })
+}
+
+/// The entry reported for an entry whose resource's VENDOR the catalog publishes no managed
+/// rule for at all: the same sentence, under the receiver-side class.
+fn no_managed_rules_for_the_vendor(template_name: &str) -> Value {
+    json!({
+        "FailureResource": template_name,
+        "ExceptionType": "InternalFailure",
+        "FailureCode": "TEMPLATE_NAME",
+        "FailureDescription": "Could not find template with the specified templateName.",
+    })
+}
+
+/// The entry reported for an entry whose resource is of a published VENDOR but of a kind no
+/// published template applies to: the fault is then the resource the ARN names.
+fn invalid_resource_arn(template_name: &str) -> Value {
+    json!({
+        "FailureResource": template_name,
+        "ExceptionType": "InvalidParameterException",
+        "FailureCode": "TEMPLATE_NAME",
+        "FailureDescription": "Invalid ResourceArn.",
+    })
+}
+
+/// Whether a reported description says a rule is enabled from its template: the state's members
+/// are the RULE's own, so a template nothing has enabled reports a state naming none.
+fn names_a_rule(description: &Value) -> bool {
+    description.pointer("/RuleState/RuleName").is_some()
 }
 
 /// The descriptions `ListManagedInsightRules` reports for `resource_arn`.
@@ -89,8 +121,8 @@ async fn rule_names(router: &smithy_server_runtime::MultiServiceRouter) -> Vec<S
         .collect()
 }
 
-/// One row of the unresolvable-template table: what the catalog publishes, and the entry the
-/// request carries.
+/// One row of the unresolvable-template table: what the catalog publishes, the entry the
+/// request carries, and the entry the operation reports back for it.
 struct Row {
     /// What the row's assertions name it by.
     case: &'static str,
@@ -101,6 +133,8 @@ struct Row {
     template: String,
     /// The resource the request's entry carries.
     resource_arn: &'static str,
+    /// Which `Failures` entry the operation reports for it, built from the template name.
+    reported: fn(&str) -> Value,
 }
 
 #[tokio::test]
@@ -112,48 +146,56 @@ async fn an_entry_whose_template_the_catalog_does_not_publish_is_reported_back()
             published: None,
             template: "no-such-template-xyz".to_string(),
             resource_arn: TABLE,
+            reported: template_not_found,
         },
         Row {
             case: "nothing published, the shortest name the pattern allows",
             published: None,
             template: "T1".to_string(),
             resource_arn: ALARM,
+            reported: template_not_found,
         },
         Row {
             case: "nothing published, a 128-character name",
             published: None,
             template: long_name,
             resource_arn: BUCKET,
+            reported: template_not_found,
         },
         Row {
             case: "nothing published, a name carrying every punctuation the pattern allows",
             published: None,
             template: "Service-Log.Rule_0".to_string(),
             resource_arn: TABLE,
+            reported: template_not_found,
         },
         Row {
             case: "a template published under another case",
             published: Some(("Orders-Insights", TABLE)),
             template: "orders-insights".to_string(),
             resource_arn: TABLE,
+            reported: template_not_found,
         },
         Row {
             case: "a template published for another vendor's resources",
             published: Some(("Orders-Insights", TABLE)),
             template: "Orders-Insights".to_string(),
             resource_arn: "arn:aws:kinesis:us-east-1:123456789012:stream/Orders",
+            reported: no_managed_rules_for_the_vendor,
         },
         Row {
             case: "a template published for another resource type of the same vendor",
             published: Some(("Orders-Insights", TABLE)),
             template: "Orders-Insights".to_string(),
             resource_arn: "arn:aws:dynamodb:us-east-1:123456789012:backup/Orders",
+            reported: invalid_resource_arn,
         },
         Row {
             case: "a template published for another vendor, named for this one's resource",
             published: Some(("Orders-Insights", ALARM)),
             template: "Orders-Insights".to_string(),
             resource_arn: TABLE,
+            reported: no_managed_rules_for_the_vendor,
         },
     ];
 
@@ -174,26 +216,23 @@ async fn an_entry_whose_template_the_catalog_does_not_publish_is_reported_back()
         .await;
         assert_eq!(
             failures(&put),
-            vec![template_not_found(template)],
-            "case {case:?}: expected exactly one TEMPLATE_NAME failure for the template the \
-             catalog does not publish, got {put}"
+            vec![(row.reported)(template)],
+            "case {case:?}: expected exactly one TEMPLATE_NAME failure for the entry the \
+             catalog could not resolve, got {put}"
         );
 
         // Nothing is enabled: no Contributor Insights rule exists, and the resource reports no
-        // managed rule with a state.
+        // managed rule naming one.
         let held = rule_names(&router).await;
         assert!(
             held.is_empty(),
-            "case {case:?}: a template that could not be found must enable no rule, got {held:?}"
+            "case {case:?}: an entry that could not be resolved must enable no rule, got {held:?}"
         );
         let reported = listed(&router, resource_arn).await;
-        let with_state: Vec<&Value> = reported
-            .iter()
-            .filter(|description| description.get("RuleState").is_some())
-            .collect();
+        let with_rule: Vec<&Value> = reported.iter().filter(|d| names_a_rule(d)).collect();
         assert!(
-            with_state.is_empty(),
-            "case {case:?}: no managed rule may be reported as enabled, got {with_state:?}"
+            with_rule.is_empty(),
+            "case {case:?}: no managed rule may be reported as enabled, got {with_rule:?}"
         );
     }
 }
@@ -238,10 +277,10 @@ async fn an_entry_naming_a_published_template_is_enabled_and_read_back() {
             "case {case:?}: expected the published template to be available, got {available:?}"
         );
         assert!(
-            available
-                .first()
-                .is_some_and(|description| description.get("RuleState").is_none()),
-            "case {case:?}: a template nothing has enabled carries no rule state, got \
+            available.first().is_some_and(|description| description
+                .pointer("/RuleState/RuleName")
+                .is_none()),
+            "case {case:?}: a template nothing has enabled names no rule in its state, got \
              {available:?}"
         );
 
@@ -319,7 +358,8 @@ async fn each_entry_of_one_request_is_processed_on_its_own() {
         failures(&put),
         vec![
             template_not_found("missing-first"),
-            // Published for alarms, so for a table it is a template that cannot be found.
+            // Published for alarms, so for a table it is a template published for other
+            // resources than the one the entry names.
             template_not_found("Latency-Insights"),
             template_not_found("missing-last"),
         ],
