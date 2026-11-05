@@ -459,6 +459,15 @@ pub const RSLVR_CODE_ASSOCIATION_MUTATION_PROTECTED: &str = "RSLVR-02307";
 /// [`firewall_rule_update_batch_too_large`].
 pub const RSLVR_CODE_FIREWALL_RULE_BATCH_TOO_LARGE: &str = "RSLVR-02052";
 
+/// The Route 53 Resolver service error code reported when a DNS Firewall rule
+/// write states a block setting for an action that blocks nothing.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`]:
+/// `ValidationException` states every malformed rule write, so the HTTP status
+/// and the shape name alone do not say which requirement was broken. See
+/// [`firewall_rule_block_option_not_for_action`].
+pub const RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_FOR_ACTION: &str = "RSLVR-02010";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -735,6 +744,12 @@ pub const FIREWALL_RULE_ACTION_BLOCK: &str = "BLOCK";
 /// from the same enum. Its doc states where it may not be used: "Not available
 /// for DNS Firewall Advanced rules."
 pub const FIREWALL_RULE_ACTION_ALLOW: &str = "ALLOW";
+
+/// The `Action` a DNS Firewall rule takes to "permit the request to go through
+/// but send an alert to the logs", from the same enum. Like
+/// [`FIREWALL_RULE_ACTION_ALLOW`] it lets the query through, so neither of the
+/// two admits a block setting ([`firewall_rule_block_option_not_for_action`]).
+pub const FIREWALL_RULE_ACTION_ALERT: &str = "ALERT";
 
 /// The `BlockResponse` that answers a blocked query with "a custom override in
 /// the response", from the model's `BlockResponse` enum

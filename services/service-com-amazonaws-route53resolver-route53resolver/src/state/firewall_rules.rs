@@ -393,6 +393,74 @@ pub fn firewall_rule_settings_fault(
     None
 }
 
+/// The block settings one rule write STATES, as the request carries them.
+///
+/// These are the four members whose meaning is "how DNS Firewall blocks the
+/// query" — `BlockResponse` and the three `BlockOverride*` settings it may
+/// require — held apart from [`FirewallRuleSettings`] because what they are
+/// checked against is what the REQUEST provided and not what the rule ends up
+/// carrying: a rule stored with block settings keeps them when its action moves
+/// off `BLOCK`, where they simply never apply.
+#[derive(Debug, Clone, Copy)]
+pub struct FirewallRuleBlockOptions<'a> {
+    pub block_response: Option<&'a str>,
+    pub block_override_domain: Option<&'a str>,
+    pub block_override_dns_type: Option<&'a str>,
+    pub block_override_ttl: Option<i32>,
+}
+
+impl FirewallRuleBlockOptions<'_> {
+    /// Whether the request stated any of them at all.
+    pub fn any_stated(&self) -> bool {
+        self.block_response.is_some()
+            || self.block_override_domain.is_some()
+            || self.block_override_dns_type.is_some()
+            || self.block_override_ttl.is_some()
+    }
+}
+
+/// The `ValidationException` a rule write is refused with when it states a
+/// block setting for an action that blocks nothing.
+///
+/// `Action`'s doc gives the two actions that let the query through — `ALLOW`
+/// ("permit the request to go through") and `ALERT` ("permit the request to go
+/// through but send an alert to the logs") — against `BLOCK`, the one that
+/// "requires additional details in the rule's BlockResponse". The sentence is
+/// the service's own for that fault
+/// ([`RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_FOR_ACTION`]) and is ENTIRELY
+/// fixed text: it names neither the option the request stated nor the action it
+/// stated it with.
+pub fn firewall_rule_block_option_not_for_action() -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_FOR_ACTION,
+            &format!(
+                "You can't provide a block option if the ACTION is \
+                 {FIREWALL_RULE_ACTION_ALLOW} or {FIREWALL_RULE_ACTION_ALERT}"
+            ),
+        )),
+    }
+}
+
+/// The `ValidationException` these stated block settings are refused with for a
+/// rule whose action is `action`, or `None` when the service admits them.
+///
+/// A block setting states how a BLOCKING rule answers the query it matched, so
+/// stating one for a rule that lets the query through is refused. `action` is
+/// the action the rule takes once the write is applied — the one the request
+/// states, or the stored one for an update that leaves it alone — so the same
+/// question is answered the same way for a create, for an update that changes
+/// the action and for an update that only adds a block setting to a rule that
+/// does not block.
+pub fn firewall_rule_block_option_fault(
+    action: &str,
+    stated: &FirewallRuleBlockOptions<'_>,
+) -> Option<ValidationException> {
+    let lets_the_query_through =
+        action == FIREWALL_RULE_ACTION_ALLOW || action == FIREWALL_RULE_ACTION_ALERT;
+    (lets_the_query_through && stated.any_stated()).then(firewall_rule_block_option_not_for_action)
+}
+
 /// One DNS Firewall rule to update, as the operations that update one state it.
 ///
 /// `UpdateFirewallRuleEntry` — one entry of a batch update — declares exactly
@@ -710,6 +778,18 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         if let Some(fault) = firewall_rule_settings_fault(&settings) {
             return Err(FirewallRuleCreateRefusal::Validation(fault));
         }
+        // A block setting belongs to the action that blocks, and a create states
+        // the rule's action itself ([`firewall_rule_block_option_fault`]).
+        let stated_block_options = FirewallRuleBlockOptions {
+            block_response: request.block_response,
+            block_override_domain: request.block_override_domain,
+            block_override_dns_type: request.block_override_dns_type,
+            block_override_ttl: request.block_override_ttl,
+        };
+        if let Some(fault) = firewall_rule_block_option_fault(request.action, &stated_block_options)
+        {
+            return Err(FirewallRuleCreateRefusal::Validation(fault));
+        }
         let advanced = settings.is_advanced();
 
         let timestamp = now_rfc3339();
@@ -953,6 +1033,24 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .or(stored.firewall_rule_type.as_ref()),
         };
         if let Some(fault) = firewall_rule_settings_fault(&settings) {
+            return Err(FirewallRuleUpdateRefusal::Validation(fault));
+        }
+
+        // A block setting belongs to the action that blocks: one STATED by this
+        // request is refused when the rule lets the query through once the
+        // change is applied — whether the request moves the action there or the
+        // rule was already there ([`firewall_rule_block_option_fault`]). The
+        // block settings the rule already carries are left alone: they are not
+        // something this request provided, and they apply to nothing until the
+        // rule blocks again.
+        let stated_block_options = FirewallRuleBlockOptions {
+            block_response: request.block_response,
+            block_override_domain: request.block_override_domain,
+            block_override_dns_type: request.block_override_dns_type,
+            block_override_ttl: request.block_override_ttl,
+        };
+        if let Some(fault) = firewall_rule_block_option_fault(settings.action, &stated_block_options)
+        {
             return Err(FirewallRuleUpdateRefusal::Validation(fault));
         }
 

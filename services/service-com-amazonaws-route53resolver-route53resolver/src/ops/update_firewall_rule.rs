@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The rule this call changes is named and
+//! changed by the one firewall-rule update the store owns
+//! ([`crate::state::ComAmazonawsRoute53resolverRoute53resolverState::update_firewall_rule`]),
+//! so a rule updated here and the same rule updated as one entry of a batch
+//! update are the same rule, admitted and refused on the same grounds — the
+//! difference being that this call carries ONE rule, so a refusal is the
+//! modelled exception that states it and the whole call fails. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,6 +195,25 @@ impl From<UpdateFirewallRuleErrorModeled> for UpdateFirewallRuleError {
     }
 }
 
+/// How this operation reports a refusal the store decided: as the modelled
+/// exception that states it, which is the one the model declares for this
+/// operation for that class of fault.
+impl From<crate::state::FirewallRuleUpdateRefusal> for UpdateFirewallRuleErrorModeled {
+    fn from(refusal: crate::state::FirewallRuleUpdateRefusal) -> Self {
+        match refusal {
+            crate::state::FirewallRuleUpdateRefusal::Validation(error) => {
+                Self::ValidationException(error)
+            }
+            crate::state::FirewallRuleUpdateRefusal::ResourceNotFound(error) => {
+                Self::ResourceNotFoundException(error)
+            }
+            crate::state::FirewallRuleUpdateRefusal::Conflict(error) => {
+                Self::ConflictException(error)
+            }
+        }
+    }
+}
+
 /// The `UpdateFirewallRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -232,18 +250,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallRule"))
+        // The engine is reachable from `&self` (constructor-injected); a rule is
+        // not an ARN-bearing resource of its own, so this operation takes
+        // nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFirewallRuleErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The change this request states, as the store takes one: the rule it
+        // NAMES (its group and the source that rule matches on), the members it
+        // replaces and the ones it leaves as stored, the match source that
+        // "cannot be changed after creation", the settings the rule has to
+        // satisfy once the change is applied, the priority that stays unique in
+        // the group and the lifecycle states a rule cannot be updated in are all
+        // decided there, so this change and the same change stated as one entry
+        // of a batch update are the same change.
+        let request = crate::state::FirewallRuleUpdate {
+            firewall_rule_group_id: &input.firewall_rule_group_id,
+            firewall_domain_list_id: input.firewall_domain_list_id.as_deref(),
+            firewall_threat_protection_id: input.firewall_threat_protection_id.as_deref(),
+            priority: input.priority,
+            action: input.action.as_deref(),
+            block_response: input.block_response.as_deref(),
+            block_override_domain: input.block_override_domain.as_deref(),
+            block_override_dns_type: input.block_override_dns_type.as_deref(),
+            block_override_ttl: input.block_override_ttl,
+            name: input.name.as_deref(),
+            firewall_domain_redirection_action: input
+                .firewall_domain_redirection_action
+                .as_deref(),
+            qtype: input.qtype.as_deref(),
+            dns_threat_protection: input.dns_threat_protection.as_deref(),
+            confidence_threshold: input.confidence_threshold.as_deref(),
+            firewall_rule_type: input.firewall_rule_type.as_ref(),
+        };
+
+        let now = ::std::time::Instant::now();
+        let updated = state
+            .lock()
+            .update_firewall_rule(request, now)
+            .map_err(UpdateFirewallRuleErrorModeled::from)?;
+
+        Ok(UpdateFirewallRuleOutput {
+            firewall_rule: Some(updated),
+        })
     }
 }
