@@ -2,14 +2,15 @@
 
 //! Engine state for the com-amazonaws-lambdaweb-lambdaweb service.
 //!
-//! Every web function a client creates lives here, with its revisions nested under
-//! it, so `CreateWebFunction`, `CreateWebFunctionRevision`, `GetWebFunction`,
-//! `GetWebFunctionRevision`, `ListWebFunctions` and `DeleteWebFunction` all read and
-//! write ONE copy of each resource. The helpers beside the state struct — ARN
-//! construction, the request's region, the documented `functionName` rule, the
-//! record-to-modelled-shape projections, the clock-driven `Pending -> Active`
-//! transition and the opaque list cursor codec — are shared by those handlers
-//! rather than duplicated per operation.
+//! Every web function a client creates lives here, with its revisions and its
+//! endpoints nested under it, so `CreateWebFunction`, `CreateWebFunctionRevision`,
+//! `GetWebFunction`, `GetWebFunctionRevision`, `GetWebFunctionEndpoint`,
+//! `ListWebFunctions` and `DeleteWebFunction` all read and write ONE copy of each
+//! resource. The helpers beside the state struct — ARN construction, the request's
+//! region, the documented resource-name rule, the record-to-modelled-shape
+//! projections, the clock-driven `Pending -> Active` transition and the opaque list
+//! cursor codec — are shared by those handlers rather than duplicated per
+//! operation. The endpoint slice lives in [`endpoints`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -19,6 +20,11 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     BuildConfig, FunctionRevisionSummary, FunctionSummary, RevisionError, ServiceConfig,
 };
+
+/// The endpoint slice: what an endpoint of a web function is, and the rules the
+/// create paths validate it against.
+mod endpoints;
+pub use endpoints::*;
 
 /// The region an emulated request is treated as having been made in when its
 /// SigV4 credential scope does not name one (an unsigned or anonymous request).
@@ -222,6 +228,10 @@ pub struct WebFunction {
     /// The revisions of this function, keyed by `revisionId`.
     pub revisions: BTreeMap<String, Revision>,
     pub latest_revision_id: Option<String>,
+    /// The endpoints of this function, keyed by `endpointName` — the endpoint's
+    /// identity in this API. Nested here, so a function's delete takes its
+    /// endpoints with it and every endpoint reader sees ONE copy of each.
+    pub endpoints: BTreeMap<String, Endpoint>,
 }
 
 impl WebFunction {
@@ -274,6 +284,9 @@ impl WebFunction {
         }
         for revision in self.revisions.values_mut() {
             revision.materialise_due(now);
+        }
+        for endpoint in self.endpoints.values_mut() {
+            endpoint.materialise_due(now);
         }
     }
 }
@@ -431,31 +444,42 @@ pub fn resolve_function_name(value: &str) -> &str {
 /// [`FUNCTION_NAME_MAX_CHARS`] characters — which the boundary validator cannot
 /// enforce because the model carries no pattern for it.
 pub fn function_name_violation(name: &str) -> Option<String> {
+    resource_name_violation("functionName", name, FUNCTION_NAME_MAX_CHARS)
+}
+
+/// Why `name` is not a legal value for the `member` that names a resource of this
+/// service, or `None` when it is.
+///
+/// One rule, stated identically by `functionName` and by `endpointName`: letters,
+/// numbers, hyphens and underscores, never starting or ending with a hyphen or an
+/// underscore, at most `max_chars` characters. The model gives those members a
+/// length bound only, so the boundary validator cannot enforce it and every create
+/// path checks it here.
+pub fn resource_name_violation(member: &str, name: &str, max_chars: usize) -> Option<String> {
     if name.is_empty() {
-        return Some("Member must have length greater than or equal to 1: functionName".to_string());
-    }
-    if name.chars().count() > FUNCTION_NAME_MAX_CHARS {
         return Some(format!(
-            "Member must have length less than or equal to {FUNCTION_NAME_MAX_CHARS}: functionName"
+            "Member must have length greater than or equal to 1: {member}"
+        ));
+    }
+    if name.chars().count() > max_chars {
+        return Some(format!(
+            "Member must have length less than or equal to {max_chars}: {member}"
         ));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Some(
-            "Member must contain only letters, numbers, hyphens (-) and underscores (_): \
-             functionName"
-                .to_string(),
-        );
+        return Some(format!(
+            "Member must contain only letters, numbers, hyphens (-) and underscores (_): {member}"
+        ));
     }
     let first = name.chars().next();
     let last = name.chars().next_back();
     if matches!(first, Some('-' | '_')) || matches!(last, Some('-' | '_')) {
-        return Some(
-            "Member must not begin or end with a hyphen (-) or an underscore (_): functionName"
-                .to_string(),
-        );
+        return Some(format!(
+            "Member must not begin or end with a hyphen (-) or an underscore (_): {member}"
+        ));
     }
     None
 }

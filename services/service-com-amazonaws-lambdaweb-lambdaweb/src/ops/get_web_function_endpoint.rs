@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWebFunctionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWebFunctionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWebFunctionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored endpoint of one stored web function: every member of the
+//! response is read back out of the endpoint slice of this service's state, so an
+//! endpoint a create stored is the endpoint this reader returns.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +192,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWebFunctionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWebFunctionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWebFunctionEndpoint"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWebFunctionEndpointErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // The only write a read makes: the state transitions the clock already owed
+        // this function, its revisions and its endpoints, which were due whether or
+        // not anybody called.
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // Either resource may be named by name or by ARN; both resolve to the one
+        // stored record.
+        let function_name = crate::state::resolve_function_name(&input.function_name);
+        let Some(function) = state.functions.get(function_name) else {
+            return Err(
+                GetWebFunctionEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The web function {} doesn't exist.",
+                            input.function_name
+                        ),
+                        resource_id: Some(input.function_name.clone()),
+                        resource_type: Some("WebFunction".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let endpoint_name = crate::state::resolve_endpoint_name(&input.endpoint_name);
+        let Some(endpoint) = function.endpoints.get(endpoint_name) else {
+            return Err(
+                GetWebFunctionEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The endpoint {} doesn't exist on web function {}.",
+                            input.endpoint_name, function.function_name
+                        ),
+                        resource_id: Some(input.endpoint_name.clone()),
+                        resource_type: Some("Endpoint".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetWebFunctionEndpointOutput {
+            function_arn: function.function_arn.clone(),
+            endpoint_arn: endpoint.endpoint_arn.clone(),
+            endpoint_name: endpoint.endpoint_name.clone(),
+            description: endpoint.description.clone(),
+            endpoint_type: endpoint.endpoint_type.clone(),
+            domain_name: endpoint.domain_name.clone(),
+            auth_type: endpoint.auth_type.clone(),
+            auto_deployment_mode: endpoint.auto_deployment_mode.clone(),
+            revision_weights: endpoint.revision_weights.clone(),
+            regions: endpoint.region_list(),
+            scaling_config: endpoint.scaling_config.clone(),
+            throttle_config: endpoint.throttle_config.clone(),
+            state: endpoint.state.wire().to_string(),
+            state_reason: endpoint.state_reason.clone(),
+            update_status: endpoint.update_status.clone(),
+            update_status_reason: endpoint.update_status_reason.clone(),
+            regional_endpoints: endpoint.regional_endpoints(),
+            created_at: ::aws_smithy_types::DateTime::from(endpoint.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(endpoint.updated_at),
+        })
     }
 }

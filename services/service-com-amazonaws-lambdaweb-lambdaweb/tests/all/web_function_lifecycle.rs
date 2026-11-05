@@ -41,20 +41,21 @@ fn settle_delay() -> Duration {
     PROVISIONING_DELAY + Duration::from_millis(250)
 }
 
-/// One wire answer, reduced to what a client branches on.
+/// One wire answer, reduced to what a client branches on. Shared with the sibling
+/// suites of this test crate, which drive the same emulator over the same wire.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: String,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn field(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn field(&self, name: &str) -> Option<&Value> {
         self.body.get(name).filter(|value| !value.is_null())
     }
 
-    fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         self.field(name)
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -62,7 +63,7 @@ impl Reply {
 
     /// The error shape this answer names: the `x-amzn-errortype` header restJson1
     /// carries, falling back to the body's `__type`.
-    fn error(&self) -> String {
+    pub(crate) fn error(&self) -> String {
         if !self.error_type.is_empty() {
             return self
                 .error_type
@@ -81,12 +82,12 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by
@@ -97,7 +98,13 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, path: &str, region: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        region: &str,
+        body: Option<Value>,
+    ) -> Reply {
         // This service's sigv4 signing name is `lambda` (model: `sigv4Name`).
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/lambda/aws4_request, \
@@ -187,7 +194,7 @@ impl Emulator {
 /// OPERATIONS.md): `arn:aws:lambda:<region>:<account>:web-function/<name>`. Written
 /// out here rather than taken from the handler's helper, so the test pins the
 /// format.
-fn expected_arn(region: &str, name: &str) -> String {
+pub(crate) fn expected_arn(region: &str, name: &str) -> String {
     format!(
         "arn:aws:lambda:{region}:{account}:web-function/{name}",
         account = engine::EMULATOR_ACCOUNT_ID
@@ -197,7 +204,7 @@ fn expected_arn(region: &str, name: &str) -> String {
 /// A minimal, valid `buildConfig`: `codeConfig.s3Object` plus `runtimeConfig`
 /// (both `@required`, model: `shape=BuildConfig`). `runtime` must match
 /// `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`.
-fn build_config(runtime: &str, bucket: &str, key: &str, version: Option<&str>) -> Value {
+pub(crate) fn build_config(runtime: &str, bucket: &str, key: &str, version: Option<&str>) -> Value {
     let mut s3_object = json!({ "bucket": bucket, "key": key });
     if let Some(version) = version {
         s3_object["versionId"] = json!(version);
@@ -210,7 +217,7 @@ fn build_config(runtime: &str, bucket: &str, key: &str, version: Option<&str>) -
 
 /// A valid `executionRoleArn` (model pattern
 /// `^arn:(aws[a-z-]*):iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+$`).
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::123456789012:role/{name}")
 }
 
@@ -1328,43 +1335,6 @@ async fn a_function_arn_names_the_region_the_request_was_signed_for() {
     }
 }
 
-#[tokio::test]
-async fn an_initial_endpoint_is_answered_with_the_scaffold_not_with_a_half_made_function() {
-    // The endpoint operations of this service are still scaffolded, so a create
-    // that asks for an initial endpoint is refused with the scaffold's 501 and
-    // stores nothing — rather than quietly creating a function without it.
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "home-region",
-            json!({ "endpointName": "prod", "endpointType": "HomeRegion", "authType": "IamAuth" }),
-        ),
-        (
-            "multi-region",
-            json!({
-                "endpointName": "edge",
-                "endpointType": "MultiRegion",
-                "authType": "ApplicationManaged",
-                "regions": ["us-east-1", "eu-west-1"],
-            }),
-        ),
-    ];
-
-    for (case, endpoint_config) in cases {
-        let emulator = Emulator::new();
-        let name = format!("endpoint-{case}");
-        let reply = emulator
-            .create(json!({ "functionName": name, "endpointConfig": endpoint_config }))
-            .await;
-        assert_eq!(
-            reply.status, 501,
-            "case {case:?}: expected the scaffold's 501, got {} with {:?}",
-            reply.status, reply.body
-        );
-        let fetched = emulator.get(&name).await;
-        assert_eq!(
-            fetched.status, 404,
-            "case {case:?}: a refused create stores nothing, got {} with {:?}",
-            fetched.status, fetched.body
-        );
-    }
-}
+// `CreateWebFunction`'s initial endpoint — the `endpointConfig` member, the
+// `endpoint` member of its answer and the `GetWebFunctionEndpoint` read-back — is
+// covered by the `web_function_endpoint` suite beside this one.

@@ -2,13 +2,15 @@
 
 //! @op CreateWebFunction
 //!
-//! Stores a new web function and, when the request carries a `revisionConfig`, its
-//! initial revision; every member of the response is read back out of the store.
+//! Stores a new web function and, when the request carries them, its initial
+//! revision and its initial endpoint; every member of the response is read back out
+//! of the store.
 //!
-//! `endpointConfig` is NOT served here: the endpoint operations of this service are
-//! still scaffolded, so a request that asks for an initial endpoint is answered with
-//! the scaffold's 501 and stores nothing, rather than silently creating a function
-//! without the endpoint it asked for.
+//! `endpointConfig` is served here: the initial endpoint is created in the endpoint
+//! slice of this service's state alongside the function, so the endpoint readers of
+//! the same service report it. A configuration that breaks one of the rules the
+//! model cannot express (the `endpointName` naming rule, the `regions` rule) is
+//! refused as a `ValidationException` before anything is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -195,13 +197,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The initial endpoint belongs to the endpoint slice of this service, every
-        // operation of which is still a stub. Refused BEFORE anything is stored, so
-        // the call creates nothing at all.
-        if input.endpoint_config.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateWebFunction's endpointConfig",
-            ));
+        // The ARN names the region the call was signed for and the emulator's
+        // canonical account, never anything the request body supplied. It is also
+        // the endpoint's HOME region: the Region "where you created the web
+        // function".
+        let region = crate::state::request_region(ctx.parts());
+
+        // The initial endpoint's own rules, checked BEFORE anything is stored so a
+        // refused create creates nothing at all. An endpoint serves revisions and
+        // the model requires at least one `revisionWeights` entry on every endpoint
+        // it reports, so the initial endpoint needs the initial revision.
+        if let Some(config) = &input.endpoint_config {
+            if input.revision_config.is_none() {
+                return Err(CreateWebFunctionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "The revisionConfig parameter is required when endpointConfig \
+                                  is specified: an endpoint serves at least one revision."
+                            .to_string(),
+                    },
+                )
+                .into());
+            }
+            if let Some(message) = crate::state::endpoint_config_violation(
+                &config.endpoint_name,
+                &config.endpoint_type,
+                config.regions.as_deref(),
+                &region,
+            ) {
+                return Err(CreateWebFunctionErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
         }
 
         let akid = ::engine::extract_akid(&ctx.parts().headers);
@@ -246,7 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ARN names the region the call was signed for and the emulator's
         // canonical account, never anything the request body supplied.
-        let region = crate::state::request_region(ctx.parts());
         let function_arn = crate::state::function_arn(&region, &input.function_name);
         state.functions.insert(
             input.function_name.clone(),
@@ -265,11 +291,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default().into_iter().collect(),
                 revisions: ::std::collections::BTreeMap::new(),
                 latest_revision_id: None,
+                endpoints: ::std::collections::BTreeMap::new(),
             },
         );
 
+        let mut initial_revision_id = None;
         if let Some(config) = input.revision_config {
-            state.add_revision(
+            initial_revision_id = state.add_revision(
                 &input.function_name,
                 crate::state::NewRevision {
                     description: config.description,
@@ -281,12 +309,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The initial endpoint serves the initial revision, with all of the traffic:
+        // it is the only revision there is to route to.
+        let mut initial_endpoint_name = None;
+        if let (Some(config), Some(revision_id)) = (input.endpoint_config, &initial_revision_id) {
+            initial_endpoint_name = state.add_endpoint(
+                &input.function_name,
+                crate::state::NewEndpoint {
+                    endpoint_name: config.endpoint_name,
+                    description: config.description,
+                    endpoint_type: config.endpoint_type,
+                    auth_type: config.auth_type,
+                    auto_deployment_mode: config.auto_deployment_mode,
+                    regions: config.regions,
+                    scaling_config: config.scaling_config,
+                    throttle_config: config.throttle_config,
+                    revision_weights: vec![RevisionWeight {
+                        revision_id: revision_id.clone(),
+                        weight: crate::state::FULL_WEIGHT,
+                    }],
+                },
+                &region,
+                now,
+            );
+        }
+
         // Every member below comes out of the stored record — including the revision
-        // summary, which is read back through the function's latest revision id.
+        // and endpoint summaries, which are read back through the records the writes
+        // above left in the store.
         let stored = state
             .functions
             .get(&input.function_name)
             .expect("the function inserted above is in the store");
+        let initial_endpoint = initial_endpoint_name.and_then(|name| stored.endpoints.get(&name));
         // The audit record for a state change: who, what, outcome. No secret and no
         // credential material — the access key id identifies the caller the way the
         // real service's trail does.
@@ -295,6 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             akid = %akid,
             function_name = %stored.function_name,
             function_arn = %stored.function_arn,
+            endpoint_arn = initial_endpoint.map(|endpoint| endpoint.endpoint_arn.as_str()),
             outcome = "created",
             "web function created"
         );
@@ -306,9 +362,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: ::aws_smithy_types::DateTime::from(stored.created_at),
             updated_at: ::aws_smithy_types::DateTime::from(stored.updated_at),
             revision: stored.latest_revision().map(crate::state::Revision::summary),
-            // This slice stores no endpoint, and a request that asked for one was
-            // refused above.
-            endpoint: None,
+            // The initial endpoint, read back out of the slice it was stored in — so
+            // what this create reports is what the endpoint readers of this service
+            // report for the same endpoint.
+            endpoint: initial_endpoint.map(crate::state::Endpoint::summary),
             tags: stored.modeled_tags(),
         })
     }

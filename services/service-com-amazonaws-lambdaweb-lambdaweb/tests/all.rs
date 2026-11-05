@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/web_function_endpoint.rs"]
+mod web_function_endpoint;
 #[path = "all/web_function_lifecycle.rs"]
 mod web_function_lifecycle;
