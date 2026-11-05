@@ -1,0 +1,100 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch.get-metric-widget-image-cross-account-metric-denied cloudwatch.get-metric-widget-image-malformed-spec-rejected cloudwatch.get-metric-widget-image-invalid-request-rejected cloudwatch.get-metric-widget-image-extreme-time-range-degrades-gracefully cloudwatch.deploy-cloudformation-dashboard-renders-widgets cloudwatch.get-metric-widget-image-renders-for-valid-metric cloudwatch.dashboard-widget-image-render-freshness-window
+Issue-Shape-Id: com.amazonaws.cloudwatch#GraniteServiceVersion20100801
+Issue-Key: cloudwatch.get-metric-widget-image-cross-account-metric-denied|run#6|AssertionError|assert message == expected, f"expected the exact message {expected!r}, got {message!r}"
+Issue-Key: cloudwatch.get-metric-widget-image-malformed-spec-rejected|run#8|AssertionError|assert message == _MALFORMED_MESSAGE, f"unexpected message for malformed widget JSON: {message!r}"
+Issue-Key: cloudwatch.get-metric-widget-image-invalid-request-rejected|run#6|AssertionError|assert message == expected, f"expected the exact message {expected!r}, got {message!r}"
+Issue-Key: cloudwatch|GetMetricWidgetImage|ValidationError
+Issue-Key: cloudwatch.deploy-cloudformation-dashboard-renders-widgets|run#24|AssertionError|assert retitled_bytes != image_bytes, (
+Issue-Key: cloudwatch.get-metric-widget-image-renders-for-valid-metric|_poll_until#8|Timeout|time.sleep(interval_s)
+Issue-Key: cloudwatch.dashboard-widget-image-render-freshness-window|_poll_until#15|Timeout|time.sleep(interval_s)
+Issue-Commit: f8cdfd71912d7158e15c3879450ee5927593f99b
+
+# cloudwatch: 4 net-new root causes in GetMetricWidgetImage — both ValidationError refusal messages are emulator-authored, an over-retention time range is refused instead of rendered, and the returned PNG is independent of the widget document and of the metric data
+
+> _Note: this issue was identified against the code base at commit `f8cdfd71912d7158e15c3879450ee5927593f99b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetMetricWidgetImage
+
+## Description
+REOPENS 20261025T020208Z-cloudwatch-getmetricwidgetimage-stub.md: its fix left the call refused. GetMetricWidgetImage no longer answers NotImplemented (it now returns PNG bytes and a ValidationError-coded refusal), but a widget AWS renders is still refused outright (Cause 3 below), and the refusal texts and the rendered bytes diverge.
+
+Four distinct net-new root causes, all in the cloudwatch GetMetricWidgetImage path. Every failing check below was NOT marked ALREADY FILED or OWNED by the replay report. Four causes must be closed before submitting.
+
+Related open/resolved issues that do NOT cover these: 20261025T024908Z-cloudwatch-four-scaffolded-operations-answer-notimplemented-so-getmetricdata.md (cause 3 there) and 20261029T210614Z-cloudwatch-4-net-new-root-causes-putalarmmuterule-describealarmcontributors.md (cause 3 there) both grade only the ERROR CODE of these calls (`expected ValidationError, got NotImplemented`) and carry replay keys on those code assertions; the code assertion now PASSES and the checks fail one assertion later, on the error MESSAGE — which neither issue states. The resolved issue 20261025T151319Z-cloudwatch-4-net-new-root-causes-cfn-deployed.md (cause 1) closed the earlier stage of cloudwatch.deploy-cloudformation-dashboard-renders-widgets (the CFN-deployed dashboard was absent, GetDashboard answered ResourceNotFound); the dashboard is now created and readable, and the check now fails further on, on the rendered image (Cause 4).
+
+=== Cause 1 of 4: the malformed-MetricWidget-JSON ValidationError message is emulator-authored ===
+Failing check ids: cloudwatch.get-metric-widget-image-cross-account-metric-denied, cloudwatch.get-metric-widget-image-malformed-spec-rejected.
+AWS: Smithy (services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/smithy-model/com-amazonaws-cloudwatch-graniteserviceversion20100801.json): GetMetricWidgetImage input MetricWidget @required ("A JSON string that defines the bitmap graph to be retrieved"), output MetricWidgetImage blob, operation errors list is EMPTY — so the refusal class is recorded behavior only. Recorded behavior: a MetricWidget whose value is not parseable JSON is refused HTTP 400 with error code `ValidationError` and the message `MetricWidget property 'metricWidget' has a bad JSON content`. That text is ENTIRELY FIXED: it names the wire member (`MetricWidget`), quotes the lower-camel internal property name (`'metricWidget'`), and interpolates nothing from the request — not the submitted string, not its length, not an offset.
+Emulator: the code is right (`ValidationError`) but the message is its own: `The field MetricWidget must be a valid JSON object`. This is the same sentence template the emulator uses for PutDashboard's DashboardBody ("The field DashboardBody must be a valid JSON object"), i.e. one generic JSON-field refusal reused for this operation rather than this operation's own text.
+Why: a client branches on this message because the operation models no error shape at all — `ValidationError` is the only code it can ever see from GetMetricWidgetImage, so the message is the only thing distinguishing "your widget JSON is malformed" from any other refusal of the same call. Dashboard-snapshot and alarm-annotation tooling that surfaces or string-matches the refusal shows text real AWS never sends, and emulator-based tests pin the wrong sentence.
+Fix: the MetricWidget JSON-parse refusal message in the GetMetricWidgetImage handler's validation (the handler must emit its own text, not the shared "field ... must be a valid JSON object" helper).
+Traces: cloudwatch.get-metric-widget-image-cross-account-metric-denied (its foreign-accountId positive control is never reached), cloudwatch.get-metric-widget-image-malformed-spec-rejected.
+
+=== Cause 2 of 4: a structurally invalid `metrics` entry is refused with an awsQuery-style parameter path instead of AWS's JSON-pointer diagnosis ===
+Failing check id: cloudwatch.get-metric-widget-image-invalid-request-rejected.
+AWS: Smithy as above (MetricWidget @required, no modeled errors). Recorded behavior: a widget document that parses as JSON but whose `metrics` entry is a one-element array rather than a metric tuple/object is refused HTTP 400 `ValidationError` with the message `MetricWidget/metrics/0/0 should be object`. The message is a JSON-pointer-shaped template: the fixed parts are the `MetricWidget` root, the `/` separators, the member name `metrics` and the suffix ` should be object`; the index segments are derived from the ZERO-BASED position of the offending element inside the submitted document (outer list index, then element index). It does not echo the submitted value.
+Emulator: refuses with the right code but the message `The value ["OnlyOneElement"] for parameter MetricWidget.metrics.member.1 is invalid.` — a generic awsQuery flattened-parameter path (`MetricWidget.metrics.member.1`, ONE-based) that echoes the offending JSON value verbatim and never says what the element should have been.
+Why: the widget document is a nested JSON graph, so the pointer into it is the entire diagnostic value of the refusal. A caller (or a dashboard editor relaying the message to an operator) cannot locate the bad element from a flattened query-parameter path, the index is off by one against AWS, and echoing the value makes the message length depend on the submitted payload where AWS's does not.
+Fix: the MetricWidget document structural validation in the GetMetricWidgetImage handler — walk the parsed widget and emit AWS's JSON-pointer path plus expected-type suffix, instead of routing the failure through the shared awsQuery invalid-parameter-value formatter.
+Traces: cloudwatch.get-metric-widget-image-invalid-request-rejected (its well-formed control widget, which must still render a PNG for a metric with no data, is never reached).
+
+=== Cause 3 of 4: a widget whose time range exceeds metric retention is REFUSED with GetMetricData's datapoint-cap error instead of rendered ===
+Failing check id: cloudwatch.get-metric-widget-image-extreme-time-range-degrades-gracefully.
+AWS: Smithy GetMetricWidgetImageInput$MetricWidget documentation states the render's own degradation contract: "If any metric on the graph could not load all the requested data points, an orange triangle with an exclamation point appears next to the graph legend." The operation models NO errors. Recorded behavior: a widget with `period` 60 and `start` "-P900D" / `end` "PT0H" — ~2.5 years, well past the documented 15-month metric retention, and far more 60-second buckets than any read-API datapoint cap — is ACCEPTED: HTTP 200 whose MetricWidgetImage is non-empty and begins with the PNG signature 89 50 4E 47 0D 0A 1A 0A. Data that cannot load is signalled INSIDE the image, never as an API error. There is no per-call datapoint ceiling on this operation.
+Emulator: the call is refused HTTP 400 `ValidationError` with the message `You have requested up to <N> datapoints, which exceeds the limit of 100800. You may reduce the datapoints requested by increasing Period, or decreasing the time range.` (recorded run: N=1296001). That is the metric-read path's datapoint-cap refusal — its fixed text is AWS's GetMetricData/GetMetricStatistics wording and `<N>` is computed from the submitted range and period — applied to a rendering operation that has no such limit.
+Why: the whole point of this operation for long-horizon reporting is that it degrades gracefully: a caller embeds a multi-year chart in a report and expects a PNG with a load warning. Instead it gets a 4xx it has no branch for (the operation models no errors), so a long time range is indistinguishable from a malformed widget, and any report or notification pipeline that renders a wide window fails hard where AWS succeeds.
+Fix: remove the metric-read datapoint-cap gate from the GetMetricWidgetImage handler; the render path must clamp/resolve the requested range against retention and emit the in-image "could not load all data points" indication rather than refusing the request.
+Traces: cloudwatch.get-metric-widget-image-extreme-time-range-degrades-gracefully.
+
+=== Cause 4 of 4: the returned PNG is a fixed placeholder — it reflects neither the widget document nor the metric data ===
+Failing check ids: cloudwatch.deploy-cloudformation-dashboard-renders-widgets, cloudwatch.get-metric-widget-image-renders-for-valid-metric, cloudwatch.dashboard-widget-image-render-freshness-window.
+AWS: Smithy: output MetricWidgetImage is a blob; the MetricWidget doc (quoted above) states the string "includes the metrics to include in the graph, statistics, annotations, title, axis limits, and so on", and that the render reports per-metric data-load problems in the image. Recorded behavior: the image is a function of the widget document AND of the metric data currently in the window. Two widgets that differ only in `title` render to DIFFERENT bytes. Rendering the same widget twice over a fixed absolute window with unchanged data returns the SAME bytes, and rendering it again after a new datapoint is written into that window returns DIFFERENT bytes (in the recorded runs, materially larger once a series has data). The requirement is this dependence, not any particular byte count.
+Emulator: GetMetricWidgetImage returns the same PNG regardless of input. A dashboard's stored metric widget and the identical widget with a different `title` render byte-identical images (recorded run: 22772 bytes, PNG-signed, equal bytes). After PutMetricData writes a datapoint into the queried namespace/metric, repeated renders of the same widget never change size or content, so both checks that poll for the image to change exhaust the harness budget (`Error: Check timed out after 60.0s`) inside their bounded poll loops. Nothing in the widget document — metrics, title, view, width/height — and nothing in the metric store affects the response bytes.
+Why: the image IS the response; a client embeds it in an email, a chat notification, a ticket or a PDF report. A constant placeholder means every chart in every notification shows the same thing, an operator paged by an alarm sees a graph unrelated to the metric that fired, and a caller cannot tell a rendered chart from a stub. It also makes the emulator's dashboards untestable: two different dashboards, and a dashboard before and after data arrives, are indistinguishable.
+Fix: the image serializer in the GetMetricWidgetImage handler must render from the parsed widget document and from the metric store the read path serves (honouring metrics/stat/period/start/end/title/view/width/height), so the bytes vary with the widget and with the datapoints in the requested window; the CloudFormation-deployed-dashboard leg reads the same render path and needs no separate change.
+Traces: cloudwatch.deploy-cloudformation-dashboard-renders-widgets (direct byte-identity evidence), cloudwatch.get-metric-widget-image-renders-for-valid-metric, cloudwatch.dashboard-widget-image-render-freshness-window.
+
+## Evidence
+All quotes are replayed assertion text from the behavioral suite (534/924 passed). Service heading: ### cloudwatch.
+
+Cause 1 — malformed MetricWidget JSON message.
+cloudwatch.get-metric-widget-image-cross-account-metric-denied [mismatch], check line 30: `AssertionError: expected the exact message "MetricWidget property 'metricWidget' has a bad JSON content", got 'The field MetricWidget must be a valid JSON object'`. The preceding `assert code == "ValidationError"` PASSED. Never reached afterwards: the own-account widget render and the unlinked-foreign-accountId widget render, both of which must be 200 with PNG-signed bytes (AWS accepts a foreign accountId here; it must not be denied).
+cloudwatch.get-metric-widget-image-malformed-spec-rejected [mismatch], check line 36: `AssertionError: unexpected message for malformed widget JSON: 'The field MetricWidget must be a valid JSON object'` against the expected constant `MetricWidget property 'metricWidget' has a bad JSON content`.
+Request in both: get_metric_widget_image(MetricWidget='{not valid json at all').
+
+Cause 2 — invalid `metrics` entry message.
+cloudwatch.get-metric-widget-image-invalid-request-rejected [mismatch], check line 36: `AssertionError: expected the exact message 'MetricWidget/metrics/0/0 should be object', got 'The value ["OnlyOneElement"] for parameter MetricWidget.metrics.member.1 is invalid.'`. The preceding `assert code == "ValidationError"` PASSED. Request: MetricWidget='{"metrics": [["OnlyOneElement"]], "width": 400, "height": 300}'. Never reached: the well-formed control MetricWidget='{"metrics": [["AWS/EC2","CPUUtilization"]], "width":400, "height":300, "start":"-PT1H", "end":"PT0H"}' must return PNG-signed bytes even though that metric has no published data.
+
+Cause 3 — over-retention range refused.
+cloudwatch.get-metric-widget-image-extreme-time-range-degrades-gracefully [error]: `botocore.errorfactory.ValidationException: An error occurred (ValidationError) when calling the GetMetricWidgetImage operation: You have requested up to 1296001 datapoints, which exceeds the limit of 100800. You may reduce the datapoints requested by increasing Period, or decreasing the time range.`
+Request: MetricWidget={"metrics":[[<fresh namespace>,"NoSuchMetric"]],"period":60,"start":"-P900D","end":"PT0H","width":400,"height":300}, OutputFormat='png'. Expected (AWS): HTTP 200, MetricWidgetImage non-empty with first 8 bytes b'\x89PNG\r\n\x1a\n'; the unloadable range is signalled in-image, not as an error. The 1296001/100800 numbers are per-request/limit values, not part of any requirement — the requirement is that the call is NOT refused.
+
+Cause 4 — placeholder render.
+cloudwatch.deploy-cloudformation-dashboard-renders-widgets [mismatch], check line 109: `AssertionError: the stored widget and the same widget retitled rendered byte-identical images (22772 bytes, first 8 b'\x89PNG\r\n\x1a\n'): the render ignores the widget`. The CFN stack now reaches CREATE_COMPLETE and GetDashboard returns the stored body (the legs closed by the resolved issue 20261025T151319Z), so the failure is attributable to the render alone.
+cloudwatch.get-metric-widget-image-renders-for-valid-metric [mismatch]: `Error: Check timed out after 60.0s`, inside its own `_poll_until(..., timeout_s=120, interval_s=5)` waiting for `len(image) > len(baseline) + 200` after put_metric_data(Namespace=<fresh>, MetricData=[{MetricName:'WidgetMetric', Value:42.0, Unit:'Count'}]). The baseline render (before any datapoint) was already a valid PNG, so the operation answers — the bytes simply never change.
+cloudwatch.dashboard-widget-image-render-freshness-window [mismatch]: `Error: Check timed out after 60.0s`, polling the same widget over a FIXED absolute 5-minute window, which must return identical bytes while data is unchanged and different bytes once a new datapoint is written into that window.
+
+## Steps to Reproduce
+Point a boto3 cloudwatch client at the emulator.
+
+Cause 1:
+1. cw.get_metric_widget_image(MetricWidget='{not valid json at all'). Expected: ClientError code 'ValidationError', HTTP 400, Message exactly "MetricWidget property 'metricWidget' has a bad JSON content". Observed: code 'ValidationError', Message 'The field MetricWidget must be a valid JSON object'.
+2. Control that must pass: cw.get_metric_widget_image(MetricWidget=json.dumps({"metrics":[["AWS/EC2","CPUUtilization",{"stat":"Average"}]],"period":300,"width":400,"height":200})) -> 200, PNG-signed bytes; and the same widget plus "accountId": "111111111111" (an unlinked foreign account) -> also 200 with PNG-signed bytes, NOT a denial.
+
+Cause 2:
+1. cw.get_metric_widget_image(MetricWidget=json.dumps({"metrics":[["OnlyOneElement"]],"width":400,"height":300})). Expected: code 'ValidationError', Message exactly 'MetricWidget/metrics/0/0 should be object'. Observed: Message 'The value ["OnlyOneElement"] for parameter MetricWidget.metrics.member.1 is invalid.'
+2. Control: cw.get_metric_widget_image(MetricWidget=json.dumps({"metrics":[["AWS/EC2","CPUUtilization"]],"width":400,"height":300,"start":"-PT1H","end":"PT0H"})) -> 200 with PNG-signed bytes.
+
+Cause 3:
+1. cw.get_metric_widget_image(MetricWidget=json.dumps({"metrics":[["<fresh-namespace>","NoSuchMetric"]],"period":60,"start":"-P900D","end":"PT0H","width":400,"height":300}), OutputFormat='png'). Expected: HTTP 200, MetricWidgetImage non-empty, first 8 bytes b'\x89PNG\r\n\x1a\n'. Observed: HTTP 400 ValidationError with the datapoint-cap message.
+
+Cause 4:
+1. widget = {"metrics":[["<fresh-namespace>","WidgetMetric"]],"title":"a","view":"timeSeries","width":400,"height":200}. baseline = cw.get_metric_widget_image(MetricWidget=json.dumps(widget))['MetricWidgetImage'].
+2. Render the SAME widget with "title":"b" -> the bytes must DIFFER from baseline. Observed: byte-identical.
+3. cw.put_metric_data(Namespace='<fresh-namespace>', MetricData=[{'MetricName':'WidgetMetric','Value':42.0,'Unit':'Count'}]), then re-render `widget` repeatedly. Expected: the bytes change (and grow materially) once the series has a datapoint. Observed: unchanged indefinitely.
+4. With a FIXED absolute window (start/end as explicit ISO timestamps spanning the publish instant): two renders with no new data must be byte-identical, and a render after writing another datapoint into that window must differ. Observed: all renders identical.
+5. Re-replay to confirm: cloudwatch.get-metric-widget-image-cross-account-metric-denied, cloudwatch.get-metric-widget-image-malformed-spec-rejected, cloudwatch.get-metric-widget-image-invalid-request-rejected, cloudwatch.get-metric-widget-image-extreme-time-range-degrades-gracefully, cloudwatch.deploy-cloudformation-dashboard-renders-widgets, cloudwatch.get-metric-widget-image-renders-for-valid-metric, cloudwatch.dashboard-widget-image-render-freshness-window.
