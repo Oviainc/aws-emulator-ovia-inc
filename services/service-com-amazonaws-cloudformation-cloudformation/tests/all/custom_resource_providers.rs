@@ -16,6 +16,13 @@
 //! is read off the request this emulator is waiting for an answer to, which is the record
 //! the `ResponseURL` is addressed by.
 //!
+//! The helpers this suite builds the sequence out of — the emulator with the provider's
+//! topic, the template, the request CloudFormation is waiting for an answer to and the
+//! unsigned write that answers it — are `pub` because the sibling suite
+//! `custom_resource_response_identity.rs` drives the same sequence to assert what the
+//! ANSWER then makes of the resource; one spelling of the sequence keeps the two from
+//! drifting about how a provider is answered.
+//!
 //! The rows differ along what the rule generalises over: the `RequestType` the operation
 //! sends (`Create`, `Update`, `Delete`), the spelling of the custom resource's type (the
 //! author's own namespace and the generic one), what the answer's `Data` carries (nothing, a
@@ -44,8 +51,8 @@ const PROVIDER_TOPIC: &str = "custom-resource-provider";
 
 /// How long one poll of a stack's status waits before asking again, and how many times: the
 /// stack's own transition is clock-owed, and what makes a released wait due is a READ.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const POLL_ATTEMPTS: usize = 40;
+pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub const POLL_ATTEMPTS: usize = 40;
 
 /// The suffix every status a stack operation in flight carries ends in.
 const IN_PROGRESS: &str = "_IN_PROGRESS";
@@ -85,7 +92,7 @@ async fn sns_ok(router: &MultiServiceRouter, case: &str, action: &str, members: 
 /// The provider request this emulator is waiting for an answer to about `logical_id` of
 /// `stack_name`, with the stack's own id: exactly what the published `ResponseURL` is
 /// addressed by.
-fn awaited_request(
+pub fn awaited_request(
     engine: &Arc<engine::InMemoryEngine>,
     stack_name: &str,
     logical_id: &str,
@@ -113,7 +120,7 @@ fn awaited_request(
 
 /// PUT one document to the `ResponseURL` of the request `request_id` about `logical_id` of
 /// the stack `stack_id` — the plain, unsigned write a provider makes.
-async fn put_response(
+pub async fn put_response(
     router: &MultiServiceRouter,
     stack_id: &str,
     logical_id: &str,
@@ -166,7 +173,11 @@ async fn describe(router: &MultiServiceRouter, stack_name: &str) -> (String, Str
 /// settled in with the body that reported it.
 ///
 /// A read is what asks the provider's answer about, so polling is what a client does.
-async fn settled(router: &MultiServiceRouter, case: &str, stack_name: &str) -> (String, String) {
+pub async fn settled(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+) -> (String, String) {
     let mut last = (String::new(), String::new());
     for _ in 0..POLL_ATTEMPTS {
         last = describe(router, stack_name).await;
@@ -187,7 +198,7 @@ async fn settled(router: &MultiServiceRouter, case: &str, stack_name: &str) -> (
 ///
 /// Answers under the id the request names where it names one (an `Update` or a `Delete`), so
 /// the answer replaces nothing, and under `minted` for a `Create`.
-async fn settled_with_a_responsive_provider(
+pub async fn settled_with_a_responsive_provider(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -247,7 +258,7 @@ fn any_awaited_request(
 }
 
 /// A stack's reported outputs, as the key/value map a client reads.
-fn outputs_of(xml: &str) -> BTreeMap<String, String> {
+pub fn outputs_of(xml: &str) -> BTreeMap<String, String> {
     xml_texts(xml, "OutputKey")
         .into_iter()
         .zip(xml_texts(xml, "OutputValue"))
@@ -257,7 +268,7 @@ fn outputs_of(xml: &str) -> BTreeMap<String, String> {
 /// The template one row deploys: one custom resource of `resource_type` whose `ServiceToken`
 /// is the provider topic, with `marker` as the property a revision changes, and outputs that
 /// publish what `Ref` and `Fn::GetAtt` resolve to for it.
-fn template(resource_type: &str, marker: &str, attributes: &[&str]) -> String {
+pub fn template(resource_type: &str, marker: &str, attributes: &[&str]) -> String {
     let mut outputs = serde_json::Map::new();
     outputs.insert("ThingRef".to_string(), json!({ "Value": { "Ref": "Thing" } }));
     for attribute in attributes {
@@ -282,7 +293,7 @@ fn template(resource_type: &str, marker: &str, attributes: &[&str]) -> String {
 }
 
 /// The emulator with the provider's topic already created in Amazon SNS.
-async fn emulator(case: &str) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub async fn emulator(case: &str) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = router_with_engine();
     sns_ok(
         &router,

@@ -465,7 +465,9 @@ pub struct Materialised {
 #[derive(Debug, Clone)]
 pub struct Stabilising {
     /// Which of that service's answers ends this wait
-    /// ([`super::stabilising::Awaited`]): the resource is ready, or the resource is gone.
+    /// ([`super::stabilising::Awaited`]): the resource it created is ready, the resource it
+    /// changed is ready, or the resource it deleted is gone — which is also what says which
+    /// action a wait that does not come through reports as failed.
     pub awaited: super::stabilising::Awaited,
     pub logical_id: String,
     pub resource_type: String,
@@ -894,7 +896,10 @@ pub async fn advance_stabilisations(
                 Some(None) => Ok(Readiness::Pending(barrier.reported_state.clone())),
                 None => match owner_for(&barrier.resource_type) {
                     Some(provisioner) => match barrier.awaited {
-                        super::stabilising::Awaited::Ready => {
+                        // A create's wait and a change's wait ask that service the one
+                        // question: is the resource in the state it serves traffic in?
+                        super::stabilising::Awaited::Ready
+                        | super::stabilising::Awaited::Updated => {
                             provisioner
                                 .readiness(ctx, region, &barrier.physical_resource_id)
                                 .await
@@ -924,7 +929,7 @@ pub async fn advance_stabilisations(
             // with, which is exactly what `Fn::GetAtt` resolves against for the type: the
             // answer is already in hand, so there is nothing to read.
             let ready_attributes = if !matches!(readiness, Ok(Readiness::Ready))
-                || barrier.awaited != super::stabilising::Awaited::Ready
+                || !barrier.awaited.awaits_readiness()
             {
                 BTreeMap::new()
             } else if let Some(Some(response)) = provider_answer {
@@ -983,7 +988,7 @@ pub async fn advance_stabilisations(
                         // real identity: the `PhysicalResourceId` it reports is what `Ref`
                         // resolves to from here on, whatever identifier the naming rules had
                         // computed for the record.
-                        if barrier.awaited == super::stabilising::Awaited::Ready {
+                        if barrier.awaited.awaits_readiness() {
                             if let Some(response) = barrier.provider_response.as_ref() {
                                 stack.adopt_provider_identity(
                                     &barrier.logical_id,
@@ -1164,9 +1169,7 @@ fn custom_resource_cleanup(
     barrier: &super::stabilising::StabilisationBarrier,
     readiness: &Result<Readiness, Refusal>,
 ) -> Option<ReplacedResource> {
-    if !matches!(readiness, Ok(Readiness::Ready))
-        || barrier.awaited != super::stabilising::Awaited::Ready
-    {
+    if !matches!(readiness, Ok(Readiness::Ready)) || !barrier.awaited.awaits_readiness() {
         return None;
     }
     let request = barrier.provider_request.as_ref()?;
@@ -1473,7 +1476,7 @@ pub async fn reconcile(
                             // owning service's applied change.
                             resource.properties = declared_properties.clone();
                             outcome.stabilising.push(Stabilising {
-                                awaited: super::stabilising::Awaited::Ready,
+                                awaited: super::stabilising::Awaited::Updated,
                                 logical_id: resource.logical_id.clone(),
                                 resource_type: resource.resource_type.clone(),
                                 physical_resource_id: resource.physical_resource_id.clone(),

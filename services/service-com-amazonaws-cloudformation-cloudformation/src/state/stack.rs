@@ -1737,7 +1737,7 @@ impl StoredStack {
     pub(super) fn coming_up(&self) -> impl Iterator<Item = &stabilising::StabilisationBarrier> {
         self.stabilisations
             .iter()
-            .filter(|barrier| barrier.awaited == stabilising::Awaited::Ready)
+            .filter(|barrier| barrier.awaited.awaits_readiness())
     }
 
     /// Record that the service owning the resource `barrier` is held for has given the answer
@@ -1822,10 +1822,8 @@ impl StoredStack {
         // WHICH action on the resource did not go through, which is what the stack's summary
         // reports it failed for.
         let action = match barrier.awaited {
-            // The resource was being CREATED whatever the enclosing operation is — a wait
-            // for a resource to be ready is only ever opened by the create of a resource the
-            // stack did not have — so its own event is the failed CREATE, which the walk had
-            // planned as a completion and the gate held back.
+            // The resource was being CREATED, so its own event is the failed CREATE, which
+            // the walk had planned as a completion and the gate held back.
             stabilising::Awaited::Ready => {
                 self.fail_planned_resource_event(
                     logical_id,
@@ -1833,6 +1831,19 @@ impl StoredStack {
                     reason,
                 );
                 failed_action::CREATE
+            }
+            // The resource ALREADY EXISTED and what was being carried out on it was the
+            // change this deployment declared, so what did not go through is its UPDATE:
+            // the event the walk planned for it is the completion of that change, and the
+            // failure that replaces it says the resource was not updated — never that a
+            // resource the stack already had failed to be created.
+            stabilising::Awaited::Updated => {
+                self.fail_planned_resource_event(
+                    logical_id,
+                    resource_status::UPDATE_FAILED,
+                    reason,
+                );
+                failed_action::UPDATE
             }
             // The resource was being DELETED, and what the owning service answered about
             // that delete was recorded when it answered: what did not happen is the removal,

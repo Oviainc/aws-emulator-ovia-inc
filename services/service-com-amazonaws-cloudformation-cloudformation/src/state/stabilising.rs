@@ -81,18 +81,40 @@ pub const REMOVAL_STABILISATION_WINDOW: Duration = super::MAX_HELD_WAIT;
 
 /// Which answer from the owning service a barrier is waiting for.
 ///
-/// The two are asked of different APIs of that service and mean opposite things, so the
+/// The answers are asked of different APIs of that service and mean opposite things, so the
 /// barrier carries which one it is rather than leaving it to be guessed from the operation:
 /// one stack operation can hold both about the same logical resource at once, when it
 /// REPLACES one — the new physical resource is coming up while the old one is being removed.
+///
+/// It also carries WHICH ACTION on the resource the wait was opened by, because that is what
+/// a wait that does not come through says did not go through: a resource that was being
+/// brought up failed its CREATE, one whose declared configuration was being changed failed
+/// its UPDATE, and one that was being removed failed its DELETE
+/// ([`super::StoredStack::fail_stabilisation`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Awaited {
     /// The resource the operation CREATED is reported ready
     /// ([`super::provisioner::Provisioner::readiness`]).
     Ready,
+    /// The resource the operation CHANGED is reported ready: the same answer [`Self::Ready`]
+    /// waits for, about a resource the stack ALREADY HAD whose declaration this deployment
+    /// changed — a change the owning service, or the provider of a custom resource, accepted
+    /// without having carried it out yet.
+    Updated,
     /// The resource the operation DELETED is no longer held by that service
     /// ([`super::provisioner::Provisioner::removal`]).
     Gone,
+}
+
+impl Awaited {
+    /// Whether this wait is for the resource to be REPORTED READY, which is the one question
+    /// a create's wait and a change's wait both ask of whoever owns the resource.
+    ///
+    /// What they differ in is the action each would report as failed, not the answer that
+    /// ends them, so every reader of that answer asks this rather than naming the variants.
+    pub fn awaits_readiness(self) -> bool {
+        matches!(self, Self::Ready | Self::Updated)
+    }
 }
 
 /// One resource of the operation in flight that is still open: the owning service accepted
@@ -185,7 +207,10 @@ impl StabilisationBarrier {
     /// The instant the wait gives up, which is the window of the answer it waits for.
     pub fn deadline(&self) -> SystemTime {
         let window = match self.awaited {
-            Awaited::Ready => CREATE_STABILISATION_WINDOW,
+            // A change the owning service has accepted is waited out for as long as a
+            // creation is: both wait for that service to report the resource in the state it
+            // serves traffic in.
+            Awaited::Ready | Awaited::Updated => CREATE_STABILISATION_WINDOW,
             Awaited::Gone => REMOVAL_STABILISATION_WINDOW,
         };
         self.opened_at + window
@@ -209,6 +234,7 @@ impl StabilisationBarrier {
         };
         let awaited = match self.awaited {
             Awaited::Ready => "created",
+            Awaited::Updated => "updated",
             Awaited::Gone => "deleted",
         };
         format!(
