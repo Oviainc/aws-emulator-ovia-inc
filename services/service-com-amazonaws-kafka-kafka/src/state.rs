@@ -255,6 +255,9 @@ pub const OPERATION_TYPE_UPDATE_CLUSTER_CONFIGURATION: &str = "UPDATE_CLUSTER_CO
 /// The `OperationType` an `UpdateSecurity` call records, in the same form.
 pub const OPERATION_TYPE_UPDATE_SECURITY: &str = "UPDATE_SECURITY";
 
+/// The `OperationType` an `UpdateMonitoring` call records, in the same form.
+pub const OPERATION_TYPE_UPDATE_MONITORING: &str = "UPDATE_MONITORING";
+
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 
@@ -431,6 +434,16 @@ pub const MAX_TOPIC_NAME_LENGTH: usize = 249;
 /// registry one topic at a time. Sized well above any realistic client script.
 pub const MAX_TOPICS_PER_CLUSTER: usize = 1_000;
 
+/// Absolute ceiling on the topic registry across every cluster it holds.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota, for the reason
+/// [`MAX_CLUSTERS_IN_REGISTRY`] exists: the cluster a topic is filed under comes
+/// from the request, so the per-cluster ceiling alone would bound each cluster's
+/// topics without bounding the registry. Sized at the per-cluster ceiling times
+/// more clusters than one client script drives, so it can only ever be reached
+/// by a caller trying to exhaust the emulator.
+pub const MAX_TOPICS_IN_REGISTRY: usize = MAX_TOPICS_PER_CLUSTER * 16;
+
 /// The `TopicState` values this emulator reports, spelled as the model's enum
 /// declares them. Named here so every topic operation reports the same
 /// spellings. (`UPDATING`, the model's fourth value, belongs to `UpdateTopic`,
@@ -479,6 +492,15 @@ pub const TOPIC_CONFIGURATIONS_PER_CHANNEL: usize = 1;
 /// with the number of calls. Sized well above what any realistic client script
 /// creates against one cluster.
 pub const MAX_CHANNELS_PER_CLUSTER: usize = 100;
+
+/// Absolute ceiling on the channel registry across every cluster it holds.
+///
+/// CHOSEN as a process-safety backstop, not a published AWS quota, for the same
+/// reason [`MAX_TOPICS_IN_REGISTRY`] exists: the cluster a channel is filed
+/// under comes from the request, so the per-cluster ceiling alone leaves the
+/// registry itself unbounded. Sized at the per-cluster ceiling times more
+/// clusters than one client script drives.
+pub const MAX_CHANNELS_IN_REGISTRY: usize = MAX_CHANNELS_PER_CLUSTER * 64;
 
 /// How long after `CreateReplicator` a new replicator becomes `RUNNING`.
 ///
@@ -1011,6 +1033,22 @@ pub fn kafka_version_page(resume_after: Option<usize>, page_size: usize) -> Kafk
 /// knows which member it was still says the same thing about the resource.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
 
+/// The message Amazon MSK answers an update whose `CurrentVersion` is not the
+/// version the cluster is actually at.
+///
+/// A CONSTANT of the service, not built from the request: it carries neither the
+/// stored version nor the submitted one, and tells the caller to read the
+/// current version back instead (the apostrophe is U+2019, as the service writes
+/// it). Shared by every operation of this service that quotes a cluster's
+/// version, so one condition gets one wording; the member at fault travels in
+/// `BadRequestException$InvalidParameter`.
+pub const CLUSTER_VERSION_NOT_CURRENT_MESSAGE: &str =
+    "The version of the cluster isn\u{2019}t current. Check the current version and try again.";
+
+/// The member a stale-version refusal names, as the request spells it on the
+/// wire (`CurrentVersion`'s `jsonName`).
+pub const CURRENT_VERSION_MEMBER: &str = "currentVersion";
+
 /// The wire error code that refusal carries, and the status the model gives the
 /// `NotFoundException` shape (`@httpError 404`).
 ///
@@ -1400,6 +1438,15 @@ pub enum ClusterChange {
     Security {
         client_authentication: Option<ClientAuthentication>,
         encryption_info: Option<EncryptionInfo>,
+    },
+    /// `UpdateMonitoring`: the CloudWatch metrics level the cluster gathers,
+    /// the open-monitoring (Prometheus) exporters it runs, the broker log
+    /// delivery it performs, or any combination the request named. `None` means
+    /// the request left that setting alone.
+    Monitoring {
+        enhanced_monitoring: Option<String>,
+        open_monitoring: Option<OpenMonitoringInfo>,
+        logging_info: Option<LoggingInfo>,
     },
 }
 
@@ -2014,6 +2061,13 @@ pub const DESTINATION_TYPE_S3: &str = "S3";
 pub enum ChannelRejected {
     /// The cluster already holds [`MAX_CHANNELS_PER_CLUSTER`] channels.
     ClusterQuota,
+    /// The registry already holds [`MAX_CHANNELS_IN_REGISTRY`] channels across
+    /// every cluster, whatever each cluster holds on its own.
+    RegistryCeiling,
+    /// The registry holds no cluster for the ARN the channel is filed under, so
+    /// nothing would ever reclaim the record. Every caller resolves the cluster
+    /// first, which makes this unreachable; it is refused rather than filed.
+    NoSuchCluster,
     /// A channel with this ARN is already registered. The registry's monotonic
     /// ordinal makes this unreachable; it is refused rather than overwriting an
     /// existing channel.
@@ -2430,6 +2484,13 @@ pub enum TopicRejected {
     DuplicateName,
     /// The cluster already holds [`MAX_TOPICS_PER_CLUSTER`] topics.
     ClusterCeiling,
+    /// The registry already holds [`MAX_TOPICS_IN_REGISTRY`] topics across every
+    /// cluster, whatever each cluster holds on its own.
+    RegistryCeiling,
+    /// The registry holds no cluster for the ARN the topic is filed under, so
+    /// nothing would ever reclaim the record. Every caller resolves the cluster
+    /// first, which makes this unreachable; it is refused rather than filed.
+    NoSuchCluster,
 }
 
 /// One topic of a provisioned cluster, holding everything a reader reports so
@@ -3735,6 +3796,28 @@ fn connectivity_cluster_info(
         zookeeper_access: Some(ZookeeperAccess {
             enabled: Some(zookeeper_access_enabled),
         }),
+        ..MutableClusterInfo::default()
+    }
+}
+
+/// The monitoring attributes a cluster operation reports, as
+/// `MutableClusterInfo`: the CloudWatch metrics level the cluster gathers, the
+/// open-monitoring exporters it runs and the broker log delivery it performs.
+///
+/// Those are what a monitoring update touches, so they are the only members
+/// set, and the exporter switches are reported resolved rather than absent —
+/// the same rule [`storage_cluster_info`] follows. `LoggingInfo` is left unset
+/// where the cluster delivers no broker logs at all, which is what a cluster
+/// created without it does.
+fn monitoring_cluster_info(
+    enhanced_monitoring: &str,
+    open_monitoring: &OpenMonitoringInfo,
+    logging_info: Option<LoggingInfo>,
+) -> MutableClusterInfo {
+    MutableClusterInfo {
+        enhanced_monitoring: Some(enhanced_monitoring.to_string()),
+        open_monitoring: Some(open_monitoring_report(open_monitoring)),
+        logging_info,
         ..MutableClusterInfo::default()
     }
 }

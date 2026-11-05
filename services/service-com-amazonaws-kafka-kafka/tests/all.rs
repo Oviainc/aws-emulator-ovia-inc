@@ -75,6 +75,8 @@ mod kafka_version_update;
 mod kafka_versions;
 #[path = "all/list_clusters_v2.rs"]
 mod list_clusters_v2;
+#[path = "all/monitoring_update.rs"]
+mod monitoring_update;
 #[path = "all/node_listing.rs"]
 mod node_listing;
 #[path = "all/placement_subnet_resolution.rs"]

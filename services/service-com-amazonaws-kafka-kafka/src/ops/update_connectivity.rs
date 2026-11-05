@@ -279,11 +279,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.current_version != cluster.current_version {
             return Err(
                 UpdateConnectivityErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("currentVersion".to_string()),
-                    message: Some(format!(
-                        "The cluster's current version is {}, not {}.",
-                        cluster.current_version, input.current_version
-                    )),
+                    invalid_parameter: Some(crate::state::CURRENT_VERSION_MEMBER.to_string()),
+                    message: Some(crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string()),
                 })
                 .into(),
             );

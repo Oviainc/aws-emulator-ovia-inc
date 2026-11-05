@@ -829,6 +829,43 @@ impl ComAmazonawsKafkaKafkaState {
         })
     }
 
+    /// Start a monitoring update: the CloudWatch metrics level the cluster
+    /// gathers, the open-monitoring exporters it runs, the broker log delivery
+    /// it performs, or any combination the request named.
+    pub fn start_monitoring_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        enhanced_monitoring: Option<String>,
+        open_monitoring: Option<OpenMonitoringInfo>,
+        logging_info: Option<LoggingInfo>,
+    ) -> Option<String> {
+        self.start_cluster_update(
+            region,
+            arn,
+            now,
+            OPERATION_TYPE_UPDATE_MONITORING,
+            |cluster| {
+                let source_cluster_info = cluster.monitoring_cluster_info();
+                let target_cluster_info = cluster.monitoring_cluster_info_after(
+                    enhanced_monitoring.as_deref(),
+                    open_monitoring.as_ref(),
+                    logging_info.as_ref(),
+                );
+                (
+                    source_cluster_info,
+                    target_cluster_info,
+                    ClusterChange::Monitoring {
+                        enhanced_monitoring,
+                        open_monitoring,
+                        logging_info,
+                    },
+                )
+            },
+        )
+    }
+
     /// File `operation` in the registry and in its own cluster's history, so the
     /// ARN a reader resolves and the history a cluster lists cannot drift apart.
     ///
@@ -889,9 +926,14 @@ impl ComAmazonawsKafkaKafkaState {
     /// anybody read it in between) and the ceiling bounds what the registry
     /// actually holds.
     ///
-    /// Refuses, changing nothing, when the cluster still holds a topic of that
-    /// name (a `DELETING` one whose removal is not yet due still counts: it is
-    /// still there) or already holds [`MAX_TOPICS_PER_CLUSTER`] topics.
+    /// Refuses, changing nothing, when the registry holds no cluster for the
+    /// ARN the topic is filed under (so nothing would ever reclaim the record),
+    /// when the cluster still holds a topic of that name (a `DELETING` one whose
+    /// removal is not yet due still counts: it is still there), when the cluster
+    /// already holds [`MAX_TOPICS_PER_CLUSTER`] topics, or when the registry
+    /// itself is at [`MAX_TOPICS_IN_REGISTRY`] — the backstop that bounds growth
+    /// however many cluster ARNs a caller presents, since the ARN comes from the
+    /// request.
     pub fn register_topic(
         &mut self,
         topic: Topic,
@@ -903,9 +945,18 @@ impl ComAmazonawsKafkaKafkaState {
         // cannot grow it past the ceiling. Each removal was due at the same
         // instant whether or not anybody addressed that topic.
         self.prune_removed_topics(&topic.cluster_arn, now);
+        // A topic lives on the brokers of ONE cluster, and a cluster leaving the
+        // registry takes its topics with it, so a record filed under an ARN the
+        // registry holds no cluster for is a record no removal path reaches.
+        if !self.clusters.contains_key(&topic.cluster_arn) {
+            return Err(TopicRejected::NoSuchCluster);
+        }
         let key = (topic.cluster_arn.clone(), topic.name.clone());
         if self.topics.contains_key(&key) {
             return Err(TopicRejected::DuplicateName);
+        }
+        if self.topics.len() >= MAX_TOPICS_IN_REGISTRY {
+            return Err(TopicRejected::RegistryCeiling);
         }
         if self.topic_count_in(&topic.cluster_arn, now) >= MAX_TOPICS_PER_CLUSTER {
             return Err(TopicRejected::ClusterCeiling);
@@ -1329,16 +1380,29 @@ impl ComAmazonawsKafkaKafkaState {
     /// not anybody read it in between) and the ceiling bounds what the registry
     /// actually holds.
     ///
-    /// Refuses, changing nothing, when the cluster is at
-    /// [`MAX_CHANNELS_PER_CLUSTER`] or when the ARN is already registered.
+    /// Refuses, changing nothing, when the registry holds no cluster for the
+    /// ARN the channel is filed under (so nothing would ever reclaim the
+    /// record), when the cluster is at [`MAX_CHANNELS_PER_CLUSTER`], when the
+    /// registry itself is at [`MAX_CHANNELS_IN_REGISTRY`] — the backstop that
+    /// bounds growth however many cluster ARNs a caller presents, since the ARN
+    /// comes from the request — or when the ARN is already registered.
     pub fn register_channel(
         &mut self,
         channel: Channel,
         now: SystemTime,
     ) -> Result<(), ChannelRejected> {
         self.prune_removed_channels(&channel.cluster_arn, now);
+        // A channel reads from ONE cluster, and a cluster leaving the registry
+        // takes its channels with it, so a record filed under an ARN the
+        // registry holds no cluster for is a record no removal path reaches.
+        if !self.clusters.contains_key(&channel.cluster_arn) {
+            return Err(ChannelRejected::NoSuchCluster);
+        }
         if self.channels.contains_key(&channel.arn) {
             return Err(ChannelRejected::DuplicateArn);
+        }
+        if self.channels.len() >= MAX_CHANNELS_IN_REGISTRY {
+            return Err(ChannelRejected::RegistryCeiling);
         }
         if self.channel_count_in_cluster(&channel.cluster_arn) >= MAX_CHANNELS_PER_CLUSTER {
             return Err(ChannelRejected::ClusterQuota);

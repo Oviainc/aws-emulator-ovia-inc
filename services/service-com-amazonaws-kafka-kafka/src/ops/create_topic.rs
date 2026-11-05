@@ -330,6 +330,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .into()
                 }
+                // The registry's own backstop, across every cluster it holds:
+                // refused as the per-cluster ceiling is, since from the caller's
+                // side both are "this service will not hold another topic".
+                crate::state::TopicRejected::RegistryCeiling => {
+                    CreateTopicErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                        invalid_parameter: None,
+                        message: Some(format!(
+                            "This emulator holds its maximum of {} topics.",
+                            crate::state::MAX_TOPICS_IN_REGISTRY
+                        )),
+                    })
+                    .into()
+                }
+                // Unreachable: the cluster was resolved above under the lock this
+                // call still holds. Reported as the same absence that lookup
+                // reports rather than as a topic filed on nothing.
+                crate::state::TopicRejected::NoSuchCluster => {
+                    CreateTopicErrorModeled::NotFoundException(NotFoundException {
+                        invalid_parameter: Some("ClusterArn".to_string()),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
             });
         }
         Ok(output)

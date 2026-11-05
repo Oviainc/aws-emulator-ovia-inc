@@ -278,14 +278,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The submitted version must be the one the cluster is actually at; a
         // stale one means the caller has not seen the cluster's latest state.
+        // Answered in the service's one sentence for that condition, which names
+        // no version: the caller reads the current one back from the cluster.
         if input.current_version != cluster.current_version {
             return Err(
                 UpdateSecurityErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("currentVersion".to_string()),
-                    message: Some(format!(
-                        "The cluster's current version is {}, not {}.",
-                        cluster.current_version, input.current_version
-                    )),
+                    invalid_parameter: Some(crate::state::CURRENT_VERSION_MEMBER.to_string()),
+                    message: Some(crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string()),
                 })
                 .into(),
             );

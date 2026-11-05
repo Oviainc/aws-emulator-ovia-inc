@@ -632,6 +632,51 @@ impl Cluster {
         }
     }
 
+    /// The cluster's monitoring settings as the `MutableClusterInfo` a cluster
+    /// operation reports: the CloudWatch metrics level it gathers, the
+    /// open-monitoring exporters it runs and the broker log delivery it
+    /// performs, which are the attributes a monitoring update changes and the
+    /// only ones set — the same rule [`Self::storage_cluster_info`] follows.
+    pub fn monitoring_cluster_info(&self) -> MutableClusterInfo {
+        monitoring_cluster_info(
+            &self.enhanced_monitoring,
+            &self.open_monitoring,
+            self.logging_info.clone(),
+        )
+    }
+
+    /// The same attributes as a submitted monitoring update leaves them, so
+    /// what the operation reports as its target is what the cluster then runs.
+    pub fn monitoring_cluster_info_after(
+        &self,
+        enhanced_monitoring: Option<&str>,
+        open_monitoring: Option<&OpenMonitoringInfo>,
+        logging_info: Option<&LoggingInfo>,
+    ) -> MutableClusterInfo {
+        monitoring_cluster_info(
+            enhanced_monitoring.unwrap_or(&self.enhanced_monitoring),
+            open_monitoring.unwrap_or(&self.open_monitoring),
+            self.logging_info_after(logging_info),
+        )
+    }
+
+    /// The broker log delivery the cluster performs once a submitted
+    /// `LoggingInfo` has landed.
+    ///
+    /// `LoggingInfo` requires `BrokerLogs`, which "is a container for the
+    /// configuration details related to broker logs" (its model
+    /// documentation), so a submitted shape REPLACES the cluster's own — a
+    /// destination it does not turn on stops receiving logs — while an omitted
+    /// one leaves the stored delivery exactly as it is. The same rule
+    /// [`Self::client_authentication_after`] applies to a submitted
+    /// `ClientAuthentication`.
+    pub(super) fn logging_info_after(
+        &self,
+        submitted: Option<&LoggingInfo>,
+    ) -> Option<LoggingInfo> {
+        submitted.cloned().or_else(|| self.logging_info.clone())
+    }
+
     /// Record `change` as the cluster's one in-flight update and move it to
     /// `UPDATING`, handing back the ARN of the operation that will apply it.
     ///
@@ -720,6 +765,23 @@ impl Cluster {
                 let encryption = self.encryption_info_after(encryption_info.as_ref());
                 self.client_authentication = authentication;
                 self.encryption_info = encryption;
+            }
+            ClusterChange::Monitoring {
+                enhanced_monitoring,
+                open_monitoring,
+                logging_info,
+            } => {
+                // Each setting the request named replaces the stored one and
+                // each one it omitted is kept — the resolution the operation's
+                // target `MutableClusterInfo` was derived from, so the cluster
+                // ends up running what the operation reported it would apply.
+                if let Some(level) = enhanced_monitoring {
+                    self.enhanced_monitoring = level;
+                }
+                if let Some(open) = open_monitoring {
+                    self.open_monitoring = open;
+                }
+                self.logging_info = self.logging_info_after(logging_info.as_ref());
             }
         }
     }

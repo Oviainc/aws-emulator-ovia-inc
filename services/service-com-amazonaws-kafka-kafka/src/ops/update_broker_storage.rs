@@ -296,11 +296,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has not seen the cluster's latest state.
         if input.current_version != current_version {
             return Err(bad_request(
-                "currentVersion",
-                format!(
-                    "The cluster's current version is {current_version}, not {}.",
-                    input.current_version
-                ),
+                crate::state::CURRENT_VERSION_MEMBER,
+                crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string(),
             ));
         }
         // Amazon MSK documents that broker storage can only be expanded — "you can

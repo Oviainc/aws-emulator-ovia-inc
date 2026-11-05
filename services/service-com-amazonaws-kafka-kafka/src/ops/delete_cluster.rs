@@ -212,16 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A supplied version must be the one the cluster is actually at; a stale
         // one means the caller is deleting a cluster it has not seen the latest
-        // state of.
+        // state of. Answered in the service's one sentence for that condition,
+        // the same one every update of a cluster's version answers it with.
         if let Some(requested) = input.current_version.as_deref() {
             if requested != cluster.current_version {
                 return Err(DeleteClusterErrorModeled::BadRequestException(
                     BadRequestException {
-                        invalid_parameter: Some("currentVersion".to_string()),
-                        message: Some(format!(
-                            "The cluster's current version is {}, not {requested}.",
-                            cluster.current_version
-                        )),
+                        invalid_parameter: Some(
+                            crate::state::CURRENT_VERSION_MEMBER.to_string(),
+                        ),
+                        message: Some(
+                            crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

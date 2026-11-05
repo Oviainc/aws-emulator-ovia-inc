@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMonitoring
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMonitoring`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a monitoring update on a provisioned cluster registered in
+//! [`crate::state::ComAmazonawsKafkaKafkaState`]: the cluster enters `UPDATING`
+//! with the returned cluster operation as its active one, and the submitted
+//! CloudWatch metrics level, open-monitoring exporters and broker log delivery
+//! become the cluster's own — together with a new cluster version — when the
+//! clock makes that operation due (see [`crate::state::Cluster::settle`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMonitoring::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update is started through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::start_monitoring_update`], the
+//! one path every update of this service comes through, so the cluster operation
+//! this call answers with is filed in the registry and the cluster-operation
+//! readers resolve that ARN.
+//!
+//! The call is accepted only for a provisioned cluster this endpoint's region
+//! holds, that is `ACTIVE`, and whose stored version is the one the request
+//! names; every other case is refused with the modelled error for it and changes
+//! nothing.
+//!
+//! Authentication is NOT this handler's business: the emulator verifies every
+//! request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here. Resource-scoped AUTHORIZATION is: this call asks for an
+//! action on the cluster its `ClusterArn` names, and that decision is taken on
+//! the ARN as submitted, before anything is resolved
+//! ([`crate::state::authorization`]).
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -94,12 +113,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kafka-kafka.json");
 // here — hence the `UpdateMonitoringError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kafka#UpdateMonitoring")]
+//
+// `NotFoundException` is widened in through `extra_errors`, exactly as
+// `UpdateBrokerStorage` widens it: the SERVICE models it (HTTP 404, and
+// `DescribeCluster`, `DeleteCluster` and `UpdateStorage` all declare it), and a
+// cluster ARN this endpoint holds no cluster for is a resource that does not
+// exist — answered with the error the service really uses for that, rather than
+// squeezed into `BadRequestException` because this one operation's error list
+// omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.kafka#UpdateMonitoring",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateMonitoringErrorModeled {
     BadRequestException(BadRequestException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -155,18 +186,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMonitoring` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMonitoringErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMonitoring"))
+        // Decided FIRST, on the ARN as submitted and from the request alone: the
+        // caller holds no resource-based policy over a cluster of another account,
+        // so such a request is refused rather than answered out of what this
+        // registry happens to hold under that ARN. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateMonitoringErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only refusals first, so the registry lock below is held for the
+        // state-dependent work alone. A value that is not an MSK cluster ARN is a
+        // request this service cannot parse, which is the distinction every reader
+        // in this crate draws between `BadRequestException` and
+        // `NotFoundException`.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(UpdateMonitoringErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
+        }
+
+        // All three settings this operation can change are optional in the model,
+        // so a request carrying none of them asks for no change at all and there
+        // is nothing for the cluster operation it would mint to do. Refusing it is
+        // CHOSEN, as the same case is in `UpdateSecurity` and
+        // `UpdateConnectivity`: answering a modelled client error is honest where
+        // minting an operation that changes nothing would not be.
+        // `EnhancedMonitoring` is named as the member at fault because it is the
+        // operation's subject; the message spells out the alternatives.
+        if input.enhanced_monitoring.is_none()
+            && input.open_monitoring.is_none()
+            && input.logging_info.is_none()
+        {
+            return Err(bad_request(
+                "EnhancedMonitoring",
+                "An UpdateMonitoring request must specify EnhancedMonitoring, OpenMonitoring, \
+                 LoggingInfo, or any combination of them."
+                    .to_string(),
+            ));
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Resolved through the settling lookup every other operation uses, so the
+        // transitions the clock already owed this cluster — its own provisioning,
+        // and an earlier update of its own whose completion has come due — are
+        // materialised before this call judges its state and version. An ARN this
+        // endpoint's region holds no cluster for — absent, or belonging to another
+        // region — is a resource that does not exist here.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateMonitoringErrorModeled::NotFoundException(NotFoundException {
+                    // The member that named the resource, as the other readers of a
+                    // cluster ARN report it.
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_arn = cluster.arn.clone();
+        let cluster_state = cluster.state.clone();
+        let current_version = cluster.current_version.clone();
+        let serverless = cluster.is_serverless();
+
+        // What this update changes is the metrics a broker group gathers and the
+        // logs its brokers deliver, and a serverless cluster has no brokers to
+        // monitor: the model carries no monitoring member for the serverless
+        // cluster kind at all.
+        if serverless {
+            return Err(bad_request(
+                "ClusterArn",
+                crate::state::PROVISIONED_ONLY_MESSAGE.to_string(),
+            ));
+        }
+
+        // A cluster reconfigures one change at a time, and one that is still being
+        // provisioned, deleted or updated has no settled configuration to update.
+        // `UpdateMonitoring` models no conflict error, so this is the bad request
+        // it is: the cluster is not in a state that accepts it. Worded as the
+        // sibling update operations word the same condition.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "The cluster is in the {cluster_state} state; it must be {} to be updated.",
+                    crate::state::CLUSTER_STATE_ACTIVE
+                ),
+            ));
+        }
+        // The optimistic-concurrency check: the version the caller updates from
+        // must be the one the cluster is actually at, so a stale version means the
+        // caller has not seen the cluster's latest state.
+        if input.current_version != current_version {
+            return Err(bad_request(
+                crate::state::CURRENT_VERSION_MEMBER,
+                crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string(),
+            ));
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING, stores the instant the change comes due and files
+        // the cluster operation this call answers with, so the ARN below resolves
+        // for every cluster-operation reader.
+        let Some(operation_arn) = state.start_monitoring_update(
+            &region,
+            &cluster_arn,
+            now,
+            input.enhanced_monitoring,
+            input.open_monitoring,
+            input.logging_info,
+        ) else {
+            // Unreachable: the cluster was resolved above under the lock this call
+            // still holds, so the registry path finds the same record. Reported as
+            // a server fault rather than as a success that started nothing, which
+            // is how the sibling update operations answer the same case.
+            return Err(
+                UpdateMonitoringErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(UpdateMonitoringOutput {
+            // Both members come from the stored cluster, not from the request.
+            cluster_arn: Some(cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
+}
+
+/// Refuse the request with the modeled `BadRequestException`, naming the member
+/// at fault and what was wrong with it — the caller has to fix the request from
+/// this text alone.
+fn bad_request(parameter: &str, message: String) -> UpdateMonitoringError {
+    UpdateMonitoringErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }
