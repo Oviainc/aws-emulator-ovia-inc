@@ -16,7 +16,9 @@
 //!   which are two domain names);
 //! * an access association is the PAIR `(private custom domain name, access association
 //!   source)`, so an account holds at most one for a pair: a second create of a pair is
-//!   the modelled `ConflictException`, while another source on the same domain name, or
+//!   the modelled `BadRequestException` carrying AWS's fixed sentence for an association
+//!   that already exists, while
+//!   another source on the same domain name, or
 //!   the same source on another domain name, is a new association — and concurrent creates
 //!   of ONE pair store exactly one record, over a table of racer counts;
 //! * a create names a STORED, PRIVATE custom domain name: a `domainNameArn` that is not an
@@ -49,7 +51,13 @@ use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answe
 use crate::tag_reads_by_arn::{apigateway_arn, get_tags};
 
 const BAD_REQUEST: &str = "BadRequestException";
-const CONFLICT: &str = "ConflictException";
+
+/// What AWS refuses a second create of one `(domain name, access association source)` pair
+/// with, verbatim: one sentence of entirely fixed text naming the two things the pair is
+/// made of by their kind, with no part of it taken from the request or from the store.
+const ALREADY_EXISTS: &str =
+    "The domain name access association between this VPC endpoint and domain name already \
+     exists.";
 
 /// The one value the modelled `AccessAssociationSourceType` enum declares
 /// (`smithy_query(query="shape", shape="AccessAssociationSourceType")`: `VPCE`).
@@ -287,20 +295,21 @@ async fn the_pair_of_domain_name_and_source_identifies_at_most_one_association()
         "the first create of a pair",
     );
 
-    // Rows differ along WHICH member repeats: the whole pair (a conflict), only the source,
-    // only the domain name. Only the whole pair names an association that already exists.
+    // Rows differ along WHICH member repeats: the whole pair (already there), only the
+    // source, only the domain name. Only the whole pair names an association that already
+    // exists.
     let rows: Vec<(&str, String, &str, Option<u16>)> = vec![
         (
             "the same pair again",
             domain.clone(),
             source,
-            Some(409),
+            Some(400),
         ),
         (
             "the same pair a third time",
             domain.clone(),
             source,
-            Some(409),
+            Some(400),
         ),
         (
             "another source on the same domain name",
@@ -318,19 +327,34 @@ async fn the_pair_of_domain_name_and_source_identifies_at_most_one_association()
             "the pair that is now also taken on the other domain name",
             other_domain.clone(),
             source,
-            Some(409),
+            Some(400),
         ),
     ];
 
     let mut stored = vec![first_arn];
-    for (case, domain_name_arn, repeated_source, conflict) in &rows {
+    for (case, domain_name_arn, repeated_source, refused) in &rows {
         let answer = create_association(
             &gateway,
             association_body(domain_name_arn, repeated_source),
         )
         .await;
-        match conflict {
-            Some(status) => assert_failure(&answer, *status, CONFLICT, case),
+        match refused {
+            Some(status) => {
+                assert_failure(&answer, *status, BAD_REQUEST, case);
+                // The refusal states the condition — the pair is already bound — in one
+                // sentence of fixed text, carrying neither half of the pair.
+                let message = answer.body["message"].as_str().unwrap_or_default();
+                assert_eq!(
+                    message, ALREADY_EXISTS,
+                    "case {case}: expected the already-exists sentence, got {message:?}"
+                );
+                assert!(
+                    !message.contains(*repeated_source)
+                        && !message.contains(domain_name_arn.as_str()),
+                    "case {case}: the sentence must carry nothing from the request, got \
+                     {message:?}"
+                );
+            }
             None => {
                 assert_eq!(
                     answer.status, 201,
@@ -349,16 +373,17 @@ async fn the_pair_of_domain_name_and_source_identifies_at_most_one_association()
     // A refused create stored nothing: the collection holds exactly the accepted ones.
     let listed = list_associations(&gateway, "limit=500").await;
     assert_eq!(
-        listed_arns(&listed.body, "GetDomainNameAccessAssociations after the conflicts"),
+        listed_arns(&listed.body, "GetDomainNameAccessAssociations after the refusals"),
         stored,
-        "case GetDomainNameAccessAssociations after the conflicts: expected {stored:?}, got {:?}",
+        "case GetDomainNameAccessAssociations after the refusals: expected {stored:?}, got {:?}",
         listed.body
     );
 }
 
 /// RULE: concurrent creates of ONE pair store exactly one association — the pair is
 /// decided and written under one hold of the store, so one caller wins and every other is
-/// refused the modelled conflict, whatever the racer count.
+/// refused as a request naming an association that already exists, whatever the racer
+/// count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_creates_of_one_pair_store_exactly_one_association() {
     for racers in [2_usize, 3, 6] {
@@ -392,8 +417,8 @@ async fn concurrent_creates_of_one_pair_store_exactly_one_association() {
             }
             assert_eq!(
                 (*status, error.as_deref()),
-                (409, Some(CONFLICT)),
-                "case {case}: every loser is the modelled conflict, got {answers:?}"
+                (400, Some(BAD_REQUEST)),
+                "case {case}: every loser is the modelled bad request, got {answers:?}"
             );
         }
 

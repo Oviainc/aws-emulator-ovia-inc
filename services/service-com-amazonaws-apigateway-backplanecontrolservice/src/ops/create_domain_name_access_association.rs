@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this handler runs.
         bound_input(&input).map_err(bad_request)?;
         let domain_name_key = domain_name_key_of(&input.domain_name_arn)
-            .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))?;
+            .ok_or_else(|| bad_request(crate::state::INVALID_DOMAIN_NAME_ARN.to_string()))?;
 
         let region = crate::state::request_region(ctx.parts());
 
@@ -298,26 +298,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let domain_name_arn = domain.domain_name_arn.clone();
 
         // An access association IS the pair `(domain name, source)`, so this account holds
-        // at most one for a pair: a second create of the same pair is the modelled
-        // conflict. The check and the insert below share ONE hold of the store lock, so
+        // at most one for a pair: a second create of the same pair names a resource that is
+        // already there, which is the modelled BAD REQUEST rather than a conflict a retry
+        // could clear. The check and the insert below share ONE hold of the store lock, so
         // concurrent creates of one pair cannot both pass it — exactly one stores a record
         // and every other is refused.
-        if let Some(existing) =
-            store.access_association_of(&domain_name_arn, &input.access_association_source)
+        if store
+            .access_association_of(&domain_name_arn, &input.access_association_source)
+            .is_some()
         {
-            let existing_arn = existing.domain_name_access_association_arn.clone();
-            return Err(
-                CreateDomainNameAccessAssociationErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(format!(
-                            "The access association source {} is already associated with the \
-                             domain name {domain_name_arn}: {existing_arn}",
-                            input.access_association_source
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(bad_request(
+                crate::state::ACCESS_ASSOCIATION_ALREADY_EXISTS.to_string(),
+            ));
         }
 
         let id = store.mint_id();

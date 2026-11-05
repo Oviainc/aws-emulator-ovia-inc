@@ -87,7 +87,7 @@ use super::types::*;
 use std::collections::BTreeMap;
 
 use crate::state::{
-    patch_enum_string, patch_f64_checked, patch_i32_checked, patch_optional_string,
+    patch_enum_string_refused_with, patch_f64_checked, patch_i32_checked, patch_optional_string,
     patch_required_string, InvalidPathRefusal, Patch, PatchFailure, PatchOpKind, RestApiEntry,
     SupportedPatchPaths, UsagePlanEntry, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
@@ -257,8 +257,17 @@ fn apply_quota_patch(entry: &mut UsagePlanEntry, patch: &Patch) -> Result<(), Pa
         "limit" => patch_i32_checked(&mut quota.limit, &nested, Ok)?,
         "offset" => patch_i32_checked(&mut quota.offset, &nested, Ok)?,
         // `period` targets the modelled `QuotaPeriodType`, but a patch value is a bare
-        // string on the wire, so the declared set is checked here.
-        "period" => patch_enum_string(&mut quota.period, &nested, QUOTA_PERIOD_TYPE_VALUES)?,
+        // string on the wire, so the declared set is checked here — and a value outside it
+        // is refused with the sentence API Gateway states for this SETTING
+        // ([`crate::state::INVALID_QUOTA_PERIOD`]) rather than with the generic out-of-set
+        // sentence a patch path earns, because the period is a quota setting whichever
+        // operation set it.
+        "period" => patch_enum_string_refused_with(
+            &mut quota.period,
+            &nested,
+            QUOTA_PERIOD_TYPE_VALUES,
+            |_| crate::state::INVALID_QUOTA_PERIOD.to_string(),
+        )?,
         _ => return Err(patch.unsupported_path()),
     }
     crate::state::bound_quota_settings(&quota).map_err(PatchFailure::BadRequest)?;

@@ -3935,6 +3935,20 @@ pub fn invalid_quota_count(count_member: &str) -> String {
     format!("Usage Plan quota {count_member} must be a non-negative numeric")
 }
 
+/// The `BadRequestException` message for a usage plan quota `period` outside the set the
+/// modelled `QuotaPeriodType` declares.
+///
+/// API Gateway answers this condition with ONE sentence of entirely fixed text: it names
+/// the setting that was refused and enumerates the periods it takes — in the order the
+/// model declares them, which is the period's own length
+/// (`smithy_query(query="shape", shape="QuotaPeriodType")`: DAY, WEEK, MONTH) rather than
+/// the alphabetical order the generated value list holds — and quotes neither the rejected
+/// value nor the patch path that carried it. One copy for every member a caller can set a
+/// quota period through, so the same value is refused the same way whichever one carried
+/// it.
+pub const INVALID_QUOTA_PERIOD: &str =
+    "Invalid Usage Plan quota period specified. Must be one of [DAY, WEEK, MONTH]";
+
 /// The smallest share of a stage's traffic a canary may take: "The percent (0-100) of
 /// traffic diverted to a canary deployment" (`CanarySettings$percentTraffic`).
 pub const MIN_CANARY_PERCENT_TRAFFIC: i32 = 0;
@@ -4165,6 +4179,21 @@ pub const BASE_PATH_MAPPING_ALREADY_EXISTS: &str = "Base path already exists for
 pub const NO_SUCH_ACCESS_ASSOCIATION: &str =
     "This private custom domain name doesn't have any domain name access associations.";
 
+/// The `BadRequestException` message for a `(domain name, access association source)` pair
+/// this account already holds a domain name access association for.
+///
+/// An access association IS that pair, so the second create of one is refused rather than
+/// stored twice — and API Gateway refuses it as a BAD REQUEST (the request names a resource
+/// that is already there, which no retry can change) rather than as a conflict. The
+/// sentence is ENTIRELY FIXED TEXT: it names the two things the pair is made of by their
+/// kind — the VPC endpoint the access association source is ("For a VPCE, the value is the
+/// VPC endpoint ID", `accessAssociationSource`, whose source type enum declares `VPCE`
+/// alone) and the domain name — and quotes back neither the source the request named nor
+/// the domain name it was resolved against, as a recorded refusal of a repeated pair shows.
+pub const ACCESS_ASSOCIATION_ALREADY_EXISTS: &str =
+    "The domain name access association between this VPC endpoint and domain name already \
+     exists.";
+
 /// The `ConflictException` message for a custom domain name a stored
 /// `DomainNameAccessAssociation` still depends on, which is what `DeleteDomainName`
 /// refuses while the dependency stands (see
@@ -4207,6 +4236,21 @@ pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
 /// shows. One copy for every member an ARN rides on, so the same unreadable value is
 /// refused the same way whichever one carried it.
 pub const INVALID_ARN: &str = "Invalid ARN specified in the request";
+
+/// The `BadRequestException` message for a value carried on a member typed as the ARN of
+/// a PRIVATE CUSTOM DOMAIN NAME that this service could not READ as one — the
+/// `domainNameArn` the access-association operations take, and the
+/// `domainNameAccessAssociationArn` whose own resource portion names the domain name the
+/// association is for.
+///
+/// API Gateway words this condition as a sentence OF ITS OWN rather than as the generic
+/// unreadable-ARN sentence ([`INVALID_ARN`]) a `resourceArn` earns, and the sentence is
+/// ENTIRELY FIXED TEXT: it names the member's kind of ARN and quotes back neither the
+/// value nor the member that carried it, as recorded refusals of both a value that is no
+/// ARN at all and an ARN whose resource portion is no domain name reference show. One copy
+/// for every member a domain name's ARN rides on, so the same unreadable value is refused
+/// the same way whichever one carried it.
+pub const INVALID_DOMAIN_NAME_ARN: &str = "Invalid domain name ARN specified.";
 
 /// The prefix every ARN begins with: "arn:", the first field of the Amazon Resource Name
 /// format, which is what a value has to carry to be read as one at all.

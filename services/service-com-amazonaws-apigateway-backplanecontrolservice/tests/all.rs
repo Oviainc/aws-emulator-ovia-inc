@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -23,16 +21,12 @@ mod documentation_part_creation;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_web_acl_edge.rs"]
 mod stage_web_acl_edge;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_web_acl_association_report.rs"]
 mod stage_web_acl_association_report;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/aws_service_integration.rs"]
 mod aws_service_integration;
-
 #[path = "all/account_settings.rs"]
 mod account_settings;
 #[path = "all/api_key_collection.rs"]
@@ -143,7 +137,6 @@ mod usage_plan_lifecycle;
 mod validation_message_rules;
 #[path = "all/vpc_links.rs"]
 mod vpc_links;
-
 // Declared after the sorted list on purpose: every apigateway fix that lands adds its
 // suite inside that list, so a line inserted there collides with every other suite
 // landing in the same window — this fix lost three serialized squash merges to exactly
@@ -276,7 +269,6 @@ mod test_invoke_method_data_plane_parity;
 mod request_validator_precedes_the_integration;
 #[path = "all/model_template.rs"]
 mod model_template;
-
 // Appended rather than folded into the sorted list above, for the reason the note on
 // `update_deployment` gives: the sorted region is contended by every apigateway fix that
 // lands in the same window.
@@ -293,22 +285,16 @@ mod vpc_link_records;
 mod stage_arn_names_the_creation_region;
 #[path = "all/vpc_link_collection.rs"]
 mod vpc_link_collection;
-// Appended for the reason the note above gives.
 #[path = "all/rest_api_import_integrations.rs"]
 mod rest_api_import_integrations;
-// Appended for the reason the note above gives.
 #[path = "all/stage_refusal_error_class.rs"]
 mod stage_refusal_error_class;
-// Appended for the reason the note above gives.
 #[path = "all/stage_variable_integration_target.rs"]
 mod stage_variable_integration_target;
-// Appended for the reason the note above gives.
 #[path = "all/patch_path_refusal_templates.rs"]
 mod patch_path_refusal_templates;
-// Appended for the reason the note above gives.
 #[path = "all/usage_plan_state_and_refusals.rs"]
 mod usage_plan_state_and_refusals;
-// Appended for the reason the note above gives.
 #[path = "all/api_key_import_enablement.rs"]
 mod api_key_import_enablement;
 // Appended for the reason the note above gives: the STAGE RESPONSE CACHE of the
@@ -347,7 +333,6 @@ mod stage_execution_logging_account_role;
 // collection is walked by.
 #[path = "all/collection_page_envelope.rs"]
 mod collection_page_envelope;
-// Appended for the reason the note above gives: what an exported definition says about
 // ITSELF — the version the downloaded file is named for, and the containers each OpenAPI
 // dialect always writes.
 #[path = "all/stage_export_version_and_containers.rs"]
@@ -361,6 +346,10 @@ mod stage_canary_and_patch_grammar;
 // invoke with, on an emulator that verifies request signatures.
 #[path = "all/stage_invoke_signed.rs"]
 mod stage_invoke_signed;
+// Appended for the reason the note above gives: the sentences a SETTING's own illegal
+// value is refused with, and the one a domain name ARN this service cannot read earns.
+#[path = "all/setting_refusal_sentences.rs"]
+mod setting_refusal_sentences;
 // Appended for the reason the note above gives: the SENTENCE and the error CLASS each
 // refusal of this control plane carries.
 #[path = "all/refusal_contract_sentences.rs"]

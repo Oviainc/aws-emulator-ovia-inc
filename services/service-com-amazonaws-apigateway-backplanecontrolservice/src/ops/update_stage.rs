@@ -127,7 +127,8 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::state::{
-    patch_enum_string, patch_f64_checked, patch_f64_in, patch_i32_in,
+    patch_enum_string, patch_enum_string_refused_with, patch_f64_checked, patch_f64_in,
+    patch_i32_in,
     patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind, StageEntry,
     MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
@@ -204,6 +205,16 @@ const LOGGING_LEVEL_OFF: &str = "OFF";
 /// INFO." The member is a plain string on the wire, so its value set is checked here.
 const LOGGING_LEVEL_VALUES: &[&str] = &[LOGGING_LEVEL_OFF, "ERROR", "INFO"];
 
+/// The `BadRequestException` message for a `loggingLevel` outside the documented set.
+///
+/// API Gateway answers this condition with its own sentence for the SETTING rather than
+/// with the generic out-of-set sentence a patch path earns: fixed text naming the setting
+/// that was refused, and then the one variable part — the level the request asked for,
+/// exactly as it spelled it.
+fn invalid_logging_level(level: &str) -> String {
+    format!("Invalid logging level specified: {level}")
+}
+
 /// The `BadRequestException` message API Gateway refuses a configuration that turns a
 /// stage's execution logging on with while the account has no CloudWatch Logs role.
 ///
@@ -267,6 +278,44 @@ fn patch_stage_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailur
 /// 300 seconds and a maximum of 3600 seconds for a method cache, and 0 ("the higher the
 /// TTL, the longer the response will be cached") disables caching.
 const CACHE_TTL_RANGE: ::std::ops::RangeInclusive<i32> = 0..=3600;
+
+/// The `BadRequestException` message for a `cacheTtlInSeconds` that is not a whole number
+/// of seconds inside [`CACHE_TTL_RANGE`].
+///
+/// API Gateway answers this condition with its own sentence for the SETTING — the
+/// time-to-live of a cached response — rather than with the generic bounds sentence a
+/// patch path earns, and it states the rule a value has to meet: an integer no greater
+/// than the documented maximum, which is read off that range so the sentence cannot name a
+/// maximum the setting would refuse.
+fn invalid_cache_ttl() -> String {
+    format!(
+        "Invalid time-to-live setting, must be an integer no greater than {}",
+        CACHE_TTL_RANGE.end()
+    )
+}
+
+/// Apply `patch` to a method setting's `cacheTtlInSeconds`: as
+/// [`crate::state::patch_i32_in`], except that EVERY value the setting cannot take — a
+/// text that is no integer as much as an integer outside [`CACHE_TTL_RANGE`] — is refused
+/// with [`invalid_cache_ttl`], the one sentence API Gateway states that rule in. `remove`
+/// is not reached here: a `remove` of a method setting is applied against the settings the
+/// stage already carries.
+fn patch_cache_ttl(current: &mut i32, patch: &Patch) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            let value = patch.require_value()?;
+            *current = value
+                .trim()
+                .parse()
+                .ok()
+                .filter(|seconds| CACHE_TTL_RANGE.contains(seconds))
+                .ok_or_else(|| PatchFailure::BadRequest(invalid_cache_ttl()))?;
+        }
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
 
 /// The range of a method setting's throttle limits: a non-negative number. API Gateway
 /// publishes DEFAULT account-level throttle limits that an account can have raised, so no
@@ -941,9 +990,12 @@ fn apply_method_setting_patch(
     let nested = patch.rebased(patch.tokens.len() - 1);
     match setting {
         "metrics/enabled" => patch_stage_bool(&mut settings.metrics_enabled, &nested),
-        "logging/loglevel" => {
-            patch_enum_string(&mut settings.logging_level, &nested, LOGGING_LEVEL_VALUES)
-        }
+        "logging/loglevel" => patch_enum_string_refused_with(
+            &mut settings.logging_level,
+            &nested,
+            LOGGING_LEVEL_VALUES,
+            invalid_logging_level,
+        ),
         "logging/dataTrace" => patch_stage_bool(&mut settings.data_trace_enabled, &nested),
         "throttling/burstLimit" => patch_i32_in(
             &mut settings.throttling_burst_limit,
@@ -956,9 +1008,7 @@ fn apply_method_setting_patch(
             THROTTLE_RATE_RANGE,
         ),
         "caching/enabled" => patch_stage_bool(&mut settings.caching_enabled, &nested),
-        "caching/ttlInSeconds" => {
-            patch_i32_in(&mut settings.cache_ttl_in_seconds, &nested, CACHE_TTL_RANGE)
-        }
+        "caching/ttlInSeconds" => patch_cache_ttl(&mut settings.cache_ttl_in_seconds, &nested),
         "caching/dataEncrypted" => patch_stage_bool(&mut settings.cache_data_encrypted, &nested),
         "caching/requireAuthorizationForCacheControl" => patch_stage_bool(
             &mut settings.require_authorization_for_cache_control,

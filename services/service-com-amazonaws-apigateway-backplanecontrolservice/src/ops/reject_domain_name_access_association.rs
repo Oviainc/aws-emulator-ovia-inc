@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectDomainNameAccessAssociation
-//! IMPLEMENTED: both ARNs are read and resolved against stored state, so a malformed pair
-//! answers the modelled `BadRequestException` (400) and a well-formed pair naming records
-//! this emulator does not hold answers the modelled `NotFoundException` (404) — the domain
-//! name first, then an access association ARN that names none of the ones that domain name
-//! has ([`crate::state::NO_SUCH_ACCESS_ASSOCIATION`]). A resolved
+//! IMPLEMENTED: both ARNs are read and resolved against stored state, so a pair this
+//! service cannot read as the private custom domain name and the access association of it
+//! that the two members name answers the modelled `BadRequestException` (400) carrying
+//! AWS's fixed sentence for an unreadable domain name ARN
+//! ([`crate::state::INVALID_DOMAIN_NAME_ARN`]) — both members name a domain name, the
+//! second through the association's own resource portion — and a readable pair naming no
+//! association of this account answers the modelled `NotFoundException` (404) with the one
+//! sentence this service states for that condition, whether the domain name is one it
+//! holds no record of or one holding none of the associations the pair names
+//! ([`crate::state::NO_SUCH_ACCESS_ASSOCIATION`]). A resolved
 //! pair is then decided by WHOSE the two resources are, because that is the whole
 //! distinction this operation is defined on: "To reject a domain name access association
 //! with an access association source in ANOTHER AWS account, use this operation. To remove
@@ -113,7 +118,12 @@ const SAME_ACCOUNT_REFUSAL: &str = "Cannot reject the domain name access associa
 /// [`crate::state::parse_tagged_resource`] — the one place this service reads a
 /// caller-supplied ARN — and then held to the kind the member names. A value that is not
 /// an ARN at all, an ARN of another vendor, or an ARN naming another kind of resource is
-/// a malformed request rather than a missing one.
+/// a malformed request rather than a missing one, and it is refused with the sentence this
+/// service states for a domain name ARN it cannot read
+/// ([`crate::state::INVALID_DOMAIN_NAME_ARN`]): BOTH of this operation's members name a
+/// private custom domain name — the `domainNameArn` directly, the access association's
+/// own ARN through the domain name its resource portion carries — so one sentence covers
+/// the pair.
 ///
 /// The owner comes from [`crate::state::arn_account`], the same parse's fifth field: this
 /// operation is defined on whether the two resources are in ONE account or in two, and an
@@ -124,10 +134,15 @@ fn arn_of_kind<'a>(
 ) -> Result<(TaggedResource, &'a str), RejectDomainNameAccessAssociationError> {
     let resource = crate::state::parse_tagged_resource(value)
         .filter(|resource| resource.kind() == kind)
-        .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))?;
-    let account = crate::state::arn_account(value)
-        .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))?;
+        .ok_or_else(invalid_domain_name_arn)?;
+    let account = crate::state::arn_account(value).ok_or_else(invalid_domain_name_arn)?;
     Ok((resource, account))
+}
+
+/// A pair this operation could not read as a private custom domain name and an access
+/// association of it: the bad request it is, carrying the one sentence AWS states for it.
+fn invalid_domain_name_arn() -> RejectDomainNameAccessAssociationError {
+    bad_request(crate::state::INVALID_DOMAIN_NAME_ARN.to_string())
 }
 
 /// A request this service cannot read: the bad request it is.
@@ -263,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // Unreachable: `arn_of_kind` held the member to this kind above, which is the
             // only variant whose `kind()` answers it.
-            return Err(bad_request(crate::state::INVALID_ARN.to_string()));
+            return Err(invalid_domain_name_arn());
         };
 
         let mut store = state.lock();
@@ -271,8 +286,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DOMAIN NAME is resolved first, because the association the pair names is looked
         // for among the ones that domain name has. The lookup is the SAME one the tag
         // operations resolve an ARN with, so what this operation says an ARN names is what
-        // every other reader of it says.
-        store.holds(&domain_name).map_err(not_found)?;
+        // every other reader of it says. A `domainNameArn` this service holds no record for
+        // names no private custom domain name, so it has none of the associations the pair
+        // could name: that is the one 404 sentence this operation states for a pair naming
+        // no association, rather than an identifier refusal for a second resource class.
+        if store.holds(&domain_name).is_err() {
+            return Err(not_found(
+                crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string(),
+            ));
+        }
         // Which of this domain name's associations the pair names. The comparison is on the
         // RESOURCE each ARN addresses rather than on the ARN text, because the account field
         // is exactly what may legitimately differ between the spelling a record stores and
