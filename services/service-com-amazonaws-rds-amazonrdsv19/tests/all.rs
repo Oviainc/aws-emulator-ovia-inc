@@ -47,6 +47,8 @@ mod db_engine_version_wire_members;
 mod db_engine_versions;
 #[path = "all/db_instance_deletion.rs"]
 mod db_instance_deletion;
+#[path = "all/db_instance_engine_endpoint.rs"]
+mod db_instance_engine_endpoint;
 #[path = "all/db_instance_envelope.rs"]
 mod db_instance_envelope;
 #[path = "all/db_instance_stop.rs"]

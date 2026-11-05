@@ -423,6 +423,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        // The key the instance is stored under, in both the record map and the engine
+        // endpoint map, so the two always name the same instance.
+        let key = (region.clone(), identifier.clone());
+
+        // Everything this create decides from the STORE is decided here, under the state
+        // lock, and the lock is released at the end of this block: the engine endpoint
+        // below is opened asynchronously, and a state guard cannot be held across an
+        // await.
+        let mut record = {
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
@@ -470,7 +479,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // itself provides. It is stored as given — which is what lets `DeleteOptionGroup`
         // see that an instance is using a group.
 
-        let key = (region.clone(), identifier.clone());
         if store.db_instances.contains_key(&key) {
             return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
                 DBInstanceAlreadyExistsFault {
@@ -530,6 +538,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mint = store.next_mint();
+        // The master user's credential, digested here while both halves are in hand: a
+        // login on the engine endpoint is checked against it, and the password itself
+        // goes nowhere.
+        let master_user_password_hash = match (&input.master_username, &input.master_user_password)
+        {
+            (Some(username), Some(password)) => Some(
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username, password,
+                ),
+            ),
+            _ => None,
+        };
         let storage_type = input
             .storage_type
             .unwrap_or_else(|| crate::state::default_storage_type(input.iops).to_string());
@@ -587,9 +607,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             allocated_storage: input.allocated_storage,
             max_allocated_storage: input.max_allocated_storage,
             // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying
-            // it, so it is accepted and never stored or returned. The username is.
+            // it, so it is never stored or returned as itself: what the record keeps is
+            // the DIGESTS a login on the instance's own engine endpoint is verified
+            // against. The username is stored as given.
+            master_user_password: master_user_password_hash,
             master_username: input.master_username,
             endpoint_port,
+            // Filled in below, once the core has assigned the engine listener its port.
+            served_endpoint: None,
             multi_az: input.multi_az.unwrap_or(false),
             // `StorageThroughput` "applies only to the gp3 storage type", whose
             // baseline the instance is provisioned with when the request names none.
@@ -674,6 +699,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "DB instance {} created with engine {}; status {}",
             record.identifier, record.engine, record.status
         ));
+        record
+        };
+
+        // The instance's own ENGINE ENDPOINT, opened with the state lock released:
+        // binding is asynchronous and the core owns the socket, the bind interface and
+        // the port. It is opened AFTER every refusal above has been answered — so nothing
+        // binds for a create that was going to fail — and before the record is admitted to
+        // the store, so an instance this service holds is one whose endpoint is already
+        // listening. The instance still reports `creating` until the clock makes
+        // `available` due, and a session opened before then is refused by the engine
+        // exactly as it is against a DB instance that is still coming up.
+        let endpoint = match crate::state::engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    &region,
+                    &record.dbi_resource_id,
+                    wire,
+                )
+                .await
+                .map_err(CreateDBInstanceError::internal_failure)?,
+            ),
+            // An engine whose native wire this emulator does not speak: no listener is
+            // opened and the instance keeps the DNS-form endpoint this service has always
+            // reported for it, rather than publishing a port that would answer nothing.
+            None => None,
+        };
+        record.served_endpoint = endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.endpoint.clone());
+
+        let mut store = state.lock();
+        // Another request may have created this identifier while this one was binding, so
+        // the conflict is answered again here rather than overwriting a stored instance.
+        if store.db_instances.contains_key(&key) {
+            return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
+                DBInstanceAlreadyExistsFault {
+                    message: Some(crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         let db_instance = record.to_wire();
         let dbi_resource_id = record.dbi_resource_id.clone();
@@ -683,7 +751,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             performance_insights_enabled: record.performance_insights_enabled,
             database_insights_mode: Some(record.database_insights_mode.clone()),
         };
-        store.db_instances.insert(key, record);
+        store.db_instances.insert(key.clone(), record);
+        // The listener is the instance's: the store holds it, so it stays open for as
+        // long as the instance does and closes with it.
+        if let Some(endpoint) = endpoint {
+            store.db_engine_endpoints.insert(key, endpoint);
+        }
         // The create happened, so the region's event log records it: that entry is what
         // `DescribeEvents` reports for this instance from now on.
         store.record_event(

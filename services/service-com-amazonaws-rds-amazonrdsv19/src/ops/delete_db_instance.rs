@@ -368,6 +368,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let dbi_resource_id = record.dbi_resource_id.clone();
         let instance_arn = record.arn();
         let db_instance = record.to_wire();
+        // The engine is going away with the instance, so the sessions it held end here
+        // rather than running SQL against an instance that is being deleted. The listener
+        // itself closes when the record leaves the store
+        // (`ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`).
+        store.sever_engine_sessions(&key);
         // The delete "can't be canceled or reverted after it begins", so the region's
         // event log records the deletion of the instance here, where it was accepted.
         store.record_event(

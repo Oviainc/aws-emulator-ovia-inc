@@ -210,7 +210,11 @@ fn rds_control_plane_calls_are_in_cloudtrail_event_history() {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
             let mut router = build_router(engine);
             router.set_request_authentication(false);
+            // `enable_all`, which is what the emulator's own boot path builds: a DB
+            // instance create opens the instance's engine listener through the core, and
+            // binding a socket needs the runtime's I/O driver.
             let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .expect("a current-thread runtime");
 

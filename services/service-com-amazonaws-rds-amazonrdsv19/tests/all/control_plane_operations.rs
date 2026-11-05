@@ -1677,11 +1677,37 @@ async fn proxy_targets_are_registered_reported_and_deregistered() {
         vec!["AVAILABLE".to_string(), "AVAILABLE".to_string()],
         "a target whose database this service holds is available: {targets}"
     );
+    // Each target reports the endpoint of the database behind it, which is the endpoint
+    // that database itself publishes: the DB instance target reports exactly the
+    // `Endpoint.Address` the instance's own describe reports (its engine listener's host,
+    // since this emulator serves MySQL — see `state::data_plane`), and the tracked
+    // cluster, which no listener serves, reports the DNS-form endpoint of a cluster.
+    let instance = expect_ok(
+        "the registered instance",
+        call(
+            &router,
+            "DescribeDBInstances",
+            &[("DBInstanceIdentifier", "emu-proxy-instance")],
+        )
+        .await,
+    );
+    let published = text(&instance, "Address");
+    let endpoints = texts(&targets, "Endpoint");
     assert!(
-        texts(&targets, "Endpoint")
+        endpoints.contains(&published),
+        "the DB instance target must report the endpoint that instance publishes \
+         ({published:?}): {targets}"
+    );
+    assert!(
+        endpoints
             .iter()
-            .all(|endpoint| endpoint.ends_with(&format!("{REGION}.rds.amazonaws.com"))),
-        "each target reports the endpoint of the database behind it: {targets}"
+            .any(|endpoint| endpoint.ends_with(&format!("{REGION}.rds.amazonaws.com"))),
+        "the tracked cluster target must report the cluster's own endpoint: {targets}"
+    );
+    assert_eq!(
+        endpoints.len(),
+        2,
+        "each registration reports one endpoint: {targets}"
     );
 
     // The deregistration removes exactly what it names, and the describe stops reporting

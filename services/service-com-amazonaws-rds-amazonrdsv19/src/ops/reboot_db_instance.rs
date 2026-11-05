@@ -225,6 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
         let instance_arn = record.arn();
         let db_instance = record.to_wire();
+        // "Rebooting a DB instance restarts the database engine service": the sessions
+        // the engine held do not survive the restart, and whatever they had not committed
+        // is rolled back with them. The endpoint stays bound — a reboot does not move the
+        // address a client reconnects to.
+        store.sever_engine_sessions(&key);
         // The restart happened, so the region's event log records it.
         store.record_event(
             &region,

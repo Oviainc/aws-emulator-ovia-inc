@@ -97,7 +97,11 @@ fn performance_insights_serves_a_data_source_only_under_the_service_that_owns_it
             let mut router = build_router(engine);
             router.set_request_authentication(false);
 
+            // `enable_all`, which is what the emulator's own boot path builds: a DB
+            // instance create opens the instance's engine listener through the core, and
+            // binding a socket needs the runtime's I/O driver.
             let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .expect("a current-thread runtime");
 

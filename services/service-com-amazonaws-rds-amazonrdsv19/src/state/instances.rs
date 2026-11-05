@@ -26,7 +26,19 @@ pub struct DbInstanceRecord {
     pub allocated_storage: Option<i32>,
     pub max_allocated_storage: Option<i32>,
     pub master_username: Option<String>,
+    /// The master user's password, as the DIGESTS a login on the instance's engine
+    /// endpoint is verified against — never the password itself, which is `@sensitive`,
+    /// is reported by no operation and is not stored (see
+    /// [`data_plane::wire_session::MasterPasswordHash`]). `None` for an instance created
+    /// without one, which no engine session can then authenticate against.
+    pub master_user_password: Option<data_plane::wire_session::MasterPasswordHash>,
     pub endpoint_port: i32,
+    /// Where the instance's own engine listener accepts connections, for the engines
+    /// whose wire this emulator speaks: what the modelled `Endpoint` publishes, because
+    /// that is the address and port a client can actually reach the engine on. `None` for
+    /// an engine this emulator serves no data plane for, which keeps the DNS-form
+    /// endpoint and the configured port.
+    pub served_endpoint: Option<ServedEndpoint>,
     pub multi_az: bool,
     pub storage_type: String,
     pub storage_encrypted: bool,
@@ -138,7 +150,14 @@ impl DbInstanceRecord {
     /// The DNS name this instance's endpoint resolves to:
     /// `<identifier>.<minted host>.<region>.<domain>`, with the domain of the control plane
     /// that owns the instance's engine — see [`endpoint_domain`].
+    ///
+    /// An instance whose engine this emulator SERVES publishes the host its own listener
+    /// is bound to instead: that is the address a client connects to, and a name this
+    /// machine does not resolve would be no endpoint at all.
     pub fn endpoint_address(&self) -> String {
+        if let Some(served) = &self.served_endpoint {
+            return served.host.clone();
+        }
         format!(
             "{}.{}.{}.{}",
             self.identifier,
@@ -146,6 +165,19 @@ impl DbInstanceRecord {
             self.region,
             endpoint_domain(&self.engine)
         )
+    }
+
+    /// The port a client connects to: the port the instance's engine listener was
+    /// assigned where it has one, else the configured port.
+    ///
+    /// The core owns the port range the listener is bound in, so the configured port
+    /// ([`Self::endpoint_port`], which `Port` and `DBPortNumber` set) is what the
+    /// instance records and this is what it publishes; for an instance with no listener
+    /// the two are the same value.
+    pub fn published_port(&self) -> i32 {
+        self.served_endpoint
+            .as_ref()
+            .map_or(self.endpoint_port, |served| served.port)
     }
 
     /// When the server certificate issued at creation expires:
@@ -161,10 +193,13 @@ impl DbInstanceRecord {
     /// `DbInstancePort`: "The port that the DB instance listens on. If the DB instance
     /// is part of a DB cluster, this can be a different port than the DB cluster port."
     ///
-    /// The member reports the port of a CLUSTER MEMBER, which is why it is separate
-    /// from `Endpoint.Port` (the port a client connects to, which this service reports
-    /// from the same stored port): an instance that belongs to no DB cluster has no
-    /// such port, and RDS reports zero for it.
+    /// The member reports the port of a CLUSTER MEMBER, which is why it is separate from
+    /// `Endpoint.Port`: an instance that belongs to no DB cluster has no such port, and
+    /// RDS reports zero for it. It reports the CONFIGURED port — the one `Port` and
+    /// `DBPortNumber` set, which the record keeps — where `Endpoint.Port` reports the
+    /// port the instance's engine listener was assigned ([`Self::published_port`]): the
+    /// endpoint has to be the one a client can reach, and this member is what still says
+    /// which port the request asked the instance to listen on.
     pub fn db_instance_port(&self) -> i32 {
         match self.db_cluster_identifier {
             Some(_) => self.endpoint_port,
@@ -191,7 +226,7 @@ impl DbInstanceRecord {
             db_name: self.db_name.clone(),
             endpoint: Some(Endpoint {
                 address: Some(self.endpoint_address()),
-                port: Some(self.endpoint_port),
+                port: Some(self.published_port()),
                 hosted_zone_id: Some(hosted_zone_id(
                     &self.region,
                     endpoint_domain(&self.engine),

@@ -270,10 +270,15 @@ async fn a_polling_client_reaches_every_settled_state_of_the_db_instance_lifecyc
         );
         let endpoint = optional_text(&available, "Address");
         assert!(
-            endpoint
-                .as_deref()
-                .is_some_and(|address| address.starts_with(row.identifier)),
-            "case {case:?}: the settled instance must report its endpoint, got {endpoint:?}"
+            endpoint.as_deref().is_some_and(|address| {
+                address.starts_with(row.identifier)
+                    || address
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|host| host.is_loopback())
+            }),
+            "case {case:?}: the settled instance must report the endpoint a client \
+             connects to — its own engine listener's host where this emulator serves its \
+             engine, else the DNS name of its endpoint — got {endpoint:?}"
         );
 
         // 3. A modification: accepted as `modifying`, and the poll loop reaches the

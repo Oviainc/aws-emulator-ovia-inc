@@ -411,6 +411,9 @@ pub mod ses_identities;
 /// Smithy model: the members it marks `@sensitive`.
 pub mod sensitive_members;
 pub mod shared_path;
+/// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
+/// the in-process SQLite engine.
+pub mod sqlite_confinement;
 pub mod validation;
 pub mod validation_message;
 /// The web identity tokens this emulator itself issued: the registry a redeemer of one

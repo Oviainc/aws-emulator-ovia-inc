@@ -115,6 +115,34 @@ fn assert_member(case: &str, envelope: &str, instance: &str, member: &str, expec
     );
 }
 
+/// Assert the port an envelope PUBLISHES.
+///
+/// For an engine whose wire this emulator serves, the published port is the one the core
+/// assigned the instance's own engine listener — that is the port a client connects to,
+/// and `db_instance_engine_endpoint` is where a session is opened on it — so what holds
+/// here is that it is a port at all; every other engine publishes the port the request
+/// asked for or the engine's documented default.
+fn assert_published_port(
+    case: &str,
+    envelope: &str,
+    instance: &str,
+    engine: &str,
+    configured: &str,
+) {
+    if service_com_amazonaws_rds_amazonrdsv19::state::engine_wire(engine).is_some() {
+        let actual = optional_text(instance, "Port");
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port > 0)),
+            "case {case:?}: the {envelope} envelope must report the port of the \
+             instance's engine listener, got {actual:?}"
+        );
+    } else {
+        assert_member(case, envelope, instance, "Port", configured);
+    }
+}
+
 /// Assert that an envelope carries exactly one `<element>` — the check an EMPTY list or
 /// an empty structure needs, which carries no text of its own.
 fn assert_element_present(case: &str, envelope: &str, instance: &str, element: &str) {
@@ -398,7 +426,7 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
                 row.option_group,
             );
             assert_member(row.case, envelope, instance, "LicenseModel", row.license_model);
-            assert_member(row.case, envelope, instance, "Port", row.port);
+            assert_published_port(row.case, envelope, instance, row.engine, row.port);
             for (member, expected) in DEFAULTS {
                 assert_member(row.case, envelope, instance, member, expected);
             }

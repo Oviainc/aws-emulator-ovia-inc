@@ -741,9 +741,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             record.domain = None;
         }
-        // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it:
-        // it is accepted and neither stored nor returned.
-        changed |= input.master_user_password.is_some();
+        // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it: it
+        // is never stored or returned as itself. What the record keeps is the DIGESTS a
+        // login on the instance's own engine endpoint is verified against, so a modified
+        // password is the one that opens a session from now on and the old one stops
+        // working — which is what changing it means.
+        if let Some(value) = input.master_user_password.as_deref() {
+            changed = true;
+            record.master_user_password = record.master_username.as_ref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(username, value)
+            });
+        }
 
         if changed {
             // RDS answers a modification with the instance in `modifying`; it settles
@@ -758,9 +766,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             performance_insights_enabled: record.performance_insights_enabled,
             database_insights_mode: Some(record.database_insights_mode.clone()),
         };
+        let renamed_key = (region.clone(), record.identifier.clone());
         store
             .db_instances
             .insert((region, record.identifier.clone()), record);
+        // A rename moves the instance to a new key, and its engine endpoint moves with
+        // it: the listener a client is connected to stays the endpoint this instance
+        // publishes, whatever it is now called.
+        store.move_engine_endpoint(&key, &renamed_key);
         // A modification can turn Performance Insights on or off and can change the
         // database-insights mode, so the SHARED data-source directory is brought up to
         // date with the settings the instance runs under NOW: a monitoring service reads

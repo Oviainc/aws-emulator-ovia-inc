@@ -359,6 +359,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ));
         let instance_arn = record.arn();
         let db_instance = record.to_wire();
+        // The database engine is shutting down, so the sessions it held end here and
+        // whatever they had not committed is rolled back with them. The endpoint stays
+        // bound, because the instance keeps it: a stopped instance refuses a login rather
+        // than refusing the connection.
+        store.sever_engine_sessions(&key);
         // The stop happened, so the region's event log records it.
         store.record_event(
             &region,

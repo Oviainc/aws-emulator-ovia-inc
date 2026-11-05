@@ -1083,12 +1083,17 @@ fn output_cases() -> Vec<OutputCase> {
             // does not cover: a DB INSTANCE (whose endpoint carries no `cluster-` infix)
             // with the port DECLARED rather than defaulted, and a VPC security group,
             // whose `Ref` is the id its service assigns rather than a name.
+            //
+            // The engine is one the RDS emulator serves no engine listener for, so its
+            // endpoint is the DNS-form name and its port is the DECLARED one, which is
+            // what this row reads back. The row below it is the same template on an
+            // engine that IS served, where the published endpoint is the listener's.
             case: "a db instance and a security group: ids and an explicit port",
             stack_name: "db-instance",
             template: r#"{"Resources":{
                    "Database":{"Type":"AWS::RDS::DBInstance",
                      "Properties":{"DBInstanceIdentifier":"probe-db",
-                       "Engine":"mysql","Port":"13306",
+                       "Engine":"oracle-se2","Port":"11521",
                        "DBInstanceClass":"db.t4g.micro"}},
                    "ClientGroup":{"Type":"AWS::EC2::SecurityGroup",
                      "Properties":{"GroupDescription":"probe"}}},
@@ -1123,10 +1128,10 @@ fn output_cases() -> Vec<OutputCase> {
                     },
                 ),
                 (
-                    // The port the template DECLARED, not the engine's default (3306 for
-                    // RDS for MySQL).
+                    // The port the template DECLARED, not the engine's default (1521 for
+                    // RDS for Oracle).
                     "InstancePort",
-                    Expected::Value("13306".to_string()),
+                    Expected::Value("11521".to_string()),
                 ),
                 (
                     // "Ref returns the ID of the security group."
@@ -1142,6 +1147,45 @@ fn output_cases() -> Vec<OutputCase> {
                     Expected::Form {
                         described: "a security group id",
                         check: is_security_group_id,
+                    },
+                ),
+            ],
+        },
+        OutputCase {
+            // The SAME template on an engine the RDS emulator DOES serve a native wire
+            // for: the DB instance is provisioned with its own engine listener, so the
+            // endpoint it publishes — and so the output `Endpoint.Address`/`Endpoint.Port`
+            // carry — is that listener's loopback host and the port the core assigned it,
+            // which is the address a client can reach. (That the endpoint ANSWERS there is
+            // pinned in the RDS crate's own `db_instance_engine_endpoint` suite.) The
+            // declared `Port` is still recorded by the instance; the row above reads it
+            // back on an engine with no listener.
+            case: "a db instance whose engine this emulator serves publishes its listener",
+            stack_name: "db-instance-served",
+            template: r#"{"Resources":{
+                   "Database":{"Type":"AWS::RDS::DBInstance",
+                     "Properties":{"DBInstanceIdentifier":"probe-served-db",
+                       "Engine":"mysql","Port":"13306",
+                       "DBInstanceClass":"db.t4g.micro"}}},
+                 "Outputs":{
+                   "InstanceEndpoint":{"Value":{"Fn::GetAtt":["Database","Endpoint.Address"]}},
+                   "InstancePort":{"Value":{"Fn::GetAtt":["Database","Endpoint.Port"]}}}}"#
+                .to_string(),
+            parameters: vec![],
+            expected: vec![
+                (
+                    "InstanceEndpoint",
+                    Expected::Form {
+                        described: "the loopback host the instance's engine listener is \
+                                    bound to",
+                        check: |value| value == "127.0.0.1",
+                    },
+                ),
+                (
+                    "InstancePort",
+                    Expected::Form {
+                        described: "the port that engine listener was assigned",
+                        check: |value| value.parse::<u16>().is_ok_and(|port| port > 0),
                     },
                 ),
             ],

@@ -274,7 +274,7 @@ impl DbClusterRecord {
     /// The window a point-in-time restore of this cluster can target, as of now: "the
     /// earliest and latest time a DB cluster can be restored to" is at most
     /// `BackupRetentionPeriod` days back and never before the cluster existed.
-    pub(super) fn backup_window(&self) -> (::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime) {
+    fn backup_window(&self) -> (::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime) {
         let now = now_as_wire_timestamp();
         let retention = f64::from(self.backup_retention_period) * 24.0 * 60.0 * 60.0;
         let earliest = (now.as_secs_f64() - retention).max(self.cluster_create_time.as_secs_f64());

@@ -16,11 +16,30 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The DB instance DATA plane (`src/state/data_plane/`): the engine endpoint a PostgreSQL
+# or MySQL client connects to.
+#
+# `rusqlite` (the `bundled` SQLite already in this workspace — `vendor/emulator-telemetry`
+# and the Athena, Redshift Data and RDS Data services build the same version and feature
+# set) is the SQL engine each instance's statements run against, in memory and per
+# instance.
+rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+# `sqlparser` reads a statement as the TOKENS of its own dialect, which is how the wire
+# tells a server command (`SHOW`, `SET`) from a query and substitutes the session's values
+# into one without inspecting its text.
+sqlparser = "0.59"
+# `sha1` is the digest the MySQL `mysql_native_password` handshake is defined in terms of,
+# and the only form a native-password login can be verified against.
+sha1 = "0.10"
+# `getrandom` draws the per-connection nonce that handshake challenges a client with from
+# the operating system's own entropy, so the proof the client answers with cannot be
+# replayed.
+getrandom = "0.3"
 # `rds_cluster_parameters`: the cluster parameter catalog and the parameter rules the
 # Amazon RDS, DocumentDB and Neptune models of the one `rds` front door share
 # (`src/state.rs`).
@@ -40,6 +59,15 @@ hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The engine-endpoint tests drive a real client against the data plane in ONE process:
+# `sha1` computes the `mysql_native_password` proof a client sends, and
+# `rustls`/`tokio-rustls` run the client side of the in-band TLS upgrade the core's
+# upgrader answers. Both are the versions this workspace already builds.
+sha1 = "0.10"
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true

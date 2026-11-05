@@ -233,3 +233,4 @@ pub fn check_event_categories(source_type: &str, categories: &[String]) -> Resul
     }
     Ok(())
 }
+

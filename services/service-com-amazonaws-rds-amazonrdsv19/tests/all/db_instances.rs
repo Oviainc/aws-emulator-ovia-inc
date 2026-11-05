@@ -581,11 +581,26 @@ async fn create_persists_every_setting_and_describe_reads_it_back() {
                 row.case
             );
             let port = text(source, "Port");
-            assert_eq!(
-                port, row.expected_port,
-                "case {:?}: {where_from} reported endpoint port {port:?}",
-                row.case
-            );
+            // The port the instance PUBLISHES is the port a client connects to. For an
+            // engine whose wire this emulator serves, that is the port the core assigned
+            // its own engine listener (`state::data_plane`), which is what makes the
+            // published endpoint reachable — that it ANSWERS there is asserted in
+            // `db_instance_engine_endpoint`; for every other engine it is the port the
+            // request asked for or the engine's documented default.
+            if state::engine_wire(row.engine).is_some() {
+                assert!(
+                    port.parse::<u16>().is_ok_and(|port| port > 0),
+                    "case {:?}: {where_from} reported endpoint port {port:?}, expected the \
+                     port the instance's engine listener is bound to",
+                    row.case
+                );
+            } else {
+                assert_eq!(
+                    port, row.expected_port,
+                    "case {:?}: {where_from} reported endpoint port {port:?}",
+                    row.case
+                );
+            }
             let publicly_accessible = text(source, "PubliclyAccessible");
             assert_eq!(
                 publicly_accessible, row.expected_publicly_accessible,
@@ -607,12 +622,27 @@ async fn create_persists_every_setting_and_describe_reads_it_back() {
                 row.case
             );
             let address = text(source, "Address");
-            assert!(
-                address.starts_with(&format!("{}.", row.identifier))
-                    && address.ends_with(&format!(".{REGION}.rds.amazonaws.com")),
-                "case {:?}: {where_from} reported endpoint address {address:?}",
-                row.case
-            );
+            // The address the instance PUBLISHES is the address a client connects to:
+            // the host its own engine listener is bound to for an engine this emulator
+            // serves — which `db_instance_engine_endpoint` opens a real session on — and
+            // the DNS name of its endpoint for one it does not.
+            if state::engine_wire(row.engine).is_some() {
+                assert!(
+                    address
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|host| host.is_loopback()),
+                    "case {:?}: {where_from} reported endpoint address {address:?}, \
+                     expected the host of the instance's engine listener",
+                    row.case
+                );
+            } else {
+                assert!(
+                    address.starts_with(&format!("{}.", row.identifier))
+                        && address.ends_with(&format!(".{REGION}.rds.amazonaws.com")),
+                    "case {:?}: {where_from} reported endpoint address {address:?}",
+                    row.case
+                );
+            }
             assert!(
                 !text(source, "InstanceCreateTime").is_empty(),
                 "case {:?}: {where_from} reported no InstanceCreateTime",
@@ -730,8 +760,11 @@ async fn one_identifier_names_a_different_instance_in_each_region() {
             "case {region:?}: the ARN must carry the region the request was signed for"
         );
         assert!(
-            text(&instance, "Address").ends_with(&format!(".{region}.rds.amazonaws.com")),
-            "case {region:?}: the endpoint host must carry the region, got {:?}",
+            text(&instance, "Address")
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|host| host.is_loopback()),
+            "case {region:?}: a postgres instance publishes the host of its own engine \
+             listener, got {:?}",
             text(&instance, "Address")
         );
         // The unfiltered report of this region holds only this region's one instance.
@@ -1575,11 +1608,26 @@ async fn modify_writes_every_supplied_setting_through_to_the_store() {
 
         let read_back = describe_one(&router, case, "emu-mod").await;
         let actual = optional_text(&read_back, reported_as);
-        assert_eq!(
-            actual.as_deref(),
-            Some(*value),
-            "case {case:?}: the store must report {reported_as} as {value:?}, got {actual:?}"
-        );
+        if *reported_as == "Port" {
+            // `DBPortNumber` sets the port the instance is CONFIGURED to listen on, which
+            // the record keeps; the port it PUBLISHES is the one the core assigned its own
+            // engine listener (the core owns the port range), so what has to hold after a
+            // port change is that the published endpoint is still a port a client can
+            // reach.
+            assert!(
+                actual
+                    .as_deref()
+                    .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port > 0)),
+                "case {case:?}: the published port must stay the port the instance's \
+                 engine listener is bound to, got {actual:?}"
+            );
+        } else {
+            assert_eq!(
+                actual.as_deref(),
+                Some(*value),
+                "case {case:?}: the store must report {reported_as} as {value:?}, got {actual:?}"
+            );
+        }
         assert_eq!(
             text(&read_back, "DBInstanceStatus"),
             "available",
@@ -1677,10 +1725,17 @@ async fn modify_renames_an_instance_and_refuses_a_name_already_taken() {
         format!("arn:aws:rds:{REGION}:{ACCOUNT}:db:emu-rename-c"),
         "the ARN must follow the rename"
     );
+    // A rename does not move the endpoint: the instance keeps the engine listener it was
+    // created with, so a client reconnects to the same address under the new name. (The
+    // DNS-form endpoint, which follows the identifier, is what an instance with no
+    // listener publishes — see `create_persists_every_setting_and_describe_reads_it_back`.)
+    let renamed_address = text(&renamed, "Address");
     assert!(
-        text(&renamed, "Address").starts_with("emu-rename-c."),
-        "the endpoint DNS name must follow the rename, got {:?}",
-        text(&renamed, "Address")
+        renamed_address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|host| host.is_loopback()),
+        "the renamed instance must keep publishing its engine listener's host, got \
+         {renamed_address:?}"
     );
     wait_for_settle();
 

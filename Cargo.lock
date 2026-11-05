@@ -15020,12 +15020,18 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "getrandom 0.3.4",
  "hex",
  "http",
+ "rusqlite",
+ "rustls",
  "serde_json",
  "service-common",
+ "sha1 0.10.7",
  "sha2 0.10.9",
+ "sqlparser",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 
