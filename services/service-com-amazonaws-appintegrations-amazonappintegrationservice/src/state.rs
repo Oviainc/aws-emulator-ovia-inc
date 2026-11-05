@@ -716,6 +716,22 @@ impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
             .filter(move |(_, record)| record.application_id == application_id)
     }
 
+    /// Whether the application `application_id` is associated with any client, which is
+    /// what `DeleteApplication` refuses an unforced delete on.
+    pub fn has_application_associations(&self, application_id: &str) -> bool {
+        self.application_associations_of(application_id).next().is_some()
+    }
+
+    /// Drop every association of the application `application_id` and answer how many
+    /// were dropped: what a `DeleteApplication` carrying `Force` does with them, since
+    /// an association exists only as part of the application it belongs to.
+    pub fn remove_application_associations_of(&mut self, application_id: &str) -> usize {
+        let before = self.application_associations.len();
+        self.application_associations
+            .retain(|_, record| record.application_id != application_id);
+        before - self.application_associations.len()
+    }
+
     /// Whether the data integration `integration_id` has ever been associated, which is
     /// what `CreateDataIntegrationAssociation` refuses a second association on and
     /// `DeleteDataIntegration` refuses a delete on.

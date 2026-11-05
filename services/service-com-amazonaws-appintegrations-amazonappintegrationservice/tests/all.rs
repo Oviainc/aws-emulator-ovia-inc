@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/application_associations.rs"]
 mod application_associations;
+#[path = "all/application_deletion.rs"]
+mod application_deletion;
 #[path = "all/application_updates.rs"]
 mod application_updates;
 #[path = "all/applications.rs"]

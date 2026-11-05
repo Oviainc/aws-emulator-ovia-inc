@@ -183,12 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An event integration's identity is its name, so a create whose name is taken
+        // is refused as a duplicate resource (HTTP 409) and persists nothing. The
+        // sentence is AppIntegrations' own: fixed text naming the resource TYPE, with
+        // the request's `Name` as its only variable part.
         if state.event_integrations.contains_key(&input.name) {
             return Err(CreateEventIntegrationErrorModeled::DuplicateResourceException(
                 DuplicateResourceException {
                     message: Some(format!(
-                        "An event integration named {} already exists.",
-                        input.name
+                        "An {resource} already exists with name: {name}.",
+                        resource = crate::state::EVENT_INTEGRATION_RESOURCE,
+                        name = input.name
                     )),
                 },
             )

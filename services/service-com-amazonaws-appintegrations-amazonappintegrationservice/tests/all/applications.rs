@@ -474,7 +474,8 @@ async fn initialization_timeout_accepts_each_published_bound_and_refuses_one_pas
             assert_reports_the_created_members(label, &fetched, &body);
         } else {
             // A refused create persists nothing, so the same (Namespace, Name) is still
-            // free: were the refused application stored, this would be a 409 duplicate.
+            // free: were the refused application stored, this create would be refused as
+            // a name already in use.
             let mut retried = body.clone();
             retried["InitializationTimeout"] = json!(INITIALIZATION_TIMEOUT_MIN);
             let accepted = create(&emulator, REGION, retried).await;
@@ -488,8 +489,35 @@ async fn initialization_timeout_accepts_each_published_bound_and_refuses_one_pas
     }
 }
 
+/// How AppIntegrations refuses a create whose `Name` is already in use in the
+/// `Namespace` it names: HTTP 400 `InvalidRequestException` with a sentence that is
+/// entirely fixed text — it names neither the application nor the namespace, so no two
+/// rows of the table below can tell their refusals apart.
+const NAME_ALREADY_IN_USE: &str = "Application name is invalid. Name already in use.";
+
+/// Every assertion about a refused duplicate: the status, the error code and the whole
+/// message.
+fn assert_refused_as_name_in_use(label: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, 400,
+        "case {label:?}: expected HTTP 400 for a duplicate (Namespace, Name), got {} / {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type, "InvalidRequestException",
+        "case {label:?}: expected InvalidRequestException, got {:?}",
+        reply.error_type
+    );
+    assert_eq!(
+        reply.message().as_deref(),
+        Some(NAME_ALREADY_IN_USE),
+        "case {label:?}: expected {NAME_ALREADY_IN_USE:?}, got {:?}",
+        reply.message()
+    );
+}
+
 #[tokio::test]
-async fn a_second_create_of_the_same_namespace_and_name_is_refused_as_a_duplicate() {
+async fn a_second_create_of_the_same_namespace_and_name_is_refused_as_a_name_in_use() {
     for Case { label, body } in round_trip_cases() {
         let emulator = Emulator::new();
         let first = create(&emulator, REGION, body.clone()).await;
@@ -505,16 +533,7 @@ async fn a_second_create_of_the_same_namespace_and_name_is_refused_as_a_duplicat
         duplicate["ApplicationSourceConfig"] =
             json!({ "ExternalUrlConfig": { "AccessUrl": "https://example.com/other" } });
         let second = create(&emulator, REGION, duplicate).await;
-        assert_eq!(
-            second.status, 409,
-            "case {label:?}: expected HTTP 409 for a duplicate (Namespace, Name), got {} / {}",
-            second.status, second.body
-        );
-        assert_eq!(
-            second.error_type, "DuplicateResourceException",
-            "case {label:?}: expected DuplicateResourceException, got {:?}",
-            second.error_type
-        );
+        assert_refused_as_name_in_use(label, &second);
 
         // And the refused create changed nothing.
         let id = first.string("Id").unwrap_or_default();
@@ -609,11 +628,7 @@ async fn a_create_repeated_with_its_client_token_reports_the_id_it_already_minte
         first.status, first.body
     );
     let second = create(&emulator, REGION, body).await;
-    assert_eq!(
-        second.status, 409,
-        "case \"no ClientToken\": expected HTTP 409 for the second create, got {} / {}",
-        second.status, second.body
-    );
+    assert_refused_as_name_in_use("no ClientToken", &second);
 }
 
 #[tokio::test]

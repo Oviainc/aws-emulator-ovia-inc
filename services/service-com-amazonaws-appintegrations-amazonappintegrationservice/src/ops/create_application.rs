@@ -14,9 +14,10 @@
 //! defaulted on the way out, so every read path reports one value.
 //!
 //! An application's identity is its (`Namespace`, `Name`) pair: a create whose pair
-//! is already taken is refused with `DuplicateResourceException` (HTTP 409) and
-//! persists nothing. A create past this emulator's stored-application bound is
-//! refused with the modelled `ResourceQuotaExceededException`.
+//! is already taken is refused as an invalid request (HTTP 400
+//! `InvalidRequestException`) and persists nothing. A create past this emulator's
+//! stored-application bound is refused with the modelled
+//! `ResourceQuotaExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +117,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How AppIntegrations refuses a `CreateApplication` whose `Name` is already in use
+/// in the `Namespace` the request names.
+///
+/// The sentence is entirely FIXED: it names neither the application nor the
+/// namespace, so nothing from the request is interpolated into it. The model declares
+/// both `InvalidRequestException` (HTTP 400, "the request is not valid") and
+/// `DuplicateResourceException` (HTTP 409) on this operation and so does not choose
+/// between them; the service answers the invalid-request one, which is permanent
+/// rather than a conflict a caller should retry.
+const NAME_ALREADY_IN_USE: &str = "Application name is invalid. Name already in use.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -214,17 +226,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if let Some(existing) = state
+        // An application's identity is its (`Namespace`, `Name`) pair, so a create whose
+        // pair is taken is refused and persists nothing.
+        if state
             .applications
             .values()
-            .find(|record| record.namespace == input.namespace && record.name == input.name)
+            .any(|record| record.namespace == input.namespace && record.name == input.name)
         {
-            return Err(CreateApplicationErrorModeled::DuplicateResourceException(
-                DuplicateResourceException {
-                    message: Some(format!(
-                        "An application named {} already exists in namespace {}.",
-                        existing.name, existing.namespace
-                    )),
+            return Err(CreateApplicationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(NAME_ALREADY_IN_USE.to_string()),
                 },
             )
             .into());

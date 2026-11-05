@@ -350,6 +350,19 @@ async fn a_second_create_of_a_live_name_is_refused_as_a_duplicate() {
             "case {label:?}: expected DuplicateResourceException, got {:?}",
             second.error_type
         );
+        // The sentence AppIntegrations words this refusal with: fixed text naming the
+        // resource type, with the request's `Name` as its only variable part. Rows
+        // differ in the form and length of that name, so the template is exercised and
+        // not a single literal.
+        assert_eq!(
+            second.message(),
+            Some(format!(
+                "An EventIntegration already exists with name: {}.",
+                expected.name
+            )),
+            "case {label:?}: expected the duplicate-name message, got {:?}",
+            second.message()
+        );
 
         // And the refused create changed nothing.
         let fetched = emulator.get(REGION, &expected.name).await;

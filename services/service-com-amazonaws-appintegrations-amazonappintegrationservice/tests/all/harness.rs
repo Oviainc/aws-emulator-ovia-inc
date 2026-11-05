@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::Value;
+use service_com_amazonaws_appintegrations_amazonappintegrationservice::state::{
+    application_association_arn, ApplicationAssociationRecord,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region a case signs for unless it is exercising the region rule itself.
@@ -107,6 +110,41 @@ impl Emulator {
             &*self.engine,
         )
         .expect("the AppIntegrations store is reachable from the engine the router runs on")
+    }
+
+    /// Store one application association per entry of `client_ids` for the application
+    /// `(application_id, application_arn)`, answering the records as the store keeps
+    /// them.
+    ///
+    /// Plumbing rather than an assertion: AppIntegrations publishes no create for an
+    /// application association, so a suite that needs one stored puts it in the store
+    /// the router serves from and then reads every assertion off the wire. The
+    /// association ids are hex-ordered and continue after whatever is already stored, so
+    /// the store's order is the order they were added in and two applications never
+    /// share one.
+    pub(crate) fn seed_application_associations<S: AsRef<str>>(
+        &self,
+        application_id: &str,
+        application_arn: &str,
+        client_ids: &[S],
+    ) -> Vec<ApplicationAssociationRecord> {
+        let state = self.appintegrations_state();
+        let mut guard = state.lock();
+        let first = guard.application_associations.len();
+        let mut seeded = Vec::new();
+        for (offset, client_id) in client_ids.iter().enumerate() {
+            let id = format!("{:08x}-0000-4000-8000-000000000000", first + offset);
+            let record = ApplicationAssociationRecord {
+                arn: application_association_arn(REGION, application_id, &id),
+                id: id.clone(),
+                application_id: application_id.to_string(),
+                application_arn: application_arn.to_string(),
+                client_id: client_id.as_ref().to_string(),
+            };
+            guard.application_associations.insert(id, record.clone());
+            seeded.push(record);
+        }
+        seeded
     }
 
     /// Send one AppIntegrations request, signed for `region`.

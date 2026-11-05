@@ -328,8 +328,18 @@ async fn an_unassociated_data_integration_reports_an_empty_association_list() {
         }
     }
 
-    // An integration this account does not hold is not an empty page: there is no
-    // resource to report associations for.
+    // An identifier this account holds no DataIntegration for has no associations
+    // either, which is an empty page and not a refusal: this operation reports the
+    // associations an identifier names, it does not verify the integration exists.
+    // Rows differ in the FORM of that identifier, including one whose integration was
+    // deleted after it was created.
+    let (doomed_id, doomed_arn) = create_integration(&emulator, &kms_key, "doomed").await;
+    let deleted = delete_integration(&emulator, &doomed_id).await;
+    assert_eq!(
+        deleted.status, 200,
+        "the integration must be deletable so a row can list a gone one, got {} / {}",
+        deleted.status, deleted.body
+    );
     for (label, identifier) in [
         (
             "a UUID this service never minted",
@@ -340,19 +350,44 @@ async fn an_unassociated_data_integration_reports_an_empty_association_list() {
             format!("arn:aws:app-integrations:{REGION}:111122223333:data-integration/{lonely_id}"),
         ),
         ("a name rather than an identifier", "lonely".to_string()),
+        ("an identifier that is neither form", "gone-1".to_string()),
+        ("the id of a deleted integration", doomed_id.clone()),
+        ("the ARN of a deleted integration", doomed_arn.clone()),
     ] {
         let listed = list_associations(&emulator, &identifier, "").await;
         assert_eq!(
-            listed.status, 404,
-            "case {label:?}: expected HTTP 404, got {} / {}",
+            listed.status, 200,
+            "case {label:?}: expected HTTP 200, got {} / {}",
             listed.status, listed.body
         );
         assert_eq!(
-            listed.error_type, "ResourceNotFoundException",
-            "case {label:?}: expected ResourceNotFoundException, got {:?}",
-            listed.error_type
+            page_of(&listed),
+            Vec::<Value>::new(),
+            "case {label:?}: expected an empty page, got {}",
+            listed.body
+        );
+        assert_eq!(
+            listed.field("NextToken"),
+            None,
+            "case {label:?}: an empty page must report no NextToken, got {:?}",
+            listed.field("NextToken")
         );
     }
+
+    // The integration that DOES hold an association still reports it: answering an
+    // unresolvable identifier with an empty page reports nothing for the resolvable one.
+    let neighbour_page = list_associations(&emulator, &neighbour_id, "").await;
+    assert_eq!(
+        neighbour_page.status, 200,
+        "expected HTTP 200 for the associated integration, got {} / {}",
+        neighbour_page.status, neighbour_page.body
+    );
+    assert_eq!(
+        page_of(&neighbour_page).len(),
+        1,
+        "expected the associated integration to still report its association, got {}",
+        neighbour_page.body
+    );
 }
 
 #[tokio::test]

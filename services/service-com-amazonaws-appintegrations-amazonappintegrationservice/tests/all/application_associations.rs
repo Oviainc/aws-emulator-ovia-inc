@@ -21,9 +21,7 @@
 //! one row.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_appintegrations_amazonappintegrationservice::state::{
-    application_association_arn, ApplicationAssociationRecord,
-};
+use service_com_amazonaws_appintegrations_amazonappintegrationservice::state::ApplicationAssociationRecord;
 
 use super::harness::{encode_label, Emulator, Reply, REGION};
 
@@ -105,38 +103,6 @@ fn expected_summary(record: &ApplicationAssociationRecord) -> Value {
     })
 }
 
-/// Store one association per entry of `client_ids` for the application
-/// `(application_id, application_arn)`, answering the records in the order the store
-/// keeps them.
-///
-/// The association ids are hex-ordered, so the store's order is the order they were
-/// added in, and they continue after whatever is already stored so two applications
-/// never share one.
-fn seed_associations(
-    emulator: &Emulator,
-    application_id: &str,
-    application_arn: &str,
-    client_ids: &[String],
-) -> Vec<ApplicationAssociationRecord> {
-    let state = emulator.appintegrations_state();
-    let mut guard = state.lock();
-    let first = guard.application_associations.len();
-    let mut seeded = Vec::new();
-    for (offset, client_id) in client_ids.iter().enumerate() {
-        let id = format!("{:08x}-0000-4000-8000-000000000000", first + offset);
-        let record = ApplicationAssociationRecord {
-            arn: application_association_arn(REGION, application_id, &id),
-            id: id.clone(),
-            application_id: application_id.to_string(),
-            application_arn: application_arn.to_string(),
-            client_id: client_id.clone(),
-        };
-        guard.application_associations.insert(id, record.clone());
-        seeded.push(record);
-    }
-    seeded
-}
-
 #[tokio::test]
 async fn the_listing_reports_the_stored_associations_of_the_application_it_names() {
     // Rows differ in how many associations the application holds and in the client id's
@@ -161,14 +127,13 @@ async fn the_listing_reports_the_stored_associations_of_the_application_it_names
         let (neighbour_id, neighbour_arn) = create_application(&emulator, "neighbour").await;
         // A neighbour's associations are not this application's: the listing reports the
         // ones belonging to the application the request names.
-        seed_associations(
-            &emulator,
+        emulator.seed_application_associations(
             &neighbour_id,
             &neighbour_arn,
-            &["neighbour-client".to_string()],
+            &["neighbour-client"],
         );
         let stored =
-            seed_associations(&emulator, &application_id, &application_arn, &client_ids);
+            emulator.seed_application_associations(&application_id, &application_arn, &client_ids);
         let expected: Vec<Value> = stored.iter().map(expected_summary).collect();
 
         // Every identifier form the `ArnOrUUID` label accepts, with and without the
@@ -279,7 +244,8 @@ async fn the_page_controls_of_the_association_listing_follow_their_published_bou
     let emulator = Emulator::new();
     let (application_id, application_arn) = create_application(&emulator, "paged").await;
     let client_ids: Vec<String> = (0..7).map(|index| format!("client-{index}")).collect();
-    let stored = seed_associations(&emulator, &application_id, &application_arn, &client_ids);
+    let stored =
+        emulator.seed_application_associations(&application_id, &application_arn, &client_ids);
     let all: Vec<Value> = stored.iter().map(expected_summary).collect();
 
     // Rows differ in the page size the walk uses: one per page, a size that divides the

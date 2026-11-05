@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored application from this service's store, so every later read of it —
+//! `GetApplication`, `ListApplications`, another `DeleteApplication` — reports it as not
+//! found and its (`Namespace`, `Name`) pair is free again. The `ClientToken` of the
+//! create that minted it is forgotten with it, so a replay of that create makes a new
+//! application rather than reporting one that no longer exists.
+//!
+//! An application that is still associated with a client is removed only when the
+//! request carries `Force`; without it the delete is refused and nothing is dropped.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +150,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplication"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `Arn` is an `ArnOrUUID`, so either identifier form this service hands out
+        // addresses the application; one that names none is a 404, and so is a second
+        // delete of an application an earlier call already removed.
+        let id = state.application_id(&input.arn).ok_or_else(|| {
+            // An operator's record of a refused destructive call, beside the one the
+            // applied delete emits below, so a refusal leaves a trace too. No
+            // credential or token is logged.
+            ::tracing::info!(
+                operation = Self::NAME,
+                outcome = "not_found",
+                "refused a DeleteApplication"
+            );
+            DeleteApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::application_not_found(&input.arn)),
+            })
+        })?;
+
+        // "If the application has associations, you must delete them first.
+        // Alternatively, use the force option to delete the application and remove its
+        // associations" (this operation's own documentation). `Force` defaults to false,
+        // so an unqualified delete of an associated application is refused, as the
+        // `InvalidRequestException` this operation models — the same shape
+        // `DeleteDataIntegration` keeps its own "delete only what nothing depends on"
+        // rule in.
+        if !input.force && state.has_application_associations(&id) {
+            ::tracing::info!(
+                operation = Self::NAME,
+                application_id = %id,
+                outcome = "still_associated",
+                "refused a DeleteApplication"
+            );
+            return Err(DeleteApplicationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "The application {id} still has associations and cannot be deleted."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An association exists only as part of the application it belongs to, so a
+        // forced delete takes its associations with it rather than leaving records
+        // pointing at an application no read resolves.
+        let dropped_associations = state.remove_application_associations_of(&id);
+        let removed = state.applications.remove(&id);
+        // The idempotency record of the create that minted it goes with it, so a retry of
+        // that create after the delete creates the application again rather than
+        // reporting the id and ARN of one that no longer exists.
+        if let Some(token) = removed.and_then(|record| record.client_token) {
+            state.application_idempotency.remove(&token);
+        }
+        // An operator's record that this call changed state: the operation, the resource
+        // it touched (the id this service minted, never a value the request supplied) and
+        // what went with it. No credential or token is logged.
+        ::tracing::info!(
+            operation = Self::NAME,
+            application_id = %id,
+            associations_dropped = dropped_associations,
+            outcome = "deleted",
+            "deleted an Application"
+        );
+
+        Ok(DeleteApplicationOutput {})
     }
 }

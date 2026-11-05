@@ -2,8 +2,10 @@
 
 //! @op ListDataIntegrationAssociations
 //!
-//! Reports one page of the associations a stored DataIntegration has, in the
-//! deterministic order of the ids this service minted for them.
+//! Reports one page of the associations the DataIntegration identifier names, in the
+//! deterministic order of the ids this service minted for them. The identifier is
+//! resolved rather than verified: one this account holds no DataIntegration for has no
+//! associations, which is an empty page rather than a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -160,19 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // The associations of a DataIntegration this account does not hold are not an
-        // empty page: there is no resource to report them for.
-        let integration_id = state
-            .data_integration_id(&input.data_integration_identifier)
-            .ok_or_else(|| {
-                ListDataIntegrationAssociationsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::data_integration_not_found(
-                            &input.data_integration_identifier,
-                        )),
-                    },
-                )
-            })?;
+        // The identifier is resolved, not verified: this operation reports the
+        // associations the identifier names, and an identifier this account holds no
+        // DataIntegration for simply has none of them — an empty page, not a refusal.
+        let integration_id = state.data_integration_id(&input.data_integration_identifier);
 
         // The cursor is an inclusive start key: the page begins at the first stored
         // association id at or after the one the token names, so a resource added or
@@ -196,8 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 usize::try_from(max).unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
             });
 
-        let mut remaining = state
-            .associations_of(&integration_id)
+        let mut remaining = integration_id
+            .as_deref()
+            .into_iter()
+            .flat_map(|id| state.associations_of(id))
             .filter(|(id, _)| start_at.as_ref().is_none_or(|from| *id >= from));
 
         let page: Vec<DataIntegrationAssociationSummary> = remaining
