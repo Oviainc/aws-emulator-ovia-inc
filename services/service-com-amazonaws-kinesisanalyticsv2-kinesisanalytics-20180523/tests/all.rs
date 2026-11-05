@@ -15,6 +15,8 @@
 mod application_lifecycle;
 #[path = "all/application_mode_and_maintenance_window.rs"]
 mod application_mode_and_maintenance_window;
+#[path = "all/application_version_reads.rs"]
+mod application_version_reads;
 #[path = "all/body_timestamp_class.rs"]
 mod body_timestamp_class;
 #[path = "all/error_envelope_wording.rs"]
