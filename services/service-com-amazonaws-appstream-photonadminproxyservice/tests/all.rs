@@ -15,6 +15,8 @@
 mod associated_fleets;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/stack_fleet_lifecycle.rs"]
 mod stack_fleet_lifecycle;
 #[path = "all/stack_registry.rs"]

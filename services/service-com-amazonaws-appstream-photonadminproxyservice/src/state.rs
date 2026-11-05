@@ -32,6 +32,12 @@
 //! Records hold the MODELLED sub-shapes (`StorageConnector`, `UserSetting`,
 //! `VpcConfig`, …) rather than copies of them, so what a Describe returns is literally
 //! what the Create persisted.
+//!
+//! A resource's tags live on that resource's own record, reached by ARN
+//! ([`ComAmazonawsAppstreamPhotonadminproxyserviceState::resource_tags`]): the map a
+//! `CreateStack`/`CreateFleet` persisted is the one `TagResource` adds to,
+//! `UntagResource` removes from and `ListTagsForResource` reports, so there is no second
+//! copy to drift.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -234,6 +240,73 @@ pub fn stack_in_use_by_fleets_message(stack_name: &str) -> String {
         "Cannot delete stack {stack_name}. This stack has fleets associated with it. \
          Only stacks with no fleets associated with it can be deleted."
     )
+}
+
+/// How many tags ONE resource may carry.
+///
+/// The model bounds a single `TagResource` request's `Tags` map and a single
+/// `UntagResource` request's `TagKeys` list at 50 entries
+/// (`smithy_query(query="shape", shape="Tags")`: `length 1..50`), and the same 50 is the
+/// per-resource ceiling: tagging that would leave a resource carrying more than this many
+/// tags is refused with `LimitExceededException`, the modelled error for "the requested
+/// limit exceeds the permitted limit for an account", and persists nothing.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// AWS's `LimitExceededException` sentence, as this service's model documents that error
+/// shape (`smithy_query(query="doc", shape="LimitExceededException")`: "The requested
+/// limit exceeds the permitted limit for an account."): the one wording a request refused
+/// for crossing a limit carries, naming the rule and nothing of the request.
+pub fn tags_limit_exceeded_message() -> String {
+    "The requested limit exceeds the permitted limit for an account.".to_string()
+}
+
+/// The ARN `resource-type` segment of a stack, the segment before the stack's name in
+/// `arn:aws:appstream:<region>:<account>:stack/<name>`.
+pub const STACK_ARN_RESOURCE_TYPE: &str = "stack";
+
+/// The ARN `resource-type` segment of a fleet.
+pub const FLEET_ARN_RESOURCE_TYPE: &str = "fleet";
+
+/// The `<kind>` word a refusal uses for an ARN whose resource part carries no
+/// `<resource-type>/<resource-id>` to name a kind with.
+pub const UNTYPED_RESOURCE_KIND: &str = "resource";
+
+/// The `resource-type` and `resource-id` an ARN names, from its sixth colon-separated
+/// field: `arn:<partition>:<service>:<region>:<account>:<resource-type>/<resource-id>`,
+/// where the separator between the type and the id is `/` or `:`.
+///
+/// An ARN whose resource part carries no type (`…:<resource-id>`) answers
+/// [`UNTYPED_RESOURCE_KIND`] and the whole resource part, so a caller is still told which
+/// resource was searched for.
+pub fn arn_resource(arn: &str) -> (String, String) {
+    let Some(resource) = arn.splitn(6, ':').nth(5) else {
+        return (UNTYPED_RESOURCE_KIND.to_string(), arn.to_string());
+    };
+    match resource.split_once(['/', ':']) {
+        Some((resource_type, resource_id))
+            if !resource_type.is_empty() && !resource_id.is_empty() =>
+        {
+            (resource_type.to_string(), resource_id.to_string())
+        }
+        _ => (UNTYPED_RESOURCE_KIND.to_string(), resource.to_string()),
+    }
+}
+
+/// AWS's `ResourceNotFoundException` sentence for a resource addressed by ARN: the same
+/// `The <kind> <name> for account <account id> does not exist.` template every named
+/// resource is refused with ([`resource_not_found_message`]), with the kind and the name
+/// read out of the ARN.
+///
+/// The ARN's `resource-type` is the kind, spelled the way AWS's sentences spell it — the
+/// hyphens an ARN segment uses between words are spaces in a sentence.
+pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
+    let (resource_type, resource_id) = arn_resource(resource_arn);
+    let kind = match resource_type.as_str() {
+        STACK_ARN_RESOURCE_TYPE => STACK_KIND.to_string(),
+        FLEET_ARN_RESOURCE_TYPE => FLEET_KIND.to_string(),
+        other => other.replace('-', " "),
+    };
+    resource_not_found_message(&kind, &resource_id)
 }
 
 /// The `Schedule` a usage report subscription carries. The model's
@@ -662,6 +735,53 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
         self.fleet_stack_associations
             .iter()
             .any(|(_, stack)| stack == stack_name)
+    }
+
+    /// The tags the resource with this ARN carries, for reading; `None` when this
+    /// service holds no resource under that ARN.
+    ///
+    /// The tags live ON the resource's own record — the map a `CreateStack`/`CreateFleet`
+    /// persisted — so a read reports exactly what the create and every later tag write
+    /// left there, and nothing can drift between two copies. The stored ARN must match
+    /// the one asked about in full, so an ARN naming another Region or account addresses
+    /// no resource here.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        let (resource_type, name) = arn_resource(resource_arn);
+        match resource_type.as_str() {
+            STACK_ARN_RESOURCE_TYPE => self
+                .stacks
+                .get(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            FLEET_ARN_RESOURCE_TYPE => self
+                .fleets
+                .get(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            _ => None,
+        }
+    }
+
+    /// The same tags, for writing: the map `TagResource` adds to and `UntagResource`
+    /// removes from.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        let (resource_type, name) = arn_resource(resource_arn);
+        match resource_type.as_str() {
+            STACK_ARN_RESOURCE_TYPE => self
+                .stacks
+                .get_mut(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            FLEET_ARN_RESOURCE_TYPE => self
+                .fleets
+                .get_mut(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            _ => None,
+        }
     }
 
     /// One page of this authentication type's users: the records to render, and the
