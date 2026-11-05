@@ -27,6 +27,8 @@ mod asset_revision_listing;
 mod asset_revisions;
 #[path = "all/asset_types.rs"]
 mod asset_types;
+#[path = "all/create_project_domain_resolution.rs"]
+mod create_project_domain_resolution;
 #[path = "all/domain_name_conflict_and_not_found.rs"]
 mod domain_name_conflict_and_not_found;
 #[path = "all/domain_project_lifecycle.rs"]

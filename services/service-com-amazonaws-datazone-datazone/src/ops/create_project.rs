@@ -6,6 +6,10 @@
 //! `GetProject`/`ListProjects` answer from the stored record and the project disappears
 //! with its domain.
 //!
+//! The domain is RESOLVED first: a `domainIdentifier` that satisfies the modelled pattern
+//! but names no stored domain is answered with `ResourceNotFoundException` naming that
+//! identifier, never with a denial.
+//!
 //! `createdBy` is the CALLER's principal (derived from the request's SigV4 scope), not
 //! anything the request body carries.
 //!
@@ -203,9 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, date_time, membership_from_request, now_ms, Membership,
-            MembershipRefusal, Project, DOMAIN_STATUS_AVAILABLE, MAX_MEMBERSHIPS_PER_PROJECT,
-            PROJECT_STATUS_ACTIVE,
+            caller_principal, date_time, domain_not_found_message, membership_from_request, now_ms,
+            Membership, MembershipRefusal, Project, DOMAIN_STATUS_AVAILABLE,
+            MAX_MEMBERSHIPS_PER_PROJECT, PROJECT_STATUS_ACTIVE,
         };
         use std::collections::BTreeMap;
 
@@ -229,26 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_clock(now);
 
         let created_by = caller_principal(ctx);
-        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
-        // caller holds none on an identifier this store serves no domain for, and the
-        // request is denied before any resource lookup rather than reported as a miss.
-        if !store.authorizes_domain(&input.domain_identifier) {
-            return Err(CreateProjectErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: crate::state::not_permitted_message(Self::NAME),
-                },
-            )
-            .into());
-        }
-        // The check above read this same store under this same lock, so the domain is
-        // there; the status it carries is what decides whether it can take a project.
+        // The domain a project is created IN is a resource this call RESOLVES: an
+        // identifier that satisfies the modelled pattern but names no domain this store
+        // holds is that resource's own miss, reported as the modelled not-found naming
+        // the identifier the request's path carried. `AccessDeniedException` stays with
+        // the authorization decision, which an absent domain is not.
         let (domain_status, project_count) = store
             .domains
             .get(&input.domain_identifier)
             .map(|d| (d.status.clone(), d.projects.len()))
             .ok_or_else(|| {
-                CreateProjectErrorModeled::InternalServerException(InternalServerException {
-                    message: "the DataZone store lost the domain mid-request".to_string(),
+                CreateProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: domain_not_found_message(&input.domain_identifier),
                 })
             })?;
         // A domain still being created, or already being deleted, cannot take a

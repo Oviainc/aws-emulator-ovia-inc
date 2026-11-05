@@ -780,9 +780,10 @@ async fn created_projects_are_persisted_scoped_and_deletable() {
 async fn a_project_needs_a_domain_that_exists_and_is_available() {
     let dz = Emulator::new();
 
-    // No such domain at all: a permission is held ON a domain, so the caller holds none
-    // on an identifier the store serves no domain for, and both the create and the
-    // listing are denied before any lookup.
+    // No such domain at all: `CreateProject` RESOLVES the domain a project is created in,
+    // so the create answers that domain's own miss naming the identifier, while the
+    // listing — which a permission is held ON the domain for — is denied before any
+    // lookup.
     let orphan = dz
         .call(
             "POST",
@@ -793,11 +794,11 @@ async fn a_project_needs_a_domain_that_exists_and_is_available() {
     assert_eq!(
         (orphan.status, orphan.error_code.as_str(), orphan.s("message")),
         (
-            403,
-            "AccessDeniedException",
-            "User is not permitted to perform operation: CreateProject".to_string()
+            404,
+            "ResourceNotFoundException",
+            "Domain dzd_doesnotexist not found".to_string()
         ),
-        "a domain nothing created must be denied, got {} {:?}",
+        "a domain nothing created must be the create's own miss, got {} {:?}",
         orphan.status,
         orphan.body
     );

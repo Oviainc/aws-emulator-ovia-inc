@@ -35,6 +35,10 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is one this service DOES take: it serves the
+//! model's own `restJson1` codec with the one difference the shared renderer cannot
+//! express — what a FAILURE's body carries (see [`rest_json_error_body`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -45,6 +49,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// What a failure carries on the wire — the one difference from the model's own
+/// `restJson1` renderer this service takes.
+pub mod rest_json_error_body;
+
 /// The `com-amazonaws-datazone-datazone` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +60,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: rest_json_error_body::DataZoneRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +72,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: rest_json_error_body::DataZoneRestJson::new(),
         }
     }
 }
@@ -135,5 +147,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the shared renderer
+        // cannot express: a failure's body carries the error shape's own members and
+        // nothing else, because this protocol names the shape in a header (see
+        // `rest_json_error_body`). Borrowed from the field built in `new`, never
+        // constructed per request.
+        Some(&self.protocol)
     }
 }

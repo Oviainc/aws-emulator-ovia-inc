@@ -3193,6 +3193,19 @@ impl std::fmt::Display for ResourceKind {
     }
 }
 
+/// The `ResourceNotFoundException` message answered for a DOMAIN the request RESOLVES and
+/// this store holds no record of — the domain a resource is created IN, named by the
+/// `domainIdentifier` the request's path carried.
+///
+/// Recorded behaviour, and fixed text apart from that ONE substitution: the identifier is
+/// taken verbatim from the request, and nothing else about the request, the caller or the
+/// store appears in it. Distinct from [`ResourceKind::not_found_message`], which names the
+/// kind alone and is what the operations that resolve a resource INSIDE a domain answer;
+/// this one belongs to the operations whose miss is the domain itself.
+pub fn domain_not_found_message(domain_identifier: &str) -> String {
+    format!("Domain {domain_identifier} not found")
+}
+
 /// The `AccessDeniedException` message DataZone answers a request it denies INSIDE a
 /// domain — one carrying a `domainIdentifier` and addressing a resource under it.
 ///

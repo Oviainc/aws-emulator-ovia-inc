@@ -424,52 +424,82 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
     // existence answer: a permission is held ON a domain, so the caller holds none
     // there and authorization decides the call first. The denial names the OPERATION
     // and nothing the caller sent, and the one whose own identifier IS the domain scope
-    // (`DeleteDomain`) carries no message at all.
-    let denied: Vec<(&str, &str, String, Option<Value>, String)> = vec![
+    // (`DeleteDomain`) carries no message member at all.
+    //
+    // One row: the case, the method, the URI, the request body, and the `message` member
+    // the denial must carry on the wire (absent when the service states nothing).
+    type Denied = (&'static str, &'static str, String, Option<Value>, Option<String>);
+    let denied: Vec<Denied> = vec![
         (
             "DeleteDomain with a domain nothing created",
             "DELETE",
             format!("/v2/domains/{MISSING_DOMAIN_ID}"),
             None,
-            String::new(),
-        ),
-        (
-            "CreateProject under a domain nothing created",
-            "POST",
-            format!("/v2/domains/{MISSING_DOMAIN_ID}/projects"),
-            Some(json!({ "name": "orphan project" })),
-            "User is not permitted to perform operation: CreateProject".to_string(),
+            None,
         ),
         (
             "DeleteProject under a domain nothing created",
             "DELETE",
             format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
             None,
-            "User is not permitted to perform operation: DeleteProject".to_string(),
+            Some("User is not permitted to perform operation: DeleteProject".to_string()),
         ),
         (
             "UpdateProject under a domain nothing created",
             "PATCH",
             format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
             Some(json!({ "description": "no such domain" })),
-            "User is not permitted to perform operation: UpdateProject".to_string(),
+            Some("User is not permitted to perform operation: UpdateProject".to_string()),
         ),
     ];
     for (label, method, uri, body, message) in denied {
         let answer = dz.call(method, &uri, body).await;
+        let on_the_wire = answer
+            .body
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         assert_eq!(
-            (answer.status, answer.error_code.as_str(), answer.s("message")),
+            (answer.status, answer.error_code.as_str(), on_the_wire.clone()),
             (403, "AccessDeniedException", message),
             "case {label:?}: expected the modelled denial, got {} {:?}",
             answer.status,
             answer.body
         );
         assert!(
-            !answer.s("message").contains(MISSING_DOMAIN_ID),
+            on_the_wire
+                .as_ref()
+                .is_none_or(|text| !text.contains(MISSING_DOMAIN_ID)),
             "case {label:?}: the denial must not echo the requested domain, got {:?}",
             answer.body
         );
     }
+
+    // `CreateProject` RESOLVES the domain a project is created in, so the same absent
+    // identifier is that domain's own miss there, named in the message.
+    let orphan = dz
+        .call(
+            "POST",
+            &format!("/v2/domains/{MISSING_DOMAIN_ID}/projects"),
+            Some(json!({ "name": "orphan project" })),
+        )
+        .await;
+    assert_eq!(
+        (
+            orphan.status,
+            orphan.error_code.as_str(),
+            orphan.s("message")
+        ),
+        (
+            404,
+            "ResourceNotFoundException",
+            format!("Domain {MISSING_DOMAIN_ID} not found")
+        ),
+        "CreateProject under a domain nothing created: expected the domain's own miss, \
+         got {} {:?}",
+        orphan.status,
+        orphan.body
+    );
 
     // The isolation itself still holds: each project is readable only under its own
     // domain, and it is still there after every refusal above.

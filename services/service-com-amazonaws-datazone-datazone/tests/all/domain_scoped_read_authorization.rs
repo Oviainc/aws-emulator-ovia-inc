@@ -78,20 +78,30 @@ impl Read {
         }
     }
 
-    /// The `message` this read's denial must carry: the recorded operation-scoped
-    /// sentence for a read INSIDE a domain, and nothing at all for the one whose own
-    /// identifier is the domain scope (recorded behaviour: that denial's body carries
-    /// no members).
-    fn denial_message(&self) -> String {
+    /// The `message` member this read's denial must carry: the recorded operation-scoped
+    /// sentence for a read INSIDE a domain, and NO member at all for the one whose own
+    /// identifier is the domain scope (recorded behaviour: that denial's body carries no
+    /// members, and a member the service states nothing in is absent from a `restJson1`
+    /// body rather than present and empty).
+    fn denial_message(&self) -> Option<String> {
         if self.suffix.is_empty() {
-            String::new()
+            None
         } else {
-            format!(
+            Some(format!(
                 "User is not permitted to perform operation: {}",
                 self.operation
-            )
+            ))
         }
     }
+}
+
+/// The `message` member an answer carries, absent when the body carries none.
+fn denial_message_member(answer: &crate::harness::Answer) -> Option<String> {
+    answer
+        .body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// One domain with one of every resource the reads below address.
@@ -357,14 +367,14 @@ async fn a_read_scoped_to_a_domain_the_store_does_not_serve_is_denied() {
                 answer.status,
                 answer.body
             );
-            let message = answer.s("message");
+            let message = denial_message_member(&answer);
             assert_eq!(
                 message,
                 read.denial_message(),
                 "case {case:?}: the denial must carry the recorded message, got {message:?}"
             );
             assert!(
-                !message.contains(&unserved),
+                message.as_ref().is_none_or(|text| !text.contains(&unserved)),
                 "case {case:?}: the denial must not echo the requested domain {unserved:?}, \
                  got {message:?}"
             );
@@ -461,7 +471,7 @@ async fn every_read_is_denied_once_the_domain_it_is_scoped_to_is_deleted() {
             answer.body
         );
         assert_eq!(
-            answer.s("message"),
+            denial_message_member(&answer),
             read.denial_message(),
             "case {:?}: the denial must carry the recorded message, got {:?}",
             read.operation,

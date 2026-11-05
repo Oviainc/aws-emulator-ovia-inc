@@ -20,7 +20,9 @@
 //!
 //! `domain_scoped_read_authorization` asserts the same rule over the single-resource
 //! reads; this suite is its counterpart for everything else, so the two together cover
-//! every domain-scoped operation this emulator serves.
+//! every domain-scoped operation this emulator serves — except `CreateProject`, whose
+//! recorded answer for an identifier naming no stored domain is that domain's own
+//! not-found, asserted in `create_project_domain_resolution`.
 //!
 //! Each rule is asserted over a TABLE, not one request:
 //!
@@ -97,20 +99,30 @@ impl Call {
         }
     }
 
-    /// The `message` this call's denial must carry: the recorded operation-scoped
-    /// sentence for a call INSIDE a domain, and nothing at all for the one whose own
-    /// identifier is the domain scope (recorded behaviour: that denial's body carries no
-    /// members).
-    fn denial_message(&self) -> String {
+    /// The `message` member this call's denial must carry: the recorded
+    /// operation-scoped sentence for a call INSIDE a domain, and NO member at all for the
+    /// one whose own identifier is the domain scope (recorded behaviour: that denial's
+    /// body carries no members, and a member the service states nothing in is absent from
+    /// a `restJson1` body rather than present and empty).
+    fn denial_message(&self) -> Option<String> {
         if self.suffix.is_empty() {
-            String::new()
+            None
         } else {
-            format!(
+            Some(format!(
                 "User is not permitted to perform operation: {}",
                 self.operation
-            )
+            ))
         }
     }
+}
+
+/// The `message` member an answer carries, absent when the body carries none.
+fn denial_message_member(answer: &crate::harness::Answer) -> Option<String> {
+    answer
+        .body
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// One domain holding one of every resource the calls below address.
@@ -135,6 +147,11 @@ impl Served {
     /// Every domain-scoped create, update, delete and listing this emulator serves, each
     /// addressing the resource this fixture really stores.
     ///
+    /// `CreateProject` is NOT among them: the domain a project is created in is a
+    /// resource that call resolves, so an identifier naming no stored domain is its own
+    /// not-found rather than a denial (asserted over its own table in
+    /// `create_project_domain_resolution`).
+    ///
     /// Ordered so that a pass over the table against the SERVING domain keeps its own
     /// preconditions: the creates, listings and updates run before the deletes, and the
     /// delete of the domain itself is last.
@@ -150,12 +167,6 @@ impl Served {
             "detail": { "createGlossary": { "includeChildDomainUnits": true } },
         });
         vec![
-            Call::new(
-                "CreateProject",
-                "POST",
-                "projects".to_string(),
-                Some(json!({ "name": "denied project" })),
-            ),
             Call::new("ListProjects", "GET", "projects".to_string(), None),
             Call::new(
                 "GetProject",
@@ -658,14 +669,14 @@ async fn every_domain_scoped_call_is_denied_when_the_store_serves_no_such_domain
                 answer.status,
                 answer.body
             );
-            let message = answer.s("message");
+            let message = denial_message_member(&answer);
             assert_eq!(
                 message,
                 call.denial_message(),
                 "case {case:?}: the denial must carry the recorded message, got {message:?}"
             );
             assert!(
-                !message.contains(&unserved),
+                message.as_ref().is_none_or(|text| !text.contains(&unserved)),
                 "case {case:?}: the denial must not echo the requested domain {unserved:?}, \
                  got {message:?}"
             );
@@ -821,7 +832,7 @@ async fn every_call_is_denied_once_the_domain_it_is_scoped_to_is_deleted() {
             answer.body
         );
         assert_eq!(
-            answer.s("message"),
+            denial_message_member(&answer),
             call.denial_message(),
             "case {:?}: the denial must carry the recorded message, got {:?}",
             call.operation,
