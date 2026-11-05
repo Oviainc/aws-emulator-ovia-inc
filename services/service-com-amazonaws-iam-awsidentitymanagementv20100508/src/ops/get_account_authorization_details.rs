@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order that the marker names, so a token this service's encoding cannot have
         // produced is refused rather than silently read as "start from the beginning".
         // This operation models no invalid-input error, so the refusal is the 400
-        // `ValidationException` an unmodelled bad request gets. A token that decodes
+        // `ValidationError` an unmodelled bad request gets. A token that decodes
         // but names an entity deleted since the previous page is NOT an error: paging
         // resumes from the position, and that entity is simply no longer in the range.
         let resume_after = match &input.marker {
@@ -211,8 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 Some(key) => Some(key),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Invalid Marker: the value is not a marker this service issued",
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::INVALID_MARKER,
                     ))
                 }
             },
@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carrying no member at all, which specifies no type and whose wire form is
         // indistinguishable from the absent parameter. Each value is one of the
         // modelled `EntityType` enum's, and the boundary validator has already refused
-        // any value outside the declared set (400 `ValidationException`).
+        // any value outside the declared set (400 `ValidationError`).
         let filter = input.filter.unwrap_or_default();
         let selected = |entity_type: &str| {
             filter.is_empty() || filter.iter().any(|wanted| wanted == entity_type)

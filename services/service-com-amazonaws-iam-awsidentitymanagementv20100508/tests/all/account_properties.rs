@@ -215,8 +215,8 @@ async fn a_fresh_account_reports_the_default_properties() {
 
 /// RULE: a namespace names an account-wide feature the service itself offers, so a
 /// key under a namespace the service does not serve configures nothing: the write
-/// is refused — the modelled `InvalidInputException` (HTTP 400, awsQuery code
-/// `InvalidInput`) naming that namespace — and nothing it carried is persisted, so
+/// is refused — HTTP 400 under the code IAM answers a value it cannot accept with
+/// (`ValidationError`) — naming that namespace, and nothing it carried is persisted, so
 /// a later read never reports a property the service does not serve.
 #[tokio::test]
 async fn a_write_under_a_namespace_the_service_does_not_serve_is_refused() {
@@ -265,8 +265,8 @@ async fn a_write_under_a_namespace_the_service_does_not_serve_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "InvalidInput",
-                "case {case:?}: expected InvalidInput, got {:?}",
+                "ValidationError",
+                "case {case:?}: expected ValidationError, got {:?}",
                 error_code(&body)
             );
             assert_eq!(
@@ -372,8 +372,8 @@ async fn setting_a_property_replaces_its_value_and_leaves_the_others_alone() {
 }
 
 /// RULE: "all keys must belong to the same namespace", so a write whose keys span
-/// more than one namespace is refused as a whole — the modelled
-/// `InvalidInputException` (HTTP 400, awsQuery code `InvalidInput`) — and persists
+/// more than one namespace is refused as a whole — HTTP 400 under the code IAM answers
+/// a value it cannot accept with (`ValidationError`) — and persists
 /// none of its pairs. The request's shape is taken before the namespace it names is
 /// looked up, so a spanning request is refused for spanning whichever namespaces it
 /// spans.
@@ -411,8 +411,8 @@ async fn a_write_whose_keys_span_two_namespaces_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {case:?}: expected InvalidInput, got {:?}",
+            "ValidationError",
+            "case {case:?}: expected ValidationError, got {:?}",
             error_code(&body)
         );
         let reported = current_properties(&router, &case).await;
@@ -474,8 +474,8 @@ async fn a_key_outside_the_published_key_shape_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "InvalidInput",
-                "case {case:?}: expected InvalidInput, got {:?}",
+                "ValidationError",
+                "case {case:?}: expected ValidationError, got {:?}",
                 error_code(&body)
             );
             let reported = current_properties(&router, &case).await;
@@ -617,8 +617,8 @@ async fn a_write_past_the_bound_on_the_held_properties_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {case:?}: expected InvalidInput, got {:?}",
+            "ValidationError",
+            "case {case:?}: expected ValidationError, got {:?}",
             error_code(&body)
         );
         let held = current_properties(&filled, &case).await;

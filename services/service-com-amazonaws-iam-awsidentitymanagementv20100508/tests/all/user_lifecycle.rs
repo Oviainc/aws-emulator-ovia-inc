@@ -565,13 +565,13 @@ async fn optional_members_round_trip_exactly_as_supplied() {
                     vec![arn.to_string()],
                     "case {name:?}: expected the stored boundary ARN, got {reported_boundary:?}"
                 );
-                // The one value the model's PermissionsBoundaryAttachmentType enum
-                // declares (smithy_query(query="shape",
-                // shape="PermissionsBoundaryAttachmentType")).
+                // The `PermissionsBoundaryType` AWS puts on the wire beside the ARN:
+                // `Policy`, not the name the model gives the single
+                // `PermissionsBoundaryAttachmentType` entry.
                 assert_eq!(
                     elements(&fetched, "PermissionsBoundaryType"),
-                    vec!["PermissionsBoundaryPolicy".to_string()],
-                    "case {name:?}: expected the modelled boundary type, got {:?}",
+                    vec!["Policy".to_string()],
+                    "case {name:?}: expected AWS's boundary type, got {:?}",
                     elements(&fetched, "PermissionsBoundaryType")
                 );
             }
@@ -968,7 +968,7 @@ async fn a_marker_this_service_did_not_issue_is_refused() {
         assert_eq!(status, 400, "case {bogus:?}: expected 400, got {status}: {body}");
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "ValidationError",
             "case {bogus:?}: expected the marker to be refused as invalid, got {:?}",
             error_code(&body)
         );

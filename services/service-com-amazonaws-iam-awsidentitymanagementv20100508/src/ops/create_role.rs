@@ -246,12 +246,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-
+        // `Path` is taken against its published form BEFORE the store is locked: the check
+        // is one pass over the member's characters — no allocation, no index into the
+        // string, no regex — and `pathType`'s own 1..512 length (this operation's input
+        // contract above) is what bounds that pass, so no caller-driven work is added
+        // inside the critical section below.
         let path = input
             .path
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        if !::service_common::iam_entity_path::is_published_form(&path) {
+            return Err(crate::state::invalid_entity_path());
+        }
+
+        let mut store = state.lock();
         // IAM authorizes its own API: the caller's identity-based policies are evaluated
         // before the role is created and before the store is consulted, on the ARN the
         // role WOULD carry, with the tags this request attaches handed to the gate — the

@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models no server error, so an unreachable store is reported
             // through the crate's generic refusal channel.
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::validation_error(
                 "the IAM store is unavailable",
             ));
         };

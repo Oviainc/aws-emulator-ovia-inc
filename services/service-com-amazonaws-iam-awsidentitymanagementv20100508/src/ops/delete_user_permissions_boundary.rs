@@ -168,7 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM entity names "are not distinguished by case", so the user is found under
         // the case-folded name whatever case the request spelled it in; a name the
         // account holds no user under "referenced a resource entity that does not exist",
-        // worded as every reader of a user in this crate words that absence — an answer
+        // worded in this operation's own sentence for it — `User ` and ` was not found.`
+        // around the name the request supplied, which is a different sentence from the
+        // `The user with name … cannot be found.` IAM's classic user surface answers, and
+        // part of the wire contract a client matching the message sees — an answer
         // withheld until the call has been authorized, because IAM decides a call against
         // the caller's policies before it reads the resource.
         let key = crate::state::name_key(&input.user_name);
@@ -196,10 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "The user with name {} cannot be found.",
-                            input.user_name
-                        )),
+                        message: Some(format!("User {} was not found.", input.user_name)),
                     },
                 )
                 .into(),
@@ -208,17 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What this operation deletes is the BOUNDARY, so a user carrying none
         // "referenced a resource entity that does not exist" and nothing is written: the
-        // refusal describes the resource that is missing — the boundary — rather than the
-        // user, which is there. The same rule `DeleteRolePermissionsBoundary` applies to a
-        // role's.
+        // refusal describes the resource that is missing — the scope on the principal's
+        // permissions — rather than the user, which is there, and names that principal by
+        // its own unique id, in the one sentence both boundary deletes word that absence
+        // with (`crate::state::principal_has_no_scope`). The same rule
+        // `DeleteRolePermissionsBoundary` applies to a role's.
         if user.permissions_boundary.is_none() {
             return Err(
                 DeleteUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "No permissions boundary is set for the user with name {}.",
-                            input.user_name
-                        )),
+                        message: Some(crate::state::principal_has_no_scope(&user.user_id)),
                     },
                 )
                 .into(),

@@ -626,7 +626,7 @@ async fn a_marker_this_service_did_not_issue_for_the_user_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "ValidationError",
             "case {case:?}: expected the marker to be refused as invalid, got {body}"
         );
     }

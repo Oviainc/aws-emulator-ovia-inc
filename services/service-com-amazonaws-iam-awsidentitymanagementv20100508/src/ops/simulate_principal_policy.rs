@@ -417,10 +417,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     Some(position) => position,
                     None => {
-                        return Err(invalid_input(
-                            "Invalid Marker: the value is not a marker this service issued"
-                                .to_string(),
-                        ))
+                        return Err(invalid_input(crate::state::INVALID_MARKER.to_string()))
                     }
                 }
             }

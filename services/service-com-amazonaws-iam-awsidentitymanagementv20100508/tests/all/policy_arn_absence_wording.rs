@@ -10,7 +10,8 @@
 //! write alike), `Policy ` and ` does not exist or is not attachable.` for the operations
 //! whose subject is the ATTACHMENT of that policy to an entity, among them the create of
 //! the version that takes effect for the identities the policy is attached to and the
-//! listing of those versions. The
+//! listing of those versions, and `Policy `, ` version ` and ` does not exist or is not
+//! attachable.` for the read addressed by a version as well as an ARN. The
 //! sentence belongs to the family, not to the handler, so no operation may compose one of
 //! its own.
 //!
@@ -81,14 +82,26 @@ enum Family {
     /// the identities it is attached to, and the listing of the policy's versions, which
     /// reports which one that is.
     Attachment,
+    /// The read addressed by a `PolicyArn` AND a `VersionId`, whose sentence names the
+    /// version it was addressed by beside the ARN: such a call cannot tell "this ARN names
+    /// nothing" from "it names nothing carrying that version".
+    Version,
 }
 
-impl Family {
-    /// IAM's message for `arn` resolving to no managed policy, for this family.
-    fn message(self, arn: &str) -> String {
-        match self {
+impl PolicyArnCall {
+    /// IAM's message for `arn` resolving to no managed policy, for this call's family.
+    fn message(&self, arn: &str) -> String {
+        match self.family {
             Family::Resource => format!("Policy {arn} was not found."),
             Family::Attachment => format!("Policy {arn} does not exist or is not attachable."),
+            Family::Version => {
+                let version = self
+                    .extra
+                    .iter()
+                    .find_map(|(member, value)| (*member == "VersionId").then_some(*value))
+                    .expect("a version-family row addresses a VersionId");
+                format!("Policy {arn} version {version} does not exist or is not attachable.")
+            }
         }
     }
 }
@@ -112,7 +125,7 @@ const POLICY_ARN_CALLS: &[PolicyArnCall] = &[
     },
     PolicyArnCall {
         action: "GetPolicyVersion",
-        family: Family::Resource,
+        family: Family::Version,
         extra: &[("VersionId", "v1")],
     },
     PolicyArnCall {
@@ -324,7 +337,7 @@ async fn an_unresolvable_policy_arn_is_refused_with_its_family_sentence() {
             // nor the path of the ARN is normalised on the way into the message.
             assert_eq!(
                 message,
-                call_under_test.family.message(arn),
+                call_under_test.message(arn),
                 "case {case:?}: expected the {:?} family's sentence, got {message:?}",
                 call_under_test.family
             );

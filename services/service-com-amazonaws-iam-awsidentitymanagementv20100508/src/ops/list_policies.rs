@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // marker names, so a token this service's encoding cannot have produced is
         // refused rather than silently read as "start from the beginning". This
         // operation models no invalid-input error, so the refusal is the 400
-        // `ValidationException` an unmodelled bad request gets. A token that decodes
+        // `ValidationError` an unmodelled bad request gets. A token that decodes
         // but names a policy deleted since the previous page is NOT an error:
         // pagination resumes from the position, and that policy is simply no longer in
         // the range.
@@ -199,8 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match crate::state::decode_marker(crate::state::MARKER_SCOPE_POLICIES, marker) {
                     Some(key) => Some(key),
                     None => {
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            "Invalid Marker: the value is not a marker this service issued",
+                        return Err(crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::INVALID_MARKER,
                         ))
                     }
                 }

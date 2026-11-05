@@ -384,30 +384,39 @@ struct EchoedCase<'a> {
     value: &'a str,
 }
 
-/// RULE: a string outside its `@pattern` is another constraint class and keeps the
-/// sentence the framework states, the rejected value included — the value-free clause
-/// belongs to the classes this service states that way (a declared bound, and an
-/// enumerated set).
+/// RULE: a string outside a `@pattern` that is not one IAM states a sentence of its own
+/// for is another constraint class and keeps the sentence the framework states, the
+/// rejected value included — the value-free clause belongs to the classes this service
+/// states that way (a declared bound, and an enumerated set), and the fixed sentence to the
+/// forms IAM takes itself (`tests/all/member_format_refusal_wording.rs`).
 #[tokio::test]
 async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
     let router = router();
 
     // Rows: a string outside its `@pattern` on three different members, across three
-    // operations.
+    // operations — each a pattern IAM publishes no sentence of its own for.
     let cases = vec![
         EchoedCase {
-            case: "a profile name outside its pattern",
-            action: "CreateInstanceProfile",
-            params: vec![("InstanceProfileName", "has space")],
-            member: "instanceProfileName",
-            value: "has space",
+            case: "an access key id outside its pattern",
+            action: "UpdateAccessKey",
+            // `accessKeyIdType` is pattern ^[\w]+$ with length 16..128, so an id of that
+            // length carrying a slash is outside the pattern alone.
+            params: vec![
+                ("UserName", "a-user"),
+                ("AccessKeyId", "AKIA/NOT/VALID/ID"),
+                ("Status", "Active"),
+            ],
+            member: "accessKeyId",
+            value: "AKIA/NOT/VALID/ID",
         },
         EchoedCase {
-            case: "a user name outside its pattern",
-            action: "CreateUser",
-            params: vec![("UserName", "has/slash")],
-            member: "userName",
-            value: "has/slash",
+            case: "an MFA device serial number outside its pattern",
+            action: "DeactivateMFADevice",
+            // `serialNumberType` is pattern ^[\w+=/:,.@-]+$ with length 9..256, so a value
+            // of that length carrying a space is outside the pattern alone.
+            params: vec![("UserName", "a-user"), ("SerialNumber", "has space 123")],
+            member: "serialNumber",
+            value: "has space 123",
         },
         EchoedCase {
             case: "a pagination marker outside its pattern",
@@ -455,12 +464,13 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();
-    // `roleNameType` is pattern ^[\w+=,.@-]+$, so a name carrying a space is the second
-    // violation beside the session duration's broken `@range`.
+    // `markerType` is pattern ^[\u0020-\u00FF]+$, so a token carrying a character above
+    // that range is the second violation beside the page size's broken `@range` — and it
+    // is a pattern IAM states no sentence of its own for, so both clauses are the walk's.
     let (status, body) = call(
         &router,
-        "UpdateRole",
-        &[("RoleName", "has space"), ("MaxSessionDuration", "0")],
+        "ListRoles",
+        &[("Marker", "page\u{20AC}"), ("MaxItems", "0")],
     )
     .await;
     assert_eq!(status, 400, "expected HTTP 400, got {status}: {body}");
@@ -471,13 +481,13 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
     );
     assert!(
         message.contains(
-            "Value at 'maxSessionDuration' failed to satisfy constraint: Member must have \
-             value greater than or equal to 3600"
+            "Value at 'maxItems' failed to satisfy constraint: Member must have \
+             value greater than or equal to 1"
         ),
-        "expected the session clause to be stated without the number, got {message:?}"
+        "expected the page-size clause to be stated without the number, got {message:?}"
     );
     assert!(
-        message.contains("Value 'has space' at 'roleName'"),
+        message.contains("Value 'page\u{20AC}' at 'marker'"),
         "expected the pattern clause to keep the framework's sentence, got {message:?}"
     );
 }

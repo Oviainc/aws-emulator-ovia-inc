@@ -542,7 +542,7 @@ async fn a_credential_age_expires_a_long_term_api_key() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "ValidationError",
             "case {service:?}: expected the client-input refusal code, got {:?}",
             error_code(&body)
         );
@@ -750,7 +750,7 @@ async fn the_listing_filters_and_pages_through_every_credential_exactly_once() {
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
+        "ValidationError",
         "expected the client-input refusal code, got {:?}",
         error_code(&body)
     );
@@ -769,7 +769,7 @@ async fn the_listing_filters_and_pages_through_every_credential_exactly_once() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "ValidationError",
             "case {bogus:?}: expected the marker to be refused as invalid, got {:?}",
             error_code(&body)
         );

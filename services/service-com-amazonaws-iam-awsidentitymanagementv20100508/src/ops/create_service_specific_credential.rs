@@ -124,6 +124,15 @@ impl From<CreateServiceSpecificCredentialErrorModeled> for CreateServiceSpecific
     }
 }
 
+/// How many times this handler asks the credential store for an id the account does not
+/// already hold before it gives up.
+///
+/// The store does not mint an id it still holds, and this handler hands each one back as soon
+/// as it is stored, so a collision is a chance event and one more attempt settles it. The
+/// bound is what makes that retry terminate: a store that kept offering a held id would
+/// otherwise spin with this account's state locked, blocking every other call on it.
+const MINT_ATTEMPTS: usize = 8;
+
 /// The `CreateServiceSpecificCredential` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -240,11 +249,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // keys", so a request that asks a password-issuing service for an expiring
         // credential asks for something that service cannot issue. This operation
         // models no client-input error, so the refusal goes through the crate's
-        // generic client-input channel (HTTP 400 `ValidationException`).
+        // generic client-input channel (HTTP 400 `ValidationError`).
         let credential_age_days = match (input.credential_age_days, service.form) {
             (Some(days), crate::state::ServiceCredentialForm::LongTermApiKey) => Some(days),
             (Some(_), crate::state::ServiceCredentialForm::UserNameAndPassword) => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                     "CredentialAgeDays is only valid for services that support long-term \
                      API keys, and {} does not",
                     service.service_name
@@ -273,13 +282,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id and the secret come from the emulator's credential store, never from
         // this handler. The store never mints an id it already holds and this one is
         // removed from it again, so an id the account already uses is possible only by
-        // chance — mint again rather than overwrite a credential the user holds.
-        let mut minted = crate::state::mint_service_specific_credential(ctx.credential_store());
-        while minted
-            .as_ref()
-            .is_some_and(|(id, _)| store.service_specific_credentials.contains_key(id))
-        {
-            minted = crate::state::mint_service_specific_credential(ctx.credential_store());
+        // chance — mint again rather than overwrite a credential the user holds, a FIXED
+        // number of times: a store that kept offering a held id would otherwise spin
+        // forever with this account's state locked, so the attempts are bounded and
+        // exhausting them is answered rather than retried.
+        let mut minted = None;
+        for _ in 0..MINT_ATTEMPTS {
+            match crate::state::mint_service_specific_credential(ctx.credential_store()) {
+                // A fresh id: this is the credential to issue.
+                Some(candidate)
+                    if !store
+                        .service_specific_credentials
+                        .contains_key(&candidate.0) =>
+                {
+                    minted = Some(candidate);
+                    break;
+                }
+                // An id the account already holds: mint again, within the bound.
+                Some(_) => continue,
+                // The store minted nothing, which another attempt cannot change.
+                None => break,
+            }
         }
         let Some((credential_id, secret)) = minted else {
             // No secret was minted, and this operation will not invent one; it models

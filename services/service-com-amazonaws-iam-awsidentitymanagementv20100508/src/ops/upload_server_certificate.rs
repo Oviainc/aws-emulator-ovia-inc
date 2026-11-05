@@ -273,10 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // "This parameter is optional. If it is not included, it defaults to a slash (/)"
-        // (`$Path`) — the default every IAM entity's path takes.
+        // (`$Path`) — the default every IAM entity's path takes. It is taken against its
+        // published form here, before the store is reached at all: the check is one pass
+        // over the member's characters — no allocation, no index into the string, no regex
+        // — and `pathType`'s own 1..512 length (this operation's input contract above) is
+        // what bounds that pass.
         let path = input
             .path
             .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        if !::service_common::iam_entity_path::is_published_form(&path) {
+            return Err(crate::state::invalid_entity_path());
+        }
 
         // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
         // "invalid … value … for an input parameter" — and "if any one of the tags is

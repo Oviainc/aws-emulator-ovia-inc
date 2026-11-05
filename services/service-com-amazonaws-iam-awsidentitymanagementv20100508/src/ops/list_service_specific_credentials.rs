@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the crate's generic client-input channel (HTTP 400).
         let all_users = input.all_users.unwrap_or(false);
         if all_users && input.user_name.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::validation_error(
                 "AllUsers cannot be specified together with UserName",
             ));
         }
@@ -219,8 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 Some(key) => Some(key),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Invalid Marker: the value is not a marker this service issued",
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::INVALID_MARKER,
                     ));
                 }
             },

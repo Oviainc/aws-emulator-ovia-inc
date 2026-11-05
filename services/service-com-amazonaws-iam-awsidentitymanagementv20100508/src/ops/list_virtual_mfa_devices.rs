@@ -181,8 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Some(key) => Some(key),
                     None => {
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            "Invalid Marker: the value is not a marker this service issued",
+                        return Err(crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::INVALID_MARKER,
                         ));
                     }
                 }
@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(crate::state::ASSIGNMENT_STATUS_ASSIGNED) => (true, false),
             Some(crate::state::ASSIGNMENT_STATUS_UNASSIGNED) => (false, true),
             Some(_) => {
-                return Err(crate::scaffolded::Scaffolded::validation(
+                return Err(crate::scaffolded::Scaffolded::validation_error(
                     "Invalid AssignmentStatus: the value is not one this operation accepts",
                 ));
             }

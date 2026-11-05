@@ -418,8 +418,8 @@ async fn a_marker_this_service_did_not_issue_for_these_tags_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {bogus:?}: expected ValidationException, got {body}"
+            "ValidationError",
+            "case {bogus:?}: expected ValidationError, got {body}"
         );
     }
 

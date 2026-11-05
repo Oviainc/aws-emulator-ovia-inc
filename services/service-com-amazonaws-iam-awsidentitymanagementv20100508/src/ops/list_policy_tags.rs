@@ -242,11 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListPolicyTagsErrorModeled::InvalidInputException(
                         InvalidInputException {
-                            message: Some(
-                                "Invalid Marker: the value is not a marker this service \
-                                 issued for this policy's tags"
-                                    .to_string(),
-                            ),
+                            message: Some(crate::state::INVALID_MARKER.to_string()),
                         },
                     )
                     .into())

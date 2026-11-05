@@ -188,9 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(marker) => match crate::state::decode_marker(&scope, marker) {
                 Some(key) => Some(key),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Invalid Marker: the value is not a marker this service issued for \
-                         this group's inline policies",
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::INVALID_MARKER,
                     ))
                 }
             },

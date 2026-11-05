@@ -629,7 +629,7 @@ async fn a_create_without_a_password_creates_nothing() {
         );
         assert_eq!(
             error_code(&refused),
-            "ValidationException",
+            "ValidationError",
             "case {case:?}: expected the framework's client-input refusal code, got {:?}",
             error_code(&refused)
         );

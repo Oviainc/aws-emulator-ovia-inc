@@ -210,10 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "The role with name {} cannot be found.",
-                            input.role_name
-                        )),
+                        message: Some(crate::state::role_cannot_be_found(&input.role_name)),
                     },
                 )
                 .into(),
@@ -239,28 +236,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What this operation deletes is the BOUNDARY, so a role carrying none
         // "referenced a resource entity that does not exist" and nothing is written: the
-        // refusal describes the resource that is missing — the boundary — rather than the
-        // role, which is there.
-        let carries_a_boundary = store
-            .roles
-            .get(&role_key)
-            .is_some_and(|role| role.permissions_boundary.is_some());
-        if !carries_a_boundary {
+        // refusal describes the resource that is missing — the scope on the principal's
+        // permissions — rather than the role, which is there, and names that principal by
+        // its own unique id (`crate::state::principal_has_no_scope`).
+        //
+        // A path the account holds no record under is one of the roles a SERVICE keeps
+        // provisioned, every one of which is filed under the reserved path the protection
+        // above has already refused, so the account's own record is what is left here — read
+        // ONCE, as `DeleteUserPermissionsBoundary` reads a user's, with both refusals and
+        // the write taken from that one borrow.
+        let Some(role) = store.roles.get_mut(&role_key) else {
             return Err(
                 DeleteRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "No permissions boundary is set for the role with name {}.",
-                            input.role_name
-                        )),
+                        message: Some(crate::state::role_cannot_be_found(&input.role_name)),
+                    },
+                )
+                .into(),
+            );
+        };
+        if role.permissions_boundary.is_none() {
+            return Err(
+                DeleteRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(crate::state::principal_has_no_scope(&role.role_id)),
                     },
                 )
                 .into(),
             );
         }
-        if let Some(role) = store.roles.get_mut(&role_key) {
-            role.permissions_boundary = None;
-        }
+        role.permissions_boundary = None;
 
         Ok(DeleteRolePermissionsBoundaryOutput)
     }

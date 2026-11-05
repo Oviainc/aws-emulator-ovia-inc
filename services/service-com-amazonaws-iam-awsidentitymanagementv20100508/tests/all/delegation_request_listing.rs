@@ -415,10 +415,9 @@ async fn a_marker_this_service_did_not_issue_for_this_collection_is_refused() {
         );
         assert_eq!(
             element(&body, "Message"),
-            "Invalid Marker: the value is not a marker this service issued for this \
-             account's delegation requests",
-            "case {case:?}: the refusal must say the marker is not one this service \
-             issued, got {:?}",
+            "Invalid Marker.",
+            "case {case:?}: the refusal must be IAM's one sentence for a marker it did \
+             not issue, got {:?}",
             element(&body, "Message")
         );
     }

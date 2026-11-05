@@ -331,6 +331,13 @@ impl<E> Scaffolded<E> {
     /// together. Answer it INSTEAD of `not_implemented` — a 501 says "nobody has
     /// written this yet", which is a different claim and is counted as one.
     ///
+    /// NOT for THIS service: `ValidationException` is the Smithy-protocol spelling, and
+    /// IAM's wire defines no such code — every value IAM cannot accept is refused
+    /// `ValidationError` ([`Scaffolded::validation_error`]), which is what the implemented
+    /// operations here answer with and what an implementer of one of the stubs beside them
+    /// should reach for. This variant is kept for the generated channel's shape rather than
+    /// for new call sites.
+    ///
     /// If this service's model declares its own `ValidationException` (or another
     /// client-input error) use THAT: the modeled shape may carry members beyond
     /// `message` — a `reason`, a field list — and a real client reads them. When the

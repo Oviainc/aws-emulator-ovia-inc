@@ -156,14 +156,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // A mutation: "creates a new group", so the lock is held for write across the
-        // uniqueness check, the quota check and the insert.
-        let mut store = state.lock();
-
-        // `Path` "is optional. If it is not included, it defaults to a slash (/)".
+        // `Path` "is optional. If it is not included, it defaults to a slash (/)", and is
+        // taken against its published form BEFORE the store is locked: the check is one
+        // pass over the member's characters — no allocation, no index into the string, no
+        // regex — and `pathType`'s own 1..512 length (this operation's input contract
+        // above) is what bounds that pass, so no caller-driven work is added inside the
+        // critical section below.
         let path = input
             .path
             .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        if !::service_common::iam_entity_path::is_published_form(&path) {
+            return Err(crate::state::invalid_entity_path());
+        }
+
+        // A mutation: "creates a new group", so the lock is held for write across the
+        // uniqueness check, the quota check and the insert.
+        let mut store = state.lock();
 
         // IAM authorizes its own API: the signing principal's identity-based policies
         // are evaluated before the group is minted, on the group this request names.

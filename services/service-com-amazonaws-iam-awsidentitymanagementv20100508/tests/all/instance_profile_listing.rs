@@ -400,7 +400,7 @@ async fn a_marker_this_collection_did_not_issue_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "ValidationError",
             "expected the marker to be refused as invalid, got {:?}",
             error_code(&body)
         );
@@ -441,8 +441,8 @@ async fn a_marker_this_collection_did_not_issue_is_refused() {
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
-        "expected ValidationException, got {:?}",
+        "ValidationError",
+        "expected ValidationError, got {:?}",
         error_code(&body)
     );
 

@@ -303,14 +303,16 @@ async fn every_admissible_value_of_each_set_is_accepted() {
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();
-    // `userNameType` is pattern ^[\w+=,.@-]+$, so a name carrying a slash is the second
-    // violation.
+    // `accessKeyIdType` is pattern ^[\w]+$ (length 16..128), so an id of that length
+    // carrying a slash is the second violation — and it is a pattern IAM states no
+    // sentence of its own for, so the clause is the framework's.
+    let malformed_key_id = "AKIA/NOT/VALID/ID";
     let (status, body) = call(
         &router,
         "UpdateAccessKey",
         &[
-            ("UserName", "has/slash"),
-            ("AccessKeyId", ACCESS_KEY_ID),
+            ("UserName", "a-user"),
+            ("AccessKeyId", malformed_key_id),
             ("Status", "Disabled"),
         ],
     )
@@ -330,7 +332,7 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
         "expected the enum clause to be stated without the value, got {message:?}"
     );
     assert!(
-        message.contains("Value 'has/slash' at 'userName'"),
+        message.contains(&format!("Value '{malformed_key_id}' at 'accessKeyId'")),
         "expected the pattern clause to keep the framework's sentence, got {message:?}"
     );
 }

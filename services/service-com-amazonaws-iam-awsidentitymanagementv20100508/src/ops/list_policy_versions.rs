@@ -193,11 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListPolicyVersionsErrorModeled::InvalidInputException(
                         InvalidInputException {
-                            message: Some(
-                                "Invalid Marker: the value is not a marker this service issued \
-                                 for this policy's versions"
-                                    .to_string(),
-                            ),
+                            message: Some(crate::state::INVALID_MARKER.to_string()),
                         },
                     )
                     .into())

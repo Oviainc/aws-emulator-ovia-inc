@@ -287,14 +287,35 @@ fn without_refused_value_echo(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// AWS's own sentence for `violation`, or `None` when the violation belongs to the
+/// model-level constraint walk and keeps that walk's clause.
+///
+/// The two readings of a form IAM takes ITSELF, in one place so every caller below partitions
+/// the violations the same way: the members whose WHOLE form is one sentence
+/// ([`crate::state::member_format_refusal`]), and a value outside the PATTERN its member's
+/// shape publishes ([`crate::state::pattern_refusal`]), which is keyed by the pattern the
+/// violation carries, so it answers for every member targeting a shape that publishes it. A
+/// violation of the member's LENGTH is not one of them: those sentences state no length, so
+/// that bound stays the walk's own clause.
+fn self_taken_sentence(violation: &Violation) -> Option<String> {
+    if let Some(sentence) = crate::state::member_format_refusal(&violation.path) {
+        return Some(sentence.to_string());
+    }
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => {
+            crate::state::pattern_refusal(&violation.path, pattern)
+        }
+        _ => None,
+    }
+}
+
 /// A refusal stated as IAM states it, or `None` when the framework's own wording stands.
 ///
 /// IAM takes a request's values in TWO layers, and the recorded refusals show both: the
-/// members [`crate::state::MEMBER_FORMAT_REFUSALS`] names are taken by IAM itself, which
-/// answers one fixed sentence for the member's whole form and no envelope at all, while
-/// every other member is taken by the model-level walk, whose envelope states one clause
-/// per constraint the request broke. So a refusal is stated by whichever layer the request
-/// reached:
+/// forms [`self_taken_sentence`] answers for are taken by IAM itself, which answers one
+/// fixed sentence for the form and no envelope at all, while every other constraint is taken
+/// by the model-level walk, whose envelope states one clause per constraint the request
+/// broke. So a refusal is stated by whichever layer the request reached:
 ///
 /// - a request whose only broken members are the ones IAM takes itself is answered with
 ///   that member's sentence, and with nothing else — no envelope, no clause and no value;
@@ -316,19 +337,17 @@ fn stated_refusal(violations: &[Violation]) -> Option<Refused> {
     let (self_taken, modeled): (Vec<Violation>, Vec<Violation>) = violations
         .iter()
         .cloned()
-        .partition(|violation| crate::state::member_format_refusal(&violation.path).is_some());
+        .partition(|violation| self_taken_sentence(violation).is_some());
     if self_taken.is_empty() {
         return without_refused_value_echo(violations);
     }
     if modeled.is_empty() {
         // One sentence, so a request that broke two self-taken members is answered with
         // the first of them in the order the walk reported them.
-        let stated = self_taken
-            .iter()
-            .find_map(|violation| crate::state::member_format_refusal(&violation.path))?;
+        let stated = self_taken.iter().find_map(self_taken_sentence)?;
         return Some(Refused {
             code: VALUE_REFUSAL_CODE.to_string(),
-            message: stated.to_string(),
+            message: stated,
         });
     }
     without_refused_value_echo(&modeled).or_else(|| {

@@ -331,7 +331,9 @@ struct MissCase {
 /// with a code its model DECLARES — the missing entity `NoSuchEntity` names, carrying
 /// its operation family's fixed text (`Policy <arn> was not found.` for a read of the
 /// policy resource, `Policy <arn> does not exist or is not attachable.` for the listing
-/// of the versions in force for the identities it is attached to), for every ARN that is
+/// of the versions in force for the identities it is attached to, `Policy <arn> version
+/// <id> does not exist or is not attachable.` for the read addressed by a version as well
+/// as an ARN), for every ARN that is
 /// a managed policy's, in the account's namespace or in AWS's; an invalid input for a
 /// value that is not a managed-policy ARN at all.
 #[tokio::test]
@@ -422,6 +424,11 @@ async fn an_unresolvable_policy_arn_is_refused_with_a_modelled_code() {
                     "ListPolicyVersions" => {
                         format!("Policy {} does not exist or is not attachable.", case.arn)
                     }
+                    // The read addressed by a version as well as an ARN names both.
+                    "GetPolicyVersion" => format!(
+                        "Policy {} version v1 does not exist or is not attachable.",
+                        case.arn
+                    ),
                     _ => format!("Policy {} was not found.", case.arn),
                 };
                 assert_eq!(

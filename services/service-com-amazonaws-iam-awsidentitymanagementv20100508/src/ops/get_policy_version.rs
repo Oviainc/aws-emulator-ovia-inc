@@ -215,10 +215,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An ARN this service can resolve no policy under "referenced a resource
             // entity that does not exist" — the refusal this operation models for a
             // policy it cannot report, whichever namespace the ARN is in, since a code
-            // outside its modelled set is one no SDK has a branch for.
+            // outside its modelled set is one no SDK has a branch for. What this request
+            // addresses is one VERSION of a policy, so the absence is worded the one way
+            // this operation words a request it cannot be served from
+            // (`crate::state::policy_version_not_found`, the same sentence a version the
+            // resolved policy does not carry answers with): the call cannot tell "this ARN
+            // names nothing" from "it names nothing carrying that version", and its
+            // wording says so.
             return Err(GetPolicyVersionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                    message: Some(crate::state::policy_version_not_found(
+                        &input.policy_arn,
+                        &input.version_id,
+                    )),
                 },
             )
             .into());

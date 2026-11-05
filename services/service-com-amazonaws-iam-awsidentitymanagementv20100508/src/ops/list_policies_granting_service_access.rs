@@ -224,11 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         ListPoliciesGrantingServiceAccessErrorModeled::InvalidInputException(
                             InvalidInputException {
-                                message: Some(
-                                    "Invalid Marker: the value is not a marker this service \
-                                     issued"
-                                        .to_string(),
-                                ),
+                                message: Some(crate::state::INVALID_MARKER.to_string()),
                             },
                         )
                         .into(),

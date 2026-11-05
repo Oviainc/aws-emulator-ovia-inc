@@ -177,34 +177,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A key is within the published length and alphabet of
         // `accountPropertyKeyType`, and is in the format "Namespace/PropertyName"
         // with "exactly one / separating the namespace from the property name", so a
-        // key outside either is "an invalid … value … supplied for an input
-        // parameter". A map key's own constraints are outside the framework's
-        // constraint walk, so this is where they are taken; both rules live once in
-        // `crate::state`, and each refusal names the key and the rule it broke.
+        // key outside either is a value this service cannot accept. A map key's own
+        // constraints are outside the framework's constraint walk, so this is where they
+        // are taken; both rules live once in `crate::state`, and each refusal names the
+        // key and the rule it broke.
+        //
+        // Every refusal of a VALUE this request carried is answered under the code IAM
+        // answers one with — `ValidationError`, through
+        // [`crate::scaffolded::Scaffolded::validation_error`] — rather than through the
+        // modelled `InvalidInputException`, whose `awsQueryError` trait renders
+        // `<Code>InvalidInput</Code>`: the code is what a client branches on, and these
+        // two account-property calls answer the former.
         let mut namespaces = ::std::collections::BTreeSet::new();
         for key in supplied.keys() {
             if !crate::state::is_account_property_key_shape(key) {
-                return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(format!(
-                            "Property key must be at most {} characters of letters, digits, \
-                             underscores, dashes and the namespace separator /, beginning \
-                             with a letter: {key}",
-                            crate::state::MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS
-                        )),
-                    },
-                )
-                .into());
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::account_property_key_refusal(),
+                ));
             }
             let Some(namespace) = crate::state::account_property_namespace(key) else {
-                return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(format!(
-                            "Property key must be in format Namespace/PropertyName: {key}"
-                        )),
-                    },
-                )
-                .into());
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Property key must be in format Namespace/PropertyName: {key}"
+                )));
             };
             namespaces.insert(namespace);
         }
@@ -216,37 +210,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored verbatim.
         if namespaces.len() > 1 {
             let spanned: Vec<&str> = namespaces.into_iter().collect();
-            return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "All account property keys must belong to the same namespace, \
-                         but the request spans {}",
-                        spanned.join(", ")
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "All account property keys must belong to the same namespace, \
+                 but the request spans {}",
+                spanned.join(", ")
+            )));
         }
 
         // A namespace names an account-wide FEATURE this service configures — "each
         // namespace groups related configuration settings" — so the set of them is the
         // service's own ([`crate::state::SERVED_ACCOUNT_PROPERTY_NAMESPACES`]) and a key
-        // under any other namespace configures nothing: it is "an invalid … value …
-        // supplied for an input parameter", refused before the store is reached, so a
-        // property the service does not serve is never persisted and never reported by a
-        // later read.
+        // under any other namespace configures nothing: it is a value this service cannot
+        // accept, refused before the store is reached, so a property the service does not
+        // serve is never persisted and never reported by a later read.
         if let Some(namespace) = namespaces
             .iter()
             .find(|namespace| !crate::state::is_served_account_property_namespace(namespace))
         {
-            return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(crate::state::unsupported_account_property_namespace(
-                        namespace,
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::unsupported_account_property_namespace(namespace),
+            ));
         }
 
         // The write: each supplied key SETS that property, so a key the account
@@ -267,16 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .count()
             + supplied.len();
         if would_hold > crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT {
-            return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Cannot hold more than {} account properties, and this request \
-                         would hold {would_hold}",
-                        crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Cannot hold more than {} account properties, and this request \
+                 would hold {would_hold}",
+                crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT
+            )));
         }
 
         for (key, value) in supplied {

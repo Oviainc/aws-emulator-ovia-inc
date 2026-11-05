@@ -153,6 +153,8 @@ mod management_event_recording;
 mod member_format_refusal_wording;
 #[path = "all/mfa_device_reads.rs"]
 mod mfa_device_reads;
+#[path = "all/net_new_refusal_wording.rs"]
+mod net_new_refusal_wording;
 #[path = "all/open_id_connect_client_id_registration.rs"]
 mod open_id_connect_client_id_registration;
 #[path = "all/open_id_connect_client_ids.rs"]

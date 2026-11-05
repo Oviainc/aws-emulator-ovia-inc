@@ -52,8 +52,10 @@ fn thumbprint(seed: u8) -> String {
 const JOB_IN_PROGRESS: &str = "IN_PROGRESS";
 const JOB_COMPLETED: &str = "COMPLETED";
 
-/// The one value `PermissionsBoundaryAttachmentType` declares, likewise written out.
-const BOUNDARY_ATTACHMENT_TYPE: &str = "PermissionsBoundaryPolicy";
+/// The `PermissionsBoundaryType` AWS puts on the wire for a boundary it reports, likewise
+/// written out: `Policy`, not the name the model gives the single
+/// `PermissionsBoundaryAttachmentType` entry.
+const BOUNDARY_ATTACHMENT_TYPE: &str = "Policy";
 
 /// Drive one call a fixture needs, asserting it succeeded, and answer the body.
 async fn expect_ok(

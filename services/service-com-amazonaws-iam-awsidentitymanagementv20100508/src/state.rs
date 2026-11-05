@@ -22,12 +22,18 @@ use crate::ops::types::{
 pub mod account;
 pub mod authorization;
 pub mod credential_report;
+pub mod entity_path;
+pub mod input_formats;
+pub mod member_forms;
 pub mod reported_services;
 pub mod role_templates;
 pub mod virtual_mfa_devices;
 
 pub use account::*;
 pub use credential_report::*;
+pub use entity_path::*;
+pub use input_formats::*;
+pub use member_forms::*;
 pub use reported_services::*;
 pub use role_templates::*;
 pub use virtual_mfa_devices::*;
@@ -43,10 +49,15 @@ pub const DEFAULT_PATH: &str = "/";
 /// 100".
 pub const DEFAULT_MAX_ITEMS: i32 = 100;
 
-/// The one value the model's `PermissionsBoundaryAttachmentType` enum declares
-/// (`smithy_query(query="shape", shape="PermissionsBoundaryAttachmentType")`),
-/// reported on every entity that carries a permissions boundary.
-pub const PERMISSIONS_BOUNDARY_TYPE: &str = "PermissionsBoundaryPolicy";
+/// The `PermissionsBoundaryType` IAM reports on every entity that carries a permissions
+/// boundary.
+///
+/// The member targets `PermissionsBoundaryAttachmentType`, whose single entry the model
+/// NAMES `PermissionsBoundaryPolicy`
+/// (`smithy_query(query="shape", shape="PermissionsBoundaryAttachmentType")`); what IAM
+/// puts on the wire for it is `Policy`, which is what a client comparing the reported type
+/// matches against, so the wire value is carried here rather than the enum entry's name.
+pub const PERMISSIONS_BOUNDARY_TYPE: &str = "Policy";
 
 /// The `EntityType` value that names an IAM role — the value `ListEntitiesForPolicy`'s
 /// `EntityFilter` documentation itself uses ("when EntityFilter is Role, only the
@@ -3735,6 +3746,34 @@ pub fn boundary_scope_not_attachable(arn: &str) -> String {
     format!("Scope ARN: {arn} does not exist or is not attachable.")
 }
 
+/// The message IAM refuses an operation addressed by a `RoleName` the account holds no role
+/// under with — the `NoSuchEntityException` message, whose fixed text is `The role with name `
+/// and ` cannot be found.` around the name the request supplied.
+///
+/// ONE wording for the role-absence this surface answers, so a reader and a write cannot
+/// describe the same missing role two different ways. It is NOT every sentence IAM has for a
+/// missing role: the permissions-boundary surface words the absence of a USER its own way
+/// (`User <name> was not found.`), and both sentences are part of the wire contract a client
+/// matching the message sees.
+pub fn role_cannot_be_found(role_name: &str) -> String {
+    format!("The role with name {role_name} cannot be found.")
+}
+
+/// The message IAM refuses a permissions-boundary DELETE with when the entity it names
+/// carries no boundary — the `NoSuchEntityException` message, whose fixed text is
+/// `Principal ` and ` does not have scope` around the entity's own unique id
+/// (`User$UserId`, `Role$RoleId`), with no trailing period.
+///
+/// What a boundary call addresses is a SCOPE on a principal's permissions, and the refusal
+/// states it that way: the principal is named by the id that identifies it for the life of
+/// the account rather than by the name the request spelled, and the sentence carries nothing
+/// of the boundary. ONE wording, shared by both boundary deletes, so a caller matching IAM's
+/// text — or reading the principal id out of it — sees one sentence whether it cleared the
+/// boundary of a role or of a user.
+pub fn principal_has_no_scope(principal_id: &str) -> String {
+    format!("Principal {principal_id} does not have scope")
+}
+
 /// How IAM refuses a delete whose entity still holds an ATTACHED MANAGED policy: one
 /// fixed sentence naming the class of subordinate entity to remove, and nothing of the
 /// entity, the policy or how many there are.
@@ -4017,6 +4056,17 @@ pub fn decode_marker(scope: &str, marker: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The message IAM refuses a paginated call whose `Marker` it did not issue with: one fixed
+/// sentence, carrying nothing of the token the request supplied and nothing of the
+/// collection being paged.
+///
+/// ONE wording, shared by every operation that takes a `Marker`, so a caller matching IAM's
+/// text sees the same sentence whichever listing it was paging and whether that operation's
+/// model gives it a client-input error of its own to answer under: what the refusal states
+/// is that the token names no page of this service, which is the same fact in every one of
+/// them.
+pub const INVALID_MARKER: &str = "Invalid Marker.";
+
 /// One stored role as a resource-LISTING operation reports it: the attributes
 /// `ListRoles` documents it withholds are dropped, every other one is reported as
 /// the account holds it.
@@ -4290,13 +4340,19 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIamAwsidentitymanagementv20100508State>)
 }
 
-/// How many characters an account property key may carry, and the alphabet it may
-/// be spelled in: `accountPropertyKeyType` is length 1..50 with pattern
-/// `^[A-Za-z][A-Za-z0-9/_-]*$`
-/// (`smithy_query(query="shape", shape="accountPropertiesMapType")`). A map KEY's
-/// own constraints are outside the framework's constraint walk, so the operation
+/// How many characters an account property key may carry: `accountPropertyKeyType` is
+/// length 1..50 (`smithy_query(query="shape", shape="accountPropertiesMapType")`). A map
+/// KEY's own constraints are outside the framework's constraint walk, so the operation
 /// taking these keys is what takes them against the published bound.
 pub const MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS: usize = 50;
+
+/// The shortest key that shape admits, the other half of its published `@length`.
+pub const MIN_ACCOUNT_PROPERTY_KEY_CHARACTERS: usize = 1;
+
+/// The alphabet that shape publishes, as the model declares it — the ONE copy of this
+/// pattern: [`is_account_property_key_shape`] enforces it and the refusal for a key outside
+/// it states it (`input_formats::account_property_key_refusal`), so the two cannot drift.
+pub const ACCOUNT_PROPERTY_KEY_PATTERN: &str = "^[A-Za-z][A-Za-z0-9/_-]*$";
 
 /// How many account-level properties one account may hold. AWS publishes no quota
 /// for these properties, so this bound is the emulator's own: it is what stops the
@@ -4311,10 +4367,13 @@ pub const MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS: usize = 50;
 pub const MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT: usize = 1_000;
 
 /// Whether `key` is within the published length and alphabet of
-/// `accountPropertyKeyType` — see [`MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS`] for both
-/// and for why this is checked here rather than by the constraint walk.
+/// `accountPropertyKeyType` ([`MIN_ACCOUNT_PROPERTY_KEY_CHARACTERS`],
+/// [`MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS`] and [`ACCOUNT_PROPERTY_KEY_PATTERN`], which is
+/// this predicate read as a regular expression) — see the bound for why this is checked
+/// here rather than by the constraint walk.
 pub fn is_account_property_key_shape(key: &str) -> bool {
-    (1..=MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS).contains(&key.chars().count())
+    (MIN_ACCOUNT_PROPERTY_KEY_CHARACTERS..=MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS)
+        .contains(&key.chars().count())
         && key.starts_with(|first: char| first.is_ascii_alphabetic())
         && key
             .chars()

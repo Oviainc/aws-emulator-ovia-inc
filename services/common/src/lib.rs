@@ -309,6 +309,11 @@ pub mod front_door;
 /// serves from one endpoint and tells apart by the `restJson1` route a request addresses.
 pub mod greengrass;
 pub mod iam_authorization;
+/// The ONE reading of the published form of an IAM entity PATH, for every service that takes
+/// one or builds one — the form IAM's own `pathType` publishes in prose and that its
+/// `@pattern` cannot decide, since Smithy's `@pattern` is a find and that pattern's
+/// alternation is anchored on one side only.
+pub mod iam_entity_path;
 /// The ONE reading of whether an in-process call to another emulated service reached that
 /// service at all, rather than being refused by the front door for a request no mounted
 /// service claims — so no performer of such a call maps the transport's own refusal as if

@@ -270,19 +270,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conflict guard, which reads this very binding, no longer counts the profile
         // against the role. The role itself is untouched: it still lives in the role map,
         // which is what lets the caller go on to delete it.
-        let profile = store
+        //
+        // The profile was resolved above, so this read answers; a store that no longer
+        // holds it carries no binding either, which is the same absence the refusal below
+        // states — so the lookup is total and nothing here can panic on what the request
+        // supplied.
+        let carries_the_role = store
             .instance_profiles
-            .get_mut(&profile_key)
-            .expect("the profile was just resolved under this key");
-        if !profile.role_keys.contains(&role_key) {
+            .get(&profile_key)
+            .is_some_and(|profile| profile.role_keys.contains(&role_key));
+        if !carries_the_role {
             // A binding the profile does not carry "referenced a resource entity that
-            // does not exist", the same answer this crate's `DetachRolePolicy` gives a
-            // policy the role does not carry.
+            // does not exist", worded as IAM words a role missing FROM a profile: the
+            // fixed text `Role `, ` in Instance Profile ` and ` cannot be found.` around
+            // the two names the request supplied, so the sentence names the binding that
+            // is missing rather than either resource on its own.
             return Err(
                 RemoveRoleFromInstanceProfileErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
                         message: Some(format!(
-                            "The role {} is not associated with Instance Profile {}.",
+                            "Role {} in Instance Profile {} cannot be found.",
                             input.role_name, input.instance_profile_name
                         )),
                     },
@@ -290,7 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        profile.role_keys.retain(|held| *held != role_key);
+        if let Some(profile) = store.instance_profiles.get_mut(&profile_key) {
+            profile.role_keys.retain(|held| *held != role_key);
+        }
 
         Ok(RemoveRoleFromInstanceProfileOutput)
     }

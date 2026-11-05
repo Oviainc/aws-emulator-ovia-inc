@@ -351,8 +351,8 @@ async fn list_groups_pages_with_a_resumable_marker() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {bogus:?}: expected ValidationException, got {:?}",
+            "ValidationError",
+            "case {bogus:?}: expected ValidationError, got {:?}",
             error_code(&body)
         );
     }

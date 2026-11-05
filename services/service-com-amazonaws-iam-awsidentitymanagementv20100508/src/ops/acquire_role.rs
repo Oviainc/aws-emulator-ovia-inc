@@ -174,31 +174,12 @@ fn is_role_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || ROLE_NAME_PUNCTUATION.contains(c))
 }
 
-/// Whether `path` satisfies `pathType`: "either a forward slash (/) by itself or a string
-/// that must begin and end with forward slashes", whose inner characters are the ASCII
-/// range `\u0021`..`\u007E` (`CreateRole$Path`), within length 1..512.
+/// Whether `path` satisfies `pathType`: the ONE reading of that published form
+/// ([`::service_common::iam_entity_path::is_published_form`]), so a path this operation
+/// RENDERS from a template is held to the same form a path a request supplies is.
 fn is_entity_path(path: &str) -> bool {
-    if path == crate::state::DEFAULT_PATH {
-        return true;
-    }
-    let characters = path.chars().count();
-    // A path other than the root is two slashes around at least one inner character, so
-    // the shortest one `pathType` admits past the root is three characters long.
-    if !(3..=MAX_PATH_CHARACTERS).contains(&characters) {
-        return false;
-    }
-    let Some(inner) = path
-        .strip_prefix('/')
-        .and_then(|rest| rest.strip_suffix('/'))
-    else {
-        return false;
-    };
-    !inner.is_empty() && inner.chars().all(|c| ('\u{21}'..='\u{7E}').contains(&c))
+    ::service_common::iam_entity_path::is_published_form(path)
 }
-
-/// The published maximum length of `pathType`: "len 1..512"
-/// (`smithy_query(query="operation", operation="AcquireRole,CreateRole")`).
-const MAX_PATH_CHARACTERS: usize = 512;
 
 /// The value each parameter the template version defines is rendered with, by parameter
 /// name — or the refusal for a request that cannot supply one.

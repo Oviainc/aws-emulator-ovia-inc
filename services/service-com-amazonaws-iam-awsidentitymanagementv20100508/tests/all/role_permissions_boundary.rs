@@ -28,10 +28,12 @@ const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Al
 /// own documentation describes, as `tests/all/managed_policies.rs` uses it.
 const POLICY_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#;
 
-/// The one value the model's `PermissionsBoundaryAttachmentType` enum declares
-/// (`smithy_query(query="shape", shape="PermissionsBoundaryAttachmentType")`),
-/// which every entity carrying a boundary reports.
-pub(crate) const PERMISSIONS_BOUNDARY_TYPE: &str = "PermissionsBoundaryPolicy";
+/// The `PermissionsBoundaryType` AWS reports for every entity carrying a boundary,
+/// written out here rather than read from the implementation's constant: what this suite
+/// pins is the value AWS puts on the WIRE, which is `Policy` — not the name the model gives
+/// the single `PermissionsBoundaryAttachmentType` entry
+/// (`smithy_query(query="shape", shape="PermissionsBoundaryAttachmentType")`).
+pub(crate) const PERMISSIONS_BOUNDARY_TYPE: &str = "Policy";
 
 /// ARNs of AWS-managed policies, spanning the paths the managed-policy ARN grammar
 /// admits: the account root, the `/service-role/` path and the `/job-function/`

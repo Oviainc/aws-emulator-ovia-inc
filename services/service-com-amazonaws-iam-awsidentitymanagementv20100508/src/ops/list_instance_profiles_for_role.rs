@@ -238,10 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     // Neither modelled error fits a token that is not one this service
                     // issued, so the refusal goes through the crate's generic client-input
-                    // channel (HTTP 400, `ValidationException`).
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Invalid Marker: the value is not a marker this service issued \
-                         for this role's instance profiles",
+                    // channel (HTTP 400, `ValidationError`).
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::INVALID_MARKER,
                     ));
                 }
             },

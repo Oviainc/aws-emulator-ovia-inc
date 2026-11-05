@@ -8,9 +8,10 @@
 //! boundary of a user the account holds and answers the empty HTTP 200 its modelled
 //! `Unit` output is, which `GetUser` then confirms while the user itself is untouched; a
 //! name no user is held under is `NoSuchEntity` (HTTP 404), the refusal naming the user
-//! that is missing; and a user the account holds that carries no boundary has no such
-//! resource to delete, so that call is `NoSuchEntity` too, the refusal describing the
-//! boundary rather than the user, which stays reported.
+//! that is missing (`User <name> was not found.`); and a user the account holds that
+//! carries no boundary has no such resource to delete, so that call is `NoSuchEntity` too,
+//! the refusal describing the missing SCOPE and naming the principal by the unique id
+//! `GetUser` reports for it, while the user stays reported.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the
 //! user's path depth, the case the request spells its name in and the alphabet that name
@@ -54,6 +55,17 @@ async fn reported_user_arn(router: &MultiServiceRouter, user_name: &str) -> Stri
         "case {user_name:?}: GetUser must report the user, got {status}: {body}"
     );
     element(&body, "Arn")
+}
+
+/// The `UserId` `GetUser` reports for `user_name` — the unique id IAM names the principal
+/// by when it refuses a boundary delete for a user that carries no boundary.
+async fn reported_user_id(router: &MultiServiceRouter, user_name: &str) -> String {
+    let (status, body) = call(router, "GetUser", &[("UserName", user_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {user_name:?}: GetUser must report the user, got {status}: {body}"
+    );
+    element(&body, "UserId")
 }
 
 /// RULE: the call clears the one boundary the named user carries and answers the empty
@@ -234,7 +246,7 @@ async fn clearing_the_boundary_of_a_name_no_user_is_held_under_is_refused() {
         let message = element(&body, "Message");
         assert_eq!(
             message,
-            format!("The user with name {user_name} cannot be found."),
+            format!("User {user_name} was not found."),
             "case {user_name:?}: expected the refusal to name the missing user, got \
              {message:?}"
         );
@@ -363,16 +375,19 @@ async fn clearing_a_boundary_a_user_does_not_carry_is_refused() {
             error_code(&body)
         );
         // The USER is not what is missing, so the refusal is not the one worded for an
-        // absent user — and `GetUser` still reports it.
+        // absent user: it describes the SCOPE that is missing, naming the principal by the
+        // unique id `GetUser` reports for it — and `GetUser` still reports the user.
         let message = element(&body, "Message");
         assert_ne!(
             message,
-            format!("The user with name {delete_name} cannot be found."),
+            format!("User {delete_name} was not found."),
             "case {case}: the refusal must describe the missing boundary, got {message:?}"
         );
-        assert!(
-            message.contains(delete_name),
-            "case {case}: the refusal must name the user the request spelled, got \
+        let user_id = reported_user_id(&router, user_name).await;
+        assert_eq!(
+            message,
+            format!("Principal {user_id} does not have scope"),
+            "case {case}: the refusal must name the principal by its unique id, got \
              {message:?}"
         );
         let arn = reported_user_arn(&router, user_name).await;

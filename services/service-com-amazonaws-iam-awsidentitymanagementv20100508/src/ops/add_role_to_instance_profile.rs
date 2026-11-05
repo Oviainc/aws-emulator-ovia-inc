@@ -268,15 +268,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let profile = store
+        // The profile was resolved above, so this read answers; a store that no longer
+        // holds it carries no binding either, so the two refusals below are reached from
+        // what it HOLDS and nothing here can panic on what the request supplied. The read
+        // borrows rather than copies the bindings: what the refusals need is whether this
+        // role is among them and how many there are.
+        let (carries_the_role, held_roles) = store
             .instance_profiles
-            .get_mut(&profile_key)
-            .expect("the profile was just resolved under this key");
+            .get(&profile_key)
+            .map_or((false, 0), |profile| {
+                (
+                    profile.role_keys.contains(&role_key),
+                    profile.role_keys.len(),
+                )
+            });
 
         // A repeated add of the role the profile already carries attempted "to create
         // a resource that already exists" (`EntityAlreadyExistsException` doc) rather
         // than a second association.
-        if profile.role_keys.contains(&role_key) {
+        if carries_the_role {
             return Err(
                 AddRoleToInstanceProfileErrorModeled::EntityAlreadyExistsException(
                     EntityAlreadyExistsException {
@@ -295,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an instance profile." (`AddRoleToInstanceProfile` doc.) The refusal names the
         // quota IAM names for it, in the one place this crate words that sentence
         // (`crate::state::instance_profile_role_quota_exceeded`).
-        if profile.role_keys.len() >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
+        if held_roles >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
             return Err(AddRoleToInstanceProfileErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(crate::state::instance_profile_role_quota_exceeded(
@@ -309,7 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The binding is the role's key on the profile record, so the single store is
         // still the one place the association lives — and the ROLE is still stored once,
         // in the role map, which is what a later read of this profile reports it from.
-        profile.role_keys.push(role_key);
+        if let Some(profile) = store.instance_profiles.get_mut(&profile_key) {
+            profile.role_keys.push(role_key);
+        }
         Ok(AddRoleToInstanceProfileOutput)
     }
 }

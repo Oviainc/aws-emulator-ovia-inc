@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 caller_akid = %caller_akid,
                 "no login profile was created"
             );
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::validation_error(
                 "Password must be specified unless the request is made with an AssumeRoot session",
             ));
         };

@@ -363,8 +363,8 @@ async fn get_group_reports_the_stored_group_and_its_members() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {token:?}: expected ValidationException, got {:?}",
+            "ValidationError",
+            "case {token:?}: expected ValidationError, got {:?}",
             error_code(&body)
         );
     }
