@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .pool(&input.user_pool_id)
                 .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
             let user = pool.user(&input.username).ok_or_else(user_not_found)?;
-            crate::state::plan_attribute_update(
+            let mut plan = crate::state::plan_attribute_update(
                 pool,
                 user,
                 &input.user_attributes,
@@ -253,7 +253,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // is verified.
                 crate::state::VerifiedFlagAuthority::Asserts,
             )
-            .map_err(refused)?
+            .map_err(refused)?;
+            // That assertion stands whether or not the request RESTATES the value
+            // it vouches for, so a request carrying the flag alone is what makes
+            // the user's STORED value a confirmed one — and an alias of the pool
+            // ([`alias_claimed_by_assertion`]).
+            plan.demotions.extend(alias_claimed_by_assertion(
+                pool,
+                user,
+                &input.user_attributes,
+            ));
+            plan
         };
 
         // The write moves an alias value this update takes from another user of
@@ -269,6 +279,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(AdminUpdateUserAttributesOutput {})
     }
+}
+
+/// The OTHER holders this request takes an alias value away from because it VOUCHES
+/// for a value `user` already holds, as `(storage key, verified flag)` for
+/// [`crate::state::AttributeUpdatePlan::demotions`].
+///
+/// "To skip the verification message and update the value of an attribute that
+/// requires verification in the same API request, include the `email_verified` or
+/// `phone_number_verified` attribute, with a value of `true`"
+/// (`AdminUpdateUserAttributes.UserAttributes` in this service's model): an
+/// administrator's flag of `true` asserts the value beside it is verified, and it
+/// asserts that about the value the user holds whether or not the request restates it.
+/// A confirmed `email` or `phone_number` is an ACTIVE alias of its user
+/// ([`crate::state::User::alias_is_active`]) and an alias value names ONE user of the
+/// pool, so vouching for a value another user answers to is what takes it from them —
+/// exactly as submitting the value does, which
+/// [`crate::state::plan_attribute_update`] plans already, so only the attributes this
+/// request does NOT restate are planned here.
+///
+/// Bounded by the two attributes this API verifies (`VerifiedAttributeType`), whatever
+/// the request's size.
+fn alias_claimed_by_assertion(
+    pool: &crate::state::UserPool,
+    user: &crate::state::User,
+    requested: &[AttributeType],
+) -> Vec<(String, &'static str)> {
+    let mut demotions = Vec::new();
+    for attribute in super::types::VERIFIED_ATTRIBUTE_TYPE_VALUES {
+        let Some(flag) = crate::state::verified_flag(attribute) else {
+            continue;
+        };
+        if requested
+            .iter()
+            .any(|submitted| submitted.name == *attribute)
+        {
+            continue;
+        }
+        let asserted = requested.iter().any(|submitted| {
+            submitted.name == flag
+                && submitted.value.as_deref() == Some(crate::state::FLAG_CONFIRMED)
+        });
+        if !asserted || !pool.is_alias_attribute(attribute) {
+            continue;
+        }
+        let Some(value) = user.attributes.get(*attribute) else {
+            continue;
+        };
+        demotions.extend(
+            pool.alias_holder_keys(attribute, value, &user.username)
+                .into_iter()
+                .map(|key| (key, flag)),
+        );
+    }
+    demotions
 }
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.

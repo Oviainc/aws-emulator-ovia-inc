@@ -243,6 +243,8 @@ mod user_pool_replicas;
 mod user_pool_server_set_configuration;
 #[path = "all/user_pool_web_acl_edge.rs"]
 mod user_pool_web_acl_edge;
+#[path = "all/user_read_projection.rs"]
+mod user_read_projection;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;
 #[path = "all/web_authn_credential_registration.rs"]

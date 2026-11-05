@@ -376,6 +376,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .entry(attribute)
                 .or_insert_with(|| input.username.clone());
         }
+        // A registrant's own email address or phone number is not proven by the
+        // registration that submitted it: the user "confirms ownership of the email
+        // address or phone number that they provided" only by answering the code
+        // (`ConfirmSignUp` in this service's model), which is what sets that
+        // attribute's flag to [`crate::state::FLAG_CONFIRMED`]. So a sign-up records
+        // the flag of every value it stores for a verifiable attribute
+        // ([`crate::state::verified_flag`]) as UNCONFIRMED, and every read projects
+        // that flag beside the value until the value is confirmed. A registration
+        // that submitted a flag of its own keeps the value it sent.
+        let unconfirmed_flags: Vec<&'static str> = attributes
+            .keys()
+            .filter_map(|name| crate::state::verified_flag(name))
+            .collect();
+        for flag in unconfirmed_flags {
+            attributes
+                .entry(flag.to_string())
+                .or_insert_with(|| crate::state::FLAG_UNCONFIRMED.to_string());
+        }
         let user = crate::state::User {
             username,
             sub: sub.clone(),

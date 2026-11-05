@@ -377,9 +377,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names is the one the submitted sign-in name resolves to, which in a pool
         // that minted the username is reached through that name.
         let resend = input.message_action.as_deref() == Some("RESEND");
-        let existing_key = sign_in_attribute
-            .as_deref()
-            .and_then(|_| pool.sign_in_name_holder_key(&input.username))
+        // Every way this pool resolves a submitted name to one of its users, not
+        // just the key the name would be stored under: "the username can't be a
+        // duplicate of another username in the same user pool"
+        // (`AdminCreateUser.Username`), and a `Username` "can be any of their alias
+        // attributes ... [or] the sub of a local user"
+        // (`AdminGetUser.Username`) — so a name the pool already resolves to a user
+        // (its username, its `sub`, or a value of one of the pool's sign-in or alias
+        // attributes that currently names it) names that user here too
+        // ([`crate::state::UserPool::user_storage_key`]). A create under such a name
+        // is the duplicate this operation refuses, and a resend addresses the user it
+        // resolves to.
+        let existing_key = pool
+            .user_storage_key(&input.username)
             .unwrap_or_else(|| key.clone());
         if let Some(existing) = pool.users.get_mut(&existing_key) {
             if !resend {
@@ -397,6 +407,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if resend {
             // There is no invitation to resend to a user that does not exist.
             return Err(user_not_found());
+        }
+        // A value submitted for one of this pool's SIGN-IN attributes names at most
+        // one user of it: `AliasAttributes` are "attributes supported as an alias for
+        // this user pool" and `UsernameAttributes` "specifies whether a user can use
+        // an email address or phone number as a username when they sign up" (this
+        // service's model), and either way the value resolves one user
+        // ([`crate::state::UserPool::sign_in_name_holder_key`]). So a create that
+        // would hand a second user a sign-in value another user already answers to is
+        // the same duplicate as a create under a taken name, and this operation —
+        // which models no `AliasExistsException` — reports the account that exists.
+        // An empty value is stored for no user at all, so it takes nothing.
+        //
+        // Asked of the DISTINCT attributes the pool signs users in with: `AliasAttributes`
+        // takes `AliasAttributeType` values and `UsernameAttributes` takes
+        // `UsernameAttributeType` values, which name three attributes between them
+        // (`phone_number`, `email`, `preferred_username`), so this set holds at most three
+        // entries however long the lists the pool stored are. Each entry is looked up once
+        // in the submitted list and resolved once, so one request costs a fixed number of
+        // resolutions rather than one per configured entry.
+        let sign_in_attributes: ::std::collections::BTreeSet<&str> = pool
+            .alias_attributes
+            .iter()
+            .chain(pool.username_attributes.iter())
+            .map(String::as_str)
+            .collect();
+        let claims_a_held_sign_in_value = sign_in_attributes.iter().any(|name| {
+            requested_attributes
+                .iter()
+                .find(|attribute| attribute.name == **name)
+                .and_then(|attribute| attribute.value.as_deref())
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| pool.sign_in_name_holder_key(value).is_some())
+        });
+        if claims_a_held_sign_in_value {
+            return Err(username_exists());
         }
         // This emulator holds a pool's users in memory, so the store is bounded.
         if pool.users.len() >= crate::state::MAX_USERS_PER_POOL {
