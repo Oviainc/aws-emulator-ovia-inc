@@ -39,9 +39,21 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The authorization pre-check in front of every operation
+//!
+//! A request the emulator's authentication layer would not verify is refused ahead of
+//! dispatch, and this endpoint states that refusal itself: HTTP 401 with the front door's
+//! own `{"message": "Unauthorized"}` envelope rather than the generic code the layer
+//! reports or any of this service's modelled errors. [`front_door`] owns that rule and
+//! states why it lives in the definition rather than in a handler or in
+//! `override_refusal`.
 
+mod front_door;
+
+use front_door::FrontDoorDefinition;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -51,7 +63,10 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with the one framework-level refusal this endpoint words
+    /// itself wrapped: the authentication layer's, which it states as the front door's own
+    /// HTTP 401 ([`front_door`]).
+    entry: FrontDoorDefinition<crate::ServiceDefinition<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +75,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: FrontDoorDefinition::new(crate::ServiceDefinition::new(engine)),
         }
     }
 }
@@ -99,12 +114,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // wording for those.
+        //
+        // An authentication refusal is declined HERE on purpose: this endpoint answers it
+        // with a status and an envelope of its own (see the module docs and
+        // [`front_door`]), and this seam can replace only the code and the message — a
+        // wording chosen here would keep the framework's 403 and its modelled-error
+        // envelope, which is not what the layer in front of this service states.
         let _ = refusal;
         None
     }

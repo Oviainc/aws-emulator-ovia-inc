@@ -17,8 +17,14 @@ mod centralization_rules;
 #[path = "all/delete_telemetry_pipeline.rs"]
 mod delete_telemetry_pipeline;
 
+#[path = "all/front_door_authorization.rs"]
+mod front_door_authorization;
+
 #[path = "all/pipeline_configuration_summary.rs"]
 mod pipeline_configuration_summary;
+
+#[path = "all/pipeline_mutation_target.rs"]
+mod pipeline_mutation_target;
 
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
