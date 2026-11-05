@@ -463,6 +463,7 @@ async fn every_operation_that_models_access_denied_takes_the_decision() {
         ("ListProfiles", json!({})),
         ("ListCapabilities", json!({})),
         ("ListPartnerships", json!({})),
+        ("ListTransformers", json!({})),
         (
             "CreateTransformer",
             json!({

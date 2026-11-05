@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTransformers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTransformers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTransformers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the transformer store in creation order. `@readonly`: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +150,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTransformers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTransformersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTransformers"))
+        // A reporting operation: nothing about the store changes here.
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(ListTransformersErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTransformersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let state = store.lock();
+
+        let (page, next_token) = crate::state::paginate(
+            &state.transformer_order,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListTransformersErrorModeled::ValidationException(ValidationException {
+                message: crate::state::INVALID_PAGE_TOKEN_MESSAGE.to_string(),
+            })
+        })?;
+
+        // Every member `TransformerSummary` declares is reported from the stored record,
+        // so a summary cannot disagree with what `GetTransformer` reports for the same
+        // transformer. `transformerArn` is not one of them: the summary does not model it.
+        let transformers = page
+            .iter()
+            .filter_map(|id| state.transformers.get(id))
+            .map(|transformer| TransformerSummary {
+                transformer_id: transformer.transformer_id.clone(),
+                name: transformer.name.clone(),
+                status: transformer.status.clone(),
+                created_at: transformer.created_at,
+                modified_at: transformer.modified_at,
+                file_format: transformer.file_format.clone(),
+                mapping_template: transformer.mapping_template.clone(),
+                edi_type: transformer.edi_type.clone(),
+                sample_document: transformer.sample_document.clone(),
+                input_conversion: transformer.input_conversion.clone(),
+                mapping: transformer.mapping.clone(),
+                output_conversion: transformer.output_conversion.clone(),
+                sample_documents: transformer.sample_documents.clone(),
+            })
+            .collect();
+
+        Ok(ListTransformersOutput {
+            transformers,
+            next_token,
+        })
     }
 }

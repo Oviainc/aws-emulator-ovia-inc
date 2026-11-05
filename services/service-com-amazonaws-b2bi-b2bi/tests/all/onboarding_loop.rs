@@ -1641,7 +1641,11 @@ async fn operations_outside_this_slice_still_answer_501() {
     let router = b2bi_router();
 
     // (case, operation, a request that satisfies the modelled input constraints)
-    let cases: &[(&str, &str, Value)] = &[("list transformers", "ListTransformers", json!({}))];
+    let cases: &[(&str, &str, Value)] = &[(
+        "update capability",
+        "UpdateCapability",
+        json!({ "capabilityId": "c-0123456789abcdef0" }),
+    )];
 
     for (case, operation, request) in cases {
         let (status, body) = call(&router, operation, request.clone()).await;
