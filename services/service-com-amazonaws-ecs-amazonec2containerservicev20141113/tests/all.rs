@@ -163,6 +163,8 @@ mod task_definition_rendering;
 mod task_definition_revision_requirement;
 #[path = "all/task_interface_allocation.rs"]
 mod task_interface_allocation;
+#[path = "all/task_interface_attach_and_connectivity.rs"]
+mod task_interface_attach_and_connectivity;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
 #[path = "all/task_override_and_size_validation.rs"]

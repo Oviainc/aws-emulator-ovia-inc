@@ -30,6 +30,13 @@
 //! records that instant in [`TaskRecord::pending_due_at`], and the same clock pass
 //! materialises it.
 //!
+//! A task that is allocated its own elastic network interface (the `awsvpc` network mode)
+//! is answered in `PROVISIONING` for a different reason: Amazon ECS has to create and
+//! attach that interface before it can launch the task, which the clock does one
+//! documented step at a time ([`INTERFACE_ATTACH_LIFECYCLE`]). Such a task is placed at the
+//! instant its interface is in place ([`placement_schedule`]), and that instant is also
+//! when it goes `CONNECTED` ([`TaskRecord::report_connected`]).
+//!
 //! `StopTask` is the same shape in reverse: the task goes to
 //! `DEACTIVATING` with `stoppingAt` set (the `Task$stoppingAt` doc: "the time when the
 //! task transitions from the `RUNNING` state to `STOPPING`") and reaches `STOPPED`
@@ -483,6 +490,11 @@ pub const STATUS_RUNNING: &str = "RUNNING";
 pub const STATUS_DEACTIVATING: &str = "DEACTIVATING";
 /// See [`STATUS_PENDING`].
 pub const STATUS_STOPPED: &str = "STOPPED";
+
+/// `Task$connectivity` of a task whose networking is in place, from the model's
+/// `Connectivity` enum (`smithy_query(query="shape",shape="Connectivity")`: `CONNECTED`,
+/// `DISCONNECTED`). See [`TaskRecord::report_connected`].
+pub const CONNECTIVITY_CONNECTED: &str = "CONNECTED";
 
 /// The container lifecycle, in the order a container passes through it — the statuses
 /// this service itself stores on a container ([`ContainerRecord::last_status`], moved by
@@ -3334,8 +3346,10 @@ pub struct TaskRecord {
     pub stop_code: Option<String>,
     pub version: i64,
     /// When `PROVISIONING` -> `PENDING` falls due: set when the capacity this task was
-    /// parked waiting for registers into its cluster, and `None` both for a task that was
-    /// placed straight away and for one still waiting for capacity to appear.
+    /// parked waiting for registers into its cluster, or — for a task that was allocated
+    /// its own elastic network interface — when that interface is in place
+    /// ([`placement_schedule`]). `None` both for a task that was placed straight away and
+    /// for one still waiting for capacity to appear.
     pub pending_due_at: Option<SystemTime>,
     /// When `PENDING` -> `RUNNING` falls due; `None` once it has been materialised, and
     /// `None` for a task that has not been placed yet.
@@ -3351,9 +3365,16 @@ pub struct TaskRecord {
     pub protection_expires_at: Option<SystemTime>,
     /// The resources Amazon ECS allocated to this task: the elastic network interface an
     /// `awsvpc` launch gets ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_task_attachments`]),
-    /// each in the state the agent last acknowledged through
+    /// each in the state the clock has taken it to or the agent last acknowledged through
     /// `SubmitAttachmentStateChanges`. Empty for a task whose network mode allocates none.
     pub attachments: Vec<AttachmentRecord>,
+    /// `Task$connectivity`: "The connectivity status of a task", from the model's
+    /// `Connectivity` enum (`CONNECTED`, `DISCONNECTED`), and `None` for a task whose
+    /// networking is not in place yet ([`Self::report_connected`]).
+    pub connectivity: Option<String>,
+    /// `Task$connectivityAt`: "The Unix timestamp for the time when the task last went
+    /// into `CONNECTED` status", and `None` for a task that has not.
+    pub connectivity_at: Option<DateTime>,
 }
 
 impl TaskRecord {
@@ -3370,6 +3391,8 @@ impl TaskRecord {
             // rather than one invented.
             attachments: Some(self.attachments.iter().map(AttachmentRecord::view).collect()),
             cluster_arn: Some(self.cluster_arn.clone()),
+            connectivity: self.connectivity.clone(),
+            connectivity_at: self.connectivity_at,
             container_instance_arn: self.container_instance_arn.clone(),
             containers: Some(
                 self.containers
@@ -3416,6 +3439,19 @@ impl TaskRecord {
         self.last_status != STATUS_STOPPED
     }
 
+    /// Whether this task is one the `PENDING` task counts count: Amazon ECS has accepted
+    /// it and is still bringing it up, so it has not started.
+    ///
+    /// `Service$pendingCount` and `Cluster$pendingTasksCount` are "the number of tasks in
+    /// the cluster that are in the `PENDING` state" — the tasks on their way up. A task
+    /// Amazon ECS still has a provisioning step to take for ([`STATUS_PROVISIONING`]: the
+    /// capacity it has to be placed on, or the interface it has to be given) is on its way
+    /// up too, and counting it anywhere else would report a service that is bringing its
+    /// tasks up as holding none at all.
+    pub fn is_pending(&self) -> bool {
+        self.last_status == STATUS_PENDING || self.last_status == STATUS_PROVISIONING
+    }
+
     /// The `ProtectedTask` a task-protection operation reports for this task: the
     /// protection it holds, read off the expiry the clock keeps.
     pub fn protection_view(&self) -> ProtectedTask {
@@ -3434,6 +3470,61 @@ impl TaskRecord {
     /// only supported for tasks belonging to an Amazon ECS service."
     pub fn is_protectable(&self) -> bool {
         self.service_name.is_some()
+    }
+
+    /// Report this task `CONNECTED` as of `at`, if the networking it runs with is in place
+    /// and it is not reported connected already.
+    ///
+    /// `Task$connectivity` is "the connectivity status of a task" and `connectivityAt`
+    /// "the time when the task last went into `CONNECTED` status". A task that is
+    /// allocated its own elastic network interface is reachable exactly when that
+    /// interface is attached, so the instant every interface it holds reports
+    /// [`ATTACHMENT_STATUS_ATTACHED`] is the instant it went `CONNECTED`; a task that was
+    /// allocated no interface of its own shares the networking of the host that runs it,
+    /// so it is connected once it has STARTED there.
+    ///
+    /// Answers whether anything changed, which is what makes the task's `version` counter
+    /// move ("Every time a task experiences a change ... the version counter is
+    /// incremented").
+    pub fn report_connected(&mut self, at: SystemTime) -> bool {
+        if self.connectivity.is_some() {
+            return false;
+        }
+        let connected = if self.holds_interface() {
+            self.interfaces_attached()
+        } else {
+            self.last_status == STATUS_RUNNING
+        };
+        if !connected {
+            return false;
+        }
+        self.connectivity = Some(CONNECTIVITY_CONNECTED.to_string());
+        self.connectivity_at = Some(DateTime::from(at));
+        true
+    }
+
+    /// Whether this task was allocated an elastic network interface of its own, which is
+    /// what the `awsvpc` network mode gets it.
+    pub fn holds_interface(&self) -> bool {
+        self.attachments
+            .iter()
+            .any(AttachmentRecord::is_elastic_network_interface)
+    }
+
+    /// Whether every elastic network interface this task was allocated is in place —
+    /// vacuously so for a task that was allocated none, which shares the networking of the
+    /// host that runs it.
+    ///
+    /// Amazon ECS attaches that interface BEFORE it launches the task ("PROVISIONING:
+    /// Amazon ECS has to perform additional steps before the task is launched. For
+    /// example, for tasks that use the `awsvpc` network mode, the elastic network
+    /// interface needs to be provisioned", the ECS task lifecycle), so this is what the
+    /// task's own `PROVISIONING` -> `PENDING` transition waits for.
+    pub fn interfaces_attached(&self) -> bool {
+        self.attachments
+            .iter()
+            .filter(|attachment| attachment.is_elastic_network_interface())
+            .all(AttachmentRecord::is_attached)
     }
 }
 

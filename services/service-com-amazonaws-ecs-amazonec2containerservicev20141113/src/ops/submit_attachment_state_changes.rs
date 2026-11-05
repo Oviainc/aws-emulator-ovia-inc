@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for (task_arn, attachment_id, status) in resolved {
-            guard.record_attachment_status(&task_arn, &attachment_id, &status);
+            guard.record_attachment_status(&task_arn, &attachment_id, &status, now);
         }
 
         // "Acknowledgement of the state change" — the report was taken, which is what the

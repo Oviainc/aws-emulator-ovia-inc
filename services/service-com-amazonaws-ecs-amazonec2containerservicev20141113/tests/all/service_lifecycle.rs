@@ -28,6 +28,11 @@ use crate::task_lifecycle::container;
 /// to fall due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
 
+/// Long enough for every clock-owed transition the START of a task here takes: the
+/// services below all run `awsvpc` revisions, so each of their tasks is placed only once
+/// the interface it was allocated is attached ([`crate::ecs_wire::AWSVPC_START`]).
+const TASK_START: Duration = crate::ecs_wire::AWSVPC_START;
+
 /// How a case names the task definition its service should run: the three forms the
 /// `taskDefinition` doc allows ("The family and revision (family:revision) or full ARN of
 /// the task definition").
@@ -444,9 +449,9 @@ async fn service_create_reads_back_with_the_task_set_its_scheduler_placed() {
         settling.push((case, test.cluster, test.service_name, test.desired));
     }
 
-    // The clock, not a reader, is what starts the tasks the scheduler placed — one span
+    // The clock, not a reader, is what starts the tasks the scheduler placed — one wait
     // covers every row, since they were all placed before it started.
-    tokio::time::sleep(ONE_SPAN).await;
+    tokio::time::sleep(TASK_START).await;
     for (case, cluster, service_name, desired) in settling {
         let settled = describe(&router, cluster, service_name, false, case).await;
         assert_eq!(
@@ -537,7 +542,7 @@ async fn update_service_moves_the_task_count_in_both_directions() {
             "case {case:?}: expected {target} wanted tasks, got {placed:?}"
         );
 
-        tokio::time::sleep(ONE_SPAN).await;
+        tokio::time::sleep(TASK_START).await;
         let settled = describe(&router, "scaling", "web", false, case).await;
         assert_eq!(
             count(&settled, "runningCount", case),
@@ -776,10 +781,10 @@ async fn the_cluster_counts_the_services_and_tasks_it_holds() {
         );
     }
 
-    // One span covers every row: the clock starts the tasks of all three services, and
+    // One wait covers every row: the clock starts the tasks of all three services, and
     // the cluster's running count is the sum of what their schedulers placed.
     let case = "every service settled";
-    tokio::time::sleep(ONE_SPAN).await;
+    tokio::time::sleep(TASK_START).await;
     let described = ok(
         &router,
         "DescribeClusters",

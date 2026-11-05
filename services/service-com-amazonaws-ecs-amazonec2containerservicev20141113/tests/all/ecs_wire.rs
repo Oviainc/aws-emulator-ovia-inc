@@ -20,6 +20,22 @@ pub(crate) const SIGNED_REGION: &str = "us-west-2";
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = "000000000000";
 
+/// Long enough for every clock-owed transition the start of an `awsvpc` task takes to
+/// fall due: Amazon ECS creates and attaches the interface such a task is allocated, one
+/// `state::INTERFACE_STEP_SPAN` per documented step of
+/// `state::INTERFACE_ATTACH_LIFECYCLE`, and only then is the task `PENDING` with its own
+/// start owed one `state::TRANSITION_SPAN` later. With margin for a loaded test machine.
+pub(crate) const AWSVPC_START: std::time::Duration = std::time::Duration::from_millis(
+    (service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_ATTACH_LIFECYCLE
+        .len() as u64
+        - 1)
+        * service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_STEP_SPAN
+            .as_millis() as u64
+        + service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN
+            .as_millis() as u64
+        + 400,
+);
+
 /// A router with just this service mounted on a fresh engine.
 pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

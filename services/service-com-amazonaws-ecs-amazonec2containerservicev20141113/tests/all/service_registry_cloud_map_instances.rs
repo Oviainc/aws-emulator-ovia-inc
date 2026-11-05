@@ -48,13 +48,10 @@ const REGISTRY_PORT: i64 = 8080;
 const NAMESPACE: &str = "registryinstances.example.com";
 const VPC: &str = "vpc-0123456789abcdef0";
 
-/// Long enough for the two clock-owed task transitions (`PENDING` then `RUNNING`, each
-/// `state::TRANSITION_SPAN`) to fall due, with margin for a loaded test machine.
-const TWO_SPANS: Duration = Duration::from_millis(
-    2 * service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN
-        .as_millis() as u64
-        + 400,
-);
+/// Long enough for every clock-owed transition an `awsvpc` task's start takes to fall due
+/// ([`crate::ecs_wire::AWSVPC_START`]): the interface it was allocated is created and
+/// attached, and only then is the task placed and started.
+const TWO_SPANS: Duration = crate::ecs_wire::AWSVPC_START;
 
 /// A Cloud Map service in [`NAMESPACE`] publishing an `SRV` record, and its `(Id, Arn)`.
 async fn srv_registry(router: &MultiServiceRouter, name: &str, case: &str) -> (String, String) {

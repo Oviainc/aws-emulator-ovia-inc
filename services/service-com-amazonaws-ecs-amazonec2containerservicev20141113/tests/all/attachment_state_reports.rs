@@ -10,8 +10,10 @@
 //!   (`smithy_query(query="doc", shape="RegisterTaskDefinitionRequest",
 //!   member="networkMode")`), and that interface is the attachment Amazon ECS reports for
 //!   the task; a task in any other mode shares its host's networking and holds none. The
-//!   attachment is reported in the state the store holds it in — Amazon ECS creates it and
-//!   the AGENT attaches it, so nothing but the agent's own report moves it.
+//!   attachment is reported in the state the store holds it in — the state Amazon ECS
+//!   created it in until either the CLOCK attaches it (see
+//!   [`crate::task_interface_attach_and_connectivity`]) or the AGENT reports on it, and
+//!   never a read.
 //! * `SubmitAttachmentStateChanges` resolves the cluster its report names, and then every
 //!   `attachmentArn` the report carries, against this store: a cluster that resolves to
 //!   nothing is refused with `ClientException` and the fixed cluster sentence, an

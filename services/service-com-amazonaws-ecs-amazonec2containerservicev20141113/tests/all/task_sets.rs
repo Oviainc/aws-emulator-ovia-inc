@@ -862,7 +862,9 @@ async fn the_scheduler_records_why_it_could_not_place_a_task_and_keeps_the_desir
                     desired,
                     "case {case:?}: expected every wanted task placed, got {created}"
                 );
-                tokio::time::sleep(ONE_SPAN).await;
+                // A Fargate service's tasks are `awsvpc`, so each of them is placed only
+                // once the interface it was allocated is attached.
+                tokio::time::sleep(crate::ecs_wire::AWSVPC_START).await;
                 let read = describe_service(&router, &cluster, "web", case).await;
                 assert_eq!(
                     count(&read, "runningCount", case),

@@ -642,36 +642,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ACQUIRE the capacity for it, the task has been accepted but not placed: Amazon
         // ECS has to add a container instance first, which is what `PROVISIONING` reports,
         // and no start is owed until it has. A placement onto capacity that already exists
-        // is `PENDING` with its start owed by the clock.
+        // is `PENDING` with its start owed by the clock — unless it has to be given an
+        // interface first, which is a step of its own ([`crate::state::placement_schedule`]).
         let awaiting_capacity = crate::state::awaits_provisioned_capacity(
             capacity_provider_name
                 .as_deref()
                 .and_then(|name| guard.capacity_providers.get(name)),
             guard.registered_container_instances(&cluster_name),
         );
-        let initial_status = crate::state::initial_task_status(awaiting_capacity);
-        let running_due_at = if awaiting_capacity {
-            None
-        } else {
-            Some(now + crate::state::TRANSITION_SPAN)
-        };
         let mut created = Vec::with_capacity(requested);
         for _ in 0..count {
             let task_id = guard.next_task_id();
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
+            // The elastic network interface an `awsvpc` task is allocated, out of the
+            // networking this run launches it with.
+            let attachments = guard.mint_task_attachments(
+                &definition.network_mode,
+                input.network_configuration.as_ref(),
+                now,
+            );
+            let schedule =
+                crate::state::placement_schedule(awaiting_capacity, &attachments, now);
             let containers = guard.mint_containers(
                 &region,
                 &cluster_name,
                 &task_id,
                 &task_arn,
                 &definition,
-                initial_status,
-            );
-            // The elastic network interface an `awsvpc` task is allocated, out of the
-            // networking this run launches it with.
-            let attachments = guard.mint_task_attachments(
-                &definition.network_mode,
-                input.network_configuration.as_ref(),
+                schedule.last_status,
             );
 
             let record = crate::state::TaskRecord {
@@ -686,7 +684,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 container_instance_arn: None,
                 task_definition_arn: definition.arn.clone(),
                 family: definition.family.clone(),
-                last_status: initial_status.to_string(),
+                last_status: schedule.last_status.to_string(),
                 desired_status: crate::state::STATUS_RUNNING.to_string(),
                 containers,
                 cpu: definition.cpu.clone(),
@@ -713,13 +711,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stopped_reason: None,
                 stop_code: None,
                 version: 1,
-                pending_due_at: None,
-                running_due_at,
+                pending_due_at: schedule.pending_due_at,
+                running_due_at: schedule.running_due_at,
                 stopped_due_at: None,
                 // Scale-in protection is `UpdateTaskProtection`'s to set; a task nobody
                 // has protected holds none.
                 protection_expires_at: None,
                 attachments,
+                // Nothing is on the network before the networking it runs with is in
+                // place: the interface it was allocated has to be attached first.
+                connectivity: None,
+                connectivity_at: None,
             };
             // `RunTask` has no `include` member to narrow the response with, so the
             // task it just created is reported with the tags it was created with.

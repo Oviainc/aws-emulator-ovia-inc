@@ -817,10 +817,11 @@ pub struct Placement {
 /// `AmazonElasticBlockStorage`").
 pub const ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE: &str = "ElasticNetworkInterface";
 
-/// `Attachment$status` of an attachment Amazon ECS has created for a task and no agent has
-/// acknowledged yet. The member's own doc lists the statuses: "Valid values are
-/// `PRECREATED`, `CREATED`, `ATTACHING`, `ATTACHED`, `DETACHING`, `DETACHED`, `DELETED`,
-/// and `FAILED`" — and the one that moves it is the agent's own report
+/// `Attachment$status` of an attachment Amazon ECS has just created for a task. The
+/// member's own doc lists the statuses: "Valid values are `PRECREATED`, `CREATED`,
+/// `ATTACHING`, `ATTACHED`, `DETACHING`, `DETACHED`, `DELETED`, and `FAILED`" — and what
+/// moves it on is the CLOCK, which attaches the resource
+/// ([`INTERFACE_ATTACH_LIFECYCLE`]), or the agent's own report
 /// (`SubmitAttachmentStateChanges`: "Sent to acknowledge that an attachment changed
 /// states"), never a read.
 pub const ATTACHMENT_STATUS_PRECREATED: &str = "PRECREATED";
@@ -851,6 +852,11 @@ pub struct AttachmentRecord {
     pub attachment_type: String,
     pub status: String,
     pub details: Vec<KeyValuePair>,
+    /// When the next step of this attachment's own progression falls due
+    /// ([`INTERFACE_ATTACH_LIFECYCLE`]), and `None` once the clock owes it nothing more:
+    /// the resource is in place, or an agent has reported a status that progression does
+    /// not pass through.
+    pub next_status_due_at: Option<SystemTime>,
 }
 
 impl AttachmentRecord {

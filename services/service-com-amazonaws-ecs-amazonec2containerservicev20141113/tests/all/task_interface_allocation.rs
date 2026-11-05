@@ -40,8 +40,10 @@ const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 /// them.
 const SUBNET: &str = "subnet-0123456789abcdef0";
 
-/// Long enough for the two clock-owed task transitions (`PENDING` then `RUNNING`, each
-/// `state::TRANSITION_SPAN`) to fall due, with margin for a loaded test machine.
+/// Long enough for the two clock-owed task transitions a task that was allocated no
+/// interface takes (`PENDING` then `RUNNING`, each `state::TRANSITION_SPAN`) to fall due,
+/// with margin for a loaded test machine. A task that WAS allocated one is placed only
+/// once that interface is attached, which takes [`crate::ecs_wire::AWSVPC_START`].
 const TWO_SPANS: Duration = Duration::from_millis(
     2 * service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN
         .as_millis() as u64
@@ -160,7 +162,14 @@ async fn an_awsvpc_task_reports_the_interface_it_was_allocated_once_it_runs() {
             }
         }
 
-        tokio::time::sleep(TWO_SPANS).await;
+        // The interface is attached on its own clock, and the task is not placed before
+        // it is in place, so an `awsvpc` task's start is the longer wait.
+        tokio::time::sleep(if network_mode == "awsvpc" {
+            crate::ecs_wire::AWSVPC_START
+        } else {
+            TWO_SPANS
+        })
+        .await;
 
         for arn in &arns {
             let task = describe(&router, arn, case).await;

@@ -23,16 +23,41 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
         }
         for task in self.tasks.values_mut() {
+            // The elastic network interface an `awsvpc` task was allocated is created and
+            // then ATTACHED on its own clock, one documented step at a time
+            // ([`INTERFACE_ATTACH_LIFECYCLE`]): the steps were owed at these instants
+            // whether or not anybody called to look. A task whose interface has just been
+            // attached is on the network from that instant
+            // ([`TaskRecord::report_connected`]).
+            let mut attached_at = None;
+            if task.desired_status == STATUS_RUNNING {
+                for attachment in &mut task.attachments {
+                    if let Some(at) = attachment.advance_interface(now) {
+                        attached_at =
+                            Some(attached_at.map_or(at, |seen: SystemTime| seen.max(at)));
+                    }
+                }
+            }
+            if let Some(at) = attached_at {
+                task.report_connected(at);
+                task.version += 1;
+            }
             // The placement a parked task was owed from the instant capacity registered
             // into its cluster: it has been placed, so it is `PENDING` and its start is
-            // owed from there like any other placed task's.
+            // owed from there like any other placed task's. A task Amazon ECS cannot
+            // launch before the interface it was allocated is in place waits where it is
+            // until that interface IS in place, however long the agent that reports on it
+            // takes ([`TaskRecord::interfaces_attached`]).
             if let Some(due) = task.pending_due_at {
-                if due <= now {
+                if due <= now && task.interfaces_attached() {
                     task.pending_due_at = None;
                     task.last_status = STATUS_PENDING.to_string();
                     for container in &mut task.containers {
                         container.advance_to(STATUS_PENDING);
                     }
+                    // The start a placed task is owed falls due one span after the instant
+                    // the placement was owed at, so a caller reading in between still
+                    // sees the task `PENDING`.
                     task.running_due_at = Some(due + TRANSITION_SPAN);
                     task.version += 1;
                 }
@@ -53,6 +78,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     for attachment in &mut task.attachments {
                         attachment.attach_allocated_interface();
                     }
+                    // A task that shares the networking of the host that runs it is on the
+                    // network once it has started there.
+                    task.report_connected(due);
                     task.version += 1;
                 }
             }
@@ -333,13 +361,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// task in any other network mode shares its host's networking and is allocated none.
     /// The attachment starts [`ATTACHMENT_STATUS_PRECREATED`] — Amazon ECS has CREATED the
     /// interface, so it already carries the id, the MAC address and the private IPv4 address
-    /// it was given beside the subnet the launch named — and reaches
-    /// [`ATTACHMENT_STATUS_ATTACHED`] when the task it belongs to runs
-    /// ([`AttachmentRecord::attach_allocated_interface`]).
+    /// it was given beside the subnet the launch named — and the CLOCK takes it on from
+    /// there, one documented step at a time ([`INTERFACE_ATTACH_LIFECYCLE`]), the first of
+    /// them owed [`INTERFACE_STEP_SPAN`] from `now`.
     pub fn mint_task_attachments(
         &mut self,
         network_mode: &str,
         configuration: Option<&NetworkConfiguration>,
+        now: SystemTime,
     ) -> Vec<AttachmentRecord> {
         if network_mode != NETWORK_MODE_AWSVPC {
             return Vec::new();
@@ -361,6 +390,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             attachment_type: ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE.to_string(),
             status: ATTACHMENT_STATUS_PRECREATED.to_string(),
             details,
+            next_status_due_at: Some(now + INTERFACE_STEP_SPAN),
         };
         attachment.report_allocated_interface();
         vec![attachment]
@@ -389,7 +419,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Record the status the agent reported for ONE attachment of ONE task, as
     /// `SubmitAttachmentStateChanges` does ("Sent to acknowledge that an attachment changed
     /// states"): the agent is what attaches the resource, so its word on the status is
-    /// stored as given.
+    /// stored as given, and the clock carries the attachment on from wherever the report
+    /// left it ([`AttachmentRecord::advance_interface`]).
+    ///
+    /// A report that puts the task's interface in place is also what puts the task on the
+    /// network, so the task is `CONNECTED` from the instant of the report
+    /// ([`TaskRecord::report_connected`]).
     ///
     /// `Task$version`: "Every time a task experiences a change ... the version counter is
     /// incremented" — an attachment of it changing state is such a change, so a report that
@@ -399,6 +434,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         task_arn: &str,
         attachment_id: &str,
         status: &str,
+        now: SystemTime,
     ) {
         let Some(task) = self.tasks.get_mut(task_arn) else {
             return;
@@ -414,6 +450,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             return;
         }
         attachment.status = status.to_string();
+        task.report_connected(now);
         task.version += 1;
     }
 
@@ -1518,8 +1555,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// The transition falls due [`TRANSITION_SPAN`] from `now` and
     /// [`Self::advance_clock`] materialises it, so nothing here moves a status that is not
-    /// owed yet. A task the caller has already asked to stop is not placed: its placement
-    /// was cancelled, not merely overtaken.
+    /// owed yet — and a task that cannot be launched before the interface it was allocated
+    /// is in place waits for that too ([`AttachmentRecord::attached_due_at`]), whichever
+    /// of the two is later. A task the caller has already asked to stop is not placed: its
+    /// placement was cancelled, not merely overtaken.
     pub fn place_tasks_awaiting_capacity(&mut self, cluster_name: &str, now: SystemTime) {
         for task in self.tasks.values_mut() {
             if task.cluster_name == cluster_name
@@ -1527,7 +1566,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 && task.desired_status == STATUS_RUNNING
                 && task.pending_due_at.is_none()
             {
-                task.pending_due_at = Some(now + TRANSITION_SPAN);
+                let placed_at = now + TRANSITION_SPAN;
+                let attached_at = task
+                    .attachments
+                    .iter()
+                    .filter_map(AttachmentRecord::attached_due_at)
+                    .max();
+                task.pending_due_at = Some(attached_at.unwrap_or(placed_at).max(placed_at));
             }
         }
     }
@@ -1665,7 +1710,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         {
             if task.last_status == STATUS_RUNNING {
                 tally.running += 1;
-            } else if task.last_status == STATUS_PENDING {
+            } else if task.is_pending() {
                 tally.pending += 1;
             }
         }
@@ -3030,7 +3075,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Place ONE task of `service`, `PENDING` with its start owed by the clock
     /// [`TRANSITION_SPAN`] from now, exactly as `RunTask` leaves a task it placed — or
     /// parked in [`STATUS_PROVISIONING`] when the strategy's provider still has to acquire
-    /// the capacity to place it on ([`awaits_provisioned_capacity`]).
+    /// the capacity to place it on ([`awaits_provisioned_capacity`]), or when the interface
+    /// it was allocated still has to be attached ([`placement_schedule`]).
     pub(super) fn place_service_task(
         &mut self,
         service: &ServiceRecord,
@@ -3054,14 +3100,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let attachments = self.mint_task_attachments(
             &definition.network_mode,
             placement.network_configuration.as_ref(),
+            now,
         );
+        let schedule = placement_schedule(awaiting_capacity, &attachments, now);
         let containers = self.mint_containers(
             region,
             &service.cluster_name,
             &task_id,
             &task_arn,
             definition,
-            initial_task_status(awaiting_capacity),
+            schedule.last_status,
         );
         // "Determines whether to propagate the tags from the task definition or the
         // service to the task. If no value is specified, the tags aren't propagated."
@@ -3081,7 +3129,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             container_instance_arn: None,
             task_definition_arn: definition.arn.clone(),
             family: definition.family.clone(),
-            last_status: initial_task_status(awaiting_capacity).to_string(),
+            last_status: schedule.last_status.to_string(),
             desired_status: STATUS_RUNNING.to_string(),
             containers,
             cpu: definition.cpu.clone(),
@@ -3111,17 +3159,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             stop_code: None,
             version: 1,
             // A task that is not placed yet has no start owed: the clock owes it only
-            // once the capacity it waits for exists.
-            pending_due_at: None,
-            running_due_at: if awaiting_capacity {
-                None
-            } else {
-                Some(now + TRANSITION_SPAN)
-            },
+            // once the capacity it waits for exists — and a task whose interface has to
+            // be attached first is placed at the instant it is in place.
+            pending_due_at: schedule.pending_due_at,
+            running_due_at: schedule.running_due_at,
             stopped_due_at: None,
             // Nobody has protected a task the scheduler has just placed.
             protection_expires_at: None,
             attachments,
+            // Nothing is on the network before the networking it runs with is in place.
+            connectivity: None,
+            connectivity_at: None,
         };
         self.tasks.insert(task_arn, record);
     }
@@ -3167,7 +3215,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 if let Some(index) = launch_type {
                     tally.by_launch_type[index].running_tasks += 1;
                 }
-            } else if task.last_status == STATUS_PENDING {
+            } else if task.is_pending() {
                 tally.pending += 1;
                 if let Some(index) = launch_type {
                     tally.by_launch_type[index].pending_tasks += 1;

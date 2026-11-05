@@ -53,6 +53,11 @@ const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 /// What the agent plane answers a report it has recorded with.
 const ACK: &str = "ACK";
 
+/// The `lastStatus` a run of [`FAMILY`] leaves its task at: an `awsvpc` task is allocated
+/// its own elastic network interface, and Amazon ECS has to attach that interface before
+/// the task can be launched, which is what `PROVISIONING` reports.
+const STARTING_STAGE: &str = "PROVISIONING";
+
 /// The sentence a report naming a cluster that resolves to nothing is refused with.
 const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
 
@@ -243,7 +248,7 @@ async fn a_task_report_resolves_the_cluster_then_the_task_before_it_records_anyt
     let read = describe_task(&router, CLUSTER, &task_arn, case).await;
     assert_eq!(
         read["lastStatus"].as_str(),
-        Some("PENDING"),
+        Some(STARTING_STAGE),
         "case {case:?}: a refused report must change nothing, got {read}"
     );
 }
@@ -334,12 +339,12 @@ async fn a_report_resolves_every_nested_reference_before_it_records_any_of_them(
         let read = describe_task(&router, CLUSTER, &task_arn, row).await;
         assert_eq!(
             read["lastStatus"].as_str(),
-            Some("PENDING"),
+            Some(STARTING_STAGE),
             "case {row:?}: a refused report must leave the task where it was, got {read}"
         );
         assert_eq!(
             container_of(&read, FIRST_CONTAINER, row)["lastStatus"].as_str(),
-            Some("PENDING"),
+            Some(STARTING_STAGE),
             "case {row:?}: a refused report must record none of its entries, got {read}"
         );
         assert_eq!(
@@ -356,10 +361,10 @@ async fn the_reported_stage_is_recorded_with_the_instants_that_stage_carries() {
     // Lifecycle" in the ECS developer guide: PROVISIONING, PENDING, RUNNING,
     // DEACTIVATING, STOPPED) plus a stage that lifecycle does not name, which cannot be
     // ranked and so is stored as the agent reported it. Every row reports against a FRESH
-    // task that a run has just left at PENDING, so the expected stage is a function of
-    // the report alone: a stage past PENDING is recorded, a stage at or before it is not.
-    // Each row carries the stage it reports, the stage the task must then hold, whether
-    // the report MOVED it, and the instant that stage carries.
+    // task that a run has just left at [`STARTING_STAGE`], so the expected stage is a
+    // function of the report alone: a stage past that one is recorded, the stage it is
+    // already at is not. Each row carries the stage it reports, the stage the task must
+    // then hold, whether the report MOVED it, and the instant that stage carries.
     let rows: [(&str, &str, &str, bool, Option<&str>); 6] = [
         (
             "an onward RUNNING",
@@ -384,18 +389,12 @@ async fn the_reported_stage_is_recorded_with_the_instants_that_stage_carries() {
         ),
         (
             "the stage it is already at",
-            "PENDING",
-            "PENDING",
+            STARTING_STAGE,
+            STARTING_STAGE,
             false,
             None,
         ),
-        (
-            "a stage it has passed",
-            "PROVISIONING",
-            "PENDING",
-            false,
-            None,
-        ),
+        ("an onward PENDING", "PENDING", "PENDING", true, None),
         (
             "a stage the lifecycle does not name",
             "ACTIVATING",

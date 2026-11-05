@@ -460,19 +460,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let task_id = guard.next_task_id();
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
+            // The elastic network interface an `awsvpc` task is allocated, out of the
+            // networking this placement launches it with.
+            let attachments = guard.mint_task_attachments(
+                &definition.network_mode,
+                input.network_configuration.as_ref(),
+                now,
+            );
+            // The capacity is already there — the call named it — so the task is placed;
+            // only its start, and the attach of any interface it was allocated, are still
+            // owed ([`crate::state::placement_schedule`]).
+            let schedule = crate::state::placement_schedule(false, &attachments, now);
             let containers = guard.mint_containers(
                 &region,
                 &cluster_name,
                 &task_id,
                 &task_arn,
                 &definition,
-                crate::state::STATUS_PENDING,
-            );
-            // The elastic network interface an `awsvpc` task is allocated, out of the
-            // networking this placement launches it with.
-            let attachments = guard.mint_task_attachments(
-                &definition.network_mode,
-                input.network_configuration.as_ref(),
+                schedule.last_status,
             );
 
             let record = crate::state::TaskRecord {
@@ -487,7 +492,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 family: definition.family.clone(),
                 // The capacity is already there — the call named it — so the task is
                 // placed, and only its start is still owed.
-                last_status: crate::state::STATUS_PENDING.to_string(),
+                last_status: schedule.last_status.to_string(),
                 desired_status: crate::state::STATUS_RUNNING.to_string(),
                 containers,
                 cpu: definition.cpu.clone(),
@@ -521,13 +526,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 version: 1,
                 // The task is placed, so no placement is outstanding; its start falls due
                 // one transition span from here and the clock materialises it.
-                pending_due_at: None,
-                running_due_at: Some(now + crate::state::TRANSITION_SPAN),
+                pending_due_at: schedule.pending_due_at,
+                running_due_at: schedule.running_due_at,
                 stopped_due_at: None,
                 // Scale-in protection is `UpdateTaskProtection`'s to set; a task nobody
                 // has protected holds none.
                 protection_expires_at: None,
                 attachments,
+                // Nothing is on the network before the networking it runs with is in
+                // place: the interface it was allocated has to be attached first.
+                connectivity: None,
+                connectivity_at: None,
             };
             // `StartTask` has no `include` member to narrow the response with, so the
             // task it just created is reported with the tags it was created with.
