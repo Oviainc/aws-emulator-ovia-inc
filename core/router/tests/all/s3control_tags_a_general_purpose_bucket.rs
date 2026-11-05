@@ -43,8 +43,10 @@ const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// The region every request below is signed for.
 const REGION: &str = "us-west-2";
 
-/// The account id the S3 Control requests name, in `x-amz-account-id`.
-const ACCOUNT: &str = "123456789012";
+/// The account id the S3 Control requests name, in `x-amz-account-id`: the
+/// caller's own, which is the only account S3 Control authorizes a request for
+/// (`engine::emulator_account_id`).
+const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
 
 /// The XML namespace S3's own model declares, which a client's payload carries.
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";

@@ -60,13 +60,14 @@ async fn a_delete_removes_the_one_group_it_names_and_frees_its_name() {
         let case = group.case;
         let emulator = Emulator::start();
 
-        // The same name in a second account, so a delete reaching more than the pair it
-        // names would be visible.
-        for account in [ACCOUNT, OTHER_ACCOUNT] {
-            let created = create_group(&emulator, account, &name, group, None).await;
+        // A second group of this account, so a delete reaching more than the
+        // pair it names would be visible.
+        let kept_name = "kept-group".to_string();
+        for created_name in [&name, &kept_name] {
+            let created = create_group(&emulator, ACCOUNT, created_name, group, None).await;
             assert_eq!(
                 created.status, 204,
-                "case {case:?}: expected the create for {account} to be accepted with 204, \
+                "case {case:?}: expected the create of {created_name} to be accepted with 204, \
                  got {} {}",
                 created.status, created.body
             );
@@ -113,12 +114,21 @@ async fn a_delete_removes_the_one_group_it_names_and_frees_its_name() {
             again.body
         );
 
-        // The other account's group of the same name is a different group, untouched.
-        let theirs = get_group(&emulator, OTHER_ACCOUNT, &name).await;
+        // The account's other group is untouched, and a delete addressed in
+        // another account is refused ahead of the lookup.
+        let kept = get_group(&emulator, ACCOUNT, &kept_name).await;
         assert_eq!(
-            sorted_leaves(&theirs.body),
-            sorted(&group.expected(&name, REGION)),
-            "case {case:?}: the delete reached the other account's group of the same name"
+            sorted_leaves(&kept.body),
+            sorted(&group.expected(&kept_name, REGION)),
+            "case {case:?}: the delete reached the account's other group"
+        );
+        let denied = delete_group(&emulator, OTHER_ACCOUNT, &kept_name).await;
+        assert_eq!(
+            (denied.status, denied.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected a delete for another account to be refused, got {} {}",
+            denied.status,
+            denied.body
         );
 
         // The name is free again: a create under it is accepted rather than refused as a

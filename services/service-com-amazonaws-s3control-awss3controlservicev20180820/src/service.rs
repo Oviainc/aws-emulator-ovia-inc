@@ -40,15 +40,18 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Two modules beside this file carry what those seams are used FOR here, so
+//! Three modules beside this file carry what those seams are used FOR here, so
 //! the rules live in one place each rather than inside the seam bodies:
 //!
 //! - [`routes`] — the routes whose URI template puts literal segments after a
 //!   greedy `@httpLabel`, which the model-derived routing table cannot match,
 //!   and the rule that resolves them;
+//! - [`authorization`] — the account a request names, and whether the caller is
+//!   authorized for it, which is decided ahead of the operation it names;
 //! - [`envelope`] — the error envelope every refusal this service answers is
 //!   finished in, and the one dispatch seam `override_operation` hands back.
 
+pub mod authorization;
 pub mod envelope;
 pub mod routes;
 

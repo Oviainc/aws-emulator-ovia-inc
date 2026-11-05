@@ -29,7 +29,9 @@ use crate::access_grants_data_plane::{
     create_grant, create_instance, create_location, get_grant, get_location,
 };
 use crate::access_grants_location_update::update_location;
-use crate::access_point_lifecycle::{call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION};
+use crate::access_point_lifecycle::{
+    assert_foreign_account_refused, call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
+};
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
     ACCESS_GRANTS_LOCATION_DEFAULT_ID, DEFAULT_LOCATION_SCOPE, PERMISSION_READ,
@@ -39,6 +41,10 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
 /// A second signing Region, used to pin that a location belongs to the instance
 /// of one account in one Region: the same id names no location there.
 const OTHER_REGION: &str = "eu-central-1";
+
+/// A third signing Region, so a row whose instance is its own still has one of
+/// its own now that every row is the caller's one account's.
+const THIRD_REGION: &str = "ap-southeast-2";
 
 /// The role an update moves a location to, for the update that must be refused
 /// once the registration is gone. Its shape is the modelled `IAMRoleArn`
@@ -155,9 +161,9 @@ fn delete_cases() -> Vec<DeleteCase> {
             ],
         },
         DeleteCase {
-            case: "another account's instance, one grant",
-            account_id: OTHER_ACCOUNT,
-            region: REGION,
+            case: "a third Region's instance, one grant",
+            account_id: ACCOUNT,
+            region: THIRD_REGION,
             location_scope: "s3://partner-bucket/inbound/",
             grants: vec![("supplier-a/*", PERMISSION_READWRITE)],
         },
@@ -491,8 +497,7 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_removes_nothing(
 
     // Each row is an address no location of the request's instance sits at: a
     // never-assigned id, the default id with no default location registered,
-    // the registered id in another account's instance, and the registered id in
-    // another Region's instance.
+    // and the registered id in another Region's instance.
     let unknown: Vec<(&str, &str, &str, String)> = vec![
         (
             "an id no register call assigned",
@@ -507,12 +512,6 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_removes_nothing(
             ACCESS_GRANTS_LOCATION_DEFAULT_ID.to_string(),
         ),
         (
-            "another account's instance",
-            OTHER_ACCOUNT,
-            case.region,
-            location_id.clone(),
-        ),
-        (
             "another Region's instance",
             case.account_id,
             OTHER_REGION,
@@ -524,6 +523,14 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_removes_nothing(
         let refused = delete_location(&emulator, account_id, region, &unknown_id).await;
         assert_no_such_location(label, "DeleteAccessGrantsLocation", &refused);
     }
+
+    // The same deregistration addressed in another account is refused before
+    // the location is resolved.
+    assert_foreign_account_refused(
+        "DeleteAccessGrantsLocation for another account",
+        OTHER_ACCOUNT,
+        &delete_location(&emulator, OTHER_ACCOUNT, case.region, &location_id).await,
+    );
 
     // The refused deregistrations released nothing: the registration and its
     // grants are all still there.

@@ -31,7 +31,8 @@
 use std::collections::BTreeSet;
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -879,12 +880,8 @@ async fn the_grant_closest_to_the_target_is_the_one_that_matches() {
 #[tokio::test]
 async fn a_grant_belongs_to_one_account_and_region() {
     let emulator = Emulator::start();
-    for (account_id, region) in [
-        (ACCOUNT, REGION),
-        (ACCOUNT, OTHER_REGION),
-        (OTHER_ACCOUNT, REGION),
-    ] {
-        create_instance(&emulator, account_id, region).await;
+    for region in [REGION, OTHER_REGION] {
+        create_instance(&emulator, ACCOUNT, region).await;
     }
     let location = create_location(&emulator, ACCOUNT, REGION, "s3://scoped-bucket/").await;
     let location_id = location
@@ -918,33 +915,48 @@ async fn a_grant_belongs_to_one_account_and_region() {
         granted.status, granted.body
     );
 
-    for (label, account_id, region) in [
-        ("the same account in another Region", ACCOUNT, OTHER_REGION),
-        ("another account in the same Region", OTHER_ACCOUNT, REGION),
-    ] {
-        let refused = get_data_access(
+    // The instance of another Region holds no grant covering this target, so
+    // the credential is not vended there — the grant is the instance's, not the
+    // account's.
+    let refused = get_data_access(
+        &emulator,
+        ACCOUNT,
+        OTHER_REGION,
+        target,
+        PERMISSION_READ,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        refused.status, 403,
+        "expected a grant of another instance not to cover this target, got {} with body {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.code(),
+        "AccessDenied",
+        "expected the AccessDenied code, got body {}",
+        refused.body
+    );
+
+    // A request addressed in another account never reaches a grant at all: it
+    // is refused because of the account it names, which the refusal states by
+    // naming that account.
+    assert_foreign_account_refused(
+        "GetDataAccess for another account",
+        OTHER_ACCOUNT,
+        &get_data_access(
             &emulator,
-            account_id,
-            region,
+            OTHER_ACCOUNT,
+            REGION,
             target,
             PERMISSION_READ,
             None,
             None,
         )
-        .await;
-        assert_eq!(
-            refused.status, 403,
-            "case {label:?}: expected a grant of another instance not to cover this target, got \
-             {} with body {}",
-            refused.status, refused.body
-        );
-        assert_eq!(
-            refused.code(),
-            "AccessDenied",
-            "case {label:?}: expected the AccessDenied code, got body {}",
-            refused.body
-        );
-    }
+        .await,
+    );
 }
 
 #[tokio::test]

@@ -28,7 +28,8 @@
 //! than copied.
 
 use crate::access_point_lifecycle::{
-    xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
+    XMLNS,
 };
 use crate::storage_lens_configuration::{leaf, tag, tags_xml};
 use crate::storage_lens_group_update::update_body;
@@ -305,43 +306,53 @@ async fn a_policy_refusal_names_the_access_point_the_request_addressed() {
 }
 
 #[tokio::test]
-async fn a_policy_refusal_names_the_access_point_asked_about_not_another_accounts() {
+async fn a_policy_refusal_names_the_access_point_asked_about_not_another_one() {
     let emulator = Emulator::start();
-    let name = "shared-ap";
+    let holds_a_policy = "policy-ap";
+    let holds_none = "no-policy-ap";
 
-    // Both accounts own an access point of the SAME name; only one of them
-    // carries a policy. A name alone does not name a resource — the owning
-    // account does too — so the account that put nothing is refused, naming the
-    // access point IT addressed.
-    for account in [ACCOUNT, OTHER_ACCOUNT] {
+    // Two access points of the caller's own, only one of them carrying a
+    // policy: a refusal must name the access point the REQUEST addressed rather
+    // than whichever one the store happens to hold a document for.
+    for name in [holds_a_policy, holds_none] {
         assert_eq!(
-            create(&emulator, account, name, "reports").await.status,
+            create(&emulator, ACCOUNT, name, "reports").await.status,
             200,
-            "case {account:?}: expected the access point to be created"
+            "case {name:?}: expected the access point to be created"
         );
     }
     assert_eq!(
-        put_policy(&emulator, ACCOUNT, name).await.status,
+        put_policy(&emulator, ACCOUNT, holds_a_policy).await.status,
         200,
-        "expected the first account's document to be stored"
+        "expected the document to be stored"
     );
 
     for (route, sub_resource) in POLICY_ROUTES {
-        let served = read_policy_route(&emulator, ACCOUNT, name, sub_resource).await;
+        let served = read_policy_route(&emulator, ACCOUNT, holds_a_policy, sub_resource).await;
         assert_eq!(
             served.status, 200,
-            "case {route:?}: expected the account that put a document to be served, got {} \
-             with body {}",
+            "case {route:?}: expected the access point that carries a document to be served, \
+             got {} with body {}",
             served.status, served.body
         );
-        let refused = read_policy_route(&emulator, OTHER_ACCOUNT, name, sub_resource).await;
+        let refused = read_policy_route(&emulator, ACCOUNT, holds_none, sub_resource).await;
         names_the_resource(
-            &format!("{route} for the account that put nothing"),
+            &format!("{route} for the access point that carries none"),
             &refused,
             NO_POLICY_CODE,
             NO_POLICY_MESSAGE,
             "AccessPointName",
-            name,
+            holds_none,
+        );
+
+        // The same read addressed in another account names no access point at
+        // all: it is refused for the ACCOUNT it asked for, before any access
+        // point is resolved.
+        let denied = read_policy_route(&emulator, OTHER_ACCOUNT, holds_a_policy, sub_resource).await;
+        assert_foreign_account_refused(
+            &format!("{route} for another account"),
+            OTHER_ACCOUNT,
+            &denied,
         );
     }
 }
@@ -356,33 +367,40 @@ fn account_id(index: u64) -> String {
 async fn the_account_configuration_refusal_names_the_account_the_request_addressed() {
     let emulator = Emulator::start();
 
-    // One row per account, so the member cannot be a constant: the ids differ in
-    // their digits, and one of them is the account another row's configuration
-    // is stored under.
-    let accounts: Vec<String> = vec![
-        ACCOUNT.to_string(),
+    // Nothing is stored yet: the caller's own account is refused, naming itself.
+    names_the_resource(
+        &format!("{ACCOUNT} before any put"),
+        &get_public_access_block(&emulator, ACCOUNT).await,
+        NO_CONFIGURATION_CODE,
+        NO_CONFIGURATION_MESSAGE,
+        "AccountId",
+        ACCOUNT,
+    );
+
+    // One row per account the caller does not hold, so the member cannot be a
+    // constant: each is refused for the account IT addressed, named in the same
+    // `<AccountId>` member, and none of them is answered as a missing
+    // configuration — the account is authorized before the store is read.
+    let others: Vec<String> = vec![
         OTHER_ACCOUNT.to_string(),
         account_id(0),
         account_id(7),
         "999999999999".to_string(),
     ];
-
-    // Nothing is stored yet: every account is refused, each naming itself.
-    for account in &accounts {
+    for account in &others {
         let refused = get_public_access_block(&emulator, account).await;
-        names_the_resource(
+        assert_foreign_account_refused(
             &format!("{account} before any put"),
-            &refused,
-            NO_CONFIGURATION_CODE,
-            NO_CONFIGURATION_MESSAGE,
-            "AccountId",
             account,
+            &refused,
         );
+        correlation_of(&format!("{account} before any put"), &refused);
     }
 
-    // One account stores a configuration: it is served, and every OTHER account
-    // is still refused naming ITSELF rather than the account that holds one.
-    let holder = &accounts[0];
+    // The caller's own configuration is stored and served, and every other
+    // account is still refused naming ITSELF rather than the account that holds
+    // one.
+    let holder = ACCOUNT;
     assert_eq!(
         put_public_access_block(&emulator, holder).await.status,
         200,
@@ -394,19 +412,18 @@ async fn the_account_configuration_refusal_names_the_account_the_request_address
         "expected the account holding a configuration to be served, got {} with body {}",
         served.status, served.body
     );
-    for account in accounts.iter().skip(1) {
+    for account in &others {
         let refused = get_public_access_block(&emulator, account).await;
-        names_the_resource(
-            &format!("{account} while {holder} holds one"),
-            &refused,
-            NO_CONFIGURATION_CODE,
-            NO_CONFIGURATION_MESSAGE,
-            "AccountId",
-            account,
+        assert_eq!(
+            refused.text("AccountId").as_deref(),
+            Some(account.as_str()),
+            "case {account:?}: expected the refusal to name the account the request addressed, \
+             got body {}",
+            refused.body
         );
         assert_ne!(
             refused.text("AccountId").as_deref(),
-            Some(holder.as_str()),
+            Some(holder),
             "case {account:?}: expected the refusal to name the account the request addressed, \
              got body {}",
             refused.body

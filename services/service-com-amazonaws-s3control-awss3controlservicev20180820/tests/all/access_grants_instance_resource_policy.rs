@@ -35,7 +35,8 @@ use std::collections::BTreeSet;
 
 use crate::access_grants_data_plane::create_instance;
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 /// A second signing Region, used to pin that a policy belongs to the instance of
@@ -219,8 +220,8 @@ fn policy_cases() -> Vec<PolicyCase> {
         },
         PolicyCase {
             case: "the shortest policy document this surface takes",
-            account_id: OTHER_ACCOUNT,
-            region: REGION,
+            account_id: ACCOUNT,
+            region: "eu-west-1",
             // `PolicyDocument` is constrained to `len 1..350000`; this is a
             // policy document close to that floor — an empty statement list is
             // the shortest one an IAM resource policy has.
@@ -248,7 +249,7 @@ fn policy_cases() -> Vec<PolicyCase> {
         },
         PolicyCase {
             case: "elements written out of the language's order, over several lines",
-            account_id: OTHER_ACCOUNT,
+            account_id: ACCOUNT,
             region: "us-east-2",
             puts: vec![Put {
                 document: "{\n  \"Statement\": [\n    {\n      \"Resource\": \"*\",\n      \
@@ -286,8 +287,8 @@ fn policy_cases() -> Vec<PolicyCase> {
         },
         PolicyCase {
             case: "a document carrying a member the policy language does not define",
-            account_id: OTHER_ACCOUNT,
-            region: "ap-southeast-2",
+            account_id: ACCOUNT,
+            region: "eu-north-1",
             puts: vec![Put {
                 document: "{\"Version\":\"2012-10-17\",\"Note\":{\"owner\":\"data-team\"},\
                            \"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\
@@ -602,13 +603,9 @@ async fn an_account_with_no_instance_in_that_region_has_no_policy_to_carry() {
     let emulator = emulator_with_instances(&cases).await;
     let policy = &cases[0].puts[0].document;
 
-    // Each row addresses an instance that was never created: another account in
-    // a Region where it has none, and the owning account in a Region where it
-    // has none.
-    let rows: Vec<(&str, &str, &str)> = vec![
-        ("another account, no instance", OTHER_ACCOUNT, OTHER_REGION),
-        ("the owning account, no instance", ACCOUNT, "eu-west-1"),
-    ];
+    // The row addresses an instance that was never created: the owning account
+    // in a Region where it has none.
+    let rows: Vec<(&str, &str, &str)> = vec![("the owning account, no instance", ACCOUNT, "me-south-1")];
 
     for (label, account_id, region) in rows {
         for (call, reply) in [
@@ -641,5 +638,24 @@ async fn an_account_with_no_instance_in_that_region_has_no_policy_to_carry() {
                 reply.body
             );
         }
+    }
+
+    // A call addressed in another account is refused before the instance is
+    // resolved, so the answer does not say whether that account has one.
+    for (call, reply) in [
+        (
+            "PutAccessGrantsInstanceResourcePolicy",
+            put_policy(&emulator, OTHER_ACCOUNT, REGION, policy, None).await,
+        ),
+        (
+            "GetAccessGrantsInstanceResourcePolicy",
+            get_policy(&emulator, OTHER_ACCOUNT, REGION).await,
+        ),
+        (
+            "DeleteAccessGrantsInstanceResourcePolicy",
+            delete_policy(&emulator, OTHER_ACCOUNT, REGION).await,
+        ),
+    ] {
+        assert_foreign_account_refused(call, OTHER_ACCOUNT, &reply);
     }
 }

@@ -37,7 +37,7 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
 };
 
 use crate::access_point_lifecycle::{
-    xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS,
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS,
 };
 use crate::batch_job_lifecycle::{
     create_job, describe_job, JobCase, ACTION_LAMBDA_INVOKE, ACTION_PUT_OBJECT_COPY,
@@ -438,28 +438,25 @@ async fn the_tag_set_is_reached_only_through_the_account_and_job_id_that_own_it(
 
     let shape = JobCase::new("copy from a CSV manifest", ACTION_PUT_OBJECT_COPY, MANIFEST_CSV);
     let mine = create_prepared_job(&emulator, ACCOUNT, &shape, "scope-mine").await;
-    let other = create_prepared_job(&emulator, OTHER_ACCOUNT, &shape, "scope-other").await;
+    let second = create_prepared_job(&emulator, ACCOUNT, &shape, "scope-second").await;
 
     let mine_tags = vec![tag("owner", "mine")];
-    let other_tags = vec![tag("owner", "other"), tag("stage", "dev")];
-    for (account_id, job_id, tags) in [
-        (ACCOUNT, &mine, &mine_tags),
-        (OTHER_ACCOUNT, &other, &other_tags),
-    ] {
-        let put = put_job_tagging(&emulator, account_id, job_id, tags).await;
+    let second_tags = vec![tag("owner", "second"), tag("stage", "dev")];
+    for (job_id, tags) in [(&mine, &mine_tags), (&second, &second_tags)] {
+        let put = put_job_tagging(&emulator, ACCOUNT, job_id, tags).await;
         assert_eq!(
             put.status, 200,
-            "case {account_id:?}: expected PutJobTagging to answer 200, got {} with body {}",
+            "case {job_id:?}: expected PutJobTagging to answer 200, got {} with body {}",
             put.status, put.body
         );
     }
 
-    // Each account reads its own job's set, never the other's.
-    for (case, account_id, job_id, expected) in [
-        ("this account's job", ACCOUNT, &mine, &mine_tags),
-        ("the other account's job", OTHER_ACCOUNT, &other, &other_tags),
+    // Each job reads its own set, never the other's.
+    for (case, job_id, expected) in [
+        ("the first job", &mine, &mine_tags),
+        ("the second job", &second, &second_tags),
     ] {
-        let reported = stored_tags(&emulator, account_id, job_id, case).await;
+        let reported = stored_tags(&emulator, ACCOUNT, job_id, case).await;
         assert_eq!(
             reported, *expected,
             "case {case:?}: expected each job to keep its own set, got {reported:?}"
@@ -467,8 +464,7 @@ async fn the_tag_set_is_reached_only_through_the_account_and_job_id_that_own_it(
     }
 
     // A well-formed `JobId` (5..36 of ^[a-zA-Z0-9\-\_]+$) the named account
-    // owns no job for is refused by all three operations — including the id of
-    // ANOTHER account's job.
+    // owns no job for is refused by all three operations.
     let unknown_ids = [
         (
             "a well-formed id no job has",
@@ -479,7 +475,6 @@ async fn the_tag_set_is_reached_only_through_the_account_and_job_id_that_own_it(
             "an id with the underscores the model admits",
             "job_id_000".to_string(),
         ),
-        ("another account's job id", other.clone()),
     ];
     for (case, unknown) in unknown_ids {
         let refusals = [
@@ -510,12 +505,41 @@ async fn the_tag_set_is_reached_only_through_the_account_and_job_id_that_own_it(
         }
     }
 
-    // And nothing those refusals named was written: both jobs keep their sets.
-    for (case, account_id, job_id, expected) in [
-        ("this account's job", ACCOUNT, &mine, &mine_tags),
-        ("the other account's job", OTHER_ACCOUNT, &other, &other_tags),
+    // The same three operations addressed in another account are refused ahead
+    // of the job lookup — for a job id this account DOES own as much as for one
+    // nothing owns — so a tag set is never reached across the account boundary.
+    for (case, job_id) in [
+        ("a job id this account owns", mine.clone()),
+        ("an id no job has", "00000000-0000-0000-0000-000000".to_string()),
     ] {
-        let reported = stored_tags(&emulator, account_id, job_id, case).await;
+        for (operation, refused) in [
+            (
+                "GetJobTagging",
+                get_job_tagging(&emulator, OTHER_ACCOUNT, &job_id).await,
+            ),
+            (
+                "PutJobTagging",
+                put_job_tagging(&emulator, OTHER_ACCOUNT, &job_id, &[tag("owner", "nobody")]).await,
+            ),
+            (
+                "DeleteJobTagging",
+                delete_job_tagging(&emulator, OTHER_ACCOUNT, &job_id).await,
+            ),
+        ] {
+            assert_foreign_account_refused(
+                &format!("{operation} for another account, {case}"),
+                OTHER_ACCOUNT,
+                &refused,
+            );
+        }
+    }
+
+    // And nothing those refusals named was written: both jobs keep their sets.
+    for (case, job_id, expected) in [
+        ("the first job", &mine, &mine_tags),
+        ("the second job", &second, &second_tags),
+    ] {
+        let reported = stored_tags(&emulator, ACCOUNT, job_id, case).await;
         assert_eq!(
             reported, *expected,
             "case {case:?}: expected a refused request to store nothing, got {reported:?}"

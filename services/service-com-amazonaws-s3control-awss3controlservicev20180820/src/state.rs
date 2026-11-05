@@ -3179,8 +3179,34 @@ pub fn no_such_access_point_policy<E>(name: &str) -> crate::scaffolded::Scaffold
 /// access point refuses a policy document that grants public access, so the
 /// document is not stored.
 pub fn public_policy_access_denied<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure("AccessDenied", 403, "Access Denied".to_string())
+    crate::scaffolded::Scaffolded::service_failure(
+        ACCESS_DENIED_CODE,
+        ACCESS_DENIED_STATUS,
+        ACCESS_DENIED_MESSAGE.to_string(),
+    )
 }
+
+/// The wire `<Code>` of the refusal S3 Control answers a request the caller is
+/// not allowed to have carried out with, which a client branches on.
+///
+/// Named separately because the refusal is answered from two places: a handler
+/// that will not carry out the request it was given, and
+/// `crate::service::authorization`, which answers it for a request naming an
+/// account the caller holds no credentials for — the same refusal, so it carries
+/// the same code, status and message.
+pub const ACCESS_DENIED_CODE: &str = "AccessDenied";
+
+/// The HTTP status of an [`ACCESS_DENIED_CODE`] refusal.
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The message of an [`ACCESS_DENIED_CODE`] refusal: fixed text, naming neither
+/// the caller, the account nor the resource.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The element an [`ACCESS_DENIED_CODE`] refusal of a request addressed in
+/// another account names that account in: the request's own `AccountId`,
+/// reported back so a caller sees WHICH account it was refused for.
+pub const ACCOUNT_ID_ELEMENT: &str = "AccountId";
 
 /// `AccessPointAlreadyOwnedByYou` (HTTP 409): the account already owns an access
 /// point of that name, so creating it again would be a second resource under one

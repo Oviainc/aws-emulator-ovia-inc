@@ -35,7 +35,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::access_point_lifecycle::{
-    call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
+    XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::ACCESS_POINT_NAME_LEN;
@@ -68,6 +69,12 @@ fn expected_endpoints(region: &str) -> BTreeMap<String, String> {
 /// one kind `CreateAccessPoint` makes: `Scope` (directory buckets) is refused
 /// and no data source is ever attached.
 const REGULAR: &str = "Regular";
+
+/// A name at the longest length the wire can ADDRESS an access point by — the
+/// maximum of `ACCESS_POINT_NAME_LEN` (50), which
+/// `state::addressable_access_point_name` holds a path segment to — so the
+/// not-found rows span the name lengths a refusal can be asked about.
+const LONGEST_ADDRESSABLE_NAME: &str = "ap-name-padded-out-to-the-addressable-maximum-0050";
 
 /// The `<Endpoints>` map of a reply, read as key/value pairs: the restXml
 /// wrapped-map layout is `<Endpoints><entry><key>..</key><value>..</value>
@@ -557,18 +564,11 @@ async fn a_refusal_states_its_class_in_fixed_words_and_names_what_was_asked_abou
             absent,
         ),
         (
-            "GetAccessPoint in another account",
+            "GetAccessPoint, a name at the longest addressable length",
             "GET",
-            OTHER_ACCOUNT,
-            format!("/v20180820/accesspoint/{}", owned.name),
-            owned.name,
-        ),
-        (
-            "DeleteAccessPoint in another account",
-            "DELETE",
-            OTHER_ACCOUNT,
-            format!("/v20180820/accesspoint/{}", owned.name),
-            owned.name,
+            ACCOUNT,
+            format!("/v20180820/accesspoint/{LONGEST_ADDRESSABLE_NAME}"),
+            LONGEST_ADDRESSABLE_NAME,
         ),
         // The shortest name the model admits, so the row set spans the name
         // lengths a not-found refusal can be asked about.
@@ -594,6 +594,46 @@ async fn a_refusal_states_its_class_in_fixed_words_and_names_what_was_asked_abou
             Some(named),
             "case {case:?}: expected the refusal to name the access point asked about, got \
              body {}",
+            refused.body
+        );
+        assert!(
+            names_its_request(&refused),
+            "case {case:?}: expected the refusal to name the request it answers, got body {}",
+            refused.body
+        );
+    }
+
+    // The same calls addressed in another account are refused ahead of the
+    // lookup, so they name no access point at all: the refusal names the
+    // ACCOUNT the request asked for instead, and says the same thing for a name
+    // this account holds as for one nothing holds.
+    for (case, method, uri) in [
+        (
+            "GetAccessPoint in another account, name present",
+            "GET",
+            format!("/v20180820/accesspoint/{}", owned.name),
+        ),
+        (
+            "GetAccessPoint in another account, name absent",
+            "GET",
+            format!("/v20180820/accesspoint/{absent}"),
+        ),
+        (
+            "DeleteAccessPoint in another account",
+            "DELETE",
+            format!("/v20180820/accesspoint/{}", owned.name),
+        ),
+        (
+            "GetAccessPointPolicy in another account",
+            "GET",
+            format!("/v20180820/accesspoint/{}/policy", owned.name),
+        ),
+    ] {
+        let refused = emulator.call(method, &uri, OTHER_ACCOUNT, "").await;
+        assert_foreign_account_refused(case, OTHER_ACCOUNT, &refused);
+        assert!(
+            refused.text("AccessPointName").is_none(),
+            "case {case:?}: expected the refusal to name no access point, got body {}",
             refused.body
         );
         assert!(

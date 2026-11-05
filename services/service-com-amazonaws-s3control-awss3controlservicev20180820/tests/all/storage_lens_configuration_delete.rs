@@ -207,21 +207,21 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
     let theirs = &documents[4];
     let config_id = "shared-id";
 
-    // Three configurations: two ids in one account, and the SAME id in another
-    // account. Deleting one of them must leave the other id and the other
-    // account's configuration of the same id exactly as they were.
+    // Two configurations in the caller's account: deleting one must leave the
+    // other exactly as it was. A third call deletes the same id in another
+    // account, which is refused before anything is removed.
     let kept_tags = vec![tag("owner", "kept"), tag("sheet", "two")];
-    let other_account_tags = vec![tag("owner", "other-account")];
     tagged_configuration(&emulator, ACCOUNT, config_id, mine, &[tag("owner", "mine")]).await;
-    tagged_configuration(&emulator, ACCOUNT, "kept-id", mine, &kept_tags).await;
-    tagged_configuration(
-        &emulator,
-        OTHER_ACCOUNT,
-        config_id,
-        theirs,
-        &other_account_tags,
-    )
-    .await;
+    tagged_configuration(&emulator, ACCOUNT, "kept-id", theirs, &kept_tags).await;
+
+    let refused = delete_configuration(&emulator, OTHER_ACCOUNT, config_id).await;
+    assert_eq!(
+        (refused.status, refused.code().as_str()),
+        (403, "AccessDenied"),
+        "expected a delete for another account to be refused, got {} {}",
+        refused.status,
+        refused.body
+    );
 
     let deleted = delete_configuration(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
@@ -232,22 +232,13 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
 
     assert_gone(&emulator, ACCOUNT, config_id, "the deleted configuration").await;
 
-    for (case, account_id, id, document, expected_tags) in [
-        (
-            "another configuration of the same account",
-            ACCOUNT,
-            "kept-id",
-            mine,
-            kept_tags.clone(),
-        ),
-        (
-            "the same id owned by another account",
-            OTHER_ACCOUNT,
-            config_id,
-            theirs,
-            other_account_tags.clone(),
-        ),
-    ] {
+    for (case, account_id, id, document, expected_tags) in [(
+        "another configuration of the same account",
+        ACCOUNT,
+        "kept-id",
+        theirs,
+        kept_tags.clone(),
+    )] {
         let read = get_configuration(&emulator, account_id, id).await;
         assert_eq!(
             read.status, 200,
@@ -274,11 +265,6 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
         vec!["kept-id".to_string()],
         "the delete must drop only the configuration it names from the account's list"
     );
-    assert_eq!(
-        listed_ids(&emulator, OTHER_ACCOUNT).await,
-        vec![config_id.to_string()],
-        "the delete must not touch another account's list"
-    );
 }
 
 #[tokio::test]
@@ -295,11 +281,6 @@ async fn a_delete_of_a_configuration_that_is_not_there_is_not_found() {
             "an id that differs from a stored one only in case",
             ACCOUNT,
             "Present",
-        ),
-        (
-            "a stored id deleted by an account that does not own it",
-            OTHER_ACCOUNT,
-            "present",
         ),
     ] {
         let refused = delete_configuration(&emulator, account_id, config_id).await;
@@ -318,6 +299,28 @@ async fn a_delete_of_a_configuration_that_is_not_there_is_not_found() {
             refused.text("Message").as_deref(),
             Some(NO_SUCH_CONFIGURATION),
             "case {case:?}: unexpected refusal message {}",
+            refused.body
+        );
+    }
+
+    // A delete addressed in another account is refused ahead of the lookup, so
+    // a stored id and an absent one are the same answer there.
+    for (case, config_id) in [
+        ("a stored id", "present"),
+        ("an id nothing was ever put under", "absent"),
+    ] {
+        let refused = delete_configuration(&emulator, OTHER_ACCOUNT, config_id).await;
+        assert_eq!(
+            (refused.status, refused.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected a delete for another account to be refused, got {} {}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.text("AccountId").as_deref(),
+            Some(OTHER_ACCOUNT),
+            "case {case:?}: expected the refusal to name the account asked for, got {}",
             refused.body
         );
     }

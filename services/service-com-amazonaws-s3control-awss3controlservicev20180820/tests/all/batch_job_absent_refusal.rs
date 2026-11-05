@@ -39,7 +39,7 @@
 
 use crate::access_grants_refusal_identities::assert_names_the_request;
 use crate::access_point_lifecycle::{
-    xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS,
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS,
 };
 use crate::batch_job_lifecycle::{
     create_job, describe_job, JobCase, ACTION_PUT_OBJECT_COPY, MANIFEST_CSV,
@@ -226,8 +226,8 @@ fn one_character_off(job_id: &str) -> String {
 }
 
 /// The ids every call of the surface is run over: each is a value the modelled
-/// `JobId` admits, and none of them names a job of the account the row names.
-fn absent_jobs(owned_elsewhere: &str, nearly_owned: &str) -> Vec<AbsentJob> {
+/// `JobId` admits, and none of them names a job of the caller's account.
+fn absent_jobs(nearly_owned: &str) -> Vec<AbsentJob> {
     let row = |case: &str, job_id: String, account_id: &'static str| AbsentJob {
         case: case.to_string(),
         job_id,
@@ -259,16 +259,6 @@ fn absent_jobs(owned_elsewhere: &str, nearly_owned: &str) -> Vec<AbsentJob> {
             one_character_off(nearly_owned),
             ACCOUNT,
         ),
-        row(
-            "a job id another account owns",
-            owned_elsewhere.to_string(),
-            ACCOUNT,
-        ),
-        row(
-            "a job id of the first account, asked for by the second",
-            nearly_owned.to_string(),
-            OTHER_ACCOUNT,
-        ),
     ]
 }
 
@@ -276,12 +266,11 @@ fn absent_jobs(owned_elsewhere: &str, nearly_owned: &str) -> Vec<AbsentJob> {
 async fn every_job_call_refuses_an_absent_job_id_in_the_services_fixed_words() {
     let emulator = Emulator::start();
 
-    // Two jobs that really are there, one per account: the rows below are about
-    // the id the request names, not about an empty store.
+    // One job that really is there: the rows below are about the id the request
+    // names, not about an empty store.
     let owned_here = existing_job(&emulator, ACCOUNT, "owned-here").await;
-    let owned_elsewhere = existing_job(&emulator, OTHER_ACCOUNT, "owned-elsewhere").await;
 
-    for row in absent_jobs(&owned_elsewhere, &owned_here) {
+    for row in absent_jobs(&owned_here) {
         for call in JobCall::ALL {
             let case = format!("{} of {}: {}", call.name(), row.job_id, row.case);
             let refused = call.issue(&emulator, row.account_id, &row.job_id).await;
@@ -308,16 +297,31 @@ async fn every_job_call_refuses_an_absent_job_id_in_the_services_fixed_words() {
         second.body
     );
 
-    // And every job that really is there is still readable: a refusal changed
-    // nothing on either account's jobs.
-    for (account_id, job_id) in [(ACCOUNT, &owned_here), (OTHER_ACCOUNT, &owned_elsewhere)] {
-        let described = describe_job(&emulator, account_id, job_id).await;
-        assert_eq!(
-            described.status, 200,
-            "expected the job {job_id:?} of {account_id} to stay readable, got {} with body {}",
-            described.status, described.body
-        );
+    // The same calls addressed in another account name no job at all: they are
+    // refused for the ACCOUNT they asked for, before any job is looked up, for
+    // a job id this account owns as much as for one nothing owns.
+    for (case, job_id) in [
+        ("a job id this account owns", owned_here.clone()),
+        ("an id naming no job", "absent-job-elsewhere".to_string()),
+    ] {
+        for call in JobCall::ALL {
+            let refused = call.issue(&emulator, OTHER_ACCOUNT, &job_id).await;
+            assert_foreign_account_refused(
+                &format!("{} for another account, {case}", call.name()),
+                OTHER_ACCOUNT,
+                &refused,
+            );
+        }
     }
+
+    // And every job that really is there is still readable: a refusal changed
+    // nothing.
+    let described = describe_job(&emulator, ACCOUNT, &owned_here).await;
+    assert_eq!(
+        described.status, 200,
+        "expected the job {owned_here:?} to stay readable, got {} with body {}",
+        described.status, described.body
+    );
 }
 
 /// The published bounds of the members the rows below drive one past, as the

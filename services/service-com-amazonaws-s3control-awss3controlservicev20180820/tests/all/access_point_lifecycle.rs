@@ -85,15 +85,53 @@ pub(crate) fn xml_unescape(text: &str) -> String {
 /// in every ARN below.
 pub(crate) const REGION: &str = "us-west-2";
 
-/// The account that owns the access points in these tests.
-pub(crate) const ACCOUNT: &str = "123456789012";
+/// The account every request below is the caller's own: the single account this
+/// emulator's credentials present (`::emulator_server::EMULATOR_ACCOUNT_ID`),
+/// which is the only one S3 Control authorizes a request for.
+pub(crate) const ACCOUNT: &str = ::emulator_server::EMULATOR_ACCOUNT_ID;
 
-/// A second account, used to pin that one account cannot read another's access
-/// points even when both use the same access point name.
+/// A second account — one the caller holds no credentials for — used to pin that
+/// a request addressed in another account's control plane is refused rather than
+/// served.
 pub(crate) const OTHER_ACCOUNT: &str = "210987654321";
 
 /// The XML namespace this service's model declares.
 pub(crate) const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
+
+/// The answer S3 Control gives a request addressed in an account the caller
+/// holds no credentials for: the account a request names says whose control
+/// plane it is for, and it is authorized ahead of the resource the request
+/// names, so the answer is the same for every operation and whether or not that
+/// resource exists.
+pub(crate) const FOREIGN_ACCOUNT_STATUS: u16 = 403;
+pub(crate) const FOREIGN_ACCOUNT_CODE: &str = "AccessDenied";
+pub(crate) const FOREIGN_ACCOUNT_MESSAGE: &str = "Access Denied";
+
+/// Assert `reply` is that refusal, naming `account` — the account the request
+/// asked for — in the member a caller reads it from.
+pub(crate) fn assert_foreign_account_refused(case: &str, account: &str, reply: &Reply) {
+    assert_eq!(
+        (reply.status, reply.code().as_str()),
+        (FOREIGN_ACCOUNT_STATUS, FOREIGN_ACCOUNT_CODE),
+        "case {case:?}: expected a request for another account to be refused \
+         {FOREIGN_ACCOUNT_STATUS} {FOREIGN_ACCOUNT_CODE}, got {} with body {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.text("Message").as_deref(),
+        Some(FOREIGN_ACCOUNT_MESSAGE),
+        "case {case:?}: expected the fixed refusal message, got body {}",
+        reply.body
+    );
+    assert_eq!(
+        reply.text("AccountId").as_deref(),
+        Some(account),
+        "case {case:?}: expected the refusal to name the account the request asked for, \
+         got body {}",
+        reply.body
+    );
+}
 
 /// How many characters of the access point name the alias can carry: the
 /// modelled `Alias` maximum (63) less the `-s3alias` tail, the 26-character
@@ -690,14 +728,14 @@ async fn list_access_points_filters_by_bucket_and_pages_through_every_access_poi
             case.case
         );
     }
-    // A same-named access point in another account, to pin that a list is
-    // scoped to the account the request names.
-    assert_eq!(
-        emulator
+    // The same create addressed in another account's control plane is refused
+    // before anything is stored, so no listing of this account's can hold it.
+    assert_foreign_account_refused(
+        "CreateAccessPoint in another account",
+        OTHER_ACCOUNT,
+        &emulator
             .create(OTHER_ACCOUNT, &CreateCase::new("other account", "reports-ap", "reports"))
-            .await
-            .status,
-        200
+            .await,
     );
 
     let all: BTreeSet<String> = cases.iter().map(|case| case.name.to_string()).collect();
@@ -737,13 +775,12 @@ async fn list_access_points_filters_by_bucket_and_pages_through_every_access_poi
         again.body
     );
 
-    // The other account sees only its own access point, under the same name.
-    let other = emulator.list(OTHER_ACCOUNT, "").await;
-    assert_eq!(
-        other.texts("Name"),
-        vec!["reports-ap".to_string()],
-        "expected an account's list to hold only its own access points, got body {}",
-        other.body
+    // A listing of another account's access points is refused rather than
+    // answered, so one account's listing never enumerates another's.
+    assert_foreign_account_refused(
+        "ListAccessPoints in another account",
+        OTHER_ACCOUNT,
+        &emulator.list(OTHER_ACCOUNT, "").await,
     );
 
     // Filtering by bucket: one row per bucket the table uses, including a
@@ -943,16 +980,6 @@ async fn every_call_against_an_access_point_that_is_not_there_is_not_found() {
                 .put_policy(ACCOUNT, absent, r#"{"Version":"2012-10-17","Statement":[]}"#)
                 .await,
         ),
-        // Another account's access point is not this account's: the name exists,
-        // the owner does not match.
-        (
-            "GetAccessPoint in another account",
-            emulator.get(OTHER_ACCOUNT, present.name).await,
-        ),
-        (
-            "DeleteAccessPoint in another account",
-            emulator.delete(OTHER_ACCOUNT, present.name).await,
-        ),
     ];
     for (label, reply) in rows {
         assert_eq!(
@@ -962,6 +989,27 @@ async fn every_call_against_an_access_point_that_is_not_there_is_not_found() {
             reply.status,
             reply.body
         );
+    }
+
+    // The same reads addressed in another account's control plane are refused
+    // ahead of the lookup, so the answer does not say whether the name is there:
+    // an access point this account DOES own is the same refusal as one it does
+    // not.
+    for (label, reply) in [
+        (
+            "GetAccessPoint in another account, name present",
+            emulator.get(OTHER_ACCOUNT, present.name).await,
+        ),
+        (
+            "GetAccessPoint in another account, name absent",
+            emulator.get(OTHER_ACCOUNT, absent).await,
+        ),
+        (
+            "DeleteAccessPoint in another account",
+            emulator.delete(OTHER_ACCOUNT, present.name).await,
+        ),
+    ] {
+        assert_foreign_account_refused(label, OTHER_ACCOUNT, &reply);
     }
 
     // An access point with no policy is a different failure from an access point
@@ -1158,20 +1206,27 @@ async fn the_number_of_stored_access_points_is_bounded_and_a_delete_releases_the
         );
     }
 
-    // Past the bound a create is refused — including under a different account,
-    // because the bound is on this process's store.
-    for (label, account) in [("same account", ACCOUNT), ("another account", OTHER_ACCOUNT)] {
-        let refused = emulator
-            .create(account, &CreateCase::new(label, "over-the-bound-ap", "bulk"))
-            .await;
-        assert_eq!(
-            (refused.status, refused.code().as_str()),
-            (400, "TooManyAccessPoints"),
-            "case {label:?}: expected a create past the bound to be refused, got {} with body {}",
-            refused.status,
-            refused.body
-        );
-    }
+    // Past the bound a create is refused, because the bound is on this
+    // process's store.
+    let refused = emulator
+        .create(ACCOUNT, &CreateCase::new("same account", "over-the-bound-ap", "bulk"))
+        .await;
+    assert_eq!(
+        (refused.status, refused.code().as_str()),
+        (400, "TooManyAccessPoints"),
+        "expected a create past the bound to be refused, got {} with body {}",
+        refused.status,
+        refused.body
+    );
+    // A create addressed in another account never reaches the bound at all: the
+    // account it names is authorized first.
+    assert_foreign_account_refused(
+        "CreateAccessPoint in another account past the bound",
+        OTHER_ACCOUNT,
+        &emulator
+            .create(OTHER_ACCOUNT, &CreateCase::new("another account", "over-the-bound-ap", "bulk"))
+            .await,
+    );
 
     // Deleting a record releases the bound, so the store cannot wedge.
     assert_eq!(emulator.delete(ACCOUNT, "bulk-ap-0").await.status, 200);

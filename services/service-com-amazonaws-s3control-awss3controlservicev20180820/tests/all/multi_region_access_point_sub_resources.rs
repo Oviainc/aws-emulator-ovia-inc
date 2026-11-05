@@ -34,7 +34,8 @@
 use std::collections::BTreeSet;
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 use crate::multi_region_access_point_lifecycle::{create, describe, settled_wait, CreateCase};
 use crate::storage_lens_configuration::{leaves_of, Leaf};
@@ -342,10 +343,10 @@ fn absent_rows() -> Vec<(&'static str, &'static str, &'static str, String)> {
             "mrap-7-9".to_string(),
         ),
         (
-            "another account's read of the same name",
-            OTHER_ACCOUNT,
+            "a name whose digits and hyphens sit at its ends",
+            ACCOUNT,
             REGION,
-            "mrap-7-9".to_string(),
+            "7-mrap-9".to_string(),
         ),
         (
             "a read signed for another Region",
@@ -463,10 +464,9 @@ fn create_cases() -> Vec<CreateCase> {
             )
         },
         CreateCase {
-            account: OTHER_ACCOUNT,
             region: OTHER_REGION,
             ..CreateCase::new(
-                "another account, another Region",
+                "another Region",
                 "sub-other-mrap",
                 "t-sub-other",
                 &["reports"],
@@ -582,24 +582,29 @@ async fn a_created_access_point_reports_its_sub_resources_through_their_own_rout
             by_name.body
         );
 
-        // One account cannot read another's sub-resources, even by its alias.
-        let other = match case.account {
-            ACCOUNT => OTHER_ACCOUNT,
-            _ => ACCOUNT,
-        };
-        let stolen = get_routes(&emulator, case.region, other, &alias).await;
-        assert_eq!(
-            stolen.status, 400,
-            "case {:?}: expected another account's routing read to resolve nothing, got {} \
-             with body {}",
-            case.name, stolen.status, stolen.body
-        );
-        let stolen_policy = get_policy(&emulator, case.region, other, case.name).await;
-        assert_eq!(
-            stolen_policy.status, 404,
-            "case {:?}: expected another account's policy read to be refused, got {} with body {}",
-            case.name, stolen_policy.status, stolen_policy.body
-        );
+        // A request addressed in another account's control plane is refused
+        // before any sub-resource is resolved, so neither the alias nor the
+        // name tells another account anything.
+        for (label, reply) in [
+            (
+                "the routing configuration by its alias",
+                get_routes(&emulator, case.region, OTHER_ACCOUNT, &alias).await,
+            ),
+            (
+                "its policy",
+                get_policy(&emulator, case.region, OTHER_ACCOUNT, case.name).await,
+            ),
+            (
+                "its policy status",
+                get_policy_status(&emulator, case.region, OTHER_ACCOUNT, case.name).await,
+            ),
+        ] {
+            assert_foreign_account_refused(
+                &format!("{}: {label}", case.name),
+                OTHER_ACCOUNT,
+                &reply,
+            );
+        }
     }
 }
 

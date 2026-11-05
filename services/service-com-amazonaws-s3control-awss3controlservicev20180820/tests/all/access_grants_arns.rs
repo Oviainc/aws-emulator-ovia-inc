@@ -33,7 +33,7 @@ use crate::access_grants_data_plane::{
     create_grant, create_instance, create_location, get_grant, get_location,
 };
 use crate::access_grants_location_update::update_location;
-use crate::access_point_lifecycle::{call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION};
+use crate::access_point_lifecycle::{call_in_region, Emulator, Reply, ACCOUNT, REGION};
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
     ACCESS_GRANTS_LOCATION_DEFAULT_ID, DEFAULT_LOCATION_SCOPE, PERMISSION_READ,
@@ -43,6 +43,10 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
 /// A second signing Region, so a row can hold its resources in an instance of
 /// another Region: an ARN names the Region its instance lives in.
 const OTHER_REGION: &str = "eu-central-1";
+
+/// A third signing Region, for the same reason: a row that needs an instance of
+/// its own takes another Region, since a caller is authorized for ONE account.
+const THIRD_REGION: &str = "ap-southeast-2";
 
 /// The IAM role an update re-points a location at, so the update reports an ARN
 /// for a location whose role is not the one it was registered with. Its shape is
@@ -90,10 +94,10 @@ fn arn_cases() -> Vec<ArnCase> {
             permission: PERMISSION_READ,
         },
         ArnCase {
-            case: "another account's instance",
-            account_id: OTHER_ACCOUNT,
-            region: REGION,
-            location_scope: "s3://arn-other-account-bucket/*",
+            case: "an instance in a third Region",
+            account_id: ACCOUNT,
+            region: THIRD_REGION,
+            location_scope: "s3://arn-third-region-bucket/*",
             sub_prefix: None,
             permission: PERMISSION_READWRITE,
         },

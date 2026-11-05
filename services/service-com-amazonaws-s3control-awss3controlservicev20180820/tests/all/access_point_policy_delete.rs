@@ -25,7 +25,9 @@
 //! The harness is the sibling suite's: the same router, request builder and XML
 //! readers a client's request meets.
 
-use crate::access_point_lifecycle::{xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS};
+use crate::access_point_lifecycle::{
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS,
+};
 
 /// One access point this suite removes a policy from, and the document put on
 /// it.
@@ -390,15 +392,6 @@ async fn deleting_a_policy_refuses_an_access_point_the_account_does_not_own() {
             .status,
         200
     );
-    // Another account owns an access point of the SAME name, with its own
-    // policy: a name alone does not name a resource, the owning account does too.
-    assert_eq!(create(&emulator, OTHER_ACCOUNT, &owned).await.status, 200);
-    assert_eq!(
-        put_policy(&emulator, OTHER_ACCOUNT, owned.name, ACCOUNT_POLICY)
-            .await
-            .status,
-        200
-    );
 
     for (label, account, name) in [
         ("a name no access point has", ACCOUNT, "no-such-ap"),
@@ -406,11 +399,6 @@ async fn deleting_a_policy_refuses_an_access_point_the_account_does_not_own() {
             "a name no access point has, three characters long",
             ACCOUNT,
             "zzz",
-        ),
-        (
-            "an access point owned by a third account",
-            "210987654322",
-            owned.name,
         ),
     ] {
         let refused = delete_policy(&emulator, account, name).await;
@@ -438,17 +426,29 @@ async fn deleting_a_policy_refuses_an_access_point_the_account_does_not_own() {
         );
     }
 
-    // A refused removal stored nothing: both owners' documents are as they were.
-    for (account, document) in [(ACCOUNT, PUBLIC_POLICY), (OTHER_ACCOUNT, ACCOUNT_POLICY)] {
-        let read = get_policy(&emulator, account, owned.name).await;
-        assert_eq!(
-            read.text("Policy").as_deref(),
-            Some(document),
-            "case {account:?}: expected the refused removals to leave the stored policy alone, \
-             got body {}",
-            read.body
+    // A removal addressed in another account is refused ahead of the lookup, so
+    // it names no access point: a name the caller's own account holds and one
+    // nothing holds are the same answer there.
+    for (label, account, name) in [
+        ("another account, a name this account holds", OTHER_ACCOUNT, owned.name),
+        ("another account, a name nothing holds", OTHER_ACCOUNT, "no-such-ap"),
+        ("a third account", "210987654322", owned.name),
+    ] {
+        assert_foreign_account_refused(
+            label,
+            account,
+            &delete_policy(&emulator, account, name).await,
         );
     }
+
+    // A refused removal stored nothing: the owner's document is as it was.
+    let read = get_policy(&emulator, ACCOUNT, owned.name).await;
+    assert_eq!(
+        read.text("Policy").as_deref(),
+        Some(PUBLIC_POLICY),
+        "expected the refused removals to leave the stored policy alone, got body {}",
+        read.body
+    );
 }
 
 #[tokio::test]

@@ -27,7 +27,8 @@
 use std::collections::BTreeSet;
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -42,6 +43,12 @@ const OTHER_REGION: &str = "eu-central-1";
 /// A third signing Region, so a table can give each row a Region of its own and
 /// still have one left over to read an absent instance in.
 const THIRD_REGION: &str = "ap-southeast-2";
+
+/// A fourth and fifth signing Region, for the same reason: an instance's
+/// identity is (account, Region), and a caller is authorized for ONE account, so
+/// a row that needs an identity of its own takes another Region.
+const FOURTH_REGION: &str = "sa-east-1";
+const FIFTH_REGION: &str = "eu-west-3";
 
 /// The largest tag set `CreateAccessGrantsInstance` accepts: `Tags` targets
 /// `TagList`, which the model constrains to `len 0..50`.
@@ -153,14 +160,14 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             identity_center_arn: Some("arn:aws:sso:::instance/ssoins-1234567890abcdef"),
             ..CreateCase::new(
-                "another account, same identity center instance",
-                OTHER_ACCOUNT,
-                REGION,
+                "another Region, same identity center instance",
+                ACCOUNT,
+                FOURTH_REGION,
             )
         },
         CreateCase {
             tags: MAX_TAGS,
-            ..CreateCase::new("the largest tag set TagList admits", OTHER_ACCOUNT, OTHER_REGION)
+            ..CreateCase::new("the largest tag set TagList admits", ACCOUNT, FIFTH_REGION)
         },
     ]
 }
@@ -295,12 +302,12 @@ async fn create_then_get_reports_the_stored_instance_for_every_shape_of_create()
 async fn an_account_with_no_instance_in_the_signing_region_is_refused() {
     let emulator = Emulator::start();
 
-    // Before any create, no (account, Region) pair has an instance.
+    // Before any create, no Region has an instance.
     for (account_id, region) in [
         (ACCOUNT, REGION),
         (ACCOUNT, OTHER_REGION),
-        (OTHER_ACCOUNT, REGION),
-        (OTHER_ACCOUNT, THIRD_REGION),
+        (ACCOUNT, THIRD_REGION),
+        (ACCOUNT, FOURTH_REGION),
     ] {
         let missing = get(&emulator, account_id, region).await;
         assert_eq!(
@@ -328,7 +335,7 @@ async fn an_account_with_no_instance_in_the_signing_region_is_refused() {
     for (account_id, region) in [
         (ACCOUNT, OTHER_REGION),
         (ACCOUNT, THIRD_REGION),
-        (OTHER_ACCOUNT, REGION),
+        (ACCOUNT, FIFTH_REGION),
     ] {
         let missing = get(&emulator, account_id, region).await;
         assert_eq!(
@@ -342,6 +349,17 @@ async fn an_account_with_no_instance_in_the_signing_region_is_refused() {
             "AccessGrantsInstanceNotExistsError",
             "case {account_id:?}/{region:?}: expected the not-exists error code, got body {}",
             missing.body
+        );
+    }
+
+    // A read addressed in another account is not a not-found: the account is
+    // authorized before any instance is looked up, so the answer says nothing
+    // about whether that account holds one.
+    for region in [REGION, OTHER_REGION] {
+        assert_foreign_account_refused(
+            &format!("GetAccessGrantsInstance for another account in {region}"),
+            OTHER_ACCOUNT,
+            &get(&emulator, OTHER_ACCOUNT, region).await,
         );
     }
 }
@@ -433,36 +451,38 @@ async fn one_account_holds_a_separate_instance_in_every_region() {
 #[tokio::test]
 async fn the_store_is_bounded_and_the_instances_it_holds_stay_readable() {
     let emulator = Emulator::start();
-    // The key's account half is caller-chosen, so the bound is reached by
-    // varying it: every account id the model's `^\d{12}$` admits is a new key.
-    let account_id = |index: usize| format!("{index:012}");
+    // An instance's key is (account, Region). The ACCOUNT half is not
+    // caller-chosen — a request for any account but the caller's own is refused
+    // before anything is stored (asserted below) — so the bound is reached by
+    // varying the REGION half, which the caller chooses in its signing scope.
+    let region = |index: usize| format!("us-bounded-{index}");
 
     for index in 0..ACCESS_GRANTS_INSTANCE_QUOTA {
-        let owner = account_id(index);
+        let signed_for = region(index);
         let created = call_in_region(
             &emulator.router,
-            REGION,
+            &signed_for,
             "POST",
             "/v20180820/accessgrantsinstance",
-            &owner,
+            ACCOUNT,
             &format!("<CreateAccessGrantsInstanceRequest xmlns=\"{XMLNS}\"/>"),
         )
         .await;
         assert_eq!(
             created.status, 200,
-            "case {owner:?}: expected a create within the store's bound to succeed, got {} with \
-             body {}",
+            "case {signed_for:?}: expected a create within the store's bound to succeed, got {} \
+             with body {}",
             created.status, created.body
         );
     }
 
-    let past_the_bound = account_id(ACCESS_GRANTS_INSTANCE_QUOTA);
+    let past_the_bound = region(ACCESS_GRANTS_INSTANCE_QUOTA);
     let refused = call_in_region(
         &emulator.router,
-        REGION,
+        &past_the_bound,
         "POST",
         "/v20180820/accessgrantsinstance",
-        &past_the_bound,
+        ACCOUNT,
         &format!("<CreateAccessGrantsInstanceRequest xmlns=\"{XMLNS}\"/>"),
     )
     .await;
@@ -478,7 +498,7 @@ async fn the_store_is_bounded_and_the_instances_it_holds_stay_readable() {
         "case {past_the_bound:?}: expected the store-full refusal's error code, got body {}",
         refused.body
     );
-    let missing = get(&emulator, &past_the_bound, REGION).await;
+    let missing = get(&emulator, ACCOUNT, &past_the_bound).await;
     assert_eq!(
         missing.code(),
         "AccessGrantsInstanceNotExistsError",
@@ -487,15 +507,32 @@ async fn the_store_is_bounded_and_the_instances_it_holds_stay_readable() {
         missing.body
     );
 
+    // The other half of the key cannot be varied at all: a create addressed in
+    // another account never reaches the store, so no caller can grow it by
+    // minting account ids.
+    assert_foreign_account_refused(
+        "CreateAccessGrantsInstance for another account",
+        OTHER_ACCOUNT,
+        &call_in_region(
+            &emulator.router,
+            REGION,
+            "POST",
+            "/v20180820/accessgrantsinstance",
+            OTHER_ACCOUNT,
+            &format!("<CreateAccessGrantsInstanceRequest xmlns=\"{XMLNS}\"/>"),
+        )
+        .await,
+    );
+
     // The refusal is about the store's size, not about the instances in it:
     // every one the bound admitted is still readable.
     for index in [0, ACCESS_GRANTS_INSTANCE_QUOTA / 2, ACCESS_GRANTS_INSTANCE_QUOTA - 1] {
-        let owner = account_id(index);
-        let read = get(&emulator, &owner, REGION).await;
+        let signed_for = region(index);
+        let read = get(&emulator, ACCOUNT, &signed_for).await;
         assert_eq!(
             read.text("AccessGrantsInstanceArn").unwrap_or_default(),
-            expected_arn(REGION),
-            "case {owner:?}: expected the stored instance to still be readable, got body {}",
+            expected_arn(&signed_for),
+            "case {signed_for:?}: expected the stored instance to still be readable, got body {}",
             read.body
         );
     }

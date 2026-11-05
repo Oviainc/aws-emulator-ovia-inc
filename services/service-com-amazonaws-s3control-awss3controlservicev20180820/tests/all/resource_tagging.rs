@@ -30,7 +30,9 @@
 //! `http::Request` dispatched by the multi-service router, which deserializes it per the
 //! Smithy model, runs the handler and serializes the restXml response.
 
-use crate::access_point_lifecycle::{Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS};
+use crate::access_point_lifecycle::{
+    assert_foreign_account_refused, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+};
 use crate::storage_lens_configuration::{leaf, reported_tags, tags_xml};
 use crate::storage_lens_group::{create_group, get_group, Group};
 
@@ -571,8 +573,8 @@ async fn a_resource_is_tagged_through_the_account_that_owns_it() {
     let emulator = Emulator::start();
     let arn = provision(&emulator, Kind::StorageLensGroup, "owned-group").await;
 
-    // The same ARN, named by an account that owns no such resource: the group is keyed
-    // by (account, name), so to that account the ARN names nothing.
+    // The same ARN, addressed in an account the caller holds no credentials
+    // for: the request is refused before the resource is resolved.
     let refused = tag_resource(
         &emulator,
         OTHER_ACCOUNT,
@@ -580,13 +582,7 @@ async fn a_resource_is_tagged_through_the_account_that_owns_it() {
         &pairs(&[("Team", "platform")]),
     )
     .await;
-    assert_eq!(
-        (refused.status, refused.code().as_str()),
-        (404, NO_SUCH_RESOURCE_CODE),
-        "another account's tagging call must be refused, got {} {}",
-        refused.status,
-        refused.body
-    );
+    assert_foreign_account_refused("TagResource for another account", OTHER_ACCOUNT, &refused);
 
     // The owner's call is accepted, and only the owner reads the tags back.
     let tagged = tag_resource(&emulator, ACCOUNT, &arn, &pairs(&[("Team", "platform")])).await;
@@ -603,11 +599,9 @@ async fn a_resource_is_tagged_through_the_account_that_owns_it() {
         read.body
     );
     let theirs = list_tags(&emulator, OTHER_ACCOUNT, &arn).await;
-    assert_eq!(
-        (theirs.status, theirs.code().as_str()),
-        (404, NO_SUCH_RESOURCE_CODE),
-        "another account must not read the owner's tags, got {} {}",
-        theirs.status,
-        theirs.body
+    assert_foreign_account_refused(
+        "ListTagsForResource for another account",
+        OTHER_ACCOUNT,
+        &theirs,
     );
 }

@@ -27,7 +27,8 @@
 use std::collections::BTreeSet;
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -38,6 +39,10 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
 /// the instance of one account in one Region: the same id names no location
 /// here.
 const OTHER_REGION: &str = "eu-central-1";
+
+/// A third signing Region, so a row whose instance is its own still has one of
+/// its own now that every row is the caller's one account's.
+const THIRD_REGION: &str = "ap-southeast-2";
 
 /// The IAM role every location in this suite is registered with, before any
 /// update. Its shape is the modelled `IAMRoleArn` pattern,
@@ -114,9 +119,9 @@ fn update_cases() -> Vec<UpdateCase> {
             new_roles: vec!["arn:aws-us-gov:iam::123456789012:role/quarterly".to_string()],
         },
         UpdateCase {
-            case: "another account's instance, the longest role ARN IAMRoleArn admits",
-            account_id: OTHER_ACCOUNT,
-            region: REGION,
+            case: "a third Region's instance, the longest role ARN IAMRoleArn admits",
+            account_id: ACCOUNT,
+            region: THIRD_REGION,
             location_scope: "s3://partner-bucket/inbound/",
             new_roles: vec![
                 role_of_length(MAX_ROLE_ARN_LEN),
@@ -426,8 +431,7 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_changes_nothing(
 
     // Each row is an address no location of the request's instance sits at: a
     // never-assigned id, the default id when no default location is
-    // registered, the registered id read from another account's instance, and
-    // the registered id read from another Region's instance.
+    // registered, and the registered id read from another Region's instance.
     let unknown: Vec<(&str, &str, &str, String)> = vec![
         (
             "an id no register call assigned",
@@ -440,12 +444,6 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_changes_nothing(
             case.account_id,
             case.region,
             ACCESS_GRANTS_LOCATION_DEFAULT_ID.to_string(),
-        ),
-        (
-            "another account's instance",
-            OTHER_ACCOUNT,
-            case.region,
-            registration.id.clone(),
         ),
         (
             "another Region's instance",
@@ -479,6 +477,21 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_changes_nothing(
             refused.body
         );
     }
+
+    // The same update addressed in another account is refused before the
+    // location is resolved.
+    assert_foreign_account_refused(
+        "UpdateAccessGrantsLocation for another account",
+        OTHER_ACCOUNT,
+        &update_location(
+            &emulator,
+            OTHER_ACCOUNT,
+            case.region,
+            &registration.id,
+            new_role,
+        )
+        .await,
+    );
 
     // The refused updates recorded nothing and replaced nothing: the one
     // registration in the store still reads as registered.

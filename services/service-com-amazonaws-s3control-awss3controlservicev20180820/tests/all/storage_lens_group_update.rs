@@ -496,18 +496,12 @@ async fn an_update_reaches_only_the_group_it_names() {
     let shared = "shared-name";
     let untouched = "untouched";
 
-    // One name owned by two accounts, plus a second name owned by the first:
-    // every one of them starts from the same document.
-    for (account, name) in [
-        (ACCOUNT, shared),
-        (OTHER_ACCOUNT, shared),
-        (ACCOUNT, untouched),
-    ] {
-        let created = create_group(&emulator, account, name, &groups[1], None).await;
+    // Two names owned by the caller, both starting from the same document.
+    for name in [shared, untouched] {
+        let created = create_group(&emulator, ACCOUNT, name, &groups[1], None).await;
         assert_eq!(
             created.status, 204,
-            "account {account}, name {name:?}: expected the create to be accepted with 204, \
-             got {} {}",
+            "name {name:?}: expected the create to be accepted with 204, got {} {}",
             created.status, created.body
         );
     }
@@ -520,37 +514,32 @@ async fn an_update_reaches_only_the_group_it_names() {
         updated.status, updated.body
     );
 
-    // Only the (account, name) pair the request named changed.
-    for (account, name, expected) in [
-        (ACCOUNT, shared, target),
-        (OTHER_ACCOUNT, shared, &groups[1]),
-        (ACCOUNT, untouched, &groups[1]),
-    ] {
-        let read = get_group(&emulator, account, name).await;
+    // Only the name the request named changed.
+    for (name, expected) in [(shared, target), (untouched, &groups[1])] {
+        let read = get_group(&emulator, ACCOUNT, name).await;
         assert_eq!(
             sorted_leaves(&read.body),
             sorted(&expected.expected(name, REGION)),
-            "account {account}, name {name:?}: expected the document of case {:?}",
+            "name {name:?}: expected the document of case {:?}",
             expected.case
         );
     }
 
-    // The other account's group of the shared name is a different group, so
-    // updating it changes only its own document.
+    // An update addressed in another account is refused ahead of the lookup, so
+    // it replaces nothing: the document stays the one this account put.
     let theirs = &groups[2];
-    let updated = update_group(&emulator, OTHER_ACCOUNT, shared, theirs).await;
+    let refused = update_group(&emulator, OTHER_ACCOUNT, shared, theirs).await;
     assert_eq!(
-        updated.status, 204,
-        "expected the second account's update to be accepted with 204, got {} {}",
-        updated.status, updated.body
+        (refused.status, refused.code().as_str()),
+        (403, "AccessDenied"),
+        "expected an update for another account to be refused, got {} {}",
+        refused.status,
+        refused.body
     );
-    for (account, expected) in [(ACCOUNT, target), (OTHER_ACCOUNT, theirs)] {
-        let read = get_group(&emulator, account, shared).await;
-        assert_eq!(
-            sorted_leaves(&read.body),
-            sorted(&expected.expected(shared, REGION)),
-            "account {account}: expected the document of case {:?}",
-            expected.case
-        );
-    }
+    let read = get_group(&emulator, ACCOUNT, shared).await;
+    assert_eq!(
+        sorted_leaves(&read.body),
+        sorted(&target.expected(shared, REGION)),
+        "expected the refused update to leave the stored document alone"
+    );
 }

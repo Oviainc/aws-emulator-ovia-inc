@@ -42,6 +42,10 @@ use crate::access_point_lifecycle::{
 /// region its request was signed for rather than a fixed one.
 const OTHER_REGION: &str = "eu-central-1";
 
+/// A third account, so the refusal rows differ in more than one account the
+/// caller holds no credentials for.
+const THIRD_ACCOUNT: &str = "555555555555";
+
 /// The status every Storage Lens configuration call whose response carries no
 /// document answers a success with, as the service states it
 /// ([`::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS`]).
@@ -827,32 +831,52 @@ async fn configurations_are_scoped_to_the_account_that_put_them() {
     let config_id = "shared-id";
 
     let mine = &documents[4];
-    let theirs = &documents[6];
-    for (account, document) in [(ACCOUNT, mine), (OTHER_ACCOUNT, theirs)] {
-        let put = put_configuration(&emulator, account, config_id, document, None).await;
-        assert_eq!(
-            put.status, NO_CONTENT,
-            "account {account}: expected {NO_CONTENT}, got {} {}",
-            put.status, put.body
-        );
-    }
-
-    for (account, document) in [(ACCOUNT, mine), (OTHER_ACCOUNT, theirs)] {
-        let got = get_configuration(&emulator, account, config_id).await;
-        assert_eq!(
-            sorted_leaves(&got.body),
-            sorted(&document.expected(config_id, REGION)),
-            "account {account}: one id under two accounts is two configurations"
-        );
-    }
-
-    // And an account that put nothing under that id holds nothing under it.
-    let third = "555555555555";
-    let missing = get_configuration(&emulator, third, config_id).await;
+    let put = put_configuration(&emulator, ACCOUNT, config_id, mine, None).await;
     assert_eq!(
-        missing.status, 404,
-        "account {third}: expected 404 for an id it never put, got {} {}",
-        missing.status, missing.body
+        put.status, NO_CONTENT,
+        "expected {NO_CONTENT}, got {} {}",
+        put.status, put.body
+    );
+    let got = get_configuration(&emulator, ACCOUNT, config_id).await;
+    assert_eq!(
+        sorted_leaves(&got.body),
+        sorted(&mine.expected(config_id, REGION)),
+        "expected the caller's own configuration to read back as it was put"
+    );
+
+    // Every call naming another account is refused ahead of the lookup, so one
+    // account's configuration is never reached under another's: not by a put
+    // that would replace it, and not by a read of the same id.
+    let theirs = &documents[6];
+    for (case, reply) in [
+        (
+            "PutStorageLensConfiguration",
+            put_configuration(&emulator, OTHER_ACCOUNT, config_id, theirs, None).await,
+        ),
+        (
+            "GetStorageLensConfiguration",
+            get_configuration(&emulator, OTHER_ACCOUNT, config_id).await,
+        ),
+        (
+            "GetStorageLensConfiguration, a third account",
+            get_configuration(&emulator, THIRD_ACCOUNT, config_id).await,
+        ),
+    ] {
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected a call for another account to be refused, got {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+
+    // The refused put stored nothing: the caller's configuration is unchanged.
+    let again = get_configuration(&emulator, ACCOUNT, config_id).await;
+    assert_eq!(
+        sorted_leaves(&again.body),
+        sorted(&mine.expected(config_id, REGION)),
+        "expected the refused put to leave the stored configuration alone"
     );
 }
 

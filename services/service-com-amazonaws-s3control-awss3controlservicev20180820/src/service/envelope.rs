@@ -30,6 +30,10 @@
 //! [`Dispatch`] is also where two things this service decides about a request
 //! are decided, both BEFORE the generated routing table gets it:
 //!
+//! * a request naming an account the caller holds no credentials for is refused
+//!   ahead of everything else, because the account names whose control plane the
+//!   request is for rather than a resource in it — see [`super::authorization`]
+//!   for the rule;
 //! * a request addressed to a sub-resource of a Multi-Region Access Point
 //!   reaches the operation that sub-resource's route names, with the greedy
 //!   label bound to the resource alone — see [`super::routes`] for the rule;
@@ -66,7 +70,7 @@ use smithy_server_runtime::{
     ServerHttpProtocol, Service, ServiceIdentity,
 };
 
-use super::routes;
+use super::{authorization, routes};
 
 /// This service's `@xmlNamespace`, which its error envelope carries exactly as
 /// its success documents do (`smithy_query(query="service_info")`:
@@ -743,13 +747,28 @@ impl ErasedOperation for Dispatch {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            let path = request_path(req.uri());
+            // The authorization stage, ahead of every other: the account a
+            // request names says whose control plane the request is for, so one
+            // naming an account this caller holds no credentials for is refused
+            // before anything is parsed, read or written — which is what keeps
+            // the answer the same whether or not the resource it names exists
+            // (see [`super::authorization`]).
+            if let Some(account) = authorization::unauthorized_account(req) {
+                return error_response(
+                    Envelope::of(path),
+                    crate::state::ACCESS_DENIED_STATUS,
+                    crate::state::ACCESS_DENIED_CODE,
+                    crate::state::ACCESS_DENIED_MESSAGE,
+                    &[(crate::state::ACCOUNT_ID_ELEMENT, account.as_str())],
+                );
+            }
             // The URI-parsing stage: a path that names an access point by a
             // name the wire cannot address is not a path this service can
             // parse, and one naming a name an access point may not be given is
             // a request it will not carry out. Both are answered here — before
             // an operation is named, and so before anything is read, created or
             // deleted — and each names the path the caller sent.
-            let path = request_path(req.uri());
             if let Some((status, code, message)) = access_point_name_refusal(path) {
                 // The `URI` member carries the path the caller sent, which is
                 // what it has to change. A path this service could not parse

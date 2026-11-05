@@ -18,21 +18,28 @@
 //! for, a different answer from a configuration whose four settings are all
 //! `false`. The table below spans that class: every one of the sixteen
 //! combinations of the four settings, the subsets of them a request may carry at
-//! all, and two accounts.
+//! all, and the accounts a caller may name — its own, which is served, and
+//! others, which are refused.
 
 use std::sync::Arc;
 
+use service_com_amazonaws_s3control_awss3controlservicev20180820::ops::types::PublicAccessBlockConfiguration;
+use service_com_amazonaws_s3control_awss3controlservicev20180820::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite is signed for.
 const REGION: &str = "us-west-2";
 
-/// The account whose configuration most rows below write and read.
-const ACCOUNT: &str = "123456789012";
+/// The account whose configuration most rows below write and read: the caller's
+/// own, which is the only one S3 Control authorizes a request for.
+const ACCOUNT: &str = ::emulator_server::EMULATOR_ACCOUNT_ID;
 
-/// A second account, used to pin that one account's configuration is not
-/// another's.
+/// A second account — one the caller holds no credentials for — used to pin that
+/// a configuration request addressed in another account is refused.
 const OTHER_ACCOUNT: &str = "210987654321";
+
+/// A third account, so the refusal rows differ in more than one foreign account.
+const THIRD_ACCOUNT: &str = "210987654322";
 
 /// The XML namespace this service's model declares.
 const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
@@ -98,9 +105,11 @@ impl Reply {
 }
 
 /// One emulator: a router with this service mounted on a single shared engine,
-/// exactly as `core/router` assembles it.
+/// exactly as `core/router` assembles it. The engine is kept so a test can seed
+/// the store directly (see [`Emulator::hold_configurations_for`]).
 struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -113,10 +122,34 @@ impl Emulator {
         router.set_request_authentication(false);
         router.register_service(
             service_com_amazonaws_s3control_awss3controlservicev20180820::EmulatedService::new(
-                engine,
+                Arc::clone(&engine),
             ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// Put `count` accounts' configurations into the store directly.
+    ///
+    /// The front door cannot reach a store of more than one configuration: a
+    /// configuration is keyed by the account alone, and every account but the
+    /// caller's own is refused before anything is stored. The store-wide bound
+    /// exists for the store, not for one caller, so it is reached here by
+    /// seeding it and then asking the service to record one more.
+    fn hold_configurations_for(&self, count: usize) {
+        let state = service_state(&*self.engine)
+            .expect("the shared engine must hold this service's state");
+        let mut store = state.lock();
+        for index in 0..count {
+            store.public_access_blocks.insert(
+                account_id(index),
+                PublicAccessBlockConfiguration {
+                    block_public_acls: true,
+                    ignore_public_acls: true,
+                    block_public_policy: true,
+                    restrict_public_buckets: true,
+                },
+            );
+        }
     }
 
     async fn call(&self, method: &str, account_id: &str, body: &str) -> Reply {
@@ -379,52 +412,63 @@ async fn a_setting_the_request_omits_is_stored_and_reported_as_false() {
 }
 
 #[tokio::test]
-async fn one_accounts_configuration_is_not_another_accounts() {
+async fn a_configuration_call_addressed_in_another_account_is_refused() {
     let emulator = Emulator::start();
     let mine = [true, false, true, false];
     let theirs = [false, true, false, true];
 
     assert_eq!(emulator.put(ACCOUNT, mine).await.status, 200);
-    let unset = emulator.get(OTHER_ACCOUNT).await;
-    assert_eq!(
-        (unset.status, unset.code().as_str()),
-        (404, NO_SUCH_CONFIGURATION),
-        "case {:?}: one account's put must not give another a configuration, got {} with body {}",
-        "second account before its own put",
-        unset.status,
-        unset.body
-    );
 
-    assert_eq!(emulator.put(OTHER_ACCOUNT, theirs).await.status, 200);
-    for (case, account, settings) in [
-        ("first account", ACCOUNT, mine),
-        ("second account", OTHER_ACCOUNT, theirs),
+    // One row per operation of this surface, each addressed in an account the
+    // caller holds no credentials for: the answer is the same refusal, before
+    // any configuration is read, written or removed, and it names the account
+    // the request asked for.
+    for (case, reply) in [
+        ("GetPublicAccessBlock", emulator.get(OTHER_ACCOUNT).await),
+        (
+            "PutPublicAccessBlock",
+            emulator.put(OTHER_ACCOUNT, theirs).await,
+        ),
+        ("DeletePublicAccessBlock", emulator.delete(OTHER_ACCOUNT).await),
+        // A third account, to pin that the rule is about the account not being
+        // the caller's own rather than about one other account.
+        ("GetPublicAccessBlock, a third account", emulator.get(THIRD_ACCOUNT).await),
     ] {
-        let read = emulator.get(account).await;
         assert_eq!(
-            read.settings(),
-            expected(settings),
-            "case {case:?}: expected the settings this account put, got body {}",
-            read.body
+            (reply.status, reply.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected a request for another account to be refused 403 \
+             AccessDenied, got {} with body {}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.text("Message").as_deref(),
+            Some("Access Denied"),
+            "case {case:?}: expected the fixed refusal message, got body {}",
+            reply.body
         );
     }
 
-    assert_eq!(emulator.delete(OTHER_ACCOUNT).await.status, 200);
+    // None of that touched the caller's own configuration, and the refused put
+    // stored nothing for the account it named.
     let kept = emulator.get(ACCOUNT).await;
     assert_eq!(
         kept.settings(),
         expected(mine),
-        "case {:?}: deleting one account's configuration must leave the other's alone, got \
-         body {}",
-        "first account after the second was deleted",
+        "expected the caller's own configuration to be exactly what it put, got body {}",
         kept.body
     );
-    let gone = emulator.get(OTHER_ACCOUNT).await;
+    assert_eq!(
+        emulator.delete(ACCOUNT).await.status,
+        200,
+        "expected the caller's own delete to still be served"
+    );
+    let gone = emulator.get(ACCOUNT).await;
     assert_eq!(
         (gone.status, gone.code().as_str()),
         (404, NO_SUCH_CONFIGURATION),
-        "case {:?}: expected the deleted account to hold no configuration, got {} with body {}",
-        "second account after its delete",
+        "expected the deleted configuration to be gone, got {} with body {}",
         gone.status,
         gone.body
     );
@@ -437,80 +481,140 @@ fn account_id(index: usize) -> String {
 }
 
 #[tokio::test]
+async fn the_store_cannot_be_grown_by_naming_accounts_the_caller_does_not_hold() {
+    let emulator = Emulator::start();
+    // Read from the crate so this test cannot drift onto a stale number.
+    let quota =
+        service_com_amazonaws_s3control_awss3controlservicev20180820::state::PUBLIC_ACCESS_BLOCK_QUOTA;
+
+    // A configuration is keyed by the account alone, and the only account a
+    // caller can address is its own, so no sequence of calls grows the store
+    // past the one record — far below the bound the store would otherwise
+    // refuse at.
+    assert!(
+        quota > 1,
+        "expected the store's bound to be more than the one record a caller can hold, got {quota}"
+    );
+    for (case, settings) in [
+        ("the first put", [true; 4]),
+        ("a replacing put", [false; 4]),
+        ("a put differing in one setting", [true, false, false, false]),
+    ] {
+        let stored = emulator.put(ACCOUNT, settings).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {case:?}: expected the caller's own put to be accepted, got {} with body {}",
+            stored.status, stored.body
+        );
+        assert_eq!(
+            emulator.get(ACCOUNT).await.settings(),
+            expected(settings),
+            "case {case:?}: expected the stored configuration to be the one just put"
+        );
+    }
+
+    // Every other account id is refused, whatever it looks like: the ids below
+    // differ in their leading digits, in being all zeroes but for one digit, and
+    // in being the largest the `^\d{12}$` pattern admits.
+    for (case, named) in [
+        ("an id one past the caller's own", account_id(0)),
+        ("an id in another block", account_id(quota)),
+        ("the largest id the pattern admits", "999999999999".to_string()),
+    ] {
+        let refused = emulator.put(&named, [true; 4]).await;
+        assert_eq!(
+            (refused.status, refused.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected the put for {named} to be refused, got {} with body {}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.text("AccountId").as_deref(),
+            Some(named.as_str()),
+            "case {case:?}: expected the refusal to name the account asked for, got body {}",
+            refused.body
+        );
+        // Nothing was stored for it: the read is refused the same way rather
+        // than reporting a configuration.
+        let read = emulator.get(&named).await;
+        assert_eq!(
+            (read.status, read.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected the read of another account to be refused too, got {} \
+             with body {}",
+            read.status,
+            read.body
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_the_bound() {
     let emulator = Emulator::start();
     // Read from the crate so this test cannot drift onto a stale number.
     let quota =
         service_com_amazonaws_s3control_awss3controlservicev20180820::state::PUBLIC_ACCESS_BLOCK_QUOTA;
 
-    for index in 0..quota {
-        let reply = emulator.put(&account_id(index), [true; 4]).await;
-        assert_eq!(
-            reply.status,
-            200,
-            "case {:?}: expected the put for account {} to be accepted, got {} with body {}",
-            "filling the store to its bound",
-            account_id(index),
-            reply.status,
-            reply.body
-        );
-    }
+    // The store holds the bound already, less the one slot the caller's own
+    // configuration takes.
+    emulator.hold_configurations_for(quota - 1);
+    let stored = emulator.put(ACCOUNT, [true; 4]).await;
+    assert_eq!(
+        stored.status, 200,
+        "expected the put that fills the last slot to be accepted, got {} with body {}",
+        stored.status, stored.body
+    );
 
-    // One account past the bound: refused rather than stored.
-    let past = account_id(quota);
-    let refused = emulator.put(&past, [true; 4]).await;
+    // A configuration already in the store stays writable at the bound:
+    // replacing it adds no record.
+    let replaced = emulator.put(ACCOUNT, [false; 4]).await;
+    assert_eq!(
+        (replaced.status, emulator.get(ACCOUNT).await.settings()),
+        (200, expected([false; 4])),
+        "expected a replace at the bound to be accepted and reported, got {} with body {}",
+        replaced.status,
+        replaced.body
+    );
+
+    // A delete releases the slot it held, so the store cannot wedge: the put
+    // that follows is accepted.
+    assert_eq!(
+        emulator.delete(ACCOUNT).await.status,
+        200,
+        "expected the caller's own delete to be served"
+    );
+    let after_the_delete = emulator.put(ACCOUNT, [true; 4]).await;
+    assert_eq!(
+        after_the_delete.status, 200,
+        "expected the put after the delete to be accepted, got {} with body {}",
+        after_the_delete.status, after_the_delete.body
+    );
+
+    // With the bound reached by records the caller holds none of, one more would
+    // grow the store past it, so it is refused rather than stored — and the
+    // refusal names the bound it is about.
+    assert_eq!(emulator.delete(ACCOUNT).await.status, 200);
+    emulator.hold_configurations_for(quota);
+    let refused = emulator.put(ACCOUNT, [true; 4]).await;
     assert_eq!(
         (refused.status, refused.code().as_str()),
         (403, "AccessDenied"),
-        "case {:?}: expected a 403 AccessDenied past the bound, got {} with body {}",
-        "one account past the bound",
+        "expected a put past the store's bound to be refused, got {} with body {}",
         refused.status,
         refused.body
     );
     assert!(
         refused.body.contains(&quota.to_string()),
-        "case {:?}: expected the refusal to name the bound {quota}, got body {}",
-        "one account past the bound",
+        "expected the refusal to name the bound {quota}, got body {}",
         refused.body
     );
-    let unstored = emulator.get(&past).await;
+    let unstored = emulator.get(ACCOUNT).await;
     assert_eq!(
         (unstored.status, unstored.code().as_str()),
         (404, NO_SUCH_CONFIGURATION),
-        "case {:?}: a refused put must store nothing, got {} with body {}",
-        "read the refused account",
+        "expected the refused put to store nothing, got {} with body {}",
         unstored.status,
         unstored.body
-    );
-
-    // An account already in the store stays writable: replacing its
-    // configuration adds no record.
-    let replaced = emulator.put(&account_id(0), [false; 4]).await;
-    assert_eq!(
-        replaced.status, 200,
-        "case {:?}: expected a replace at the bound to be accepted, got {} with body {}",
-        "replace at the bound", replaced.status, replaced.body
-    );
-    assert_eq!(
-        emulator.get(&account_id(0)).await.settings(),
-        expected([false; 4]),
-        "case {:?}: expected the replacing settings to be reported",
-        "replace at the bound"
-    );
-
-    // A delete releases a slot, so the account refused above is accepted now.
-    assert_eq!(emulator.delete(&account_id(1)).await.status, 200);
-    let accepted = emulator.put(&past, [true; 4]).await;
-    assert_eq!(
-        accepted.status, 200,
-        "case {:?}: expected the put to be accepted once a delete released a slot, got {} \
-         with body {}",
-        "one account past the bound, after a delete", accepted.status, accepted.body
-    );
-    assert_eq!(
-        emulator.get(&past).await.settings(),
-        expected([true; 4]),
-        "case {:?}: expected the newly accepted configuration to be reported",
-        "one account past the bound, after a delete"
     );
 }

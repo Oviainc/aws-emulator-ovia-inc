@@ -32,7 +32,8 @@
 use std::collections::BTreeSet;
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -169,9 +170,9 @@ fn register_cases() -> Vec<RegisterCase> {
             )
         },
         RegisterCase {
-            account_id: OTHER_ACCOUNT,
+            region: THIRD_REGION,
             tags: 2,
-            ..RegisterCase::new("another account's instance", "s3://other-account-bucket/")
+            ..RegisterCase::new("an instance in a third Region", "s3://third-region-bucket/")
         },
         RegisterCase::new(
             "the longest S3 path the model admits",
@@ -446,6 +447,22 @@ async fn registering_without_an_instance_in_the_signing_region_is_refused_and_re
             refused.body
         );
     }
+
+    // A registration addressed in another account is refused before any
+    // instance is resolved, so it says nothing about whether that account has
+    // one.
+    assert_foreign_account_refused(
+        "CreateAccessGrantsLocation for another account",
+        OTHER_ACCOUNT,
+        &register(
+            &emulator,
+            &RegisterCase {
+                account_id: OTHER_ACCOUNT,
+                ..RegisterCase::new("another account", "s3://their-bucket/")
+            },
+        )
+        .await,
+    );
 }
 
 #[tokio::test]
@@ -514,7 +531,7 @@ async fn one_s3_path_is_registered_once_per_instance_and_read_only_there() {
     let owners = [
         (ACCOUNT, REGION),
         (ACCOUNT, OTHER_REGION),
-        (OTHER_ACCOUNT, REGION),
+        (ACCOUNT, THIRD_REGION),
     ];
 
     let mut registered = Vec::new();

@@ -34,7 +34,8 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 use crate::storage_lens_configuration::{leaves_of, Leaf};
 
@@ -200,12 +201,6 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             region: OTHER_REGION,
             ..CreateCase::new("signed for another Region", "eu-mrap", "t-eu", &["reports-eu"])
-        },
-        CreateCase {
-            account: OTHER_ACCOUNT,
-            // The same NAME as the first row: a name is unique within an
-            // account, so another account may hold it, with its own alias.
-            ..CreateCase::new("another account, same name", "reports-mrap", "t-other", &["reports"])
         },
     ]
 }
@@ -797,30 +792,41 @@ async fn a_delete_releases_the_access_point_once_the_clock_owes_it() {
 }
 
 #[tokio::test]
-async fn one_account_cannot_read_or_delete_another_account_s_access_point() {
+async fn a_request_addressed_in_another_account_is_refused_before_the_access_point_is_looked_up() {
     let emulator = Emulator::start();
     let case = CreateCase::new("owned by one account", "private-mrap", "t-private", &["reports"]);
     create(&emulator, &case).await;
 
-    let read = get(&emulator, REGION, OTHER_ACCOUNT, case.name).await;
-    assert_eq!(
-        read.status, 404,
-        "expected another account's read to find nothing, got {} with body {}",
-        read.status, read.body
-    );
-    assert_eq!(
-        read.code(),
-        "NoSuchMultiRegionAccessPoint",
-        "expected the missing-access-point code, got body {}",
-        read.body
-    );
-
-    let removed = delete(&emulator, REGION, OTHER_ACCOUNT, case.name, "t-steal").await;
-    assert_eq!(
-        removed.status, 404,
-        "expected another account's delete to find nothing, got {} with body {}",
-        removed.status, removed.body
-    );
+    // One row per call that names the account: a name the caller's own account
+    // holds, a name nothing holds, and a create of a new name — all the same
+    // refusal, so the answer says nothing about what the other account holds.
+    for (label, reply) in [
+        (
+            "GetMultiRegionAccessPoint, name present",
+            get(&emulator, REGION, OTHER_ACCOUNT, case.name).await,
+        ),
+        (
+            "GetMultiRegionAccessPoint, name absent",
+            get(&emulator, REGION, OTHER_ACCOUNT, "absent-mrap").await,
+        ),
+        (
+            "DeleteMultiRegionAccessPoint",
+            delete(&emulator, REGION, OTHER_ACCOUNT, case.name, "t-steal").await,
+        ),
+        (
+            "CreateMultiRegionAccessPoint",
+            create(
+                &emulator,
+                &CreateCase {
+                    account: OTHER_ACCOUNT,
+                    ..CreateCase::new("another account", "theirs-mrap", "t-other", &["reports"])
+                },
+            )
+            .await,
+        ),
+    ] {
+        assert_foreign_account_refused(label, OTHER_ACCOUNT, &reply);
+    }
 
     // The owner still holds it.
     let owner = get(&emulator, REGION, ACCOUNT, case.name).await;

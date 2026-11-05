@@ -401,38 +401,52 @@ async fn groups_are_scoped_to_the_account_that_created_them() {
 
     let mine = &groups[1];
     let theirs = &groups[7];
-    for (account, group) in [(ACCOUNT, mine), (OTHER_ACCOUNT, theirs)] {
-        let created = create_group(&emulator, account, name, group, None).await;
-        assert_eq!(
-            created.status, 204,
-            "account {account}: expected the create to be accepted with 204, got {} {}",
-            created.status, created.body
-        );
-    }
-
-    // One name, two accounts, two documents: each account reads its own.
-    for (account, group) in [(ACCOUNT, mine), (OTHER_ACCOUNT, theirs)] {
-        let read = get_group(&emulator, account, name).await;
-        assert_eq!(
-            sorted_leaves(&read.body),
-            sorted(&group.expected(name, REGION)),
-            "account {account}: must read back its own document, not the other account's"
-        );
-    }
-
-    // A name only one account holds is not there for the other.
-    let only_mine = "mine-alone";
-    let created = create_group(&emulator, ACCOUNT, only_mine, mine, None).await;
+    let created = create_group(&emulator, ACCOUNT, name, mine, None).await;
     assert_eq!(
         created.status, 204,
         "expected the create to be accepted with 204, got {} {}",
         created.status, created.body
     );
-    let absent = get_group(&emulator, OTHER_ACCOUNT, only_mine).await;
+    let read = get_group(&emulator, ACCOUNT, name).await;
     assert_eq!(
-        absent.status, 404,
-        "another account's group must not be readable, got {} {}",
-        absent.status, absent.body
+        sorted_leaves(&read.body),
+        sorted(&mine.expected(name, REGION)),
+        "the caller must read back its own document"
+    );
+
+    // Every call naming another account is refused ahead of the lookup, so one
+    // account's group is never created, replaced or read under another's — for
+    // a name this account holds as much as for one it does not.
+    for (case, reply) in [
+        (
+            "CreateStorageLensGroup under a name this account holds",
+            create_group(&emulator, OTHER_ACCOUNT, name, theirs, None).await,
+        ),
+        (
+            "GetStorageLensGroup of a name this account holds",
+            get_group(&emulator, OTHER_ACCOUNT, name).await,
+        ),
+        (
+            "GetStorageLensGroup of a name nothing holds",
+            get_group(&emulator, OTHER_ACCOUNT, "mine-alone").await,
+        ),
+    ] {
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected a call for another account to be refused, got {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+
+    // The refused create stored nothing: the document is the one this account
+    // put.
+    let again = get_group(&emulator, ACCOUNT, name).await;
+    assert_eq!(
+        sorted_leaves(&again.body),
+        sorted(&mine.expected(name, REGION)),
+        "the refused create changed the stored document"
     );
 }
 
@@ -586,26 +600,34 @@ async fn the_number_of_stored_groups_is_bounded_store_wide() {
         );
     }
 
-    // Past the bound a create is refused — including under a DIFFERENT account
-    // id, because the bound is on this process's store and `AccountId` is a
-    // request member: a per-account bound would hand each new account id a
-    // fresh allowance.
-    for (label, account) in [("same account", ACCOUNT), ("another account", OTHER_ACCOUNT)] {
-        let refused = create_group(&emulator, account, "over-the-bound", group, None).await;
-        assert_eq!(
-            (refused.status, refused.code().as_str()),
-            (400, "TooManyStorageLensGroups"),
-            "case {label:?}: expected a create past the bound to be refused, got {} {}",
-            refused.status,
-            refused.body
-        );
-        let read = get_group(&emulator, account, "over-the-bound").await;
-        assert_eq!(
-            read.status, 404,
-            "case {label:?}: the refused create recorded a group, answered {} {}",
-            read.status, read.body
-        );
-    }
+    // Past the bound a create is refused, because the bound is on this
+    // process's store.
+    let refused = create_group(&emulator, ACCOUNT, "over-the-bound", group, None).await;
+    assert_eq!(
+        (refused.status, refused.code().as_str()),
+        (400, "TooManyStorageLensGroups"),
+        "expected a create past the bound to be refused, got {} {}",
+        refused.status,
+        refused.body
+    );
+    let read = get_group(&emulator, ACCOUNT, "over-the-bound").await;
+    assert_eq!(
+        read.status, 404,
+        "the refused create recorded a group, answered {} {}",
+        read.status, read.body
+    );
+
+    // A create under a DIFFERENT account id never reaches the bound at all: the
+    // account is authorized first, so no caller can hand itself a fresh
+    // allowance by naming another account.
+    let denied = create_group(&emulator, OTHER_ACCOUNT, "over-the-bound", group, None).await;
+    assert_eq!(
+        (denied.status, denied.code().as_str()),
+        (403, "AccessDenied"),
+        "expected a create for another account to be refused, got {} {}",
+        denied.status,
+        denied.body
+    );
 
     // The records within the bound are untouched by the refusals.
     let first = get_group(&emulator, ACCOUNT, "bulk-group-0").await;

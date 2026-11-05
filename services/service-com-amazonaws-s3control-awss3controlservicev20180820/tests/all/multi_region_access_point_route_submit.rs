@@ -25,7 +25,8 @@
 //! sibling suites', reused rather than copied.
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 use crate::multi_region_access_point_lifecycle::{create, settled_wait, CreateCase};
 use crate::multi_region_access_point_sub_resources::{
@@ -642,13 +643,11 @@ async fn a_submit_whose_mrap_resolves_to_nothing_is_refused_and_writes_nothing()
 
     // Each row names a value the submit cannot resolve to an access point this
     // account holds: the NAME rather than the alias, an alias nothing was
-    // created under, a value of the shortest shape the label admits, and the
-    // real alias under another account.
+    // created under, and a value of the shortest shape the label admits.
     let rows: Vec<(&str, String, &str)> = vec![
         ("the access point's name rather than its alias", case.name.to_string(), ACCOUNT),
         ("an alias nothing was created under", "nevercreated.mrap".to_string(), ACCOUNT),
         ("the shortest value the label admits", "abc".to_string(), ACCOUNT),
-        ("another account's submit on this alias", alias.clone(), OTHER_ACCOUNT),
     ];
 
     for (row, mrap, account) in rows {
@@ -667,6 +666,32 @@ async fn a_submit_whose_mrap_resolves_to_nothing_is_refused_and_writes_nothing()
             after, untouched,
             "case {row:?}: a submit that resolves no access point must write nothing, \
              got {after:?}"
+        );
+    }
+
+    // A submit addressed in another account is refused before the alias is
+    // resolved at all — for the real alias as much as for a value nothing was
+    // created under — and writes nothing either.
+    for (row, mrap) in [
+        ("another account's submit on this alias", alias.clone()),
+        (
+            "another account's submit on an alias nothing holds",
+            "nevercreated.mrap".to_string(),
+        ),
+    ] {
+        let submitted = submit(
+            &emulator,
+            REGION,
+            OTHER_ACCOUNT,
+            &mrap,
+            &[Update::bucket("reports", TRAFFIC_DIAL_PASSIVE)],
+        )
+        .await;
+        assert_foreign_account_refused(row, OTHER_ACCOUNT, &submitted);
+        let after = routes_of(row, &emulator, REGION, ACCOUNT, &alias).await;
+        assert_eq!(
+            after, untouched,
+            "case {row:?}: a refused submit must write nothing, got {after:?}"
         );
     }
 }

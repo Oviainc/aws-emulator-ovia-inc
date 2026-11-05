@@ -40,7 +40,9 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
     JOB_PREPARATION, JOB_STATUS_READY, JOB_STATUS_SUSPENDED,
 };
 
-use crate::access_point_lifecycle::{Emulator, Reply, ACCOUNT, OTHER_ACCOUNT};
+use crate::access_point_lifecycle::{
+    assert_foreign_account_refused, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT,
+};
 use crate::batch_job_lifecycle::{
     create_job, describe_job, JobCase, ACTION_COMPUTE_CHECKSUM, ACTION_INITIATE_RESTORE,
     ACTION_LAMBDA_INVOKE, ACTION_PUT_OBJECT_COPY, ACTION_PUT_OBJECT_TAGGING, GENERATED_MANIFEST,
@@ -349,41 +351,35 @@ async fn a_listing_reports_only_the_jobs_of_the_account_the_request_names() {
     let emulator = Emulator::start();
     let rows = list_rows();
     let mine = create_rows(&emulator, ACCOUNT, &rows).await;
-    // A second account holding a job of its own: a listing is scoped to the
-    // account the request names, not to whatever the store happens to hold.
-    let theirs = create_rows(&emulator, OTHER_ACCOUNT, &rows[..2]).await;
 
-    for (case, account, expected) in [
-        ("the account that holds six jobs", ACCOUNT, &mine),
-        ("the account that holds two", OTHER_ACCOUNT, &theirs),
+    let listed = list_jobs(&emulator, ACCOUNT, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "expected 200, got {} with body {}",
+        listed.status, listed.body
+    );
+    assert_eq!(
+        listed_job_ids(&listed).into_iter().collect::<BTreeSet<_>>(),
+        mine.iter().cloned().collect::<BTreeSet<_>>(),
+        "expected only the caller's own jobs, got body {}",
+        listed.body
+    );
+
+    // A listing for another account is refused rather than answered — with
+    // neither that account's jobs nor this one's — so no listing enumerates
+    // across the account boundary.
+    for (case, account) in [
+        ("another account", OTHER_ACCOUNT),
+        ("a third account", "210987654322"),
     ] {
-        let listed = list_jobs(&emulator, account, "").await;
-        assert_eq!(
-            listed.status, 200,
-            "case {case:?}: expected 200, got {} with body {}",
-            listed.status, listed.body
-        );
-        assert_eq!(
-            listed_job_ids(&listed).into_iter().collect::<BTreeSet<_>>(),
-            expected.iter().cloned().collect::<BTreeSet<_>>(),
-            "case {case:?}: expected only that account's own jobs, got body {}",
-            listed.body
+        let refused = list_jobs(&emulator, account, "").await;
+        assert_foreign_account_refused(case, account, &refused);
+        assert!(
+            job_summaries(&refused).is_empty() && refused.text("NextToken").is_none(),
+            "case {case:?}: expected the refusal to carry no listing, got body {}",
+            refused.body
         );
     }
-
-    // An account that holds no job at all is answered an empty listing, not a
-    // refusal and not somebody else's jobs.
-    let empty = list_jobs(&emulator, "210987654322", "").await;
-    assert_eq!(
-        empty.status, 200,
-        "expected an account holding no job to be answered 200, got {} with body {}",
-        empty.status, empty.body
-    );
-    assert!(
-        job_summaries(&empty).is_empty() && empty.text("NextToken").is_none(),
-        "expected an empty listing with no continuation token, got body {}",
-        empty.body
-    );
 }
 
 #[tokio::test]

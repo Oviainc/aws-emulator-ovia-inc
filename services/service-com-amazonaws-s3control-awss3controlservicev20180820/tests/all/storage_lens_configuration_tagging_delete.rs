@@ -173,7 +173,6 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
     // another account. Deleting one account's tag set must leave the other
     // configuration's and the other account's alone.
     let kept_tags = vec![tag("owner", "kept"), tag("sheet", "two")];
-    let other_account_tags = vec![tag("owner", "other-account")];
     let config_id = "shared-id";
 
     tagged_configuration(
@@ -184,8 +183,7 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
         &[tag("owner", "mine")],
     )
     .await;
-    tagged_configuration(&emulator, ACCOUNT, "kept-id", mine, &kept_tags).await;
-    tagged_configuration(&emulator, OTHER_ACCOUNT, config_id, theirs, &other_account_tags).await;
+    tagged_configuration(&emulator, ACCOUNT, "kept-id", theirs, &kept_tags).await;
 
     let deleted = delete_tagging(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
@@ -203,12 +201,6 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
             "kept-id",
             kept_tags.clone(),
         ),
-        (
-            "the same id owned by another account",
-            OTHER_ACCOUNT,
-            config_id,
-            other_account_tags.clone(),
-        ),
     ] {
         let reported = get_tagging(&emulator, account_id, id).await;
         assert_eq!(
@@ -219,13 +211,22 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
         );
     }
 
-    // And the other account's configuration document is still readable, so the
-    // delete dropped no configuration.
-    let read = get_configuration(&emulator, OTHER_ACCOUNT, config_id).await;
+    // The same delete addressed in another account is refused, and the
+    // configuration it named is still readable here, so the refusal dropped
+    // nothing.
+    let refused = delete_tagging(&emulator, OTHER_ACCOUNT, config_id).await;
+    assert_eq!(
+        (refused.status, refused.code().as_str()),
+        (403, "AccessDenied"),
+        "expected a tagging delete for another account to be refused, got {} {}",
+        refused.status,
+        refused.body
+    );
+    let read = get_configuration(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
         sorted_leaves(&read.body),
-        sorted(&theirs.expected(config_id, REGION)),
-        "the tagging delete changed another account's configuration document"
+        sorted(&mine.expected(config_id, REGION)),
+        "the tagging delete changed the configuration document"
     );
 }
 
@@ -251,11 +252,6 @@ async fn a_delete_against_a_configuration_that_is_not_there_is_not_found() {
             ACCOUNT,
             "Present",
         ),
-        (
-            "a stored id read by an account that does not own it",
-            OTHER_ACCOUNT,
-            "present",
-        ),
     ] {
         let refused = delete_tagging(&emulator, account_id, config_id).await;
         assert_eq!(
@@ -269,6 +265,19 @@ async fn a_delete_against_a_configuration_that_is_not_there_is_not_found() {
             refused.code(),
             "NoSuchConfiguration",
             "case {case:?}: unexpected refusal {}",
+            refused.body
+        );
+    }
+
+    // A delete addressed in another account is refused ahead of the lookup, so
+    // a stored id and an absent one are the same answer there.
+    for (case, config_id) in [("a stored id", "present"), ("an absent id", "absent")] {
+        let refused = delete_tagging(&emulator, OTHER_ACCOUNT, config_id).await;
+        assert_eq!(
+            (refused.status, refused.code().as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: expected a delete for another account to be refused, got {} {}",
+            refused.status,
             refused.body
         );
     }

@@ -40,7 +40,8 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
 };
 
 use crate::access_point_lifecycle::{
-    xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
+    XMLNS,
 };
 
 /// The IAM role every job below runs its action with. Satisfies the modelled
@@ -775,26 +776,20 @@ async fn one_client_request_token_creates_one_job_and_a_different_request_is_ref
             under_new_token.body
         );
 
-        // A token is scoped to the account that used it: another account
-        // reusing it creates its own job, which the first account cannot
-        // describe.
-        let other_account = create_job(&emulator, OTHER_ACCOUNT, &case, &token).await;
-        let other_job_id = other_account.text("JobId").unwrap_or_default();
-        assert_eq!(
-            other_account.status, 200,
-            "case {:?}: expected another account's create to answer 200, got {} with body {}",
-            case.case, other_account.status, other_account.body
+        // A create addressed in another account is refused before the token is
+        // looked at, so no job is created for it and the token keeps naming the
+        // caller's own job.
+        assert_foreign_account_refused(
+            case.case,
+            OTHER_ACCOUNT,
+            &create_job(&emulator, OTHER_ACCOUNT, &case, &token).await,
         );
-        assert_ne!(
-            other_job_id, job_id,
-            "case {:?}: expected another account's create to be its own job, got {other_job_id:?}",
-            case.case
-        );
-        let cross_account = describe_job(&emulator, ACCOUNT, &other_job_id).await;
+        let still_mine = describe_job(&emulator, ACCOUNT, &job_id).await;
         assert_eq!(
-            cross_account.status, 400,
-            "case {:?}: expected one account not to describe another's job, got {} with body {}",
-            case.case, cross_account.status, cross_account.body
+            still_mine.status, 200,
+            "case {:?}: expected the caller's own job to be unchanged by the refused create, \
+             got {} with body {}",
+            case.case, still_mine.status, still_mine.body
         );
     }
 }

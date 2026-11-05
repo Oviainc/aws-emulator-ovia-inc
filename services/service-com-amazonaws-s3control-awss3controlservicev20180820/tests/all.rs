@@ -35,6 +35,8 @@ mod access_point_policy_delete;
 mod access_point_public_access_block_default;
 #[path = "all/access_point_reads_and_refusals.rs"]
 mod access_point_reads_and_refusals;
+#[path = "all/account_authorization.rs"]
+mod account_authorization;
 #[path = "all/batch_job_absent_refusal.rs"]
 mod batch_job_absent_refusal;
 #[path = "all/batch_job_lifecycle.rs"]

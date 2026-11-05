@@ -316,13 +316,16 @@ async fn a_list_reports_one_entry_per_configuration_the_account_holds() {
 
     let cases = cases();
     put_every_case(&emulator, &cases).await;
-    // The same id in another account, which this account's list must not report.
+    // The same put addressed in another account is refused, so nothing of that
+    // account's can enter this listing.
+    let refused =
+        put_configuration(&emulator, REGION, OTHER_ACCOUNT, &cases[0].config_id, false).await;
     assert_eq!(
-        put_configuration(&emulator, REGION, OTHER_ACCOUNT, &cases[0].config_id, false)
-            .await
-            .status,
-        NO_CONTENT,
-        "expected the other account's put to be accepted"
+        (refused.status, refused.code().as_str()),
+        (403, "AccessDenied"),
+        "expected the put for another account to be refused, got {} {}",
+        refused.status,
+        refused.body
     );
 
     // Read twice: the entries are the stored configurations, and reporting them
@@ -353,17 +356,20 @@ async fn a_list_reports_one_entry_per_configuration_the_account_holds() {
         );
     }
 
-    // The other account sees only its own configuration, under the shared id.
+    // A listing for another account is refused rather than answered, so no
+    // listing reaches across the account boundary.
     let other = list_configurations(&emulator, OTHER_ACCOUNT, None).await;
     assert_eq!(
-        reported_entries(&other.body),
-        vec![Entry {
-            id: cases[0].config_id.clone(),
-            storage_lens_arn: expected_arn(&cases[0].config_id, REGION),
-            home_region: REGION.to_string(),
-            is_enabled: false,
-        }],
-        "expected an account's list to hold only its own configurations, got body {}",
+        (other.status, other.code().as_str()),
+        (403, "AccessDenied"),
+        "expected a listing for another account to be refused, got {} {}",
+        other.status,
+        other.body
+    );
+    assert!(
+        other.text("StorageLensConfigurationList").is_none()
+            && other.text("StorageLensArn").is_none(),
+        "expected the refusal to carry no listing, got body {}",
         other.body
     );
 }

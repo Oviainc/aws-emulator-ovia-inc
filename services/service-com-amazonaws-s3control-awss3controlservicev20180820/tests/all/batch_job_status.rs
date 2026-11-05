@@ -39,7 +39,9 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
 };
 
 use crate::access_grants_data_plane::query_escape;
-use crate::access_point_lifecycle::{Emulator, Reply, ACCOUNT, OTHER_ACCOUNT};
+use crate::access_point_lifecycle::{
+    assert_foreign_account_refused, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT,
+};
 use crate::batch_job_lifecycle::{
     create_job, describe_job, JobCase, ACTION_COMPUTE_CHECKSUM, ACTION_LAMBDA_INVOKE,
     ACTION_PUT_OBJECT_COPY, ACTION_PUT_OBJECT_TAGGING, GENERATED_MANIFEST, MANIFEST_CSV,
@@ -639,15 +641,12 @@ async fn an_update_that_names_no_job_or_no_admitted_value_is_refused_and_stores_
         }
     }
 
-    // An update is scoped to the account that owns the job: the same id under
-    // another account names no job.
+    // An update addressed in another account is refused before the job is
+    // looked up, so the same id named for an account the caller does not hold
+    // is an authorization failure rather than a bad request about the job.
     let refused =
         update_job_status(&emulator, OTHER_ACCOUNT, &job_id, JOB_STATUS_CANCELLED, None).await;
-    assert_eq!(
-        refused.status, 400,
-        "expected an update of another account's job id to be refused 400, got {} with body {}",
-        refused.status, refused.body
-    );
+    assert_foreign_account_refused("UpdateJobStatus for another account", OTHER_ACCOUNT, &refused);
 
     // A value the modelled enum and lengths do not admit is refused by the
     // boundary validator, before the handler runs, so only the status is this

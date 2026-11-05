@@ -31,7 +31,8 @@ use crate::access_grants_instance::get as get_instance;
 use crate::access_grants_location_delete::{delete_grant, delete_location};
 use crate::access_grants_location_update::update_location;
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -284,12 +285,12 @@ async fn every_grant_refusal_names_the_grant_id_the_request_asked_about() {
 
     let mut cases = unknown_ids();
     cases.push(("the id of a deleted grant", deleted_id));
-    // The grant of another account's instance is addressed by an id that exists,
-    // in an instance that does not hold it.
+    // The grant read from the instance in another Region is addressed by an id
+    // that exists, in an instance that does not hold it.
     assert_eq!(
-        create_instance(&emulator, OTHER_ACCOUNT, REGION).await.status,
+        create_instance(&emulator, ACCOUNT, OTHER_REGION).await.status,
         200,
-        "expected the other account's instance to be created"
+        "expected the instance in the other Region to be created"
     );
 
     for (case, grant_id) in &cases {
@@ -309,13 +310,21 @@ async fn every_grant_refusal_names_the_grant_id_the_request_asked_about() {
                 delete_grant(&emulator, ACCOUNT, REGION, grant_id).await,
             ),
             (
-                "GetAccessGrant in another account's instance",
-                get_grant(&emulator, OTHER_ACCOUNT, REGION, grant_id).await,
+                "GetAccessGrant in another Region's instance",
+                get_grant(&emulator, ACCOUNT, OTHER_REGION, grant_id).await,
             ),
         ] {
             assert_refused(case, call, &reply, &expected);
         }
     }
+
+    // The same read addressed in another account is refused before any grant is
+    // resolved, so it names no grant id at all.
+    assert_foreign_account_refused(
+        "GetAccessGrant for another account",
+        OTHER_ACCOUNT,
+        &get_grant(&emulator, OTHER_ACCOUNT, REGION, &cases[0].1).await,
+    );
 }
 
 #[tokio::test]
@@ -424,9 +433,9 @@ async fn the_referential_integrity_refusal_is_a_bad_request_naming_the_location(
         NotEmptyCase {
             // The default location carries the documented id rather than a
             // minted one, so the member names that id here.
-            case: "the default location, three grants, another account",
-            account_id: OTHER_ACCOUNT,
-            region: REGION,
+            case: "the default location, three grants, a third Region",
+            account_id: ACCOUNT,
+            region: THIRD_REGION,
             location_scope: DEFAULT_LOCATION_SCOPE,
             grants: vec![
                 ("archive-bucket/*", PERMISSION_READ),
@@ -520,8 +529,8 @@ async fn the_referential_integrity_refusal_is_a_bad_request_naming_the_location(
 #[tokio::test]
 async fn an_account_with_no_instance_is_refused_in_fixed_words_by_every_operation() {
     let emulator = Emulator::start();
-    // Each row is a pair with no instance: two accounts in the Region one
-    // account does hold an instance in, and a Region no account holds one in.
+    // Each row is a pair with no instance: the owning account in two Regions it
+    // holds no instance in.
     assert_eq!(
         create_instance(&emulator, ACCOUNT, REGION).await.status,
         200,
@@ -538,9 +547,8 @@ async fn an_account_with_no_instance_is_refused_in_fixed_words_by_every_operatio
     };
 
     for (case, account_id, region) in [
-        ("another account in the same Region", OTHER_ACCOUNT, REGION),
         ("the owning account in another Region", ACCOUNT, OTHER_REGION),
-        ("a Region nothing was created in", OTHER_ACCOUNT, THIRD_REGION),
+        ("a Region nothing was created in", ACCOUNT, THIRD_REGION),
     ] {
         for (call, reply) in [
             (
@@ -599,6 +607,26 @@ async fn an_account_with_no_instance_is_refused_in_fixed_words_by_every_operatio
         "expected the created instance to still read, got {} with body {}",
         read.status, read.body
     );
+
+    // A call addressed in another account is refused ahead of the instance
+    // lookup, so no operation of this surface reports whether that account
+    // holds one.
+    for (call, reply) in [
+        (
+            "GetAccessGrantsInstance",
+            get_instance(&emulator, OTHER_ACCOUNT, REGION).await,
+        ),
+        (
+            "DeleteAccessGrantsInstance",
+            delete_instance(&emulator, OTHER_ACCOUNT, REGION).await,
+        ),
+        (
+            "CreateAccessGrantsLocation",
+            create_location(&emulator, OTHER_ACCOUNT, REGION, "s3://reports-bucket/").await,
+        ),
+    ] {
+        assert_foreign_account_refused(call, OTHER_ACCOUNT, &reply);
+    }
 }
 
 #[tokio::test]
@@ -609,7 +637,7 @@ async fn deleting_an_instance_makes_every_later_read_of_it_refuse() {
     let pairs = [
         ("the owning account", ACCOUNT, REGION),
         ("the same account in another Region", ACCOUNT, OTHER_REGION),
-        ("another account", OTHER_ACCOUNT, REGION),
+        ("the same account in a third Region", ACCOUNT, THIRD_REGION),
     ];
     for (case, account_id, region) in pairs {
         assert_eq!(
@@ -710,8 +738,8 @@ async fn an_instance_that_still_holds_locations_or_grants_is_not_deleted() {
         ),
         (
             "two locations, one granted",
-            OTHER_ACCOUNT,
-            REGION,
+            ACCOUNT,
+            THIRD_REGION,
             vec!["s3://partner-bucket/inbound/", "s3://partner-bucket/out/"],
             true,
         ),

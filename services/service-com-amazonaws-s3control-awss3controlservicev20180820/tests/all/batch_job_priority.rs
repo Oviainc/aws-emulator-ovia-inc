@@ -30,7 +30,9 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
     JOB_PREPARATION, JOB_STATUS_READY,
 };
 
-use crate::access_point_lifecycle::{Emulator, Reply, ACCOUNT, OTHER_ACCOUNT};
+use crate::access_point_lifecycle::{
+    assert_foreign_account_refused, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT,
+};
 use crate::batch_job_lifecycle::{
     create_job, describe_job, JobCase, ACTION_LAMBDA_INVOKE, ACTION_PUT_OBJECT_COPY,
     ACTION_PUT_OBJECT_TAGGING, GENERATED_MANIFEST, MANIFEST_CSV, MANIFEST_INVENTORY,
@@ -221,10 +223,6 @@ async fn the_last_update_wins_and_each_job_keeps_its_own_priority() {
     let shape = JobCase::new("copy from a CSV manifest", ACTION_PUT_OBJECT_COPY, MANIFEST_CSV);
     let first = create_prepared_job(&emulator, ACCOUNT, &shape, "sequence-first").await;
     let second = create_prepared_job(&emulator, ACCOUNT, &shape, "sequence-second").await;
-    // A job of the SAME id cannot exist twice, but another account's job is a
-    // different record: the update names the account as well as the id.
-    let other_account_job =
-        create_prepared_job(&emulator, OTHER_ACCOUNT, &shape, "sequence-other").await;
 
     // A run of updates on one job: each replaces the last, rising and then
     // falling, so neither "the highest wins" nor "the first wins" passes.
@@ -242,28 +240,19 @@ async fn the_last_update_wins_and_each_job_keeps_its_own_priority() {
         );
     }
 
-    // The jobs nobody updated still carry what their create submitted.
-    for (case, account_id, job_id) in [
-        ("another job of the same account", ACCOUNT, &second),
-        ("a job of another account", OTHER_ACCOUNT, &other_account_job),
-    ] {
-        let described = described_priority(&emulator, account_id, job_id).await;
-        assert_eq!(
-            described,
-            CREATED_PRIORITY.to_string(),
-            "case {case:?}: expected the job nobody updated to keep priority \
-             {CREATED_PRIORITY}, got {described}"
-        );
-    }
-
-    // And an update is scoped to the account that owns the job: the same id
-    // under another account names no job.
-    let refused = update_job_priority(&emulator, OTHER_ACCOUNT, &first, "3").await;
+    // The job nobody updated still carries what its create submitted.
+    let described = described_priority(&emulator, ACCOUNT, &second).await;
     assert_eq!(
-        refused.status, 400,
-        "expected an update of another account's job id to be refused 400, got {} with body {}",
-        refused.status, refused.body
+        described,
+        CREATED_PRIORITY.to_string(),
+        "expected the job nobody updated to keep priority {CREATED_PRIORITY}, got {described}"
     );
+
+    // And an update addressed in another account is refused before the job is
+    // looked up: the same id named for an account the caller does not hold is
+    // not a bad request about the job but an authorization failure.
+    let refused = update_job_priority(&emulator, OTHER_ACCOUNT, &first, "3").await;
+    assert_foreign_account_refused("UpdateJobPriority for another account", OTHER_ACCOUNT, &refused);
     let described = described_priority(&emulator, ACCOUNT, &first).await;
     assert_eq!(
         described, "7",
