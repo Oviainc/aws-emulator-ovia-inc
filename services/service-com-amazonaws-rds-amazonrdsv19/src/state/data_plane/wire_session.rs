@@ -396,6 +396,9 @@ pub struct TlsFacts {
 #[derive(Debug, Clone)]
 pub struct SessionFacts {
     pub wire: EngineWire,
+    /// The DB instance this session is on, which is what a record of what the session did
+    /// is attributable to.
+    pub identifier: String,
     pub user: String,
     pub database: String,
     /// The PostgreSQL backend pid / MySQL connection id of this session.
@@ -632,6 +635,12 @@ pub fn run_statement(
 /// A statement whose qualifiers name SEVERAL databases is one this endpoint does not
 /// serve: the databases are separate, so it is refused as the endpoint's own limit rather
 /// than answered over one of them.
+///
+/// The resolution is over the statement's NAMES rather than its plan, so a client that
+/// writes a table alias or a CTE named exactly like one of the instance's own databases
+/// has that name read as the database — the limit of resolving a qualifier without
+/// planning the statement, and the reason the qualifier is only taken from a word that is
+/// not itself qualified.
 fn resolve_qualifiers(
     database: &InstanceDatabase,
     facts: &SessionFacts,

@@ -300,7 +300,7 @@ impl InstanceDatabase {
     /// the caller answers the create with a failure rather than publishing an endpoint
     /// nothing serves — and each database is opened empty when it is first named.
     pub fn open() -> Result<Self, EngineError> {
-        drop(open_confined_database()?);
+        probe_the_engine_starts()?;
         Ok(Self {
             databases: Mutex::new(Databases::default()),
         })
@@ -581,6 +581,14 @@ fn connection<'a>(
         .open
         .get_mut(&key)
         .ok_or_else(|| EngineError::new(EngineErrorKind::Internal, "the database is not open"))
+}
+
+/// Whether the engine can be started on this host at all: one database is opened under
+/// the bounds above and closed again, so a DB instance whose engine cannot run is refused
+/// at create time rather than publishing an endpoint nothing serves.
+fn probe_the_engine_starts() -> Result<(), EngineError> {
+    drop(open_confined_database()?);
+    Ok(())
 }
 
 /// One empty in-memory database, with every bound above in force before any client

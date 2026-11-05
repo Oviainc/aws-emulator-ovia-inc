@@ -143,6 +143,41 @@ const PG_EXTENSION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pg_extension (\
 /// schema a client's own objects are in.
 const DEFAULT_EXTENSION_SCHEMA: &str = "public";
 
+/// The extension every PostgreSQL database is created with.
+///
+/// `CREATE DATABASE` copies `template1`, which carries the procedural language, so a
+/// client reads it back from the catalog of a database nobody has installed anything in.
+const PRE_INSTALLED_EXTENSION: &str = "plpgsql";
+
+/// Bring a PostgreSQL database's extension catalog into existence, once, with the
+/// extension the database was created with already in it.
+///
+/// Called as a session opens, because `pg_extension` is a catalog of the DATABASE and a
+/// client may read it before it installs anything. Only a database whose catalog does not
+/// exist yet gets one: an extension a client dropped is not installed again behind it.
+pub fn open_extension_catalog(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+) -> Result<(), EngineError> {
+    let present = database.execute(
+        &facts.database,
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'pg_extension'",
+        &[],
+    )?;
+    let present = matches!(
+        present.rows.first().and_then(|row| row.first()),
+        Some(Cell::Integer(1..))
+    );
+    if present {
+        return Ok(());
+    }
+    database.execute(&facts.database, PG_EXTENSION_SCHEMA, &[])?;
+    if let Some(entry) = extension(PRE_INSTALLED_EXTENSION) {
+        record_extension(database, facts, *entry, None)?;
+    }
+    Ok(())
+}
+
 /// The extensions installed in the session's database, in the order they were installed.
 fn installed(database: &InstanceDatabase, facts: &SessionFacts) -> Result<Vec<String>, EngineError> {
     database.execute(&facts.database, PG_EXTENSION_SCHEMA, &[])?;
@@ -159,6 +194,26 @@ fn installed(database: &InstanceDatabase, facts: &SessionFacts) -> Result<Vec<St
             _ => None,
         })
         .collect())
+}
+
+/// Record a statement that changed what a DB instance HOLDS.
+///
+/// Creating or dropping a database or an extension is a change to the instance's own
+/// contents — a drop takes every table in that namespace with it — so each one leaves a
+/// line naming the instance, the session that ran it and the object it changed, the way an
+/// engine session's refusals are recorded ([`super::wire_session::record_refused_login`]).
+/// The statement's text is not recorded: what the object was and what happened to it is
+/// what a reader needs.
+fn record_catalog_change(facts: &SessionFacts, outcome: &'static str, object: &str) {
+    ::tracing::info!(
+        audit = true,
+        operation = "DbInstanceEngineStatement",
+        outcome,
+        db_instance_identifier = %facts.identifier,
+        connection_id = facts.connection_id,
+        object = %object,
+        "a statement changed what a DB instance's engine holds"
+    );
 }
 
 /// `CREATE EXTENSION [IF NOT EXISTS] <name> [WITH] [SCHEMA s] [VERSION v] [CASCADE]`.
@@ -219,6 +274,7 @@ pub fn create_extension(
         // requirements CASCADE installs are installed at the version each declares.
         let version = (position == last).then_some(statement.version.as_deref()).flatten();
         record_extension(database, facts, install, version)?;
+        record_catalog_change(facts, "extension-installed", install.name);
     }
     Ok(answer)
 }
@@ -312,6 +368,7 @@ pub fn drop_extension(
             "DELETE FROM pg_extension WHERE extname = ?",
             &[Some(dependent.clone())],
         )?;
+        record_catalog_change(facts, "extension-dropped", &dependent);
         answer = answer.with_notice(WireNotice::notice(
             "00000",
             format!("drop cascades to extension {dependent}"),
@@ -320,8 +377,9 @@ pub fn drop_extension(
     database.execute(
         &facts.database,
         "DELETE FROM pg_extension WHERE extname = ?",
-        &[Some(name)],
+        &[Some(name.clone())],
     )?;
+    record_catalog_change(facts, "extension-dropped", &name);
     Ok(answer)
 }
 
@@ -369,6 +427,7 @@ pub fn create_database(
         };
     }
     database.create_database(&name)?;
+    record_catalog_change(facts, "database-created", &name);
     let mut answer = StatementAnswer::new(
         format!("CREATE {object}"),
         // MySQL answers its OK packet for a created schema with one row affected;
@@ -444,6 +503,7 @@ pub fn drop_database(
         ));
     }
     database.drop_database(&name);
+    record_catalog_change(facts, "database-dropped", &name);
     let mut answer = StatementAnswer::new(format!("DROP {object}"), ResultSet::changed(0, 0));
     answer.databases_changed = true;
     // A MySQL session that drops the schema it was using is left with none selected.

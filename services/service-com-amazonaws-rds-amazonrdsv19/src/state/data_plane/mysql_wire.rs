@@ -206,6 +206,7 @@ async fn serve_session(
     // 4. The session is open.
     let mut session_facts = SessionFacts {
         wire: EngineWire::MySql,
+        identifier: facts.identifier.clone(),
         user: login.user.clone(),
         database,
         connection_id,

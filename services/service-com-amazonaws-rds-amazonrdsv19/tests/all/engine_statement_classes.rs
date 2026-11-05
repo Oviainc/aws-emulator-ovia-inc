@@ -98,6 +98,20 @@ async fn a_postgres_session_installs_the_extensions_the_instance_ships() {
     .await
     .expect("the master user must be admitted");
 
+    // The catalog a PostgreSQL database is created with: it is there before the client
+    // installs anything, carrying the extension the database was created with.
+    let shipped = session
+        .query("SELECT extname FROM pg_extension")
+        .await
+        .expect("the catalog read runs on a database nothing was installed in");
+    assert_eq!(
+        column(&shipped),
+        vec!["plpgsql".to_string()],
+        "case {:?}: a database must carry the extension it was created with, got \
+         {shipped:?}",
+        "the catalog of a fresh database"
+    );
+
     // The documented procedure for the S3 integration, then the conditions the statement
     // class defines. Each row runs on the one session, in order.
     let cases = [
@@ -199,6 +213,7 @@ async fn a_postgres_session_installs_the_extensions_the_instance_ships() {
             ("aws_lambda".to_string(), "1.0".to_string()),
             ("aws_s3".to_string(), "1.1".to_string()),
             ("hstore".to_string(), "1.7".to_string()),
+            ("plpgsql".to_string(), "1.0".to_string()),
             ("uuid-ossp".to_string(), "1.1".to_string()),
         ],
         "case {:?}: the catalog must carry exactly the extensions installed above, each at \
@@ -240,7 +255,11 @@ async fn a_postgres_session_installs_the_extensions_the_instance_ships() {
         .expect("the catalog read runs");
     assert_eq!(
         column(&installed),
-        vec!["aws_commons".to_string(), "aws_s3".to_string()],
+        vec![
+            "aws_commons".to_string(),
+            "aws_s3".to_string(),
+            "plpgsql".to_string()
+        ],
         "case {:?}: the other database must carry only what was installed in it, got \
          {installed:?}",
         "per-database extensions"

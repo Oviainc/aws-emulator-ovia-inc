@@ -227,6 +227,7 @@ async fn serve_session(
     // 4. The session is open.
     let mut session_facts = SessionFacts {
         wire: EngineWire::Postgres,
+        identifier: facts.identifier.clone(),
         user: user.clone(),
         database: database.clone(),
         connection_id: context.take_connection_id(),
@@ -844,10 +845,15 @@ fn render_cell(column: Option<&ColumnInfo>, cell: &Cell) -> Option<String> {
 }
 
 /// Record this session in `pg_stat_ssl`, the view a client reads its own connection's TLS
-/// from. The row is the SESSION's own fact: whether its socket is encrypted and, where the
-/// handshake could be observed, what it negotiated.
+/// from, and open the database's extension catalog.
+///
+/// The `pg_stat_ssl` row is the SESSION's own fact: whether its socket is encrypted and,
+/// where the handshake could be observed, what it negotiated. The catalog is the
+/// DATABASE's, and a client may read it before installing anything
+/// ([`super::server_statements::open_extension_catalog`]).
 async fn register_session(database: &Arc<InstanceDatabase>, facts: &SessionFacts) {
     let database = Arc::clone(database);
+    let session = facts.clone();
     let name = facts.database.clone();
     let pid = facts.connection_id.to_string();
     let encrypted = i64::from(facts.encrypted());
@@ -857,6 +863,7 @@ async fn register_session(database: &Arc<InstanceDatabase>, facts: &SessionFacts
         .and_then(|tls| tls.protocol.clone());
     let cipher = facts.tls.as_ref().and_then(|tls| tls.cipher.clone());
     let _ = tokio::task::spawn_blocking(move || {
+        let _ = super::server_statements::open_extension_catalog(&database, &session);
         let _ = database.execute(&name, PG_STAT_SSL_SCHEMA, &[]);
         let _ = database.execute(
             &name,
