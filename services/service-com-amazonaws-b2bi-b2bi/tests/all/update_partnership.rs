@@ -445,3 +445,214 @@ async fn updating_an_unknown_partnership_is_refused_as_not_found() {
         );
     }
 }
+
+/// The summary `ListPartnerships` reports for `partnership_id`, from the page named by
+/// `filter` — `None` enumerates every partnership, `Some(profileId)` only that profile's.
+async fn listed_partnership(
+    router: &MultiServiceRouter,
+    partnership_id: &str,
+    filter: Option<&str>,
+) -> Value {
+    let mut request = json!({});
+    if let Some(profile_id) = filter {
+        request["profileId"] = json!(profile_id);
+    }
+    let (status, body) = call(router, "ListPartnerships", request).await;
+    assert_eq!(
+        status, 200,
+        "ListPartnerships(filter {filter:?}) must succeed, got {status} {body}"
+    );
+    let summaries = body["partnerships"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ListPartnerships must report a list, got {body}"));
+    summaries
+        .iter()
+        .find(|summary| summary["partnershipId"] == json!(partnership_id))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("ListPartnerships(filter {filter:?}) must report {partnership_id}, got {body}")
+        })
+}
+
+/// RULE: an update writes to the ONE record its `partnershipId` addresses, so every reader
+/// of this service reports that same written record — the single-resource read and the
+/// enumeration, narrowed or not — and every other stored partnership is reported exactly as
+/// it was, member for member.
+///
+/// This is the same replacement rule the suite above states, asserted across the readers
+/// rather than only `GetPartnership`: the enumeration projects the stored partnership into
+/// its own summary shape, so a replacement that reached one projection and not the other
+/// would leave two readers disagreeing about which capabilities a partnership is bound to.
+/// The members compared are those of `com.amazonaws.b2bi#PartnershipSummary`
+/// (`smithy_query(query="shape",shape="PartnershipSummary")`).
+///
+/// The rows span capability-list sizes 0..3, the same ids in another order, re-setting the
+/// stored list, swapping to a different capability, options written with and without a
+/// list, and an update that names only `name`.
+#[tokio::test]
+async fn an_update_is_reported_by_every_reader_and_leaves_the_siblings_alone() {
+    let router = b2bi_router();
+    let profile_id = given_profile(&router, "acme").await;
+    let other_profile_id = given_profile(&router, "globex").await;
+    let capabilities: Vec<String> = {
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            ids.push(given_capability(&router, &format!("edi-{index}")).await);
+        }
+        ids
+    };
+    // The partnership under test, a sibling under the SAME profile (so it shares the
+    // narrowed page) and one under another profile (so it is only in the unnarrowed page).
+    let partnership_id =
+        given_partnership(&router, &profile_id, &capabilities[0], "Partner Under Test").await;
+    let sibling_id = given_partnership(&router, &profile_id, &capabilities[1], "Sibling").await;
+    let stranger_id =
+        given_partnership(&router, &other_profile_id, &capabilities[2], "Stranger").await;
+    let sibling_before = listed_partnership(&router, &sibling_id, None).await;
+    let stranger_before = listed_partnership(&router, &stranger_id, None).await;
+
+    // Members of `com.amazonaws.b2bi#CapabilityOptions`
+    // (`smithy_query(query="shape",shape="CapabilityOptions")`).
+    let validating = json!({
+        "outboundEdi": { "x12": { "common": { "validateEdi": true, "gs05TimeFormat": "HHMM" } } }
+    });
+    let wrapped = json!({
+        "outboundEdi": { "x12": { "wrapOptions": { "wrapBy": "LINE_LENGTH", "lineLength": 80 } } }
+    });
+
+    // The members `ListPartnerships` projects for a partnership, which must be the stored
+    // record's and so must agree with what the update answered.
+    let summary_members = [
+        "partnershipId",
+        "profileId",
+        "tradingPartnerId",
+        "name",
+        "capabilities",
+        "capabilityOptions",
+        "createdAt",
+        "modifiedAt",
+    ];
+
+    // (case, the `capabilities` the update submits, the `capabilityOptions` it submits) —
+    // the row shape the suite above already declares.
+    let cases: Vec<UpdateCase<'_>> = vec![
+        (
+            "re-set the list the record already holds",
+            Some(vec![capabilities[0].clone()]),
+            None,
+        ),
+        (
+            "swap to a different single capability",
+            Some(vec![capabilities[2].clone()]),
+            Some(&validating),
+        ),
+        (
+            "grow to two capabilities",
+            Some(vec![capabilities[0].clone(), capabilities[1].clone()]),
+            None,
+        ),
+        (
+            "the same two in the other order",
+            Some(vec![capabilities[1].clone(), capabilities[0].clone()]),
+            Some(&wrapped),
+        ),
+        ("all three capabilities", Some(capabilities.clone()), None),
+        (
+            "an empty list unbinds every capability",
+            Some(Vec::new()),
+            Some(&validating),
+        ),
+        (
+            "options rewritten with no capabilities list",
+            None,
+            Some(&wrapped),
+        ),
+        ("name only", None, None),
+    ];
+
+    for (index, (case, submitted, options)) in cases.iter().enumerate() {
+        let name = format!("partner-{index}");
+        let mut request = json!({ "partnershipId": partnership_id.clone(), "name": name });
+        if let Some(submitted) = submitted {
+            request["capabilities"] = json!(submitted);
+        }
+        if let Some(options) = options {
+            request["capabilityOptions"] = (*options).clone();
+        }
+
+        let (status, updated) = call(&router, "UpdatePartnership", request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdatePartnership must succeed, got {status} {updated}"
+        );
+
+        // Every reader reports the record the update wrote: the single-resource read, the
+        // whole enumeration, and the enumeration narrowed to the owning profile.
+        let fetched = get_partnership(&router, &partnership_id).await;
+        let listed = listed_partnership(&router, &partnership_id, None).await;
+        let narrowed = listed_partnership(&router, &partnership_id, Some(&profile_id)).await;
+
+        // What the enumeration reports is what this row SUBMITTED, not merely what the
+        // other readers happen to say: a row whose write was dropped fails here.
+        assert_eq!(
+            text(&listed, "name"),
+            name,
+            "case {case:?}: the enumerated summary must carry the submitted name, got {:?}",
+            listed["name"]
+        );
+        if let Some(submitted) = submitted {
+            assert_eq!(
+                listed["capabilities"],
+                json!(submitted),
+                "case {case:?}: the enumerated summary must carry the submitted capability \
+                 list, in order, got {:?}",
+                listed["capabilities"]
+            );
+        }
+        if let Some(options) = options {
+            assert_eq!(
+                listed["capabilityOptions"],
+                (*options).clone(),
+                "case {case:?}: the enumerated summary must carry the submitted \
+                 capabilityOptions, got {:?}",
+                listed["capabilityOptions"]
+            );
+        }
+
+        for member in summary_members {
+            assert_eq!(
+                fetched[member], updated[member],
+                "case {case:?}: GetPartnership disagrees with the update on {member}: {:?} vs \
+                 {:?}",
+                fetched[member], updated[member]
+            );
+            assert_eq!(
+                listed[member], updated[member],
+                "case {case:?}: ListPartnerships disagrees with the update on {member}: {:?} vs \
+                 {:?}",
+                listed[member], updated[member]
+            );
+            assert_eq!(
+                narrowed[member], listed[member],
+                "case {case:?}: the narrowed page disagrees with the whole one on {member}: {:?} \
+                 vs {:?}",
+                narrowed[member], listed[member]
+            );
+        }
+
+        // The write reached one record: the sibling sharing the profile and the partnership
+        // under another profile are reported exactly as they were before the update.
+        let sibling_now = listed_partnership(&router, &sibling_id, None).await;
+        assert_eq!(
+            sibling_now, sibling_before,
+            "case {case:?}: the sibling partnership must be untouched, got {sibling_now} \
+             instead of {sibling_before}"
+        );
+        let stranger_now = listed_partnership(&router, &stranger_id, None).await;
+        assert_eq!(
+            stranger_now, stranger_before,
+            "case {case:?}: the partnership under another profile must be untouched, got \
+             {stranger_now} instead of {stranger_before}"
+        );
+    }
+}
