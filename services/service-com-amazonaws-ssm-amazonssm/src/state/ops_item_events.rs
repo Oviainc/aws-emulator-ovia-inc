@@ -46,10 +46,19 @@ pub const MAX_EVENT_PAGE_SIZE: i32 = 50;
 ///
 /// Emulator resource guard, NOT a published AWS retention: an OpsItem can be edited
 /// without end and each edit appends an event, so without a bound the trail of one
-/// OpsItem would grow without end. The OpsItems themselves are already bounded
-/// ([`super::ops_items::MAX_OPS_ITEMS`]), so bounding the trail per OpsItem bounds the
-/// whole store.
+/// OpsItem would grow without end.
 pub const MAX_EVENTS_PER_OPS_ITEM: usize = 100;
+
+/// How many events this store retains in TOTAL, across every Region and every OpsItem,
+/// oldest dropped first.
+///
+/// The guard that makes the store finite whatever becomes of the OpsItems the events are
+/// about. The OpsItems themselves are bounded ([`super::ops_items::MAX_OPS_ITEMS`]) and one
+/// trail is bounded ([`MAX_EVENTS_PER_OPS_ITEM`]), but an id that no longer names a held
+/// OpsItem still has a trail, so neither of those bounds the total: without this one the
+/// store would grow with the number of OpsItem ids a process has ever seen. Stated as a
+/// number of full trails, so the two bounds move together.
+pub const MAX_OPS_ITEM_EVENTS: usize = 20 * MAX_EVENTS_PER_OPS_ITEM;
 
 /// The page size an event listing serves, or the refusal message for a `MaxResults`
 /// outside the modelled range — which the protocol's boundary validator already refuses,
@@ -187,9 +196,10 @@ impl ComAmazonawsSsmAmazonssmState {
 
     /// Append one event to `ops_item_id`'s trail in `region`, returning its event id.
     ///
-    /// This is the store's ONE write path for the trail, so the per-OpsItem bound
-    /// ([`MAX_EVENTS_PER_OPS_ITEM`]) holds however a caller reached it: past it, the oldest
-    /// event of that OpsItem's trail is dropped.
+    /// This is the store's ONE write path for the trail, so both bounds hold however a
+    /// caller reached it ([`Self::evict_ops_item_events_due`]): that OpsItem's trail keeps
+    /// at most [`MAX_EVENTS_PER_OPS_ITEM`] events and the store at most
+    /// [`MAX_OPS_ITEM_EVENTS`], the oldest dropped first.
     pub fn record_ops_item_event(
         &mut self,
         region: &str,
@@ -213,25 +223,64 @@ impl ComAmazonawsSsmAmazonssmState {
         };
         self.ops_item_events
             .insert((region.to_string(), event_id.clone()), record);
-        while self
+        self.evict_ops_item_events_due(region, ops_item_id);
+        event_id
+    }
+
+    /// Drop what the two bounds owe after an append to `ops_item_id`'s trail in `region`:
+    /// the oldest events of that trail past [`MAX_EVENTS_PER_OPS_ITEM`], and the oldest
+    /// events of the whole store past [`MAX_OPS_ITEM_EVENTS`].
+    ///
+    /// Oldest is by `(created_time, sequence)` — the total order a listing reads the trail
+    /// in — so what is dropped is what a reader would have reached last. Each bound is
+    /// settled in ONE pass over the events it ranks, and the pass is taken only when that
+    /// bound is over, so an append below both bounds costs a count rather than a sort.
+    fn evict_ops_item_events_due(&mut self, region: &str, ops_item_id: &str) {
+        let in_trail = self
             .ops_item_events
             .values()
             .filter(|held| held.region == region && held.ops_item_id == ops_item_id)
-            .count()
-            > MAX_EVENTS_PER_OPS_ITEM
-        {
-            let Some(oldest) = self
-                .ops_item_events
-                .values()
-                .filter(|held| held.region == region && held.ops_item_id == ops_item_id)
-                .min_by_key(|held| (held.created_time, held.sequence))
-                .map(|held| (held.region.clone(), held.event_id.clone()))
-            else {
-                break;
-            };
-            self.ops_item_events.remove(&oldest);
+            .count();
+        if let Some(excess) = in_trail.checked_sub(MAX_EVENTS_PER_OPS_ITEM) {
+            let dropped = self.oldest_ops_item_events(excess, |held| {
+                held.region == region && held.ops_item_id == ops_item_id
+            });
+            for key in dropped {
+                self.ops_item_events.remove(&key);
+            }
         }
-        event_id
+        // The store's own size is what this bound ranks, and a `BTreeMap`'s length is known
+        // without walking it, so the whole-store check costs nothing per append.
+        if let Some(excess) = self.ops_item_events.len().checked_sub(MAX_OPS_ITEM_EVENTS) {
+            let dropped = self.oldest_ops_item_events(excess, |_| true);
+            for key in dropped {
+                self.ops_item_events.remove(&key);
+            }
+        }
+    }
+
+    /// The store keys of the `count` oldest events `ranked` admits, oldest first.
+    ///
+    /// Empty for `count` of zero, so a bound that owes nothing ranks nothing.
+    fn oldest_ops_item_events(
+        &self,
+        count: usize,
+        ranked: impl Fn(&OpsItemEventRecord) -> bool,
+    ) -> Vec<(String, String)> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut oldest_first: Vec<&OpsItemEventRecord> = self
+            .ops_item_events
+            .values()
+            .filter(|held| ranked(held))
+            .collect();
+        oldest_first.sort_by_key(|held| (held.created_time, held.sequence));
+        oldest_first
+            .into_iter()
+            .take(count)
+            .map(|held| (held.region.clone(), held.event_id.clone()))
+            .collect()
     }
 
     /// Every event `region` holds, most recent first: an event trail is read newest-first,
@@ -345,6 +394,59 @@ mod tests {
             state.ops_item_events_of("us-east-1", "oi-ba9876543210").len(),
             1,
             "another OpsItem's trail is untouched by the bound"
+        );
+    }
+
+    /// The store is bounded in total, whatever becomes of the OpsItems its events are
+    /// about: trails of ids nothing holds any more still count against it, the oldest
+    /// events are the ones dropped, and the newest append survives.
+    #[test]
+    fn the_whole_store_is_bounded_across_ops_items_and_regions() {
+        let mut state = ComAmazonawsSsmAmazonssmState::default();
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // One full trail per OpsItem id, over as many ids as it takes to pass the store's
+        // bound — the shape a caller that keeps creating and retiring OpsItems leaves
+        // behind, which the per-OpsItem bound alone would never catch.
+        let trails = MAX_OPS_ITEM_EVENTS / MAX_EVENTS_PER_OPS_ITEM + 1;
+        let mut first_id = String::new();
+        let mut last_id = String::new();
+        let mut appended = 0u64;
+        for trail in 0..trails {
+            for step in 0..MAX_EVENTS_PER_OPS_ITEM {
+                let id = state.record_ops_item_event(
+                    "us-east-1",
+                    &format!("oi-{trail:012x}"),
+                    DETAIL_TYPE_UPDATE,
+                    written_detail(step as u64 + 1, "Open"),
+                    "arn:aws:sts::123456789012:assumed-role/tests/tests",
+                    base + Duration::from_secs(appended),
+                );
+                if appended == 0 {
+                    first_id = id.clone();
+                }
+                last_id = id;
+                appended += 1;
+            }
+        }
+        assert!(
+            appended as usize > MAX_OPS_ITEM_EVENTS,
+            "the case has to pass the bound to test it, appended {appended}"
+        );
+        let held = state.ops_item_events_in_region("us-east-1");
+        assert_eq!(
+            held.len(),
+            MAX_OPS_ITEM_EVENTS,
+            "the store holds at most {MAX_OPS_ITEM_EVENTS} events, got {}",
+            held.len()
+        );
+        assert!(
+            !held.iter().any(|event| event.event_id == first_id),
+            "the oldest events of a full store are the ones dropped"
+        );
+        assert_eq!(
+            held.first().map(|event| event.event_id.as_str()),
+            Some(last_id.as_str()),
+            "the newest append survives the bound and is reported first"
         );
     }
 }
