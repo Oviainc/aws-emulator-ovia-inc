@@ -231,6 +231,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
 
+        // The deployment type this cluster will have: the request's, else the only member
+        // the modelled `ClusterDeploymentType` enum declares.
+        let deployment_type = input
+            .deployment_type
+            .clone()
+            .unwrap_or_else(|| st::CLUSTER_DEPLOYMENT_TYPE_READ_REPLICAS.to_string());
+
+        // An availability setting sold as an AWS Marketplace offering is provisioned only
+        // for an account that holds an active subscription to that offering. The account
+        // subscribes out of band — no operation of this service does — so the precondition
+        // is checked here, BEFORE the id is minted and before any record is written, so a
+        // refused create leaves behind neither a cluster nor one of its nodes.
+        let gated_offering = st::marketplace_offering_for_deployment_type(&deployment_type);
+        if let Some(offering) =
+            gated_offering.filter(|offering| !state.holds_marketplace_subscription(*offering))
+        {
+            return Err(CreateDbClusterErrorModeled::ValidationException(ValidationException {
+                message: offering.missing_subscription_message.to_string(),
+                // The request is well formed and it is the account's subscription that is
+                // missing, so no field of it failed validation: the reason is the
+                // modelled catch-all.
+                reason: st::VALIDATION_EXCEPTION_REASON_OTHER.to_string(),
+            })
+            .into());
+        }
+
         // The store is bounded: past the emulator's own cardinality bound a create is
         // refused with the modelled quota error instead of growing the state without end.
         if state.db_clusters.len() >= st::DB_CLUSTER_QUOTA {
@@ -335,9 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             region: region.clone(),
             // Absent a choice the cluster is of the only type the model declares.
-            deployment_type: input
-                .deployment_type
-                .unwrap_or_else(|| st::CLUSTER_DEPLOYMENT_TYPE_READ_REPLICAS.to_string()),
+            deployment_type,
             db_instance_type: input.db_instance_type,
             network_type: input.network_type,
             db_storage_type: input.db_storage_type,

@@ -76,15 +76,22 @@ const ALWAYS_REPORTED_SUMMARY_MEMBERS: &[&str] = &[
     "status",
 ];
 
-/// A router mounting only this service over a fresh shared engine.
-pub(crate) fn router() -> MultiServiceRouter {
+/// A router mounting only this service over a fresh shared engine, handed back beside
+/// the engine itself — what a test needs when it has to write the store the way the
+/// world outside this API does (an AWS Marketplace subscription, say).
+pub(crate) fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests exercise handler behaviour, not SigV4: the `Authorization` header
     // below is there to carry the credential scope's region, not to be verified.
     router.set_request_authentication(false);
-    router.register_service(influxdb::EmulatedService::new(engine));
-    router
+    router.register_service(influxdb::EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// A router mounting only this service over a fresh shared engine.
+pub(crate) fn router() -> MultiServiceRouter {
+    router_and_engine().0
 }
 
 /// One `awsJson1_0` call, signed into `region`'s credential scope.
@@ -1149,9 +1156,8 @@ async fn the_operations_outside_this_slice_still_answer_501() {
     let router = router();
     for (operation, body) in [
         ("RebootDbInstance", json!({ "identifier": "abc" })),
-        ("ListDbClusters", json!({})),
-        // `GetDbCluster` is implemented beside `CreateDbCluster`; the cluster
-        // operations still scaffolded are these.
+        // `GetDbCluster` and `ListDbClusters` are implemented beside `CreateDbCluster`;
+        // the cluster operations still scaffolded are these.
         ("ListDbInstancesForCluster", json!({ "dbClusterId": "abc" })),
         ("ListDbBackups", json!({})),
     ] {

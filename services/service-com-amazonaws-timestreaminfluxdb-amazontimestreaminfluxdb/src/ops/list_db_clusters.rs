@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDbClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDbClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDbClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the DB clusters this store holds, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +147,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDbClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDbClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDbClusters"))
+        use crate::state as st;
+        use ::std::ops::Bound;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListDbClustersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // `maxResults` is modelled `range 1..100`, so the framework has already refused
+        // anything outside it; an omitted value pages at that modelled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(st::MAX_RESULTS_DEFAULT))
+            .unwrap_or(st::MAX_RESULTS_DEFAULT as usize)
+            .max(1);
+
+        let mut state = state.lock();
+        // Reporting only: settling applies the status changes the clock already made due
+        // for each cluster and for the nodes it provisioned, every one of which was owed
+        // at the same instant whether or not anybody listed.
+        let stored: Vec<String> = state.db_clusters.keys().cloned().collect();
+        for id in &stored {
+            state.settle_db_cluster(id, now);
+        }
+
+        // The token is the id the previous page ended on, so a page resumes strictly
+        // after it: every live cluster is yielded exactly once even if the cluster the
+        // token names was deleted between pages.
+        let lower = match input.next_token.as_deref() {
+            Some(token) => Bound::Excluded(token.to_string()),
+            None => Bound::Unbounded,
+        };
+        let mut remaining = state.db_clusters.range((lower, Bound::Unbounded));
+        let items: Vec<DbClusterSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.to_summary())
+            .collect();
+        // A token comes back only when a further page exists, and it names the last id
+        // on THIS page so the next request resumes after it.
+        let next_token = remaining
+            .next()
+            .and_then(|_| items.last().map(|item| item.id.clone()));
+
+        Ok(ListDbClustersOutput { items, next_token })
     }
 }

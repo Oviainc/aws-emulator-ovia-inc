@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/db_cluster_lifecycle.rs"]
 mod db_cluster_lifecycle;
+#[path = "all/db_cluster_marketplace_subscription.rs"]
+mod db_cluster_marketplace_subscription;
 #[path = "all/db_instance_lifecycle.rs"]
 mod db_instance_lifecycle;
 #[path = "all/db_parameter_group.rs"]

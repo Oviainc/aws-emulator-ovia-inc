@@ -8,7 +8,7 @@
 //! record into each operation's own output shape. The handlers in `src/ops/` hold no
 //! state of their own — they read and write the records here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -22,7 +22,12 @@ use crate::ops::types::{
 /// this one and reaches the same [`DbInstance`] records.
 mod clusters;
 
+/// The account-level AWS Marketplace subscriptions some deployment types are gated
+/// behind, and the refusal a create gets without one.
+mod marketplace;
+
 pub use clusters::*;
+pub use marketplace::*;
 
 /// `Status` values this service's records use, each one a member of
 /// `crate::ops::types::STATUS_VALUES` (the modelled `Status` enum).
@@ -588,6 +593,12 @@ pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     pub db_cluster_names: BTreeMap<(String, String), String>,
     /// Monotonic sequence mixed into every minted cluster `id`.
     pub db_cluster_seq: u64,
+    /// The AWS Marketplace offerings this account holds an ACTIVE subscription to, by
+    /// [`MarketplaceOffering::key`]. EMPTY by default, because nothing in this API
+    /// subscribes an account: a buyer subscribes in AWS Marketplace, out of band of
+    /// every operation here, which is what
+    /// [`subscribe_account_to_marketplace_offering`] stands in for.
+    pub marketplace_subscriptions: BTreeSet<String>,
 }
 
 impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {

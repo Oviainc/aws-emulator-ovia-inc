@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ClusterConfiguration, DbBackupConfiguration, GetDbClusterOutput, LogDeliveryConfiguration,
-    MaintenanceSchedule, Parameters,
+    ClusterConfiguration, DbBackupConfiguration, DbClusterSummary, GetDbClusterOutput,
+    LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
 };
 
 use super::{
@@ -234,6 +234,29 @@ impl DbCluster {
             cluster_configuration: Some(self.cluster_configuration.clone()),
             db_backup_configurations: backup_configurations_output(&self.db_backup_configurations),
             kms_key_id: self.kms_key_id.clone(),
+        }
+    }
+
+    /// Project this stored record into the `DbClusterSummary` the list operation reports.
+    ///
+    /// Every member of that shape is a member of this record; the summary is the subset
+    /// of [`Self::to_get_output`], so one cluster never reports two different values for
+    /// the same member.
+    pub fn to_summary(&self) -> DbClusterSummary {
+        DbClusterSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            status: Some(self.status.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            reader_endpoint: Some(self.reader_endpoint.clone()),
+            port: Some(self.port),
+            deployment_type: Some(self.deployment_type.clone()),
+            db_instance_type: Some(self.db_instance_type.clone()),
+            network_type: self.network_type.clone(),
+            db_storage_type: self.db_storage_type.clone(),
+            allocated_storage: Some(self.allocated_storage),
+            engine_type: Some(self.engine_type.clone()),
         }
     }
 

@@ -22,7 +22,28 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instance_lifecycle::{call, call_in, ok, router, ACCOUNT, REGION};
+use service_com_amazonaws_timestreaminfluxdb_amazontimestreaminfluxdb as influxdb;
+
+use crate::db_instance_lifecycle::{call, call_in, ok, router_and_engine, ACCOUNT, REGION};
+
+/// A router whose account already holds the AWS Marketplace subscription the
+/// read-replicas cluster deployment type is gated behind.
+///
+/// Every cluster this service creates is of that deployment type (the sole member of the
+/// modelled `ClusterDeploymentType` enum), so without the subscription `CreateDbCluster`
+/// is refused — that rule, and the fact a refusal stores nothing, are asserted in
+/// [`crate::db_cluster_marketplace_subscription`]. A buyer subscribes in AWS Marketplace,
+/// out of band of every operation here, so the happy-path rows below grant the
+/// subscription through the store seam before they create anything.
+fn router() -> MultiServiceRouter {
+    let (router, engine) = router_and_engine();
+    influxdb::state::subscribe_account_to_marketplace_offering(
+        &*engine,
+        influxdb::state::READ_REPLICAS_OFFERING,
+    )
+    .expect("the shared engine holds this service's store");
+    router
+}
 
 /// Members that `CreateDbClusterInput` and `GetDbClusterOutput` BOTH model and that the
 /// cluster reports exactly as the request gave them, from
@@ -1032,6 +1053,151 @@ async fn a_value_outside_a_modelled_constraint_is_refused_and_stores_nothing() {
         "case \"the refusals stored nothing\": a refused create must persist nothing, \
          got {listed}"
     );
+}
+
+/// Members of `DbClusterSummary`, from `smithy_query(query="shape",
+/// shape="DbClusterSummary")`. A listed cluster's summary must agree with its record.
+const CLUSTER_SUMMARY_MEMBERS: &[&str] = &[
+    "allocatedStorage",
+    "arn",
+    "dbInstanceType",
+    "dbStorageType",
+    "deploymentType",
+    "endpoint",
+    "engineType",
+    "id",
+    "name",
+    "networkType",
+    "port",
+    "readerEndpoint",
+    "status",
+];
+
+#[tokio::test]
+async fn paging_yields_every_live_cluster_exactly_once() {
+    // (clusters created, maxResults): `MaxResults` is modelled range 1..100.
+    let cases: [(usize, Option<i64>); 5] = [
+        (1, None),
+        (2, Some(1)),
+        (4, Some(2)),
+        (3, Some(100)),
+        (5, Some(3)),
+    ];
+    for (count, max_results) in cases {
+        let case = format!("{count} clusters at maxResults {max_results:?}");
+        let router = router();
+        let mut expected: Vec<String> = Vec::new();
+        for index in 0..count {
+            let created = ok(
+                &case,
+                call(
+                    &router,
+                    "CreateDbCluster",
+                    minimal_create(&format!("page-{index}")),
+                )
+                .await,
+            );
+            expected.push(cluster_id_of(&case, &created));
+        }
+        expected.sort();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(
+                pages <= count + 1,
+                "case {case:?}: paging did not terminate after {pages} pages, saw {seen:?}"
+            );
+            let mut request = json!({});
+            if let Some(limit) = max_results {
+                request["maxResults"] = json!(limit);
+            }
+            if let Some(token) = &token {
+                request["nextToken"] = json!(token);
+            }
+            let page = ok(&case, call(&router, "ListDbClusters", request).await);
+            let items = page["items"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: expected an `items` list, got {page}"));
+            if let Some(limit) = max_results {
+                assert!(
+                    items.len() as i64 <= limit,
+                    "case {case:?}: a page of {} exceeds maxResults {limit}",
+                    items.len()
+                );
+            }
+            for item in items {
+                seen.push(id_of(&case, item));
+            }
+            match page.get("nextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            seen.len(),
+            sorted.len(),
+            "case {case:?}: paging repeated a cluster: {seen:?}"
+        );
+        assert_eq!(
+            sorted, expected,
+            "case {case:?}: paging must yield exactly the live clusters"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_cluster_summary_agrees_with_the_full_record() {
+    let router = router();
+    let cases = create_cases(&router).await;
+    for case in &cases {
+        ok(
+            &case.label,
+            call(&router, "CreateDbCluster", case.body.clone()).await,
+        );
+    }
+
+    let listed = ok(
+        "summaries",
+        call(&router, "ListDbClusters", json!({ "maxResults": 100 })).await,
+    );
+    let items = listed["items"].as_array().expect("an `items` list");
+    assert_eq!(
+        items.len(),
+        cases.len(),
+        "case \"summaries\": every created cluster must be listed, got {listed}"
+    );
+    for item in items {
+        let id = id_of("summaries", item);
+        let record = ok(
+            &id,
+            call(&router, "GetDbCluster", json!({ "dbClusterId": &id })).await,
+        );
+        for member in CLUSTER_SUMMARY_MEMBERS {
+            // `status` is the one member the clock may advance between the two calls.
+            if *member == "status" {
+                continue;
+            }
+            assert_eq!(
+                item.get(member),
+                record.get(member),
+                "case {id:?}: the summary's {member} disagrees with the record, \
+                 {item} vs {record}"
+            );
+        }
+        let status = item["status"].as_str().unwrap_or_default();
+        assert!(
+            influxdb::ops::types::shared_types::CLUSTER_STATUS_VALUES.contains(&status),
+            "case {id:?}: {status:?} is not a member of the modelled ClusterStatus enum, \
+             got {item}"
+        );
+    }
 }
 
 #[test]
