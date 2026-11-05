@@ -810,10 +810,14 @@ async fn a_custom_health_status_is_accepted_only_where_a_custom_health_check_is_
             // is due later, which `custom_health_status.rs` pins — so what this proves
             // is that both readers answer from the ONE stored record, whichever status
             // that record currently reports.
+            // `ALL`, so the comparison holds whichever status the record reports: the
+            // view a request that names no status gets leaves out an instance the
+            // service has stopped routing traffic to.
             let found = ok(
                 &router,
                 "DiscoverInstances",
-                json!({ "NamespaceName": "health-ns", "ServiceName": service_name }),
+                json!({ "NamespaceName": "health-ns", "ServiceName": service_name,
+                        "HealthStatus": "ALL" }),
             )
             .await;
             let discovered = found["Instances"][0]["HealthStatus"].clone();

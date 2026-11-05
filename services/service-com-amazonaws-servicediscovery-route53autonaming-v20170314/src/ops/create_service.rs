@@ -351,9 +351,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::service_arn(&region, &format!("service/{id}")),
             id: id.clone(),
             name: input.name.clone(),
-            namespace_id,
             description: crate::state::described(input.description.clone()),
-            dns_config: input.dns_config.clone(),
+            // The record holds the configuration with the members the service itself
+            // decides already resolved, so every read path reports the same one.
+            dns_config: input
+                .dns_config
+                .clone()
+                .map(|config| crate::state::stored_dns_config(config, &namespace_id)),
+            namespace_id,
             health_check_config: input.health_check_config.clone(),
             health_check_custom_config: input.health_check_custom_config.clone(),
             service_type: service_type.to_string(),

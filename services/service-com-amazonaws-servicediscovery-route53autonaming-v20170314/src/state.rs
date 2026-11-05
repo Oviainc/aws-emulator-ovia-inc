@@ -311,6 +311,37 @@ pub fn described(description: Option<String>) -> Option<String> {
     description.filter(|text| !text.is_empty())
 }
 
+/// The routing policy a `DnsConfig` carries when its creator stated none.
+///
+/// `DnsConfig$RoutingPolicy` is optional on input and names "the routing policy that you
+/// want to apply to all Route 53 DNS records that Cloud Map creates"; a stored service
+/// always applies one, and the one it applies when the caller named none is the
+/// multivalue answer policy (the other member of the modelled `RoutingPolicy` enum,
+/// `WEIGHTED`, is what a creator asks for explicitly).
+pub const DEFAULT_ROUTING_POLICY: &str = "MULTIVALUE";
+
+/// A `DnsConfig` as it is PERSISTED: the configuration the caller stated, plus the
+/// members the service itself decides.
+///
+/// Both are members a read reports whether or not the request carried them, so they are
+/// resolved ONCE here — where the record is written — rather than per read path:
+///
+/// * `RoutingPolicy` — [`DEFAULT_ROUTING_POLICY`] when the request named none.
+/// * `NamespaceId` — the namespace that owns the service, which is what this
+///   (deprecated) member names; the request may have left it out, or named the namespace
+///   by ARN, and the record holds the resolved id either way.
+pub fn stored_dns_config(requested: DnsConfig, namespace_id: &str) -> DnsConfig {
+    DnsConfig {
+        namespace_id: Some(namespace_id.to_string()),
+        routing_policy: Some(
+            requested
+                .routing_policy
+                .unwrap_or_else(|| DEFAULT_ROUTING_POLICY.to_string()),
+        ),
+        dns_records: requested.dns_records,
+    }
+}
+
 /// Fold a digest into `digits` id characters.
 ///
 /// Cloud Map ids are lowercase alphanumeric, so the digest bytes are folded into base

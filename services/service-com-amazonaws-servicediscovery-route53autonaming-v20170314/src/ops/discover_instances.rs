@@ -3,7 +3,9 @@
 //! @op DiscoverInstances
 //! Implemented: resolves the namespace and service BY NAME, then answers with the
 //! attribute maps that were persisted by `RegisterInstance`, filtered as the
-//! `QueryParameters`, `OptionalParameters` and `HealthStatus` members document.
+//! `QueryParameters`, `OptionalParameters` and `HealthStatus` members document — and,
+//! where the request names no `HealthStatus`, with the instances a health-checked
+//! service still routes traffic to.
 //!
 //! ## Shape of an operation
 //!
@@ -369,7 +371,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         only_healthy
                     }
                 }
-                // `ALL`, and an absent filter, return everything that matched.
+                // A request that names NO status asks for the instances the service
+                // would route traffic to, and an instance reported unhealthy is one
+                // Cloud Map "stops routing traffic to" (documented on
+                // `HealthCheckCustomConfig`), so it is left out of that view; an
+                // instance nothing has reported on yet is still served, because no
+                // checker has taken it out. `ALL` is what asks for every instance
+                // whatever its status.
+                None => narrowed
+                    .into_iter()
+                    .filter(|instance| {
+                        instance.health_status != crate::state::HEALTH_STATUS_UNHEALTHY
+                    })
+                    .collect(),
+                // `ALL` returns everything that matched; a value outside the modelled
+                // `HealthStatusFilter` enum is refused before this handler runs.
                 _ => narrowed,
             }
         };

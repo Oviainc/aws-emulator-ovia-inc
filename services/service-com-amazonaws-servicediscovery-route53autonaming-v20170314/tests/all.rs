@@ -25,6 +25,10 @@ mod delete_namespace;
 mod delete_service;
 #[path = "all/discover_instances_revision.rs"]
 mod discover_instances_revision;
+#[path = "all/discovery_health_views.rs"]
+mod discovery_health_views;
+#[path = "all/dns_config_defaults.rs"]
+mod dns_config_defaults;
 #[path = "all/instance_health_status.rs"]
 mod instance_health_status;
 #[path = "all/list_instances.rs"]

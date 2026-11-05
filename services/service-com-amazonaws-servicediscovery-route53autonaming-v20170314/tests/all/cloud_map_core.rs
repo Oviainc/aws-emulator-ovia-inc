@@ -564,7 +564,8 @@ async fn optional_parameters_narrow_the_result_only_when_they_match_something() 
 /// `HealthStatus` "is ignored for services that don't have a health check configured,
 /// and all instances are returned"; with one configured, the filter selects on the
 /// instance's own status — which for a Route 53 health check is the verdict the service
-/// computes once the check is due (`ROUTE53_HEALTH_CHECK_VERDICT`).
+/// computes once the check is due (`ROUTE53_HEALTH_CHECK_VERDICT`) — and a request that
+/// names no status gets the instances the service still routes traffic to.
 ///
 /// The filter values come from the model's `HealthStatusFilter` enum
 /// (`HEALTH_STATUS_FILTER_VALUES` in `src/ops/types/shared_types.rs`).
@@ -607,7 +608,9 @@ async fn the_health_status_filter_applies_only_to_a_health_checked_service() {
         ("plain-svc", Some("HEALTHY"), vec!["i-1"]),
         ("plain-svc", Some("UNHEALTHY"), vec!["i-1"]),
         ("plain-svc", Some("HEALTHY_OR_ELSE_ALL"), vec!["i-1"]),
-        ("checked-svc", None, vec!["i-1"]),
+        // A request that names no status asks for the instances the service still
+        // routes traffic to, and this one's instance is reported unhealthy.
+        ("checked-svc", None, vec![]),
         ("checked-svc", Some("ALL"), vec!["i-1"]),
         // The service's own checker reported: nothing it can probe here answers, so
         // the instance is unhealthy rather than healthy.
@@ -1568,10 +1571,13 @@ async fn a_custom_health_check_takes_its_initial_status_from_the_attribute() {
                         "Attributes": attributes }),
             )
             .await;
+            // `ALL`, so the row whose initial status is UNHEALTHY is reported rather
+            // than left out of the view a request that names no status gets.
             let found = ok(
                 &router,
                 "DiscoverInstances",
-                json!({ "NamespaceName": "init-ns", "ServiceName": service_name }),
+                json!({ "NamespaceName": "init-ns", "ServiceName": service_name,
+                        "HealthStatus": "ALL" }),
             )
             .await;
             let reported = found["Instances"]

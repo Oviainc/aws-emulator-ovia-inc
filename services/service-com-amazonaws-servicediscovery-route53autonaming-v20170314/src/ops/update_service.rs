@@ -348,7 +348,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let mut config = stored_dns_config.clone().unwrap_or_default();
             config.dns_records = change.dns_records.clone();
-            Some(config)
+            // A configuration a service did not have until this call still carries the
+            // members the service itself decides, resolved by the same rule
+            // `CreateService` applies, so the member set a read reports never depends
+            // on which call wrote the record.
+            Some(crate::state::stored_dns_config(config, &namespace_id))
         });
         let health_check_changed = !same_health_check(
             stored_health_check.as_ref(),
