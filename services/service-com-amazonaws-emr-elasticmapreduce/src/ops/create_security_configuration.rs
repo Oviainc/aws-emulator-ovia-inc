@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 AuditOutcome::ValidationRefused,
             );
-            return Err(invalid_request(reason));
+            return Err(invalid_document(reason));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -245,6 +245,22 @@ fn invalid_request(message: String) -> CreateSecurityConfigurationError {
         error_code: None,
         message: Some(message),
     })
+    .into()
+}
+
+/// Refuse the DOCUMENT the request carried, with this operation's modeled client error
+/// (HTTP 400) under the discriminator Amazon EMR publishes for a security configuration
+/// it will not store — so a client branching on the code recognises the class without
+/// reading the prose.
+///
+/// Reached from the document-VALIDATION stage, whose refusals are the ones recorded under
+/// that code. The emulator's own stored-size bound keeps the plain refusal
+/// ([`invalid_request`]): its wording is this emulator's, so publishing Amazon EMR's
+/// discriminator beside it would make the code mean two things.
+fn invalid_document(message: String) -> CreateSecurityConfigurationError {
+    CreateSecurityConfigurationErrorModeled::InvalidRequestException(
+        crate::state::invalid_security_configuration(message),
+    )
     .into()
 }
 

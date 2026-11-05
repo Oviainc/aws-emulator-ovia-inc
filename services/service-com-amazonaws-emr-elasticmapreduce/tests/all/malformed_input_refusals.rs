@@ -39,6 +39,7 @@
 
 use serde_json::{json, Value};
 
+use crate::cluster_id_refusal_code::INVALID_CLUSTER_ID;
 use crate::input_refusals::error_message;
 use crate::job_flow_lifecycle::{assert_refused, at, kept_alive_request, Emr};
 use crate::refusal_messages::{message, studio_request};
@@ -61,7 +62,10 @@ const INVALID_JOB_ID_MALFORMED: &str = "INVALID_JOB_ID_MALFORMED";
 const MALFORMED_MARKER: &str = "MalformedMarker";
 
 /// The discriminator an operation answers a `ReleaseLabel` it cannot use with.
-const INVALID_RELEASE_LABEL: &str = "INVALID_RELEASE_LABEL";
+///
+/// `pub(crate)` so a sibling suite asserts it through one constant rather than its own
+/// copy.
+pub(crate) const INVALID_RELEASE_LABEL: &str = "INVALID_RELEASE_LABEL";
 
 /// A release the service's catalog offers, so a row probing another member of
 /// `ListSupportedInstanceTypes` gets past the release check.
@@ -146,7 +150,7 @@ fn cluster_id_requests(cluster_id: Option<&str>) -> Vec<(&'static str, Value)> {
         ),
         (
             "GetSession",
-            with_id(json!({ "SessionId": "s-ABCDEFGHIJKLM" })),
+            with_id(json!({ "SessionId": "is-ABCDEFGHIJKLM" })),
         ),
     ]
 }
@@ -334,12 +338,12 @@ async fn an_omitted_cluster_id_is_refused_by_its_operations_surface() {
         ),
     ));
     // The session-credentials read states the cluster-id sentence with no id in it, so
-    // there is nothing for `null` to fill.
+    // there is nothing for `null` to fill — and it publishes its own code for the class.
     cases.push((
         "GetClusterSessionCredentials",
         json!({ "ExecutionRoleArn": "arn:aws:iam::000000000000:role/EMRRuntime" }),
         (
-            MALFORMED_CLUSTER_ID,
+            INVALID_CLUSTER_ID,
             "Cluster id is not valid.".to_string(),
         ),
     ));

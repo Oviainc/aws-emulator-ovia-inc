@@ -174,15 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(record) = crate::state::release_label_record(requested) else {
+            // Amazon EMR's own sentence and discriminator for this class on THIS
+            // operation, both constant: the label the request sent is deliberately not
+            // echoed back. `ListSupportedInstanceTypes` words the same class its own way
+            // and under its own code, so neither is shared.
             return Err(DescribeReleaseLabelErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    // Amazon EMR's own sentence for this class on THIS operation, and it
-                    // is constant: the label the request sent is deliberately not echoed
-                    // back. `ListSupportedInstanceTypes` words the same class its own
-                    // way, so neither sentence is shared.
-                    message: Some("The release label isn't valid.".to_string()),
-                },
+                crate::state::release_label_not_valid(),
             )
             .into());
         };

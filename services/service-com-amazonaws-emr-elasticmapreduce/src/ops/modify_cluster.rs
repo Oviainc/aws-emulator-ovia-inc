@@ -142,8 +142,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{DEFAULT_STEP_CONCURRENCY_LEVEL, MAX_STEP_CONCURRENCY_LEVEL};
-
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
@@ -178,16 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The number of steps that can be executed concurrently. You can specify a
         // minimum of 1 step and a maximum of 256 steps."
         // (`ModifyCluster$StepConcurrencyLevel` doc.) The model types the member as a
-        // plain integer, so the range is refused here rather than at the boundary.
+        // plain integer, so the band is enforced here rather than at the boundary, with
+        // Amazon EMR's own sentence for the side of the band the level falls outside.
         if let Some(level) = input.step_concurrency_level {
-            if !(DEFAULT_STEP_CONCURRENCY_LEVEL..=MAX_STEP_CONCURRENCY_LEVEL).contains(&level) {
+            if let Some(message) = crate::state::step_concurrency_level_violation(level) {
                 return Err(ModifyClusterErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         error_code: None,
-                        message: Some(format!(
-                            "StepConcurrencyLevel {level} is outside \
-                             {DEFAULT_STEP_CONCURRENCY_LEVEL}..{MAX_STEP_CONCURRENCY_LEVEL}"
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into());

@@ -109,7 +109,7 @@ fn unknown_cluster_cases(cluster_id: &str) -> Vec<(&'static str, Value, String)>
         ),
         (
             "GetSession",
-            json!({ "ClusterId": cluster_id, "SessionId": "s-session" }),
+            json!({ "ClusterId": cluster_id, "SessionId": "is-0000000000000" }),
             quoted,
         ),
         (

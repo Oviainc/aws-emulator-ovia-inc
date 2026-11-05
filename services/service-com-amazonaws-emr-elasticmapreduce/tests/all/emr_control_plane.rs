@@ -89,7 +89,7 @@ fn cluster_id_requests(cluster_id: &str) -> Vec<(&'static str, Value)> {
         ),
         (
             "GetSession",
-            json!({ "ClusterId": cluster_id, "SessionId": "s-session" }),
+            json!({ "ClusterId": cluster_id, "SessionId": "is-0000000000000" }),
         ),
     ]
 }
@@ -868,7 +868,7 @@ async fn get_session_refuses_a_session_the_cluster_does_not_carry() {
         }))
         .await;
 
-    for session_id in ["s-nope", "s-ZZZZZZZZZZZZZ", "", "session"] {
+    for session_id in ["is-0000000000000", "is-ZZZZZZZZZZZZZ", "is-a", "is-ad6bbdf71f480"] {
         let (status, payload) = emr
             .call(
                 "GetSession",

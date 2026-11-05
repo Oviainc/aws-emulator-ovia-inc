@@ -36,7 +36,10 @@ pub(crate) const JOB_FLOW_SENTENCE: &str = "Specified job flow ID not valid.";
 /// id has, a short and a long body, a bare prefix, the empty string (`ClusterId` is
 /// `len 0..256`, so the boundary validator hands it to the handler) and a value of
 /// another form entirely.
-const UNKNOWN_CLUSTER_IDS: &[&str] = &[
+///
+/// `pub(crate)` so a sibling suite refuses the same ids through one list rather than its
+/// own copy.
+pub(crate) const UNKNOWN_CLUSTER_IDS: &[&str] = &[
     "j-ZZZZZZZZZZZZZ",
     "j-3ABCDEFGHIJKL",
     "j-1",
@@ -395,35 +398,51 @@ async fn an_unoffered_release_label_is_worded_per_operation() {
 // GetSession: the shape of the id, then the resources it names
 // ---------------------------------------------------------------------------
 
-/// Session ids no session could ever be minted under: each carries a character outside
-/// the class an EMR identifier is drawn from — a space, a slash, a control character,
-/// punctuation, a tab, a newline.
-const MALFORMED_SESSION_IDS: &[&str] = &[
+/// Session ids no session could ever be minted under. Rows differ along WHY the value is
+/// outside the form a session id has: a character outside the identifier class (a space,
+/// a slash, a control character, punctuation, a tab, a newline), another resource's
+/// prefix, no prefix at all, a bare prefix and the empty string.
+///
+/// `pub(crate)` so a sibling suite refuses the same ids through one list rather than its
+/// own copy.
+pub(crate) const MALFORMED_SESSION_IDS: &[&str] = &[
     "not a valid !! session /// id \u{1}\u{2}",
-    "has a space",
-    "has/a/slash",
-    "has\u{1}a\u{2}control",
-    "has\ta\ttab",
-    "has\na\nnewline",
-    "percent%encoded",
+    "is-has a space",
+    "is-has/a/slash",
+    "is-has\u{1}a\u{2}control",
+    "is-has\ta\ttab",
+    "is-has\na\nnewline",
+    "is-percent%encoded",
     "is-0000000000000;drop",
-];
-
-/// Session ids that COULD have been minted — the class is letters, digits, hyphen and
-/// underscore — so each reaches the lookups rather than the shape gate.
-const WELL_FORMED_SESSION_IDS: &[&str] = &[
-    "is-0000000000000",
-    "is-ad6bbdf71f480",
+    "is_underscored",
+    "e-3ABCDEFGHIJKL",
     "s-SESSIONZZZZZ",
-    "under_scored",
+    "j-3ABCDEFGHIJKL",
+    "es-3ABCDEFGHIJKL",
+    "session",
     "0",
+    "is",
+    "is-",
     "",
 ];
 
-/// THE RULE: `GetSession` settles the SHAPE of `SessionId` before it resolves anything,
-/// so a value outside the class a session id is drawn from is a bad request —
+/// Session ids that COULD have been minted — the session prefix and a body of letters
+/// and digits — so each reaches the lookups rather than the shape gate.
+///
+/// `pub(crate)` for the same reason as [`MALFORMED_SESSION_IDS`].
+pub(crate) const WELL_FORMED_SESSION_IDS: &[&str] = &[
+    "is-0000000000000",
+    "is-ad6bbdf71f480",
+    "is-ZZZZZZZZZZZZZ",
+    "is-a",
+    "is-9",
+    "is-000000000000000000000000",
+];
+
+/// THE RULE: `GetSession` settles the SHAPE of `SessionId` before it resolves the
+/// session's resources, so a value outside the form a session id has is a bad request —
 /// `ValidationException`, HTTP 400, naming the session's qualified path exactly as the
-/// request spelled it — whether or not the cluster beside it exists; a well-formed id
+/// request spelled it — even when the cluster beside it does not exist; a well-formed id
 /// instead reaches the lookups, where an unresolvable cluster and an absent session each
 /// answer their own sentence.
 #[tokio::test]

@@ -300,7 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             AuditOutcome, ClusterRecord, ClusterStatusRecord, InstanceFleetRecord,
             InstanceGroupRecord, InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
             MAX_CLUSTERS, MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
-            MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL, TRANSITION_SPAN,
+            MAX_STEPS_PER_JOB_FLOW, TRANSITION_SPAN,
         };
 
         let now = ::std::time::SystemTime::now();
@@ -394,16 +394,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specifies the number of steps that can be executed concurrently. The default
         // value is 1. The maximum value is 256." (RunJobFlow$StepConcurrencyLevel doc.)
+        // A level outside that band is refused with Amazon EMR's own sentence for the
+        // side of the band it falls outside.
         let step_concurrency_level = input
             .step_concurrency_level
             .unwrap_or(DEFAULT_STEP_CONCURRENCY_LEVEL);
-        if !(DEFAULT_STEP_CONCURRENCY_LEVEL..=MAX_STEP_CONCURRENCY_LEVEL)
-            .contains(&step_concurrency_level)
+        if let Some(message) =
+            crate::state::step_concurrency_level_violation(step_concurrency_level)
         {
-            return Err(refuse(format!(
-                "StepConcurrencyLevel {step_concurrency_level} is outside \
-                 {DEFAULT_STEP_CONCURRENCY_LEVEL}..{MAX_STEP_CONCURRENCY_LEVEL}"
-            )));
+            return Err(refuse(message));
         }
 
         // "Also called instance profile and Amazon EC2 role. An IAM role for an Amazon

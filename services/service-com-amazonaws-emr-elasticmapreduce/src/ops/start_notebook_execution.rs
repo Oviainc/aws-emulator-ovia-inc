@@ -6,7 +6,8 @@
 //! request in the shared engine, and answers with that id.
 //! `DescribeNotebookExecution` and `ListNotebookExecutions` report the record this
 //! handler wrote. An `ExecutionEngine.Id` naming no cluster this service holds is
-//! refused with the modelled `InvalidRequestException`, before anything is written.
+//! refused as a bad REQUEST — the request-validation envelope, HTTP 400, naming no
+//! cluster — before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -199,14 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // notebook execution" / "The unique identifier of the execution engine. For an
         // Amazon EMR cluster, this is the cluster ID." (`ExecutionEngineConfig` and
         // `ExecutionEngineConfig$Id` docs.) The engine is resolved against this
-        // service's own clusters, so an id naming no cluster is refused rather than
-        // recorded as an execution nothing could ever run.
-        let engine_id = input.execution_engine.id.clone();
-        if !store.clusters.contains_key(&engine_id) {
-            return Err(StartNotebookExecutionErrorModeled::InvalidRequestException(
-                crate::state::unknown_cluster(&engine_id),
-            )
-            .into());
+        // service's own clusters, so an engine naming no usable cluster is refused
+        // rather than recorded as an execution nothing could ever run — as a
+        // request-validation refusal, which is the envelope Amazon EMR answers this
+        // class in, worded by `crate::state::engine_not_available_message`: it states the
+        // cluster resolution produced, which is none on this path, and so echoes no id
+        // from the request.
+        if !store.clusters.contains_key(&input.execution_engine.id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::engine_not_available_message(),
+            ));
         }
 
         if store.notebook_executions.len() >= MAX_NOTEBOOK_EXECUTIONS {

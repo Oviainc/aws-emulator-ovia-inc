@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use crate::job_flow_lifecycle::{
     assert_minted_id, assert_refused, at, epoch_secs, kept_alive_request, Emr,
 };
+use crate::refusal_messages::message;
 
 /// Longer than the service's clock-owed transition span (500 ms), so an execution that
 /// was `START_PENDING` or `STOP_PENDING` has reached its next status by the time we look.
@@ -49,6 +50,27 @@ const PAGE_SIZE: usize = 50;
 /// bad user input (`smithy_query(query="operation",
 /// operation="ListNotebookExecutions,StartNotebookExecution")`).
 const MODELED_CLIENT_ERROR: &str = "InvalidRequestException";
+
+/// The error code the request-validation envelope carries, for a request Amazon EMR
+/// judges on its own input before any resource is resolved.
+///
+/// `pub(crate)` so a sibling suite asserts the same code through one constant.
+pub(crate) const REQUEST_VALIDATION: &str = "ValidationException";
+
+/// The sentence `StartNotebookExecution` answers an `ExecutionEngine` that resolves no
+/// usable Amazon EMR cluster with: it names the cluster RESOLUTION produced and states
+/// that it is not available, so `resolved_cluster_id` fills the slot and the
+/// absent-value rendering stands there when resolution produced none — which is the case
+/// on every refusal of this class.
+///
+/// `pub(crate)` so a sibling suite builds the same sentence through one helper rather than
+/// its own copy.
+pub(crate) fn engine_sentence(resolved_cluster_id: Option<&str>) -> String {
+    format!(
+        "The EMR cluster Id {} is not available",
+        resolved_cluster_id.unwrap_or("null")
+    )
+}
 
 /// Every value `com.amazonaws.emr#NotebookExecutionStatus` declares
 /// (`smithy_query(query="shape", shape="NotebookExecutionStatus")`).
@@ -569,7 +591,16 @@ async fn an_execution_engine_that_names_no_cluster_is_refused_atomically() {
             );
             continue;
         }
-        assert_refused(label, status, &payload, MODELED_CLIENT_ERROR);
+        // An engine that resolves no cluster is a bad REQUEST: the request-validation
+        // envelope, with the class's sentence naming the cluster resolution produced —
+        // none — rather than the id the request carried.
+        let expected = engine_sentence(None);
+        assert_refused(label, status, &payload, REQUEST_VALIDATION);
+        assert_eq!(
+            message(label, &payload),
+            expected,
+            "case {label:?}: expected {expected:?}, got {payload}"
+        );
         assert!(
             at(&payload, &["NotebookExecutionId"]).is_null(),
             "case {label:?}: a refusal mints no execution id, got {payload}"

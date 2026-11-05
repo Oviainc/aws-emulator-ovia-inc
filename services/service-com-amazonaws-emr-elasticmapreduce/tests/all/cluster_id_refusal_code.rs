@@ -14,8 +14,10 @@
 //! non-prose discriminator a client can branch on. A request naming a cluster the
 //! service resolves none of is refused with the code of the SURFACE the id was
 //! addressed through, beside that surface's sentence: the cluster surface answers
-//! `MalformedClusterId`, and the legacy job-flow surface — the one that calls a cluster
-//! a job flow and words its refusal that way — answers `INVALID_JOB_ID_MALFORMED`.
+//! `MalformedClusterId`, the legacy job-flow surface — the one that calls a cluster
+//! a job flow and words its refusal that way — answers `INVALID_JOB_ID_MALFORMED`, and
+//! the session-credentials read — the one that states the cluster-id sentence without the
+//! id — answers `InvalidClusterId`.
 //! A refusal of any OTHER class on the same operations carries no code at all, which is
 //! what gives either discriminator its meaning.
 
@@ -23,25 +25,24 @@ use serde_json::{json, Value};
 
 use crate::job_flow_lifecycle::{assert_refused, kept_alive_request, Emr};
 use crate::refusal_messages::message;
+use crate::refusal_wording::UNKNOWN_CLUSTER_IDS;
 use crate::resource_tags::error_code;
 
 /// The discriminator the CLUSTER surface answers an id it resolves no cluster for with.
-const MALFORMED_CLUSTER_ID: &str = "MalformedClusterId";
+///
+/// `pub(crate)` so a sibling suite asserts it through one constant rather than its own
+/// copy.
+pub(crate) const MALFORMED_CLUSTER_ID: &str = "MalformedClusterId";
 
 /// The discriminator the LEGACY job-flow surface answers the same class with.
 const INVALID_JOB_ID_MALFORMED: &str = "INVALID_JOB_ID_MALFORMED";
 
-/// Cluster ids no cluster carries: the shape a real id has, a shorter and a longer body,
-/// a prefix with nothing after it, the empty string (`ClusterId` is `len 0..256`, so the
-/// boundary validator passes it to the handler) and a value of another form entirely.
-const UNKNOWN_CLUSTER_IDS: &[&str] = &[
-    "j-ZZZZZZZZZZZZZ",
-    "j-1",
-    "j-000000000000000000000000",
-    "j-",
-    "",
-    "not-a-cluster-id",
-];
+/// The discriminator the SESSION-CREDENTIALS read answers the same class with: its own,
+/// not the cluster reads'.
+///
+/// `pub(crate)` so a sibling suite asserts it through one constant rather than its own
+/// copy.
+pub(crate) const INVALID_CLUSTER_ID: &str = "InvalidClusterId";
 
 /// Assert one refusal: HTTP 400, the modelled client error, and `expected` in
 /// `ErrorCode`.
@@ -60,11 +61,14 @@ fn assert_code(case: &str, status: u16, payload: &Value, expected: &str) {
 ///
 /// Rows span the whole family, so the rule is asserted where it holds rather than only
 /// where it was observed: the cluster reads, the step reads and the step cancellation,
-/// the cluster modification, the session read, the notebook start (whose
-/// `ExecutionEngine$Id` "is the cluster ID"), the session-credentials read that states
-/// the refusal without the id, both tag operations — reached by `ResourceId` alone and
-/// with the `ClusterId` that scopes them — and the instance-fleet add, which reaches the
-/// cluster as a JOB FLOW and so answers the other code.
+/// the cluster modification, the session read, the session-credentials read that states
+/// the refusal without the id and under its own code, both tag operations — reached by
+/// `ResourceId` alone and with the `ClusterId` that scopes them — and the instance-fleet
+/// add, which reaches the cluster as a JOB FLOW and so answers the other code.
+///
+/// The notebook start is NOT a row: it reaches a cluster through its
+/// `ExecutionEngine$Id`, and refuses an engine that names no usable cluster through the
+/// request-validation envelope, which carries no `ErrorCode` member at all.
 fn cluster_id_cases(cluster_id: &str) -> Vec<(&'static str, Value, &'static str)> {
     let mut cases: Vec<(&'static str, Value, &'static str)> = vec![
         (
@@ -104,7 +108,7 @@ fn cluster_id_cases(cluster_id: &str) -> Vec<(&'static str, Value, &'static str)
         ),
         (
             "GetSession",
-            json!({ "ClusterId": cluster_id, "SessionId": "s-session" }),
+            json!({ "ClusterId": cluster_id, "SessionId": "is-0000000000000" }),
             MALFORMED_CLUSTER_ID,
         ),
         (
@@ -113,17 +117,7 @@ fn cluster_id_cases(cluster_id: &str) -> Vec<(&'static str, Value, &'static str)
                 "ClusterId": cluster_id,
                 "ExecutionRoleArn": "arn:aws:iam::000000000000:role/EMRRuntime",
             }),
-            MALFORMED_CLUSTER_ID,
-        ),
-        (
-            "StartNotebookExecution",
-            json!({
-                "NotebookExecutionName": "probe",
-                "RelativePath": "notebooks/demo.ipynb",
-                "ExecutionEngine": { "Id": cluster_id, "Type": "EMR" },
-                "ServiceRole": "EMR_Notebooks_DefaultRole",
-            }),
-            MALFORMED_CLUSTER_ID,
+            INVALID_CLUSTER_ID,
         ),
         (
             "AddTags",
@@ -243,7 +237,7 @@ async fn a_refusal_of_another_class_on_the_same_operations_carries_no_code() {
         (
             "a session the cluster has none of",
             "GetSession",
-            json!({ "ClusterId": &live, "SessionId": "s-ZZZZZZZZZZZZZ" }),
+            json!({ "ClusterId": &live, "SessionId": "is-ZZZZZZZZZZZZZ" }),
         ),
         (
             "a tag key outside the class a tag is drawn from",

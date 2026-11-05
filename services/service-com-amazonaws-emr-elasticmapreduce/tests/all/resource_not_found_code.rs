@@ -240,10 +240,12 @@ async fn an_absent_studio_or_session_mapping_is_refused_with_the_not_found_code(
 
 /// THE OTHER HALF of the rule: a refusal that is NOT about an absent resource and that
 /// Amazon EMR publishes no code of its own for carries no discriminator, so
-/// `ResourceNotFound` means exactly one thing. Rows span those classes — a malformed
-/// document, a name already taken, a mutually exclusive pair of members and a step id
-/// Amazon EMR rejects as not valid — across the modelled `InvalidRequestException`
-/// channel and the `ValidationException` one.
+/// `ResourceNotFound` means exactly one thing. Rows span those classes — a name already
+/// taken, a mutually exclusive pair of members and a step id Amazon EMR rejects as not
+/// valid — across the modelled `InvalidRequestException` channel and the
+/// `ValidationException` one. A document the service will not store is NOT a row: Amazon
+/// EMR publishes its own code for that class, which the security-configuration suite
+/// asserts.
 #[tokio::test]
 async fn a_refusal_of_another_class_carries_no_discriminator() {
     let emr = Emr::new();
@@ -267,11 +269,6 @@ async fn a_refusal_of_another_class_carries_no_discriminator() {
                 "SecurityConfiguration":
                     r#"{"EncryptionConfiguration":{"EnableInTransitEncryption":false,"EnableAtRestEncryption":true,"AtRestEncryptionConfiguration":{"S3EncryptionConfiguration":{"EncryptionMode":"SSE-S3"}}}}"#,
             }),
-        ),
-        (
-            "a document that is not JSON",
-            "CreateSecurityConfiguration",
-            json!({ "Name": "malformed", "SecurityConfiguration": "{not json" }),
         ),
         (
             "both ways of naming one identity",

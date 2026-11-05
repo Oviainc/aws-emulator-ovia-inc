@@ -980,7 +980,7 @@ mod tests {
     /// Each operation words a `ClusterId` it cannot use through the surface it reaches a
     /// cluster by: the cluster surface quotes the id, the legacy job-flow surface names a
     /// job flow, and the session-credentials read states the cluster-id sentence with no
-    /// id in it. Rows span all three.
+    /// id in it and under its own code. Rows span all three.
     #[test]
     fn an_absent_cluster_id_is_refused_by_its_operations_surface() {
         let cases = [
@@ -994,7 +994,7 @@ mod tests {
             ),
             (
                 "GetClusterSessionCredentials",
-                "MalformedClusterId",
+                "InvalidClusterId",
                 "Cluster id is not valid.",
             ),
         ];

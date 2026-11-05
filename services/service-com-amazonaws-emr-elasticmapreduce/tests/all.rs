@@ -79,5 +79,7 @@ mod supported_instance_types;
 mod tag_character_class;
 #[path = "all/termination_protection.rs"]
 mod termination_protection;
+#[path = "all/validation_refusal_identity.rs"]
+mod validation_refusal_identity;
 #[path = "all/unreadable_request_values.rs"]
 mod unreadable_request_values;
