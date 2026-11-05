@@ -211,6 +211,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_MAX_RESULTS)
             .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // listing is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(ListAssetRevisionsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
             ListAssetRevisionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: ResourceKind::Domain.not_found_message(),

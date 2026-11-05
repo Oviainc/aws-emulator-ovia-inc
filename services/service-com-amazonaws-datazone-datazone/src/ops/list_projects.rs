@@ -195,7 +195,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_MAX_RESULTS)
             .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
 
-        // This operation models no `ResourceNotFoundException`, so an unknown domain is
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // listing is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(ListProjectsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+        // What is left for the lookup is a domain on its way out, which no longer holds
+        // its contents. This operation models no `ResourceNotFoundException`, so that is
         // refused as a bad request rather than reported as a domain with no projects.
         let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
             ListProjectsErrorModeled::ValidationException(ValidationException {

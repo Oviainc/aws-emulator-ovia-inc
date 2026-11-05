@@ -478,15 +478,27 @@ async fn an_unknown_domain_or_a_token_this_service_never_issued_is_refused() {
     let domain = dz.available_domain("pool-listing-refusals").await;
     create_pools(&dz, &domain).await;
 
-    // This operation models no `ResourceNotFoundException` (SOURCE:
-    // smithy_query(query="operation", operation="ListAccountPools")), so a domain this
-    // emulator does not hold is refused as invalid input, and so is a token it never
-    // issued.
-    let cases: Vec<(&str, String)> = vec![
+    // A permission is held ON a domain, so a caller holds none on an identifier this
+    // store serves no domain for: authorization decides the listing before any lookup
+    // (403 `AccessDeniedException`). Inside a domain it may list, a token this service
+    // never issued is still invalid input — this operation models no
+    // `ResourceNotFoundException` (SOURCE: smithy_query(query="operation",
+    // operation="ListAccountPools")).
+    let denied = dz
+        .call("GET", "/v2/domains/dzd_nosuchdomain000/account-pools", None)
+        .await;
+    assert_eq!(
+        (denied.status, denied.error_code.as_str(), denied.s("message")),
         (
-            "a well-formed domain id nothing created",
-            "/v2/domains/dzd_nosuchdomain000/account-pools".to_string(),
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: ListAccountPools".to_string()
         ),
+        "a listing scoped to a domain nothing created must be denied, got {} {:?}",
+        denied.status,
+        denied.body
+    );
+    let cases: Vec<(&str, String)> = vec![
         (
             "a token this service never issued",
             format!("/v2/domains/{domain}/account-pools?nextToken=notatoken"),
@@ -507,9 +519,10 @@ async fn an_unknown_domain_or_a_token_this_service_never_issued_is_refused() {
         );
     }
 
-    // A domain on its way out holds no pools a caller may list: the listing's liveness
-    // notion is the reader's, so it refuses exactly while `GetAccountPool` reports
-    // nothing.
+    // A domain on its way out holds no pools a caller may list: while it is still
+    // stored the listing refuses exactly where `GetAccountPool` reports nothing, and
+    // once the clock has taken it away the identifier names no domain at all, so
+    // authorization denies the call.
     let deleted = dz
         .call("DELETE", &format!("/v2/domains/{domain}"), None)
         .await;
@@ -518,14 +531,17 @@ async fn an_unknown_domain_or_a_token_this_service_never_issued_is_refused() {
         "deleting the domain: expected 202, got {} {:?}",
         deleted.status, deleted.body
     );
-    for label in ["while the domain is being deleted", "once it is gone"] {
+    for (label, status, code) in [
+        ("while the domain is being deleted", 400, "ValidationException"),
+        ("once it is gone", 403, "AccessDeniedException"),
+    ] {
         let answer = dz
             .call("GET", &format!("/v2/domains/{domain}/account-pools"), None)
             .await;
         assert_eq!(
             (answer.status, answer.error_code.as_str()),
-            (400, "ValidationException"),
-            "case {label:?}: expected 400 ValidationException, got {} {:?}",
+            (status, code),
+            "case {label:?}: expected {status} {code}, got {} {:?}",
             answer.status,
             answer.body
         );

@@ -206,18 +206,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss or
+        // as bad input.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateAssetTypeErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // Prerequisite: "The domain-identifier and owning-project-identifier must be
-        // valid and active." This operation models no `ResourceNotFoundException`, so an
-        // identifier that resolves to nothing fails the input constraints instead.
+        // valid and active." The domain is there — the check above read this same store
+        // under this same lock — so what is read here is the state it is in; the owning
+        // project is a separate question, and this operation models no
+        // `ResourceNotFoundException`, so an identifier that resolves to no project in
+        // the domain fails the input constraints instead.
         let domain = store
             .domains
             .get(&input.domain_identifier)
             .ok_or_else(|| {
-                CreateAssetTypeErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "domainIdentifier {} does not identify a domain",
-                        input.domain_identifier
-                    ),
+                CreateAssetTypeErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
                 })
             })?;
         if domain.status != DOMAIN_STATUS_AVAILABLE {

@@ -422,10 +422,13 @@ async fn an_asset_needs_a_settled_domain_and_a_project_that_owns_it() {
 
     let rows = vec![
         Row {
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // create before any lookup.
             label: "a domain that was never created",
             domain: "dzd_0000000000".to_string(),
             project: project.clone(),
-            expect: (404, "ResourceNotFoundException"),
+            expect: (403, "AccessDeniedException"),
         },
         Row {
             label: "a domain that is still CREATING",

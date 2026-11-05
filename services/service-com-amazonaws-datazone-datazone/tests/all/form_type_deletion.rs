@@ -577,11 +577,14 @@ async fn a_delete_the_service_cannot_satisfy_is_refused_with_a_modelled_error() 
     // (label, domain in the path, form type in the path, status, wire code)
     let cases: Vec<(&str, String, String, u16, &str)> = vec![
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // delete before any lookup.
             "a well-formed domain id that names no domain",
             "dzd_doesnotexist".to_string(),
             "ScopedForm".to_string(),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "a real domain and a form type nobody created",
@@ -682,9 +685,26 @@ async fn a_form_type_in_a_domain_being_deleted_is_already_gone() {
         domain_deleted.status, domain_deleted.body
     );
 
-    // Straight away, while the domain is still reported DELETING, and again once the
-    // clock has taken it away: the form type is unreachable either way.
-    for (label, wait) in [("while the domain is DELETING", false), ("once it is gone", true)] {
+    // Straight away, while the domain is still reported DELETING, the form type is
+    // already gone with the domain that held it; once the clock has taken the domain
+    // away the identifier names no domain at all, so authorization denies the call.
+    let cases: [(&str, bool, u16, &str, String); 2] = [
+        (
+            "while the domain is DELETING",
+            false,
+            404,
+            "ResourceNotFoundException",
+            DOMAIN_NOT_FOUND.to_string(),
+        ),
+        (
+            "once it is gone",
+            true,
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: DeleteFormType".to_string(),
+        ),
+    ];
+    for (label, wait, status, code, message) in cases {
         if wait {
             tokio::time::sleep(SETTLED).await;
         }
@@ -697,11 +717,7 @@ async fn a_form_type_in_a_domain_being_deleted_is_already_gone() {
             .await;
         assert_eq!(
             (answer.status, answer.error_code.as_str(), answer.s("message")),
-            (
-                404,
-                "ResourceNotFoundException",
-                DOMAIN_NOT_FOUND.to_string()
-            ),
+            (status, code, message),
             "case {label:?}: expected the domain to be unreachable, got {} {:?}",
             answer.status,
             answer.body

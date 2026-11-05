@@ -209,6 +209,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup — including the idempotency
+        // replay below — rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateGlossaryTermErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // The `@idempotencyToken`: a repeat of the SAME request returns the term the
         // first one created, so a retry never leaves two terms behind. Resolved BEFORE
         // the state checks below on purpose: a replay reports what the first request
@@ -227,8 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The documented prerequisites, in order. This operation DOES model
         // `ResourceNotFoundException` (smithy_query operation="CreateGlossaryTerm"), so a
-        // domain or a glossary that is not stored is answered with that 404 rather than
-        // with the access error `CreateGlossary` has to use.
+        // domain already on its way out, or a glossary that is not stored, is answered
+        // with that 404.
         let domain = store
             .live_domain(&input.domain_identifier)
             .ok_or_else(|| {

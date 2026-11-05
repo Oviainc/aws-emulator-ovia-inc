@@ -207,9 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the order the store keys the pools under, their id.
         let by_name = input.sort_by.as_deref() == Some(SORT_FIELD_NAME);
 
-        // This operation models no `ResourceNotFoundException`, so a domain this emulator
-        // does not hold cannot be reported as missing: it is refused as invalid input
-        // naming the member to fix, rather than answered as a domain with no pools. The
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // listing is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(ListAccountPoolsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+        // What is left for the lookup is a domain on its way out. This operation models
+        // no `ResourceNotFoundException`, so that one is refused as invalid input naming
+        // the member to fix, rather than answered as a domain with no pools. The
         // liveness notion is `GetAccountPool`'s, so the listing and the reader agree on
         // which domains still hold pools.
         let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {

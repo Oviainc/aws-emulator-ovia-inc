@@ -352,20 +352,40 @@ async fn an_unknown_domain_parent_token_or_page_size_is_refused() {
         .s("rootDomainUnitId");
     let child = create_unit(&dz, &domain, &root, "a child", "refusals").await;
 
-    // Each row is a request that must be refused, and why: this operation models no
-    // ResourceNotFoundException, so an identifier that names nothing is bad input.
-    let cases = vec![
+    // A listing scoped to a domain the store serves no record of is DENIED, whatever
+    // the rest of the request names: a permission is held ON a domain, so the caller
+    // holds none there and authorization decides the call before any lookup.
+    for (label, uri) in [
         (
             "a domain that is not stored",
             format!("/v2/domains/dzd_nosuchdomain000/domain-units?parentDomainUnitIdentifier={root}"),
         ),
         (
-            "a parent unit that is not stored in this domain",
-            format!("/v2/domains/{domain}/domain-units?parentDomainUnitIdentifier=nosuchparent"),
-        ),
-        (
             "a parent unit stored in ANOTHER domain",
             format!("/v2/domains/dzd_nosuchdomain000/domain-units?parentDomainUnitIdentifier={child}"),
+        ),
+    ] {
+        let answer = dz.call("GET", &uri, None).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str(), answer.s("message")),
+            (
+                403,
+                "AccessDeniedException",
+                "User is not permitted to perform operation: ListDomainUnitsForParent".to_string()
+            ),
+            "case {label:?}: expected the modelled denial, got {} {:?}",
+            answer.status,
+            answer.body
+        );
+    }
+
+    // Inside a domain the caller may list, each row is a request that must be refused,
+    // and why: this operation models no ResourceNotFoundException, so an identifier that
+    // names nothing in that domain is bad input.
+    let cases = vec![
+        (
+            "a parent unit that is not stored in this domain",
+            format!("/v2/domains/{domain}/domain-units?parentDomainUnitIdentifier=nosuchparent"),
         ),
         (
             "a nextToken this service never issued",

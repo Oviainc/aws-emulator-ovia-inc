@@ -519,7 +519,8 @@ async fn an_unknown_or_unsettled_domain_is_refused() {
         "detail": { "createGlossary": { "includeChildDomainUnits": true } },
     });
 
-    // A well-formed domain id nothing was created under.
+    // A well-formed domain id nothing was created under: a permission is held ON a
+    // domain, so the caller holds none here and authorization decides the call first.
     let unknown = dz
         .call(
             "POST",
@@ -528,9 +529,13 @@ async fn an_unknown_or_unsettled_domain_is_refused() {
         )
         .await;
     assert_eq!(
-        (unknown.status, unknown.error_code.as_str()),
-        (400, "ValidationException"),
-        "an unknown domain must be refused, got {} {:?}",
+        (unknown.status, unknown.error_code.as_str(), unknown.s("message")),
+        (
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: AddPolicyGrant".to_string()
+        ),
+        "a domain nothing created must be denied, got {} {:?}",
         unknown.status,
         unknown.body
     );
@@ -844,7 +849,8 @@ async fn remove_drops_the_named_principals_grants_and_nothing_else() {
         "a removal naming an unknown grant must change nothing"
     );
 
-    // An unknown domain is refused rather than silently succeeding.
+    // A domain the store serves no record of is denied rather than silently succeeding:
+    // a permission is held ON a domain, so the caller holds none there.
     let unknown = dz
         .call(
             "POST",
@@ -856,9 +862,13 @@ async fn remove_drops_the_named_principals_grants_and_nothing_else() {
         )
         .await;
     assert_eq!(
-        (unknown.status, unknown.error_code.as_str()),
-        (400, "ValidationException"),
-        "removing a grant from an unknown domain must be refused, got {} {:?}",
+        (unknown.status, unknown.error_code.as_str(), unknown.s("message")),
+        (
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: RemovePolicyGrant".to_string()
+        ),
+        "removing a grant in a domain nothing created must be denied, got {} {:?}",
         unknown.status,
         unknown.body
     );

@@ -199,6 +199,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup — including the idempotency
+        // replay below — rather than reported as a miss or as bad input.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateDomainUnitErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // The `@idempotencyToken`: a repeat of the SAME request answers with the unit
         // the first one created, so a retry never leaves two units behind. Answered
         // BEFORE the domain-state check below, deliberately: the retried request
@@ -215,10 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let created_by = caller_principal(ctx);
         // `CreateDomainUnit` models no `ResourceNotFoundException`, so a request whose
-        // `domainIdentifier` or `parentDomainUnitIdentifier` names nothing stored is
-        // refused as invalid input, naming the member the caller has to fix. A domain
-        // that IS stored but is not available is a conflict, not invalid input, so the
-        // lookup takes every stored domain and the status check below decides.
+        // `parentDomainUnitIdentifier` names nothing stored is refused as invalid input,
+        // naming the member the caller has to fix. A domain that IS stored but is not
+        // available is a conflict, not invalid input, so the lookup takes every stored
+        // domain and the status check below decides.
         let (domain_status, parent_is_stored, name_clash, unit_count) = store
             .domains
             .get(&input.domain_identifier)
@@ -238,9 +251,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })
             .ok_or_else(|| {
-                CreateDomainUnitErrorModeled::ValidationException(ValidationException {
-                    message: "domainIdentifier does not name a domain in this account"
-                        .to_string(),
+                CreateDomainUnitErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
                 })
             })?;
         // A domain still being created, or already being deleted, cannot take a new

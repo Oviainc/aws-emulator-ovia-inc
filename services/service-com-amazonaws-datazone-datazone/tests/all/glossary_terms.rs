@@ -494,15 +494,31 @@ async fn a_term_needs_an_available_domain_a_stored_glossary_and_stored_relations
     let stored_term = term_in(&dz, &domain, &glossary, "a stored term").await;
     let foreign_term = term_in(&dz, &other_domain, &other_glossary, "a foreign term").await;
 
-    // Each of these names something the store does not hold, so each is refused with the
-    // `ResourceNotFoundException` this operation models (smithy_query
+    // A call scoped to a domain the store serves no record of is denied before any
+    // lookup: a permission is held ON a domain, so the caller holds none there.
+    let denied = dz
+        .call(
+            "POST",
+            "/v2/domains/dzd_nosuchdomain000/glossary-terms",
+            Some(json!({ "glossaryIdentifier": glossary.clone(), "name": "t" })),
+        )
+        .await;
+    assert_eq!(
+        (denied.status, denied.error_code.as_str(), denied.s("message")),
+        (
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: CreateGlossaryTerm".to_string()
+        ),
+        "a term scoped to a domain nothing created must be denied, got {} {:?}",
+        denied.status,
+        denied.body
+    );
+
+    // Each of these names something the SERVED domain does not hold, so each is refused
+    // with the `ResourceNotFoundException` this operation models (smithy_query
     // operation="CreateGlossaryTerm").
     let absent: Vec<(&str, String, Value)> = vec![
-        (
-            "a well-formed domain id nothing created",
-            "/v2/domains/dzd_nosuchdomain000/glossary-terms".to_string(),
-            json!({ "glossaryIdentifier": glossary.clone(), "name": "t" }),
-        ),
         (
             "a glossary nothing created",
             format!("/v2/domains/{domain}/glossary-terms"),

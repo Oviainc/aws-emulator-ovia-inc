@@ -301,10 +301,13 @@ async fn the_preconditions_the_listing_needs_are_refused_with_the_modelled_error
     // Each row: the request, and the refusal it earns.
     let rows = vec![
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // listing before any lookup.
             "a domain nothing created",
             format!("/v2/domains/dzd_0000000000/assets/{id}/revisions"),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "an asset the domain does not hold",

@@ -399,12 +399,15 @@ async fn an_update_is_scoped_to_its_domain_and_refuses_what_the_model_rejects() 
             "ResourceNotFoundException",
         ),
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // update before any lookup.
             "a domain that does not exist",
             "dzd_doesnotexist".to_string(),
             id.clone(),
             json!({ "name": "x" }),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             // `DomainId` is `^dzd[-_][a-zA-Z0-9_-]{1,36}$`.

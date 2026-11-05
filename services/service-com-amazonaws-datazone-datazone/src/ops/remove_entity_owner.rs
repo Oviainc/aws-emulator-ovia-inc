@@ -174,15 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        // This operation models `ResourceNotFoundException`, so a domain or an entity
-        // that is not stored is reported as not found rather than as bad input. It
-        // models no `ConflictException`, so a stored domain in any status is served:
-        // the units of a domain being deleted are still readable until the clock
-        // removes it.
-        if !store.domains.contains_key(&input.domain_identifier) {
-            return Err(RemoveEntityOwnerErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: ResourceKind::Domain.not_found_message(),
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss.
+        // A stored domain in any status is served past this check: the units of a domain
+        // being deleted are still reachable until the clock removes it.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(RemoveEntityOwnerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
                 },
             )
             .into());

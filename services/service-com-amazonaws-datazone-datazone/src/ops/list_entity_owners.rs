@@ -208,19 +208,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_MAX_RESULTS)
             .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
 
-        // This operation models no `ResourceNotFoundException`, so neither identifier
-        // can be reported as missing: an unknown domain, and an unknown entity within a
-        // stored domain, are both refused as invalid input naming the member to fix —
-        // the treatment `ListDomainUnitsForParent` gives those same two members. A
-        // domain that is still being deleted is reached here deliberately: it still
-        // holds its units and `GetDomainUnit` still reports their owners, so this
-        // listing agrees with that reader until the clock removes the domain.
-        if !store.domains.contains_key(&input.domain_identifier) {
-            return Err(ListEntityOwnersErrorModeled::ValidationException(ValidationException {
-                message: "domainIdentifier does not name a domain in this account".to_string(),
-            })
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // listing is denied before any resource lookup rather than reported as a miss or
+        // as bad input. A domain that is still being deleted is reached past this check
+        // deliberately: it still holds its units and `GetDomainUnit` still reports their
+        // owners, so this listing agrees with that reader until the clock removes the
+        // domain.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(ListEntityOwnersErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
             .into());
         }
+        // The entity inside the domain is a different question: this operation models no
+        // `ResourceNotFoundException`, so an entity the served domain does not hold is
+        // refused as invalid input naming the member to fix.
         let entity = store
             .owned_entity(
                 &input.domain_identifier,

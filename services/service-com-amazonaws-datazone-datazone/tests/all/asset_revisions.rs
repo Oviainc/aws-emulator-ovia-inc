@@ -557,12 +557,15 @@ async fn the_preconditions_a_revision_needs_are_refused_with_the_modelled_errors
     // Each row: the domain and asset the call addresses, the body, and the refusal.
     let rows = vec![
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // call before any lookup.
             "a domain nothing created",
             "dzd_0000000000".to_string(),
             id.clone(),
             json!({ "name": "revised" }),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "an asset the domain does not hold",

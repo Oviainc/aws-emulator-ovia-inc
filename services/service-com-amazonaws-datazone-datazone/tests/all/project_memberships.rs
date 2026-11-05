@@ -647,12 +647,15 @@ async fn an_unknown_domain_project_member_or_token_is_refused() {
 
     let cases = vec![
         RefusalCase {
+            // A permission is held ON a domain, so the caller holds none on an identifier
+            // the store serves no domain for: authorization decides these calls before
+            // any lookup, whether they list, create or delete.
             label: "list, unknown domain",
             method: "GET",
             uri: format!("/v2/domains/dzd_doesnotexist/projects/{project_id}/memberships"),
             body: None,
-            status: 404,
-            code: "ResourceNotFoundException",
+            status: 403,
+            code: "AccessDeniedException",
         },
         RefusalCase {
             label: "list, unknown project",
@@ -677,8 +680,8 @@ async fn an_unknown_domain_project_member_or_token_is_refused() {
             method: "POST",
             uri: format!("/v2/domains/dzd_doesnotexist/projects/{project_id}/createMembership"),
             body: Some(json!({ "member": member, "designation": SERVICE_DESIGNATIONS[0] })),
-            status: 404,
-            code: "ResourceNotFoundException",
+            status: 403,
+            code: "AccessDeniedException",
         },
         RefusalCase {
             label: "create, unknown project",
@@ -703,8 +706,8 @@ async fn an_unknown_domain_project_member_or_token_is_refused() {
             method: "POST",
             uri: format!("/v2/domains/dzd_doesnotexist/projects/{project_id}/deleteMembership"),
             body: Some(json!({ "member": member })),
-            status: 404,
-            code: "ResourceNotFoundException",
+            status: 403,
+            code: "AccessDeniedException",
         },
         RefusalCase {
             label: "delete, unknown project",

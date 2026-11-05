@@ -780,7 +780,9 @@ async fn created_projects_are_persisted_scoped_and_deletable() {
 async fn a_project_needs_a_domain_that_exists_and_is_available() {
     let dz = Emulator::new();
 
-    // No such domain at all.
+    // No such domain at all: a permission is held ON a domain, so the caller holds none
+    // on an identifier the store serves no domain for, and both the create and the
+    // listing are denied before any lookup.
     let orphan = dz
         .call(
             "POST",
@@ -789,9 +791,13 @@ async fn a_project_needs_a_domain_that_exists_and_is_available() {
         )
         .await;
     assert_eq!(
-        (orphan.status, orphan.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "an unknown domain must be refused, got {} {:?}",
+        (orphan.status, orphan.error_code.as_str(), orphan.s("message")),
+        (
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: CreateProject".to_string()
+        ),
+        "a domain nothing created must be denied, got {} {:?}",
         orphan.status,
         orphan.body
     );
@@ -799,9 +805,13 @@ async fn a_project_needs_a_domain_that_exists_and_is_available() {
         .call("GET", "/v2/domains/dzd_doesnotexist/projects", None)
         .await;
     assert_eq!(
-        (listed.status, listed.error_code.as_str()),
-        (400, "ValidationException"),
-        "ListProjects models no ResourceNotFoundException, so an unknown domain is a bad request; got {} {:?}",
+        (listed.status, listed.error_code.as_str(), listed.s("message")),
+        (
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: ListProjects".to_string()
+        ),
+        "a listing scoped to a domain nothing created must be denied, got {} {:?}",
         listed.status,
         listed.body
     );

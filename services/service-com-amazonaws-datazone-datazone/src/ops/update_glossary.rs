@@ -201,8 +201,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // update is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(UpdateGlossaryErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // The documented prerequisites, read under one lock before anything is written.
-        // A domain that is gone, or already on its way out, holds no glossary to update,
+        // A domain already on its way out holds no glossary to update,
         // and a glossary this domain does not hold is as absent as one nothing created —
         // this operation DOES model `ResourceNotFoundException` (smithy_query
         // operation="UpdateGlossary"), so that is the refusal, naming only the kind.

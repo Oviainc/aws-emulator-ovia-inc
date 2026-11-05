@@ -166,8 +166,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock(now_ms());
 
-        // This operation models no `ResourceNotFoundException`, so an unknown domain is
-        // refused as a bad request.
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss or
+        // as bad input.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(RemovePolicyGrantErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+        // What is left is a domain on its way out, which no longer holds its grants.
+        // This operation models no `ResourceNotFoundException`, so that is refused as a
+        // bad request.
         if store.live_domain(&input.domain_identifier).is_none() {
             return Err(RemovePolicyGrantErrorModeled::ValidationException(ValidationException {
                 message: format!(

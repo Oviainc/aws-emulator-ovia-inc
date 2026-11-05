@@ -455,11 +455,14 @@ async fn a_domain_unit_needs_a_stored_domain_an_available_domain_and_a_stored_pa
     // settles it, so nothing slow may run in between.
     let cases = [
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // create before any lookup.
             "unknown domain",
             "/v2/domains/dzd_nosuchdomain000/domain-units".to_string(),
             json!({ "name": "orphan", "parentDomainUnitIdentifier": root }),
-            400u16,
-            "ValidationException",
+            403u16,
+            "AccessDeniedException",
         ),
         (
             "unknown parent in a stored domain",

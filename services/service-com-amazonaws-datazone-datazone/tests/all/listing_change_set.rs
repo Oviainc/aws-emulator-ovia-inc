@@ -580,11 +580,14 @@ async fn a_change_set_needs_a_settled_domain_and_a_stored_entity() {
     // (label, domain, body, expected status, expected error code)
     let rows: Vec<(&str, String, Value, u16, &str)> = vec![
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the call
+            // before any lookup.
             "a domain nothing created",
             "dzd_doesnotexist".to_string(),
             json!({ "entityIdentifier": asset_id, "entityType": "ASSET", "action": "PUBLISH" }),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "a domain that is still CREATING",

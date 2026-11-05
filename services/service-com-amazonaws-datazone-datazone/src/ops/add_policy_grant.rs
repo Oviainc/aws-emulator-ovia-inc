@@ -200,18 +200,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        // This operation models no `ResourceNotFoundException`, so an unknown domain is
-        // refused as a bad request.
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss or
+        // as bad input.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(AddPolicyGrantErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // The check above read this same store under this same lock, so the domain is
+        // there; the status it carries is what decides whether it can take a grant.
         let domain_status = store
             .domains
             .get(&input.domain_identifier)
             .map(|domain| domain.status.clone())
             .ok_or_else(|| {
-                AddPolicyGrantErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "domainIdentifier {} does not identify a domain",
-                        input.domain_identifier
-                    ),
+                AddPolicyGrantErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
                 })
             })?;
         // A domain still being created, or already being deleted, cannot take a grant:

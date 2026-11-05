@@ -500,11 +500,11 @@ async fn create_asset_type_enforces_its_documented_prerequisites() {
                 "owningProjectIdentifier": project.clone(),
                 "formsInput": {},
             }),
-            // CreateAssetType models no ResourceNotFoundException
-            // (smithy_query operation="CreateAssetType"), so an identifier that
-            // resolves to nothing fails the input constraints.
-            status: 400,
-            code: "ValidationException",
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // create before any lookup.
+            status: 403,
+            code: "AccessDeniedException",
         },
         RefusalCase {
             label: "an unknown owning project",

@@ -188,6 +188,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock(now_ms());
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // listing is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(
+                ListProjectMembershipsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: crate::state::not_permitted_message(Self::NAME),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
                 ListProjectMembershipsErrorModeled::ValidationException(ValidationException {

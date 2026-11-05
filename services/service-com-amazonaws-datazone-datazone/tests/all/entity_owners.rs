@@ -514,17 +514,53 @@ async fn a_bad_entity_type_identifier_token_or_page_size_is_refused() {
     );
     let before = owners_of(&list(&dz, &domain, DOMAIN_UNIT, &unit, "").await.body);
 
-    // The listing models no `ResourceNotFoundException`, so every one of these is bad
-    // input: an unknown identifier, an entityType the model does not declare, a token
-    // this service never issued, and a page size one past each published bound of the
-    // modelled `maxResults` range (1..25).
-    let list_cases: Vec<(&str, String, &str, &str)> = vec![
+    // A call scoped to a domain the store serves no record of is DENIED, whatever else
+    // it names: a permission is held ON a domain, so the caller holds none there and
+    // authorization decides the call before any lookup — for the listing and for both
+    // writes alike.
+    for (label, operation, answer) in [
         (
-            "a domain that is not stored",
-            "dzd_nosuchdomain000".to_string(),
-            DOMAIN_UNIT,
-            "",
+            "list in a domain that is not stored",
+            "ListEntityOwners",
+            list(&dz, "dzd_nosuchdomain000", DOMAIN_UNIT, &unit, "").await,
         ),
+        (
+            "add into a domain that is not stored",
+            "AddEntityOwner",
+            add(
+                &dz,
+                "dzd_nosuchdomain000",
+                DOMAIN_UNIT,
+                &unit,
+                &Owner::user("x"),
+            )
+            .await,
+        ),
+        (
+            "remove from a domain that is not stored",
+            "RemoveEntityOwner",
+            remove(&dz, "dzd_nosuchdomain000", DOMAIN_UNIT, &unit, &owner).await,
+        ),
+    ] {
+        assert_eq!(
+            (answer.status, answer.error_code.as_str(), answer.s("message")),
+            (
+                403,
+                "AccessDeniedException",
+                format!("User is not permitted to perform operation: {operation}")
+            ),
+            "case {label:?}: expected the modelled denial, got {} {:?}",
+            answer.status,
+            answer.body
+        );
+    }
+
+    // Inside a domain the caller may act in, the listing models no
+    // `ResourceNotFoundException`, so every one of these is bad input: an unknown
+    // identifier, an entityType the model does not declare, a token this service never
+    // issued, and a page size one past each published bound of the modelled `maxResults`
+    // range (1..25).
+    let list_cases: Vec<(&str, String, &str, &str)> = vec![
         (
             "an entity that is not stored in this domain",
             domain.clone(),
@@ -574,17 +610,10 @@ async fn a_bad_entity_type_identifier_token_or_page_size_is_refused() {
         );
     }
 
-    // Both writes DO model `ResourceNotFoundException`, so an identifier that names
-    // nothing is 404 there; an entityType the model does not declare is still 400.
+    // Both writes DO model `ResourceNotFoundException`, so an entity that names nothing
+    // in a domain the caller may act in is 404 there; an entityType the model does not
+    // declare is still 400.
     for (label, in_domain, entity_type, entity, status, code) in [
-        (
-            "add into a domain that is not stored",
-            "dzd_nosuchdomain000",
-            DOMAIN_UNIT,
-            unit.as_str(),
-            404,
-            "ResourceNotFoundException",
-        ),
         (
             "add onto an entity that is not stored",
             domain.as_str(),
@@ -612,14 +641,6 @@ async fn a_bad_entity_type_identifier_token_or_page_size_is_refused() {
         );
     }
     for (label, in_domain, entity_type, entity, status, code) in [
-        (
-            "remove from a domain that is not stored",
-            "dzd_nosuchdomain000",
-            DOMAIN_UNIT,
-            unit.as_str(),
-            404,
-            "ResourceNotFoundException",
-        ),
         (
             "remove from an entity that is not stored",
             domain.as_str(),

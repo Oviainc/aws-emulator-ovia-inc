@@ -197,6 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup — including the idempotency
+        // replay below — rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateGlossaryErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // The `@idempotencyToken`: a repeat of the SAME request returns the glossary the
         // first one created, so a retry never leaves two glossaries behind. Resolved
         // BEFORE the state checks below on purpose: a replay reports what the first
@@ -209,18 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(glossary_output(existing));
         }
 
-        // The documented prerequisites, in order. This operation models no
-        // `ResourceNotFoundException` (smithy_query operation="CreateGlossary"), so a
-        // caller naming a domain or an owning project it cannot act in is refused with
-        // the access error the operation does model, which is also the refusal that
-        // reveals nothing about whether the named resource exists.
+        // The documented prerequisites, in order. The domain is there — the check above
+        // read this same store under this same lock — so what is read here is the state
+        // it is in; the owning project is a separate question, and this operation models
+        // no `ResourceNotFoundException` (smithy_query operation="CreateGlossary"), so a
+        // caller naming an owning project it cannot act in is refused with the access
+        // error the operation does model.
         let (domain_status, owning_project_stored, name_clash, glossary_count) = {
             let domain = store.domains.get(&input.domain_identifier).ok_or_else(|| {
-                CreateGlossaryErrorModeled::AccessDeniedException(AccessDeniedException {
-                    message: format!(
-                        "You do not have access to domain {}",
-                        input.domain_identifier
-                    ),
+                CreateGlossaryErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
                 })
             })?;
             (

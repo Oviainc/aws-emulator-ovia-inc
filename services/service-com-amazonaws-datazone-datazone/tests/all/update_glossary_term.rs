@@ -633,12 +633,15 @@ async fn an_update_needs_the_term_the_glossary_and_the_relations_to_be_stored() 
             "ResourceNotFoundException",
         ),
         (
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // update before any lookup.
             "a well-formed domain id nothing created",
             "dzd_nosuchdomain000".to_string(),
             id.clone(),
             json!({ "status": "DISABLED" }),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "a glossaryIdentifier nothing created",

@@ -654,7 +654,8 @@ async fn a_filter_needs_a_live_domain_an_asset_and_its_own_id() {
         "columnConfiguration": { "includedColumnNames": ["order_id"] },
     });
 
-    // A domain nothing created.
+    // A domain nothing created: a permission is held ON a domain, so the caller holds
+    // none there and authorization decides the create before any lookup.
     let no_domain = dz
         .call(
             "POST",
@@ -663,8 +664,16 @@ async fn a_filter_needs_a_live_domain_an_asset_and_its_own_id() {
         )
         .await;
     assert_eq!(
-        (no_domain.status, no_domain.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
+        (
+            no_domain.status,
+            no_domain.error_code.as_str(),
+            no_domain.s("message")
+        ),
+        (
+            403,
+            "AccessDeniedException",
+            "User is not permitted to perform operation: CreateAssetFilter".to_string()
+        ),
         "a filter in a domain nothing created: got {} {:?}",
         no_domain.status,
         no_domain.body

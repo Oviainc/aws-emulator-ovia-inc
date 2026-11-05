@@ -218,7 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        // A domain that is gone, or already being deleted, holds no project to update.
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // update is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(UpdateProjectErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+        // A domain already being deleted holds no project to update.
         if store.live_domain(&input.domain_identifier).is_none() {
             return Err(UpdateProjectErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

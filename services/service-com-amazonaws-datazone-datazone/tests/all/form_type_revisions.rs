@@ -520,13 +520,14 @@ async fn a_create_the_service_cannot_satisfy_is_refused_with_a_modelled_error() 
     // (label, domain to post to, request body, expected status, expected wire code)
     let cases: Vec<(&str, String, Value, u16, &str)> = vec![
         (
-            // `CreateFormType` models no ResourceNotFoundException, so an identifier
-            // naming no domain is a request the service cannot satisfy.
+            // A permission is held ON a domain, so the caller holds none on an
+            // identifier the store serves no domain for: authorization decides the
+            // create before any lookup.
             "a well-formed domain id that names no domain",
             "dzd_doesnotexist".to_string(),
             json!({ "name": "RefusedForm", "model": model, "owningProjectIdentifier": project }),
-            400,
-            "ValidationException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "an owning project that is not in the domain",

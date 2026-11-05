@@ -369,9 +369,8 @@ async fn an_account_pool_needs_a_domain_that_exists_and_is_available() {
     let dz = Emulator::new();
     let (domain, _) = available_domain_with_root(&dz, "pool-prerequisites").await;
 
-    // A well-formed domain id nothing created: this operation models
-    // `ResourceNotFoundException` (smithy_query operation="CreateAccountPool"), so that
-    // is the refusal.
+    // A well-formed domain id nothing created: a permission is held ON a domain, so the
+    // caller holds none here and authorization decides the create before any lookup.
     for case in pool_cases() {
         let answer = dz
             .call(
@@ -381,14 +380,21 @@ async fn an_account_pool_needs_a_domain_that_exists_and_is_available() {
             )
             .await;
         assert_eq!(
-            answer.status, 404,
-            "case {:?}: expected 404 for an unknown domain, got {} {:?}",
+            answer.status, 403,
+            "case {:?}: expected 403 for a domain nothing created, got {} {:?}",
             case.label, answer.status, answer.body
         );
         assert_eq!(
-            answer.error_code, "ResourceNotFoundException",
-            "case {:?}: expected ResourceNotFoundException, got {:?}",
+            answer.error_code, "AccessDeniedException",
+            "case {:?}: expected AccessDeniedException, got {:?}",
             case.label, answer.error_code
+        );
+        assert_eq!(
+            answer.s("message"),
+            "User is not permitted to perform operation: CreateAccountPool",
+            "case {:?}: the denial must carry the recorded wording, got {:?}",
+            case.label,
+            answer.body
         );
     }
 

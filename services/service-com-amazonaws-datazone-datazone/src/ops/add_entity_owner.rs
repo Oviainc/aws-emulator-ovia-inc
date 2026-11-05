@@ -179,15 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        // This operation DOES model `ResourceNotFoundException`, so a domain or an
-        // entity that is not stored is reported as not found rather than as bad input.
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(AddEntityOwnerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // The check above read this same store under this same lock, so the domain is
+        // there; the status it carries is what decides whether it can take an owner.
         let domain_status = store
             .domains
             .get(&input.domain_identifier)
             .map(|domain| domain.status.clone())
             .ok_or_else(|| {
-                AddEntityOwnerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: ResourceKind::Domain.not_found_message(),
+                AddEntityOwnerErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
                 })
             })?;
         // A domain still being created, or already being deleted, cannot take an owner:

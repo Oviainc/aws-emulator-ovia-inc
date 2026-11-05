@@ -327,22 +327,6 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
 
     let cases = vec![
         NotFoundCase {
-            label: "DeleteDomain with an unknown domain",
-            method: "DELETE",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}"),
-            body: None,
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
-        },
-        NotFoundCase {
-            label: "CreateProject under an unknown domain",
-            method: "POST",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}/projects"),
-            body: Some(json!({ "name": "orphan project" })),
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
-        },
-        NotFoundCase {
             label: "GetProject with an unknown project in a real domain",
             method: "GET",
             uri: format!("/v2/domains/{domain_a}/projects/{MISSING_PROJECT_ID}"),
@@ -367,22 +351,6 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
             body: None,
             expect_kind: "Project",
             identifier: project_id.clone(),
-        },
-        NotFoundCase {
-            label: "DeleteProject under an unknown domain",
-            method: "DELETE",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
-            body: None,
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
-        },
-        NotFoundCase {
-            label: "UpdateProject under an unknown domain",
-            method: "PATCH",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
-            body: Some(json!({ "description": "no such domain" })),
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
         },
         NotFoundCase {
             label: "UpdateProject scoped to an unrelated domain",
@@ -449,6 +417,57 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
              {message:?}",
             case.label,
             case.identifier
+        );
+    }
+
+    // A call scoped to a domain the store serves no record of never reaches an
+    // existence answer: a permission is held ON a domain, so the caller holds none
+    // there and authorization decides the call first. The denial names the OPERATION
+    // and nothing the caller sent, and the one whose own identifier IS the domain scope
+    // (`DeleteDomain`) carries no message at all.
+    let denied: Vec<(&str, &str, String, Option<Value>, String)> = vec![
+        (
+            "DeleteDomain with a domain nothing created",
+            "DELETE",
+            format!("/v2/domains/{MISSING_DOMAIN_ID}"),
+            None,
+            String::new(),
+        ),
+        (
+            "CreateProject under a domain nothing created",
+            "POST",
+            format!("/v2/domains/{MISSING_DOMAIN_ID}/projects"),
+            Some(json!({ "name": "orphan project" })),
+            "User is not permitted to perform operation: CreateProject".to_string(),
+        ),
+        (
+            "DeleteProject under a domain nothing created",
+            "DELETE",
+            format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
+            None,
+            "User is not permitted to perform operation: DeleteProject".to_string(),
+        ),
+        (
+            "UpdateProject under a domain nothing created",
+            "PATCH",
+            format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
+            Some(json!({ "description": "no such domain" })),
+            "User is not permitted to perform operation: UpdateProject".to_string(),
+        ),
+    ];
+    for (label, method, uri, body, message) in denied {
+        let answer = dz.call(method, &uri, body).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str(), answer.s("message")),
+            (403, "AccessDeniedException", message),
+            "case {label:?}: expected the modelled denial, got {} {:?}",
+            answer.status,
+            answer.body
+        );
+        assert!(
+            !answer.s("message").contains(MISSING_DOMAIN_ID),
+            "case {label:?}: the denial must not echo the requested domain, got {:?}",
+            answer.body
         );
     }
 

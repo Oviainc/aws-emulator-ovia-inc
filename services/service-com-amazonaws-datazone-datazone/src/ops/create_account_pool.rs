@@ -199,9 +199,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        // The pool is created IN a domain, so the domain is resolved from the store
-        // first: this operation models `ResourceNotFoundException`, which is what a
-        // caller naming a domain this emulator does not hold gets.
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateAccountPoolErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // The pool is created IN a domain, and the check above read this same store
+        // under this same lock, so the domain is there; what is read here is the state
+        // it is in.
         let (domain_status, root_domain_unit_id, pool_count) = store
             .domains
             .get(&input.domain_identifier)
@@ -213,11 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })
             .ok_or_else(|| {
-                CreateAccountPoolErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::ResourceKind::Domain.not_found_message(),
-                    },
-                )
+                CreateAccountPoolErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
+                })
             })?;
         // A domain still being created, or already being deleted, cannot take an
         // account pool: the request conflicts with the domain's current state.

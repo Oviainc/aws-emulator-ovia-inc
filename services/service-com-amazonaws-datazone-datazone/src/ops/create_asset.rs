@@ -245,6 +245,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup — including the idempotency
+        // replay below — rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateAssetErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // The `@idempotencyToken`: a repeat of the SAME request returns the asset the
         // first one created, so a retry never leaves two assets behind.
         if let Some(existing) = input
@@ -263,12 +276,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(asset_output(existing, revision));
         }
 
+        // The check above read this same store under this same lock, so the domain is
+        // there; the status it carries is what decides whether it can take an asset.
         let domain = store
             .domains
             .get(&input.domain_identifier)
             .ok_or_else(|| {
-                CreateAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
+                CreateAssetErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost the domain mid-request".to_string(),
                 })
             })?;
         // A domain still being created, or already being deleted, cannot take an asset:

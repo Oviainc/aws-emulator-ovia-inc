@@ -179,9 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
+        // Authorization comes FIRST, and the identifier THIS call carries is the domain
+        // scope itself: a permission is held on a domain, so a caller holds none on an
+        // identifier this store serves no domain for, and the delete is denied instead
+        // of being answered with an existence report — the answer `GetDomain` gives the
+        // same identifier. The denial of a domain-level request says nothing further;
+        // see `DOMAIN_SCOPE_DENIED_MESSAGE`.
+        if !store.authorizes_domain(&input.identifier) {
+            return Err(DeleteDomainErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::DOMAIN_SCOPE_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The check above read this same store under this same lock, so the domain is
+        // there; a store that disagreed with itself would be a fault of this emulator,
+        // not a statement about the caller's request.
         let domain = store.domains.get_mut(&input.identifier).ok_or_else(|| {
-            DeleteDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::ResourceKind::Domain.not_found_message(),
+            DeleteDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store lost the domain mid-request".to_string(),
             })
         })?;
 
