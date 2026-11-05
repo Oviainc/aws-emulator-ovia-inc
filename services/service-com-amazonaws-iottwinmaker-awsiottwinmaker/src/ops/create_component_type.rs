@@ -34,6 +34,13 @@
 //!   because `dataType` is required on the `PropertyDefinitionResponse` a read
 //!   reports, so there would be nothing to resolve it from (the rule
 //!   [`crate::state::Workspace::stranded_property_definition`]);
+//! * a property definition's `defaultValue` carries a value of a type other
+//!   than the `dataType` the definition resolves to — a `ValidationException`,
+//!   because a read reports that default AS the property's value
+//!   ([`crate::state::latest_property_value`]) beside the `dataType` it
+//!   contradicts (the rule
+//!   [`crate::state::Workspace::property_definition_default_violation`], the
+//!   same rule every writer of a property's value is held to);
 //! * a reference the request DECLARES does not resolve — an `extendsFrom` or
 //!   `compositeComponentTypes[*].componentTypeId` id naming a component type
 //!   the service does not hold, inheritance that names the component type being
@@ -376,6 +383,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation_exception(
                 crate::state::property_definition_needs_data_type_message(property_name),
             ));
+        }
+        // A definition's `defaultValue` is a value OF the property it defines —
+        // a read reports it as the property's value for as long as nothing has
+        // been written to the property — so it carries a value of the
+        // `dataType` the definition reports beside it, the rule
+        // `crate::state::Workspace::property_definition_default_violation`
+        // every writer of a definition shares with every writer of a property's
+        // VALUE. Asked AFTER the `dataType` rule above, over the same resolved
+        // chain, so a default is judged against the `dataType` the definition
+        // ends up with whether it declares one itself or inherits it.
+        if let Some(message) = workspace.property_definition_default_violation(
+            &extends_from,
+            property_definitions
+                .iter()
+                .map(|(property_name, definition)| (property_name.as_str(), definition)),
+        ) {
+            return Err(validation_exception(message));
         }
 
         let arn = crate::state::component_type_arn(

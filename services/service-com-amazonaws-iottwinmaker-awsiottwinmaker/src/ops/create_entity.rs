@@ -28,6 +28,13 @@
 //!   BEFORE anything is stored rather than left for a read to report a value
 //!   against a `dataType` it contradicts — the rule the time-series data plane
 //!   holds every value it writes to;
+//! * a requested property's definition declares a `defaultValue` that is not a
+//!   value of the `dataType` the property has, its own or the inherited one
+//!   ([`crate::state::Workspace::component_property_default_violation`]): a
+//!   read reports that default AS the property's value
+//!   ([`crate::state::latest_property_value`]) for as long as nothing has been
+//!   written to the property, so it is a value of the property and is held to
+//!   the same rule the `value` above is;
 //! * a component — top-level or composite — instantiates a component type the
 //!   workspace holds and that type is ABSTRACT
 //!   ([`crate::state::ComponentType::is_abstract`]): an abstract component type
@@ -632,7 +639,11 @@ fn validation(message: String) -> CreateEntityErrorModeled {
 /// time-series data plane holds every value it writes to
 /// (`crate::ops::batch_put_property_values`). A value is judged against the
 /// `dataType` a read REPORTS for the property, so one supplied against a
-/// definition the component INHERITS is judged too.
+/// definition the component INHERITS is judged too — and the `defaultValue` a
+/// declaration carries is judged by the same rule
+/// (`crate::state::Workspace::component_property_default_violation`), since a
+/// read reports it as the property's value while nothing has been written to
+/// the property.
 ///
 /// `member_path` is the request member the map hangs off (`components.<name>`,
 /// `compositeComponents.<path>`), so the refusal names the exact member the
@@ -674,6 +685,19 @@ fn require_property_types(
             ) {
                 return Err(validation(violation));
             }
+        }
+        // The `defaultValue` a declaration carries is a value of the property
+        // too — a read reports it as the property's value for as long as
+        // nothing has been written to the property — so it is held to the same
+        // rule the value above is
+        // (`crate::state::Workspace::component_property_default_violation`),
+        // against the `dataType` the property's definition resolves to.
+        if let Some(violation) = workspace.component_property_default_violation(
+            component_type_id,
+            property_name,
+            property.definition.as_ref(),
+        ) {
+            return Err(validation(violation));
         }
     }
     Ok(())

@@ -37,6 +37,15 @@
 //!   update that clears or re-points `extendsFrom` takes away the inheritance
 //!   an older definition was relying on, and asked whenever the request touches
 //!   either input of the rule;
+//! * the patched component type would hold a property definition whose
+//!   `defaultValue` carries a value of a type other than the `dataType` the
+//!   definition resolves to — a `ValidationException`, the rule
+//!   [`crate::state::Workspace::property_definition_default_violation`] holds
+//!   for every writer of a definition, because a read reports that default AS
+//!   the property's value ([`crate::state::latest_property_value`]) beside the
+//!   `dataType` it contradicts. Checked over the whole patched record, and
+//!   whenever the request touches either input of the rule, exactly as the
+//!   `dataType` rule above is;
 //! * a reference the update DECLARES does not resolve — an `extendsFrom` or
 //!   `compositeComponentTypes[*].componentTypeId` id naming a component type
 //!   the service does not hold, inheritance that reaches back to the component
@@ -416,6 +425,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(validation_exception(
                     crate::state::property_definition_needs_data_type_message(property_name),
                 ));
+            }
+            // A definition's `defaultValue` is a value OF the property it
+            // defines — a read reports it as the property's value for as long
+            // as nothing has been written to the property — so it carries a
+            // value of the `dataType` the definition reports beside it: the
+            // rule `crate::state::Workspace::property_definition_default_violation`
+            // this update shares with `CreateComponentType`. Asked over the
+            // WHOLE patched record, and whenever the request touches either
+            // input of the rule, for the same reason the `dataType` rule above
+            // is: a patch that re-points `extendsFrom`, or that restates a
+            // `dataType`, is the call that leaves an older default
+            // contradicting the type a read now reports beside it.
+            if let Some(message) = workspace.property_definition_default_violation(
+                &updated.extends_from,
+                updated
+                    .property_definitions
+                    .iter()
+                    .map(|(property_name, definition)| (property_name.as_str(), definition)),
+            ) {
+                return Err(validation_exception(message));
             }
         }
 

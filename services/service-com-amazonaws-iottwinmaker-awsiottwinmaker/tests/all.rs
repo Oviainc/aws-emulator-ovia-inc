@@ -167,6 +167,9 @@ mod pricing_plan_tier_and_pending;
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 
+#[path = "all/property_definition_default_value_type.rs"]
+mod property_definition_default_value_type;
+
 #[path = "all/property_group_refinement.rs"]
 mod property_group_refinement;
 

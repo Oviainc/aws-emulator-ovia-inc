@@ -63,7 +63,14 @@
 //! a property `value` that is not a value of the `dataType` the property has,
 //! its own or the inherited one
 //! ([`crate::state::Workspace::component_property_value_violation`], the rule
-//! every writer of a property's value shares)
+//! every writer of a property's value shares), a property definition whose
+//! `defaultValue` is not a value of that same `dataType`
+//! ([`crate::state::Workspace::component_property_default_violation`], the same
+//! rule asked of the default a read reports AS the property's value while
+//! nothing has been written to it, and asked of every definition the patched
+//! component would hold wherever the entry re-points the `componentTypeId`
+//! those definitions resolve through —
+//! [`crate::state::Workspace::component_property_defaults_violation`])
 //! — and a `parentEntityId` that names no
 //! entity of the workspace, names the entity being updated, or names an entity
 //! BELOW it (which would make the stored parent graph cyclic). The patch is
@@ -520,6 +527,19 @@ fn apply_component_update(
                 "{member}.propertyUpdates.{property_name}.definition.dataType is required"
             )));
         }
+        // The same reasoning for the DEFAULT a definition the component holds
+        // declares: the `dataType` it is judged against is resolved through the
+        // component type the component instantiates, so an entry that re-points
+        // `componentTypeId` is the call that can leave a stored default
+        // contradicting the type a read now reports beside it — the rule
+        // `crate::state::Workspace::component_property_defaults_violation`,
+        // asked of the whole patched record.
+        if let Some(violation) = workspace.component_property_defaults_violation(
+            component_type_id.as_deref(),
+            &component.properties,
+        ) {
+            return Err(validation(violation));
+        }
     }
     apply_property_group_updates(
         &mut component.property_groups,
@@ -738,6 +758,28 @@ fn apply_property_updates(
                         &property_name,
                         declared,
                         value,
+                    ) {
+                        return Err(validation(violation));
+                    }
+                }
+                // The `defaultValue` the definition the property ENDS UP with
+                // declares is a value of the property too — a read reports it
+                // as the property's value for as long as nothing has been
+                // written to the property — so it is held to the same rule the
+                // value above is
+                // (`crate::state::Workspace::component_property_default_violation`),
+                // against the `dataType` that same definition resolves to, and
+                // decided before the patch is applied.
+                if update.definition.is_some() {
+                    let declared = update.definition.as_ref().or_else(|| {
+                        properties
+                            .get(&property_name)
+                            .and_then(|property| property.definition.as_ref())
+                    });
+                    if let Some(violation) = workspace.component_property_default_violation(
+                        component_type_id,
+                        &property_name,
+                        declared,
                     ) {
                         return Err(validation(violation));
                     }

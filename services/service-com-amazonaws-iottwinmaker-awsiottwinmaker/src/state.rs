@@ -57,6 +57,12 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
+/// How a resource is NAMED and what a refusal that could not resolve one says.
+mod identity;
+/// The opaque pagination tokens this service's listings mint and read.
+mod page_tokens;
+pub use identity::*;
+pub use page_tokens::*;
 
 /// The `ParentEntityId` sentinel the service uses for an entity with no parent.
 /// Taken from the `ParentEntityId` pattern, which admits the literal `$ROOT`
@@ -1515,6 +1521,54 @@ impl Workspace {
             })
     }
 
+    /// Why the `defaultValue` one of the `definitions` a component type that
+    /// `extends_from` these parents would hold declares cannot be stored —
+    /// `None` when every one of them can.
+    ///
+    /// The rule is [`default_value_type_violation`], asked of each definition as
+    /// a read would REPORT it: the declaration this writer is about to store
+    /// folded over the ones the declared inheritance brings for the same property
+    /// ([`refined_property_definition`]), which is the same resolution
+    /// `GetComponentType` reports a definition through. A declaration may
+    /// therefore refine an inherited `dataType` with a default of its own, or an
+    /// inherited default with a `dataType` of its own, and it is the resolved
+    /// pair that has to agree — so a patch that re-points `extendsFrom` away
+    /// from the `dataType` an older default was written against is refused by
+    /// the same walk that refuses a mistyped default in the request itself.
+    ///
+    /// Asked of the WHOLE set of definitions the component type would hold, over
+    /// ONE walk of the declared chain, exactly as its sibling
+    /// [`stranded_property_definition`](Self::stranded_property_definition) is,
+    /// and in property-NAME order, so a record holding more than one such
+    /// definition is always refused for the same one. Shared by every writer of a
+    /// COMPONENT TYPE's definitions; the same question about a COMPONENT's
+    /// definition is
+    /// [`component_property_default_violation`](Self::component_property_default_violation).
+    pub fn property_definition_default_violation<'definitions>(
+        &self,
+        extends_from: &[String],
+        definitions: impl IntoIterator<
+            Item = (
+                &'definitions str,
+                &'definitions crate::ops::types::PropertyDefinitionRequest,
+            ),
+        >,
+    ) -> Option<String> {
+        let (chain, _, _) = self.component_type_closure(extends_from.iter().cloned());
+        definitions
+            .into_iter()
+            .find_map(|(property_name, definition)| {
+                let reported = refined_property_definition(
+                    ::std::iter::once(definition).chain(
+                        chain
+                            .iter()
+                            .filter_map(|ancestor| ancestor.property_definitions.get(property_name)),
+                    ),
+                );
+                default_value_type_violation(property_name, reported.as_ref())
+            })
+    }
+
     /// Every id that some stored entity names as its parent, in ONE pass.
     ///
     /// A listing needs `hasChildEntities` for each entity it reports; asking
@@ -1741,6 +1795,35 @@ impl Workspace {
         })
     }
 
+    /// Why one of the properties a component instantiating `component_type_id`
+    /// HOLDS would report a `defaultValue` the `dataType` beside it does not
+    /// declare — `None` when none of them would.
+    ///
+    /// [`component_property_default_violation`](Self::component_property_default_violation)
+    /// asked of the definitions a component ALREADY HOLDS rather than of one a
+    /// request carries, for the reason its sibling
+    /// [`stranded_component_property_definition`](Self::stranded_component_property_definition)
+    /// is: the component type is the other input of the rule — the declarations
+    /// a component holds resolve both their `dataType` and their default through
+    /// it — so a writer that re-points it answers the rule over the WHOLE record
+    /// it would store instead of over the entries the request happened to name.
+    /// Walked in name order, the way every writer of a requested map walks one
+    /// ([`requested_in_key_order`]), so a record holding more than one such
+    /// definition is always refused for the same one.
+    pub fn component_property_defaults_violation(
+        &self,
+        component_type_id: Option<&str>,
+        properties: &BTreeMap<String, PropertyRecord>,
+    ) -> Option<String> {
+        properties.iter().find_map(|(property_name, property)| {
+            self.component_property_default_violation(
+                component_type_id,
+                property_name,
+                property.definition.as_ref(),
+            )
+        })
+    }
+
     /// Why `value` cannot be written to the property `property_name` of a
     /// component that instantiates `component_type_id` and declares
     /// `definition` for it — `None` when it can.
@@ -1772,6 +1855,40 @@ impl Workspace {
             self.refined_component_property_definition(component_type_id, definition, property_name)
                 .as_ref(),
             value,
+        )
+    }
+
+    /// Why the `defaultValue` the definition `definition` declares for the
+    /// property `property_name` of a component that instantiates
+    /// `component_type_id` cannot be stored — `None` when it can.
+    ///
+    /// The rule is [`default_value_type_violation`], asked of the definition the
+    /// property EFFECTIVELY carries: the declaration the write itself holds,
+    /// refined over the ones it INHERITS from the component type the holder
+    /// instantiates and from the types that type extends
+    /// ([`refined_component_property_definition`](Self::refined_component_property_definition))
+    /// — the same resolution every reader of the property's definition makes
+    /// ([`effective_property_definition`](Self::effective_property_definition)).
+    /// A default is therefore judged against the `dataType` a read REPORTS for
+    /// the property, whether the property declares it itself or inherits it.
+    ///
+    /// The component-level counterpart of
+    /// [`property_definition_default_violation`](Self::property_definition_default_violation),
+    /// which asks the same question of a component TYPE's own definitions, and
+    /// the definition-side counterpart of
+    /// [`component_property_value_violation`](Self::component_property_value_violation):
+    /// a default is a value of the property, so one rule holds every value a
+    /// component's property comes to report, whichever member it arrived in.
+    pub fn component_property_default_violation(
+        &self,
+        component_type_id: Option<&str>,
+        property_name: &str,
+        definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
+    ) -> Option<String> {
+        default_value_type_violation(
+            property_name,
+            self.refined_component_property_definition(component_type_id, definition, property_name)
+                .as_ref(),
         )
     }
 
@@ -3604,6 +3721,53 @@ pub fn data_value_type_violation(
     })
 }
 
+/// Why the `defaultValue` the resolved `definition` declares cannot stand as a
+/// value of the property that definition defines, as the message that earns —
+/// `None` when it can.
+///
+/// `defaultValue` is "an object that contains the default value" of the
+/// property, and a read REPORTS it as the property's value whenever nothing has
+/// been written to the property ([`latest_property_value`]), so it is a value of
+/// the property like any other and carries a value of the `dataType` the
+/// definition declares beside it: the rule [`data_value_type_violation`] every
+/// writer of a property's value is held to, asked here of the default a
+/// definition declares rather than of a value a write carries. A default
+/// carrying another type is refused rather than stored, so no read can report a
+/// value of a type the definition reported beside it does not declare.
+///
+/// `definition` is the definition a read REPORTS for the property — the
+/// declaration being stored folded over the ones it inherits
+/// ([`refined_property_definition`]) — because `dataType` and `defaultValue` are
+/// resolved over that same fold: a declaration may refine an inherited
+/// `dataType` with its own default, or an inherited default with its own
+/// `dataType`, and it is the pair a read puts in one response that has to agree.
+/// A definition no `dataType` reaches constrains nothing, and one whose default
+/// names no typed value at all contradicts no `dataType`, so neither is refused
+/// here.
+///
+/// Shared by every writer of a property DEFINITION, whichever resource holds it:
+/// a component type's own definitions
+/// ([`Workspace::property_definition_default_violation`]) and a component's
+/// ([`Workspace::component_property_default_violation`]).
+pub fn default_value_type_violation(
+    property_name: &str,
+    definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
+) -> Option<String> {
+    let definition = definition?;
+    let default = definition.default_value.as_ref()?;
+    let carried = data_value_type(default)?;
+    let declared = definition
+        .data_type
+        .as_ref()
+        .map(|data_type| data_type.r#type.as_str())?;
+    (carried != declared).then(|| {
+        format!(
+            "the defaultValue of property {property_name} is a {carried} where that \
+             property's dataType is {declared}"
+        )
+    })
+}
+
 /// The comparison operators a property FILTER may carry.
 ///
 /// `operator` is modelled as a plain string with no value list, so this set is
@@ -4739,348 +4903,6 @@ impl RegionalState {
     }
 }
 
-/// The greatest number of characters the modelled `ErrorMessage` shape — the
-/// member every one of this service's modelled refusals states its reason on —
-/// admits: `@length(0..2048)`, from
-/// `smithy_query(query="shape", shape="ErrorMessage")`.
-pub const ERROR_MESSAGE_MAX_CHARS: usize = 2048;
-
-/// What a message that does not fit the member it is reported on is cut with.
-///
-/// The cut is marked rather than silent, so a caller can tell a message the
-/// service shortened from one it worded that way.
-const MESSAGE_ELISION: &str = "...";
-
-/// `message` rendered so it satisfies the `@length` maximum of the member it is
-/// reported on, which is `max_chars` characters.
-///
-/// A message names what the request named, and an identifier the model bounds
-/// as widely as — or more widely than — the member the message travels on
-/// renders text past that member's own bound: a `ComponentPath` of 2048
-/// characters, or a `Name` of 256, stated on a member capped at 256. The
-/// message that already fits is returned unchanged; a longer one keeps its
-/// leading characters AND its trailing ones around [`MESSAGE_ELISION`], because
-/// these messages name the thing first and give the reason last, so cutting
-/// only the tail would drop the reason. The result is exactly `max_chars`
-/// characters — Smithy measures a string's length in characters, so the cut is
-/// counted and made in characters rather than in bytes.
-pub fn clamped_message(message: String, max_chars: usize) -> String {
-    let characters: Vec<char> = message.chars().collect();
-    if characters.len() <= max_chars {
-        return message;
-    }
-    let elision: Vec<char> = MESSAGE_ELISION.chars().collect();
-    // A member too small to hold the marker itself holds as much of the
-    // message as it admits and nothing else.
-    if max_chars <= elision.len() {
-        return characters[..max_chars].iter().collect();
-    }
-    let kept = max_chars - elision.len();
-    let tail = kept / 2;
-    let head = kept - tail;
-    characters[..head]
-        .iter()
-        .chain(elision.iter())
-        .chain(characters[characters.len() - tail..].iter())
-        .collect()
-}
-
-/// The message for a resource no ARN in this service's index names.
-///
-/// Built from the request, naming the ARN that was looked for — the same
-/// construction as [`entity_not_found_message`], one level up from an id to
-/// the ARN the tagging operations address a resource by.
-pub fn resource_not_found_message(resource_arn: &str) -> String {
-    format!("Resource {resource_arn} not found.")
-}
-
-/// The message for an entity the workspace the request named does not hold.
-///
-/// Built from the request: it names the entity that was looked for and the
-/// workspace it was looked for in, which is the construction the service's own
-/// `ResourceNotFoundException` for an entity uses.
-pub fn entity_not_found_message(workspace_id: &str, entity_id: &str) -> String {
-    format!("Entity {entity_id} in workspace {workspace_id} not found.")
-}
-
-/// The message for a component type the workspace the request named does not
-/// hold. Built from the request, naming what was looked for and where, in the
-/// sentence the service itself answers for that miss: "Cannot find component
-/// type ", " in workspace " and the trailing period are fixed, and the two ids
-/// come from the request.
-pub fn component_type_not_found_message(workspace_id: &str, component_type_id: &str) -> String {
-    format!("Cannot find component type {component_type_id} in workspace {workspace_id}.")
-}
-
-/// What still references a component type, as the ids of the resources the
-/// references live on: the answer
-/// [`Workspace::component_type_references`] gives, and what the in-use refusal
-/// of a delete is built from.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ComponentTypeReferences {
-    /// The ids of the entities one of whose components — top-level or composite
-    /// — instantiates the component type, each listed once however many of its
-    /// components do, in id order.
-    pub entity_ids: Vec<String>,
-    /// The ids of the other component types that extend the component type or
-    /// name it in their composite declarations, each listed once, in id order.
-    pub component_type_ids: Vec<String>,
-}
-
-impl ComponentTypeReferences {
-    /// Whether nothing stored references the component type, which is what makes
-    /// it deletable.
-    pub fn is_empty(&self) -> bool {
-        self.entity_ids.is_empty() && self.component_type_ids.is_empty()
-    }
-
-    /// The message a delete blocked by these references is refused with, or
-    /// `None` when there are none.
-    ///
-    /// The refusal names the RESOURCES that have to go first, as a bracketed,
-    /// comma-separated list of their ids, and asks for them to be deleted: that
-    /// is what lets a caller drive the remediation off the refusal. Entities come
-    /// first where both kinds reference the type, so the caller is asked for one
-    /// kind at a time; nothing else of the service's state is named.
-    pub fn in_use_message(&self, component_type_id: &str) -> Option<String> {
-        if !self.entity_ids.is_empty() {
-            return Some(format!(
-                "Component type {component_type_id} is being used by entities [{}], please \
-                 delete the entities first.",
-                self.entity_ids.join(", ")
-            ));
-        }
-        if !self.component_type_ids.is_empty() {
-            return Some(format!(
-                "Component type {component_type_id} is being used by component types [{}], \
-                 please delete the component types first.",
-                self.component_type_ids.join(", ")
-            ));
-        }
-        None
-    }
-}
-
-/// The message for a component an entity the request named does not have —
-/// whichever member addressed it, the `componentName` it is called by or the
-/// `componentPath` it would sit at, since either way the value names the
-/// component that could not be resolved.
-///
-/// Built from the request, naming the component, the entity it was looked for on
-/// and the workspace that entity lives in. This is the ONE construction for
-/// "the entity is there, the component on it is not", which is a different miss
-/// from [`entity_not_found_message`]'s and is reported as a bad reference rather
-/// than as a missing resource.
-pub fn component_not_found_message(
-    workspace_id: &str,
-    entity_id: &str,
-    component: &str,
-) -> String {
-    format!("Component {component} of Entity {entity_id} in workspace {workspace_id} not found.")
-}
-
-/// The message for a scene the workspace the request named does not hold.
-/// Built from the request, naming what was looked for and where — the same
-/// construction as [`entity_not_found_message`] one resource across.
-pub fn scene_not_found_message(workspace_id: &str, scene_id: &str) -> String {
-    format!("Scene {scene_id} in workspace {workspace_id} not found.")
-}
-
-/// The message for a cancellation of a job that has already finished. Built
-/// from the request and the store: it names the job and the terminal state it
-/// finished in, which is what makes the conflict actionable for a caller that
-/// polled a moment too late.
-pub fn metadata_transfer_job_terminal_message(
-    metadata_transfer_job_id: &str,
-    state: &str,
-) -> String {
-    format!(
-        "MetadataTransferJob {metadata_transfer_job_id} is {state} and can no longer be cancelled."
-    )
-}
-
-/// The message for a sync job the workspace the request named does not hold.
-/// Built from the request, naming the SOURCE that was looked for and the
-/// workspace it was looked for in — a sync job has no id of its own, the source
-/// being its identity inside the workspace. Same construction as
-/// [`scene_not_found_message`] one resource across.
-pub fn sync_job_not_found_message(workspace_id: &str, sync_source: &str) -> String {
-    format!("SyncJob for sync source {sync_source} in workspace {workspace_id} not found.")
-}
-
-/// The message for a workspace this service does not hold, on a path that LOOKS
-/// a workspace UP to serve the request: built from the request, naming the
-/// workspace that was looked for.
-///
-/// The service's not-found message is per-operation, not one string for the
-/// whole API: the look-up path reports what it could not find for the id it was
-/// given, while the workspace's own UPDATE path reports the account-scoped form
-/// [`workspace_does_not_exist_message`] builds. Every operation that resolves a
-/// workspace in order to read or write something it contains uses this one.
-pub fn workspace_not_found_message(workspace_id: &str) -> String {
-    format!("Unable to find workspace for id: {workspace_id}")
-}
-
-/// The message the workspace UPDATE path reports for a workspace this service
-/// does not hold: built from the request and the caller's account, which is what
-/// scopes a workspace id.
-///
-/// The other construction of the same miss is [`workspace_not_found_message`];
-/// see it for why the two differ.
-pub fn workspace_does_not_exist_message(workspace_id: &str) -> String {
-    format!(
-        "Workspace with id {}|{workspace_id} does not exist.",
-        ::emulator_server::emulator_account_id()
-    )
-}
-
-/// The message for a delete of an entity that still has children, which only
-/// `isRecursive` removes: built from the request, naming the entity the delete
-/// addressed and the workspace it addressed it in.
-pub fn entity_has_children_message(workspace_id: &str, entity_id: &str) -> String {
-    format!("Cannot delete entity {entity_id} in {workspace_id} as it has child entities.")
-}
-
-/// The message for a create whose id is already TAKEN, as the message a
-/// `ConflictException` carries.
-///
-/// Built entirely from the request, in the service's own construction: the kind
-/// of resource and the id the create asked for first, then the workspace that
-/// holds it where the resource lives inside one, then what is wrong with it —
-/// the same order the not-found family above reads in
-/// ([`entity_not_found_message`]), with "already exists" in place of "not
-/// found". `kind` is the resource's name as the service writes it in this
-/// sentence; `workspace_id` is `None` for a resource that nests under no
-/// workspace. Shared by every create of this service, so one conflict reads one
-/// way wherever it is refused.
-pub fn already_exists_message(kind: &str, resource_id: &str, workspace_id: Option<&str>) -> String {
-    match workspace_id {
-        Some(workspace_id) => {
-            format!("{kind} {resource_id} in workspace {workspace_id} already exists.")
-        }
-        None => format!("{kind} {resource_id} already exists."),
-    }
-}
-
-/// The Region this request is served in: the region of its SigV4 credential
-/// scope, or [`DEFAULT_REGION`] when it is unsigned.
-///
-/// The ONE answer to "which Region is this?", used both to pick the store that
-/// answers the request
-/// ([`region`](ComAmazonawsIottwinmakerAwsiottwinmakerState::region)) and to
-/// build the ARNs it mints, so a resource can never be filed in one Region and
-/// stamped with another.
-///
-/// A scope region that is not of the shape the modelled `TwinMakerArn` admits
-/// for its region segment (`[a-z0-9-]+`) is replaced by the default, so a
-/// caller cannot drive this service into minting an ARN its own model forbids.
-pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// The ARN of a workspace.
-pub fn workspace_arn(region: &str, workspace_id: &str) -> String {
-    ::engine::emulator_arn(
-        "iottwinmaker",
-        region,
-        &format!("{WORKSPACE_ARN_RESOURCE_PREFIX}{workspace_id}"),
-    )
-}
-
-/// The resource prefix of a workspace's ARN, shared by the ARN [`workspace_arn`]
-/// mints and the id [`workspace_id_in_arn`] reads back out of it, so one
-/// definition says what the shape is.
-const WORKSPACE_ARN_RESOURCE_PREFIX: &str = "workspace/";
-
-/// The `workspaceId` inside a workspace ARN, or `None` when the value is not
-/// one: the inverse of [`workspace_arn`], for a caller holding a stored ARN and
-/// comparing it against an id.
-///
-/// Unlike
-/// [`resolve_workspace_id`](RegionalState::resolve_workspace_id),
-/// this reads the id out of the ARN rather than resolving it against the stored
-/// workspaces, so it still names the workspace of an ARN whose workspace has
-/// been deleted. An ARN's resource portion is its sixth colon-separated field.
-pub fn workspace_id_in_arn(arn: &str) -> Option<&str> {
-    arn.splitn(6, ':')
-        .nth(5)?
-        .strip_prefix(WORKSPACE_ARN_RESOURCE_PREFIX)
-}
-
-/// The ARN of an entity, nested under its workspace's resource path.
-pub fn entity_arn(region: &str, workspace_id: &str, entity_id: &str) -> String {
-    ::engine::emulator_arn(
-        "iottwinmaker",
-        region,
-        &format!("workspace/{workspace_id}/entity/{entity_id}"),
-    )
-}
-
-/// The ARN of a component type, nested under its workspace's resource path the
-/// way [`entity_arn`] nests an entity's.
-pub fn component_type_arn(region: &str, workspace_id: &str, component_type_id: &str) -> String {
-    ::engine::emulator_arn(
-        "iottwinmaker",
-        region,
-        &format!("workspace/{workspace_id}/componentType/{component_type_id}"),
-    )
-}
-
-/// The ARN of a scene, nested under its workspace's resource path the way
-/// [`entity_arn`] nests an entity's.
-pub fn scene_arn(region: &str, workspace_id: &str, scene_id: &str) -> String {
-    ::engine::emulator_arn(
-        "iottwinmaker",
-        region,
-        &format!("workspace/{workspace_id}/scene/{scene_id}"),
-    )
-}
-
-/// The ARN of a sync job, nested under its workspace's resource path the way
-/// [`scene_arn`] nests a scene's. The sync SOURCE takes the place of the id,
-/// being the job's identity inside its workspace.
-pub fn sync_job_arn(region: &str, workspace_id: &str, sync_source: &str) -> String {
-    ::engine::emulator_arn(
-        "iottwinmaker",
-        region,
-        &format!("workspace/{workspace_id}/sync-job/{sync_source}"),
-    )
-}
-
-/// The ARN of a metadata transfer job. An ACCOUNT-level resource, so — unlike
-/// [`scene_arn`] — its resource portion nests under no workspace.
-pub fn metadata_transfer_job_arn(region: &str, metadata_transfer_job_id: &str) -> String {
-    ::engine::emulator_arn(
-        "iottwinmaker",
-        region,
-        &format!("metadata-transfer-job/{metadata_transfer_job_id}"),
-    )
-}
-
-/// The ARN of the role a metadata transfer job runs under: the service-linked
-/// role at [`METADATA_TRANSFER_JOB_ROLE_PATH`], in this emulator's account.
-///
-/// IAM is global, so the ARN carries no region — which is also what the
-/// modelled `RoleArn` pattern (`^arn:…:iam::[0-9]{12}:role/`) requires.
-pub fn metadata_transfer_job_role() -> String {
-    ::engine::emulator_arn("iam", "", METADATA_TRANSFER_JOB_ROLE_PATH)
-}
-
-/// The message for a metadata transfer job this account does not hold. Built
-/// from the request, naming the job that was looked for — the same construction
-/// as [`resource_not_found_message`], one resource across.
-pub fn metadata_transfer_job_not_found_message(metadata_transfer_job_id: &str) -> String {
-    format!("MetadataTransferJob {metadata_transfer_job_id} not found.")
-}
-
 /// A stored instant as the modelled `Timestamp` the wire carries.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
@@ -5090,310 +4912,6 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
         since_epoch.subsec_nanos(),
     )
-}
-
-/// The opaque `nextToken` every paginated operation of this service mints.
-///
-/// One shape, shared by all of them so a token means the same thing wherever it
-/// is read: hex (so the token is opaque to a caller and safe in a JSON body)
-/// over an `envelope` naming the LISTING it belongs to, the resume `key` it
-/// resumes at, the `region` the page was taken in, and the `scope` the listing
-/// was taken in — the parent resource whose page it is, which makes a token
-/// minted for another resource, by another listing, or by hand recognisably not
-/// this listing's.
-///
-/// The `region` is part of what a token is bound to for the reason the scope is:
-/// this service is regional ([`request_region`]), so each Region answers out of
-/// its own store and the same id names an independent resource in each. A resume
-/// key only means something inside the ONE sequence it was taken from, and a
-/// Region's store is its own sequence, so a token carries the Region that minted
-/// it and no other Region's endpoint resumes it.
-///
-/// The parts are separated by newlines, which the Region segment
-/// ([`request_region`] admits only `[a-z0-9-]+`) and the ids, ARNs and tag keys
-/// this service's listings resume at all exclude; the LAST part keeps any
-/// newline it carries (see [`decode_page_token`]), so a scope part that is free
-/// text — a query statement — goes last.
-///
-/// One cursor has exactly ONE token: the body is rendered in lower-case hex and
-/// nothing else, so a differently cased rendering of the same bytes is a value
-/// no caller was handed ([`decode_page_token`]).
-pub fn encode_page_token(envelope: &str, region: &str, scope: &[&str], key: &str) -> String {
-    let mut body = format!("{envelope}{key}\n{region}");
-    for part in scope {
-        body.push('\n');
-        body.push_str(part);
-    }
-    ::hex::encode(body)
-}
-
-/// The resume key inside a `nextToken` [`encode_page_token`] minted for this
-/// `envelope`, `region` and `scope`, or `None` when the token is not one of
-/// them.
-///
-/// The key is split off first, then the Region and each scope part are compared
-/// in turn, so a token whose envelope, Region, arity or scope disagrees is
-/// rejected rather than resumed; the final part absorbs the remainder, so the
-/// last scope part may itself contain newlines. A token carrying an EMPTY key is
-/// rejected too: a listing never mints one, since a page is only resumed at a
-/// row that exists.
-///
-/// Decoding is only the first half of reading a token: `::hex::decode` reads
-/// spellings [`encode_page_token`] never writes — an upper-case or a mixed-case
-/// digit beside the lower-case one `::hex::encode` emits — so a value that
-/// decodes here is NOT yet a token this service handed out. The read is finished
-/// by minting the token again from the cursor it understood and keeping it only
-/// when that token is the one it was given, byte for byte: a token is this
-/// service's own opaque value, so the only value that carries a cursor is the
-/// one value a caller was handed, and every other rendering of the same cursor
-/// is a token nothing minted ([`invalid_next_token_message`]).
-pub fn decode_page_token(
-    envelope: &str,
-    region: &str,
-    scope: &[&str],
-    token: &str,
-) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let body = decoded.strip_prefix(envelope)?;
-    let mut parts = body.splitn(scope.len() + 2, '\n');
-    let key = parts.next()?;
-    if parts.next()? != region {
-        return None;
-    }
-    for expected in scope {
-        if parts.next()? != *expected {
-            return None;
-        }
-    }
-    if key.is_empty() {
-        return None;
-    }
-    (encode_page_token(envelope, region, scope, key) == token).then(|| key.to_string())
-}
-
-/// The opaque `nextToken` for a page that resumes at a row's ORDINAL rather
-/// than at a key of its own: [`encode_page_token`] over the ONE spelling of a
-/// position this service mints.
-///
-/// A sequence whose rows carry no key — a query's rows, a table's rows, a
-/// series' samples — is resumed at a row's position in it, and that position is
-/// written here in exactly one spelling (`usize::to_string`: a plain decimal,
-/// no sign and no leading zero), so [`decode_ordinal_page_token`] can tell a
-/// position this service wrote from any other spelling of the same number.
-pub fn encode_ordinal_page_token(
-    envelope: &str,
-    region: &str,
-    scope: &[&str],
-    ordinal: usize,
-) -> String {
-    encode_page_token(envelope, region, scope, &ordinal.to_string())
-}
-
-/// The row ORDINAL inside a `nextToken` [`encode_ordinal_page_token`] minted for
-/// this `envelope` and `scope`, or `None` when the token is not one of them.
-///
-/// A token is only minted where a page stopped with rows still LEFT OVER, so a
-/// minted position is at least 1 and is spelled the one way
-/// [`encode_ordinal_page_token`] writes it. Every other spelling of a number is
-/// a position nothing minted — a sign, a leading zero, a value no `usize`
-/// holds — and so is 0 itself; each earns the refusal a key no listing minted
-/// earns ([`invalid_next_token_message`]), rather than being resumed at
-/// whatever position the text happens to parse to.
-///
-/// The other half of the rule is [`ordinal_resumes_a_selected_row`], asked
-/// where the length of the sequence the position is read against is known.
-pub fn decode_ordinal_page_token(
-    envelope: &str,
-    region: &str,
-    scope: &[&str],
-    token: &str,
-) -> Option<usize> {
-    let key = decode_page_token(envelope, region, scope, token)?;
-    let ordinal: usize = key.parse().ok()?;
-    (ordinal >= 1 && key == ordinal.to_string()).then_some(ordinal)
-}
-
-/// Whether an ordinal [`decode_ordinal_page_token`] read is a position a token
-/// can have been minted at in a sequence of `selected` rows.
-///
-/// A page mints a token only where rows are still left over, so a minted
-/// position is the position of a row the sequence really HOLDS. A position at
-/// or past its end is one nothing minted: it earns the same refusal
-/// ([`invalid_next_token_message`]) as a token of another listing, rather than
-/// an HTTP 200 page of no rows and no further token — which would report the
-/// end of a walk this service never started.
-pub fn ordinal_resumes_a_selected_row(resume_at: usize, selected: usize) -> bool {
-    resume_at < selected
-}
-
-/// What a `nextToken` binds the `filters` of a LISTING to: the conjunction
-/// those filters stand for, as a value two requests share exactly when they
-/// select the same rows.
-///
-/// A resume key — a row's own key or its ordinal — only means something inside
-/// the ONE sequence it was taken from, so a listing that resumes at one binds
-/// its token to every request member that decides that sequence, and a filter
-/// decides it, since a row no filter selects is not in it. Resuming a filtered
-/// page under other filters would otherwise walk past every row the new filters
-/// select that sorts before the key, so a request whose filters are not the ones
-/// the token was minted under is refused ([`invalid_next_token_message`]) rather
-/// than answered a page with rows missing.
-///
-/// A `terms` entry is one filter as the member it names and the value that
-/// member compares against. Filters are applied as a CONJUNCTION, which neither
-/// the order they were listed in nor a repeated term changes, so the terms are
-/// taken sorted and de-duplicated; JSON is what renders them, so a free-text
-/// value delimits itself rather than depending on a separator the value could
-/// itself carry, and a value's TYPE is part of the rendering, so two filters one
-/// text spelling cannot tell apart are still told apart.
-///
-/// Shared by every paginated listing that filters, so one filter list reads as
-/// one scope wherever it is bound; a listing filtering on a property's VALUE
-/// binds its filters by [`property_filters_token_scope`] instead, that filter
-/// shape carrying an operator of its own.
-pub fn filters_token_scope<'a, I>(terms: I) -> String
-where
-    I: IntoIterator<Item = (&'a str, ::serde_json::Value)>,
-{
-    let mut rendered: Vec<String> = terms
-        .into_iter()
-        .map(|(member, value)| ::serde_json::json!([member, value]).to_string())
-        .collect();
-    rendered.sort();
-    rendered.dedup();
-    ::serde_json::Value::from(rendered).to_string()
-}
-
-/// What a `nextToken` that resumes at an ORDINAL binds a property FILTER list
-/// to: the conjunction those filters stand for, as a value two requests share
-/// exactly when they keep the same rows out of the same sequence.
-///
-/// An ordinal only means something inside the ONE sequence it was counted in, so
-/// a listing that resumes at one binds its token to every request member that
-/// decides that sequence — and a filter decides it, since a value no filter
-/// selects is not in it. Filters are applied as a CONJUNCTION, which neither the
-/// order they were listed in nor a repeated term changes, so they are taken
-/// sorted and de-duplicated, the way a selection is; a filter naming no operator
-/// is taken under the one it is applied with
-/// ([`COMPARISON_OPERATOR_EQUALS`]). Shared by every paginated operation that
-/// filters on a property's value, so one filter list reads as one scope wherever
-/// it is bound.
-pub fn property_filters_token_scope(
-    filters: &[crate::ops::types::PropertyFilter],
-) -> ::serde_json::Value {
-    let mut rendered: Vec<String> = filters
-        .iter()
-        .map(|filter| {
-            ::serde_json::json!([
-                filter.property_name.as_deref().unwrap_or(""),
-                filter
-                    .operator
-                    .as_deref()
-                    .unwrap_or(COMPARISON_OPERATOR_EQUALS),
-                filter
-                    .value
-                    .as_ref()
-                    .map_or(::serde_json::Value::Null, |value| {
-                        data_value_scope(value, 0)
-                    }),
-            ])
-            .to_string()
-        })
-        .collect();
-    rendered.sort();
-    rendered.dedup();
-    ::serde_json::Value::from(rendered)
-}
-
-/// How deeply a `DataValue`'s list and map nesting is rendered into a token
-/// scope before the rendering stops. A `DataValue` nests through
-/// `listValue`/`mapValue` and a filter value's depth is what the REQUEST says it
-/// is, so the number of stack frames must not be something a caller gets to
-/// choose. Past the bound the nested value renders as nothing.
-const MAX_TOKEN_VALUE_DEPTH: usize = 32;
-
-/// A `DataValue` as the value a token scope binds to: the members it carries
-/// under the names the model gives them, so two values read the same here
-/// exactly when they are the same value.
-///
-/// A map's entries are taken in KEY order — a map is unordered, so the order a
-/// request wrote them in says nothing about the value — and a number is rendered
-/// as text, so two numbers one JSON double cannot tell apart are still told
-/// apart. JSON is what renders it, so a value's text delimits itself rather than
-/// depending on a separator a free-text string value could itself carry.
-///
-/// `depth` is how far inside a nested list or map this value sits.
-fn data_value_scope(value: &crate::ops::types::DataValue, depth: usize) -> ::serde_json::Value {
-    use ::serde_json::Value as Json;
-
-    if depth >= MAX_TOKEN_VALUE_DEPTH {
-        return Json::Null;
-    }
-    let mut members = ::serde_json::Map::new();
-    if let Some(found) = value.boolean_value {
-        members.insert("booleanValue".to_string(), Json::Bool(found));
-    }
-    if let Some(found) = value.double_value {
-        members.insert("doubleValue".to_string(), Json::String(format!("{found:?}")));
-    }
-    if let Some(found) = value.integer_value {
-        members.insert("integerValue".to_string(), Json::String(found.to_string()));
-    }
-    if let Some(found) = value.long_value {
-        members.insert("longValue".to_string(), Json::String(found.to_string()));
-    }
-    if let Some(found) = &value.string_value {
-        members.insert("stringValue".to_string(), Json::String(found.clone()));
-    }
-    if let Some(found) = &value.list_value {
-        members.insert(
-            "listValue".to_string(),
-            Json::Array(
-                found
-                    .iter()
-                    .map(|entry| data_value_scope(entry, depth + 1))
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(found) = &value.map_value {
-        let entries: BTreeMap<&String, &crate::ops::types::DataValue> = found.iter().collect();
-        members.insert(
-            "mapValue".to_string(),
-            Json::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, entry)| (key.clone(), data_value_scope(entry, depth + 1)))
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(found) = &value.relationship_value {
-        members.insert(
-            "relationshipValue".to_string(),
-            ::serde_json::json!([
-                found.target_entity_id.as_deref().unwrap_or(""),
-                found.target_component_name.as_deref().unwrap_or(""),
-            ]),
-        );
-    }
-    if let Some(found) = &value.expression {
-        members.insert("expression".to_string(), Json::String(found.clone()));
-    }
-    Json::Object(members)
-}
-
-/// The message for a `nextToken` [`decode_page_token`] does not recognise: the
-/// ONE refusal every paginated operation of this service reports for a token it
-/// did not mint, so the same failure reads the same way whichever page was
-/// asked for.
-///
-/// The token is NOT part of it. A `nextToken` is opaque to the caller and
-/// modelled up to 17880 characters of any bytes, so interpolating it would copy
-/// an arbitrary request string back into a response body; the refusal names the
-/// member and what is wrong with it instead.
-pub fn invalid_next_token_message() -> String {
-    "nextToken is not a token this listing minted".to_string()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
