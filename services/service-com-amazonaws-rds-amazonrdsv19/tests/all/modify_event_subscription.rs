@@ -299,7 +299,9 @@ const MODIFY_CASES: &[ModifyCase] = &[
         base_source_type: Some("db-instance"),
         base_categories: &["availability", "backup", "failure"],
         base_enabled: None,
-        source_type: None,
+        // A request that names categories names the source type they belong to: "if
+        // SourceType is null, Categories must also be null".
+        source_type: Some("db-instance"),
         categories: Some(&["failure"]),
         topic: None,
         enabled: None,
@@ -316,7 +318,7 @@ const MODIFY_CASES: &[ModifyCase] = &[
         base_source_type: Some("db-instance"),
         base_categories: &["availability"],
         base_enabled: None,
-        source_type: None,
+        source_type: Some("db-instance"),
         categories: Some(&["availability", "backup", "failure", "maintenance"]),
         topic: None,
         enabled: None,
@@ -577,7 +579,8 @@ async fn modify_leaves_the_source_identifiers_alone() {
             &router,
             REGION,
             name,
-            None,
+            // The categories' own source type, which a request naming categories carries.
+            Some("db-security-group"),
             Some(&["failure"]),
             Some("rds-alerts"),
             Some(false),
@@ -706,8 +709,10 @@ const REFUSAL_CASES: &[RefusalCase] = &[
         code: "SNSInvalidTopic",
     },
     RefusalCase {
+        // A value outside the set the model's `SourceType` enum carries; `db-shard-group`
+        // IS one of them, so the row has to name something no source type.
         case: "a source type a subscription may not name",
-        source_type: Some("db-shard-group"),
+        source_type: Some("db-replica"),
         categories: None,
         sns_topic_arn: None,
         enabled: None,
@@ -724,8 +729,10 @@ const REFUSAL_CASES: &[RefusalCase] = &[
         code: "InvalidParameterValue",
     },
     RefusalCase {
+        // The categories name their own source type, as a request carrying categories has
+        // to: what is refused is the category, not the pair.
         case: "a category the stored source type does not publish",
-        source_type: None,
+        source_type: Some("db-instance"),
         categories: Some(&["flooding"]),
         sns_topic_arn: None,
         enabled: None,
@@ -734,7 +741,7 @@ const REFUSAL_CASES: &[RefusalCase] = &[
     },
     RefusalCase {
         case: "a category list of which only one entry is unpublished",
-        source_type: None,
+        source_type: Some("db-instance"),
         categories: Some(&["availability", "global-failover"]),
         sns_topic_arn: None,
         enabled: None,
@@ -869,8 +876,12 @@ async fn categories_are_refused_without_a_source_type_and_past_the_stored_bounds
             Some("InvalidParameterValue"),
         ),
     ] {
-        let mut params: Vec<(String, String)> =
-            vec![("SubscriptionName".to_string(), bounded.to_string())];
+        let mut params: Vec<(String, String)> = vec![
+            ("SubscriptionName".to_string(), bounded.to_string()),
+            // The categories' own source type, which a request that names categories has
+            // to carry: the bounds under test are on the LIST, not on the pair.
+            ("SourceType".to_string(), "zero-etl".to_string()),
+        ];
         params.extend(category_params(&categories));
         let response = call(&router, "ModifyEventSubscription", &params).await;
         match expected {

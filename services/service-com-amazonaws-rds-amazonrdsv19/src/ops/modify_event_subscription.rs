@@ -214,6 +214,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `EventCategories` is "a list of event categories for a source type (SourceType)
+        // that you want to subscribe to", so the two are one pair in the REQUEST: naming
+        // categories without the source type they belong to is a combination this operation
+        // cannot serve, whatever subscription the request names. It is answered from the
+        // request alone — before the subscription is resolved — with the sentence RDS states
+        // that combination rule with (`crate::state::CATEGORIES_NEED_A_SOURCE_TYPE`).
+        if input.source_type.is_none()
+            && input
+                .event_categories
+                .as_ref()
+                .is_some_and(|categories| !categories.is_empty())
+        {
+            return Err(ModifyEventSubscriptionError::invalid_parameter_combination(
+                crate::state::CATEGORIES_NEED_A_SOURCE_TYPE,
+            ));
+        }
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router
         // builds; 501 is the honest answer, never a fabricated subscription.
@@ -250,35 +267,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| record.event_categories.clone());
 
         // The subscription this call LEAVES BEHIND has to satisfy the same rule a create
-        // of it would, so the resulting source type and category list are resolved
-        // together rather than one at a time: `EventCategories` is "a list of event
-        // categories for a source type (SourceType) that you want to subscribe to", so
-        // each category has to be one the resulting source type publishes, and a
-        // subscription that names no source type has no type for a category to belong to.
-        match &source_type {
-            None => {
-                if !event_categories.is_empty() {
-                    return Err(ModifyEventSubscriptionError::invalid_parameter_combination(
-                        "SourceType must be provided when EventCategories is supplied: \
-                         both name values of one source type",
-                    ));
-                }
-            }
-            // A category the source type does not publish names no event, which is the
-            // modelled `SubscriptionCategoryNotFoundFault`.
-            Some(source_type) => {
-                if let Err(message) =
-                    crate::state::check_event_categories(source_type, &event_categories)
-                {
-                    return Err(
-                        ModifyEventSubscriptionErrorModeled::SubscriptionCategoryNotFoundFault(
-                            SubscriptionCategoryNotFoundFault {
-                                message: Some(message),
-                            },
-                        )
-                        .into(),
-                    );
-                }
+        // of it would: `EventCategories` is "a list of event categories for a source type
+        // (SourceType) that you want to subscribe to", so each category has to be one the
+        // resulting source type publishes. A resulting subscription with categories and no
+        // source type cannot arise: the request's own pair is refused above, and no create
+        // stores one.
+        if let Some(source_type) = &source_type {
+            if let Err(message) =
+                crate::state::check_event_categories(source_type, &event_categories)
+            {
+                return Err(
+                    // A category the source type does not publish names no event, which is
+                    // the modelled `SubscriptionCategoryNotFoundFault`.
+                    ModifyEventSubscriptionErrorModeled::SubscriptionCategoryNotFoundFault(
+                        SubscriptionCategoryNotFoundFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
             }
         }
 

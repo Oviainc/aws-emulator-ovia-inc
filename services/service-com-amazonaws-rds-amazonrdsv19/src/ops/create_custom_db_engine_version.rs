@@ -321,14 +321,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(CreateCustomDBEngineVersionError::validation)?;
 
-        // `Engine`'s pattern admits any name, so the SET of engines a CEV can be created
-        // for is checked here. Engine names are published lowercase and compared that way
-        // everywhere in this crate, so the request's value is folded once and the folded
-        // value is what is stored and keyed by.
-        let engine = input.engine.to_ascii_lowercase();
-        crate::state::check_custom_engine(&engine)
+        // `Engine`'s pattern admits any name in any case, so the SET of engines a CEV can
+        // be created for is checked FIRST, before any other member is read: a request for
+        // an engine no account mints versions of can never be served, whatever else it
+        // carries. It is checked against the value the request SENT, because RDS publishes
+        // its engine names as lowercase tokens and matches them exactly; the names are
+        // compared, stored and keyed in that one form everywhere in this crate.
+        crate::state::check_custom_engine(&input.engine)
             .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
+        let engine = input.engine.clone();
         let engine_version = input.engine_version.clone();
+        // The CEV name carries the major engine version of the build it packages, which is
+        // what resolves the engine version the CEV is built ON: a name that carries none
+        // resolves no engine version, and is refused with the same fixed sentence as an
+        // engine that names no engine, before anything else the request carries is read.
+        crate::state::check_custom_engine_version_name(&engine_version)
+            .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
 
         // The two combinations the operation documents as unserveable, refused before
         // anything is resolved: each value is fine on its own, so what fails is the pair.

@@ -447,13 +447,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        // `OptionGroupName` and `DBParameterGroupName` are NOT resolved the same way,
-        // and deliberately: alongside every engine major version AWS creates a DEFAULT
-        // option group and DB parameter group (`default:mysql-8-0`, `default.mysql8.0`)
-        // that no request creates and this service does not hold, so refusing every
-        // name it has no record of would refuse the groups AWS itself provides. They
-        // are stored as given — which is what lets `DeleteOptionGroup` see that an
-        // instance is using a group — and left to the issues that model those groups.
+        // `DBParameterGroupName`: "Must match the name of an existing DB parameter group."
+        // A name that matches none is the modelled not-found fault. The groups RDS provides
+        // itself are there without any request having created them
+        // (`crate::state::is_default_parameter_group_name`), so a name of that form
+        // resolves even though this store holds no record of it.
+        if let Some(named) = &input.db_parameter_group_name {
+            if !store.db_parameter_group_exists(&region, named) {
+                return Err(CreateDBInstanceErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(crate::state::db_parameter_group_not_found_message(named)),
+                    },
+                )
+                .into());
+            }
+        }
+        // `OptionGroupName` is NOT resolved the same way, and deliberately: alongside
+        // every engine major version AWS creates a DEFAULT option group
+        // (`default:mysql-8-0`) that no request creates and this service does not hold,
+        // and its name is not drawn from the parameter groups' `default.` form, so
+        // refusing every name this store has no record of would refuse the groups AWS
+        // itself provides. It is stored as given — which is what lets `DeleteOptionGroup`
+        // see that an instance is using a group.
 
         let key = (region.clone(), identifier.clone());
         if store.db_instances.contains_key(&key) {

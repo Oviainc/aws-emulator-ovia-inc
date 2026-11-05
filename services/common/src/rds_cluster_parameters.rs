@@ -533,6 +533,9 @@ pub fn validate_parameter_name(family: &str, name: &str) -> Result<(), String> {
 /// a character outside that set (a `.`, which is what a `default.<family>` group's name
 /// carries), one that does not start with a letter, or one past the bound is refused
 /// instead of stored.
+///
+/// The refusal is [`not_a_valid_identifier_message`]: the one sentence pair this service
+/// family words EVERY identifier refusal with, naming the member at fault.
 pub fn validate_parameter_group_name(member: &str, value: &str) -> Result<(), String> {
     let well_formed = !value.is_empty()
         && value.chars().count() <= MAX_PARAMETER_GROUP_NAME_LEN
@@ -543,11 +546,21 @@ pub fn validate_parameter_group_name(member: &str, value: &str) -> Result<(), St
     if well_formed {
         return Ok(());
     }
-    Err(format!(
-        "Invalid value '{value}' for {member}: it must contain from 1 to \
-         {MAX_PARAMETER_GROUP_NAME_LEN} letters, numbers, or hyphens, the first character must \
-         be a letter, and it cannot end with a hyphen or contain two consecutive hyphens"
-    ))
+    Err(not_a_valid_identifier_message(member))
+}
+
+/// How Amazon RDS refuses a member whose value is not a valid identifier: it names the
+/// request MEMBER at fault and then states the rule, in that one sentence pair.
+///
+/// Everything but the member name is fixed text, and the rejected value is NOT echoed —
+/// which is why this takes the member and nothing else. The caller answers it with the
+/// Query API's `InvalidParameterValue`.
+pub fn not_a_valid_identifier_message(member: &str) -> String {
+    format!(
+        "The parameter {member} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with \
+         a hyphen or contain two consecutive hyphens."
+    )
 }
 
 /// Refuse a `DBParameterGroupFamily` that names a DocumentDB engine family that does not

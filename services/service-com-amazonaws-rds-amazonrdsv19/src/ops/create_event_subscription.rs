@@ -261,12 +261,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `EventCategories` is "a list of event categories for a particular source type
         // (SourceType) that you want to subscribe to", and `SourceIds`'s own constraints
         // say "If SourceIds are supplied, SourceType must also be provided": neither
-        // list can be resolved without the source type they belong to.
+        // list can be resolved without the source type they belong to. Each is refused
+        // with the sentence Amazon RDS states ITS rule with, so a caller reading the
+        // refusal knows which of the two lists it has to drop or which member to add.
         let Some(source_type) = source_type else {
-            if !event_categories.is_empty() || !source_ids.is_empty() {
+            if !event_categories.is_empty() {
                 return Err(CreateEventSubscriptionError::invalid_parameter_combination(
-                    "SourceType must be provided when EventCategories or SourceIds is \
-                     supplied: both name values of one source type",
+                    crate::state::CATEGORIES_NEED_A_SOURCE_TYPE,
+                ));
+            }
+            if !source_ids.is_empty() {
+                return Err(CreateEventSubscriptionError::invalid_parameter_combination(
+                    crate::state::SOURCE_IDS_NEED_A_SOURCE_TYPE,
                 ));
             }
             return self.insert(

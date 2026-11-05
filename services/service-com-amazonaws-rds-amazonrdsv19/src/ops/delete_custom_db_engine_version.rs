@@ -13,7 +13,7 @@
 //!   request was signed for is a resource the account cannot act on at all — an AWS-managed
 //!   engine version, a CEV of another region, a name nothing created — and is refused with
 //!   HTTP 403 `AccessDenied` carrying the ONE fixed sentence this service words that
-//!   refusal with ([`crate::state::custom_db_engine_version_deletion_denied_message`]):
+//!   refusal with ([`crate::state::custom_db_engine_version_denied_message`]):
 //!   the same text whether the deletion is withheld from the caller or the pair names
 //!   nothing, with no part of it taken from the request, the caller's identity or the
 //!   store, so it discloses nothing about the named version — not whether an account could
@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // about the request, the caller or the version itself.
         let Some(record) = store.custom_db_engine_versions.get(&key) else {
             return Err(crate::scaffolded::Scaffolded::access_denied(
-                crate::state::custom_db_engine_version_deletion_denied_message(),
+                crate::state::custom_db_engine_version_denied_message(),
             ));
         };
 

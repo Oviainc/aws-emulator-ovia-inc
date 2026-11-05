@@ -570,23 +570,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // A cluster parameter group the request MOVES the cluster to is resolved in the
-        // store, answering the modelled not-found fault when it names none. The groups
-        // whose names begin `default.` are the ones AWS itself provides per engine family
-        // and no request creates, so this service holds no record of them and accepts them
-        // — the same reason `ModifyDBInstance` does not resolve `OptionGroupName`.
+        // store, answering the modelled not-found fault when it names none. The groups RDS
+        // provides itself are there without any request having created them
+        // (`crate::state::is_default_parameter_group_name`), so a name of that form
+        // resolves even though this store holds no record of it — the same reason
+        // `ModifyDBInstance` does not resolve `OptionGroupName`.
         if let Some(name) = &input.db_cluster_parameter_group_name {
-            let lowered = name.to_ascii_lowercase();
-            if !lowered.starts_with("default.")
-                && !store
-                    .db_cluster_parameter_groups
-                    .contains_key(&(region.clone(), lowered.clone()))
-            {
+            if !store.db_cluster_parameter_group_exists(&region, name) {
                 return Err(
                     ModifyDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
                         DBClusterParameterGroupNotFoundFault {
-                            message: Some(format!(
-                                "DBClusterParameterGroup not found: {name}"
-                            )),
+                            message: Some(
+                                crate::state::db_cluster_parameter_group_not_found_message(name),
+                            ),
                         },
                     )
                     .into(),

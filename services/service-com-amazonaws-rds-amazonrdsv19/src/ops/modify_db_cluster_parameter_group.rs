@@ -10,6 +10,13 @@
 //! a static parameter, or one the caller asks to apply `pending-reboot`, leaves the group
 //! with a pending change until that reboot.
 //!
+//! The group RDS provides for an engine-version family is not the account's to change:
+//! a `DBClusterParameterGroupName` of that form
+//! ([`crate::state::is_default_parameter_group_name`]) is refused with
+//! `InvalidParameterValue` and the protection RDS states for it, before the name is
+//! resolved — no request creates such a group, so this store holds no record of one and
+//! resolving it first would report a group that exists as missing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,6 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A parameter group RDS provides itself is not the account's to change: it exists
+        // for every engine-version family RDS publishes
+        // (`crate::state::is_default_parameter_group_name`), so the refusal is the
+        // protection RDS states for it — the same sentence `ModifyDBParameterGroup`
+        // answers for the instance-scoped group — rather than the not-found fault a name
+        // this store holds no record of would otherwise get. Checked before the group is
+        // resolved, because no such group is ever a record in this store.
+        if crate::state::is_default_parameter_group_name(&input.db_cluster_parameter_group_name) {
+            return Err(ModifyDBClusterParameterGroupError::invalid_parameter_value(
+                crate::state::CANNOT_MODIFY_DEFAULT_PARAMETER_GROUP_MESSAGE,
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
@@ -186,10 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "DBClusterParameterGroup not found: {}",
-                            input.db_cluster_parameter_group_name
-                        )),
+                        message: Some(
+                            crate::state::db_cluster_parameter_group_not_found_message(
+                                &input.db_cluster_parameter_group_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),

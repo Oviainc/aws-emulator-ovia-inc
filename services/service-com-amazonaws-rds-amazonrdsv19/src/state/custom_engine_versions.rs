@@ -18,7 +18,7 @@
 
 use std::time::Instant;
 
-use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
+use super::{PendingChange, PendingStatus, ARN_NAMESPACE, INVALID_DB_ENGINE_MESSAGE};
 use crate::ops::types::{Tag, CUSTOM_ENGINE_VERSION_STATUS_VALUES};
 
 /// How many custom engine versions one region holds. The cap is this emulator's, for the
@@ -81,18 +81,47 @@ const ARN_RESOURCE_TYPE: &str = "cev";
 
 /// Refuse an `Engine` no custom engine version can be created for.
 ///
-/// The member's pattern admits any name at all, so the SET of engines is checked here: a
-/// value outside it names no engine whose versions an account mints, which is what the
-/// Query API's `InvalidParameterValue` reports.
+/// The member's pattern (`^[A-Za-z0-9-]{1,35}$`) admits any name in any case, so the SET of
+/// engines is checked here, against the value the request SENT: Amazon RDS publishes its
+/// engine names as lowercase tokens and matches them exactly, so a value that differs from
+/// a published name in nothing but case names no engine an account mints versions of
+/// either. Either way the refusal is the service's own fixed text for a value that is no
+/// engine of this operation — it states no rule and echoes nothing from the request — which
+/// the caller answers with the Query API's `InvalidParameterValue`, the same code and the
+/// same sentence [`super::check_engine`] answers an unpublished `Engine` elsewhere with.
 pub fn check_custom_engine(engine: &str) -> Result<(), String> {
     if CUSTOM_ENGINE_VERSION_ENGINES.contains(&engine) {
         return Ok(());
     }
-    Err(format!(
-        "invalid value '{engine}' for Engine: a custom DB engine version can be created \
-         for {}",
-        CUSTOM_ENGINE_VERSION_ENGINES.join(", ")
-    ))
+    Err(INVALID_DB_ENGINE_MESSAGE.to_string())
+}
+
+/// Refuse an `(Engine, EngineVersion)` pair that names no engine build a CEV can be
+/// created on.
+///
+/// `CreateCustomDBEngineVersion$EngineVersion` documents the name format a CEV carries:
+/// "for RDS Custom for Oracle, the name format is `19.`*customized_string*", and for the
+/// SQL Server engines "*major_engine_version*.*minor_engine_version*.*customized_string*".
+/// Either way the name BEGINS with the major engine version of the build it packages — that
+/// is how the service resolves which DB engine version the CEV is built on, and it is what
+/// [`crate::ops::describe_db_engine_versions::custom_version_basis`] reads the CEV's
+/// `MajorEngineVersion` and `DBParameterGroupFamily` out of. A name whose leading component
+/// is not a major engine version resolves no engine version at all, which the service
+/// refuses with the same fixed `Invalid DB engine` sentence an `Engine` that names no engine
+/// gets ([`check_custom_engine`]): in both cases the pair names no DB engine to build on.
+pub fn check_custom_engine_version_name(engine_version: &str) -> Result<(), String> {
+    let (major, customized) = match engine_version.split_once('.') {
+        Some(halves) => halves,
+        // No separator at all: the whole name would have to be the major version, and then
+        // it names a version the engine already publishes rather than a new CEV.
+        None => return Err(INVALID_DB_ENGINE_MESSAGE.to_string()),
+    };
+    let names_a_major_version =
+        !major.is_empty() && major.chars().all(|c| c.is_ascii_digit()) && !customized.is_empty();
+    if names_a_major_version {
+        return Ok(());
+    }
+    Err(INVALID_DB_ENGINE_MESSAGE.to_string())
 }
 
 /// Whether a CEV of `engine` is created from an Amazon Machine Image rather than from
@@ -134,16 +163,17 @@ pub fn custom_db_engine_version_resource_arn(
     )
 }
 
-/// How a `DeleteCustomDBEngineVersion` this service will not serve a delete for is refused:
+/// How a request this service will not serve against a custom engine version is refused:
 /// ONE sentence, the same for every such request, which is why it takes no argument.
 ///
-/// The deletion of a custom engine version is withheld both from a caller that may not
-/// manage CEVs at all and for a `(Engine, EngineVersion)` pair that names no CEV the
-/// account holds, and the two are answered with the IDENTICAL text — nothing in it is taken
-/// from the request, from the caller's identity or from the store, so the refusal cannot be
-/// used to learn whether a version of that name exists or who asked about it.
+/// Managing a custom engine version — deleting it, modifying it — is withheld both from a
+/// caller that may not manage CEVs at all and for a `(Engine, EngineVersion)` pair that
+/// names no CEV the account holds, and the two are answered with the IDENTICAL text —
+/// nothing in it is taken from the request, from the caller's identity or from the store,
+/// so the refusal cannot be used to learn whether a version of that name exists or who
+/// asked about it.
 #[must_use]
-pub fn custom_db_engine_version_deletion_denied_message() -> &'static str {
+pub fn custom_db_engine_version_denied_message() -> &'static str {
     "The custom engine version you requested may not exist or you don't have the required \
      permission."
 }

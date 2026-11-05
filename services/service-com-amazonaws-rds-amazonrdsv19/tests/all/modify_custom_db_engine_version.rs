@@ -20,8 +20,8 @@
 //! * the status changes are driven over every ORDERED PAIR of the statuses the modelled
 //!   `CustomEngineVersionStatus` enum publishes, which is what "you can change any status
 //!   to any status" ranges over, the identity pairs included;
-//! * the not-found refusals are a row per way a `(Engine, EngineVersion)` can name no
-//!   stored CEV: an unknown CEV name, a stored name under another engine, a CEV stored in
+//! * the denials are a row per way a `(Engine, EngineVersion)` can name no CEV the account
+//!   holds: an unknown CEV name, a stored name under another engine, a CEV stored in
 //!   another region, and an engine version this service PUBLISHES rather than one an
 //!   account minted;
 //! * the report gate is driven over every status one CEV passes through — the status it is
@@ -411,8 +411,8 @@ async fn each_member_the_request_names_is_the_only_one_that_changes() {
     }
 }
 
-/// One row of the not-found table: a `(Engine, EngineVersion)` that names no CEV the
-/// account stored in the region the request is signed for.
+/// One row of the denial table: a `(Engine, EngineVersion)` that names no CEV the
+/// account holds in the region the request is signed for.
 struct Missing {
     case: &'static str,
     region: &'static str,
@@ -420,7 +420,7 @@ struct Missing {
     engine_version: &'static str,
 }
 
-/// The ways a request can name no stored CEV. The CEV the rows are written against is
+/// The ways a request can name no held CEV. The CEV the rows are written against is
 /// `custom-oracle-ee`/`19.found_cev`, created in [`REGION`].
 const MISSING: &[Missing] = &[
     Missing {
@@ -449,8 +449,21 @@ const MISSING: &[Missing] = &[
     },
 ];
 
+/// The sentence a request this service will not serve against a custom engine version is
+/// refused with: one fixed text, the same for every such request, with nothing
+/// interpolated into it.
+///
+/// Spelled out here rather than read from the service, so the wording is pinned by the test
+/// and not by the code under test.
+const DENIAL: &str = "The custom engine version you requested may not exist or you don't \
+                      have the required permission.";
+
+/// A `(Engine, EngineVersion)` that names no CEV the account holds is a resource the
+/// account cannot act on, so the modification is withheld before the pair is resolved: HTTP
+/// 403 `AccessDenied` with the one fixed sentence, which discloses nothing about the named
+/// version — the same answer `DeleteCustomDBEngineVersion` gives.
 #[tokio::test]
-async fn a_request_that_names_no_stored_cev_is_not_found() {
+async fn a_request_that_names_no_held_cev_is_denied() {
     let router = emulator();
     create_cev(
         &router,
@@ -465,7 +478,7 @@ async fn a_request_that_names_no_stored_cev_is_not_found() {
 
     for row in MISSING {
         let case = row.case;
-        expect_error(
+        let body = expect_error(
             case,
             modify(
                 &router,
@@ -475,9 +488,24 @@ async fn a_request_that_names_no_stored_cev_is_not_found() {
                 &[("Description", "changed-by-a-lost-request")],
             )
             .await,
-            404,
-            "CustomDBEngineVersionNotFoundFault",
+            403,
+            "AccessDenied",
         );
+        let message = text(&body, "Message");
+        assert_eq!(
+            message, DENIAL,
+            "case {case:?}: the denial must be the fixed custom-engine-version sentence, got \
+             {body}"
+        );
+        // The equality above pins the whole text; this scan says WHAT may not appear in it,
+        // so a future rewording cannot reintroduce the existence oracle.
+        for leaked in [row.region, row.engine, row.engine_version] {
+            assert!(
+                !message.contains(leaked),
+                "case {case:?}: the denial must disclose nothing about the request, but it \
+                 carries {leaked:?}: {message}"
+            );
+        }
     }
 
     // The CEV that WAS stored is untouched by every refusal above.

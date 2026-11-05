@@ -476,8 +476,22 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
 async fn a_supplied_member_is_reported_from_the_store_rather_than_defaulted() {
     let router = emulator();
     let identifier = "emu-env-supplied";
-    // A `DBSubnetGroupName` is RESOLVED against the store rather than echoed, so the
-    // group this row names has to exist before an instance can reference it.
+    // A `DBSubnetGroupName` and a `DBParameterGroupName` are RESOLVED against the store
+    // rather than echoed, so the groups this row names have to exist before an instance
+    // can reference them.
+    expect_ok(
+        "the named parameter group is created first",
+        call(
+            &router,
+            "CreateDBParameterGroup",
+            &[
+                ("DBParameterGroupName", "custom-mysql80".to_string()),
+                ("DBParameterGroupFamily", "mysql8.0".to_string()),
+                ("Description", "a-group-under-test".to_string()),
+            ],
+        )
+        .await,
+    );
     expect_ok(
         "the named subnet group is created first",
         call(

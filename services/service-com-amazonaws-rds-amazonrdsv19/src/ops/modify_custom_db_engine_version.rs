@@ -16,8 +16,12 @@
 //! * a status change additionally requires that the CEV "must not currently be in use by
 //!   an RDS Custom instance, snapshot, or automated backup" (`Status`), which is read off
 //!   this service's own store ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::custom_db_engine_version_in_use`]);
-//! * `(Engine, EngineVersion)` that names no stored CEV in the request's region is
-//!   `CustomDBEngineVersionNotFoundFault`.
+//! * `(Engine, EngineVersion)` that names no stored CEV in the request's region names a
+//!   CEV the account does not hold, so changing it is withheld before the pair is resolved:
+//!   HTTP 403 `AccessDenied` with the ONE fixed sentence this service words that refusal
+//!   with ([`crate::state::custom_db_engine_version_denied_message`]), the same text the
+//!   delete answers and with no part of it taken from the request or the store, so it
+//!   discloses nothing about the named version.
 //!
 //! The answer is the stored record read through the ONE projection
 //! `crate::ops::describe_db_engine_versions::custom_version_to_wire` — the same one the
@@ -292,17 +296,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region.clone(),
             crate::state::custom_db_engine_version_key(&engine, &engine_version),
         );
+        // Changing an engine version the ACCOUNT minted is withheld, before the pair is
+        // resolved, for every pair that names no CEV this region holds: the action over a
+        // resource the account does not hold is refused as an authorization failure, with
+        // the one fixed sentence this service words that refusal with
+        // ([`crate::state::custom_db_engine_version_denied_message`]) — the same text the
+        // delete answers, carrying nothing about the request, the caller or the version, so
+        // it says nothing about whether a version of that name exists.
         let Some(record) = store.custom_db_engine_versions.get(&key) else {
-            return Err(
-                ModifyCustomDBEngineVersionErrorModeled::CustomDBEngineVersionNotFoundFault(
-                    CustomDBEngineVersionNotFoundFault {
-                        message: Some(format!(
-                            "Custom engine version {engine_version} not found for engine {engine}"
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::custom_db_engine_version_denied_message(),
+            ));
         };
 
         // Nothing about a CEV can be changed while its creation has not settled: it is in

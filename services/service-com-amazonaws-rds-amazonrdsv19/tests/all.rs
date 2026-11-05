@@ -121,6 +121,8 @@ mod existence_and_parameter_guards;
 mod export_tasks;
 #[path = "all/global_clusters.rs"]
 mod global_clusters;
+#[path = "all/guard_order_and_refusal_classes.rs"]
+mod guard_order_and_refusal_classes;
 #[path = "all/lifecycle_poll_loops.rs"]
 mod lifecycle_poll_loops;
 #[path = "all/maintenance_action_resource_guard.rs"]

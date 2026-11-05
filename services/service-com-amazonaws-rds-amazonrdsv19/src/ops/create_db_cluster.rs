@@ -380,44 +380,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(CreateDBClusterError::invalid_parameter_value)?;
         let identifier = input.db_cluster_identifier.to_ascii_lowercase();
 
-        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
-        // in Amazon Web Services Secrets Manager" and report the secret it created as
-        // `MasterUserSecret`. This service mints no Secrets Manager secret, so there is no
-        // managed secret to report: the request is answered with the scaffold's
-        // `NotImplemented` naming the member, rather than with a cluster whose managed
-        // secret does not exist. A request that carries its own `MasterUserPassword` is
-        // served normally.
-        if input.manage_master_user_password == Some(true) {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateDBCluster$ManageMasterUserPassword is not implemented in \
-                              this emulator: it has RDS generate the master user password in \
-                              Amazon Web Services Secrets Manager and report that secret as \
-                              MasterUserSecret, and this service mints no such secret. Name \
-                              MasterUserPassword instead."
-                        .to_string(),
-                },
-            ));
-        }
-
-        // `WithExpressConfiguration` creates "an Aurora DB Cluster with express
-        // configuration", which provisions the cluster's writer DB INSTANCE as part of
-        // this call. This operation stores a cluster and no instance, so a cluster created
-        // for it would come back without the writer the member asks for: it is answered the
-        // same way, naming the member.
-        if input.with_express_configuration == Some(true) {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateDBCluster$WithExpressConfiguration is not implemented in \
-                              this emulator: express configuration creates the cluster's \
-                              writer DB instance as part of this call, and this operation \
-                              creates no DB instance. Create the cluster without it and add \
-                              the writer with CreateDBInstance."
-                        .to_string(),
-                },
-            ));
-        }
-
         // Every stored list and every stored free-form value is BOUNDED before anything is
         // resolved or stored: these members publish no bound of their own and all of them
         // enter the store, so the caps are this emulator's.
@@ -889,12 +851,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
-        // `OptionGroupName` and `DBClusterParameterGroupName` are NOT resolved the same
-        // way, and deliberately: alongside every engine major version AWS creates a DEFAULT
-        // option group and DB cluster parameter group (`default:aurora-mysql-8-0`,
-        // `default.aurora-mysql8.0`) that no request creates and this service does not
-        // hold, so refusing every name it has no record of would refuse the groups AWS
-        // itself provides. They are stored as given, as `CreateDBInstance` stores its own.
+        // `DBClusterParameterGroupName`: "Must match the name of an existing DB cluster
+        // parameter group." A name that matches none is the modelled not-found fault — the
+        // same resolution `ModifyDBCluster` gives the group it moves a cluster to. The
+        // groups RDS provides itself are there without any request having created them
+        // ([`crate::state::is_default_parameter_group_name`]), so a name of that form
+        // resolves even though this store holds no record of it.
+        if let Some(named) = &input.db_cluster_parameter_group_name {
+            if !store.db_cluster_parameter_group_exists(&region, named) {
+                return Err(
+                    CreateDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
+                        DBClusterParameterGroupNotFoundFault {
+                            message: Some(
+                                crate::state::db_cluster_parameter_group_not_found_message(named),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // `OptionGroupName` is NOT resolved the same way, and deliberately: alongside every
+        // engine major version AWS creates a DEFAULT option group
+        // (`default:aurora-mysql-8-0`) that no request creates and this service does not
+        // hold, and its name is not drawn from the parameter groups' `default.` form, so
+        // refusing every name this store has no record of would refuse the groups AWS
+        // itself provides. It is stored as given, as `CreateDBInstance` stores its own.
+
+        // What this EMULATOR cannot serve is answered only once every value the request
+        // carries has been validated and every resource it names resolved: a request AWS
+        // refuses as a client error gets that client error, never a server-fault class that
+        // hides it.
+        //
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // in Amazon Web Services Secrets Manager" and report the secret it created as
+        // `MasterUserSecret`. This service mints no Secrets Manager secret, so there is no
+        // managed secret to report: the request is answered with the scaffold's
+        // `NotImplemented` naming the member, rather than with a cluster whose managed
+        // secret does not exist. A request that carries its own `MasterUserPassword` is
+        // served normally.
+        if input.manage_master_user_password == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateDBCluster$ManageMasterUserPassword is not implemented in \
+                              this emulator: it has RDS generate the master user password in \
+                              Amazon Web Services Secrets Manager and report that secret as \
+                              MasterUserSecret, and this service mints no such secret. Name \
+                              MasterUserPassword instead."
+                        .to_string(),
+                },
+            ));
+        }
+        // `WithExpressConfiguration` creates "an Aurora DB Cluster with express
+        // configuration", which provisions the cluster's writer DB INSTANCE as part of
+        // this call. This operation stores a cluster and no instance, so a cluster created
+        // for it would come back without the writer the member asks for: it is answered the
+        // same way, naming the member.
+        if input.with_express_configuration == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateDBCluster$WithExpressConfiguration is not implemented in \
+                              this emulator: express configuration creates the cluster's \
+                              writer DB instance as part of this call, and this operation \
+                              creates no DB instance. Create the cluster without it and add \
+                              the writer with CreateDBInstance."
+                        .to_string(),
+                },
+            ));
+        }
 
         let key = (region.clone(), identifier.clone());
         if store.db_clusters.contains_key(&key) {

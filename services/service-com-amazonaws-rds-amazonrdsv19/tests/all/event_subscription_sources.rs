@@ -502,12 +502,13 @@ async fn a_subscription_name_resolves_only_in_the_region_it_was_created_in() {
 async fn a_source_type_a_subscription_may_not_name_never_reaches_the_resolution() {
     let router = emulator();
 
-    // `db-shard-group` is a value of the WIDER `SourceType` enum `DescribeEvents` carries,
-    // and not one of the ten `CreateEventSubscriptionMessage$SourceType` publishes, so no
-    // subscription of that type can exist for an add to resolve a source against.
+    // A value outside the set the model's `SourceType` enum carries names no event source
+    // at all, so no subscription of that type can exist for an add to resolve a source
+    // against. (`db-shard-group` IS one of them, so it is not the value to probe with.)
+    let unpublished = "db-replica";
     assert!(
-        !EVENT_SUBSCRIPTION_SOURCE_TYPES.contains(&"db-shard-group"),
-        "case db-shard-group: expected it outside the published subscription source types, \
+        !EVENT_SUBSCRIPTION_SOURCE_TYPES.contains(&unpublished),
+        "case {unpublished}: expected it outside the published subscription source types, \
          got {EVENT_SUBSCRIPTION_SOURCE_TYPES:?}"
     );
     expect_error(
@@ -515,8 +516,8 @@ async fn a_source_type_a_subscription_may_not_name_never_reaches_the_resolution(
         create_subscription(
             &router,
             REGION,
-            "emu-add-sub-shard-group",
-            Some("db-shard-group"),
+            "emu-add-sub-unpublished-type",
+            Some(unpublished),
             &[],
         )
         .await,
@@ -525,7 +526,12 @@ async fn a_source_type_a_subscription_may_not_name_never_reaches_the_resolution(
     );
     expect_error(
         "an add against the subscription the refused create did not store",
-        add_source(&router, "emu-add-sub-shard-group", "emu-src-shard-group-a").await,
+        add_source(
+            &router,
+            "emu-add-sub-unpublished-type",
+            "emu-src-unpublished-a",
+        )
+        .await,
         404,
         "SubscriptionNotFound",
     );
@@ -542,20 +548,13 @@ struct CatalogCase {
     resolved: bool,
 }
 
-/// Every value `CreateEventSubscriptionMessage$SourceType` publishes, in the order
-/// `EVENT_SUBSCRIPTION_SOURCE_TYPES` carries them — including the four the issue cited
-/// none of (`db-cluster-snapshot`, `db-proxy`, `zero-etl`, `blue-green-deployment`).
+/// Every value a subscription's `SourceType` may name, in the order
+/// `EVENT_SUBSCRIPTION_SOURCE_TYPES` carries them — including the ones the issue cited
+/// none of (`db-cluster-snapshot`, `db-proxy`, `zero-etl`, `blue-green-deployment`,
+/// `db-shard-group`).
 const CATALOG_CASES: &[CatalogCase] = &[
     CatalogCase {
         source_type: "db-instance",
-        resolved: true,
-    },
-    CatalogCase {
-        source_type: "db-cluster",
-        resolved: true,
-    },
-    CatalogCase {
-        source_type: "db-parameter-group",
         resolved: true,
     },
     CatalogCase {
@@ -563,7 +562,15 @@ const CATALOG_CASES: &[CatalogCase] = &[
         resolved: false,
     },
     CatalogCase {
+        source_type: "db-parameter-group",
+        resolved: true,
+    },
+    CatalogCase {
         source_type: "db-snapshot",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-cluster",
         resolved: true,
     },
     CatalogCase {
@@ -571,19 +578,23 @@ const CATALOG_CASES: &[CatalogCase] = &[
         resolved: true,
     },
     CatalogCase {
-        source_type: "db-proxy",
-        resolved: true,
-    },
-    CatalogCase {
-        source_type: "zero-etl",
-        resolved: true,
-    },
-    CatalogCase {
         source_type: "custom-engine-version",
         resolved: false,
     },
     CatalogCase {
+        source_type: "db-proxy",
+        resolved: true,
+    },
+    CatalogCase {
         source_type: "blue-green-deployment",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "db-shard-group",
+        resolved: true,
+    },
+    CatalogCase {
+        source_type: "zero-etl",
         resolved: true,
     },
 ];
