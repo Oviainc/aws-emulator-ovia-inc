@@ -30,21 +30,13 @@
 //! bounds, the case and the "one character off a stored name" shape of that
 //! name, plus a resource this account created and then removed.
 
-use std::time::Duration;
-
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{Answer, Emulator};
 use crate::endpoint_access::{
-    available_cluster, borrowed, create_endpoint, create_subnet_group, name_of_length,
-    OTHER_ACCOUNT,
+    assert_served, available_cluster, borrowed, create_endpoint, create_subnet_group,
+    name_of_length, settle, OTHER_ACCOUNT,
 };
-
-/// Wait out the span a clock-owed change falls due after, plus a margin for a
-/// loaded runner.
-async fn settle() {
-    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
-}
 
 /// One form parameter, owned so a row can build it from a borrowed name.
 fn pair(name: &str, value: &str) -> (String, String) {
@@ -72,15 +64,6 @@ fn assert_refusal(case: &str, answer: &Answer, status: u16, code: &str, message:
         "case {case}: expected the message {message:?}, got {:?} with body {}",
         answer.text("Message"),
         answer.body
-    );
-}
-
-/// Assert one answer was served.
-fn assert_ok(case: &str, answer: &Answer) {
-    assert_eq!(
-        answer.status, 200,
-        "case {case}: expected status 200, got {} with body {}",
-        answer.status, answer.body
     );
 }
 
@@ -159,12 +142,12 @@ fn endpoint_operations() -> Vec<(&'static str, Request, EndpointWording)> {
 async fn every_endpoint_operation_words_its_endpoint_not_found_refusal_its_own_way() {
     let emulator = Emulator::new();
     available_cluster(&emulator, "wording-endpoint-host").await;
-    assert_ok(
+    assert_served(
         "seed subnet group",
         &create_subnet_group(&emulator, "wording-endpoint-subnets", &["subnet-a", "subnet-b"])
             .await,
     );
-    assert_ok(
+    assert_served(
         "seed the present endpoint",
         &create_endpoint(
             &emulator,
@@ -178,7 +161,7 @@ async fn every_endpoint_operation_words_its_endpoint_not_found_refusal_its_own_w
     // An endpoint this account created and then deleted: once the clock-owed
     // removal is due, the name resolves to nothing exactly like one that never
     // existed.
-    assert_ok(
+    assert_served(
         "seed the doomed endpoint",
         &create_endpoint(
             &emulator,
@@ -190,7 +173,7 @@ async fn every_endpoint_operation_words_its_endpoint_not_found_refusal_its_own_w
         .await,
     );
     settle().await;
-    assert_ok(
+    assert_served(
         "delete the doomed endpoint",
         &call(
             &emulator,
@@ -268,14 +251,14 @@ async fn every_endpoint_operation_words_its_endpoint_not_found_refusal_its_own_w
         &endpoint_only("wording-present-endpoint"),
     )
     .await;
-    assert_ok("a stored endpoint is described", &served);
+    assert_served("a stored endpoint is described", &served);
     let modified = call(
         &emulator,
         "ModifyEndpointAccess",
         &endpoint_only("wording-present-endpoint"),
     )
     .await;
-    assert_ok("a stored endpoint is modified", &modified);
+    assert_served("a stored endpoint is modified", &modified);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +297,7 @@ async fn the_endpoint_authorization_operations_refuse_an_unknown_cluster_with_a_
     available_cluster(&emulator, "wording-auth-host").await;
     // A cluster this account created and then deleted.
     let doomed = emulator.create_minimal("wording-auth-doomed").await;
-    assert_ok("seed the doomed cluster", &doomed);
+    assert_served("seed the doomed cluster", &doomed);
     let deleted = call(
         &emulator,
         "DeleteCluster",
@@ -324,7 +307,7 @@ async fn the_endpoint_authorization_operations_refuse_an_unknown_cluster_with_a_
         ],
     )
     .await;
-    assert_ok("delete the doomed cluster", &deleted);
+    assert_served("delete the doomed cluster", &deleted);
     settle().await;
 
     // `max_len` is the documented bound on `ClusterIdentifier`; see
@@ -383,7 +366,7 @@ async fn the_endpoint_authorization_operations_refuse_an_unknown_cluster_with_a_
     }
 
     // Rule 3: the stored cluster is served by the same operations.
-    assert_ok(
+    assert_served(
         "a stored cluster's authorizations are listed",
         &call(
             &emulator,
@@ -392,7 +375,7 @@ async fn the_endpoint_authorization_operations_refuse_an_unknown_cluster_with_a_
         )
         .await,
     );
-    assert_ok(
+    assert_served(
         "a stored cluster takes an authorization",
         &call(
             &emulator,
@@ -470,7 +453,7 @@ async fn an_authorization_to_the_callers_own_account_is_refused_before_the_clust
         "ClusterNotFound",
         CLUSTER_IDENTIFIER_CANNOT_BE_FOUND,
     );
-    assert_ok(
+    assert_served(
         "AuthorizeEndpointAccess to a third-party account on a cluster this account holds",
         &call(
             &emulator,
@@ -524,7 +507,7 @@ async fn create_limit(emulator: &Emulator, cluster_identifier: &str) -> String {
         ],
     )
     .await;
-    assert_ok("seed a usage limit", &created);
+    assert_served("seed a usage limit", &created);
     created
         .text("UsageLimitId")
         .expect("a created usage limit reports the id the service minted")
@@ -536,7 +519,7 @@ async fn the_usage_limit_operations_word_their_not_found_refusal_with_the_id_the
     available_cluster(&emulator, "wording-limit-host").await;
     let present = create_limit(&emulator, "wording-limit-host").await;
     let doomed = create_limit(&emulator, "wording-limit-host").await;
-    assert_ok(
+    assert_served(
         "delete the doomed usage limit",
         &call(
             &emulator,
@@ -596,14 +579,14 @@ async fn the_usage_limit_operations_word_their_not_found_refusal_with_the_id_the
         &[pair("UsageLimitId", &present), pair("Amount", "250")],
     )
     .await;
-    assert_ok("a minted usage limit is modified", &modified);
+    assert_served("a minted usage limit is modified", &modified);
     let described = call(
         &emulator,
         "DescribeUsageLimits",
         &[pair("UsageLimitId", &present)],
     )
     .await;
-    assert_ok("a minted usage limit is described", &described);
+    assert_served("a minted usage limit is described", &described);
     assert_eq!(
         described.text("Amount").as_deref(),
         Some("250"),

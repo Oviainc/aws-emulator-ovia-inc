@@ -74,16 +74,25 @@ pub(crate) fn assert_served(case: &str, answer: &Answer) {
     );
 }
 
+/// Wait out the span a clock-owed change falls due after, plus a margin for a
+/// loaded runner.
+///
+/// `pub(crate)` so the sibling suite about this family's refusal WORDING waits
+/// the same span out rather than repeating the sleep.
+pub(crate) async fn settle() {
+    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
+}
+
 /// Create one cluster and leave it in the `available` state, which is the state
 /// an endpoint may be created on it in.
 ///
 /// The clock-owed `creating` -> `available` transition falls due
 /// [`state::PROVISIONING_SPAN`] after the create, so this waits that span out
-/// (plus a margin for a loaded runner) rather than reaching into the store.
+/// rather than reaching into the store.
 pub(crate) async fn available_cluster(emulator: &Emulator, identifier: &str) {
     let created = emulator.create_minimal(identifier).await;
     assert_served(&format!("seed cluster {identifier}"), &created);
-    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
+    settle().await;
 }
 
 /// Create one cluster subnet group holding `subnet_ids`.

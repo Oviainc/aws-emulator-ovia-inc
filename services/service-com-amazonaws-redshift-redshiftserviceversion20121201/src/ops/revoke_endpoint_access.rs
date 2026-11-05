@@ -192,30 +192,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let started = ::std::time::Instant::now();
 
-        // Every name the request carries is resolved BEFORE anything else about
-        // the request is judged, so a name that resolves to nothing is answered
-        // with that resource's own modelled fault rather than with a refusal of
-        // the request's shape. The pair this call revokes is a cluster and an
-        // account, so a request that names no cluster names no authorization.
+        // Every name the request carries is resolved BEFORE the SHAPE of the
+        // request is judged, so a name that resolves to nothing is answered with
+        // that resource's own modelled fault rather than with a refusal of the
+        // request's shape. The one judgement that comes first is the grantee
+        // account below: that one is about what the request MEANS, not about its
+        // shape, and it needs nothing from the store. The pair this call revokes
+        // is a cluster and an account, so a request that names no cluster names
+        // no authorization.
         let Some(cluster_identifier) = input.cluster_identifier.clone() else {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
                 "ClusterIdentifier must be specified to revoke endpoint access to a cluster.",
             ));
         };
 
-        let mut store = state.lock();
-        store.settle(started);
-
         // An endpoint authorization grants ANOTHER account access to this
         // account's cluster, so the grantee can never be the grantor. That is a
         // judgement on the request's own argument rather than on anything the
         // store holds, and AWS makes it BEFORE resolving the cluster: a caller
-        // probing the guard learns the real reason, not a not-found.
+        // probing the guard learns the real reason, not a not-found. Decided
+        // before the store is even locked, since nothing in it bears on the
+        // answer.
         if input.account.as_deref() == Some(::engine::emulator_account_id()) {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                 st::SELF_ACCOUNT_NOT_GRANTABLE,
             ));
         }
+
+        let mut store = state.lock();
+        store.settle(started);
 
         // "The cluster to revoke access from": resolved BEFORE the authorization,
         // so a request naming neither an existing cluster nor an existing

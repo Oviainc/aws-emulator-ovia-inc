@@ -185,10 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let started = ::std::time::Instant::now();
 
-        // Every name the request carries is resolved BEFORE anything else about
-        // the request is judged, so a name that resolves to nothing is answered
-        // with that resource's own modelled fault rather than with a refusal of
-        // the request's shape.
+        // Every name the request carries is resolved BEFORE the SHAPE of the
+        // request is judged, so a name that resolves to nothing is answered with
+        // that resource's own modelled fault rather than with a refusal of the
+        // request's shape. The one judgement that comes first is the grantee
+        // account below: that one is about what the request MEANS, not about its
+        // shape, and it needs nothing from the store.
         //
         // An authorization is granted ON one cluster and reports which one, so a
         // request that names none describes no authorization.
@@ -198,19 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let mut store = state.lock();
-        store.settle(started);
-
         // An endpoint authorization grants ANOTHER account access to this
         // account's cluster, so the grantee can never be the grantor. That is a
         // judgement on the request's own argument rather than on anything the
         // store holds, and AWS makes it BEFORE resolving the cluster: a caller
-        // probing the guard learns the real reason, not a not-found.
+        // probing the guard learns the real reason, not a not-found. Decided
+        // before the store is even locked, since nothing in it bears on the
+        // answer.
         if input.account == ::engine::emulator_account_id() {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                 st::SELF_ACCOUNT_NOT_GRANTABLE,
             ));
         }
+
+        let mut store = state.lock();
+        store.settle(started);
 
         // "The cluster identifier of the cluster to grant access to": the cluster
         // is what is granted, so it has to be there and to be in the state that
