@@ -184,7 +184,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The ARN the conflict reports is the one a computation model of this
+                // store CARRIES under that id, read back from the record rather than
+                // rebuilt, so the refusal cannot name an ARN no computation model of
+                // this store has. A computation model id is minted by the create and
+                // never reused, so the id of a removed model is the fallback's case:
+                // the canonical ARN of that id is then the one honest answer.
+                let conflicting_arn = store
+                    .computation_models
+                    .get(&spent_on)
+                    .map(|model| model.arn.clone())
+                    .unwrap_or_else(|| crate::state::computation_model_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -255,16 +266,19 @@ fn not_found(requested: &str) -> DeleteComputationModelError {
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the computation model that request
-/// removed, so `resourceId`/`resourceArn` name it — built from this request's
-/// region, because the model that call deleted no longer carries an ARN of its
-/// own.
-fn token_spent(region: &str, computation_model_id: &str) -> DeleteComputationModelError {
+/// removed, so `resourceId`/`resourceArn` name it — `resource_arn` the ARN a
+/// computation model of this store carries under that id, and only for an id no
+/// computation model of this store holds one built from this request's region.
+fn token_spent(
+    computation_model_id: &str,
+    resource_arn: String,
+) -> DeleteComputationModelError {
     DeleteComputationModelError::Modeled(
         DeleteComputationModelErrorModeled::ConflictingOperationException(
             ConflictingOperationException {
                 message: crate::state::already_using_message("computation model", "clientToken"),
                 resource_id: computation_model_id.to_string(),
-                resource_arn: crate::state::computation_model_arn(region, computation_model_id),
+                resource_arn,
             },
         ),
     )

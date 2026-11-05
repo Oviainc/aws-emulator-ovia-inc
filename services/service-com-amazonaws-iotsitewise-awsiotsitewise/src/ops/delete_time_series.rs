@@ -369,7 +369,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the time series that request
 /// removed, so `resourceId`/`resourceArn` name it — built from this request's
-/// region, because the stream that call deleted is gone.
+/// region. A refusal naming a resource of this store reports the ARN that
+/// resource carries, but no stream carries one: a time series is reported through
+/// [`crate::state::CaptureSourceRecord::time_series_summary`], which derives its
+/// `timeSeriesArn` for the region of the request doing the reading, so there is no
+/// minted ARN to read back here and building one is the only answer.
 fn token_spent(region: &str, time_series_id: &str) -> DeleteTimeSeriesError {
     DeleteTimeSeriesError::Modeled(
         DeleteTimeSeriesErrorModeled::ConflictingOperationException(ConflictingOperationException {

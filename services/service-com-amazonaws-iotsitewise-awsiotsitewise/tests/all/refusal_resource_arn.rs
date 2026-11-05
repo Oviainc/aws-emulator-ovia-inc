@@ -23,12 +23,19 @@
 //! resource reports.
 //!
 //! The rows span what the rule generalises over: the operation kind (create,
-//! update, associate, disassociate, property write, composite-model create), the
-//! resource kind (asset, asset model), the modelled error (409
-//! `ConflictingOperationException`, 409 `ResourceAlreadyExistsException`, 412
+//! update, delete, associate, disassociate, property write, composite-model
+//! create), the resource kind (asset, asset model, workspace), the modelled error
+//! (409 `ConflictingOperationException`, 409 `ResourceAlreadyExistsException`, 412
 //! `PreconditionFailedException`), what collided (a spent `clientToken`, a
-//! caller-supplied id, an external id, a bound property alias, an `If-Match`
-//! header) and how the request carries it (payload member, query string, header).
+//! caller-supplied id, an external id, a resource's unique name, a bound property
+//! alias, an `If-Match` header) and how the request carries it (payload member,
+//! query string, header).
+//!
+//! The delete rows are the case a build cannot be right about by construction: a
+//! delete FREES the identity it removed — a caller-supplied `assetId` or
+//! `assetModelId`, a `workspaceName` — so a later create can hold that identity
+//! again, and the conflict a token spent on the delete answers has to name the ARN
+//! the resource now holding it was minted with.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -73,6 +80,7 @@ const MODEL_EXTERNAL_ID: &str = "refusal-arn-model";
 enum Kind {
     Asset,
     AssetModel,
+    Workspace,
 }
 
 impl Kind {
@@ -81,6 +89,9 @@ impl Kind {
         match self {
             Kind::Asset => format!("asset/{id}"),
             Kind::AssetModel => format!("asset-model/{id}"),
+            // A workspace is addressed by its name, so the name is what the
+            // resource section carries.
+            Kind::Workspace => format!("workspace/{id}"),
         }
     }
 
@@ -89,6 +100,7 @@ impl Kind {
         match self {
             Kind::Asset => (format!("/assets/{id}"), "assetArn"),
             Kind::AssetModel => (format!("/asset-models/{id}"), "assetModelArn"),
+            Kind::Workspace => (format!("/workspaces/{id}"), "workspaceArn"),
         }
     }
 }
@@ -434,6 +446,79 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
     .await;
     assert_eq!(status, 202, "UpdateAssetModel: got {status} {body}");
 
+    // --- the identities a delete freed, and the resources that hold them now --
+    // Each delete below spends a token on a resource it removes; a create then
+    // takes the identity that delete freed, signed for HOME like every other
+    // create here. So when a DIFFERENT request reuses the spent token, the
+    // resource its conflict names is one this store HOLDS — and the ARN it has to
+    // report is the one that resource was minted with, which no rebuild from the
+    // refused request's region can produce.
+    let deleted_asset = create_asset(router, "RefusalArnDeleted", &plain).await;
+    let asset_delete_token = token_for("spent on DeleteAsset");
+    let (status, body) = call(
+        router,
+        "DELETE",
+        &format!("/assets/{deleted_asset}?clientToken={asset_delete_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 202, "DeleteAsset: got {status} {body}");
+    let (status, recreated) = call(
+        router,
+        "POST",
+        "/assets",
+        Some(json!({
+            "assetName": "RefusalArnDeletedAgain",
+            "assetModelId": plain,
+            "assetId": deleted_asset,
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "CreateAsset reusing a freed assetId: got {status} {recreated}"
+    );
+    let spare_delete_asset = create_asset(router, "RefusalArnSpareDeleted", &plain).await;
+
+    let deleted_model = create_model(router, "RefusalArnModelDeleted", json!([])).await;
+    let model_delete_token = token_for("spent on DeleteAssetModel");
+    let (status, body) = call(
+        router,
+        "DELETE",
+        &format!("/asset-models/{deleted_model}?clientToken={model_delete_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 202, "DeleteAssetModel: got {status} {body}");
+    let recreated_model = create_model_from(
+        router,
+        json!({
+            "assetModelName": "RefusalArnModelDeletedAgain",
+            "assetModelId": deleted_model,
+        }),
+    )
+    .await;
+    assert_eq!(
+        recreated_model, deleted_model,
+        "CreateAssetModel reusing a freed assetModelId must hold it, got {recreated_model}"
+    );
+    let spare_delete_model = create_model(router, "RefusalArnModelSpareDeleted", json!([])).await;
+
+    let deleted_workspace = "refusal-arn-deleted";
+    crate::support::ensure_workspace(router, deleted_workspace).await;
+    let workspace_delete_token = token_for("spent on DeleteWorkspace");
+    let (status, body) = call(
+        router,
+        "DELETE",
+        &format!("/workspaces/{deleted_workspace}?clientToken={workspace_delete_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "DeleteWorkspace: got {status} {body}");
+    crate::support::ensure_workspace(router, deleted_workspace).await;
+    let spare_delete_workspace = "refusal-arn-spare-deleted";
+    crate::support::ensure_workspace(router, spare_delete_workspace).await;
+
     vec![
         Row {
             case: "DisassociateAssets under a clientToken spent on another request",
@@ -671,6 +756,67 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             code: "PreconditionFailedException",
             kind: Kind::AssetModel,
             resource_id: conditional_model.clone(),
+        },
+        Row {
+            case: "CreateAssetModel naming an assetModelId a model already holds",
+            method: "POST",
+            uri: "/asset-models".to_string(),
+            body: Some(json!({
+                "assetModelName": "RefusalArnModelIdCollision",
+                "assetModelId": created_model,
+            })),
+            headers: Vec::new(),
+            status: 409,
+            code: "ResourceAlreadyExistsException",
+            kind: Kind::AssetModel,
+            resource_id: created_model.clone(),
+        },
+        Row {
+            case: "CreateAssetModel naming an assetModelName a model already holds",
+            method: "POST",
+            uri: "/asset-models".to_string(),
+            // The name `created_model` was created under, which is unique to it.
+            body: Some(json!({ "assetModelName": "RefusalArnModelCreated" })),
+            headers: Vec::new(),
+            status: 409,
+            code: "ResourceAlreadyExistsException",
+            kind: Kind::AssetModel,
+            resource_id: created_model.clone(),
+        },
+        Row {
+            case: "DeleteAsset under a token spent on the delete of an assetId held again",
+            method: "DELETE",
+            uri: format!("/assets/{spare_delete_asset}?clientToken={asset_delete_token}"),
+            body: None,
+            headers: Vec::new(),
+            status: 409,
+            code: "ConflictingOperationException",
+            kind: Kind::Asset,
+            resource_id: deleted_asset.clone(),
+        },
+        Row {
+            case: "DeleteAssetModel under a token spent on the delete of an id held again",
+            method: "DELETE",
+            uri: format!("/asset-models/{spare_delete_model}?clientToken={model_delete_token}"),
+            body: None,
+            headers: Vec::new(),
+            status: 409,
+            code: "ConflictingOperationException",
+            kind: Kind::AssetModel,
+            resource_id: deleted_model.clone(),
+        },
+        Row {
+            case: "DeleteWorkspace under a token spent on the delete of a name held again",
+            method: "DELETE",
+            uri: format!(
+                "/workspaces/{spare_delete_workspace}?clientToken={workspace_delete_token}"
+            ),
+            body: None,
+            headers: Vec::new(),
+            status: 409,
+            code: "ConflictingOperationException",
+            kind: Kind::Workspace,
+            resource_id: deleted_workspace.to_string(),
         },
     ]
 }

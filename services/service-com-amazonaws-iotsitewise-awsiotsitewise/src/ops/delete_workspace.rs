@@ -183,7 +183,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The ARN the conflict reports is the one a workspace of this store
+                // CARRIES under that name, read back from the record rather than
+                // rebuilt, so the refusal cannot name an ARN no workspace of this
+                // store has: a workspace is identified by its name, so a delete
+                // frees that name and a later create may hold it again — through
+                // whichever regional endpoint that create was signed for. Only a
+                // name this store holds no workspace under leaves nothing to read.
+                let conflicting_arn = store
+                    .workspaces
+                    .get(&spent_on)
+                    .map(|workspace| workspace.arn.clone())
+                    .unwrap_or_else(|| crate::state::workspace_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -278,14 +290,15 @@ fn contained(contents: &[(&'static str, usize)]) -> String {
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the workspace that request removed,
-/// so `resourceId`/`resourceArn` name it — built from this request's region,
-/// because the workspace that call deleted no longer carries an ARN of its own.
-fn token_spent(region: &str, workspace_name: &str) -> DeleteWorkspaceError {
+/// so `resourceId`/`resourceArn` name it — `resource_arn` the ARN a workspace of
+/// this store carries under that name, and only for a name no workspace of this
+/// store holds one built from this request's region.
+fn token_spent(workspace_name: &str, resource_arn: String) -> DeleteWorkspaceError {
     DeleteWorkspaceError::Modeled(DeleteWorkspaceErrorModeled::ConflictingOperationException(
         ConflictingOperationException {
             message: crate::state::already_using_message("workspace", "clientToken"),
             resource_id: workspace_name.to_string(),
-            resource_arn: crate::state::workspace_arn(region, workspace_name),
+            resource_arn,
         },
     ))
 }

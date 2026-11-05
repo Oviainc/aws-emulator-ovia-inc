@@ -190,7 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The ARN the conflict reports is the one an asset of this store
+                // CARRIES under that id, read back from the record rather than
+                // rebuilt, so the refusal cannot name an ARN no asset of this store
+                // has: a delete frees the id it removed and `CreateAsset` takes a
+                // caller-supplied `assetId`, so that id can be an asset again — one
+                // minted through whichever regional endpoint created it. Only an id
+                // this store holds no asset under leaves nothing to read.
+                let arn = store.stored_asset_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -286,14 +294,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the asset that request removed, so
-/// `resourceId`/`resourceArn` name it — built from this request's region, because
-/// the asset that call deleted no longer carries an ARN of its own.
-fn token_spent(region: &str, asset_id: &str) -> DeleteAssetError {
+/// `resourceId`/`resourceArn` name it — `resource_arn` as
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::stored_asset_arn`]
+/// sources it: the ARN an asset of this store carries under that id, and only for
+/// an id no asset of this store holds one built from this request's region.
+fn token_spent(asset_id: &str, resource_arn: String) -> DeleteAssetError {
     DeleteAssetError::Modeled(DeleteAssetErrorModeled::ConflictingOperationException(
         ConflictingOperationException {
             message: crate::state::already_using_message("asset", "clientToken"),
             resource_id: asset_id.to_string(),
-            resource_arn: crate::state::asset_arn(region, asset_id),
+            resource_arn,
         },
     ))
 }
