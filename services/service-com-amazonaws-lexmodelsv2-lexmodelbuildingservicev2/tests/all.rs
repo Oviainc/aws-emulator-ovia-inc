@@ -33,6 +33,8 @@ mod refusal_wording;
 mod response_media_type;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/slot_constraints.rs"]
+mod slot_constraints;
 #[path = "all/slot_type.rs"]
 mod slot_type;
 #[path = "all/slot_type_listing.rs"]

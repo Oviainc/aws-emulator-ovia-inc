@@ -270,10 +270,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|setting| setting.allow_multiple_values)
             && input.locale_id != crate::state::MULTIPLE_VALUES_LOCALE_ID
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "multipleValuesSetting.allowMultipleValues is only available in the {} locale",
-                crate::state::MULTIPLE_VALUES_LOCALE_ID
-            )));
+            // The operation models its own `ValidationException`, so the refusal goes on
+            // that channel rather than the scaffold wrapper's synthetic one.
+            return Err(CreateSlotErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "multipleValuesSetting.allowMultipleValues is only available in the {} locale",
+                        crate::state::MULTIPLE_VALUES_LOCALE_ID
+                    )),
+                },
+            )
+            .into());
         }
 
         // The per-intent slot quota bounds the store: past it the service answers its
