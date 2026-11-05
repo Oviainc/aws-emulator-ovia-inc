@@ -1000,3 +1000,5 @@ mod cloudformation_provisions_agentcore_workload_identities;
 mod events_lambda_target_resource_policy;
 #[path = "all/cloudformation_provisions_lambda_functions.rs"]
 mod cloudformation_provisions_lambda_functions;
+#[path = "all/cloudformation_updates_lambda_functions.rs"]
+mod cloudformation_updates_lambda_functions;

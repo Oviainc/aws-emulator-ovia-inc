@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 
@@ -73,6 +74,30 @@ const ROLE_PROPERTY: &str = "Role";
 /// reports it as the state the function is still being removed in; the resource's creation
 /// does not wait on it ([`readiness`]).
 const STATE_MEMBER: &str = "State";
+
+/// The member Lambda reports the progress of the LAST modification of a function in, beside
+/// [`STATE_MEMBER`]: `InProgress` while it is still being applied, `Successful` once it is.
+const LAST_UPDATE_STATUS_MEMBER: &str = "LastUpdateStatus";
+
+/// The two values those members take while Lambda refuses a further modification of the
+/// function: "When the code is Creating, you can't invoke or modify the function" for a
+/// function still being provisioned, and "During this time, you can't modify the function"
+/// for one whose last update is still being applied.
+const STATE_PENDING: &str = "Pending";
+const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// How long [`await_modifiable`] waits between asking Lambda whether the function is out of
+/// those windows, and how many times it asks.
+///
+/// The interval is short enough that a settled function is noticed about as soon as it
+/// settles, and the budget — a few times over the window AWS Lambda itself holds a
+/// modification open for, the span the other waits in this provisioning layer are sized
+/// against — long enough to cover it on a loaded machine. A wait that runs out is not a
+/// failure of its own: what fails then is the call that needed the function modifiable,
+/// reported as Lambda's own refusal of it, so a function genuinely stuck fails the resource
+/// rather than holding the deployment open.
+const MODIFIABLE_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+const MODIFIABLE_CHECKS: usize = 80;
 
 /// Every property `AWS::Lambda::Function` publishes. A declared property this list does not
 /// carry is REFUSED rather than dropped, so a function is never reported created with less
@@ -252,6 +277,11 @@ pub(super) async fn update(
     refuse_unpassable_role(ctx, region, declared).await?;
     let name = resource.physical_resource_id.clone();
 
+    // Each of the calls below modifies the SAME function, and Lambda refuses a modification
+    // while the one before it is still being applied, so each is made only once that service
+    // reports the function out of that window ([`await_modifiable`]).
+    await_modifiable(ctx, region, &name).await;
+
     let mut configuration = Map::new();
     for member in CREATE_MEMBERS {
         // `PackageType` and `Architectures` are no members of
@@ -286,6 +316,7 @@ pub(super) async fn update(
     if let Some(architectures) = declared_in(declared, "Architectures") {
         code.insert("Architectures".to_string(), architectures.clone());
     }
+    await_modifiable(ctx, region, &name).await;
     call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
@@ -295,6 +326,7 @@ pub(super) async fn update(
         Some(&Value::Object(code)),
     )
     .await?;
+    await_modifiable(ctx, region, &name).await;
     configure(ctx, region, &asked, &name).await?;
 
     let mut attributes = BTreeMap::new();
@@ -553,6 +585,50 @@ async fn configure(
         .await?;
     }
     Ok(())
+}
+
+/// Wait until Lambda reports the function MODIFIABLE — neither still being provisioned
+/// (`State` `Pending`) nor still applying the modification before this one
+/// (`LastUpdateStatus` `InProgress`) — which is what the next call on it needs.
+///
+/// Applying a changed declaration takes SEVERAL calls on one function
+/// (`UpdateFunctionConfiguration`, then `UpdateFunctionCode`, then the properties that are
+/// calls of their own), and Lambda refuses each of them inside the window the one before it
+/// opened. A deployment that makes the next call regardless fails the resource on that
+/// refusal, so the stack reports a resource it was perfectly able to update as failed — hence
+/// this wait, exactly as the proxy and stream arms of [`super::super::provisioner`] wait for
+/// the state the next call needs.
+///
+/// Returns as soon as the function is modifiable, and gives up after [`MODIFIABLE_CHECKS`]
+/// checks. A refusal of the READ ends the wait the same way: it says nothing about whether
+/// the function is modifiable, and the call that follows is what reports Lambda's answer.
+async fn await_modifiable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) {
+    for _ in 0..MODIFIABLE_CHECKS {
+        let Ok(answered) = call_rest_json(
+            ctx,
+            LAMBDA_SIGNING_NAME,
+            region,
+            "GET",
+            &configuration_uri(name),
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        let provisioning = reported_text(&answered, STATE_MEMBER)
+            .is_some_and(|state| state == STATE_PENDING);
+        let updating = reported_text(&answered, LAST_UPDATE_STATUS_MEMBER)
+            .is_some_and(|status| status == LAST_UPDATE_STATUS_IN_PROGRESS);
+        if !provisioning && !updating {
+            return;
+        }
+        ::tokio::time::sleep(MODIFIABLE_CHECK_INTERVAL).await;
+    }
 }
 
 /// `DeleteFunction` on one function, with a function Lambda no longer holds read as the
