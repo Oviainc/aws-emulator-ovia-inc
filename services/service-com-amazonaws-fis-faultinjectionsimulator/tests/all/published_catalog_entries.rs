@@ -553,7 +553,8 @@ async fn a_listing_and_a_read_of_either_catalog_agree_entry_for_entry() {
 
     // Causes 4 and 6 of the issue read the entry a listing reports at an index, so the rows
     // here are indices into each list: its head, its second and third entries, and its
-    // tail. Both catalogs are enumerated in id order, which is what makes an index stable.
+    // tail. Each catalog is enumerated in the order the service publishes it in, which is
+    // what makes an index stable.
     let actions = list_actions(&router, FALLBACK_REGION).await;
     let action_ids: Vec<&str> = actions
         .iter()
@@ -603,13 +604,15 @@ async fn a_listing_and_a_read_of_either_catalog_agree_entry_for_entry() {
                 .unwrap_or_else(|| panic!("a listed resource type carries no id: {entry:?}"))
         })
         .collect();
-    let mut sorted = type_ids.clone();
-    sorted.sort_unstable();
     assert_eq!(
-        type_ids, sorted,
-        "case targetResourceTypes: expected the catalog to be published in id order, got \
+        type_ids.iter().collect::<BTreeSet<&&str>>().len(),
+        type_ids.len(),
+        "case targetResourceTypes: expected every published resource type once, got \
          {type_ids:?}"
     );
+    // The ORDER the ids come in is the published one rather than ascending, and
+    // `published_catalog_text.rs` asserts it index by index; what matters here is only that
+    // an index is stable enough to read the entry back by.
 
     for index in [0, 1, 2, type_ids.len() - 1] {
         let id = type_ids[index];

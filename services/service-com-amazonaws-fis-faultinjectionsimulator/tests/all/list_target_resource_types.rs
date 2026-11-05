@@ -205,10 +205,13 @@ fn ids(case: &str, listed: &[Value]) -> Vec<String> {
 ///
 /// FIS publishes a target resource type as soon as one of its own actions can target it,
 /// and `ACTION_CATALOG` records an action only where the reference named in the module docs
-/// states one, so these two are published while no catalogued action targets them. Named
+/// states one, so these three are published while no catalogued action targets them. Named
 /// here so the cross-table check below stays an assertion rather than an exception.
-const UNTARGETED_PUBLISHED_TYPES: &[&str] =
-    &["aws:directconnect:virtual-interface", "aws:dsql:cluster"];
+const UNTARGETED_PUBLISHED_TYPES: &[&str] = &[
+    "aws:directconnect:virtual-interface",
+    "aws:dsql:cluster",
+    "aws:ec2:vpc-endpoint",
+];
 
 /// The resource type ids this suite expects the list to publish, by the reference named in
 /// the module docs.
@@ -219,7 +222,7 @@ const UNTARGETED_PUBLISHED_TYPES: &[&str] =
 /// `aws:eks:pod`), storage and databases (`aws:ec2:ebs-volume`, `aws:s3:bucket`,
 /// `aws:rds:cluster`, `aws:rds:db`, `aws:dynamodb:global-table`, `aws:dsql:cluster`,
 /// `aws:elasticache:replicationgroup`), networking (`aws:ec2:subnet`,
-/// `aws:ec2:route-table`, `aws:ec2:transit-gateway`,
+/// `aws:ec2:route-table`, `aws:ec2:transit-gateway`, `aws:ec2:vpc-endpoint`,
 /// `aws:directconnect:virtual-interface`), resilience
 /// (`aws:arc:zonal-shift-managed-resource`) and identity (`aws:iam:role`).
 fn expected_ids() -> BTreeSet<String> {
@@ -235,6 +238,7 @@ fn expected_ids() -> BTreeSet<String> {
         "aws:ec2:spot-instance",
         "aws:ec2:subnet",
         "aws:ec2:transit-gateway",
+        "aws:ec2:vpc-endpoint",
         "aws:ecs:cluster",
         "aws:ecs:task",
         "aws:eks:cluster",
