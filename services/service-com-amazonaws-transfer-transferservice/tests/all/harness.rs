@@ -33,6 +33,18 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// only keeps a suite off the boundary.
 pub(crate) const SETTLE_MARGIN: Duration = Duration::from_millis(400);
 
+/// How often [`poll_until`] re-reads a stage it is waiting on — a client's poll, kept
+/// short so the wait is bounded by the stage and not by the interval.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long [`poll_until`] waits for a stage before calling it stalled.
+///
+/// Deliberately NOT derived from the spans in `src/state.rs`: a client knows none of
+/// them, so this is a client's patience — far longer than any span this emulator
+/// chooses, and short enough that a stage which never settles fails the suite instead
+/// of hanging it.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Wait out the span a server spends `STARTING`, whatever `src/state.rs` sets it to:
 /// the span is read from the crate under test rather than copied, so a suite cannot
 /// wait out a span the service no longer has.
@@ -530,6 +542,33 @@ pub(crate) fn unix_seconds(at: std::time::SystemTime) -> f64 {
     at.duration_since(std::time::SystemTime::UNIX_EPOCH)
         .expect("the test clock is past the Unix epoch")
         .as_secs_f64()
+}
+
+/// Re-read one stage of a flow until `probe` reports it settled, and answer what it
+/// last saw.
+///
+/// For a suite that waits the way a CLIENT waits: on what the API serves, not on a span
+/// read out of the crate under test. `probe` answers `(settled, what it read)`, so a
+/// stage that never settles fails with the value the API was still serving — the
+/// evidence a stall leaves — rather than hanging the suite.
+pub(crate) async fn poll_until<F, Fut>(case: &str, stage: &str, probe: F) -> Value
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = (bool, Value)>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let (settled, last) = probe().await;
+        if settled {
+            return last;
+        }
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: {stage} did not settle within {SETTLE_DEADLINE:?}; the last \
+             answer was {last:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Assert that `actual` carries each member `expected` names, where a `null`

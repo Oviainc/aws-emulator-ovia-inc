@@ -10,7 +10,8 @@
 //! `OFFLINE`, then `ONLINE`, then the endpoint's host key, then `OK` once that key is
 //! pinned, then a terminal per-file `StatusCode` naming the `FilePath` it sent, with the
 //! bytes at the destination. Nothing in the chain stays non-terminal, and no stage needs
-//! the caller to know how long the emulator takes over it.
+//! the caller to know how long the emulator takes over it — which is why every wait here
+//! is [`poll_until`] rather than a sleep of a span read out of the crate.
 //!
 //! The suites beside this one assert each stage's own rule on its own table
 //! ([`crate::connector_gated_workflow`] for the verdict of a connection and for what one
@@ -25,24 +26,10 @@
 //! [`Target`], because the connector data plane calls them for the credentials a session
 //! authenticates with and for the bytes a transfer moves.
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
 
-use crate::connector_gated_workflow::{results, s3, Target, COMPLETED, FAILED, STATUS_OK};
-use crate::harness::member_of;
-
-/// How often this suite re-reads a stage it is waiting on — a client's poll, kept short
-/// so the wait is bounded by the stage and not by the interval.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How long a stage of the flow may take before this suite calls it stalled.
-///
-/// Deliberately NOT read from the spans in `src/state.rs`: what the rule says is that a
-/// client who knows none of them still sees every stage settle, so the bound here is a
-/// client's patience — far longer than any span this emulator chooses, and short enough
-/// that a stage which never settles fails the test instead of hanging it.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+use crate::connector_gated_workflow::{results, Target, COMPLETED, FAILED, STATUS_OK};
+use crate::harness::{member_of, poll_until};
 
 /// `State`'s two terminal values this flow waits on (`smithy_query(query="shape",
 /// shape="State")` -> `[OFFLINE, ONLINE, STARTING, STOPPING, START_FAILED, STOP_FAILED]`).
@@ -130,6 +117,7 @@ async fn the_documented_end_to_end_flow_settles_at_every_stage() {
 
     // Stage 2: the connector is created trusting no host key, so the client reads the one
     // the endpoint presents out of its first probe — the key it then pins.
+    let case = "a connector created trusting no host key";
     let connector_id = target
         .create_connector(case, json!({"UserSecretId": &secret}), None)
         .await;
@@ -151,6 +139,7 @@ async fn the_documented_end_to_end_flow_settles_at_every_stage() {
 
     // Stage 3: pinning that key is what brings the connector into service, and the client
     // sees that from `Status` alone.
+    let case = "the observed host key pinned on the connector";
     let pinned = target
         .emulator
         .call(
@@ -194,7 +183,7 @@ async fn the_documented_end_to_end_flow_settles_at_every_stage() {
             })
             .collect();
         for (key, body) in &sources {
-            put_object(&target, key, body.clone()).await;
+            target.put_object(key, body.clone()).await;
         }
 
         let sent: Vec<String> = sources
@@ -272,43 +261,4 @@ async fn the_documented_end_to_end_flow_settles_at_every_stage() {
             );
         }
     }
-}
-
-/// Re-read one stage until `probe` reports it settled, and answer what it last saw.
-///
-/// `probe` answers `(settled, what it read)`, so a stage that never settles fails with
-/// the value the API was still serving — which is the evidence a stall leaves.
-async fn poll_until<F, Fut>(case: &str, stage: &str, probe: F) -> Value
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = (bool, Value)>,
-{
-    let started = Instant::now();
-    loop {
-        let (settled, last) = probe().await;
-        if settled {
-            return last;
-        }
-        assert!(
-            started.elapsed() < SETTLE_DEADLINE,
-            "case {case:?}: {stage} did not settle within {SETTLE_DEADLINE:?}; the last \
-             answer was {last:?}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// Put one object into the target's bucket, with bytes of this test's own making.
-///
-/// [`Target::put_object`] takes `&'static [u8]`, which a per-file body computed here is
-/// not, so this suite writes its own bodies through the same in-process S3 client.
-async fn put_object(target: &Target, key: &str, body: Vec<u8>) {
-    s3(&target.emulator)
-        .put_object()
-        .bucket(&target.bucket)
-        .key(key)
-        .body(aws_sdk_s3::primitives::ByteStream::from(body))
-        .send()
-        .await
-        .expect("the emulated S3 stores the source object");
 }

@@ -281,12 +281,16 @@ impl Target {
     }
 
     /// Put one object into the bucket.
-    pub(crate) async fn put_object(&self, key: &str, body: &'static [u8]) {
+    ///
+    /// `body` is anything a suite's bytes come as — a constant this crate holds, or a
+    /// body one row computed for itself — so a suite that gives each file its own bytes
+    /// needs no second copy of this.
+    pub(crate) async fn put_object(&self, key: &str, body: impl Into<Vec<u8>>) {
         s3(&self.emulator)
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(body))
+            .body(aws_sdk_s3::primitives::ByteStream::from(body.into()))
             .send()
             .await
             .expect("the emulated S3 stores the source object");
