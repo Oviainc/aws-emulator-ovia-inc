@@ -794,7 +794,7 @@ async fn a_policy_put_the_service_refuses_establishes_nothing() {
         ACCOUNT,
         "never-created-mrap",
         "t-absent-put",
-        r#"{"Statement":[]}"#,
+        r#"{"Version":"2012-10-17","Statement":[]}"#,
     )
     .await;
     let refusal = refusal_of("a put naming an absent access point", &absent);

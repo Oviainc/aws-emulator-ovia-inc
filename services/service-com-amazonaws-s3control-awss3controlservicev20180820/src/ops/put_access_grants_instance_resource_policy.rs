@@ -154,14 +154,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::no_such_access_grants_instance());
         };
 
-        // A resource policy is an IAM policy document, so one that is not JSON
-        // at all is a malformed policy rather than a stored value. Its size is
-        // already bounded by the modelled `PolicyDocument` length, which the
-        // boundary validator refuses past before this handler runs.
-        if ::serde_json::from_str::<::serde_json::Value>(&input.policy).is_err() {
-            return Err(crate::state::malformed_policy(
-                "it is not a well-formed JSON document",
-            ));
+        // A resource policy is a document in the IAM JSON policy language, so
+        // one that is not a policy at all is a malformed policy rather than a
+        // stored value. A member the language does not define is NOT refused
+        // here: this surface renders it back in the document it reports, so only
+        // the document clause is read. Its size is already bounded by the
+        // modelled `PolicyDocument` length, which the boundary validator refuses
+        // past before this handler runs.
+        if let Some(refusal) = crate::state::policy_document_refusal(&input.policy) {
+            return Err(refusal);
         }
 
         // "Updates the resource policy of the S3 Access Grants instance": the

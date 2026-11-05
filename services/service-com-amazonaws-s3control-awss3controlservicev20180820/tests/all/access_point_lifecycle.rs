@@ -689,8 +689,12 @@ async fn a_policy_round_trips_byte_for_byte_and_the_last_put_wins() {
             r#"{"Version":"2012-10-17","Statement":[{"Sid":"rapport-été-☃","Effect":"Allow"}]}"#,
         ),
         (
+            // Nested through the elements the policy language defines — a
+            // condition block, its operators, their keys and their value lists
+            // — because a member the language does not define is refused
+            // whatever it nests.
             "deeply nested document",
-            r#"{"a":{"b":{"c":{"d":[1,2,{"e":[[],[{}]]}]}}}}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Condition":{"StringLike":{"s3:prefix":["a","b"]},"Bool":{"aws:SecureTransport":[false]}}}]}"#,
         ),
     ];
 
@@ -796,9 +800,10 @@ async fn list_access_points_filters_by_bucket_and_pages_through_every_access_poi
         &emulator.list(OTHER_ACCOUNT, "").await,
     );
 
-    // Filtering by bucket: one row per bucket the table uses, including a
-    // bucket no access point fronts.
-    for bucket in ["reports", "finance", "partner", "no-such-bucket"] {
+    // Filtering by bucket: one row per bucket the table uses. A bucket no
+    // access point fronts is NOT a row here — it carries no collection to page
+    // through, and the refusal it answers is pinned beside this suite.
+    for bucket in ["reports", "finance", "partner"] {
         let expected: BTreeSet<String> = cases
             .iter()
             .filter(|case| case.bucket == bucket)
@@ -1141,12 +1146,18 @@ async fn a_request_the_service_cannot_serve_faithfully_is_refused_rather_than_an
     }
 }
 
-/// A JSON policy document of exactly `bytes` bytes: an object whose single
-/// member's value is padded to the length asked for.
+/// A policy document of exactly `bytes` bytes: one statement whose `Sid` is
+/// padded to the length asked for, so a document written to probe the SIZE bound
+/// is still a document in the policy language (the grammar is read before the
+/// bound, and a member the language does not define is refused whatever its
+/// size).
 fn policy_of_length(bytes: usize) -> String {
-    let envelope = r#"{"Sid":""}"#.len();
-    assert!(bytes >= envelope, "a JSON object cannot be that short");
-    format!("{{\"Sid\":\"{}\"}}", "a".repeat(bytes - envelope))
+    let envelope = r#"{"Version":"2012-10-17","Statement":[{"Sid":""}]}"#.len();
+    assert!(bytes >= envelope, "a policy document cannot be that short");
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"{}\"}}]}}",
+        "a".repeat(bytes - envelope)
+    )
 }
 
 #[tokio::test]

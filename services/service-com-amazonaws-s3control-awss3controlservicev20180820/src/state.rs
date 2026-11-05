@@ -2665,6 +2665,40 @@ pub fn valid_access_point_name(name: &str) -> bool {
         && !name.ends_with(ALIAS_TAIL)
 }
 
+/// The ARN namespace of the buckets this service's BUCKET routes address: S3 on
+/// Outposts.
+///
+/// Every `/v20180820/bucket/{Bucket}` route documents its `Bucket` member as "the
+/// S3 on Outposts bucket", addressed "in the format
+/// `arn:aws:s3-outposts:<region>:<account>:outpost/<outpost>/bucket/<name>`"
+/// whose "value must be URL encoded"
+/// (`smithy_query(query="doc",shape="PutBucketReplicationRequest",member="Bucket")`),
+/// so the vendor field of a parsed bucket address is this one.
+pub const OUTPOSTS_VENDOR: &str = "s3-outposts";
+
+/// The resource type an S3 on Outposts BUCKET ARN names under its outpost:
+/// `outpost/<outpost>/bucket/<name>`, so the resource field of a bucket address
+/// carries this segment.
+pub const OUTPOSTS_BUCKET_SEGMENT: &str = "/bucket/";
+
+/// Whether `bucket` — the address span of a bucket route's request path, already
+/// percent-decoded — is an S3 on Outposts bucket ARN
+/// ([`OUTPOSTS_VENDOR`]).
+///
+/// One of the two forms those routes document a bucket is addressed in: the ARN
+/// the SDK and CLI put in the label. The other is the bucket's NAME beside the
+/// `x-amz-outpost-id` header the REST API requires, which is read where the
+/// request's headers are (`crate::service::envelope`), so this reads the label
+/// alone. A request in neither form names no Outpost, no account and no Region,
+/// so there is no resource for the path to address and the URI cannot be parsed
+/// at all ([`INVALID_URI_CODE`]) — a different answer from a bucket that is
+/// addressed properly and merely does not exist.
+pub fn addressable_bucket(bucket: &str) -> bool {
+    ::service_common::arn::parse(bucket).is_some_and(|arn| {
+        arn.vendor == OUTPOSTS_VENDOR && arn.resource.contains(OUTPOSTS_BUCKET_SEGMENT)
+    })
+}
+
 /// The characters a Storage Lens configuration id can be ADDRESSED with: the
 /// ASCII letters and digits, the hyphen and the underscore.
 ///
@@ -3184,6 +3218,26 @@ pub fn no_such_access_point_policy<E>(name: &str) -> crate::scaffolded::Scaffold
     )
 }
 
+/// `InvalidRequest` (HTTP 400): a listing scoped to a bucket that has no access
+/// point attached to it.
+///
+/// An access point is a resource OF a bucket, so scoping the listing to one asks
+/// for that bucket's access points: a bucket with none attached carries no such
+/// collection, which is a request the service will not carry out rather than an
+/// empty page. The message is fixed text, naming no bucket: the caller asked
+/// about one bucket and the answer is about that same one.
+pub fn no_access_point_attached_to_bucket<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        NO_ACCESS_POINT_ATTACHED_MESSAGE,
+    )
+}
+
+/// The message of [`no_access_point_attached_to_bucket`]: fixed text, naming no
+/// bucket.
+pub const NO_ACCESS_POINT_ATTACHED_MESSAGE: &str = "No access point attached to this bucket";
+
 /// `AccessDenied` (HTTP 403): a `BlockPublicPolicy` setting in force for the
 /// access point refuses a policy document that grants public access, so the
 /// document is not stored.
@@ -3247,10 +3301,97 @@ pub fn too_many_access_points<E>() -> crate::scaffolded::Scaffolded<E> {
 /// will store — it is not JSON, or it is larger than [`MAX_POLICY_BYTES`].
 pub fn malformed_policy<E>(why: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "MalformedPolicy",
-        400,
+        MALFORMED_POLICY_CODE,
+        MALFORMED_POLICY_STATUS,
         format!("The specified policy is not a policy this service can store: {why}"),
     )
+}
+
+/// The wire `<Code>` of a refusal of a policy document, which a client branches
+/// on. Named separately because the same code carries every clause a document
+/// can break ([`policy_grammar_refusal`]).
+pub const MALFORMED_POLICY_CODE: &str = "MalformedPolicy";
+
+/// The HTTP status of a [`MALFORMED_POLICY_CODE`] refusal.
+pub const MALFORMED_POLICY_STATUS: u16 = 400;
+
+/// [`MALFORMED_POLICY_CODE`] stating `message`: the refusal of a document whose
+/// clause of the IAM policy language AWS words itself, so the message is handed
+/// through exactly as that language's reading states it.
+pub fn malformed_policy_stating<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        MALFORMED_POLICY_CODE,
+        MALFORMED_POLICY_STATUS,
+        message,
+    )
+}
+
+/// The refusal a text that is not a policy DOCUMENT at all is answered with, or
+/// `None` for one that is.
+///
+/// Every operation of this service that takes a policy document as a string
+/// reads at least this clause, so two of them handed the same text cannot
+/// disagree about whether it is a policy: a member documented as "a policy
+/// document, formatted in JSON" carries a document in the IAM JSON policy
+/// language, whose top-level elements are the members of a JSON OBJECT — and the
+/// language is read once for the whole workspace
+/// ([`::service_common::iam_policy`]).
+///
+/// The document's SIZE is not read here: the bound is the one the carrying
+/// member states, which differs per operation (see [`MAX_POLICY_BYTES`] and the
+/// modelled length of the Access Grants `PolicyDocument`), so each caller
+/// applies its own before this.
+pub fn policy_document_refusal<E>(document: &str) -> Option<crate::scaffolded::Scaffolded<E>> {
+    matches!(
+        ::service_common::iam_policy::attached_policy_defect(document, |_| true),
+        Some(::service_common::iam_policy::AttachedPolicyDefect::NotAPolicyObject)
+    )
+    .then(|| malformed_policy_stating(::service_common::iam_policy::NOT_A_JSON_POLICY_MESSAGE))
+}
+
+/// The refusal a document the ACCESS POINT policy surface will not attach is
+/// answered with, or `None` for one it stores.
+///
+/// The whole reading the validator that surface runs applies
+/// ([`::service_common::iam_policy::attached_policy_defect`]), each clause
+/// answered with AWS's own sentence for it: the text is a policy object, every
+/// member name it carries is one the policy language defines, it carries the
+/// element the language requires, it declares a version string the language
+/// defines, and every action its statements name is one the language can read
+/// and this surface can grant ([`grantable_action`]).
+///
+/// A document breaking any clause describes nothing an access point's policy
+/// could enforce, so it is refused rather than attached. The whole reading is
+/// this surface's and not every policy surface's: the Access Grants instance
+/// resource policy accepts a member the language does not define and reports it
+/// back in the document it renders, so that operation reads only
+/// [`policy_document_refusal`].
+pub fn access_point_policy_refusal<E>(document: &str) -> Option<crate::scaffolded::Scaffolded<E>> {
+    ::service_common::iam_policy::attached_policy_defect(document, |action| {
+        grantable_action(action)
+    })
+    .map(|defect| malformed_policy_stating(defect.message()))
+}
+
+/// The IAM service namespaces an action an access point policy grants is named
+/// in: the prefixes of the S3 family.
+///
+/// An access point fronts S3 storage, so a statement of its policy grants an
+/// action of S3's own API; an action named in another service's namespace names
+/// nothing the access point could allow. The prefixes are the ones the S3 family
+/// publishes for its APIs — general-purpose and directory buckets (`s3`,
+/// `s3express`), Object Lambda access points (`s3-object-lambda`) and S3 on
+/// Outposts (`s3-outposts`).
+pub const S3_ACTION_NAMESPACES: [&str; 4] = ["s3", "s3-object-lambda", "s3-outposts", "s3express"];
+
+/// Whether `action` names an action an access point policy can grant: the policy
+/// language's wildcard, or a `<namespace>:<action>` pair whose namespace is one
+/// of [`S3_ACTION_NAMESPACES`].
+pub fn grantable_action(action: &str) -> bool {
+    action == ::service_common::iam_policy::ANY_ACTION
+        || action
+            .split_once(':')
+            .is_some_and(|(namespace, _)| S3_ACTION_NAMESPACES.contains(&namespace))
 }
 
 /// `AccessDenied` (HTTP 403): the store already holds

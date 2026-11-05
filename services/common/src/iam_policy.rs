@@ -37,6 +37,15 @@
 //! ARN or by the wildcard. The two are applied together by a service that STORES a policy,
 //! because IAM refuses a document breaking either.
 //!
+//! Which NAMES a document may carry its elements under, and which of them it must carry at
+//! all, is the third reading ([`attached_policy_defect`]): the validator a service runs
+//! before it ATTACHES a document to one of its resources, which is stricter than the
+//! grammar above in two places (the language enumerates a document's members —
+//! [`POLICY_ELEMENTS`] and [`STATEMENT_ELEMENTS`] — so a name outside them describes
+//! nothing a policy engine could enforce; and that validator requires a version string the
+//! language itself lets a document omit). Its clauses carry AWS's own sentences, as
+//! [`PolicyValueDefect`]'s do.
+//!
 //! This judges only the SHAPE of a document. What a policy then SAYS — whether it allows a
 //! request — is [`super::iam_authorization`], and the two read the same elements in the
 //! same forms (a string, a list of them, or the `{"AWS": …}` object a `Principal` is
@@ -241,6 +250,222 @@ fn names_values(element: &::serde_json::Value) -> bool {
             !members.is_empty() && members.values().all(names_values)
         }
         _ => false,
+    }
+}
+
+/// The member names the IAM JSON policy language defines at a document's TOP level, in the
+/// policy reference's own order: the policy-language version, the document's optional id,
+/// and the statements themselves.
+pub const POLICY_ELEMENTS: [&str; 3] = ["Version", "Id", "Statement"];
+
+/// The member names the language defines INSIDE a statement, in the policy reference's own
+/// order: the statement id, the effect, the principal and its complement, the action and
+/// its complement, the resource and its complement, and the condition block.
+pub const STATEMENT_ELEMENTS: [&str; 9] = [
+    "Sid",
+    "Effect",
+    "Principal",
+    "NotPrincipal",
+    "Action",
+    "NotAction",
+    "Resource",
+    "NotResource",
+    "Condition",
+];
+
+/// The one top-level element the IAM JSON policy language documents as REQUIRED: the
+/// `Statement` element, which holds the permissions the document grants. `Version` and `Id`
+/// are both optional, so this is the only name a policy object must carry.
+pub const REQUIRED_POLICY_ELEMENT: &str = "Statement";
+
+/// What a document a service ATTACHES to one of its resources failed to be.
+///
+/// The reading of the validator those services run, stated as one clause per variant in the
+/// order that validator reads them. It is stricter than the grammar above in two places,
+/// because that validator is: the document's members must be names the language DEFINES
+/// (the grammar reads which elements are present, not whether a name is one at all), and it
+/// must declare a version string (the language lets a document omit `Version`, which is why
+/// [`PolicyDefect`] does not require one). Every other clause the grammar states — a
+/// statement's effect, its action, its principal — is [`resource_policy_defect`]'s, applied
+/// beside this one by a service that wants it.
+///
+/// Unlike [`PolicyDefect`], each variant carries AWS's own sentence for its clause
+/// ([`Self::message`]), because AWS words these identically wherever a service attaches a
+/// policy document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachedPolicyDefect {
+    /// The text does not open a JSON object, or is not JSON at all: a policy document's
+    /// top-level elements are an object's members, so a text opening with anything else —
+    /// an array, a scalar, whitespace, or no byte at all — carries no policy.
+    NotAPolicyObject,
+    /// A member name the language does not define, at the document's top level
+    /// ([`POLICY_ELEMENTS`]) or inside one of its statements ([`STATEMENT_ELEMENTS`]),
+    /// carried as submitted because AWS's sentence for this clause names it.
+    UnknownElement(String),
+    /// The document carries none of the element the language requires
+    /// ([`REQUIRED_POLICY_ELEMENT`]). A document carrying an EMPTY statement list carries
+    /// that element, so it is not missing it — whether the element names any statement is
+    /// [`PolicyDefect::NoStatement`].
+    MissingElement(&'static str),
+    /// The document declares no `Version` of [`POLICY_VERSIONS`] — including declaring none
+    /// at all.
+    UndefinedVersion,
+    /// An action element names a value the language cannot read as an action
+    /// ([`readable_action`]), or that the owning service cannot grant.
+    UnreadableAction,
+}
+
+impl AttachedPolicyDefect {
+    /// How AWS words this clause in the malformed-document refusal it answers a document
+    /// breaking it with. Only the two element clauses carry anything of the document — the
+    /// member name they name; the rest is fixed text.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotAPolicyObject => NOT_A_JSON_POLICY_MESSAGE.to_string(),
+            Self::UnknownElement(name) => format!("Unknown field {name}"),
+            Self::MissingElement(name) => format!("Missing required field {name}"),
+            Self::UndefinedVersion => INVALID_POLICY_VERSION_MESSAGE.to_string(),
+            Self::UnreadableAction => POLICY_INVALID_ACTION_MESSAGE.to_string(),
+        }
+    }
+}
+
+/// The sentence AWS words the refusal of a text that is not a JSON policy object with:
+/// fixed text, carrying nothing of the submitted document. The first BYTE is what it states,
+/// which is why that is what [`attached_policy_defect`] reads.
+pub const NOT_A_JSON_POLICY_MESSAGE: &str =
+    "Policies must be valid JSON and the first byte must be '{'";
+
+/// The sentence AWS words the refusal of a document declaring no version the policy
+/// language defines with: fixed text, carrying nothing of the submitted document.
+pub const INVALID_POLICY_VERSION_MESSAGE: &str = "The policy must contain a valid version string";
+
+/// The sentence AWS words the refusal of a document naming an action it will not read with:
+/// fixed text, carrying nothing of the submitted document.
+pub const POLICY_INVALID_ACTION_MESSAGE: &str = "Policy has invalid action";
+
+/// The first clause of [`AttachedPolicyDefect`] `text` breaks, or `None` for a document the
+/// attaching service stores.
+///
+/// `grantable` is the OWNING service's reading of which actions its resource can grant — an
+/// access point grants its own API's actions, and which namespaces those are is that
+/// service's rule rather than the language's, so it is passed in and applied beside the
+/// language's own reading of an action's form ([`readable_action`]). Pass
+/// `|_| true` to read the form alone.
+///
+/// The document is parsed ONCE here and every clause read off the parsed value, so a
+/// service applying the whole reading does not re-parse it per clause.
+pub fn attached_policy_defect(
+    text: &str,
+    grantable: impl Fn(&str) -> bool,
+) -> Option<AttachedPolicyDefect> {
+    if text.as_bytes().first() != Some(&b'{') {
+        return Some(AttachedPolicyDefect::NotAPolicyObject);
+    }
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(text) else {
+        return Some(AttachedPolicyDefect::NotAPolicyObject);
+    };
+    // The names a document carries. Only the two levels the language ENUMERATES are read:
+    // the names inside a `Condition` block are condition operators and condition keys, and
+    // the names inside a `Principal` are principal types, neither of which the language
+    // fixes.
+    let statements = statements(&document);
+    if let Some(name) = undefined_element_of(&document, &POLICY_ELEMENTS).or_else(|| {
+        statements
+            .iter()
+            .find_map(|statement| undefined_element_of(statement, &STATEMENT_ELEMENTS))
+    }) {
+        return Some(AttachedPolicyDefect::UnknownElement(name));
+    }
+    if !document
+        .as_object()
+        .is_some_and(|members| members.contains_key(REQUIRED_POLICY_ELEMENT))
+    {
+        return Some(AttachedPolicyDefect::MissingElement(
+            REQUIRED_POLICY_ELEMENT,
+        ));
+    }
+    // The version clause, read through the grammar's own reading of which versions exist
+    // plus the one thing this validator adds: a document declaring none declares no valid
+    // one either.
+    if document.get("Version").is_none() || declares_unsupported_version(&document) {
+        return Some(AttachedPolicyDefect::UndefinedVersion);
+    }
+    let unreadable = statements.iter().any(|statement| {
+        ACTION_ELEMENTS
+            .into_iter()
+            .any(|key| statement.get(key).is_some_and(element_names_no_action))
+    });
+    let ungrantable = statements
+        .iter()
+        .flat_map(|statement| {
+            ACTION_ELEMENTS
+                .into_iter()
+                .filter_map(|key| statement.get(key))
+                .flat_map(element_values)
+                .collect::<Vec<String>>()
+        })
+        .any(|action| !grantable(&action));
+    (unreadable || ungrantable).then_some(AttachedPolicyDefect::UnreadableAction)
+}
+
+/// The first member name `value` carries that is not one of `defined`, or `None` for a
+/// value that carries only defined names — or that is not an object at all.
+fn undefined_element_of(value: &::serde_json::Value, defined: &[&str]) -> Option<String> {
+    value
+        .as_object()?
+        .keys()
+        .find(|name| !defined.contains(&name.as_str()))
+        .cloned()
+}
+
+/// The statement elements that name ACTIONS: the action element and its complement.
+const ACTION_ELEMENTS: [&str; 2] = ["Action", "NotAction"];
+
+/// The one value an IAM action element may name BESIDE a `<service>:<action>` pair: the
+/// wildcard that stands for every action, which the language admits wherever an action is
+/// named.
+pub const ANY_ACTION: &str = "*";
+
+/// Whether `value` is an action the IAM policy language can READ: [`ANY_ACTION`], or a
+/// `<service>:<action>` pair whose service namespace and action name are both non-empty
+/// and written in the characters each is written in.
+///
+/// A service namespace is written in lowercase letters, digits and hyphens (`s3`,
+/// `s3-object-lambda`, `elasticloadbalancing`); an action name is written in letters and
+/// digits, and may carry the `*` and `?` wildcards the language admits inside it
+/// (`s3:Get*`). Neither half is read for CASE — IAM reads an action name
+/// case-insensitively — and neither is read against which actions a service publishes:
+/// that catalogue is the service's, not the language's.
+#[must_use]
+pub fn readable_action(value: &str) -> bool {
+    if value == ANY_ACTION {
+        return true;
+    }
+    let Some((namespace, action)) = value.split_once(':') else {
+        return false;
+    };
+    let namespace_character = |character: char| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+    };
+    let action_character =
+        |character: char| character.is_ascii_alphanumeric() || matches!(character, '*' | '?');
+    !namespace.is_empty()
+        && namespace.chars().all(namespace_character)
+        && !action.is_empty()
+        && action.chars().all(action_character)
+}
+
+/// Whether `element` — an action element that is present — names something other than one
+/// action or a non-empty list of them.
+fn element_names_no_action(element: &::serde_json::Value) -> bool {
+    match element {
+        ::serde_json::Value::String(value) => !readable_action(value),
+        ::serde_json::Value::Array(entries) => {
+            entries.is_empty() || entries.iter().any(element_names_no_action)
+        }
+        _ => true,
     }
 }
 
@@ -891,6 +1116,281 @@ mod tests {
                 defect,
                 Some(PolicyDefect::NotJson),
                 "case {case:?}: text that is not JSON is not a policy, got {defect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_attaching_validator_reports_the_first_clause_a_document_breaks() {
+        // The rows differ along what each clause generalises over: the first byte
+        // and JSON type of the text, which undefined member name is carried and
+        // at which level, which defined names a document carries beside the
+        // required one, how a version string fails to be one, and the JSON form
+        // an action element takes.
+        let rows: [(&str, String, Option<AttachedPolicyDefect>); 29] = [
+            ("one statement, every clause met", policy(STATEMENT), None),
+            (
+                "a statement written as the object itself",
+                format!("{{\"Version\":\"2012-10-17\",\"Statement\":{STATEMENT}}}"),
+                None,
+            ),
+            (
+                "every top-level name the language defines",
+                format!("{{\"Version\":\"2008-10-17\",\"Id\":\"one\",\"Statement\":[{STATEMENT}]}}"),
+                None,
+            ),
+            (
+                "every statement name the language defines",
+                policy(
+                    "{\"Sid\":\"s\",\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                     \"NotPrincipal\":\"*\",\"Action\":\"svc:A\",\"NotAction\":\"svc:B\",\
+                     \"Resource\":\"*\",\"NotResource\":\"*\",\
+                     \"Condition\":{\"StringEquals\":{\"aws:PrincipalAccount\":\"1\"}}}",
+                ),
+                None,
+            ),
+            (
+                "a condition operator and key, which the language does not enumerate",
+                policy(
+                    "{\"Effect\":\"Deny\",\"Condition\":{\"ForAnyValue:StringLike\":\
+                     {\"s3:prefix\":\"home/\"}}}",
+                ),
+                None,
+            ),
+            (
+                "a principal type, which the language does not enumerate",
+                policy("{\"Effect\":\"Deny\",\"Principal\":{\"Federated\":\"example.com\"}}"),
+                None,
+            ),
+            (
+                "an EMPTY statement list, which carries the required element",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
+                None,
+            ),
+            (
+                "an array of statements with no document around them",
+                format!("[{STATEMENT}]"),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "a number",
+                "5".to_string(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "a string",
+                "\"hello\"".to_string(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "a boolean",
+                "true".to_string(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "null",
+                "null".to_string(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "no text at all",
+                String::new(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "an object the text does not open with",
+                " {\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "a truncated object",
+                "{\"Statement\":[]".to_string(),
+                Some(AttachedPolicyDefect::NotAPolicyObject),
+            ),
+            (
+                "an undefined name at the document's own level",
+                format!("{{\"hello\":\"world\",\"Version\":\"2012-10-17\",\"Statement\":[{STATEMENT}]}}"),
+                Some(AttachedPolicyDefect::UnknownElement("hello".to_string())),
+            ),
+            (
+                "a statement element written at the document's level",
+                format!("{{\"Effect\":\"Allow\",\"Version\":\"2012-10-17\",\"Statement\":[{STATEMENT}]}}"),
+                Some(AttachedPolicyDefect::UnknownElement("Effect".to_string())),
+            ),
+            (
+                "a misspelled statement list",
+                "{\"Statements\":[]}".to_string(),
+                Some(AttachedPolicyDefect::UnknownElement("Statements".to_string())),
+            ),
+            (
+                "an undefined name inside the only statement",
+                policy("{\"Effect\":\"Deny\",\"Comment\":\"why\"}"),
+                Some(AttachedPolicyDefect::UnknownElement("Comment".to_string())),
+            ),
+            (
+                "an undefined name inside the second statement",
+                policy(&format!(
+                    "{STATEMENT},{{\"Effect\":\"Deny\",\"Actions\":\"svc:A\"}}"
+                )),
+                Some(AttachedPolicyDefect::UnknownElement("Actions".to_string())),
+            ),
+            (
+                "an object declaring nothing",
+                "{}".to_string(),
+                Some(AttachedPolicyDefect::MissingElement("Statement")),
+            ),
+            (
+                "a version and nothing else",
+                "{\"Version\":\"2012-10-17\"}".to_string(),
+                Some(AttachedPolicyDefect::MissingElement("Statement")),
+            ),
+            (
+                "a version and an id but no statement",
+                "{\"Version\":\"2012-10-17\",\"Id\":\"one\"}".to_string(),
+                Some(AttachedPolicyDefect::MissingElement("Statement")),
+            ),
+            (
+                "no version at all",
+                format!("{{\"Statement\":[{STATEMENT}]}}"),
+                Some(AttachedPolicyDefect::UndefinedVersion),
+            ),
+            (
+                "a version date the language does not define",
+                format!("{{\"Version\":\"2024-01-01\",\"Statement\":[{STATEMENT}]}}"),
+                Some(AttachedPolicyDefect::UndefinedVersion),
+            ),
+            (
+                "the current version without its separators",
+                format!("{{\"Version\":\"20121017\",\"Statement\":[{STATEMENT}]}}"),
+                Some(AttachedPolicyDefect::UndefinedVersion),
+            ),
+            (
+                "a version that is not a string",
+                format!("{{\"Version\":2012,\"Statement\":[{STATEMENT}]}}"),
+                Some(AttachedPolicyDefect::UndefinedVersion),
+            ),
+            (
+                "one unreadable action in a list of two",
+                policy("{\"Effect\":\"Deny\",\"Action\":[\"svc:A\",\"nope\"]}"),
+                Some(AttachedPolicyDefect::UnreadableAction),
+            ),
+            (
+                "an action element naming nothing at all",
+                policy("{\"Effect\":\"Deny\",\"NotAction\":[]}"),
+                Some(AttachedPolicyDefect::UnreadableAction),
+            ),
+        ];
+        for (case, document, defect) in rows {
+            let found = attached_policy_defect(&document, |_| true);
+            assert_eq!(
+                found, defect,
+                "case {case:?}: expected {defect:?}, got {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_attaching_clause_is_worded_with_its_own_sentence() {
+        for (defect, sentence) in [
+            (
+                AttachedPolicyDefect::NotAPolicyObject,
+                NOT_A_JSON_POLICY_MESSAGE.to_string(),
+            ),
+            (
+                AttachedPolicyDefect::UnknownElement("hello".to_string()),
+                "Unknown field hello".to_string(),
+            ),
+            (
+                AttachedPolicyDefect::MissingElement("Statement"),
+                "Missing required field Statement".to_string(),
+            ),
+            (
+                AttachedPolicyDefect::UndefinedVersion,
+                INVALID_POLICY_VERSION_MESSAGE.to_string(),
+            ),
+            (
+                AttachedPolicyDefect::UnreadableAction,
+                POLICY_INVALID_ACTION_MESSAGE.to_string(),
+            ),
+        ] {
+            assert_eq!(
+                defect.message(),
+                sentence,
+                "case {defect:?}: expected the clause's own sentence"
+            );
+        }
+    }
+
+    #[test]
+    fn the_owning_service_decides_which_actions_its_resource_can_grant() {
+        // The language reads an action's FORM; which actions the resource can
+        // grant is the attaching service's own reading, passed in. One row per
+        // element form, so the closure is applied through every one of them.
+        let grantable = |action: &str| action.starts_with("svc:");
+        for (case, document, defect) in [
+            (
+                "an action the service grants",
+                policy("{\"Effect\":\"Allow\",\"Action\":\"svc:A\"}"),
+                None,
+            ),
+            (
+                "an action of another service",
+                policy("{\"Effect\":\"Allow\",\"Action\":\"other:A\"}"),
+                Some(AttachedPolicyDefect::UnreadableAction),
+            ),
+            (
+                "one of each in a list",
+                policy("{\"Effect\":\"Allow\",\"Action\":[\"svc:A\",\"other:A\"]}"),
+                Some(AttachedPolicyDefect::UnreadableAction),
+            ),
+            (
+                "another service's action in the complement element",
+                policy("{\"Effect\":\"Deny\",\"NotAction\":\"other:A\"}"),
+                Some(AttachedPolicyDefect::UnreadableAction),
+            ),
+        ] {
+            let found = attached_policy_defect(&document, grantable);
+            assert_eq!(
+                found, defect,
+                "case {case:?}: expected {defect:?}, got {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_is_read_as_a_service_namespace_and_an_action_name() {
+        // The rows differ along the form of the value: the wildcard, a pair, a
+        // pair carrying wildcards in its action name, a missing half, and
+        // characters neither half is written in.
+        let rows: [(&str, &str, bool); 13] = [
+            ("the wildcard", "*", true),
+            ("a pair", "s3:GetObject", true),
+            ("a hyphenated namespace", "s3-object-lambda:GetObject", true),
+            ("a wildcard inside the action name", "s3:Get*", true),
+            ("a wildcard action name", "s3:*", true),
+            ("a single-character wildcard", "s3:GetObjec?", true),
+            ("no namespace at all", "GetObject", false),
+            ("no action name", "s3:", false),
+            ("no namespace before the separator", ":GetObject", false),
+            ("a third field", "s3:GetObject:extra", false),
+            ("a space inside the action name", "s3:Get Object", false),
+            (
+                "an action name written in lower case, which IAM reads case-insensitively",
+                "s3:getObject",
+                true,
+            ),
+            (
+                "an ARN, which names a resource and not an action",
+                "arn:aws:s3:::b",
+                false,
+            ),
+        ];
+        for (case, value, readable) in rows {
+            assert_eq!(
+                readable_action(value),
+                readable,
+                "case {case:?}: expected readable_action({value:?}) == {readable}, got {}",
+                readable_action(value)
             );
         }
     }

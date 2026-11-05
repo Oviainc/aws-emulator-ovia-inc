@@ -144,9 +144,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The document is retained verbatim on the record, so its size is
-        // bounded before anything is stored, and a document that is not JSON at
-        // all is not a resource policy — the same two rules this service
-        // applies to a single-Region access point's policy
+        // bounded before anything is stored, and a document that is not one in
+        // the IAM JSON policy language is not a resource policy — the same two
+        // rules this service applies to a single-Region access point's policy
         // (`crate::ops::put_access_point_policy`).
         if input.details.policy.len() > crate::state::MAX_POLICY_BYTES {
             return Err(crate::state::malformed_policy(&format!(
@@ -155,10 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_POLICY_BYTES
             )));
         }
-        if ::serde_json::from_str::<::serde_json::Value>(&input.details.policy).is_err() {
-            return Err(crate::state::malformed_policy(
-                "it is not a well-formed JSON document",
-            ));
+        if let Some(refusal) = crate::state::access_point_policy_refusal(&input.details.policy) {
+            return Err(refusal);
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

@@ -182,12 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_POLICY_BYTES
             )));
         }
-        // An access point policy is an IAM resource policy, so a document that
-        // is not JSON at all is a malformed policy, not a stored value.
-        if ::serde_json::from_str::<::serde_json::Value>(&input.policy).is_err() {
-            return Err(crate::state::malformed_policy(
-                "it is not a well-formed JSON document",
-            ));
+        // An access point policy is a document in the IAM JSON policy language,
+        // so one that is not a policy at all is a malformed policy rather than a
+        // stored value — the one reading of that language this service applies
+        // wherever it takes a policy document.
+        if let Some(refusal) = crate::state::access_point_policy_refusal(&input.policy) {
+            return Err(refusal);
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

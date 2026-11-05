@@ -87,12 +87,14 @@ fn cases() -> Vec<Case> {
         Case::new(
             "a document carrying XML metacharacters and non-ASCII text",
             "escaped-policy-ap",
-            r#"{"Sid":"a & b <c> \"d\" 'e' — ünïcode"}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Sid":"a & b <c> \"d\" 'e' — ünïcode","Effect":"Deny"}]}"#,
         ),
         Case::new(
+            // Nested through the elements the policy language defines, because a
+            // member it does not define is refused whatever it nests.
             "a deeply nested document",
             "nested-policy-ap",
-            r#"{"a":{"b":{"c":{"d":[1,2,{"e":[[],[{}]]}]}}}}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Condition":{"StringLike":{"s3:prefix":["a","b"]},"Bool":{"aws:SecureTransport":[false]}}}]}"#,
         ),
         Case {
             vpc_id: Some("vpc-0a1b2c3d4e5f67890"),

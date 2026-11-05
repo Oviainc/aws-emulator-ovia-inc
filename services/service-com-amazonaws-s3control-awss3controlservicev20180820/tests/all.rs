@@ -31,6 +31,8 @@ mod access_grants_refusal_identities;
 mod access_point_lifecycle;
 #[path = "all/access_point_policy_delete.rs"]
 mod access_point_policy_delete;
+#[path = "all/access_point_policy_grammar.rs"]
+mod access_point_policy_grammar;
 #[path = "all/access_point_public_access_block_default.rs"]
 mod access_point_public_access_block_default;
 #[path = "all/access_point_reads_and_refusals.rs"]

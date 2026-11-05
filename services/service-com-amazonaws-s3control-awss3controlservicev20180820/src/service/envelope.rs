@@ -48,7 +48,12 @@
 //!   400 it reads as its own bug;
 //! * a request addressing a Storage Lens configuration by an id the wire cannot
 //!   carry is answered as a URI this service could not parse, before an
-//!   operation is named and so before anything is read, written or deleted.
+//!   operation is named and so before anything is read, written or deleted;
+//! * a request addressing a BUCKET in neither form those routes document — the
+//!   bucket's S3 on Outposts ARN, or its name together with the Outpost header
+//!   the REST API requires — is answered the same way, before the request's body
+//!   is read at all: what the caller has to change is the resource it addressed,
+//!   not the document it sent.
 //!
 //! Not every failure travels in the wrapped envelope: the Storage Lens
 //! CONFIGURATION surface answers the refusals of its OWN resource in the FLAT
@@ -168,6 +173,88 @@ const JOBS_PATH: &str = "/v20180820/jobs/";
 /// own name rules and are NOT in this space — the prefix ends in a separator,
 /// so a sibling segment that merely starts with it is not claimed.
 const ACCESS_POINT_PATH: &str = "/v20180820/accesspoint/";
+
+/// The path space a BUCKET is addressed in: every bucket route is
+/// `/v20180820/bucket/{Bucket}` or a sub-resource of it, so what follows this
+/// prefix is the bucket ADDRESS (`smithy_query(query="digest")`). The prefix ends
+/// in a separator, so `GET /v20180820/bucket` — the regional-bucket listing,
+/// which addresses no bucket — is not in this space.
+const BUCKET_PATH: &str = "/v20180820/bucket/";
+
+/// The sub-resources of a bucket this service's routes bind, as the trailing
+/// literal segment of their URI templates (`.../{Bucket}/lifecycleconfiguration`,
+/// `/policy`, `/replication`, `/tagging`, `/versioning`, per
+/// `smithy_query(query="digest")`). What a bucket route's path carries BEFORE one
+/// of these is the bucket's address, whether or not the separators inside it are
+/// percent-encoded.
+const BUCKET_SUB_RESOURCES: [&str; 5] = [
+    "lifecycleconfiguration",
+    "policy",
+    "replication",
+    "tagging",
+    "versioning",
+];
+
+/// The header the REST API carries the Outpost a bucket lives on in. Every
+/// bucket route documents it: "All Amazon S3 on Outposts REST API requests for
+/// this action require an additional parameter of x-amz-outpost-id to be passed
+/// with the request", and `CreateBucket` binds it as its `OutpostId` member
+/// (`smithy_query(query="operation",operation="CreateBucket")`).
+const OUTPOST_ID_HEADER: &str = "x-amz-outpost-id";
+
+/// The bucket address `path` carries and the sub-resource it addresses under it,
+/// or `None` for a path that addresses no bucket.
+///
+/// The address is read as one span rather than one segment: it carries a
+/// URL-encoded ARN, and a client that leaves the ARN's own separators unescaped
+/// writes it across several segments, so the trailing sub-resource segment is
+/// what the address ends before.
+fn bucket_address(path: &str) -> Option<(&str, Option<&str>)> {
+    let rest = path.strip_prefix(BUCKET_PATH)?;
+    let (address, sub_resource) = match rest.rsplit_once('/') {
+        Some((before, last)) if BUCKET_SUB_RESOURCES.contains(&last) => (before, Some(last)),
+        _ => (rest, None),
+    };
+    (!address.is_empty()).then_some((address, sub_resource))
+}
+
+/// Whether this request addresses a bucket in neither form the bucket routes
+/// document, so there is no bucket for the path to address.
+///
+/// Those routes address an S3 on Outposts bucket, and their documentation states
+/// two addressing forms: the bucket's ARN in the label — "you must specify the
+/// ARN of the bucket accessed in the format
+/// arn:aws:s3-outposts:::outpost//bucket/ … The value must be URL encoded" — or
+/// its NAME in the label together with the [`OUTPOST_ID_HEADER`] the REST API
+/// requires ("you must specify the name and the x-amz-outpost-id as well", see
+/// `smithy_query(query="doc",shape="GetBucketRequest",member="Bucket")`). A
+/// request carrying neither names no Outpost, no account and no Region, so the
+/// URI cannot be parsed at all — a different answer from a bucket addressed
+/// properly that merely does not exist.
+///
+/// `CreateBucket` is outside this reading: it is the one bucket route whose
+/// label the model documents as "The name of the bucket", with the Outpost it is
+/// created on carried in its own `OutpostId` member, so a plain name there is
+/// the documented form and is left to that operation.
+///
+/// The escapes are the wire's rather than part of the address, so the span is
+/// percent-decoded the way the codec that deserializes the label would decode it
+/// ([`::service_common::percent_decode_path_label`]) before it is read.
+fn bucket_address_unparsable(req: &RtRequest, path: &str) -> bool {
+    let Some((address, sub_resource)) = bucket_address(path) else {
+        return false;
+    };
+    // `PUT /v20180820/bucket/{Bucket}` is `CreateBucket`, the one route that
+    // takes the bucket's name.
+    if sub_resource.is_none() && req.method().eq_ignore_ascii_case("PUT") {
+        return false;
+    }
+    if req.headers().get(OUTPOST_ID_HEADER).is_some() {
+        return false;
+    }
+    let decoded = ::service_common::percent_decode_path_label(address);
+    !crate::state::addressable_bucket(&decoded)
+}
 
 /// The fixed words the framework's own refusal envelope states a value it READ
 /// and found to break a rule in (`N validation error(s) detected: …`).
@@ -775,6 +862,23 @@ impl ErasedOperation for Dispatch {
                 // names no resource, so the refusal is stated in the service's
                 // own envelope rather than in any resource's.
                 return error_response(Envelope::Wrapped, status, code, message, &[("URI", path)]);
+            }
+            // The same stage for the bucket space: those routes address an S3 on
+            // Outposts bucket, by its ARN or by its name together with the
+            // Outpost header the REST API requires, so a request carrying
+            // neither addresses no bucket at all
+            // ([`bucket_address_unparsable`]) — the path is refused here, before
+            // an operation is named and so before the request's BODY is read,
+            // because what the caller has to change is the resource it
+            // addressed.
+            if bucket_address_unparsable(req, path) {
+                return error_response(
+                    Envelope::Wrapped,
+                    crate::state::INVALID_URI_STATUS,
+                    crate::state::INVALID_URI_CODE,
+                    crate::state::INVALID_URI_MESSAGE,
+                    &[("URI", addressed_resource(path))],
+                );
             }
             // The same stage for the Storage Lens configuration space: an id
             // the wire cannot carry
