@@ -26,6 +26,11 @@ tracing = { workspace = true }
 # services in this workspace mint their ids with.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `service-common` carries the workspace's ONE rendering of a constraint-violation
+# refusal — the counted envelope, the per-class requirement and the `@pattern`
+# expression quoted without its whole-value anchors — which `src/service.rs` states
+# this service's `@pattern` refusals through.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

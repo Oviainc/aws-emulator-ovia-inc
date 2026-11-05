@@ -19,6 +19,8 @@ mod not_found_resource_identifier;
 mod state_roundtrip;
 #[path = "all/timestamp_wire_form.rs"]
 mod timestamp_wire_form;
+#[path = "all/validation_message_wording.rs"]
+mod validation_message_wording;
 #[path = "all/workflow_definition_listing.rs"]
 mod workflow_definition_listing;
 #[path = "all/workflow_lifecycle.rs"]

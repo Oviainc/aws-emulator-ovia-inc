@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The ONE choice this service makes about how a modelled input-constraint refusal is
+/// worded — the `@pattern` class, stated over the expression alone — delegating every
+/// other part of the sentence to the shared home for it. Private: it is reached through
+/// `override_refusal` below, not by a caller.
+mod validation;
+
 /// The `com-amazonaws-novaact-amazonnovaagentsdataplane` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -105,8 +111,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // This service states a `@pattern` requirement over the expression alone —
+        // see [`validation`], which replaces code and message together.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(
