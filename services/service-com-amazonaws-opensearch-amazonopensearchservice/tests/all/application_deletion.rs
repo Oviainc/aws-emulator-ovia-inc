@@ -64,7 +64,7 @@ async fn get_application(emulator: &Emulator, id: &str) -> Answer {
 }
 
 /// `DeleteApplication`: `DELETE /2021-01-01/opensearch/application/{id}`.
-async fn delete_application(emulator: &Emulator, id: &str) -> Answer {
+pub(crate) async fn delete_application(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "DELETE",

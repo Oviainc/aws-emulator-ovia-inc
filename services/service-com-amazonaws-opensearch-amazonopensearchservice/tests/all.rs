@@ -137,6 +137,8 @@ mod instance_type_engine_refusal;
 mod instance_type_limits;
 #[path = "all/migration_listing.rs"]
 mod migration_listing;
+#[path = "all/migration_owner_resolution.rs"]
+mod migration_owner_resolution;
 #[path = "all/migration_source_constraint.rs"]
 mod migration_source_constraint;
 #[path = "all/missing_resource_refusals.rs"]
