@@ -290,10 +290,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Conditional: You must specify only one of the following parameters: TemplateBody
-        // or TemplateURL—or set UsePreviousTemplate to true." The RULE is the model's; no
-        // recording of this suite carries AWS's own sentence for the none/both cases, so the
-        // refusal states the condition the model documents, worded as `UpdateStack` words the
-        // same condition in this crate.
+        // or TemplateURL—or set UsePreviousTemplate to true." A request carrying the template
+        // BOTH by value and by reference states two templates, which is the condition every
+        // operation whose input carries that pair is held to, in the one place that owns it;
+        // every other way of not naming exactly one source states the condition the model
+        // documents, worded as `UpdateStack` words the same condition in this crate.
+        crate::state::validate_one_template_source(
+            input.template_body.as_deref(),
+            input.template_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let template_sources = [
             input.template_body.is_some(),
             input.template_url.is_some(),

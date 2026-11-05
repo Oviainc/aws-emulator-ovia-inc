@@ -319,7 +319,10 @@ fn cases() -> Vec<Case> {
             .to_string(),
             description: None,
             parameters: Vec::new(),
-            capabilities: Vec::new(),
+            // A template that invokes a macro requires the macro acknowledgement, and the
+            // reason names RESOURCES, of which this template declares none that requires
+            // anything.
+            capabilities: vec!["CAPABILITY_AUTO_EXPAND"],
             reason_types: Vec::new(),
             transforms: vec!["AWS::Serverless-2016-10-31"],
         },
@@ -333,7 +336,7 @@ fn cases() -> Vec<Case> {
             .to_string(),
             description: None,
             parameters: Vec::new(),
-            capabilities: Vec::new(),
+            capabilities: vec!["CAPABILITY_AUTO_EXPAND"],
             reason_types: Vec::new(),
             transforms: vec!["AWS::Include", "MyMacro"],
         },
@@ -353,7 +356,7 @@ fn cases() -> Vec<Case> {
                 .to_string(),
             description: Some("A serverless role"),
             parameters: vec![parameter("Stage", Some("dev"), false, None)],
-            capabilities: vec!["CAPABILITY_NAMED_IAM"],
+            capabilities: vec!["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
             reason_types: vec!["AWS::IAM::Role"],
             transforms: vec!["AWS::Serverless-2016-10-31"],
         },
@@ -617,17 +620,17 @@ async fn a_description_at_its_documented_bound_is_reported() {
 }
 
 #[tokio::test]
-async fn template_body_wins_when_both_are_passed() {
+async fn a_request_naming_both_a_body_and_a_url_is_refused() {
     let router = router();
-    // "Conditional: You must pass TemplateURL or TemplateBody. If both are passed, only
-    // TemplateBody is used."
+    // A template reaches this operation one of two ways, and a request stating BOTH states
+    // two templates — so the verdict is a refusal rather than a verdict on one of them.
     let (status, body) = call(
         &router,
         "ValidateTemplate",
         &[
             member(
                 "TemplateBody",
-                r#"{"Description": "The body that is used",
+                r#"{"Description": "A body beside a reference",
                     "Resources": {"Q": {"Type": "AWS::SQS::Queue"}}}"#,
             ),
             member("TemplateURL", "https://s3.amazonaws.com/a-bucket/other.json"),
@@ -635,13 +638,19 @@ async fn template_body_wins_when_both_are_passed() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case \"both TemplateBody and TemplateURL\": expected 200, got {status} {body}"
+        status, 400,
+        "case \"both TemplateBody and TemplateURL\": expected the request refused, got \
+         {status} {body}"
     );
     assert_eq!(
-        xml_text(&outside_parameters(&body), "Description").as_deref(),
-        Some("The body that is used"),
-        "case \"both TemplateBody and TemplateURL\": expected the body's own Description, \
+        xml_text(&body, "Code").as_deref(),
+        Some("ValidationError"),
+        "case \"both TemplateBody and TemplateURL\": expected a ValidationError, got {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "Message").as_deref(),
+        Some("You cannot specify both Template URL and Template Body."),
+        "case \"both TemplateBody and TemplateURL\": expected the service's own sentence, \
          got {body}"
     );
 }

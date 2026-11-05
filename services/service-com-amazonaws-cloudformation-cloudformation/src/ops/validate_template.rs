@@ -11,11 +11,9 @@
 //! What it refuses is a matter of FORM: "CloudFormation first checks if the template is
 //! valid JSON. If it isn't, CloudFormation checks if the template is valid YAML. If both
 //! these checks fail, CloudFormation returns a template validation error" — that, a body
-//! declaring no resource, and a `Description` past its documented maximum. It does NOT
-//! consult the resource-type registry: a template declaring a resource type CloudFormation
-//! does not recognise is well-formed, and that type is what refuses the stack OPERATION
-//! submitting it (`CreateStack`, `UpdateStack`, `CreateChangeSet`; see
-//! [`crate::state::resource_types`]), not this verdict on the body.
+//! declaring no resource, a `Description` past its documented maximum, and a resource type
+//! CloudFormation does not recognise, which is a template-format error here exactly as it is
+//! for every other operation that reads a body ([`crate::state::resource_types`]).
 //!
 //! A `TemplateURL` says WHERE that body is rather than what it means, so the object it
 //! addresses is read from this emulator's own Amazon S3 and the verdict is given on it
@@ -163,9 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A verdict on the REQUEST's template body: this operation reads no stored
         // resource and writes none.
         let _ = &self.engine;
-        // "Conditional: You must pass TemplateURL or TemplateBody. If both are passed,
-        // only TemplateBody is used" (`ValidateTemplateInput$TemplateBody`).
-        //
+        // "Conditional: You must pass TemplateURL or TemplateBody" — and one of them, not
+        // both: a request carrying a body AND a reference states two templates, so there is
+        // no one body to give a verdict on. The condition and its wording come from the one
+        // place that owns them (`crate::state::validate_one_template_source`).
+        crate::state::validate_one_template_source(
+            input.template_body.as_deref(),
+            input.template_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // A `TemplateURL` says WHERE the body is, not what it means: the object it
         // addresses is read from this emulator's own Amazon S3 and the verdict below is
         // given on it exactly as on an inline body (`crate::state::template_url`).
@@ -227,19 +231,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 template::MAX_DESCRIPTION_BYTES
             )));
         }
-        // No resource-type check here, deliberately: this operation's documented scope is
-        // the body's FORM ("CloudFormation first checks if the template is valid JSON. If
-        // it isn't, CloudFormation checks if the template is valid YAML"), and a template
-        // declaring a type CloudFormation does not recognise is still well-formed. That
-        // type is refused by the operations that submit the template for DEPLOYMENT, which
-        // are the ones that consult the resource-type registry
-        // (`crate::state::resource_types`).
-        //
-        // The template-VALIDATION rules, on the other hand, are each decided from the
-        // document alone — a function no template may use, an intrinsic spelled with the
-        // wrong arguments, a name the template does not declare, a dependency cycle — so
-        // they are this operation's verdict too, and the body is held to exactly the pass
-        // the operations that SUBMIT one hold it to, worded identically
+        // A resource type CloudFormation does not recognise is a template-FORMAT error, and
+        // this verdict on the body is held to the same catalogue the operations that SUBMIT
+        // a body for deployment hold it to, worded identically: a client validating a
+        // template before a stack operation is told what that operation would refuse
+        // (`crate::state::resource_types`). A template declaring a `Transform` is held to no
+        // catalogue at all, which is the rule that one place owns.
+        crate::state::validate_resource_types(template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The template-VALIDATION rules are each decided from the document alone — a
+        // function no template may use, an intrinsic spelled with the wrong arguments, a name
+        // the template does not declare, a dependency cycle — so they are this operation's
+        // verdict too, and the body is held to exactly the pass the operations that SUBMIT
+        // one hold it to, worded identically
         // (`crate::state::template_validation`). The values in force are the template's own
         // `Default`s, which is every value a request carrying nothing but a body fixes.
         let parameters: ::std::collections::BTreeMap<String, String> =
@@ -255,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(ctx.parts()),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        let required = template::required_capabilities(&template);
+        let required = crate::state::template_summary::required_capabilities(template_body, &template);
         Ok(ValidateTemplateOutput {
             // One `TemplateParameter` per parameter the template declares, carrying what
             // the declaration says: a template declaring no `Parameters` section reports
@@ -278,8 +282,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The description found within the template."
             description: template.description.clone(),
             // "The capabilities found within the template": reported only where the
-            // template declares something that has to be acknowledged, together with the
-            // resources that generated them.
+            // template declares something that has to be acknowledged — its IAM resources
+            // and the macros it invokes — together with the resources that generated them
+            // (`crate::state::template_summary`).
             capabilities: (!required.capabilities.is_empty()).then_some(required.capabilities),
             capabilities_reason: required.reason,
             // "A list of the transforms that are declared in the template."

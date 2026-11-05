@@ -147,7 +147,8 @@ struct Case {
     /// The resource types `CapabilitiesReason` must name, sorted; empty when the response
     /// must carry no reason at all.
     reason_types: Vec<&'static str>,
-    /// Every resource type the template defines, without repetition, in wire order.
+    /// Every resource type the template defines, without repetition, sorted by name — the
+    /// order a summary reports the SET of types in, whatever order the body declares them.
     resource_types: Vec<&'static str>,
     transforms: Vec<&'static str>,
 }
@@ -217,8 +218,8 @@ fn cases() -> Vec<Case> {
             resource_types: vec![
                 "AWS::S3::Bucket",
                 "AWS::S3Tables::TableBucket",
-                "AWS::S3Vectors::VectorBucket",
                 "AWS::S3Vectors::Index",
+                "AWS::S3Vectors::VectorBucket",
             ],
             transforms: Vec::new(),
         },
@@ -326,7 +327,9 @@ fn cases() -> Vec<Case> {
             description: None,
             metadata: None,
             parameters: Vec::new(),
-            capabilities: Vec::new(),
+            // A template that invokes a macro requires the macro acknowledgement; the reason
+            // names RESOURCES, of which this template declares none that requires anything.
+            capabilities: vec!["CAPABILITY_AUTO_EXPAND"],
             reason_types: Vec::new(),
             resource_types: vec!["AWS::S3::Bucket"],
             transforms: vec!["MyFirstMacro", "MySecondMacro"],
@@ -342,7 +345,7 @@ fn cases() -> Vec<Case> {
             description: None,
             metadata: None,
             parameters: Vec::new(),
-            capabilities: Vec::new(),
+            capabilities: vec!["CAPABILITY_AUTO_EXPAND"],
             reason_types: Vec::new(),
             resource_types: vec!["AWS::SNS::Topic"],
             transforms: vec!["MyMacro"],
@@ -412,7 +415,8 @@ async fn get_template_summary_reports_what_the_template_declares() {
         assert_eq!(
             wire_list(&body, "ResourceTypes"),
             case.resource_types,
-            "case {label:?}: expected every declared resource type once, got {body}"
+            "case {label:?}: expected the sorted set of every declared resource type, got \
+             {body}"
         );
         assert_eq!(
             wire_list(&body, "DeclaredTransforms"),

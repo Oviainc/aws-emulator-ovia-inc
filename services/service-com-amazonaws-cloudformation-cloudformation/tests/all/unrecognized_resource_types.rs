@@ -25,9 +25,10 @@
 //! resources at all.
 //!
 //! The same rule is then driven through the other operations that submit a template for
-//! deployment — `CreateChangeSet` and `UpdateStack` — and `ValidateTemplate`, whose
-//! documented scope is the body's FORM, is held to the opposite: it answers a verdict for a
-//! well-formed template whatever types it declares.
+//! deployment — `CreateChangeSet` and `UpdateStack` — and through `ValidateTemplate`, whose
+//! whole answer IS a verdict on the body: a template declaring a type CloudFormation does
+//! not recognise is refused there too, with the same sentence, so a client validating a body
+//! before a stack operation is told what that operation would refuse.
 
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::{
     is_published, is_recognized, AWS_RESOURCE_TYPES,
@@ -373,12 +374,12 @@ async fn create_stack_is_held_to_the_published_resource_type_catalogue() {
     }
 }
 
-/// `ValidateTemplate` is NOT held to the catalogue: its documented scope is whether the
-/// body is valid JSON or YAML, and a template declaring an unrecognised type is still
-/// well-formed — the type is what refuses the stack operation that submits it, not this
-/// verdict on the body.
+/// `ValidateTemplate` is held to the SAME catalogue: its whole answer is a verdict on the
+/// body, so a template declaring a type CloudFormation does not recognise is refused with
+/// the same sentence the operations that submit one answer, and a body whose every type is
+/// recognised is reported on.
 #[tokio::test]
-async fn validate_template_reports_on_the_form_of_the_body_not_its_resource_types() {
+async fn validate_template_is_held_to_the_same_catalogue_as_a_submitted_template() {
     let router = router();
     for case in cases() {
         // A body that declares no resource at all is refused by ValidateTemplate's own
@@ -393,12 +394,16 @@ async fn validate_template_reports_on_the_form_of_the_body_not_its_resource_type
             &[member("TemplateBody", &case.template)],
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected ValidateTemplate to answer a verdict on a well-formed \
-             template whatever types it declares, got {status} with body {body}",
-            case.case
-        );
+        if case.unrecognized.is_empty() {
+            assert_eq!(
+                status, 200,
+                "case {:?}: expected ValidateTemplate to report on a template whose every \
+                 type is recognised, got {status} with body {body}",
+                case.case
+            );
+            continue;
+        }
+        assert_refused(case.case, status, &body, case.unrecognized);
     }
 }
 

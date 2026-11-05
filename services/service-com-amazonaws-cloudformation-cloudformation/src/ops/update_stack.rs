@@ -431,7 +431,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Conditional: You must specify only one of the following parameters:
-        // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true."
+        // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true." A request
+        // carrying the template BOTH by value and by reference states two templates, which
+        // is the condition every operation whose input carries that pair is held to, in the
+        // one place that owns it; every other way of not naming exactly one source is the
+        // three-way condition this input documents.
+        crate::state::validate_one_template_source(
+            input.template_body.as_deref(),
+            input.template_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let template_sources = [
             input.template_body.is_some(),
             input.template_url.is_some(),

@@ -23,9 +23,11 @@
 //!   a section the transform does not define it for;
 //! * an intrinsic function whose arguments are not the ones it takes is refused for its own
 //!   arity, as is a condition's boolean operator;
-//! * a `Ref` or an `Fn::GetAtt` naming something the template does not declare, and a
-//!   `Condition` naming a condition it does not declare, are unresolved DEPENDENCIES: the
-//!   section they appear in is named, because that is where the author has to look;
+//! * a `Ref` naming something the template does not declare, and a `Condition` naming a
+//!   condition it does not declare, are unresolved DEPENDENCIES: the section they appear in
+//!   is named, because that is where the author has to look — while an `Fn::GetAtt` reading
+//!   an attribute off a resource the template does not declare is reported for the FUNCTION
+//!   instance that read it;
 //! * an `Fn::FindInMap` whose keys the `Mappings` section does not carry resolves to
 //!   nothing — unless the lookup names a `DefaultValue` to fall back to;
 //! * and a dependency CYCLE among the declared resources is refused, since no creation
@@ -100,6 +102,14 @@ pub fn refusal(
     if let Some(message) = parameter_name_refusal(&document) {
         return Some(message);
     }
+    // A parameter's `Default` is the value in force when the request passes none ("a value of
+    // the appropriate type for the template to use if no value is specified"), so the
+    // declaration itself is refused where that value is not one the parameter's own
+    // `AllowedValues` admits — "an array containing the list of values allowed for the
+    // parameter" is the set every value of it has to come from, the default included.
+    if let Some(message) = parameter_default_refusal(body) {
+        return Some(message);
+    }
     // The directives are read from the SUBMITTED document: whether a template uses one is a
     // question about what the author wrote, not about what the expansion left behind.
     let declares_extensions = template::body_declared_transforms(body)
@@ -149,6 +159,51 @@ fn parameter_name_refusal(document: &Value) -> Option<String> {
     Some(format!(
         "Template format error: Parameter name {name} is non alphanumeric."
     ))
+}
+
+/// `Some(message)` for a parameter whose declared `Default` is not a value its own
+/// `AllowedValues` admits, naming the parameter whose declaration it is.
+///
+/// A declaration permitting any value of its type (no `AllowedValues`) and one stating no
+/// `Default` are both consistent: there is no value to hold to a set. A LIST-typed parameter
+/// states several values in one default — "CommaDelimitedList: an array of literal strings
+/// that are separated by commas" — and each of them has to be admitted, since each is a value
+/// of that parameter.
+fn parameter_default_refusal(body: &str) -> Option<String> {
+    let declared = template::parse(body)?;
+    let off = declared.parameters.iter().find(|parameter| {
+        let Some(default) = parameter.default.as_deref() else {
+            return false;
+        };
+        if parameter.allowed_values.is_empty() {
+            return false;
+        }
+        declared_values(parameter, default)
+            .any(|value| !parameter.allowed_values.iter().any(|allowed| allowed == value))
+    })?;
+    Some(format!(
+        "Parameter '{}' must be one of AllowedValues",
+        off.key
+    ))
+}
+
+/// The values one parameter's `Default` puts in force: the whole text for a scalar parameter,
+/// and each comma-separated entry for a list-typed one (`CommaDelimitedList` and every
+/// `List<…>` type), whose value IS that array.
+fn declared_values<'a>(
+    parameter: &template::DeclaredParameter,
+    default: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    let listed = parameter
+        .declared_type
+        .as_deref()
+        .is_some_and(|declared_type| declared_type.contains("List"));
+    let values: Vec<&str> = if listed {
+        default.split(',').map(str::trim).collect()
+    } else {
+        vec![default]
+    };
+    values.into_iter()
 }
 
 /// What an expression inside a template resolves against where the REQUEST decides it.
@@ -586,11 +641,13 @@ fn unresolved_in(
                         }
                     }
                     // "Fn::GetAtt returns the value of an attribute from a resource in the
-                    // template": the first argument names a RESOURCE, never a parameter.
+                    // template": the first argument names a RESOURCE, never a parameter, and
+                    // a name the template declares no resource under is reported for the
+                    // INTRINSIC that read it.
                     (template::FN_GET_ATT, argument) => {
                         if let Some(name) = get_att_resource(argument) {
                             if !declared.resources.contains(name) {
-                                return Some(unresolved_dependency_in(name, section));
+                                return Some(get_att_undefined_resource(name));
                             }
                         }
                     }
@@ -683,6 +740,17 @@ fn unresolved_dependency_in(name: &str, section: &str) -> String {
         "Template format error: Unresolved resource dependencies [{name}] in the {section} \
          block of the template"
     )
+}
+
+/// How an `Fn::GetAtt` reading an attribute off a resource the template does not declare is
+/// refused.
+///
+/// This is a TEMPLATE error rather than a template-FORMAT one, and it names the function
+/// rather than the section: the document is well formed and the reference is well spelled —
+/// what is wrong is the resource the instance of the function names, which is the one thing
+/// the message states.
+fn get_att_undefined_resource(name: &str) -> String {
+    format!("Template error: instance of Fn::GetAtt references undefined resource {name}")
 }
 
 /// How a reference to a condition the template does not declare is refused.

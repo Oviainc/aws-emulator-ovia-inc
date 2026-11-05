@@ -78,6 +78,10 @@ const REVISED_TEMPLATE: &str = r#"{"Parameters":{"Shown":{"Type":"String","Defau
 const ONE_TEMPLATE_SOURCE: &str =
     "You must specify exactly one of TemplateBody, TemplateURL or UsePreviousTemplate";
 
+/// The refusal for a request that names the template BOTH by value and by reference, spelled
+/// out here for the same reason.
+const BOTH_TEMPLATE_SOURCES: &str = "You cannot specify both Template URL and Template Body.";
+
 /// A `TemplateURL` for the rows that name a second template source: the refusal for naming
 /// more than one is answered before anything is fetched, so what the URL addresses never
 /// matters to those rows.
@@ -605,10 +609,20 @@ async fn an_update_must_name_exactly_one_source_for_its_template() {
             Some("ValidationError"),
             "case {case:?}: expected <Code>ValidationError</Code>, got {body}"
         );
+        // A row naming the template BOTH by value and by reference states two templates,
+        // which is the refusal every operation that takes that pair gives it; every other
+        // way of not naming exactly one source states the three-way condition.
+        let names_both = source.members.iter().any(|(key, _)| *key == "TemplateBody")
+            && source.members.iter().any(|(key, _)| *key == "TemplateURL");
+        let expected = if names_both {
+            BOTH_TEMPLATE_SOURCES
+        } else {
+            ONE_TEMPLATE_SOURCE
+        };
         assert_eq!(
             message.as_deref(),
-            Some(ONE_TEMPLATE_SOURCE),
-            "case {case:?}: expected {ONE_TEMPLATE_SOURCE:?}, got {message:?}"
+            Some(expected),
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 }

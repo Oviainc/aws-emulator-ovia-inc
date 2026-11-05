@@ -90,8 +90,11 @@
 use super::types::*;
 
 /// The two `TemplateStage` enum values (model shape `TemplateStage`).
-const TEMPLATE_STAGE_ORIGINAL: &str = "Original";
-const TEMPLATE_STAGE_PROCESSED: &str = "Processed";
+///
+/// Reachable from the service's own refusal wording, which states this value set in the
+/// order CloudFormation states it (`crate::service`), so the two spellings cannot drift.
+pub(crate) const TEMPLATE_STAGE_ORIGINAL: &str = "Original";
+pub(crate) const TEMPLATE_STAGE_PROCESSED: &str = "Processed";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

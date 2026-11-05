@@ -116,12 +116,24 @@ const REGISTRATION_STATUS_VALUE_SET: &[&str] = &[
     registry::registration_status::FAILED,
 ];
 
+/// `TemplateStage`, in the order CloudFormation's OWN input validation lists its value set:
+/// the stage CloudFormation DEPLOYS first, then the one the template was submitted as.
+///
+/// That is not the order the model declares the enum in
+/// (`smithy_query(query="shape", shape="TemplateStage")` gives `[Original, Processed]`) — so a
+/// value outside the set is refused from this order rather than from the declaration.
+const TEMPLATE_STAGE_VALUE_SET: &[&str] = &[
+    crate::ops::get_template::TEMPLATE_STAGE_PROCESSED,
+    crate::ops::get_template::TEMPLATE_STAGE_ORIGINAL,
+];
+
 /// Every enum of this service whose value set its own refusals state in an order other than
 /// the model's declaration order.
 ///
 /// Keyed by the SET rather than by an operation or a member, so each entry governs every
 /// member that targets that enum and one refusal cannot drift from another's.
-const SERVICE_ORDERED_ENUM_VALUE_SETS: &[&[&str]] = &[REGISTRATION_STATUS_VALUE_SET];
+const SERVICE_ORDERED_ENUM_VALUE_SETS: &[&[&str]] =
+    &[REGISTRATION_STATUS_VALUE_SET, TEMPLATE_STAGE_VALUE_SET];
 
 /// The order this service states `allowed` in, when it is one of the sets
 /// [`SERVICE_ORDERED_ENUM_VALUE_SETS`] names — compared as a SET, so the model's declaration

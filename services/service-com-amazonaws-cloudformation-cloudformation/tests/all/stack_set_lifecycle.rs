@@ -634,7 +634,7 @@ async fn a_request_naming_no_template_or_two_is_refused() {
                 member("TemplateURL", "https://example.s3.amazonaws.com/t.json"),
             ],
             expected_status: 400,
-            expected_message: "You cannot specify both TemplateBody and TemplateURL",
+            expected_message: "You cannot specify both Template URL and Template Body.",
         },
         Row {
             // A `TemplateURL` is resolved by reading the object it addresses out of this

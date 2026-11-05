@@ -816,7 +816,7 @@ async fn a_request_that_cannot_describe_a_refactor_is_refused() {
             }],
             mappings: Vec::new(),
             code: "ValidationError",
-            names: "TemplateURL",
+            names: "Template URL",
         },
         RefusalCase {
             // One past the bound on what ONE record may carry.

@@ -31,7 +31,15 @@
 //! (`https://s3.<region>.amazonaws.com/<bucket>/<key>`), with the `?versionId=` a versioned
 //! object is addressed by. A host that names no S3 service label at all is read path-style
 //! too: a client addressing this emulator through an endpoint of its own still names its
-//! bucket in the first path segment, and the host is not what the object is read from.
+//! bucket in the first path segment, and the host is not what the object is read from. The
+//! one Amazon S3 endpoint a template may NOT be read from is a bucket's static WEBSITE
+//! endpoint — "URLs from S3 static websites are not supported" — which is refused for the
+//! endpoint it is, before the URL is read for an object at all ([`names_s3_website`]).
+//!
+//! Text that addresses no object is likewise refused for what it is: text that is no Amazon
+//! S3 location at all (a scheme the documentation does not allow, a host naming neither
+//! addressing style and carrying no object in its path) is not a SUPPORTED url, while an
+//! Amazon S3 endpoint carrying no bucket and key references no object ([`object`]).
 //!
 //! A member whose own model admits the direct `s3://<bucket>/<key>` form beside those two
 //! ([`addressed_object`]) reads its object through the SAME addressing, so no operation
@@ -68,20 +76,39 @@
 /// with `https://`. URLs from S3 static websites are not supported."
 const HTTPS_SCHEME: &str = "https";
 
+/// The refusal for an Amazon S3 location addressed over any other scheme, as the service
+/// words that documented rule back.
+const S3_LOCATION_SCHEME: &str = "The location for an Amazon S3 bucket must start with https://";
+
 /// The host label that marks the Amazon S3 service in either addressing style: `s3` on its
 /// own (`bucket.s3.us-east-1.amazonaws.com`, `s3.us-east-1.amazonaws.com`) or the legacy
 /// region-suffixed spelling (`bucket.s3-us-east-1.amazonaws.com`).
 const S3_LABEL: &str = "s3";
 const S3_LABEL_PREFIX: &str = "s3-";
 
+/// The host label that marks a bucket's STATIC WEBSITE endpoint rather than the Amazon S3
+/// REST endpoint, in both spellings Amazon S3 publishes one under:
+/// `<bucket>.s3-website-<region>.amazonaws.com` and `<bucket>.s3-website.<region>.amazonaws.com`.
+const S3_WEBSITE_LABEL: &str = "s3-website";
+
+/// The refusal for a `TemplateURL` addressing a bucket's static website endpoint: "URLs from
+/// S3 static websites are not supported" (`TemplateURL`), whatever object that endpoint would
+/// serve — so this is answered for the ENDPOINT, before the URL is read for an object or held
+/// to the scheme the REST endpoint takes (a website endpoint serves plain HTTP).
+const S3_WEBSITE_URL: &str = "S3 static website URLs are not supported.";
+
 /// The query parameter that addresses one version of a versioned object.
 const VERSION_ID: &str = "versionId";
 
-/// The refusal for a `TemplateURL` whose scheme is not the documented one.
+/// The refusal for a `TemplateURL` that is no Amazon S3 location at all: "The URL must point
+/// to a template (max size: 1 MB) that is located in an Amazon S3 bucket or a Systems Manager
+/// document. The location for an Amazon S3 bucket must start with `https://`" — so a scheme
+/// the documentation does not allow, and an https URL whose host names no Amazon S3 endpoint
+/// and carries no object either, are both unsupported.
 const UNSUPPORTED_URL: &str = "TemplateURL must be a supported URL.";
 
-/// The refusal for text that addresses no Amazon S3 object at all, so no object was even
-/// asked for.
+/// The refusal for text that addresses an Amazon S3 endpoint but no object in it, so no
+/// object was even asked for.
 const NOT_A_READABLE_OBJECT: &str =
     "TemplateURL must reference a valid S3 object to which you have access.";
 
@@ -255,14 +282,58 @@ pub async fn read_bytes(
 /// here parses caller-supplied URL text by hand; what is read HERE is which Amazon S3
 /// addressing style the host spells.
 ///
-/// `Err(message)` is the refusal for text that addresses no object: a scheme the
-/// documentation does not allow, or an https URL carrying no bucket and key.
+/// `Err(message)` is the refusal for text that addresses no readable object, and WHICH
+/// refusal it is follows from what the URL is: a bucket's static WEBSITE endpoint is refused
+/// for that endpoint, a location addressed over any scheme but `https` for the scheme the
+/// documentation fixes, an Amazon S3 endpoint carrying no bucket and key references no
+/// object, and text that is no location at all — text no URL reader will read, or a host
+/// naming no Amazon S3 endpoint and carrying no object in its path either — is not a
+/// SUPPORTED url.
 pub fn object(template_url: &str) -> Result<Object, String> {
     let parsed = ::url::Url::parse(template_url).map_err(|_| UNSUPPORTED_URL.to_string())?;
-    if parsed.scheme() != HTTPS_SCHEME {
-        return Err(UNSUPPORTED_URL.to_string());
+    if names_s3_website(&parsed) {
+        return Err(S3_WEBSITE_URL.to_string());
     }
-    hosted_object(&parsed).ok_or_else(|| NOT_A_READABLE_OBJECT.to_string())
+    if parsed.scheme() != HTTPS_SCHEME {
+        return Err(S3_LOCATION_SCHEME.to_string());
+    }
+    hosted_object(&parsed).ok_or_else(|| {
+        if names_s3(&parsed) {
+            NOT_A_READABLE_OBJECT.to_string()
+        } else {
+            UNSUPPORTED_URL.to_string()
+        }
+    })
+}
+
+/// Whether a URL's host names an Amazon S3 endpoint, in either documented addressing style
+/// ([`S3_LABEL`]).
+///
+/// A host that names none is still read path-style ([`hosted_object`]) — a client addressing
+/// this emulator through an endpoint of its own names its bucket in the first path segment —
+/// so this says only what the host IS, which is what decides how a URL carrying no object at
+/// all is refused.
+fn names_s3(parsed: &::url::Url) -> bool {
+    parsed
+        .host_str()
+        .is_some_and(|host| host.split('.').any(is_s3_label))
+}
+
+/// Whether one host label marks the Amazon S3 service.
+fn is_s3_label(label: &str) -> bool {
+    label == S3_LABEL || label.starts_with(S3_LABEL_PREFIX)
+}
+
+/// Whether a URL addresses a bucket's STATIC WEBSITE endpoint ([`S3_WEBSITE_LABEL`]), which
+/// is the one Amazon S3 endpoint a template may not be read from.
+fn names_s3_website(parsed: &::url::Url) -> bool {
+    parsed.host_str().is_some_and(|host| {
+        host.split('.').any(|label| {
+            label
+                .strip_prefix(S3_WEBSITE_LABEL)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+        })
+    })
 }
 
 /// The Amazon S3 object `url` addresses, for a member whose OWN model constrains which
@@ -287,8 +358,13 @@ pub fn addressed_object(url: &str) -> Option<Object> {
 }
 
 /// The bucket and key an http(s) URL names in either documented Amazon S3 addressing style,
-/// or `None` for one that carries no bucket and key at all.
+/// or `None` for one that carries no bucket and key at all — and for one addressing a
+/// bucket's static WEBSITE endpoint, which serves a website rather than the objects an
+/// addressed object is read from ([`names_s3_website`]), so no caller of this reads one.
 fn hosted_object(parsed: &::url::Url) -> Option<Object> {
+    if names_s3_website(parsed) {
+        return None;
+    }
     // The host is read for the BUCKET it names and for nothing else: nothing here connects
     // to it.
     let host = parsed.host_str()?;
@@ -297,9 +373,7 @@ fn hosted_object(parsed: &::url::Url) -> Option<Object> {
     // path-style addressing — the S3 label first, or a host naming no S3 label at all —
     // puts it in the first path segment.
     let labels: Vec<&str> = host.split('.').collect();
-    let service_label = labels
-        .iter()
-        .position(|label| *label == S3_LABEL || label.starts_with(S3_LABEL_PREFIX));
+    let service_label = labels.iter().position(|label| is_s3_label(label));
     let path = parsed.path().trim_start_matches('/');
     let (bucket, key) = match service_label {
         Some(0) | None => match path.split_once('/') {
@@ -461,7 +535,7 @@ mod tests {
             (
                 "a scheme the documentation does not allow",
                 "s3://assets/main.json",
-                UNSUPPORTED_URL,
+                S3_LOCATION_SCHEME,
             ),
             (
                 "no scheme at all",
@@ -470,8 +544,8 @@ mod tests {
             ),
             (
                 "an http URL",
-                "http://assets.s3.amazonaws.com/main.json",
-                UNSUPPORTED_URL,
+                "http://assets.s3.amazonaws.com/main.yaml",
+                S3_LOCATION_SCHEME,
             ),
             (
                 "no path, so no key",
@@ -487,6 +561,26 @@ mod tests {
                 "path-style with a bucket but no key",
                 "https://s3.us-east-1.amazonaws.com/assets",
                 NOT_A_READABLE_OBJECT,
+            ),
+            (
+                "a host that is no Amazon S3 endpoint and carries no object",
+                "https://templates.example.com/main.json",
+                UNSUPPORTED_URL,
+            ),
+            (
+                "a static website endpoint, region-suffixed",
+                "http://assets.s3-website-us-east-1.amazonaws.com/main.json",
+                S3_WEBSITE_URL,
+            ),
+            (
+                "a static website endpoint, dot-separated",
+                "http://assets.s3-website.eu-west-1.amazonaws.com/main.json",
+                S3_WEBSITE_URL,
+            ),
+            (
+                "a static website endpoint addressed over https",
+                "https://assets.s3-website-us-east-1.amazonaws.com/main.json",
+                S3_WEBSITE_URL,
             ),
         ];
         for (case, url, refusal) in rows {

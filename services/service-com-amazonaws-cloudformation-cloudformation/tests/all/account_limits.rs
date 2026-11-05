@@ -64,20 +64,23 @@ async fn describe_account_limits(
     call(router, "DescribeAccountLimits", members).await
 }
 
-/// Every limit this account is held to, and the ceiling the crate enforces for it.
+/// Every limit this account is held to, the ceiling the crate enforces for it, and the
+/// order CloudFormation reports them in.
 ///
 /// The names are the three the model documents on `AccountLimit$Name` ("Values:
 /// `ConcurrentResourcesLimit` | `StackLimit` | `StackOutputsLimit`"), and each value is the
 /// constant the code that meters that limit reads — so a row here fails the moment a
-/// reported limit stops being the enforced one.
+/// reported limit stops being the enforced one. The ORDER is the service's own: the per-stack
+/// quotas first and the per-account resource ceiling last, which is what a client reading a
+/// limit positionally reads.
 fn expected_limits() -> Vec<(&'static str, usize)> {
     vec![
+        (account_limit_name::STACK, MAX_STACKS),
+        (account_limit_name::STACK_OUTPUTS, MAX_OUTPUTS_PER_TEMPLATE),
         (
             account_limit_name::CONCURRENT_RESOURCES,
             MAX_CONCURRENT_RESOURCES,
         ),
-        (account_limit_name::STACK, MAX_STACKS),
-        (account_limit_name::STACK_OUTPUTS, MAX_OUTPUTS_PER_TEMPLATE),
     ]
 }
 
@@ -169,7 +172,7 @@ async fn describe_account_limits_reports_every_limit_this_account_is_held_to() {
         assert_eq!(
             reported[index].name.as_deref(),
             Some(*name),
-            "case {name:?}: expected it reported in LimitName order, got {reported:?}"
+            "case {name:?}: expected it reported in the service's own order, got {reported:?}"
         );
         assert_eq!(
             reported[index].value,

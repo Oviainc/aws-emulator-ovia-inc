@@ -206,20 +206,6 @@ fn cases() -> Vec<Case> {
             region: REGION,
         },
         Case {
-            // "If both are passed, only TemplateBody is used" — the URL this answers is an
-            // estimate of the BODY, and the sibling refusal row shows a `TemplateURL` alone
-            // is not read at all.
-            case: "a body beside an ignored TemplateURL",
-            members: vec![
-                member("TemplateBody", &one_queue()),
-                member(
-                    "TemplateURL",
-                    "https://s3.amazonaws.com/a-bucket/another-template.json",
-                ),
-            ],
-            region: REGION,
-        },
-        Case {
             case: "one queue, estimated in another Region",
             members: vec![member("TemplateBody", &one_queue())],
             region: OTHER_REGION,
@@ -364,6 +350,21 @@ async fn estimate_template_cost_refuses_a_body_it_cannot_estimate() {
             status: 400,
             code: "ValidationError",
             message: "Either TemplateBody or TemplateURL must be specified".to_string(),
+        },
+        RefusalCase {
+            // A template reaches this operation one of two ways, and a request stating BOTH
+            // states two templates: there is no one body to estimate.
+            case: "a body beside a TemplateURL",
+            members: vec![
+                member("TemplateBody", &one_queue()),
+                member(
+                    "TemplateURL",
+                    "https://s3.amazonaws.com/a-bucket/another-template.json",
+                ),
+            ],
+            status: 400,
+            code: "ValidationError",
+            message: "You cannot specify both Template URL and Template Body.".to_string(),
         },
         RefusalCase {
             case: "a body that is neither valid JSON nor valid YAML",

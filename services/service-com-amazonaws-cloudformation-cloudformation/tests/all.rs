@@ -337,6 +337,8 @@ mod stop_stack_set_operation;
 mod template_by_reference;
 #[path = "all/template_outputs.rs"]
 mod template_outputs;
+#[path = "all/template_planning_surfaces.rs"]
+mod template_planning_surfaces;
 #[path = "all/template_quotas.rs"]
 mod template_quotas;
 #[path = "all/template_refusal_wording.rs"]

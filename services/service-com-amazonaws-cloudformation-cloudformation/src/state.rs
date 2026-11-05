@@ -258,6 +258,15 @@ pub mod template;
 /// one answers.
 pub mod template_validation;
 
+/// What a client reads ABOUT a template before it deploys one: the capabilities its
+/// declarations require, the resource types it defines and the properties an import of each
+/// of those types takes.
+pub mod template_summary;
+
+/// The primary identifier of a resource type: the properties whose values identify one
+/// resource of that type.
+pub mod primary_identifier;
+
 /// The `AWS::Serverless-2016-10-31` (AWS SAM) transform: the resources that macro's
 /// expansion puts in place of a template's `AWS::Serverless::*` declarations, applied
 /// before anything reads the template.
@@ -514,14 +523,15 @@ pub const MAX_STACKS: usize = 2_000;
 
 /// The most resources the account's stacks hold at once.
 ///
-/// CloudFormation meters concurrent resources per account — it is the first of the three
-/// per-account limits `AccountLimit` documents ("Number of concurrent resources") — and
-/// the documented default is 2,500, adjustable through Service Quotas, so this is that
-/// default as this emulator's own ceiling. It is what bounds the resource records the
-/// store holds across its stacks, and `CreateStack` — the operation that brings new
-/// resources into the account and the one that models `LimitExceededException` for a
-/// quota already reached — is what refuses a create past it.
-pub const MAX_CONCURRENT_RESOURCES: usize = 2_500;
+/// CloudFormation meters concurrent resources per account — it is one of the three
+/// per-account limits `AccountLimit` documents ("Number of concurrent resources") — and the
+/// documented default quota is 8,500, adjustable through Service Quotas, so this is that
+/// default as this emulator's own ceiling: the number `DescribeAccountLimits` advertises as
+/// `ConcurrentResourcesLimit` is the one a write is really measured against. It is what
+/// bounds the resource records the store holds across its stacks, and `CreateStack` — the
+/// operation that brings new resources into the account and the one that models
+/// `LimitExceededException` for a quota already reached — is what refuses a create past it.
+pub const MAX_CONCURRENT_RESOURCES: usize = 8_500;
 
 /// The most LIVE stacks this store holds across EVERY Region together.
 ///
@@ -642,6 +652,33 @@ pub fn validate_template_body(template_body: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The refusal for a request that carries the template it submits BOTH by value and by
+/// reference, as the service words it.
+///
+/// A template reaches an operation one of two ways — the request's own `TemplateBody` or a
+/// `TemplateURL` naming the object that holds it — and a request stating both states two
+/// templates, so there is no one body to act on. The sentence is the one the recorded
+/// refusals of this condition carry (`ValidateTemplate` and `CreateChangeSet` answer it
+/// identically), and it is shared by every operation whose input carries exactly those two
+/// members, since the condition is a property of the REQUEST SHAPE rather than of one
+/// operation. (An operation that also takes `UsePreviousTemplate` states the three-way
+/// condition its own documentation states for every OTHER way of not naming exactly one
+/// source, [`ONE_TEMPLATE_SOURCE`].)
+pub const BOTH_TEMPLATE_SOURCES: &str = "You cannot specify both Template URL and Template Body.";
+
+/// `Err(message)` for a request that names the template it submits BOTH by value and by
+/// reference — the RULE every operation whose input carries that pair is held to, in one
+/// place, so neither the condition nor its wording is restated per operation.
+pub fn validate_one_template_source(
+    template_body: Option<&str>,
+    template_url: Option<&str>,
+) -> Result<(), String> {
+    if template_body.is_some() && template_url.is_some() {
+        return Err(BOTH_TEMPLATE_SOURCES.to_string());
+    }
+    Ok(())
+}
+
 /// The refusal a template body past [`TEMPLATE_BODY_MAX_BYTES`] is held to, in the one
 /// place that words it: a body submitted by REFERENCE is held to the same ceiling, and the
 /// two cannot drift apart about what it is ([`template_url`]).
@@ -664,14 +701,14 @@ pub fn template_body_too_long() -> String {
 ///
 /// A template CONTAINS a macro in either of the two ways one is invoked: the `Transform`
 /// section naming it for the whole template, and the `Fn::Transform` intrinsic naming one
-/// for part of it ([`include::body_invokes_a_macro`]). Both hand the template to processing
-/// that may rewrite it, which is what the acknowledgement is about, so either requires it.
+/// for part of it. Which templates those are is decided in the ONE place that owns the
+/// question ([`template_summary::requires_auto_expand`]), so the acknowledgement a request
+/// is held to is the capability the template REPORTS requiring.
 pub fn missing_auto_expand_capability(
     template_body: &str,
     acknowledged: &[String],
 ) -> Vec<String> {
-    let declares_transform = !template::body_declared_transforms(template_body).is_empty()
-        || include::body_invokes_a_macro(template_body);
+    let declares_transform = template_summary::requires_auto_expand(template_body);
     let acknowledged_auto_expand = acknowledged
         .iter()
         .any(|capability| capability == CAPABILITY_AUTO_EXPAND);
@@ -2851,24 +2888,30 @@ impl ComAmazonawsCloudformationCloudformationState {
             .sum()
     }
 
-    /// The account limits this store reports and enforces, in `LimitName` order.
+    /// The account limits this store reports and enforces, in the order CloudFormation
+    /// reports them.
     ///
     /// `DescribeAccountLimits` "retrieves your account's CloudFormation limits", and
-    /// `AccountLimit` names exactly three of them: the concurrent resources, the stacks and
-    /// the stack outputs this account may hold. Each value is the ceiling this store itself
-    /// holds a caller to — [`MAX_CONCURRENT_RESOURCES`], [`MAX_STACKS`] and
-    /// [`template::MAX_OUTPUTS_PER_TEMPLATE`] — so the limits a caller reads are the limits
-    /// its next write is measured against, rather than numbers nothing honours.
+    /// `AccountLimit` names exactly three of them: the stacks, the stack outputs and the
+    /// concurrent resources this account may hold. Each value is the ceiling this store
+    /// itself holds a caller to — [`MAX_STACKS`], [`template::MAX_OUTPUTS_PER_TEMPLATE`] and
+    /// [`MAX_CONCURRENT_RESOURCES`] — so the limits a caller reads are the limits its next
+    /// write is measured against, rather than numbers nothing honours.
+    ///
+    /// The ORDER is the service's own, which is not the alphabetical order the model's
+    /// documentation of `AccountLimit$Name` happens to list the values in: the per-STACK
+    /// quotas come first and the per-account resource ceiling last, which is the order a
+    /// client reading a limit positionally reads them in.
     pub fn account_limits(&self) -> Vec<crate::ops::types::AccountLimit> {
         [
-            (
-                account_limit_name::CONCURRENT_RESOURCES,
-                MAX_CONCURRENT_RESOURCES,
-            ),
             (account_limit_name::STACK, MAX_STACKS),
             (
                 account_limit_name::STACK_OUTPUTS,
                 template::MAX_OUTPUTS_PER_TEMPLATE,
+            ),
+            (
+                account_limit_name::CONCURRENT_RESOURCES,
+                MAX_CONCURRENT_RESOURCES,
             ),
         ]
         .into_iter()

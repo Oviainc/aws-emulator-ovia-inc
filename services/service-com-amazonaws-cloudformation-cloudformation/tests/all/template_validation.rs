@@ -144,7 +144,7 @@ fn refused() -> Vec<Refused> {
         Refused {
             case: "an Fn::GetAtt naming a resource the template does not declare",
             template: r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}},"Outputs":{"X":{"Value":{"Fn::GetAtt":["Absent","Arn"]}}}}"#,
-            message: "Unresolved resource dependencies [Absent] in the Outputs block",
+            message: "Template error: instance of Fn::GetAtt references undefined resource Absent",
         },
         Refused {
             case: "an Fn::Sub variable neither its own map nor the template supplies",

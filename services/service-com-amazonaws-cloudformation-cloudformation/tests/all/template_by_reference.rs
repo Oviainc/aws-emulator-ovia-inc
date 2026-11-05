@@ -524,7 +524,7 @@ async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
         Unresolvable {
             case: "a scheme the documentation does not support",
             url: format!("s3://{STAGING_BUCKET}/{key}"),
-            message: "TemplateURL must be a supported URL.".to_string(),
+            message: "The location for an Amazon S3 bucket must start with https://".to_string(),
         },
         Unresolvable {
             case: "an https URL carrying no key at all",

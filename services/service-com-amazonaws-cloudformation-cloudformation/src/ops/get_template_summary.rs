@@ -16,10 +16,9 @@
 //! has been deleted", which is as long as this store keeps a deleted stack at all, and "if
 //! the template doesn't exist, a ValidationError is returned".
 //!
-//! One part of the surface is NOT summarised here, for a reason the handler states where it
-//! answers: `ResourceIdentifierSummaries`, whose identifier properties are a resource type's
-//! published primary identifier — something this emulator's type catalogue deliberately
-//! carries none of ([`crate::state::resource_schema`]).
+//! One part of the surface is reported from what the template's TYPES are identified by:
+//! `ResourceIdentifierSummaries`, whose identifier properties are each resource type's
+//! primary identifier ([`crate::state::primary_identifier`]).
 //!
 //! A `TemplateURL` says WHERE the body is rather than what it means, so the object it
 //! addresses is read from this emulator's own Amazon S3 and summarised exactly as an inline
@@ -185,11 +184,16 @@ fn parameter_declaration(declared: &template::DeclaredParameter) -> ParameterDec
 }
 
 /// The summary of one template: every member computed from what that template declares.
+///
+/// `body` is the text `declared` was read from, which is what decides whether the template
+/// invokes a macro: an `Fn::Transform` naming one stands anywhere in the document rather than
+/// in a section a reading of the template keeps.
 fn summary_of(
+    body: &str,
     declared: &template::Template,
     unrecognized: Vec<String>,
 ) -> GetTemplateSummaryOutput {
-    let required = template::required_capabilities(declared);
+    let required = crate::state::template_summary::required_capabilities(body, declared);
     GetTemplateSummaryOutput {
         // One declaration per declared parameter — "a list of parameter declarations that
         // describe various properties for each parameter" — and the EMPTY list for a
@@ -205,11 +209,14 @@ fn summary_of(
         // "The value that's defined in the Description property of the template."
         description: declared.description.clone(),
         // "The capabilities found within the template", reported only where the template
-        // declares something that has to be acknowledged, together with the resources that
-        // generated them — the same reading `ValidateTemplate` reports.
+        // declares something that has to be acknowledged — its IAM resources and the macros
+        // it invokes — together with the resources that generated them: the same reading
+        // `ValidateTemplate` reports (`crate::state::template_summary`).
         capabilities: (!required.capabilities.is_empty()).then_some(required.capabilities),
         capabilities_reason: required.reason,
-        resource_types: Some(template::declared_resource_types(declared)),
+        // "A list of all the template resource types that are defined in the template": the
+        // SET of types its resources have, in the order that set is reported in.
+        resource_types: Some(crate::state::template_summary::resource_types(declared)),
         // "The Amazon Web Services template format version, which identifies the
         // capabilities of the template": the version in FORCE for this template — the one it
         // states, or the latest, which is what a template stating none conforms to.
@@ -224,11 +231,20 @@ fn summary_of(
             .then(|| declared.transforms.clone()),
         // `ResourceIdentifierSummaries` describes "the target resources of an import
         // operation and the properties you can provide during the import to identify the
-        // target resources" — which property identifies a resource of a type is that type's
-        // published primary identifier, and this emulator's resource-type catalogue
-        // deliberately carries none (`crate::state::resource_schema`). The member is
-        // reported ABSENT rather than filled with a property guessed from the type's name.
-        resource_identifier_summaries: None,
+        // target resources": one entry per resource TYPE the template declares, carrying the
+        // logical ids declared with that type and that type's primary identifier — the
+        // properties whose values name an existing resource of it
+        // (`crate::state::primary_identifier`).
+        resource_identifier_summaries: Some(
+            crate::state::template_summary::identifier_summaries(declared)
+                .into_iter()
+                .map(|summary| ResourceIdentifierSummary {
+                    resource_type: Some(summary.resource_type),
+                    logical_resource_ids: Some(summary.logical_resource_ids),
+                    resource_identifiers: Some(summary.resource_identifiers),
+                })
+                .collect(),
+        ),
         // "A list of all of the unrecognized resource types. This is only returned if the
         // TemplateSummaryConfig parameter has the TreatUnrecognizedResourceTypesAsWarnings
         // configuration set to True" — the only configuration under which such a template
@@ -478,6 +494,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        Ok(summary_of(&declared, unrecognized))
+        Ok(summary_of(&template_body, &declared, unrecognized))
     }
 }

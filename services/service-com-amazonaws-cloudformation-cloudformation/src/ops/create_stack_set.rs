@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(body), None) => Some(body.clone()),
             (Some(_), Some(_)) => {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    "You cannot specify both TemplateBody and TemplateURL",
+                    crate::state::BOTH_TEMPLATE_SOURCES,
                 ))
             }
             // A `TemplateURL` says WHERE the template is, not what it means: the object it

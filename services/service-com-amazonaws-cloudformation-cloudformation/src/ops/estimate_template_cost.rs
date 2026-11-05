@@ -236,6 +236,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = &self.engine;
         // "Conditional: You must pass TemplateBody or TemplateURL. If both are passed,
         // only TemplateBody is used" (`EstimateTemplateCostInput$TemplateBody`).
+        // A template reaches this operation one of two ways, and a request stating BOTH
+        // states two templates — the condition every operation whose input carries exactly
+        // those two members is held to, in the one place that owns it, whatever the member's
+        // own documentation says is "used" when both are passed.
+        crate::state::validate_one_template_source(
+            input.template_body.as_deref(),
+            input.template_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         //
         // A `TemplateURL` says WHERE the body is, not what it means: the object it
         // addresses is read from this emulator's own Amazon S3 and the estimate below is
