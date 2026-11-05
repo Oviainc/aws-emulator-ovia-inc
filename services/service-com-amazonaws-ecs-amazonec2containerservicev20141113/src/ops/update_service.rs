@@ -359,6 +359,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The period of time, in seconds, that the Amazon ECS service scheduler ignores
+        // unhealthy ... health checks after a task has first started": a period the
+        // scheduler waits out is never negative, so an update naming one is refused and
+        // nothing of it is written — the same check the create of a service makes.
+        if let Some(message) = crate::state::health_check_grace_period_violation(
+            input.health_check_grace_period_seconds,
+        ) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "The platform version that your tasks in the service run on ... If one isn't
         // specified, the LATEST platform version is used": a version this service does
         // not know names no platform, which is what `PlatformUnknownException` is
@@ -779,6 +794,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The deployment configuration this update LEAVES the service with — the members
+        // it supplies over the ones the service already holds — still has to leave the
+        // scheduler room to replace a task, so the pair is weighed on the merged
+        // configuration rather than on the half this request carried
+        // ([`crate::state::deployment_room_violation`]).
+        if let Some(configuration) = input.deployment_configuration.clone() {
+            if let Some(message) =
+                crate::state::deployment_room_violation(&crate::state::merged_deployment_configuration(
+                    &snapshot.deployment_configuration,
+                    configuration,
+                ))
+            {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // And the platform version the service is left with has to be one published for
+        // the operating system the revision it runs declares: the version the request
+        // names, else the one the service already holds
+        // ([`crate::state::names_no_platform_for_os_family`]).
+        if let Some(definition) = definition.as_ref() {
+            let effective_platform_version = input
+                .platform_version
+                .as_deref()
+                .or(snapshot.platform_version.as_deref());
+            if crate::state::names_no_platform_for_os_family(
+                effective_platform_version,
+                &crate::state::requested_os_family(definition.runtime_platform.as_ref()),
+            ) {
+                return Err(UpdateServiceErrorModeled::PlatformUnknownException(
+                    PlatformUnknownException {
+                        message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
         // A `loadBalancers` list this request NAMES is validated whole — every target

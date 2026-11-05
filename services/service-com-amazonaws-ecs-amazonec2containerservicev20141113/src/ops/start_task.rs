@@ -383,6 +383,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // And every member of `overrides` replaces something that revision fixed, so each
+        // is weighed against it the same way the scheduler's own placement weighs it
+        // ([`crate::state::task_override_violation`]). `StartTask` names neither a launch
+        // type nor a capacity provider — the capacity is the container instance it names —
+        // so only a revision registered for Fargate carries a Fargate task size here.
+        if let Some(message) = crate::state::task_override_violation(
+            &definition,
+            input.overrides.as_ref(),
+            crate::state::runs_fargate_task_size(&definition, None, &[]),
+        ) {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // One task per named instance, so the store's task bound is checked against the
         // whole list before any of it is placed.

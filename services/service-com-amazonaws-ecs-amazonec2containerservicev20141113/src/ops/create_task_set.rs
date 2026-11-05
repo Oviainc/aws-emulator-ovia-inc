@@ -438,6 +438,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        // The Fargate platform versions are published per OPERATING SYSTEM, so which of
+        // them exist for this task set is decided by the family its revision declares: a
+        // version published for none of them names no platform at all
+        // ([`crate::state::names_no_platform_for_os_family`]), the same rule the create of
+        // a service is held to.
+        if crate::state::names_no_platform_for_os_family(
+            input.platform_version.as_deref(),
+            &crate::state::requested_os_family(definition.runtime_platform.as_ref()),
+        ) {
+            return Err(CreateTaskSetErrorModeled::PlatformUnknownException(
+                PlatformUnknownException {
+                    message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // "An identifier that you provide to ensure the idempotency of the request": the
         // same token in the same service is the SAME create, so the stored task set is

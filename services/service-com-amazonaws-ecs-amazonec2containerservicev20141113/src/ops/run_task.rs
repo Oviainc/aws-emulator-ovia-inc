@@ -536,6 +536,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A list of container overrides in JSON format that specify the name of a
+        // container in the specified task definition and the overrides it should receive":
+        // every member of `overrides` replaces something the STORED revision fixed, so
+        // each is weighed against that revision — the container it names, the
+        // reservations it may raise, the task size it may change and the ephemeral
+        // storage it may ask for ([`crate::state::task_override_violation`]). Checked
+        // before any task is created, since AWS runs nothing when it refuses.
+        if let Some(message) = crate::state::task_override_violation(
+            &definition,
+            input.overrides.as_ref(),
+            crate::state::runs_fargate_task_size(
+                &definition,
+                input.launch_type.as_deref(),
+                &effective_strategy,
+            ),
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The Fargate platform versions are published per OPERATING SYSTEM, so which of
+        // them exist for this placement is decided by the family its revision declares: a
+        // version published for none of them names no platform at all, which is what
+        // `PlatformUnknownException` is modelled for
+        // ([`crate::state::names_no_platform_for_os_family`]) — the same rule a service's
+        // create is held to, against the same stored revision.
+        if crate::state::names_no_platform_for_os_family(
+            input.platform_version.as_deref(),
+            &crate::state::requested_os_family(definition.runtime_platform.as_ref()),
+        ) {
+            return Err(RunTaskErrorModeled::PlatformUnknownException(
+                PlatformUnknownException {
+                    message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "The EC2 launch type runs your tasks on Amazon EC2 instances registered to
         // your cluster" (and `EXTERNAL` on the on-premises capacity registered to it), so
         // a cluster with no container instance registered has nowhere to place the task:

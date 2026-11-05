@@ -194,179 +194,16 @@ const DEFAULT_NETWORK_MODE: &str = "bridge";
 /// [`crate::state::NETWORK_MODE_AWSVPC`], which the projection's own awsvpc rules read.
 const FARGATE_NETWORK_MODE: &str = crate::state::NETWORK_MODE_AWSVPC;
 
-/// How many CPU units one vCPU is, so a `cpu` given "as a string using vCPUs (for
-/// example, `1 vCPU` or `1 vcpu`)" is read as the CPU units it stands for
-/// (`RegisterTaskDefinition$cpu`).
-const CPU_UNITS_PER_VCPU: f64 = 1024.0;
+/// The task-level `pidMode` a FARGATE task definition cannot declare. The member's own
+/// doc: "On Fargate for Linux containers, the only valid value is `task`" — and the
+/// Windows note beside it ("This parameter is not supported for Windows containers")
+/// leaves no Fargate task that may share the host's process namespace.
+const PID_MODE_HOST: &str = "host";
 
-/// How many MiB one GB is, so a `memory` given "as a string using GB (for example,
-/// `1GB` or `1 GB`)" is read as the MiB it stands for
-/// (`RegisterTaskDefinition$memory`).
-const MIB_PER_GB: i64 = 1024;
-
-/// The unit a vCPU-spelled `cpu` names, lower-cased: the member documents `1 vCPU` and
-/// `1 vcpu` as the same value, so the spelling is compared case-insensitively.
-const VCPU_UNIT: &str = "vcpu";
-
-/// The unit a GB-spelled `memory` names, lower-cased (`1GB` / `1 GB`).
-const GB_UNIT: &str = "gb";
-
-/// The largest number of units a `cpu` or `memory` value can stand for and still name a
-/// size: ten times the largest the documented catalog states (16384 CPU units, 122880
-/// MiB), so every size a task could ask for converts while a value no task size reaches
-/// does not become a saturated count.
-const MAX_STATED_UNITS: f64 = 1_228_800.0;
-
-/// The task memory a Fargate task size allows, in MiB.
-enum FargateMemory {
-    /// Exactly the values the doc lists for this CPU size — they are not one
-    /// progression: 256 CPU units allow 512, 1024 and 2048 MiB, skipping 1536.
-    Listed(&'static [i64]),
-    /// Every multiple of `step` MiB from `min` through `max`, the form the doc states as
-    /// "Between X and Y in increments of Z".
-    Stepped { min: i64, max: i64, step: i64 },
-}
-
-/// One Fargate task size: the task CPU units, and the task memory those units support.
-///
-/// The catalog below is the `RegisterTaskDefinition$memory` doc's own list of legal
-/// pairs ("If using the Fargate launch type, this field is required and you must use one
-/// of the following values. This determines your range of supported values for the `cpu`
-/// parameter"), read as CPU units -> memory. A pair outside it is a combination Fargate
-/// has no configuration for.
-struct FargateTaskSize {
-    cpu: i64,
-    memory: FargateMemory,
-}
-
-/// The Fargate task sizes, from the `memory` member's documented list.
-const FARGATE_TASK_SIZES: [FargateTaskSize; 7] = [
-    // "512 (0.5 GB), 1024 (1 GB), 2048 (2 GB) - Available cpu values: 256 (.25 vCPU)"
-    FargateTaskSize {
-        cpu: 256,
-        memory: FargateMemory::Listed(&[512, 1024, 2048]),
-    },
-    // "1024 (1 GB), 2048 (2 GB), 3072 (3 GB), 4096 (4 GB) - Available cpu values: 512"
-    FargateTaskSize {
-        cpu: 512,
-        memory: FargateMemory::Stepped {
-            min: 1024,
-            max: 4096,
-            step: 1024,
-        },
-    },
-    // "2048 (2 GB) ... 8192 (8 GB) - Available cpu values: 1024 (1 vCPU)"
-    FargateTaskSize {
-        cpu: 1024,
-        memory: FargateMemory::Stepped {
-            min: 2048,
-            max: 8192,
-            step: 1024,
-        },
-    },
-    // "Between 4096 (4 GB) and 16384 (16 GB) in increments of 1024 (1 GB) - 2048 vCPU"
-    FargateTaskSize {
-        cpu: 2048,
-        memory: FargateMemory::Stepped {
-            min: 4096,
-            max: 16384,
-            step: 1024,
-        },
-    },
-    // "Between 8192 (8 GB) and 30720 (30 GB) in increments of 1024 (1 GB) - 4096 vCPU"
-    FargateTaskSize {
-        cpu: 4096,
-        memory: FargateMemory::Stepped {
-            min: 8192,
-            max: 30720,
-            step: 1024,
-        },
-    },
-    // "Between 16 GB and 60 GB in 4 GB increments - Available cpu values: 8192 (8 vCPU)"
-    FargateTaskSize {
-        cpu: 8192,
-        memory: FargateMemory::Stepped {
-            min: 16 * MIB_PER_GB,
-            max: 60 * MIB_PER_GB,
-            step: 4 * MIB_PER_GB,
-        },
-    },
-    // "Between 32GB and 120 GB in 8 GB increments - Available cpu values: 16384 (16 vCPU)"
-    FargateTaskSize {
-        cpu: 16384,
-        memory: FargateMemory::Stepped {
-            min: 32 * MIB_PER_GB,
-            max: 120 * MIB_PER_GB,
-            step: 8 * MIB_PER_GB,
-        },
-    },
-];
-
-/// The CPU units a `cpu` value stands for, or `None` when it spells no number of them.
-///
-/// "It can be expressed as an integer using CPU units (for example, `1024`) or as a
-/// string using vCPUs (for example, `1 vCPU` or `1 vcpu`) in a task definition." A value
-/// that is negative, or too large or too small to be a number of vCPUs, names no task
-/// size either, so it carries no units rather than a saturated count.
-fn cpu_units(cpu: &str) -> Option<i64> {
-    let cpu = cpu.trim().to_ascii_lowercase();
-    match cpu.strip_suffix(VCPU_UNIT) {
-        Some(count) => {
-            let vcpus: f64 = count.trim().parse().ok()?;
-            units_of(vcpus * CPU_UNITS_PER_VCPU)
-        }
-        None => cpu.parse().ok().filter(|units| *units >= 0),
-    }
-}
-
-/// The MiB a `memory` value stands for, or `None` when it spells no amount of it.
-///
-/// "It can be expressed as an integer using MiB (for example ,`1024`) or as a string
-/// using GB (for example, `1GB` or `1 GB`) in a task definition." As with `cpu`, a value
-/// outside the amounts a task can ask for carries no MiB at all.
-fn memory_mib(memory: &str) -> Option<i64> {
-    let memory = memory.trim().to_ascii_lowercase();
-    match memory.strip_suffix(GB_UNIT) {
-        Some(count) => {
-            let gb: f64 = count.trim().parse().ok()?;
-            units_of(gb * MIB_PER_GB as f64)
-        }
-        None => memory.parse().ok().filter(|mib| *mib >= 0),
-    }
-}
-
-/// The whole number of units `scaled` stands for, or `None` when it is not a number a
-/// task size could carry: a non-finite value, a negative one, or one past what the
-/// largest Fargate size is stated in.
-fn units_of(scaled: f64) -> Option<i64> {
-    if !scaled.is_finite() || !(0.0..=MAX_STATED_UNITS).contains(&scaled) {
-        return None;
-    }
-    Some(scaled.round() as i64)
-}
-
-/// Whether Fargate has a task size for this pair of CPU units and MiB
-/// ([`FARGATE_TASK_SIZES`]).
-fn is_fargate_task_size(cpu: i64, memory: i64) -> bool {
-    FARGATE_TASK_SIZES
-        .iter()
-        .filter(|size| size.cpu == cpu)
-        .any(|size| match size.memory {
-            FargateMemory::Listed(values) => values.contains(&memory),
-            FargateMemory::Stepped { min, max, step } => {
-                memory >= min && memory <= max && (memory - min) % step == 0
-            }
-        })
-}
-
-/// A `cpu` or `memory` value as the refusal below states it: the number of units it
-/// stands for, or the text itself when it stands for none.
-fn stated(value: &str, units: Option<i64>) -> String {
-    match units {
-        Some(units) => units.to_string(),
-        None => value.trim().to_string(),
-    }
-}
+/// The one `pidMode` a Fargate task may declare, which the refusal above points at: the
+/// same doc's "If `task` is specified, all containers within the specified task share the
+/// same process namespace."
+const PID_MODE_TASK: &str = "task";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -503,31 +340,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Both are present for Fargate by here, and they are only legal TOGETHER: each
         // task size Fargate offers pairs one `cpu` with the `memory` values it supports
-        // ([`FARGATE_TASK_SIZES`]), so a pair outside that catalog names a configuration
-        // Fargate cannot run — whichever of the two the caller got wrong.
+        // ([`crate::state::fargate_task_size_violation`]), so a pair outside that catalog
+        // names a configuration Fargate cannot run — whichever of the two the caller got
+        // wrong.
         if wants_fargate {
             let cpu = input.cpu.clone().unwrap_or_default();
             let memory = input.memory.clone().unwrap_or_default();
-            let units = cpu_units(&cpu);
-            let mib = memory_mib(&memory);
-            let supported = match (units, mib) {
-                (Some(units), Some(mib)) => is_fargate_task_size(units, mib),
-                _ => false,
-            };
-            if !supported {
+            // The operating-system family the registration declares is part of the
+            // lookup: the published Windows configurations start a whole vCPU above the
+            // smallest Linux one ([`crate::state::MIN_WINDOWS_FARGATE_CPU_UNITS`]), so
+            // the same pair can be a configuration for one family and none for the other.
+            let os_family = crate::state::requested_os_family(input.runtime_platform.as_ref());
+            if let Some(message) =
+                crate::state::fargate_task_size_violation(&cpu, &memory, &os_family)
+            {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // "On Fargate for Linux containers, the only valid value is `task`": the host
+            // the `host` PID mode shares its process namespace with is a container
+            // instance of the caller's own, which a Fargate task has none of.
+            if input.pid_mode.as_deref() == Some(PID_MODE_HOST) {
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                     ClientException {
                         message: Some(format!(
-                            "No Fargate configuration exists for given values: {} CPU, \
-                             {} memory. See the Amazon ECS documentation for the valid \
-                             values.",
-                            stated(&cpu, units),
-                            stated(&memory, mib)
+                            "Tasks using the Fargate launch type do not support pidMode \
+                             '{PID_MODE_HOST}'. The supported value for pidMode is \
+                             '{PID_MODE_TASK}'."
                         )),
                     },
                 )
                 .into());
             }
+        }
+
+        // "The total amount, in GiB, of ephemeral storage to set for the task. The
+        // minimum supported value is 21 GiB and the maximum supported value is 200 GiB" —
+        // a size outside that range names an amount Amazon ECS can provision for no task,
+        // whatever launch type it runs on.
+        if let Some(message) =
+            crate::state::ephemeral_storage_violation(input.ephemeral_storage.as_ref())
+        {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // Every container needs a name and an image to be runnable, and — unless the
@@ -597,6 +460,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                     ClientException {
                         message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // The `awslogs` driver does not ship the logs itself: the Amazon ECS agent
+            // calls CloudWatch Logs for the container, with the credentials of "the task
+            // execution role that grants the Amazon ECS container agent permission to
+            // make Amazon Web Services API calls on your behalf"
+            // (`TaskDefinition$executionRoleArn`). On Fargate the agent is Amazon ECS's
+            // own, so there is no instance role it could fall back on — and
+            // [`crate::state::ATTRIBUTE_EXECUTION_ROLE_AWSLOGS`] is the same pairing read
+            // the other way. A revision that names no role can therefore deliver no log.
+            if wants_fargate
+                && definition.log_configuration.as_ref().is_some_and(|logging| {
+                    logging.log_driver == crate::state::LOG_DRIVER_AWSLOGS
+                })
+                && input.execution_role_arn.is_none()
+            {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Fargate requires task definition to have execution role ARN \
+                             to support log driver {}.",
+                            crate::state::LOG_DRIVER_AWSLOGS
+                        )),
                     },
                 )
                 .into());

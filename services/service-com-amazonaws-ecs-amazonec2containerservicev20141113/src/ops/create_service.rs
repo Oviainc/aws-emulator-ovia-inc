@@ -480,6 +480,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        // And the two percentages TOGETHER have to leave the scheduler room to replace a
+        // task, which is weighed on the configuration the service would be created with —
+        // the request's members over the documented defaults
+        // ([`crate::state::deployment_room_violation`]).
+        if let Some(message) =
+            crate::state::deployment_room_violation(&crate::state::deployment_configuration(
+                input.deployment_configuration.clone(),
+                daemon,
+                scheduler_owned,
+            ))
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "The period of time, in seconds, that the Amazon ECS service scheduler ignores
+        // unhealthy ... health checks after a task has first started": a period the
+        // scheduler waits out is never negative, so a service naming one is refused and
+        // nothing is created — the same check an update of a service makes.
+        if let Some(message) = crate::state::health_check_grace_period_violation(
+            input.health_check_grace_period_seconds,
+        ) {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
 
         // "A task definition must be specified if the service uses either the ECS or
         // CODE_DEPLOY deployment controllers."
@@ -721,6 +754,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // The Fargate platform versions are published per OPERATING SYSTEM, so which
+            // of them exist for this service is decided by the family its revision
+            // declares: a version published for none of them names no platform at all,
+            // which is what `PlatformUnknownException` is modelled for
+            // ([`crate::state::names_no_platform_for_os_family`]).
+            if crate::state::names_no_platform_for_os_family(
+                input.platform_version.as_deref(),
+                &crate::state::requested_os_family(definition.runtime_platform.as_ref()),
+            ) {
+                return Err(CreateServiceErrorModeled::PlatformUnknownException(
+                    PlatformUnknownException {
+                        message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
                     },
                 )
                 .into());
