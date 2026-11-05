@@ -204,9 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             (None, None) => {
-                return Err(state::missing_parameter(
-                    "The request must contain the parameter \
-                     localGatewayVirtualInterfaceGroupId or networkInterfaceId",
+                // "You must specify ONE of the following targets:
+                // LocalGatewayVirtualInterfaceGroupId NetworkInterfaceId"
+                // (`CreateLocalGatewayRoute`): a route with no target has nowhere to send
+                // the traffic it matches, and the sentence is about the VALUE the request
+                // names a target with rather than about one parameter it left out — there
+                // are two members it could have carried, neither of them required on its
+                // own — so it is refused with the code EC2 answers a parameter value it
+                // cannot act on with.
+                return Err(state::invalid_parameter_value(
+                    "You must specify one of the following targets: \
+                     localGatewayVirtualInterfaceGroupId, networkInterfaceId",
                 ));
             }
             (Some(group_id), None) => Target::VirtualInterfaceGroup(group_id),

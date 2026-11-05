@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayPolicyTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayPolicyTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayPolicyTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Creates a transit gateway policy table": it resolves the transit gateway the table
+//! belongs to and stores ONE policy table in the one policy table store, which
+//! `DescribeTransitGatewayPolicyTables` and `AssociateTransitGatewayPolicyTable` then read.
+//!
+//! Nothing about the answer is taken from a recording: the policy table id comes from the
+//! store's id mint, the transit gateway is the one the request names and resolved against
+//! the store, the tags come from the request's `TagSpecifications`, and the table is stored
+//! carrying no association — every association is made by a request.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +137,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayPolicyTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayPolicyTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayPolicyTable"))
+        // `ctx` carries request metadata only; a policy table is a resource OF the gateway
+        // the request names and carries no Region of its own, so nothing here is read off
+        // it. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+        use std::time::SystemTime;
+
+        // "The ID of the transit gateway used for the policy table" (`TransitGatewayId`) is
+        // `@required` but modelled `clientOptional`, so a request that left it out reaches
+        // this handler as an empty string rather than being refused at the boundary. A
+        // parameter the request did not carry is EC2's `MissingParameter`.
+        if input.transit_gateway_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter transitGatewayId",
+            ));
+        }
+
+        // "The tags specification for the transit gateway policy table created during the
+        // request" (`TagSpecifications`) — "you must specify the resource type to tag,
+        // otherwise the request will fail" (`TagSpecification`), and the only type this
+        // action tags is the policy table it creates. The payload's own bounds are applied
+        // by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_TRANSIT_GATEWAY_POLICY_TABLE,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // gateway the request names, so it is answered before anything is resolved or
+        // written — the order `CreateTransitGatewayRouteTable` answers it in beside this
+        // operation — and every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the gateway admits this call is asked of the state it is
+        // ACTUALLY in rather than of the one its last writer left it in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway used for the policy table" (`TransitGatewayId`): a
+        // policy table is a resource OF a transit gateway, so an id this account holds no
+        // gateway for has nothing to create a policy table on. Resolved against the store
+        // alone — the one refusal `DescribeTransitGateways` answers for a `TransitGatewayId`
+        // it cannot resolve, so one resource family reads one way.
+        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &input.transit_gateway_id,
+            ));
+        }
+
+        // "Describes the created transit gateway policy table"
+        // (`CreateTransitGatewayPolicyTableResult$TransitGatewayPolicyTable`): the table is
+        // stored by the crate's one writer of that store — which mints the policy table id —
+        // and a table is stored carrying no association, every association being made by a
+        // request to `AssociateTransitGatewayPolicyTable`.
+        let view = TransitGatewayPolicyTable {
+            transit_gateway_policy_table_id: None,
+            transit_gateway_id: Some(input.transit_gateway_id.clone()),
+            state: Some(state::TRANSIT_GATEWAY_POLICY_TABLE_STATE_AVAILABLE.to_string()),
+            creation_time: Some(state::system_time_to_date_time(SystemTime::now())),
+            tags: (!tags.is_empty()).then_some(tags),
+        };
+        let Some(policy_table_id) = store.insert_transit_gateway_policy_table(view) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway policy tables as it will store",
+            ));
+        };
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeTransitGatewayPolicyTables` cannot report one table differently.
+        let Some(stored) = store
+            .transit_gateway_policy_tables
+            .get(&policy_table_id)
+            .map(|record| record.view.clone())
+        else {
+            return Err(state::internal_error(
+                "the transit gateway policy table just created could not be read back",
+            ));
+        };
+        Ok(CreateTransitGatewayPolicyTableOutput {
+            transit_gateway_policy_table: Some(stored),
+        })
     }
 }
+
+/// The `ResourceType` a `TagSpecification` of this action may name: the policy table it
+/// creates, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+const RESOURCE_TYPE_TRANSIT_GATEWAY_POLICY_TABLE: &str = "transit-gateway-policy-table";

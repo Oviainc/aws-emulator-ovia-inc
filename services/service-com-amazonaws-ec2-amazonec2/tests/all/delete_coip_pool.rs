@@ -215,8 +215,9 @@ async fn deleting_the_same_pool_twice_refuses_the_second_call() {
     );
     assert_eq!(
         error_code(&body),
-        ec2::state::INVALID_POOL_ID_NOT_FOUND,
-        "second delete: the id is well formed, so expected InvalidPoolID.NotFound, got {body}"
+        ec2::state::INVALID_PARAMETER_VALUE,
+        "second delete: the pool is gone, so this delete cannot act on the value it names, \
+         which is what the recorded refusal of this operation answers, got {body}"
     );
     assert_eq!(
         stored_pools(&engine),
@@ -242,14 +243,17 @@ async fn deleting_the_same_pool_twice_refuses_the_second_call() {
 #[tokio::test]
 async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
     let prefix = ec2::state::COIP_POOL_ID_PREFIX;
-    let not_found = ec2::state::INVALID_POOL_ID_NOT_FOUND;
     let bad_value = ec2::state::INVALID_PARAMETER_VALUE;
     let malformed = ec2::state::INVALID_POOL_ID_MALFORMED;
     // The forms a pool id takes are `COIP_POOL_ID_PREFIX` plus 8 or 17 lowercase hex
     // digits, which `ec2::state::coip_pool_id_is_well_formed` is the one reader of.
     let cases = [
-        ("the long form", format!("{prefix}00000000000000000"), not_found),
-        ("the short form", format!("{prefix}00000000"), not_found),
+        // An id in a form this service MINTS but holds no pool for is a value this delete
+        // cannot act on: the recorded refusal of THIS operation names the pool and answers
+        // `InvalidParameterValue`, where the operations that READ a pool answer the pool's own
+        // `InvalidPoolID.NotFound`.
+        ("the long form", format!("{prefix}00000000000000000"), bad_value),
+        ("the short form", format!("{prefix}00000000"), bad_value),
         // The middle class is about the digit COUNT, not about any one value: a hexadecimal
         // suffix one digit long, one between the two mintable lengths, and one far past the
         // longer of them.

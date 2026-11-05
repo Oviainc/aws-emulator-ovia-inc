@@ -140,18 +140,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstanceExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstanceExportTask"))
+        // `ctx` carries request metadata only; the instance, the environment and the S3
+        // target are each named by the request.
+        let _ = ctx;
+        use crate::state;
+
+        // The three `@required` members are modelled `clientOptional`, so a request that
+        // left one out reaches this handler as an empty value rather than being refused at
+        // the boundary. An export task names the instance to export, the environment it is
+        // exported FOR and the bucket it is exported INTO, so a request missing any of them
+        // is one this operation cannot act on — which is the code it is recorded answering a
+        // member it cannot accept with.
+        for (parameter, value) in [
+            ("instanceId", input.instance_id.as_str()),
+            ("targetEnvironment", input.target_environment.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(invalid_parameter(format!(
+                    "Invalid value for parameter {parameter}: a value is required"
+                )));
+            }
+        }
+        if input
+            .export_to_s3_task
+            .s3_bucket
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(invalid_parameter(
+                "Invalid value for parameter exportToS3.s3Bucket: a value is required",
+            ));
+        }
+
+        // "The target virtualization environment" (`TargetEnvironment`): the environments EC2
+        // exports an instance for are the members of the modelled `ExportEnvironment` enum,
+        // so a value outside it names no environment at all. The boundary validator refuses
+        // a spelling outside the enum; this is the backstop that keeps one the store would
+        // then report from reaching the task.
+        if !EXPORT_ENVIRONMENT_VALUES.contains(&input.target_environment.as_str()) {
+            return Err(invalid_parameter(format!(
+                "Invalid value '{requested}' for parameter targetEnvironment",
+                requested = input.target_environment,
+            )));
+        }
+
+        // "The tags to apply to the export instance task during creation"
+        // (`TagSpecifications`) — "you must specify the resource type to tag, otherwise the
+        // request will fail" (`TagSpecification`), and the only type this action tags is the
+        // task it creates.
+        let _tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_EXPORT_INSTANCE_TASK,
+            Self::NAME,
+        )?;
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance" (`InstanceId`): the task exports THAT instance, so an id
+        // this account holds no instance for has nothing to export. This operation reads such
+        // a value as a parameter it cannot accept rather than as a resource that is missing,
+        // which is what it is recorded answering.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(invalid_parameter(format!(
+                "Invalid value '{instance_id}' for parameter instanceId",
+                instance_id = input.instance_id,
+            )));
+        }
+
+        // Running the export itself — the task, its progress and the object it writes to the
+        // bucket — is still unwritten, so the operation answers the scaffold's 501 rather
+        // than a success it cannot back with state. Every refusal the request earns is minted
+        // above, before this point, so a client learns that its input is wrong from the code
+        // the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
+}
+
+/// The `ResourceType` a `TagSpecification` of this action may name: the export task it
+/// creates, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+const RESOURCE_TYPE_EXPORT_INSTANCE_TASK: &str = "export-instance-task";
+
+/// `InvalidParameter` (HTTP 400): a member of the request is one this operation cannot
+/// accept.
+///
+/// EC2's own code for a parameter that is wrong in a way `InvalidParameterValue` does not
+/// cover, and the code this operation is recorded answering a request it cannot act on with —
+/// the instance to export included, which the VM export surface reports as a parameter it
+/// cannot accept rather than as an instance that is missing.
+fn invalid_parameter(message: impl Into<String>) -> CreateInstanceExportTaskError {
+    crate::scaffolded::Scaffolded::service_error("InvalidParameter", 400, message)
 }

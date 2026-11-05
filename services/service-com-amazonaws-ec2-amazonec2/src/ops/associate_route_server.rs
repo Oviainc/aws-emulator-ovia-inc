@@ -160,15 +160,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // server association is the connection established between a route server and a
         // VPC", `RouteServerAssociation`), and it is that route server which then updates
         // the VPC's route tables — so a VPC that already holds an association cannot take a
-        // second one, which is EC2's `Resource.AlreadyAssociated`, naming the route server it
-        // is already associated with. That also answers a request repeating an association
-        // the account already has, so a repeat can never restart an association's clock.
+        // second one. The refusal names the resource that is already there, which is the
+        // association: EC2 answers a resource a create would duplicate with
+        // `<Resource>AlreadyExists`, and the VPC the request named already has one, whether
+        // it is with this route server or another. That also answers a request repeating an
+        // association the account already has, so a repeat can never restart an
+        // association's clock, and it is the code a second caller racing the first on one
+        // VPC gets.
         if let Some(associated_with) = store.route_server_association_of_vpc(&input.vpc_id) {
-            return Err(state::resource_already_associated(format!(
-                "The vpc '{vpc_id}' is already associated with route server \
-                 '{associated_with}'",
-                vpc_id = input.vpc_id,
-            )));
+            return Err(route_server_association_already_exists(
+                &input.vpc_id,
+                associated_with,
+            ));
         }
 
         if !store.has_route_server_association_capacity() {
@@ -198,4 +201,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             route_server_association: Some(association),
         })
     }
+}
+
+/// `RouteServerAssociationAlreadyExists` (HTTP 400): the VPC the request named already holds
+/// a route server association, so this one would be its second.
+///
+/// The `<Resource>AlreadyExists` wording EC2 answers a create whose resource is already there
+/// with, for the resource this operation creates — a route server association — naming the
+/// VPC from the REQUEST and the route server the store already holds it with.
+fn route_server_association_already_exists(
+    vpc_id: &str,
+    associated_with: &str,
+) -> AssociateRouteServerError {
+    crate::scaffolded::Scaffolded::service_error(
+        "RouteServerAssociationAlreadyExists",
+        400,
+        format!("The vpc '{vpc_id}' is already associated with route server '{associated_with}'"),
+    )
 }

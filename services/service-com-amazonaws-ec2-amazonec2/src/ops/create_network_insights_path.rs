@@ -157,8 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state;
 
         // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
-        // the request" (`ClientToken`): the model puts no `@length` on it, so its length is
-        // bounded the way every other client token of this crate is.
+        // the request" (`ClientToken`): the member is `@required` but modelled
+        // `clientOptional`, so a request that left it out reaches this handler as an empty
+        // string rather than being refused at the boundary — and a path is minted per token,
+        // so a request carrying none asks for an idempotency key this operation needs. A
+        // parameter the request did not carry is EC2's `MissingParameter`.
+        if input.client_token.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter clientToken",
+            ));
+        }
+        // The model puts no `@length` on it, so its length is bounded the way every other
+        // client token of this crate is.
         if input.client_token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS {
             return Err(state::invalid_parameter_value(format!(
                 "clientToken accepts at most {max} characters",

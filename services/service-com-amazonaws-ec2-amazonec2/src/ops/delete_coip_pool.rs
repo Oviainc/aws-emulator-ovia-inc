@@ -158,15 +158,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup and removed by another: the record reported below is the record that left
         // the store.
         //
-        // The pool goes whatever it holds: nothing of this emulator can give a pool a CIDR or
-        // an address usage yet (`CreateCoipCidr` and `GetCoipPoolUsage` are still scaffold
-        // stubs with their own open issues), so there is no in-use state to refuse against,
-        // and inventing one would refuse deletes the real service allows. Whichever of those
-        // lands first owns the in-use refusal, and this is where it belongs.
+        // THIS operation's refusal for an id it cannot resolve is `InvalidParameterValue`,
+        // whatever the id's form: the recorded answers for it name the value as one the
+        // delete cannot act on rather than as a pool that is missing, where the operations
+        // that READ a pool (`CreateCoipCidr`, `GetCoipPoolUsage`) answer the pool's own
+        // `InvalidPoolID.NotFound` for a well-formed id. The sentence is the one this
+        // surface words a `CoipPoolId` it holds no pool for with, so both halves say the
+        // same thing about the same value.
+        //
+        // A pool that still holds address ranges is not refused here: EC2 does not keep a
+        // `CreateCoipCidr`-provisioned range from being deleted with its pool, and inventing
+        // that refusal would reject deletes the real service allows.
         let pool_id = input.coip_pool_id.as_str();
-        let removed = store
-            .remove_coip_pool(pool_id)
-            .ok_or_else(|| crate::state::coip_pool_id_does_not_exist(pool_id))?;
+        let removed = store.remove_coip_pool(pool_id).ok_or_else(|| {
+            if crate::state::coip_pool_id_reads_as_one(pool_id) {
+                // A value that READS as a pool id — whatever digit count it carries — but
+                // names no pool of the account is one this delete cannot act on, which is the
+                // code its recorded refusals answer; the sentence is the one this surface
+                // words a `CoipPoolId` it holds no pool for with, so every half of the
+                // refusal says the same thing about the same value.
+                crate::state::invalid_parameter_value(
+                    crate::state::coip_pool_does_not_exist_message(pool_id),
+                )
+            } else {
+                // A value that is no pool id at all is `InvalidPoolID.Malformed` BEFORE
+                // anything is looked up, through the crate's one reader of that failure.
+                crate::state::coip_pool_id_does_not_exist(pool_id)
+            }
+        })?;
 
         // "Information about the CoIP address pool" (`DeleteCoipPoolResult$CoipPool`): the
         // pool as it was last stored, which is what the describes reported until this call.

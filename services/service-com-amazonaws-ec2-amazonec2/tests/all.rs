@@ -1329,3 +1329,9 @@ mod modify_managed_prefix_list;
 // roles, standing associations and dry run it refuses without removing anything.
 #[path = "all/delete_transit_gateway_route_table.rs"]
 mod delete_transit_gateway_route_table;
+// The REFUSAL paths of the nine operation families whose negative contract used to answer the
+// scaffold's 501: the code and status each family publishes for a resource this account holds
+// none of, a value the operation cannot act on, a dependency the store holds and a `DryRun` of
+// a request that would otherwise have succeeded. Declared at the tail of this file, which is
+#[path = "all/refusal_paths_answer_modelled_codes.rs"]
+mod refusal_paths_answer_modelled_codes;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDhcpOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDhcpOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDhcpOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes the specified set of DHCP options": it resolves the options set the request
+//! names and takes it OUT of the one DHCP options store, so `DescribeDhcpOptions` no longer
+//! reports it and the bytes it held go back to the store's byte budget.
+//!
+//! "You must disassociate the set of DHCP options before you can delete it", so a set a VPC
+//! is still associated with is refused rather than deleted — the association being the VPC's
+//! own `DhcpOptionsId`, which is where `AssociateDhcpOptions` writes it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDhcpOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDhcpOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDhcpOptions"))
+        // `ctx` carries request metadata only; the options set is named by id and resolved
+        // against the store the engine on `self` holds.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the DHCP options set" (`DhcpOptionsId`) is `@required` but modelled
+        // `clientOptional`, so a request that left it out reaches this handler as an empty
+        // string rather than being refused at the boundary. A parameter the request did not
+        // carry is EC2's `MissingParameter`.
+        if input.dhcp_options_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter dhcpOptionsId",
+            ));
+        }
+        // A value that is not a dhcp-options id at all is refused BEFORE the lookup — the
+        // ordering every resource of this service keeps, so a caller can tell "not a
+        // dhcp-options id" from "no such options set".
+        if !state::dhcp_options_id_is_well_formed(&input.dhcp_options_id) {
+            return Err(state::invalid_dhcp_options_id_malformed(
+                &input.dhcp_options_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // A set this account holds no options set for has nothing to delete. The sentence is
+        // this operation's own: its recorded refusal names the resource in the SINGULAR
+        // (`dhcpOption`), where the describe of the sets names it in the plural — which of
+        // the two an operation answers is a fact of that operation.
+        if !store.holds_dhcp_options(&input.dhcp_options_id) {
+            return Err(dhcp_options_id_not_found(&input.dhcp_options_id));
+        }
+
+        // "You must disassociate the set of DHCP options before you can delete it. You can
+        // disassociate the set of DHCP options by associating either a new set of options or
+        // the default set of options with the VPC" (`DeleteDhcpOptions`): a set a VPC is
+        // still associated with is in USE, so deleting it would leave that VPC pointing at
+        // an options set that is not there — EC2's `DependencyViolation`, naming the options
+        // set the request asked to delete, and NOTHING is deleted.
+        if store
+            .vpcs
+            .values()
+            .any(|vpc| vpc.dhcp_options_id.as_deref() == Some(input.dhcp_options_id.as_str()))
+        {
+            return Err(state::dependency_violation(format!(
+                "The dhcpOptions '{dhcp_options_id}' has dependencies and cannot be deleted.",
+                dhcp_options_id = input.dhcp_options_id,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been deleted yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The delete itself: the record goes out of the store, so `DescribeDhcpOptions` no
+        // longer reports it, and the caller-chosen bytes it held go back to the store's byte
+        // budget on exactly the terms the create charged them.
+        if let Some(removed) = store.dhcp_options.remove(&input.dhcp_options_id) {
+            store.release_stored_bytes(
+                state::dhcp_configuration_list_bytes(
+                    removed.dhcp_configurations.as_deref().unwrap_or_default(),
+                )
+                .saturating_add(state::tag_list_bytes(
+                    removed.tags.as_deref().unwrap_or_default(),
+                )),
+            );
+        }
+        Ok(DeleteDhcpOptionsOutput)
     }
+}
+
+/// `InvalidDhcpOptionID.NotFound` (HTTP 400): the request named a DHCP options set id this
+/// account holds no options set for.
+///
+/// A second wording of that code beside [`crate::state::invalid_dhcp_option_id_not_found`],
+/// and a named function here rather than a literal at the call site, because which of the two
+/// an operation answers is a fact of that operation: the recorded refusal of THIS one names
+/// the resource in the singular. The id comes from the REQUEST.
+fn dhcp_options_id_not_found(dhcp_options_id: &str) -> DeleteDhcpOptionsError {
+    crate::scaffolded::Scaffolded::service_error(
+        crate::state::INVALID_DHCP_OPTION_ID_NOT_FOUND,
+        400,
+        format!("The dhcpOption ID '{dhcp_options_id}' does not exist"),
+    )
 }

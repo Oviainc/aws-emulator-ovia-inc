@@ -197,8 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             gateway_load_balancer_arns.is_empty(),
         ) {
             (true, true) => {
-                return Err(state::missing_parameter(
-                    "The request must contain the parameter NetworkLoadBalancerArn or \
+                // The sentence names the two members one of which the request has to carry,
+                // and the refusal is the code EC2 answers a request whose members do not
+                // describe a service it can create with: there are two members it could have
+                // carried and neither is required on its own, so this is about the VALUES
+                // the request names rather than about one parameter it left out.
+                return Err(state::invalid_parameter_value(
+                    "You must specify either NetworkLoadBalancerArn or \
                      GatewayLoadBalancerArn",
                 ))
             }

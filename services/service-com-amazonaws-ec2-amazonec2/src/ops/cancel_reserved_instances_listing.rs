@@ -143,8 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // comes from the stored listing itself.
         let _ = ctx;
         use crate::state::{
-            LISTING_ID_MEMBER, RESERVED_INSTANCES_LISTING_STATUS_ACTIVE,
-            invalid_marketplace_value, require_service_state,
+            RESERVED_INSTANCES_LISTING_STATUS_ACTIVE, require_service_state,
         };
 
         let state = require_service_state(&*self.engine)?;
@@ -165,16 +164,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record.view.status.as_deref() == Some(RESERVED_INSTANCES_LISTING_STATUS_ACTIVE)
             });
         if !on_sale {
-            return Err(invalid_marketplace_value(LISTING_ID_MEMBER));
+            return Err(invalid_listing_id());
         }
 
         let withdrawn = store
             .cancel_reserved_instances_listing(listing_id, ::std::time::SystemTime::now())
-            .ok_or_else(|| invalid_marketplace_value(LISTING_ID_MEMBER))?;
+            .ok_or_else(invalid_listing_id)?;
         // "The Reserved Instance listing" (`$ReservedInstancesListings`): the one this call
         // withdrew, as it now stands.
         Ok(CancelReservedInstancesListingOutput {
             reserved_instances_listings: Some(vec![withdrawn]),
         })
     }
+}
+
+/// `InvalidInput` (HTTP 400): the `listingId` the request named is not one this operation can
+/// act on — it names no listing of the account, or one that is no longer on sale.
+///
+/// The sentence is the one EC2 is recorded answering THIS operation's bad `listingId` with:
+/// the `Invalid value for '<member>'` wording the Marketplace surface shares
+/// ([`crate::state::invalid_marketplace_value`]), opened by the SPACE that recorded message
+/// carries — the service sends it where a reason would go, and a message a client compares is
+/// the whole message.
+fn invalid_listing_id() -> CancelReservedInstancesListingError {
+    crate::state::invalid_input(format!(
+        " Invalid value for '{member}'",
+        member = crate::state::LISTING_ID_MEMBER,
+    ))
 }

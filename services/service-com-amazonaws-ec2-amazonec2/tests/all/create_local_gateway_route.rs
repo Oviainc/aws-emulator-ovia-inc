@@ -747,7 +747,11 @@ async fn a_request_that_does_not_name_exactly_one_known_target_is_refused() {
 
     // (the target fields, the code EC2 answers).
     let cases: Vec<(Vec<Param>, &str)> = vec![
-        (Vec::new(), "MissingParameter"),
+        // "You must specify ONE of the following targets" (`CreateLocalGatewayRoute`): a
+        // request that names neither is refused for the VALUE it had to carry — there are two
+        // members it could have used and neither is required on its own — which is the code
+        // this operation is recorded answering such a request with.
+        (Vec::new(), "InvalidParameterValue"),
         (
             vec![
                 param("LocalGatewayVirtualInterfaceGroupId", &known_group),
@@ -879,7 +883,7 @@ async fn a_dry_run_reports_the_permission_check_and_writes_nothing() {
                 rows()[0].destination.param(),
             ],
             400,
-            "MissingParameter",
+            "InvalidParameterValue",
         ),
     ];
     for (case, mut params, expected_status, expected_code) in cases {

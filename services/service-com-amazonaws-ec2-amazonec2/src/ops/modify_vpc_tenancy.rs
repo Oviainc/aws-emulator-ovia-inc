@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVpcTenancy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVpcTenancy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVpcTenancy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Modifies the instance tenancy attribute of the specified VPC": it resolves the VPC the
+//! request names and writes the tenancy onto the stored record, so every later reader of
+//! that VPC — `DescribeVpcs` — reports the tenancy this call accepted.
+//!
+//! "You can change the instance tenancy attribute of a VPC to `default` ONLY. You cannot
+//! change the instance tenancy attribute to `dedicated`", so the only value this operation
+//! accepts is the one the `VpcTenancy` enum publishes, and a VPC that already has it is
+//! written with it again rather than refused: the request asks for a state, and the VPC ends
+//! up in it.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +142,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVpcTenancy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVpcTenancyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVpcTenancy"))
+        // `ctx` carries request metadata only; the VPC is named by id and the tenancy by the
+        // request, so nothing here is read off it.
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("vpcId", input.vpc_id.as_str()),
+            ("instanceTenancy", input.instance_tenancy.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "You can change the instance tenancy attribute of a VPC to DEFAULT only. You
+        // cannot change the instance tenancy attribute to dedicated" — which is why
+        // `VpcTenancy` publishes exactly one member
+        // ([`crate::ops::types::VPC_TENANCY_VALUES`]). The boundary validator refuses a
+        // spelling outside the enum; this is the backstop that keeps a tenancy this
+        // operation may not set from reaching the store whatever reaches the handler.
+        if !VPC_TENANCY_VALUES.contains(&input.instance_tenancy.as_str()) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{tenancy}' for instanceTenancy. The instance tenancy of a \
+                 VPC can only be changed to '{allowed}'",
+                tenancy = input.instance_tenancy,
+                allowed = VPC_TENANCY_VALUES.join("', '"),
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // "The ID of the VPC" (`VpcId`): an id this account holds no VPC for has no tenancy
+        // attribute to modify, which is the refusal every other operation of this service
+        // answers for an unknown VPC id.
+        let Some(vpc) = store.vpcs.get_mut(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+
+        // The modification itself, onto the record every reader of this VPC reads: "after
+        // you modify the tenancy of the VPC, any new instances that you launch into the VPC
+        // have a tenancy of default" — which is what the stored attribute decides — while
+        // "the tenancy of any existing instances in the VPC is NOT affected", so nothing
+        // else is touched.
+        vpc.instance_tenancy = Some(input.instance_tenancy.clone());
+
+        // "Returns true if the request succeeds; otherwise, returns an error"
+        // (`ReturnValue`).
+        Ok(ModifyVpcTenancyOutput {
+            return_value: Some(true),
+        })
     }
 }

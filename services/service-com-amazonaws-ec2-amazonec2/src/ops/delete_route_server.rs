@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRouteServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRouteServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRouteServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes the specified route server": it resolves the route server, refuses one a VPC is
+//! still associated with, and takes the route server — with the endpoints and peers that are
+//! resources OF it — out of the store, so `DescribeRouteServers` no longer reports any of
+//! them.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +140,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRouteServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRouteServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRouteServer"))
+        // `ctx` carries request metadata only; the route server is named by id.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the route server to delete" (`RouteServerId`) is `@required` but
+        // modelled `clientOptional`, so a request that left it out reaches this handler as
+        // an empty string rather than being refused at the boundary. A parameter the request
+        // did not carry is EC2's `MissingParameter`.
+        if input.route_server_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter routeServerId",
+            ));
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the route server and its associations admit this call is
+        // asked of the state they are ACTUALLY in rather than of the one their last writer
+        // left them in.
+        store.materialize_due_transitions();
+
+        // An id that names no route server of the account is an error, not a delete of
+        // nothing. The crate's one resolver for that lookup tells a malformed id from an
+        // unknown one, and it is asked BEFORE the dry run: an unknown id is a reason the
+        // request would not have succeeded.
+        state::require_known_route_server(&store, &input.route_server_id)?;
+
+        // A route server that is still associated with a VPC is the thing updating that
+        // VPC's route tables ("a route server association is the connection established
+        // between a route server and a VPC", `RouteServerAssociation`), so it cannot be
+        // taken away while an association is live: the association has to be removed first
+        // with `DisassociateRouteServer`. That is a refusal for the STATE the route server
+        // is in, which EC2 answers with `IncorrectState`, and it names the VPCs that hold
+        // it.
+        let now = ::std::time::Instant::now();
+        let associated_vpcs: Vec<String> = store
+            .route_server_associations_at(&input.route_server_id, now)
+            .into_iter()
+            .filter_map(|association| association.vpc_id)
+            .collect();
+        if !associated_vpcs.is_empty() {
+            return Err(state::incorrect_state(format!(
+                "Route Server has non-deleted association with VPC: {vpcs}.",
+                vpcs = associated_vpcs.join(", "),
+            )));
+        }
+
+        // DryRun sits AFTER every id has been resolved and every refusal asked, and BEFORE
+        // the write — the order `AssociateRouteServer` answers it in beside this operation:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The delete itself: the route server record is the only thing that holds the route
+        // server, so taking it out of the store IS the delete, and its endpoints and peers go
+        // with it — they are resources OF the route server, which is why a live ASSOCIATION
+        // had to be removed first. The answer carries the route server as it was last
+        // reported, with the state a delete leaves it in, so the caller sees what it asked to
+        // be taken away rather than a record built beside it.
+        let Some(record) = store.route_servers.remove(&input.route_server_id) else {
+            return Err(state::internal_error(format!(
+                "the route server '{route_server_id}' resolved a moment ago is not in the \
+                 store any more",
+                route_server_id = input.route_server_id,
+            )));
+        };
+        store.route_server_endpoints.retain(|_, endpoint| {
+            endpoint.route_server_id.as_deref() != Some(input.route_server_id.as_str())
+        });
+        store
+            .route_server_peers
+            .retain(|_, peer| peer.route_server_id.as_deref() != Some(input.route_server_id.as_str()));
+        let mut view = record.view_at(now);
+        view.state = Some(ROUTE_SERVER_STATE_DELETING.to_string());
+        Ok(DeleteRouteServerOutput {
+            route_server: Some(view),
+        })
     }
 }
+
+/// A route server whose delete is under way: the `RouteServerState` enum's `deleting` member
+/// (`smithy_query(query="shape",shape="RouteServerState")`, whose members are `pending`,
+/// `available`, `modifying`, `deleting` and `deleted`).
+///
+/// The store holds a route server only while it HAS one, so the record is gone by the time
+/// this state is reported: it is the state of the route server this call took away, which is
+/// what AWS answers a delete with, and a later `DescribeRouteServers` reports no route server
+/// under that id at all.
+const ROUTE_SERVER_STATE_DELETING: &str = "deleting";

@@ -139,18 +139,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocalGatewayVirtualInterfaceGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocalGatewayVirtualInterfaceGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocalGatewayVirtualInterfaceGroup"))
+        // `ctx` carries request metadata only; a virtual interface group is a resource OF
+        // the local gateway the request names.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the local gateway" (`LocalGatewayId`) is `@required` but modelled
+        // `clientOptional`, so a request that left it out reaches this handler as an empty
+        // string rather than being refused at the boundary. A parameter the request did not
+        // carry is EC2's `MissingParameter`.
+        if input.local_gateway_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayId",
+            ));
+        }
+        // The request's own FORM before anything is resolved, through the crate's one reader
+        // of this id's form, so "not a local gateway id" never reads as "no such gateway".
+        state::require_well_formed_local_gateway_id(&input.local_gateway_id)?;
+
+        // "The tags assigned to the virtual interface group" (`TagSpecifications`) — "you
+        // must specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the group it creates.
+        let _tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_LOCAL_GATEWAY_VIRTUAL_INTERFACE_GROUP,
+            Self::NAME,
+        )?;
+
+        // "The Autonomous System Number(ASN) for the local Border Gateway Protocol (BGP)"
+        // and "the extended 32-bit ASN" (`LocalBgpAsn` / `LocalBgpAsnExtended`): an ASN is a
+        // positive number, so a value that is not one configures no BGP session at all and
+        // is refused with the code EC2 answers a parameter value it cannot accept with.
+        for (member, asn) in [
+            ("localBgpAsn", input.local_bgp_asn.map(i64::from)),
+            ("localBgpAsnExtended", input.local_bgp_asn_extended),
+        ] {
+            if asn.is_some_and(|asn| asn <= 0) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{asn}' for {member}. An Autonomous System Number is a \
+                     positive number",
+                    asn = asn.unwrap_or_default(),
+                )));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, so it is
+        // answered once the request's own form has been read and before anything is
+        // resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // A virtual interface group belongs TO a local gateway
+        // (`LocalGatewayVirtualInterfaceGroup$LocalGatewayId`), so an id this account holds
+        // no local gateway for has nothing to create a group on: it is refused with the
+        // gateway's own `NotFound` code, by the one resolver every operation of this crate
+        // reads that id with.
+        state::require_known_local_gateway(&store, &input.local_gateway_id)?;
+
+        // Storing the group itself is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }

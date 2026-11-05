@@ -135,18 +135,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLocalGatewayVirtualInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLocalGatewayVirtualInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLocalGatewayVirtualInterface"))
+        // `ctx` carries request metadata only; the virtual interface is named by id.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the virtual interface" (`LocalGatewayVirtualInterfaceId`) is
+        // `@required` but modelled `clientOptional`, so a request that left it out reaches
+        // this handler as an empty string rather than being refused at the boundary. A
+        // parameter the request did not carry is EC2's `MissingParameter`.
+        let virtual_interface_id = input.local_gateway_virtual_interface_id.as_str();
+        if virtual_interface_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayVirtualInterfaceId",
+            ));
+        }
+        // Something that is not a virtual interface id at all is refused BEFORE the lookup,
+        // the order every resource of this service keeps, through the one reader of this
+        // id's form.
+        if !state::local_gateway_virtual_interface_id_is_well_formed(virtual_interface_id) {
+            return Err(virtual_interface_id_malformed(virtual_interface_id));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // An id this account holds no virtual interface for has nothing to delete, which is
+        // the refusal `DescribeLocalGatewayVirtualInterfaces` answers for an id it cannot
+        // resolve.
+        if !store
+            .local_gateway_virtual_interfaces
+            .contains_key(virtual_interface_id)
+        {
+            return Err(virtual_interface_id_not_found(virtual_interface_id));
+        }
+
+        // Taking the virtual interface down is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
+}
+
+/// `InvalidLocalGatewayVirtualInterfaceID.Malformed` (HTTP 400): the request named something
+/// that is not a local gateway virtual interface id at all, so there is nothing to look up.
+///
+/// The `Invalid<Resource>ID.<Problem>` pair this resource's GROUP carries
+/// ([`crate::state::INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_MALFORMED`]), for the interface
+/// itself, worded the way that group's own refusal is worded.
+fn virtual_interface_id_malformed(id: &str) -> DeleteLocalGatewayVirtualInterfaceError {
+    crate::scaffolded::Scaffolded::service_error(
+        "InvalidLocalGatewayVirtualInterfaceID.Malformed",
+        400,
+        format!("The local-gateway-virtual-interface ID '{id}' is malformed"),
+    )
+}
+
+/// `InvalidLocalGatewayVirtualInterfaceID.NotFound` (HTTP 400): the request named a
+/// well-formed virtual interface id this account holds no virtual interface for — the
+/// not-found half of the pair above, worded like the group's own.
+fn virtual_interface_id_not_found(id: &str) -> DeleteLocalGatewayVirtualInterfaceError {
+    crate::scaffolded::Scaffolded::service_error(
+        "InvalidLocalGatewayVirtualInterfaceID.NotFound",
+        400,
+        format!("The local-gateway-virtual-interface ID '{id}' does not exist"),
+    )
 }

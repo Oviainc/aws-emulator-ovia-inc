@@ -277,19 +277,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The IDs of the local gateway route tables" (`...Request$LocalGatewayRouteTableIds`):
-        // an id that names no route table of the account is an error, not an absent row — the
-        // answer every sibling describe of this crate gives for an id it cannot resolve, and
-        // the one the single `LocalGatewayRouteTableId` of a search gets, so the same id is
-        // refused the same way however it is asked about. A SET, so the narrowing below costs
-        // one lookup per stored table rather than a scan of the asked-for list.
-        if let Some(unknown) = requested
-            .iter()
-            .find(|id| !store.local_gateway_route_tables.contains_key(id.as_str()))
-        {
-            return Err(crate::state::invalid_local_gateway_route_table_id_not_found(
-                unknown,
-            ));
-        }
+        // the ids are a SELECTOR over the tables the account holds, not a set of resources
+        // this report has to resolve — a well-formed id the account holds no table under
+        // selects no row and is answered with the rows that DO match, which is what the local
+        // gateway surface answers such a request with. (The request's FORM is still read
+        // above: a value that is not a route table id at all is refused, because there is
+        // nothing for it to select.) A SET, so the narrowing below costs one lookup per
+        // stored table rather than a scan of the asked-for list.
         let wanted: ::std::collections::HashSet<&str> =
             requested.iter().map(String::as_str).collect();
 

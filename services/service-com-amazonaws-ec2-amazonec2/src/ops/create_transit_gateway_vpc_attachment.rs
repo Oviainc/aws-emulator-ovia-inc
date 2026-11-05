@@ -226,13 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut subnet_ids: Vec<String> = Vec::with_capacity(input.subnet_ids.len());
         let mut zones: Vec<(String, String)> = Vec::with_capacity(input.subnet_ids.len());
         for subnet_id in &input.subnet_ids {
-            let Some(subnet) = store
-                .subnets
-                .get(subnet_id)
-                .filter(|subnet| subnet.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
-            else {
+            // A subnet id the store holds NO subnet under and one that names a subnet of
+            // ANOTHER VPC are two different facts about the request, and this operation words
+            // them apart: an id naming nothing at all gets the sentence every VPC-facing
+            // operation of this service answers an unknown subnet with, while a subnet that
+            // exists but is not in the VPC being attached gets the transit gateway family's
+            // own sentence — that subnet is not one this attachment can reach.
+            let Some(subnet) = store.subnets.get(subnet_id) else {
                 return Err(state::invalid_subnet_id_not_found(subnet_id));
             };
+            if subnet.vpc_id.as_deref() != Some(input.vpc_id.as_str()) {
+                return Err(subnet_was_deleted_or_does_not_exist(subnet_id));
+            }
             if subnet_ids.iter().any(|named| named == subnet_id) {
                 continue;
             }
@@ -293,15 +298,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state::OPTION_ENABLE,
             )?),
             // "Enables you to reference a security group across VPCs attached to a transit
-            // gateway … at the transit gateway level the default is set to disable", so an
-            // attachment the request asked nothing for takes the gateway's setting.
+            // gateway": the ATTACHMENT's own default is `enable`, which is what a recorded
+            // attachment created without the member carries — the gateway-level default the
+            // transit gateway documentation names ("at the transit gateway level the default
+            // is set to disable") is the GATEWAY's own setting and is not what a new
+            // attachment inherits.
             security_group_referencing_support: Some(resolve_option(
                 requested.and_then(|options| options.security_group_referencing_support.as_deref()),
                 "securityGroupReferencingSupport",
-                gateway_options
-                    .as_ref()
-                    .and_then(|options| options.security_group_referencing_support.clone()),
-                state::OPTION_DISABLE,
+                None,
+                state::OPTION_ENABLE,
             )?),
             // "Specifies whether IPv6 support is enabled for the attachment … The default is
             // disable": no transit gateway option corresponds to it, so the member's own
@@ -470,6 +476,29 @@ fn duplicate_transit_gateway_attachment(
             "{transit_gateway_id} has non-deleted Transit Gateway Attachment \
              {attachment_id} with VPC {vpc_id}"
         ),
+    )
+}
+
+/// `InvalidSubnetID.NotFound` (HTTP 400) in the wording the transit gateway family answers a
+/// resource of it that it cannot reach with: "Subnet <id> was deleted or does not exist.",
+/// the template [`crate::state::invalid_transit_gateway_id_not_found`] and
+/// [`crate::state::invalid_transit_gateway_route_table_id_not_found`] use for the gateway and
+/// its route tables.
+///
+/// A second wording of that code beside [`crate::state::invalid_subnet_id_not_found`], and a
+/// named function here rather than a literal at the call site, because WHICH of the two this
+/// operation answers is a fact of the REQUEST: an id the store holds no subnet under is
+/// answered the VPC surface's "The subnet ID '<id>' does not exist", while a subnet that
+/// exists outside the VPC being attached is not a subnet this attachment can use at all, and
+/// the transit gateway service — which is what answers that — words it this way. The id comes
+/// from the REQUEST.
+fn subnet_was_deleted_or_does_not_exist(
+    subnet_id: &str,
+) -> CreateTransitGatewayVpcAttachmentError {
+    crate::scaffolded::Scaffolded::service_error(
+        state::INVALID_SUBNET_ID_NOT_FOUND,
+        400,
+        format!("Subnet {subnet_id} was deleted or does not exist."),
     )
 }
 

@@ -157,16 +157,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpnConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpnConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpnConnection"))
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("customerGatewayId", input.customer_gateway_id.as_str()),
+            ("type", input.r#type.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "The type of VPN connection" (`Type`): the one type EC2 offers is
+        // `ipsec.1`, so a value outside it names no connection this service can make.
+        if input.r#type != VPN_CONNECTION_TYPE_IPSEC_1 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{requested}' for type. The only supported type is \
+                 '{VPN_CONNECTION_TYPE_IPSEC_1}'",
+                requested = input.r#type,
+            )));
+        }
+
+        // "You must specify either `VpnGatewayId` or `TransitGatewayId`, but not both"
+        // (`CreateVpnConnection`): the connection terminates on ONE gateway on the Amazon
+        // side, so a request naming both names two and one naming neither names none.
+        match (
+            input.vpn_gateway_id.as_deref(),
+            input.transit_gateway_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                    "You must specify either vpnGatewayId or transitGatewayId, but not both",
+                ));
+            }
+            (None, None) => {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter vpnGatewayId or \
+                     transitGatewayId",
+                ));
+            }
+            _ => {}
+        }
+
+        // "The tags to apply to the VPN connection" (`TagSpecifications`) — "you must
+        // specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the connection it
+        // creates.
+        let _tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_VPN_CONNECTION,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "The ID of the customer gateway" (`CustomerGatewayId`): the connection runs
+        // BETWEEN that gateway and the Amazon-side one, so an id this account holds no
+        // customer gateway for has nothing to connect — the refusal
+        // `DescribeCustomerGateways` answers for an id it cannot resolve.
+        if !store
+            .customer_gateways
+            .contains_key(&input.customer_gateway_id)
+        {
+            return Err(state::invalid_customer_gateway_id_not_found(
+                &input.customer_gateway_id,
+            ));
+        }
+        // The Amazon-side gateway, resolved the same way: whichever of the two the request
+        // named has to be a gateway this account holds.
+        if let Some(vpn_gateway_id) = input.vpn_gateway_id.as_deref() {
+            if !store.vpn_gateways.contains_key(vpn_gateway_id) {
+                return Err(state::invalid_vpn_gateway_id_not_found(vpn_gateway_id));
+            }
+        }
+        if let Some(transit_gateway_id) = input.transit_gateway_id.as_deref() {
+            if !store.transit_gateways.contains_key(transit_gateway_id) {
+                return Err(state::invalid_transit_gateway_id_not_found(
+                    transit_gateway_id,
+                ));
+            }
+        }
+
+        // Making the connection itself — the tunnels, their endpoints and their
+        // pre-shared keys — is still unwritten, so the operation answers the scaffold's 501
+        // rather than a success it cannot back with state. Every refusal the request earns is
+        // minted above, before this point, so a client learns that its input is wrong from
+        // the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }
+
+/// The one `Type` a VPN connection is made with: `ipsec.1`, as
+/// `CreateVpnConnectionRequest$Type` publishes it ("The type of VPN connection … The only
+/// supported connection type is `ipsec.1`").
+const VPN_CONNECTION_TYPE_IPSEC_1: &str = "ipsec.1";
+
+/// The `ResourceType` a `TagSpecification` of this action may name: the VPN connection it
+/// creates, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+const RESOURCE_TYPE_VPN_CONNECTION: &str = "vpn-connection";

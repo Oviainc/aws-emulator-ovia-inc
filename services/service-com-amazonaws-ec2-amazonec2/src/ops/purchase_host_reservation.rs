@@ -155,18 +155,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseHostReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseHostReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseHostReservation"))
+        // `ctx` carries request metadata only; the hosts and the offering are each named by
+        // the request and resolved against the store the engine on `self` holds.
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty value rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        if input.host_id_set.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter hostIdSet",
+            ));
+        }
+        if input.offering_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter offeringId",
+            ));
+        }
+        // The list is resolved host by host below, so the number of ids one request may name
+        // is capped first — the same ceiling the rest of this crate puts on a caller-chosen
+        // id list — before any work proportional to it is done.
+        if input.host_id_set.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "HostIdSet carries {supplied} ids, above the maximum of {maximum}",
+                supplied = input.host_id_set.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        // "The tags to apply to the Dedicated Host Reservation during purchase"
+        // (`TagSpecifications`) — "you must specify the resource type to tag, otherwise the
+        // request will fail" (`TagSpecification`), and the only type this action tags is the
+        // reservation it buys.
+        let _tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_DEDICATED_HOST_RESERVATION,
+            Self::NAME,
+        )?;
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "The IDs of the Dedicated Hosts with which the reservation will be associated"
+        // (`HostIdSet`): the reservation covers THOSE hosts, so an id this account holds no
+        // host for has nothing to reserve — refused before the offering is read, because a
+        // purchase for a host that is not there cannot be priced either. A malformed id is
+        // answered as malformed first, the order this service keeps for every id. The refusal
+        // names the whole SET the request asked for, the way this operation's recorded answer
+        // does: the purchase is for the set, so it is the set that is not valid.
+        if let Some(host_id) = input
+            .host_id_set
+            .iter()
+            .find(|host_id| !state::host_id_is_well_formed(host_id))
+        {
+            return Err(host_id_malformed(host_id));
+        }
+        if input
+            .host_id_set
+            .iter()
+            .any(|host_id| !store.dedicated_hosts.contains_key(host_id))
+        {
+            return Err(host_ids_not_valid(&input.host_id_set));
+        }
+
+        // "The ID of the offering" (`OfferingId`): a value that is not an offering id at all
+        // names nothing in the catalog `DescribeHostReservationOfferings` publishes, so it is
+        // refused for its form before anything is purchased.
+        if !state::prefixed_id_is_well_formed(HOST_OFFERING_ID_PREFIX, &input.offering_id) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{offering_id}' for offeringId. An offering id is one of \
+                 those DescribeHostReservationOfferings reports",
+                offering_id = input.offering_id,
+            )));
+        }
+
+        // Buying the reservation itself is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
+}
+
+/// The `ResourceType` a `TagSpecification` of this action may name: the host reservation it
+/// buys, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+const RESOURCE_TYPE_DEDICATED_HOST_RESERVATION: &str = "dedicated-host-reservation";
+
+/// The id prefix every Dedicated Host reservation OFFERING carries, as
+/// `crate::ops::describe_host_reservation_offerings` mints the ids of the catalog it
+/// publishes (`hro-…`).
+const HOST_OFFERING_ID_PREFIX: &str = "hro";
+
+/// `InvalidHostID.Malformed` (HTTP 400): the request named something that is not a Dedicated
+/// Host id at all, so there is nothing to look up.
+///
+/// The sentence names the resource the way EC2's own `ResourceType` member for it spells it
+/// (`dedicated-host`) and the id the REQUEST sent — the wording this operation is recorded
+/// answering such a value with, where [`crate::state::unresolvable_host_id`] answers the
+/// resource-agnostic `Invalid id: "…"` sentence the Dedicated Host operations themselves use.
+fn host_id_malformed(host_id: &str) -> PurchaseHostReservationError {
+    crate::scaffolded::Scaffolded::service_error(
+        crate::state::INVALID_HOST_ID_MALFORMED,
+        400,
+        format!(
+            "The dedicated-host ID '{host_id}' is malformed",
+            host_id = crate::state::echoed_resource_id(host_id),
+        ),
+    )
+}
+
+/// `InvalidHostId.NotFound` (HTTP 400): the request named host ids this account holds no
+/// Dedicated Hosts for.
+///
+/// A SECOND spelling of that code beside [`crate::state::invalid_host_id_not_found`]'s
+/// `InvalidHostID.NotFound`, and a named function here rather than a literal at the call
+/// site, because which of the two an operation answers is a fact of that operation: the
+/// Dedicated Host operations themselves answer `InvalidHostID.NotFound` for the ONE host they
+/// act on, while the reservation purchase — which buys a reservation for the whole `HostIdSet`
+/// — is recorded answering this one and naming that SET, as a Python-style list of the ids the
+/// REQUEST carried.
+fn host_ids_not_valid(host_id_set: &[String]) -> PurchaseHostReservationError {
+    let named: Vec<String> = host_id_set
+        .iter()
+        .map(|host_id| format!("'{host_id}'"))
+        .collect();
+    crate::scaffolded::Scaffolded::service_error(
+        "InvalidHostId.NotFound",
+        400,
+        format!(
+            "The specified Dedicated host IDs [{ids}] are not valid.",
+            ids = named.join(", "),
+        ),
+    )
 }

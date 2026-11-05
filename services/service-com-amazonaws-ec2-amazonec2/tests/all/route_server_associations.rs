@@ -20,7 +20,7 @@
 //! 4. reading associations WRITES NOTHING: two reads of one route server report the same
 //!    associations, and a read never creates one;
 //! 5. one VPC holds at most ONE association: a second `AssociateRouteServer` naming a VPC
-//!    that already holds one is refused with `Resource.AlreadyAssociated` and writes
+//!    that already holds one is refused with `RouteServerAssociationAlreadyExists` and writes
 //!    nothing, and deleting a VPC takes the association it held with it rather than leaving
 //!    one that names a VPC which no longer exists;
 //! 6. every way `AssociateRouteServer` can be refused is rendered in THIS SERVICE'S
@@ -502,9 +502,11 @@ async fn a_dry_run_of_a_request_that_would_succeed_writes_nothing() {
 
 /// The rule: an association is the connection between one route server and one VPC, so a
 /// VPC that already holds one cannot take a second — whether the second request repeats the
-/// pair or names another route server — and the refusal is EC2's `Resource.AlreadyAssociated`
-/// with nothing written. An unknown VPC id is refused with the code every operation of this
-/// service refuses one with, and deleting a VPC takes the association it held with it.
+/// pair or names another route server — and the refusal is the `<Resource>AlreadyExists`
+/// code EC2 answers a resource a create would duplicate with, which for this operation is
+/// `RouteServerAssociationAlreadyExists`, with nothing written. An unknown VPC id is refused
+/// with the code every operation of this service refuses one with, and deleting a VPC takes
+/// the association it held with it.
 ///
 /// The rows differ in which route server the second associate names, which parameter the
 /// request leaves out, and whether the VPC named exists at all.
@@ -529,7 +531,7 @@ async fn one_vpc_holds_at_most_one_route_server_association() {
             &first_server,
             &associated_vpc,
             Vec::new(),
-            "Resource.AlreadyAssociated",
+            "RouteServerAssociationAlreadyExists",
             format!("The vpc '{associated_vpc}' is already associated with route server '{first_server}'"),
         ),
         (
@@ -537,7 +539,7 @@ async fn one_vpc_holds_at_most_one_route_server_association() {
             &second_server,
             &associated_vpc,
             Vec::new(),
-            "Resource.AlreadyAssociated",
+            "RouteServerAssociationAlreadyExists",
             format!("The vpc '{associated_vpc}' is already associated with route server '{first_server}'"),
         ),
         (
@@ -545,7 +547,7 @@ async fn one_vpc_holds_at_most_one_route_server_association() {
             &second_server,
             &associated_vpc,
             vec![param("DryRun", "true")],
-            "Resource.AlreadyAssociated",
+            "RouteServerAssociationAlreadyExists",
             format!("The vpc '{associated_vpc}' is already associated with route server '{first_server}'"),
         ),
         (
@@ -738,7 +740,7 @@ async fn every_refusal_of_the_associate_is_rendered_in_this_services_error_envel
             case: "a VPC that already holds an association".to_string(),
             params: associate_params(&route_server_id, &associated_vpc, &[]),
             status: 400,
-            code: "Resource.AlreadyAssociated",
+            code: "RouteServerAssociationAlreadyExists",
             message: format!(
                 "The vpc '{associated_vpc}' is already associated with route server \
                  '{route_server_id}'"

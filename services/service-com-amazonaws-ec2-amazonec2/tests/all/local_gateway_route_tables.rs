@@ -407,25 +407,46 @@ async fn the_ids_narrow_the_report_to_the_route_tables_named() {
         );
     }
 
-    // An id the report cannot resolve is REFUSED rather than reported as a missing row: a
-    // value that is not an id of this resource at all is `.Malformed`, and a well-formed id
-    // the account holds no table for is `.NotFound` — the answer the search of one table
-    // gives for the same id, and the answer every sibling describe of this crate gives for an
-    // id list. Rows differ in which id is unresolvable, in how it is unresolvable, and in
-    // where it sits beside a known id — and the form is read before the lookup, so a
-    // malformed id is `.Malformed` whatever it is asked with.
+    // An id the report cannot RESOLVE is a selector that matches nothing rather than a
+    // refusal: a well-formed id the account holds no table for selects no row and the rows
+    // that DO match come back, which is what this surface answers such a request with — while
+    // a value that is not an id of this resource at all is still `.Malformed`, the form being
+    // read before anything is selected. Rows differ in which id is unresolvable, in how it is
+    // unresolvable, and in where it sits beside a known id.
     let unknown = "lgw-rtb-0ffffffffffffffff";
     let short_unknown = "lgw-rtb-0fffffff";
     let known = seeded[2].clone();
+    let selecting_nothing: Vec<Vec<String>> = vec![
+        vec![unknown.to_string()],
+        vec![short_unknown.to_string()],
+    ];
+    for ids in selecting_nothing {
+        let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let case = format!("ids={borrowed:?}");
+        let (status, body) =
+            describe(&router, &indexed("LocalGatewayRouteTableId", &borrowed)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        assert!(
+            elements(&body, ID_ELEMENT).is_empty(),
+            "case {case:?}: an id nothing is stored under selects no route table, got {body}"
+        );
+    }
+    // An id beside a KNOWN one narrows the report to the known one.
+    let borrowed = vec![known.as_str(), unknown];
+    let (status, body) = describe(&router, &indexed("LocalGatewayRouteTableId", &borrowed)).await;
+    assert_eq!(
+        status, 200,
+        "case {borrowed:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        elements(&body, ID_ELEMENT),
+        vec![known.clone()],
+        "case {borrowed:?}: expected the known route table alone, got {body}"
+    );
     let unresolvable_cases: Vec<(Vec<String>, &str)> = vec![
-        (
-            vec![unknown.to_string()],
-            "InvalidLocalGatewayRouteTableID.NotFound",
-        ),
-        (
-            vec![short_unknown.to_string()],
-            "InvalidLocalGatewayRouteTableID.NotFound",
-        ),
         (
             vec!["not-a-route-table-id".to_string()],
             "InvalidLocalGatewayRouteTableID.Malformed",
@@ -437,14 +458,6 @@ async fn the_ids_narrow_the_report_to_the_route_tables_named() {
         (
             vec![String::new()],
             "InvalidLocalGatewayRouteTableID.Malformed",
-        ),
-        (
-            vec![known.clone(), unknown.to_string()],
-            "InvalidLocalGatewayRouteTableID.NotFound",
-        ),
-        (
-            vec![unknown.to_string(), known.clone()],
-            "InvalidLocalGatewayRouteTableID.NotFound",
         ),
         (
             vec![known, "not-a-route-table-id".to_string()],
@@ -849,20 +862,27 @@ async fn a_request_past_a_published_cap_is_refused_rather_than_evaluated() {
     // `lgw-rtb-` and 17 lowercase hex digits.
     let unheld_id = |index: usize| format!("lgw-rtb-{index:017x}");
 
-    // The id list AT its cap is read, so the answer is about what the ids NAME — no table
-    // here — and not about how many there are; one past the cap, the count is the answer.
+    // The id list AT its cap is READ rather than counted, so the request is served; one past
+    // the cap, the count is the answer. A handful of unheld ids proves the reading itself:
+    // they select no row, so the report comes back empty.
+    let unheld: Vec<String> = (0..3).map(unheld_id).collect();
+    let borrowed: Vec<&str> = unheld.iter().map(String::as_str).collect();
+    let (status, body) = describe(&router, &indexed("LocalGatewayRouteTableId", &borrowed)).await;
+    assert_eq!(
+        status, 200,
+        "a few unheld ids: expected HTTP 200, got {status} with body {body}"
+    );
+    assert!(
+        elements(&body, ID_ELEMENT).is_empty(),
+        "a few unheld ids: ids that name no table select no row, got {body}"
+    );
     let ids: Vec<String> = (0..ec2::state::MAX_RESOURCE_IDS).map(unheld_id).collect();
     let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (status, body) = describe(&router, &indexed("LocalGatewayRouteTableId", &borrowed)).await;
     assert_eq!(
-        status, 400,
-        "ids at the cap: expected HTTP 400, got {status} with body {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "InvalidLocalGatewayRouteTableID.NotFound",
-        "ids at the cap: the ids are read, so expected the answer for an id naming no table, \
-         got {body}"
+        status, 200,
+        "ids at the cap: the list is at the published cap, so the request is served rather \
+         than refused for its size, got {status} with body {body}"
     );
 
     let ids: Vec<String> = (0..=ec2::state::MAX_RESOURCE_IDS).map(unheld_id).collect();

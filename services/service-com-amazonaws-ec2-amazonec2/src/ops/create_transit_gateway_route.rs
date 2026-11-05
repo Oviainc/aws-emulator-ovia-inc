@@ -138,18 +138,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayRoute"))
+        // `ctx` carries request metadata only; a route is a resource of the route table the
+        // request names, so nothing here is read off it.
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("destinationCidrBlock", input.destination_cidr_block.as_str()),
+            (
+                "transitGatewayRouteTableId",
+                input.transit_gateway_route_table_id.as_str(),
+            ),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "The CIDR range used for destination matches" (`DestinationCidrBlock`): a value
+        // that is not a CIDR block at all matches no destination, so it is refused with the
+        // code EC2 answers a parameter value it cannot accept with, before anything is
+        // resolved.
+        if !state::cidr_block_is_well_formed(&input.destination_cidr_block) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{destination}' for destinationCidrBlock. A destination is a \
+                 CIDR block",
+                destination = input.destination_cidr_block,
+            )));
+        }
+
+        // "Indicates whether to drop traffic that matches this route" (`Blackhole`): a
+        // blackhole route drops the traffic instead of sending it to an attachment, so a
+        // request that asks for both names two destinations for one route and cannot hold
+        // together — EC2's `InvalidParameterCombination`.
+        let blackhole = input.blackhole.unwrap_or(false);
+        if blackhole && input.transit_gateway_attachment_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "transitGatewayAttachmentId cannot be given for a route whose blackhole is \
+                 set: a blackhole route drops the traffic that matches it",
+            ));
+        }
+
+        // The form of each id the request names, before anything is looked up, so "not an id
+        // of this kind" never reads as "no such resource".
+        state::require_well_formed_transit_gateway_route_table_id(
+            &input.transit_gateway_route_table_id,
+        )?;
+        if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
+            if !state::prefixed_id_is_well_formed(
+                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+                attachment_id,
+            ) {
+                return Err(state::invalid_parameter_value(
+                    state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE,
+                ));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // route table the request names, so it is answered before anything is resolved or
+        // written — the order `CreateTransitGatewayRouteTable` answers it in beside this
+        // operation.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the route table and the attachment admit this call is
+        // asked of the state they are ACTUALLY in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway route table" the route is created in
+        // (`TransitGatewayRouteTableId`): a route is a resource OF that table, so an id this
+        // account holds no route table for has nothing to add a route to. Resolved against
+        // the store alone, by the one refusal every operation of this crate answers an
+        // unresolvable transit gateway route table id with.
+        if !store
+            .transit_gateway_route_tables
+            .contains_key(&input.transit_gateway_route_table_id)
+        {
+            return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                &input.transit_gateway_route_table_id,
+            ));
+        }
+
+        // "The ID of the attachment" the route sends its traffic to
+        // (`TransitGatewayAttachmentId`), resolved the same way: an id naming no attachment
+        // of the account has nothing to send traffic to.
+        if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
+            if !store.transit_gateway_attachments.contains_key(attachment_id) {
+                return Err(state::invalid_transit_gateway_attachment_id_not_found(
+                    attachment_id,
+                ));
+            }
+        }
+
+        // A route that is not a blackhole sends the traffic it matches to an attachment, so
+        // one that names none has nowhere to send it. Asked AFTER the route table has been
+        // resolved, because the table is what the route would be created in: a request that
+        // names no table at all cannot be told about a target it also left out.
+        if !blackhole && input.transit_gateway_attachment_id.is_none() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter transitGatewayAttachmentId for a \
+                 route whose blackhole is not set",
+            ));
+        }
+
+        // Storing the route itself is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }

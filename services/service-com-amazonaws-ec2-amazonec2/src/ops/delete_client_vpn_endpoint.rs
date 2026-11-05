@@ -135,18 +135,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClientVpnEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClientVpnEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClientVpnEndpoint"))
+        // `ctx` carries request metadata only; the endpoint is named by id and resolved
+        // against the store the engine on `self` holds.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the Client VPN to be deleted" (`ClientVpnEndpointId`) is `@required`
+        // but modelled `clientOptional`, so a request that left it out reaches this handler
+        // as an empty string rather than being refused at the boundary. A parameter the
+        // request did not carry is EC2's `MissingParameter`.
+        if input.client_vpn_endpoint_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter clientVpnEndpointId",
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // The endpoint the request names, resolved by the ONE lookup every operation taking
+        // a `ClientVpnEndpointId` resolves it through, so an id this account holds no
+        // endpoint for is refused the one way this surface refuses it rather than reported
+        // as deleted.
+        state::require_known_client_vpn_endpoint(&store, &input.client_vpn_endpoint_id)?;
+
+        // Taking the endpoint down is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }

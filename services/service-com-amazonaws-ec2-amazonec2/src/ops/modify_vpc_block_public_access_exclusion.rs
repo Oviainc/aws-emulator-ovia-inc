@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVpcBlockPublicAccessExclusion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVpcBlockPublicAccessExclusion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVpcBlockPublicAccessExclusion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Modify VPC Block Public Access (BPA) exclusions": it resolves the exclusion the request
+//! names and writes the requested internet gateway exclusion mode onto the stored record, so
+//! every later reader of that exclusion — `DescribeVpcBlockPublicAccessExclusions` — reports
+//! the mode this call accepted.
+//!
+//! A change is applied over a span, so the exclusion is left in the non-terminal
+//! `update-in-progress` state with the clock owing it `update-complete`, exactly as its
+//! create leaves it `create-in-progress`; the mode stored is a word out of the model's own
+//! catalog rather than the request's text.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVpcBlockPublicAccessExclusion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVpcBlockPublicAccessExclusionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVpcBlockPublicAccessExclusion"))
+        // `ctx` carries request metadata only; the exclusion is named by id and the mode by
+        // the request.
+        let _ = ctx;
+        use crate::state;
+        use std::time::SystemTime;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("exclusionId", input.exclusion_id.as_str()),
+            (
+                "internetGatewayExclusionMode",
+                input.internet_gateway_exclusion_mode.as_str(),
+            ),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "The exclusion mode for internet gateway traffic"
+        // (`InternetGatewayExclusionMode`): the stored word comes out of the model's own
+        // catalog through the crate's one reader of that member, so request text never
+        // reaches the store, and a spelling outside the catalog is refused with the code EC2
+        // answers a parameter value it cannot accept with.
+        let Some(exclusion_mode) =
+            state::internet_gateway_exclusion_mode(&input.internet_gateway_exclusion_mode)
+        else {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{requested}' for internetGatewayExclusionMode. Valid values \
+                 are '{allowed}'",
+                requested = input.internet_gateway_exclusion_mode,
+                allowed = INTERNET_GATEWAY_EXCLUSION_MODE_VALUES.join("', '"),
+            )));
+        };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called — an exclusion its create left `create-in-progress` is
+        // `create-complete` once that instant has passed — so those moves are applied before
+        // this write reads the store.
+        store.materialize_due_transitions();
+
+        // "The ID of an exclusion" (`ExclusionId`): an id this account holds no exclusion
+        // under has no mode to modify, refused by the one place this crate words that
+        // refusal.
+        let Some(record) = store
+            .vpc_block_public_access_exclusions
+            .get_mut(&input.exclusion_id)
+        else {
+            return Err(state::invalid_vpc_bpa_exclusion_id_not_found(
+                &input.exclusion_id,
+            ));
+        };
+
+        // The modification itself: the mode the request asked for, the state a change is
+        // applied over, and "when the exclusion was last updated"
+        // (`VpcBlockPublicAccessExclusion$LastUpdateTimestamp`), which is now.
+        record.view.internet_gateway_exclusion_mode = Some(exclusion_mode.to_string());
+        record.view.state = Some(EXCLUSION_STATE_UPDATE_IN_PROGRESS.to_string());
+        record.view.last_update_timestamp = Some(state::system_time_to_date_time(SystemTime::now()));
+        record.pending = Some(state::ExclusionTransition::starting_now(
+            EXCLUSION_STATE_UPDATE_COMPLETE,
+        ));
+
+        // The answer is the record as it now stands in the store, so this call and every
+        // later reader of the exclusion agree.
+        Ok(ModifyVpcBlockPublicAccessExclusionOutput {
+            vpc_block_public_access_exclusion: Some(record.view.clone()),
+        })
     }
 }
+
+/// An exclusion whose modification is under way: the `VpcBlockPublicAccessExclusionState`
+/// enum's `update-in-progress` member
+/// ([`crate::ops::types::VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION_STATE_VALUES`]).
+const EXCLUSION_STATE_UPDATE_IN_PROGRESS: &str = "update-in-progress";
+
+/// An exclusion whose modification is in place: that same enum's `update-complete` member,
+/// the state the clock owes an `update-in-progress` one.
+const EXCLUSION_STATE_UPDATE_COMPLETE: &str = "update-complete";

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateRouteServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateRouteServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateRouteServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Disassociates a route server from a VPC": it resolves the route server and the VPC the
+//! request pairs, and takes the association between the two OUT of the one association
+//! store, so `GetRouteServerAssociations` no longer reports it and the VPC can be associated
+//! with a route server again.
+//!
+//! A pairing the account holds no association for is refused rather than reported as
+//! disassociated: that is the one way a client learns that the VPC it named was never served
+//! by the route server it named.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +138,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateRouteServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateRouteServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateRouteServer"))
+        // `ctx` carries request metadata only; both ends of the association are named by id.
+        let _ = ctx;
+        use crate::state;
+
+        // Both ids are `@required` but modelled `clientOptional`, so a request that left
+        // either out reaches this handler as an empty string rather than being refused by
+        // the boundary validator. A parameter the request did not carry is EC2's
+        // `MissingParameter`.
+        for (parameter, value) in [
+            ("routeServerId", input.route_server_id.as_str()),
+            ("vpcId", input.vpc_id.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // "The ID of the route server to disassociate" (`RouteServerId`): an id that names no
+        // route server of the account is an error, not a disassociation of nothing. The
+        // crate's one resolver for that lookup tells a malformed id from an unknown one.
+        state::require_known_route_server(&store, &input.route_server_id)?;
+
+        // "The ID of the VPC to disassociate from the route server" (`VpcId`), refused with
+        // the code every other operation of this service refuses an unknown VPC id with.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // An association IS the (route server, VPC) pair — "a route server association is the
+        // connection established between a route server and a VPC" (`RouteServerAssociation`)
+        // — so a pair the store holds no association for has nothing to disassociate, and
+        // that is refused rather than answered as though the pair had just been separated.
+        // A VPC associated with ANOTHER route server is not associated with this one either,
+        // so it earns the same refusal.
+        let pairing = (input.route_server_id.clone(), input.vpc_id.clone());
+        if !store.route_server_associations.contains_key(&pairing) {
+            return Err(route_server_not_associated(
+                &input.route_server_id,
+                &input.vpc_id,
+            ));
+        }
+
+        // DryRun sits AFTER every id has been resolved and every refusal asked, and BEFORE
+        // the write — the order `AssociateRouteServer` answers it in beside this operation:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The disassociation itself: the association is the only record of the pairing, so
+        // taking it out of the store IS the disassociation — nothing is left to report it,
+        // which is why the answer carries the state the store has actually reached rather
+        // than a transient one no record would hold.
+        store.route_server_associations.remove(&pairing);
+        Ok(DisassociateRouteServerOutput {
+            route_server_association: Some(RouteServerAssociation {
+                route_server_id: Some(input.route_server_id.clone()),
+                vpc_id: Some(input.vpc_id.clone()),
+                state: Some(ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATED.to_string()),
+            }),
+        })
     }
+}
+
+/// An association that is no longer in force: the `RouteServerAssociationState` enum's
+/// `disassociated` member (`smithy_query(query="shape",shape="RouteServerAssociationState")`,
+/// whose members are `associating`, `associated`, `disassociating` and `disassociated`).
+const ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
+
+/// `InvalidRouteServerId.NotAssociated` (HTTP 400): the request paired a route server with a
+/// VPC the account holds no association between.
+///
+/// The `Invalid<Resource>Id.<Problem>` convention EC2 names its refusals with, for the one
+/// problem this operation has with a pairing it cannot find — it is the route server that is
+/// not associated with the VPC the request named — and the message names both ends from the
+/// REQUEST.
+fn route_server_not_associated(
+    route_server_id: &str,
+    vpc_id: &str,
+) -> DisassociateRouteServerError {
+    crate::scaffolded::Scaffolded::service_error(
+        "InvalidRouteServerId.NotAssociated",
+        400,
+        format!("Route Server {route_server_id} is not associated with VPC {vpc_id}."),
+    )
 }

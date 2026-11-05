@@ -36,8 +36,7 @@ use ec2::ops::types::{
 };
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, INCORRECT_STATE, INVALID_PARAMETER_VALUE,
-    INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE,
-    INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND, PROTOCOL_VALUE_GRE,
+    INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE, PROTOCOL_VALUE_GRE,
     RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT, TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
     TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN,
     TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CONNECT,
@@ -578,7 +577,11 @@ async fn the_create_refuses_a_transport_attachment_it_cannot_build_on() {
         });
     }
 
-    // Well formed, but no attachment of the account holds it.
+    // Well formed, but no attachment of the account holds it. The transport attachment is a
+    // PARAMETER VALUE of this operation rather than the resource it acts on, so an id naming
+    // no attachment of the account is refused as a value it cannot act on — the code this
+    // operation is recorded answering such a transport with, where the attachment's own
+    // `NotFound` belongs to the operations whose subject IS the attachment.
     let unknown = "tgw-attach-00000000000000000";
     refusals.push(Refusal {
         label: format!("unknown transport id {unknown:?}"),
@@ -586,9 +589,10 @@ async fn the_create_refuses_a_transport_attachment_it_cannot_build_on() {
             param("TransportTransitGatewayAttachmentId", unknown),
             options.clone(),
         ],
-        code: INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+        code: INVALID_PARAMETER_VALUE,
         message: format!(
-            "The {RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT} ID '{unknown}' does not exist"
+            "Invalid value '{unknown}' for transportTransitGatewayAttachmentId. The transit \
+             gateway attachment to create the Connect attachment from could not be found"
         ),
     });
 

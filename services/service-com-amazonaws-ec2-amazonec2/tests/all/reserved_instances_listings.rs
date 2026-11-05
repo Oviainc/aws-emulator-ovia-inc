@@ -840,8 +840,9 @@ async fn a_listing_id_this_operation_cannot_act_on_is_refused_as_an_invalid_list
         );
         assert_eq!(
             error_message(&body),
-            "Invalid value for 'listingId'",
-            "case {case:?}: expected the sentence EC2 refuses a listingId with, got {body}"
+            " Invalid value for 'listingId'",
+            "case {case:?}: expected the sentence EC2 refuses a listingId with — which opens \
+             with the SPACE the recorded message carries where a reason would go — got {body}"
         );
         assert_eq!(
             stored_listings(&engine),

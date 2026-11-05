@@ -138,18 +138,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInstanceEventWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInstanceEventWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInstanceEventWindow"))
+        // `ctx` carries request metadata only; the event window is named by id.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the event window" (`InstanceEventWindowId`) is `@required` but modelled
+        // `clientOptional`, so a request that left it out reaches this handler as an empty
+        // string rather than being refused at the boundary. A parameter the request did not
+        // carry is EC2's `MissingParameter`.
+        if input.instance_event_window_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter instanceEventWindowId",
+            ));
+        }
+        // A value that is not an event window id at all is refused BEFORE the lookup, the
+        // order every resource of this service keeps.
+        if !state::instance_event_window_id_is_well_formed(&input.instance_event_window_id) {
+            return Err(state::unresolvable_instance_event_window_id(
+                &input.instance_event_window_id,
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // An id this account holds no event window for has nothing to delete. THIS
+        // operation's code for that refusal is the one its recorded answer carries —
+        // `InvalidInstanceEventWindowIDNotFound`, written as one word, where the rest of the
+        // event-window surface answers the dotted `Invalid<Resource>Id.NotFound` form — and
+        // the sentence is the template this service refuses a missing resource id with.
+        if !store
+            .instance_event_windows
+            .contains_key(&input.instance_event_window_id)
+        {
+            return Err(event_window_not_found(&input.instance_event_window_id));
+        }
+
+        // Taking the event window down — and what that does to the instances and the tags
+        // associated with it, which `ForceDelete` is about — is still unwritten, so the
+        // operation answers the scaffold's 501 rather than a success it cannot back with
+        // state. Every refusal the request earns is minted above, before this point, so a
+        // client learns that its input is wrong from the code the real service answers
+        // rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
+}
+
+/// `InvalidInstanceEventWindowIDNotFound` (HTTP 400): the request named an event window id
+/// this account holds no event window for.
+///
+/// The code THIS operation is recorded answering — one word, with neither the `Id.NotFound`
+/// dot the rest of this service's id refusals carry nor the `ID` casing of the resource's own
+/// prefix — kept as a named function rather than a literal at the call site, because which of
+/// the two an operation answers is a fact of that operation. The sentence is the one
+/// [`crate::state::invalid_instance_event_window_id_not_found`] words, naming the id from the
+/// REQUEST.
+fn event_window_not_found(instance_event_window_id: &str) -> DeleteInstanceEventWindowError {
+    crate::scaffolded::Scaffolded::service_error(
+        "InvalidInstanceEventWindowIDNotFound",
+        400,
+        format!(
+            "The {resource} ID '{instance_event_window_id}' does not exist",
+            resource = crate::state::RESOURCE_TYPE_INSTANCE_EVENT_WINDOW,
+        ),
+    )
 }

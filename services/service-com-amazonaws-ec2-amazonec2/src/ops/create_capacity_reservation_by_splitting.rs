@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityReservationBySplitting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityReservationBySplitting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityReservationBySplitting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Create a new Capacity Reservation by splitting the capacity of the source Capacity
+//! Reservation": it resolves the source reservation, MOVES the number of instances the
+//! request asks for out of it into a new reservation, and answers both as the store now
+//! holds them — so the two together hold exactly the capacity the source held before the
+//! call, and `DescribeCapacityReservations` reports what this answered.
+//!
+//! The capacity is moved rather than created: a source that does not hold that many
+//! instances, or that would be left with none, is refused and nothing is written. Two
+//! callers splitting one reservation at once are serialized by the one store lock, so the
+//! second sees what the first took.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityReservationBySplitting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityReservationBySplittingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityReservationBySplitting"))
+        use crate::state;
+        use std::time::SystemTime;
+
+        // The Region the request was signed for: the new reservation's ARN names it, and it
+        // is the scope an idempotency token is read under — the same reading
+        // `CreateCapacityReservation` makes.
+        let region = state::request_region(ctx.parts());
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left the
+        // id out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        if input.source_capacity_reservation_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter sourceCapacityReservationId",
+            ));
+        }
+        // "The number of instances to split from the source Capacity Reservation"
+        // (`InstanceCount`): splitting off no instances — or a negative number of them —
+        // creates no reservation, so it is refused with the code EC2 answers a parameter
+        // value it cannot act on with.
+        if input.instance_count < 1 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{instance_count}' for instanceCount. The number of instances \
+                 to split from the source Capacity Reservation is at least 1",
+                instance_count = input.instance_count,
+            )));
+        }
+
+        // "The tags to apply to the new Capacity Reservation" (`TagSpecifications`) — "you
+        // must specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the reservation it
+        // creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CAPACITY_RESERVATION,
+            Self::NAME,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the source reservation still holds the capacity this
+        // split asks for is asked of the state it is ACTUALLY in — a reservation past its
+        // end date has expired whether or not anybody called.
+        store.materialize_due_transitions();
+        let now = SystemTime::now();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`ClientToken`) — one token names the one reservation
+        // it minted, so a replay reports that reservation and splits nothing more. A token
+        // whose reservation the store no longer holds is a MISS, not a replay, and the
+        // request is served as a fresh split. The token is read under the Region the request
+        // was signed for, the scope `CreateCapacityReservation` reads its own under.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .capacity_reservation_client_tokens
+                    .get(&(region.clone(), token.to_string()))
+                    .cloned()
+            })
+            .filter(|minted_id| store.capacity_reservations.contains_key(minted_id));
+
+        // "The ID of the Capacity Reservation from which you want to split the capacity"
+        // (`SourceCapacityReservationId`): the capacity comes OUT of that reservation, so an
+        // id this account holds no reservation for has nothing to split — resolved through
+        // the one resolver every operation of this crate reads a `CapacityReservationId`
+        // with, which refuses a malformed id before an unknown one.
+        let source = state::require_known_capacity_reservation(
+            &store,
+            &input.source_capacity_reservation_id,
+        )?;
+        let source_state = source.state_at(now).to_string();
+        let source_view = source.view.clone();
+
+        // Capacity can only be split out of a reservation that HOLDS capacity: one that has
+        // been cancelled, has expired or has failed holds none, so there is nothing to move
+        // into a new reservation. A refusal for the state the resource is in is EC2's
+        // `IncorrectState`.
+        if source_state != state::CAPACITY_RESERVATION_STATE_ACTIVE {
+            return Err(state::incorrect_state(format!(
+                "The capacity reservation '{source_id}' is in state '{source_state}'; \
+                 capacity can only be split from a reservation in state '{active}'",
+                source_id = input.source_capacity_reservation_id,
+                active = state::CAPACITY_RESERVATION_STATE_ACTIVE,
+            )));
+        }
+
+        // "The number of instances in the new Capacity Reservation. The number of instances
+        // in the source Capacity Reservation was REDUCED by this amount" (`$InstanceCount`):
+        // the capacity is MOVED rather than created, so the source has to hold at least that
+        // many instances that nothing has launched into, and it has to keep at least one —
+        // a reservation cannot be split down to nothing. Two callers splitting the same
+        // reservation at once are serialized by the one store lock, so the second one sees
+        // what the first took and is refused here rather than oversubscribing the source.
+        let available = source_view.available_instance_count.unwrap_or_default();
+        if input.instance_count >= available {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{requested}' for instanceCount. The capacity reservation \
+                 '{source_id}' has {available} instances available, and a split leaves at \
+                 least one of them in it",
+                requested = input.instance_count,
+                source_id = input.source_capacity_reservation_id,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // A replay answers the reservation its token already minted, with the source as it
+        // now stands: the split it asked for was already made, and making it again would
+        // take the capacity twice.
+        if let Some(minted_id) = replayed {
+            let destination = store
+                .capacity_reservations
+                .get(&minted_id)
+                .map(|record| record.view_at(now));
+            let source = store
+                .capacity_reservations
+                .get(&input.source_capacity_reservation_id)
+                .map(|record| record.view_at(now));
+            return Ok(CreateCapacityReservationBySplittingOutput {
+                source_capacity_reservation: source,
+                destination_capacity_reservation: destination,
+                instance_count: Some(input.instance_count),
+            });
+        }
+
+        // The destination reservation: the SAME capacity the source holds — its instance
+        // type, platform, zone, tenancy and match criteria — for the number of instances the
+        // request asked for, because the capacity is moved rather than newly reserved. It is
+        // stored through the one writer of this store, which mints its id and its ARN, and
+        // it is `active` from the start: the capacity it holds was already provisioned for
+        // the source.
+        let destination_spec = state::CapacityReservationSpec {
+            instance_type: source_view.instance_type.clone().unwrap_or_default(),
+            instance_platform: source_view.instance_platform.clone().unwrap_or_default(),
+            availability_zone: source_view.availability_zone.clone().unwrap_or_default(),
+            availability_zone_id: source_view.availability_zone_id.clone().unwrap_or_default(),
+            region: region.clone(),
+            tenancy: source_view.tenancy.clone().unwrap_or_default(),
+            instance_count: input.instance_count,
+            ebs_optimized: source_view.ebs_optimized.unwrap_or(false),
+            ephemeral_storage: source_view.ephemeral_storage.unwrap_or(false),
+            end_date: source_view.end_date.map(state::date_time_to_system_time),
+            instance_match_criteria: source_view
+                .instance_match_criteria
+                .clone()
+                .unwrap_or_default(),
+            created_at: now,
+            start_date: None,
+            commitment: None,
+            delivery_preference: None,
+            state: state::CAPACITY_RESERVATION_STATE_ACTIVE,
+            tags,
+            interruption_info: None,
+            zero_size_preference: None,
+            pending: None,
+        };
+        let Some(destination_id) = store.insert_capacity_reservation(destination_spec) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many Capacity Reservations as it will store",
+            ));
+        };
+
+        // The capacity MOVED: the source holds that many fewer instances, both in the
+        // capacity it reserves and in the capacity nothing has launched into, so the two
+        // reservations together hold exactly what the source held before this call.
+        if let Some(record) = store
+            .capacity_reservations
+            .get_mut(&input.source_capacity_reservation_id)
+        {
+            record.view.total_instance_count = Some(
+                record
+                    .view
+                    .total_instance_count
+                    .unwrap_or_default()
+                    .saturating_sub(input.instance_count),
+            );
+            record.view.available_instance_count = Some(
+                record
+                    .view
+                    .available_instance_count
+                    .unwrap_or_default()
+                    .saturating_sub(input.instance_count),
+            );
+        }
+        // The token names the reservation it minted, so a replay of this very request
+        // answers that one instead of splitting the source again.
+        if let Some(token) = input.client_token.clone() {
+            store.add_stored_bytes(token.len());
+            store
+                .capacity_reservation_client_tokens
+                .insert((region, token), destination_id.clone());
+        }
+
+        // Both answers are read back OUT of the store, so what this call reports is what a
+        // later `DescribeCapacityReservations` reports.
+        Ok(CreateCapacityReservationBySplittingOutput {
+            source_capacity_reservation: store
+                .capacity_reservations
+                .get(&input.source_capacity_reservation_id)
+                .map(|record| record.view_at(now)),
+            destination_capacity_reservation: store
+                .capacity_reservations
+                .get(&destination_id)
+                .map(|record| record.view_at(now)),
+            instance_count: Some(input.instance_count),
+        })
     }
 }

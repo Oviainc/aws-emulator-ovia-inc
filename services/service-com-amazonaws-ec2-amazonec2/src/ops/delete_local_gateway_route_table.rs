@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLocalGatewayRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLocalGatewayRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLocalGatewayRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a local gateway route table": it resolves the route table the request names,
+//! refuses one an association still holds, and leaves the table in the non-terminal
+//! `deleting` state with the clock owing it `deleted` — so a caller reading straight after
+//! the call still sees the delete in progress and `DescribeLocalGatewayRouteTables` reports
+//! the very state this call answered with.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +132,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLocalGatewayRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLocalGatewayRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLocalGatewayRouteTable"))
+        // `ctx` carries request metadata only; the table is named by id and every fact the
+        // answer carries is read off the stored record.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the local gateway route table" (`LocalGatewayRouteTableId`) is
+        // `@required` but modelled `clientOptional`, so a request that left it out reaches
+        // this handler as an empty string rather than being refused at the boundary. A
+        // parameter the request did not carry is EC2's `MissingParameter`.
+        let route_table_id = input.local_gateway_route_table_id.as_str();
+        if route_table_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayRouteTableId",
+            ));
+        }
+        // The request's own FORM before anything is resolved, through the crate's one reader
+        // of this id's form, so "not a route table id of this kind" never reads as "no such
+        // route table".
+        state::require_well_formed_local_gateway_route_table_id(route_table_id)?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // The table the request names, refused with the resource's own `NotFound` code when
+        // the account holds none under that id — by the one resolver every operation of this
+        // crate reads a `LocalGatewayRouteTableId` with, so a delete and a describe cannot
+        // disagree about which ids exist.
+        state::require_known_local_gateway_route_table(&store, route_table_id)?;
+
+        // A route table that still holds a VPC association or a virtual interface group
+        // association is in use, so taking it away would leave those associations pointing
+        // at nothing: EC2's `DependencyViolation`, naming the association that holds it.
+        if let Some(association_id) = store
+            .local_gateway_route_table_vpc_associations
+            .iter()
+            .find(|(_, record)| {
+                record.view.local_gateway_route_table_id.as_deref() == Some(route_table_id)
+            })
+            .map(|(association_id, _)| association_id.clone())
+        {
+            return Err(state::dependency_violation(format!(
+                "The local gateway route table '{route_table_id}' has a dependent object: \
+                 the VPC association '{association_id}'"
+            )));
+        }
+        if let Some(association_id) = store
+            .local_gateway_route_table_virtual_interface_group_associations
+            .iter()
+            .find(|(_, record)| {
+                record.view.local_gateway_route_table_id.as_deref() == Some(route_table_id)
+            })
+            .map(|(association_id, _)| association_id.clone())
+        {
+            return Err(state::dependency_violation(format!(
+                "The local gateway route table '{route_table_id}' has a dependent object: \
+                 the virtual interface group association '{association_id}'"
+            )));
+        }
+
+        // The delete itself: the table is left in the non-terminal `deleting` state with the
+        // clock owing it `deleted`, so a caller reading straight after this call still sees
+        // the delete in progress, and the record is kept rather than dropped — which is what
+        // lets `DescribeLocalGatewayRouteTables` report the state this call reported.
+        let Some(record) = store.local_gateway_route_tables.get_mut(route_table_id) else {
+            return Err(state::internal_error(format!(
+                "the local gateway route table '{route_table_id}' resolved a moment ago is \
+                 not in the store any more"
+            )));
+        };
+        record.view.state = Some(ROUTE_TABLE_STATE_DELETING.to_string());
+        record.pending = Some(state::PendingStateMove::starting_now(
+            ROUTE_TABLE_STATE_DELETED,
+        ));
+
+        // "Information about the local gateway route table"
+        // (`DeleteLocalGatewayRouteTableResult$LocalGatewayRouteTable`): the record as it now
+        // stands in the store, so this call and every later reader of it agree.
+        Ok(DeleteLocalGatewayRouteTableOutput {
+            local_gateway_route_table: Some(record.view.clone()),
+        })
     }
 }
+
+/// A local gateway route table whose delete is under way: the
+/// `LocalGatewayRouteTableState` enum's `deleting` member
+/// (`smithy_query(query="shape",shape="LocalGatewayRouteTableState")`, whose members are
+/// `pending`, `available`, `deleting` and `deleted`).
+const ROUTE_TABLE_STATE_DELETING: &str = "deleting";
+
+/// A local gateway route table whose delete has finished: that same enum's `deleted` member.
+const ROUTE_TABLE_STATE_DELETED: &str = "deleted";

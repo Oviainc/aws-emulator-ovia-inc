@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCoipPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCoipPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCoipPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Creates a pool of customer-owned IP (CoIP) addresses": it resolves the local gateway
+//! route table the pool belongs to and stores ONE pool in the one CoIP pool store, which
+//! `DescribeCoipPools`, `CreateCoipCidr`, `GetCoipPoolUsage` and `DeleteCoipPool` then read.
+//!
+//! Nothing about the answer is taken from a recording: the pool id comes from the store's id
+//! mint, its `PoolArn` is built from that id and the Region the request was signed for, the
+//! route table is the one the request names and resolved against the store, and the pool
+//! holds no address range until `CreateCoipCidr` provisions one.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +136,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCoipPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCoipPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCoipPool"))
+        use crate::state;
+
+        // The Region the request was signed for, which the pool's own `PoolArn` names — the
+        // only fact of this answer that is read off the request's metadata.
+        let region = state::request_region(ctx.parts());
+
+        // "The ID of the local gateway route table" (`LocalGatewayRouteTableId`) is
+        // `@required` but modelled `clientOptional`, so a request that left it out reaches
+        // this handler as an empty string rather than being refused at the boundary. A
+        // parameter the request did not carry is EC2's `MissingParameter`.
+        let route_table_id = input.local_gateway_route_table_id.as_str();
+        if route_table_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayRouteTableId",
+            ));
+        }
+        // The request's own FORM before anything is resolved, through the crate's one reader
+        // of this id's form, so "not a route table id of this kind" never reads as "no such
+        // route table".
+        state::require_well_formed_local_gateway_route_table_id(route_table_id)?;
+
+        // "The tags to assign to the CoIP address pool" (`TagSpecifications`) — "you must
+        // specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the pool it creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_COIP_POOL,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written —
+        // the order `CreateLocalGatewayRoute` answers it in beside this operation. Every
+        // caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // A CoIP pool belongs TO a local gateway route table
+        // (`CoipPool$LocalGatewayRouteTableId`), so an id this account holds no route table
+        // for has nothing to create a pool on: it is refused with the route table's own
+        // `NotFound` code, by the one resolver every operation of this crate reads that id
+        // with, and NOTHING is stored.
+        state::require_known_local_gateway_route_table(&store, route_table_id)?;
+
+        // "Information about the CoIP address pool" (`CreateCoipPoolResult$CoipPool`): the
+        // pool is stored by the crate's one writer of that store — which mints the pool id
+        // and builds the `PoolArn` from it — and a new pool holds no address ranges until
+        // `CreateCoipCidr` provisions one, so it is stored with none rather than with a
+        // range nothing allocated.
+        let Some(pool_id) = store.insert_coip_pool(state::CoipPoolSpec {
+            local_gateway_route_table_id: route_table_id.to_string(),
+            region,
+            pool_cidrs: Vec::new(),
+            tags,
+        }) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many customer-owned IP address pools as it will \
+                 store",
+            ));
+        };
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeCoipPools` cannot report one pool differently.
+        let Some(stored) = store.coip_pools.get(&pool_id) else {
+            return Err(state::internal_error(
+                "the customer-owned IP address pool just created could not be read back",
+            ));
+        };
+        Ok(CreateCoipPoolOutput {
+            coip_pool: Some(stored.clone()),
+        })
     }
 }
+
+/// The `ResourceType` a `TagSpecification` of this action may name: the CoIP pool it
+/// creates, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+const RESOURCE_TYPE_COIP_POOL: &str = "coip-pool";

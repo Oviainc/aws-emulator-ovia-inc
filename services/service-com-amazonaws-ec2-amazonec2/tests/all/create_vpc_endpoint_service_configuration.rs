@@ -585,7 +585,10 @@ fn refusal_cases() -> Vec<RefusalCase> {
             case: "no load balancer behind the service at all",
             params: vec![param("AcceptanceRequired", "false")],
             status: 400,
-            code: "MissingParameter",
+            // There are two members one of which the request has to carry, and neither is
+            // required on its own, so the refusal is about the VALUES the request named —
+            // the code this operation is recorded answering such a request with.
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "both kinds of load balancer at once",

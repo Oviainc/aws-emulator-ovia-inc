@@ -498,9 +498,11 @@ async fn a_vpc_attachment_is_computed_from_the_request_and_the_store() {
         // the row's gateway kind states — so no row is refused as a second attachment of one
         // VPC to one gateway, and what an attachment inherits is read off the gateway it was
         // made on. The gateway created with no options at all carries `DnsSupport` "Enabled by
-        // default" and `SecurityGroupReferencingSupport` "disabled by default"
-        // (`TransitGatewayRequestOptions`); the reversed one carries both the other way round.
-        let (transit_gateway_id, inherited_dns, inherited_group_referencing) = match case.gateway {
+        // default" (`TransitGatewayRequestOptions`); the reversed one carries it the other way
+        // round. `SecurityGroupReferencingSupport` is NOT inherited — the attachment's own
+        // default is `enable`, as the options an attachment created without the member carries
+        // show — so each row's gateway setting for it is not read.
+        let (transit_gateway_id, inherited_dns, _gateway_group_referencing) = match case.gateway {
             Gateway::Default => (
                 create_transit_gateway(&fixture.router, &[]).await,
                 OPTION_ENABLE,
@@ -597,11 +599,15 @@ async fn a_vpc_attachment_is_computed_from_the_request_and_the_store() {
                 expected_option(case.options.dns_support, Some(inherited_dns), OPTION_ENABLE),
             ),
             (
+                // The ATTACHMENT's own default is `enable`, which a recorded attachment
+                // created without the member carries: the gateway-level default the transit
+                // gateway documentation names is the GATEWAY's own setting and is not what a
+                // new attachment inherits, so the gateway's value is not read here.
                 "securityGroupReferencingSupport".to_string(),
                 expected_option(
                     case.options.security_group_referencing_support,
-                    Some(inherited_group_referencing),
-                    OPTION_DISABLE,
+                    None,
+                    OPTION_ENABLE,
                 ),
             ),
             (
@@ -753,7 +759,9 @@ async fn the_create_refuses_a_parent_it_cannot_attach() {
     }
 
     // A subnet of ANOTHER VPC: it is no subnet of the VPC being attached, so it is no subnet
-    // this attachment can place an address in.
+    // this attachment can place an address in. The transit gateway family words THAT refusal
+    // its own way — "Subnet <id> was deleted or does not exist." — where an id the store holds
+    // no subnet under at all gets the VPC surface's sentence above.
     let unreachable = fixture.secondary.subnet(0).to_string();
     refusals.push(Refusal {
         label: "a subnet of another VPC".to_string(),
@@ -763,11 +771,13 @@ async fn the_create_refuses_a_parent_it_cannot_attach() {
             param("SubnetIds.1", &unreachable),
         ],
         code: INVALID_SUBNET_ID_NOT_FOUND.to_string(),
-        message: format!("The subnet ID '{unreachable}' does not exist"),
+        message: format!("Subnet {unreachable} was deleted or does not exist."),
     });
 
     // A VPC this account does not hold is refused for the subnets of it that are not there
-    // either, which is the refusal AWS answers such a request with.
+    // either, which is the refusal AWS answers such a request with. The subnet named DOES
+    // exist, but not in the VPC the request asks to attach, so the sentence is the transit
+    // gateway family's own for a subnet this attachment cannot reach.
     let unknown_vpc = format!("vpc-{UNKNOWN_SUFFIX}");
     refusals.push(Refusal {
         label: "a VPC no VPC of the account has".to_string(),
@@ -778,7 +788,7 @@ async fn the_create_refuses_a_parent_it_cannot_attach() {
         ],
         code: INVALID_SUBNET_ID_NOT_FOUND.to_string(),
         message: format!(
-            "The subnet ID '{subnet_id}' does not exist",
+            "Subnet {subnet_id} was deleted or does not exist.",
             subnet_id = fixture.primary.subnet(0)
         ),
     });

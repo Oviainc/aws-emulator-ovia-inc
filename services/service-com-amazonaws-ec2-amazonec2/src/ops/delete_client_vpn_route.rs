@@ -140,18 +140,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClientVpnRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClientVpnRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClientVpnRoute"))
+        // `ctx` carries request metadata only; the endpoint, the destination and the target
+        // subnet are each named by the request.
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("clientVpnEndpointId", input.client_vpn_endpoint_id.as_str()),
+            ("destinationCidrBlock", input.destination_cidr_block.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "The IPv4 address range, in CIDR notation, of the route to be deleted. This must
+        // match the CIDR for the route exactly" (`DestinationCidrBlock`): a value that is not
+        // a CIDR block at all matches no route, so it is refused with the code EC2 answers a
+        // parameter value it cannot accept with.
+        if !state::cidr_block_is_well_formed(&input.destination_cidr_block) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({destination}) for parameter destinationCidrBlock is invalid. This \
+                 is not a valid CIDR block.",
+                destination = input.destination_cidr_block,
+            )));
+        }
+        // "The ID of the target subnet used by the route" (`TargetVpcSubnetId`): something
+        // that is not a subnet id at all is refused for its form, by the one reader of that
+        // id's form this surface uses, before anything is looked up.
+        if let Some(subnet_id) = input.target_vpc_subnet_id.as_deref() {
+            if !state::prefixed_id_is_well_formed(state::SUBNET_ID_PREFIX, subnet_id) {
+                return Err(state::invalid_subnet_id_malformed(subnet_id));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // The endpoint the route belongs to, resolved by the ONE lookup every operation
+        // taking a `ClientVpnEndpointId` resolves it through: an id this account holds no
+        // endpoint for has no route table to delete a route from.
+        state::require_known_client_vpn_endpoint(&store, &input.client_vpn_endpoint_id)?;
+
+        // Taking the route out of the endpoint's route table is still unwritten, so the
+        // operation answers the scaffold's 501 rather than a success it cannot back with
+        // state. Every refusal the request earns is minted above, before this point, so a
+        // client learns that its input is wrong from the code the real service answers
+        // rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }

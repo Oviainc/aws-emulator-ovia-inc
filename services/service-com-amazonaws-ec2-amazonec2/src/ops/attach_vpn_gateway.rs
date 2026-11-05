@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachVpnGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachVpnGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachVpnGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Attaches an available virtual private gateway to a VPC": it resolves the gateway and the
+//! VPC the request names and records the attachment on the stored gateway — which is where
+//! `DescribeVpnGateways` reads a gateway's `VpcAttachments` from, so what this call answers
+//! is what every later reader reports.
+//!
+//! One gateway attaches one VPC at a time and one VPC holds one gateway, so a second
+//! attachment of either end is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +135,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachVpnGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachVpnGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachVpnGateway"))
+        // `ctx` carries request metadata only; the gateway and the VPC are each named by id
+        // and resolved against the store the engine on `self` holds.
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("vpnGatewayId", input.vpn_gateway_id.as_str()),
+            ("vpcId", input.vpc_id.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered before
+        // anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "Attaches a virtual private gateway to a VPC": the GATEWAY is the subject of the
+        // attach, so it is resolved first — an id this account holds no virtual private
+        // gateway for has nothing to attach, which is the refusal `DescribeVpnGateways`
+        // answers for a `VpnGatewayId` it cannot resolve.
+        if !store.vpn_gateways.contains_key(&input.vpn_gateway_id) {
+            return Err(state::invalid_vpn_gateway_id_not_found(
+                &input.vpn_gateway_id,
+            ));
+        }
+        // "The ID of the VPC" the gateway is attached to (`VpcId`), refused with the code
+        // every other operation of this service refuses an unknown VPC id with.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // "You can attach one virtual private gateway to a VPC at a time" (Amazon VPC User
+        // Guide, "Site-to-Site VPN"): a gateway that already attaches a VPC has nothing to
+        // attach, and so has one whose VPC already holds another gateway — both are EC2's
+        // `Resource.AlreadyAssociated`, and nothing is written. A gateway whose attachment
+        // has been detached attaches nothing any more, so it does not stand in the way.
+        if let Some(attached_vpc) = store
+            .vpn_gateways
+            .get(&input.vpn_gateway_id)
+            .and_then(|record| {
+                record
+                    .view
+                    .vpc_attachments
+                    .iter()
+                    .flatten()
+                    .find(|attachment| !attachment_is_detached(attachment.state.as_deref()))
+                    .and_then(|attachment| attachment.vpc_id.clone())
+            })
+        {
+            return Err(state::resource_already_associated(format!(
+                "The vpnGateway '{vpn_gateway_id}' is already attached to the vpc \
+                 '{attached_vpc}'",
+                vpn_gateway_id = input.vpn_gateway_id,
+            )));
+        }
+        if let Some(holder) = store
+            .vpn_gateways
+            .iter()
+            .find(|(_, record)| {
+                record
+                    .view
+                    .vpc_attachments
+                    .iter()
+                    .flatten()
+                    .any(|attachment| {
+                        attachment.vpc_id.as_deref() == Some(input.vpc_id.as_str())
+                            && !attachment_is_detached(attachment.state.as_deref())
+                    })
+            })
+            .map(|(vpn_gateway_id, _)| vpn_gateway_id.clone())
+        {
+            return Err(state::resource_already_associated(format!(
+                "The vpc '{vpc_id}' already has the vpnGateway '{holder}' attached",
+                vpc_id = input.vpc_id,
+            )));
+        }
+
+        // The attachment itself, recorded on the gateway: "any VPCs attached to the virtual
+        // private gateway" (`VpnGateway$VpcAttachments`) is where every reader of one reads
+        // it, so writing it there IS the attachment and `DescribeVpnGateways` reports what
+        // this call answered. It is stored ATTACHED, the way the one writer of an internet
+        // gateway's attachment stores that one: the attachment is complete within the call,
+        // so the state it reports is the state the store holds.
+        let Some(record) = store.vpn_gateways.get_mut(&input.vpn_gateway_id) else {
+            return Err(state::internal_error(format!(
+                "the virtual private gateway '{vpn_gateway_id}' resolved a moment ago is not \
+                 in the store any more",
+                vpn_gateway_id = input.vpn_gateway_id,
+            )));
+        };
+        let attachment = VpcAttachment {
+            state: Some(ATTACHMENT_STATE_ATTACHED.to_string()),
+            vpc_id: Some(input.vpc_id.clone()),
+        };
+        record
+            .view
+            .vpc_attachments
+            .get_or_insert_with(Vec::new)
+            .push(attachment.clone());
+
+        // "Information about the attachment" (`AttachVpnGatewayResult$VpcAttachment`): the
+        // record as it was stored.
+        Ok(AttachVpnGatewayOutput {
+            vpc_attachment: Some(attachment),
+        })
     }
+}
+
+/// An attachment that is in force: the `AttachmentStatus` enum's `attached` member
+/// (`smithy_query(query="shape",shape="AttachmentStatus")`, whose members are `attaching`,
+/// `attached`, `detaching` and `detached`).
+const ATTACHMENT_STATE_ATTACHED: &str = "attached";
+
+/// Whether an attachment in `state` has been detached, so it attaches nothing any more and
+/// does not stand in the way of a new attachment: that same enum's `detached` member.
+fn attachment_is_detached(state: Option<&str>) -> bool {
+    state == Some("detached")
 }

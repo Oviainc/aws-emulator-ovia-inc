@@ -140,18 +140,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayMulticastDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayMulticastDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayMulticastDomain"))
+        // `ctx` carries request metadata only; a multicast domain is a resource OF the
+        // gateway the request names, so nothing here is read off it. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the transit gateway" (`TransitGatewayId`) is `@required` but modelled
+        // `clientOptional`, so a request that left it out reaches this handler as an empty
+        // string rather than being refused at the boundary. A parameter the request did not
+        // carry is EC2's `MissingParameter`.
+        if input.transit_gateway_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter transitGatewayId",
+            ));
+        }
+
+        // "The tags for the transit gateway multicast domain" (`TagSpecifications`) — "you
+        // must specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the domain it creates.
+        let _tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, so it is
+        // answered before anything is resolved or written, the order
+        // `CreateTransitGatewayRouteTable` answers it in beside this operation.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the gateway admits this call is asked of the state it is
+        // ACTUALLY in rather than of the one its last writer left it in.
+        store.materialize_due_transitions();
+
+        // A multicast domain is a resource OF a transit gateway, so an id this account holds
+        // no gateway for has nothing to create a domain on. Resolved against the store
+        // alone — the one refusal `DescribeTransitGateways` answers for a `TransitGatewayId`
+        // it cannot resolve, so one resource family reads one way.
+        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &input.transit_gateway_id,
+            ));
+        }
+
+        // Storing the domain itself is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }
+
+/// The `ResourceType` a `TagSpecification` of this action may name: the multicast domain it
+/// creates, as the `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+const RESOURCE_TYPE_TRANSIT_GATEWAY_MULTICAST_DOMAIN: &str = "transit-gateway-multicast-domain";

@@ -251,11 +251,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // id that names no option set of the account is an error, not an absent row. A set,
         // so narrowing below costs one lookup per option set rather than a scan of the
         // asked-for list.
+        //
+        // The sentence names the resource in the SINGULAR (`dhcpOption`), which is the
+        // wording recorded for this refusal — the same one `DeleteDhcpOptions` answers, so
+        // one id read two ways is refused one way.
         if let Some(unknown) = requested
             .iter()
             .find(|id| !store.holds_dhcp_options(id.as_str()))
         {
-            return Err(crate::state::invalid_dhcp_option_id_not_found(unknown));
+            return Err(crate::scaffolded::Scaffolded::service_error(
+                crate::state::INVALID_DHCP_OPTION_ID_NOT_FOUND,
+                400,
+                format!("The dhcpOption ID '{unknown}' does not exist"),
+            ));
         }
         let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
 

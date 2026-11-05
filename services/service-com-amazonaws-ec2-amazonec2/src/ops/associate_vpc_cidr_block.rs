@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateVpcCidrBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateVpcCidrBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateVpcCidrBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Associates a CIDR block with your VPC": it resolves the VPC the request names, reads the
+//! range the request asks for — an IPv4 or IPv6 block it carries, or an Amazon-provided IPv6
+//! block the store mints — and writes the association onto the stored VPC, which is where
+//! `DescribeVpcs` and `DisassociateVpcCidrBlock` read a VPC's associations from.
+//!
+//! A range that would have to be allocated out of an IPAM pool is left to the operation that
+//! allocates one: this operation reports no association it cannot back with a range.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +163,290 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateVpcCidrBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateVpcCidrBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; the VPC is named by id and every range the
+        // request asks for is read off the request itself.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the VPC" (`VpcId`) is `@required` but modelled `clientOptional`, so a
+        // request that left it out reaches this handler as an empty string rather than being
+        // refused at the boundary. A parameter the request did not carry is EC2's
+        // `MissingParameter`.
+        if input.vpc_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter vpcId",
+            ));
+        }
+
+        // "Associates a CIDR block with your VPC": the request has to name exactly ONE range
+        // to associate — an IPv4 block or an IPv4 IPAM pool to take one from, an IPv6 block,
+        // an IPv6 pool, an Amazon-provided IPv6 block or an IPv6 IPAM pool. A request naming
+        // none asks for no association at all, and one naming several asks for several, which
+        // this operation associates one at a time.
+        let named_sources = [
+            input.cidr_block.is_some(),
+            input.ipv4_ipam_pool_id.is_some(),
+            input.ipv6_cidr_block.is_some(),
+            input.ipv6_ipam_pool_id.is_some(),
+            input.amazon_provided_ipv6_cidr_block == Some(true),
+        ]
+        .into_iter()
+        .filter(|named| *named)
+        .count();
+        if named_sources == 0 {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter cidrBlock, ipv6CidrBlock, \
+                 amazonProvidedIpv6CidrBlock, ipv4IpamPoolId or ipv6IpamPoolId",
+            ));
+        }
+        if named_sources > 1 {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "Only one of cidrBlock, ipv6CidrBlock, amazonProvidedIpv6CidrBlock, \
+                 ipv4IpamPoolId and ipv6IpamPoolId may be given in one request",
+            ));
+        }
+
+        // A block the request names has to BE a block: a value that is not one describes no
+        // range, so it is refused with the code EC2 answers a parameter value it cannot
+        // accept with, through the one reader this crate reads a VPC's IPv4 range with and
+        // its IPv6 counterpart.
+        if let Some(cidr_block) = input.cidr_block.as_deref() {
+            match state::canonical_vpc_ipv4_cidr(cidr_block) {
+                Ok(_) => {}
+                Err(state::CidrProblem::Malformed) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({cidr_block}) for parameter cidrBlock is invalid. This is \
+                         not a valid CIDR block."
+                    )));
+                }
+                // A block the VPC range rules do not admit is a RANGE violation, not an
+                // unreadable value: "The block range must be between a /16 netmask and /28
+                // netmask" (`InvalidVpc.Range`, EC2 API error codes).
+                Err(state::CidrProblem::PrefixLength) => {
+                    return Err(state::invalid_vpc_range(cidr_block));
+                }
+            }
+        }
+        if let Some(ipv6_cidr_block) = input.ipv6_cidr_block.as_deref() {
+            if state::canonical_ipv6_cidr(ipv6_cidr_block).is_err() {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({ipv6_cidr_block}) for parameter ipv6CidrBlock is invalid. This \
+                     is not a valid CIDR block."
+                )));
+            }
+        }
+        // "The netmask length of the IPv4 CIDR you want to allocate to this VPC from an
+        // Amazon VPC IP Address Manager (IPAM) pool" (`Ipv4NetmaskLength`) and its IPv6
+        // counterpart: a netmask length is part of asking an IPAM pool for a range, so it
+        // cannot be given without the pool it would be taken from.
+        if input.ipv4_netmask_length.is_some() && input.ipv4_ipam_pool_id.is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "ipv4NetmaskLength can only be given with ipv4IpamPoolId",
+            ));
+        }
+        if input.ipv6_netmask_length.is_some() && input.ipv6_ipam_pool_id.is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "ipv6NetmaskLength can only be given with ipv6IpamPoolId",
+            ));
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "The ID of the VPC" the range is associated WITH: an id this account holds no VPC
+        // for has nothing to associate a range with. The code is the one every operation of
+        // this service answers an unknown VPC id with; the SENTENCE is this operation's own
+        // — its recorded refusal names the id and says it is not found FOR THE USER, where
+        // the VPC's own operations say "The vpc ID '<id>' does not exist". Which of the two
+        // an operation answers is a fact of that operation.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(vpc_not_found_for_user(&input.vpc_id));
+        }
+        // An IPAM pool the range would be taken from is resolved the same way: a pool id
+        // this account holds no pool for has no range to give out.
+        for pool_id in [
+            input.ipv4_ipam_pool_id.as_deref(),
+            input.ipv6_ipam_pool_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !store.ipam_pools.contains_key(pool_id) {
+                return Err(state::id_not_found(
+                    state::INVALID_IPAM_POOL_ID_NOT_FOUND,
+                    "IPAM pool ID",
+                    pool_id,
+                ));
+            }
+        }
+
+        // The association itself. "Associates a CIDR block with your VPC": the VPC's own
+        // association sets are where every reader of one reads it — `DescribeVpcs` and
+        // `DisassociateVpcCidrBlock` both work off them — so writing the association there IS
+        // the association.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateVpcCidrBlock"))
+        // A block the request names is stored as the request named it (in canonical form), an
+        // Amazon-provided IPv6 block is MINTED by the store ("you cannot specify the range of
+        // IP addresses, or the size of the CIDR block"), and a block that would have to be
+        // allocated out of an IPAM pool is left to the operation that allocates one
+        // (`AllocateIpamPoolCidr`), which is still a scaffold: this operation reports no
+        // association it cannot back with a range.
+        let ipv4_block = input.cidr_block.as_deref().map(canonical_ipv4);
+        let ipv6_block = match (
+            input.ipv6_cidr_block.as_deref(),
+            input.amazon_provided_ipv6_cidr_block == Some(true),
+        ) {
+            (Some(requested), _) => Some(requested.to_string()),
+            (None, true) => Some(store.mint_amazon_ipv6_cidr()),
+            (None, false) => None,
+        };
+
+        // One VPC holds at most [`MAX_CIDR_BLOCKS_PER_VPC`] blocks of each family, and the
+        // same range is not associated twice: a block that overlaps one the VPC already holds
+        // would leave two associations covering one address.
+        let vpc = store
+            .vpcs
+            .get_mut(&input.vpc_id)
+            .ok_or_else(|| vpc_not_found_for_user(&input.vpc_id))?;
+        if let Some(cidr_block) = ipv4_block.as_deref() {
+            let held = vpc.cidr_block_association_set.iter().flatten();
+            if held.clone().count() >= MAX_CIDR_BLOCKS_PER_VPC {
+                return Err(state::cidr_limit_exceeded(format!(
+                    "The vpc '{vpc_id}' already holds the maximum of \
+                     {MAX_CIDR_BLOCKS_PER_VPC} IPv4 CIDR blocks",
+                    vpc_id = input.vpc_id,
+                )));
+            }
+            if held
+                .filter_map(|association| association.cidr_block.as_deref())
+                .any(|associated| state::ipv4_cidr_blocks_overlap(associated, cidr_block))
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "The CIDR '{cidr_block}' conflicts with a CIDR block the vpc \
+                     '{vpc_id}' already holds",
+                    vpc_id = input.vpc_id,
+                )));
+            }
+        }
+        if let Some(ipv6_cidr_block) = ipv6_block.as_deref() {
+            let held = vpc.ipv6_cidr_block_association_set.iter().flatten();
+            if held.clone().count() >= MAX_CIDR_BLOCKS_PER_VPC {
+                return Err(state::cidr_limit_exceeded(format!(
+                    "The vpc '{vpc_id}' already holds the maximum of \
+                     {MAX_CIDR_BLOCKS_PER_VPC} IPv6 CIDR blocks",
+                    vpc_id = input.vpc_id,
+                )));
+            }
+            if held
+                .filter_map(|association| association.ipv6_cidr_block.as_deref())
+                .any(|associated| state::ipv6_cidr_blocks_overlap(associated, ipv6_cidr_block))
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "The CIDR '{ipv6_cidr_block}' conflicts with a CIDR block the vpc \
+                     '{vpc_id}' already holds",
+                    vpc_id = input.vpc_id,
+                )));
+            }
+        }
+
+        // A block this operation cannot produce — one the request asked to take out of an
+        // IPAM pool — leaves nothing to store, so the operation answers the scaffold's 501
+        // rather than an association with no range. Every refusal the request earns is minted
+        // above, before this point.
+        if ipv4_block.is_none() && ipv6_block.is_none() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        }
+
+        // The association is written in the terminal `associated` state: this store completes
+        // it within the call, exactly as the one writer of an internet gateway's attachment
+        // records that attachment, so the state the answer carries is the state the store
+        // holds and no reader can see a move that is never made.
+        let mut ipv4_association = None;
+        if let Some(cidr_block) = ipv4_block {
+            let association_id = store.next_id(CIDR_ASSOCIATION_ID_PREFIX);
+            let association = VpcCidrBlockAssociation {
+                association_id: Some(association_id),
+                cidr_block: Some(cidr_block),
+                cidr_block_state: Some(VpcCidrBlockState {
+                    state: Some(state::CIDR_BLOCK_STATE_ASSOCIATED.to_string()),
+                    status_message: None,
+                }),
+            };
+            if let Some(vpc) = store.vpcs.get_mut(&input.vpc_id) {
+                vpc.cidr_block_association_set
+                    .get_or_insert_with(Vec::new)
+                    .push(association.clone());
+            }
+            ipv4_association = Some(association);
+        }
+        let mut ipv6_association = None;
+        if let Some(ipv6_cidr_block) = ipv6_block {
+            let association_id = store.next_id(CIDR_ASSOCIATION_ID_PREFIX);
+            let association = VpcIpv6CidrBlockAssociation {
+                association_id: Some(association_id),
+                ipv6_cidr_block: Some(ipv6_cidr_block),
+                ipv6_cidr_block_state: Some(VpcCidrBlockState {
+                    state: Some(state::CIDR_BLOCK_STATE_ASSOCIATED.to_string()),
+                    status_message: None,
+                }),
+                network_border_group: input.ipv6_cidr_block_network_border_group.clone(),
+                ipv6_pool: input.ipv6_pool.clone(),
+                ipv6_address_attribute: None,
+                ip_source: None,
+            };
+            if let Some(vpc) = store.vpcs.get_mut(&input.vpc_id) {
+                vpc.ipv6_cidr_block_association_set
+                    .get_or_insert_with(Vec::new)
+                    .push(association.clone());
+            }
+            ipv6_association = Some(association);
+        }
+
+        // The answer names the VPC the association was made on and the association itself,
+        // as it was stored.
+        Ok(AssociateVpcCidrBlockOutput {
+            ipv6_cidr_block_association: ipv6_association,
+            cidr_block_association: ipv4_association,
+            vpc_id: Some(input.vpc_id.clone()),
+        })
     }
+}
+
+/// The id prefix every VPC CIDR block association carries, the one
+/// `ComAmazonawsEc2Amazonec2State::insert_vpc` gives the association of a VPC's primary
+/// block.
+const CIDR_ASSOCIATION_ID_PREFIX: &str = "vpc-cidr-assoc";
+
+/// How many CIDR blocks of one family a VPC holds.
+///
+/// Amazon VPC User Guide, "VPC CIDR blocks": a VPC has one primary IPv4 block and "you can
+/// add up to four secondary IPv4 CIDR blocks", and the same ceiling applies to its IPv6
+/// blocks — so five of each.
+const MAX_CIDR_BLOCKS_PER_VPC: usize = 5;
+
+/// A requested IPv4 block in the canonical form AWS stores it in ("we modify the specified
+/// CIDR block to its canonical form", `CidrBlock`), through the one reader this crate reads a
+/// VPC's IPv4 range with. The value has already been read for its form above, so a block that
+/// does not parse here is stored as the request wrote it rather than dropped.
+fn canonical_ipv4(cidr_block: &str) -> String {
+    crate::state::canonical_vpc_ipv4_cidr(cidr_block).unwrap_or_else(|_| cidr_block.to_string())
+}
+
+/// `InvalidVpcID.NotFound` (HTTP 400) in the wording THIS operation answers a VPC id it
+/// cannot resolve with: `<id> is not found for user.`
+///
+/// A second wording of that code beside [`crate::state::invalid_vpc_id_not_found`]'s "The vpc
+/// ID '<id>' does not exist", and a named function here rather than a literal at the call
+/// site, because which of the two an operation answers is a fact of that operation: the
+/// recorded refusal of this one names the id and says it is not found for the user. The id
+/// comes from the REQUEST.
+fn vpc_not_found_for_user(vpc_id: &str) -> AssociateVpcCidrBlockError {
+    crate::scaffolded::Scaffolded::service_error(
+        crate::state::INVALID_VPC_ID_NOT_FOUND,
+        400,
+        format!("{vpc_id} is not found for user."),
+    )
 }

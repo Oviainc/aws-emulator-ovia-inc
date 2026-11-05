@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachVpnGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachVpnGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachVpnGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Detaches a virtual private gateway from a VPC": it resolves the gateway and the VPC the
+//! request names and takes their attachment OFF the stored gateway, so `DescribeVpnGateways`
+//! no longer reports it and the VPC can take a gateway again.
+//!
+//! A pairing the gateway holds no attachment for is refused rather than reported as
+//! detached: that is the one way a client learns that the VPC it named was never attached to
+//! the gateway it named.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachVpnGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachVpnGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachVpnGateway"))
+        // `ctx` carries request metadata only; both ends of the attachment are named by id.
+        let _ = ctx;
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("vpnGatewayId", input.vpn_gateway_id.as_str()),
+            ("vpcId", input.vpc_id.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered before
+        // anything is resolved or written — the order `AttachVpnGateway` answers it in.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // The GATEWAY is the subject of the detach, so it is resolved first: an id this
+        // account holds no virtual private gateway for has nothing to detach.
+        if !store.vpn_gateways.contains_key(&input.vpn_gateway_id) {
+            return Err(state::invalid_vpn_gateway_id_not_found(
+                &input.vpn_gateway_id,
+            ));
+        }
+        // "The ID of the VPC" the gateway is detached from (`VpcId`), refused with the code
+        // every other operation of this service refuses an unknown VPC id with.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // The attachment itself: the gateway's `VpcAttachments` is the only record of it, so
+        // the entry for this VPC is what the detach acts on. A gateway that holds no
+        // attachment of this VPC has nothing to detach, which EC2 answers with
+        // `InvalidAttachment.NotFound`. The entry is left in the TERMINAL `detached` state
+        // rather than dropped, so a caller polling `DescribeVpnGateways` after this call sees
+        // that the attachment is gone rather than nothing at all — and an attachment in that
+        // state attaches nothing, so `AttachVpnGateway` may attach the VPC again.
+        let Some(record) = store.vpn_gateways.get_mut(&input.vpn_gateway_id) else {
+            return Err(state::internal_error(format!(
+                "the virtual private gateway '{vpn_gateway_id}' resolved a moment ago is not \
+                 in the store any more",
+                vpn_gateway_id = input.vpn_gateway_id,
+            )));
+        };
+        let attachments = record.view.vpc_attachments.get_or_insert_with(Vec::new);
+        let Some(attachment) = attachments.iter_mut().find(|attachment| {
+            attachment.vpc_id.as_deref() == Some(input.vpc_id.as_str())
+                && attachment.state.as_deref() != Some(ATTACHMENT_STATE_DETACHED)
+        }) else {
+            return Err(crate::scaffolded::Scaffolded::service_error(
+                state::INVALID_ATTACHMENT_NOT_FOUND,
+                400,
+                format!(
+                    "The vpnGateway '{vpn_gateway_id}' is not attached to the vpc \
+                     '{vpc_id}'.",
+                    vpn_gateway_id = input.vpn_gateway_id,
+                    vpc_id = input.vpc_id,
+                ),
+            ));
+        };
+        attachment.state = Some(ATTACHMENT_STATE_DETACHED.to_string());
+        Ok(DetachVpnGatewayOutput)
     }
 }
+
+/// An attachment that has been taken down: the `AttachmentStatus` enum's `detached` member
+/// (`smithy_query(query="shape",shape="AttachmentStatus")`, whose members are `attaching`,
+/// `attached`, `detaching` and `detached`).
+const ATTACHMENT_STATE_DETACHED: &str = "detached";

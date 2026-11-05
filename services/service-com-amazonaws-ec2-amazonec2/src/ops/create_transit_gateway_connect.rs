@@ -206,17 +206,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the transit gateway attachment. You can specify a VPC attachment or
         // Amazon Web Services Direct Connect attachment"
-        // (`TransportTransitGatewayAttachmentId`). Every kind of attachment shares one id
-        // space, so an id naming an attachment of a kind that cannot carry a Connect
-        // attachment is refused for its kind rather than reported as unknown.
-        let transport = store
+        // (`TransportTransitGatewayAttachmentId`). The transport attachment is a PARAMETER
+        // VALUE of this operation rather than the resource it acts on, so a value that names
+        // no attachment of the account — and one that names an attachment of a kind that
+        // cannot carry a Connect attachment — is refused with the code EC2 answers a
+        // parameter value it cannot act on with, which is what this operation is recorded
+        // answering for a transport attachment it cannot use.
+        let Some(transport) = store
             .transit_gateway_attachments
             .get(&input.transport_transit_gateway_attachment_id)
-            .ok_or_else(|| {
-                state::invalid_transit_gateway_attachment_id_not_found(
-                    &input.transport_transit_gateway_attachment_id,
-                )
-            })?;
+        else {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{attachment_id}' for transportTransitGatewayAttachmentId. \
+                 The transit gateway attachment to create the Connect attachment from could \
+                 not be found",
+                attachment_id = input.transport_transit_gateway_attachment_id,
+            )));
+        };
         if !matches!(transport.view, state::TransitGatewayAttachmentView::Vpc(_)) {
             return Err(state::invalid_parameter_value(format!(
                 "The transit gateway attachment '{attachment_id}' is a '{kind}' attachment; a \

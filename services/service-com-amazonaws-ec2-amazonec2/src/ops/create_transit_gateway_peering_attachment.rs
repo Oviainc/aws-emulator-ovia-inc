@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayPeeringAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayPeeringAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayPeeringAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Requests a transit gateway peering attachment between the specified transit gateway
+//! (requester) and a peer transit gateway (accepter)": it resolves both gateways, refuses a
+//! peer it cannot place in this account and Region, and stores ONE peering attachment in the
+//! one attachment store in the non-terminal state a request starts in, with the clock owing
+//! it `pendingAcceptance` — which is what `AcceptTransitGatewayPeeringAttachment` then acts
+//! on. `DescribeTransitGatewayPeeringAttachments` and `DescribeTransitGatewayAttachments`
+//! read the very record this writes.
+//!
+//! Nothing about the answer is taken from a recording: the attachment id comes from the
+//! store's id mint, the two `PeeringTgwInfo` ends from the request and from this emulator's
+//! own account and Region, the options from the request where it carries them — held to the
+//! enum the model publishes — and otherwise from the member's documented default, and the
+//! state from the one writer that stores a peering attachment.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +153,337 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayPeeringAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayPeeringAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayPeeringAttachment"))
+        use crate::state;
+
+        // "The Region where the peer transit gateway is located" is compared against the
+        // Region this request was signed for, which is the only Region whose gateways this
+        // store holds — so the request's own Region is read off `ctx`, the way every other
+        // handler of this crate reads it.
+        let region = state::request_region(ctx.parts());
+
+        // The four `@required` members are modelled `clientOptional`, so a request that left
+        // one out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("transitGatewayId", input.transit_gateway_id.as_str()),
+            ("peerTransitGatewayId", input.peer_transit_gateway_id.as_str()),
+            ("peerAccountId", input.peer_account_id.as_str()),
+            ("peerRegion", input.peer_region.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "The tags to apply to the transit gateway peering attachment"
+        // (`TagSpecifications`) — "you must specify the resource type to tag, otherwise the
+        // request will fail" (`TagSpecification`), and the only type this action tags is the
+        // attachment it creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
+            Self::NAME,
+        )?;
+
+        // "The ID of the Amazon Web Services account that owns the peer transit gateway"
+        // (`PeerAccountId`): an account id is twelve digits, so a value that is not one
+        // names no account at all and is refused with the code EC2 answers a parameter it
+        // cannot accept with.
+        if !account_id_is_well_formed(&input.peer_account_id) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{peer_account_id}' for peerAccountId. An Amazon Web Services \
+                 account ID is a {ACCOUNT_ID_DIGITS}-digit number",
+                peer_account_id = input.peer_account_id,
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, so it is
+        // answered before anything is resolved or written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the gateways and the attachments they already carry admit
+        // this call is asked of the state they are ACTUALLY in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway" the peering is REQUESTED from
+        // (`TransitGatewayId`): the attachment is a resource of that gateway, so an id this
+        // account holds no gateway for has nothing to request a peering from. This operation
+        // reads that id as a VALUE it cannot act on rather than as a resource that is
+        // missing — the refusal recorded for it is `InvalidParameterValue`, where the PEER
+        // gateway below is the one answered with the transit gateway's own `NotFound` code.
+        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{transit_gateway_id}' for transitGatewayId. The transit \
+                 gateway to request the peering from could not be found",
+                transit_gateway_id = input.transit_gateway_id,
+            )));
+        }
+
+        // "Requests a transit gateway peering attachment BETWEEN the specified transit
+        // gateway (requester) and a PEER transit gateway (accepter)": a peering joins two
+        // gateways, so one gateway cannot be both ends of it.
+        if input.peer_transit_gateway_id == input.transit_gateway_id {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{peer}' for peerTransitGatewayId. A transit gateway cannot be \
+                 peered with itself",
+                peer = input.peer_transit_gateway_id,
+            )));
+        }
+
+        // "The peer transit gateway can be in your account or a different Amazon Web
+        // Services account", and `PeerRegion` says which Region it is in. This emulator holds
+        // the gateways of ONE account in ONE Region, so a peer the request places outside
+        // them is one it cannot resolve at all, and a peer it places inside them has to be a
+        // gateway the store holds — either way an id naming no transit gateway this service
+        // can peer with is the transit gateway's own `NotFound` refusal, and nothing is
+        // stored.
+        if input.peer_account_id != ::engine::emulator_account_id()
+            || input.peer_region != region
+            || !store
+                .transit_gateways
+                .contains_key(&input.peer_transit_gateway_id)
+        {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &input.peer_transit_gateway_id,
+            ));
+        }
+
+        // "Indicates whether dynamic routing is enabled or disabled"
+        // (`CreateTransitGatewayPeeringAttachmentRequestOptions$DynamicRouting`): the value
+        // the request asked for has to be one the `DynamicRoutingValue` enum publishes, so a
+        // spelling outside it is refused rather than stored and reported back as the
+        // attachment's own setting; a request that names none takes the member's documented
+        // default, which is that dynamic routing is off.
+        let dynamic_routing = match input
+            .options
+            .as_ref()
+            .and_then(|options| options.dynamic_routing.as_deref())
+        {
+            Some(requested) if DYNAMIC_ROUTING_VALUE_VALUES.contains(&requested) => {
+                requested.to_string()
+            }
+            Some(requested) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{requested}' for Options.DynamicRouting. Valid values are \
+                     '{allowed}'",
+                    allowed = DYNAMIC_ROUTING_VALUE_VALUES.join("', '"),
+                )));
+            }
+            None => state::OPTION_DISABLE.to_string(),
+        };
+
+        // "Attaches an AVAILABLE transit gateway": a peering is carried by both gateways, so
+        // neither can take one while it is still being created or being modified — a refusal
+        // for the STATE a resource is in, which EC2 answers with `IncorrectState`, and which
+        // is why this emulator's own clock-owed `pending` -> `available` move matters here.
+        for transit_gateway_id in [
+            input.transit_gateway_id.as_str(),
+            input.peer_transit_gateway_id.as_str(),
+        ] {
+            let gateway_state = store
+                .transit_gateways
+                .get(transit_gateway_id)
+                .and_then(|gateway| gateway.state.clone())
+                .unwrap_or_default();
+            if gateway_state != state::TRANSIT_GATEWAY_STATE_AVAILABLE {
+                return Err(state::incorrect_state(format!(
+                    "The transit gateway '{transit_gateway_id}' is in state \
+                     '{gateway_state}'; a peering attachment can only be created between \
+                     transit gateways in state '{available}'",
+                    available = state::TRANSIT_GATEWAY_STATE_AVAILABLE,
+                )));
+            }
+        }
+
+        // One pair of gateways is peered once: a peering the lifecycle has not finished with
+        // already joins these two, so a second one is refused and NOTHING is written —
+        // whichever end of the pair requested it.
+        if let Some(held) = store
+            .transit_gateway_attachments
+            .iter()
+            .filter_map(|(attachment_id, record)| match &record.view {
+                state::TransitGatewayAttachmentView::Peering(attachment) => {
+                    Some((attachment_id, attachment))
+                }
+                _ => None,
+            })
+            .find(|(_, attachment)| {
+                peering_joins(
+                    attachment,
+                    &input.transit_gateway_id,
+                    &input.peer_transit_gateway_id,
+                ) && !peering_is_finished(attachment.state.as_deref())
+            })
+            .map(|(attachment_id, _)| attachment_id.clone())
+        {
+            return Err(duplicate_transit_gateway_attachment(
+                &input.transit_gateway_id,
+                &held,
+                &input.peer_transit_gateway_id,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_transit_gateway_attachment_capacity() {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway attachments as it will store",
+            ));
+        }
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES + state::tag_list_bytes(&tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // "Information about the requester transit gateway" and "information about the
+        // accepter transit gateway" (`$RequesterTgwInfo` / `$AccepterTgwInfo`): each is the
+        // gateway, the account that owns it and the Region it is in — the account and the
+        // Region from the request for the accepter, and this emulator's own for the
+        // requester, whose gateway the store holds.
+        let attachment = TransitGatewayPeeringAttachment {
+            transit_gateway_attachment_id: None,
+            accepter_transit_gateway_attachment_id: None,
+            requester_tgw_info: Some(PeeringTgwInfo {
+                transit_gateway_id: Some(input.transit_gateway_id.clone()),
+                core_network_id: None,
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                region: Some(region.clone()),
+            }),
+            accepter_tgw_info: Some(PeeringTgwInfo {
+                transit_gateway_id: Some(input.peer_transit_gateway_id.clone()),
+                core_network_id: None,
+                owner_id: Some(input.peer_account_id.clone()),
+                region: Some(input.peer_region.clone()),
+            }),
+            options: Some(TransitGatewayPeeringAttachmentOptions {
+                dynamic_routing: Some(dynamic_routing),
+            }),
+            // The state and its status are set by the writer below, which is the only place
+            // a peering attachment's state is chosen.
+            status: None,
+            state: None,
+            creation_time: Some(state::system_time_to_date_time(
+                ::std::time::SystemTime::now(),
+            )),
+            tags: (!tags.is_empty()).then(|| tags.clone()),
+        };
+
+        // "After you create the peering attachment, the OWNER OF THE ACCEPTER transit gateway
+        // must accept the attachment request": the attachment is requested here and waits for
+        // that acceptance, so it is stored in the transient state a request starts in with
+        // the clock owing it `pendingAcceptance`, and
+        // `AcceptTransitGatewayPeeringAttachment` is what moves it on from there.
+        let Some(attachment_id) = store.insert_transit_gateway_attachment(
+            state::TransitGatewayAttachmentView::Peering(attachment),
+        ) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway attachments as it will store",
+            ));
+        };
+        if let Some(record) = store.transit_gateway_attachments.get_mut(&attachment_id) {
+            record.view.set_state(PEERING_STATE_INITIATING_REQUEST);
+            record.pending = Some(state::PendingStateMove::starting_now(
+                state::TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING_ACCEPTANCE,
+            ));
+        }
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeTransitGatewayPeeringAttachments` cannot drift apart.
+        let Some(state::TransitGatewayAttachmentView::Peering(stored)) = store
+            .transit_gateway_attachments
+            .get(&attachment_id)
+            .map(|record| &record.view)
+        else {
+            return Err(state::internal_error(
+                "the transit gateway peering attachment just created could not be read back",
+            ));
+        };
+        Ok(CreateTransitGatewayPeeringAttachmentOutput {
+            transit_gateway_peering_attachment: Some(stored.clone()),
+        })
     }
 }
+
+/// The number of digits an Amazon Web Services account id has, which `PeerAccountId` names
+/// one of.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Whether `account_id` is an account id at all: [`ACCOUNT_ID_DIGITS`] decimal digits.
+fn account_id_is_well_formed(account_id: &str) -> bool {
+    account_id.len() == ACCOUNT_ID_DIGITS && account_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The state a peering REQUEST starts in: the `TransitGatewayAttachmentState` enum's
+/// `initiatingRequest` member
+/// (`smithy_query(query="shape",shape="TransitGatewayAttachmentState")`, whose `initiating`
+/// member the model records as deprecated).
+const PEERING_STATE_INITIATING_REQUEST: &str = "initiatingRequest";
+
+/// Whether `attachment` joins the two gateways `transit_gateway_id` and
+/// `peer_transit_gateway_id`, in either role: a peering is a connection between a PAIR, so
+/// which end requested it does not change which pair it joins.
+fn peering_joins(
+    attachment: &TransitGatewayPeeringAttachment,
+    transit_gateway_id: &str,
+    peer_transit_gateway_id: &str,
+) -> bool {
+    let end = |info: &Option<PeeringTgwInfo>| {
+        info.as_ref()
+            .and_then(|info| info.transit_gateway_id.clone())
+            .unwrap_or_default()
+    };
+    let requester = end(&attachment.requester_tgw_info);
+    let accepter = end(&attachment.accepter_tgw_info);
+    (requester == transit_gateway_id && accepter == peer_transit_gateway_id)
+        || (requester == peer_transit_gateway_id && accepter == transit_gateway_id)
+}
+
+/// Whether a peering attachment in `state` has finished its lifecycle, so it joins nothing
+/// any more and does not stand in the way of a new peering of the same pair.
+///
+/// The terminal states of the attachment state enum that are not "in service": one that was
+/// deleted, one the accepter rejected, and one that could not be made.
+fn peering_is_finished(attachment_state: Option<&str>) -> bool {
+    matches!(
+        attachment_state,
+        Some(
+            crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETED
+                | crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED
+                | crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILED
+        )
+    )
+}
+
+/// `DuplicateTransitGatewayAttachment` (HTTP 400): the two gateways are already joined by a
+/// peering attachment the lifecycle has not finished with, which is the refusal EC2 answers a
+/// second attachment of one pair with — it names the requester, the attachment it already
+/// holds and the peer.
+fn duplicate_transit_gateway_attachment(
+    transit_gateway_id: &str,
+    attachment_id: &str,
+    peer_transit_gateway_id: &str,
+) -> CreateTransitGatewayPeeringAttachmentError {
+    crate::scaffolded::Scaffolded::service_error(
+        "DuplicateTransitGatewayAttachment",
+        400,
+        format!(
+            "{transit_gateway_id} has non-deleted Transit Gateway Attachment \
+             {attachment_id} with Transit Gateway {peer_transit_gateway_id}"
+        ),
+    )
+}
+

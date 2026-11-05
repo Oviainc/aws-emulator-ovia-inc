@@ -138,18 +138,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseCapacityBlockExtension` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseCapacityBlockExtensionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseCapacityBlockExtension"))
+        use crate::state;
+
+        // "available for purchase in the Amazon Web Services Region that you're currently
+        // using" (`DescribeCapacityBlockExtensionOfferings`), which is the Region of the
+        // request's SigV4 credential scope: a Capacity Reservation reserves capacity in one
+        // Availability Zone, so the Region it belongs to is the Region that zone is in — the
+        // same reading the offerings search of this family makes.
+        let region = state::request_region(ctx.parts());
+        let zones = state::availability_zones_in_region(&region);
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            (
+                "capacityBlockExtensionOfferingId",
+                input.capacity_block_extension_offering_id.as_str(),
+            ),
+            (
+                "capacityReservationId",
+                input.capacity_reservation_id.as_str(),
+            ),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "The ID of the Capacity Block extension offering to purchase" and "the ID of the
+        // Capacity reservation to be extended": the RESERVATION is what the purchase extends,
+        // so an id that names no reservation of the account in this Region has nothing to
+        // extend — resolved through the one reader this family resolves an extendable
+        // reservation with, which answers the reservation's own `NotFound` code for a
+        // well-formed id the store holds nothing under and `.Malformed` for a value outside
+        // the id shape.
+        state::require_extendable_capacity_reservation(
+            &store,
+            &zones,
+            &input.capacity_reservation_id,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation" (`DryRun`): asked
+        // after the reservation has been resolved — an unknown reservation is a reason the
+        // request would NOT have succeeded — and before anything is bought, which for a dry
+        // run is nothing at all. The order the offerings search of this family answers it in.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Buying the extension itself is still unwritten, so the operation answers the
+        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
+        // request earns is minted above, before this point, so a client learns that its
+        // input is wrong from the code the real service answers rather than from this.
+        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
     }
 }
