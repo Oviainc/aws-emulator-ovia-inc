@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::APPLIED_QUOTA_PAGE_SIZE;
+
 use crate::quota_workflow::{client, emulator, walk_pages, Client};
 
 /// Comfortably past BOTH steps the clock owes a quota increase request
@@ -102,6 +104,17 @@ fn items(case: &str, response: &Value, member: &str) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected a {member} list, got {response}"))
         .clone()
+}
+
+/// The page a listing of this service serves a caller — a first call or a continuation
+/// — that names no `MaxResults`: its OWN unasked page size, which for the applied-quota
+/// listing is `APPLIED_QUOTA_PAGE_SIZE` and for the others the whole remainder.
+fn unasked_page(operation: &str) -> usize {
+    if operation == "ListServiceQuotas" {
+        APPLIED_QUOTA_PAGE_SIZE
+    } else {
+        usize::MAX
+    }
 }
 
 /// The `NextToken` of `body`'s first page at `size`, or `None` when that page is the
@@ -327,8 +340,12 @@ async fn a_token_resumes_the_selection_that_issued_it() {
                 }
                 let next = caller.ok(operation, resume).await;
                 let served = items(&case, &next, member);
-                let expected = continuation
-                    .map_or(whole.len(), |size| (taken + size as usize).min(whole.len()));
+                let expected = match continuation {
+                    Some(size) => (taken + size as usize).min(whole.len()),
+                    // A continuation that names no page size is bounded by the
+                    // LISTING'S own unasked page, the same way its first page is.
+                    None => taken.saturating_add(unasked_page(operation)).min(whole.len()),
+                };
                 assert_eq!(
                     served,
                     whole[taken..expected].to_vec(),

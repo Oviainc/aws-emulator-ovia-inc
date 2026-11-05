@@ -12,9 +12,10 @@
 //!   code the service does not publish is refused instead of answered with another
 //!   quota's record;
 //! * `MaxResults` bounds what a CALLER may ask for and not what a listing serves when
-//!   none is named, so an unasked listing carries its WHOLE published set in one page
-//!   with no `NextToken`, while an asked page size cuts that same listing into
-//!   `NextToken`-chained pages that walk to it once.
+//!   none is named, which is that LISTING'S own unasked page — the whole published set
+//!   for the default-quota listing, a bounded page for the applied one — with a
+//!   `NextToken` after it exactly while items remain, while an asked page size cuts the
+//!   same listing into `NextToken`-chained pages that walk to it once.
 //!
 //! The rows below span the shapes a `ServiceQuota` comes in — adjustable and fixed,
 //! counted and measured, rate-shaped and plain, regional and global, with AWS's own
@@ -23,6 +24,8 @@
 //! harness (`Client`, `walk_pages`) is the one `quota_workflow.rs` owns.
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::APPLIED_QUOTA_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client};
 
@@ -114,11 +117,53 @@ const ROWS: &[Row] = &[
         quota_code: Some("L-B82A30EA"),
         quota_name: "Rate of SendDurableExecutionCallbackSuccess API requests",
         description: Some(
-            "The maximum rate of SendDurableExecutionCallbackSuccess API requests.",
+            "The maximum number of SendDurableExecutionCallbackSuccess API requests per second.",
         ),
         unit: "None",
         value: 6000.0,
         adjustable: true,
+        global_quota: false,
+        period: None,
+        metric_resource: None,
+    },
+    // The per-second rate quota of another API of the same service: the same
+    // description form around its OWN operation's name, and published as not
+    // adjustable over a one-second window.
+    Row {
+        service_code: "lambda",
+        quota_code: Some("L-4273958C"),
+        quota_name: "Rate of GetPolicy API requests",
+        description: Some("The maximum number of GetPolicy API requests per second."),
+        unit: "None",
+        value: 15.0,
+        adjustable: false,
+        global_quota: false,
+        period: Some((1, "SECOND")),
+        metric_resource: None,
+    },
+    // The BURST allowance beside such a rate, which is a quota of its own.
+    Row {
+        service_code: "lambda",
+        quota_code: Some("L-25EEC0A4"),
+        quota_name: "Burst rate of ResumeMicrovm API requests",
+        description: Some("The maximum burst rate of ResumeMicrovm API requests."),
+        unit: "None",
+        value: 5.0,
+        adjustable: true,
+        global_quota: false,
+        period: None,
+        metric_resource: None,
+    },
+    // A DURATION quota of the same service that is not a rate: no window, not
+    // adjustable, and its own published sentence.
+    Row {
+        service_code: "lambda",
+        quota_code: Some("L-B430C318"),
+        quota_name: "Max Execution Duration of a MicroVM (in Hours)",
+        description: Some("The maximum execution duration of a MicroVM (in Hours)."),
+        unit: "None",
+        value: 8.0,
+        adjustable: false,
         global_quota: false,
         period: None,
         metric_resource: None,
@@ -495,36 +540,39 @@ async fn a_pair_the_catalog_does_not_publish_is_refused_rather_than_substituted(
 }
 
 /// RULE: `MaxResults` bounds what a CALLER may ask for, not what a listing of this
-/// service serves when the caller names none — so an unasked QUOTA listing carries the
-/// service's whole published set in one page with no `NextToken`, and only a page a
-/// caller cut short with `MaxResults` is followed by a token that resumes exactly
-/// where it stopped.
+/// service serves when the caller names none — which is that LISTING'S own unasked page:
+/// the whole published set for the default-quota listing, and
+/// `APPLIED_QUOTA_PAGE_SIZE` records for the applied one. Either way a `NextToken`
+/// follows a page exactly while items remain, and it resumes exactly where the page
+/// stopped.
 #[tokio::test]
-async fn an_unasked_quota_listing_is_whole_and_an_asked_page_resumes() {
+async fn an_unasked_quota_listing_serves_its_own_page_and_an_asked_page_resumes() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
     // Rows: the quota listings of this service, over item sets that are shorter than
     // the smallest asked page but one (iam's few quotas), a few dozen long (lambda,
     // vpc) and hundreds long (ec2's quotas).
-    let mut listings: Vec<(&str, Value, &str)> = Vec::new();
+    let mut listings: Vec<(&str, Value, &str, usize)> = Vec::new();
     for service_code in PAGED_SERVICES {
         listings.push((
             "ListServiceQuotas",
             json!({"ServiceCode": service_code}),
             "Quotas",
+            APPLIED_QUOTA_PAGE_SIZE,
         ));
         listings.push((
             "ListAWSDefaultServiceQuotas",
             json!({"ServiceCode": service_code}),
             "Quotas",
+            usize::MAX,
         ));
     }
 
     let mut shorter_than_the_largest_page = 0_usize;
     let mut longer_than_the_largest_page = 0_usize;
 
-    for (operation, base, items) in listings {
+    for (operation, base, items, unasked_limit) in listings {
         let case = format!("{operation} {base}");
         // The published listing, walked one page at a time with the tokens the
         // service itself issues for a caller-named page size.
@@ -541,21 +589,25 @@ async fn an_unasked_quota_listing_is_whole_and_an_asked_page_resumes() {
 
         let first = client.ok(operation, base.clone()).await;
         let page = first[items].as_array().cloned().unwrap_or_default();
+        let served = unasked_limit.min(whole.len());
         assert_eq!(
             page.len(),
-            whole.len(),
-            "case {case}: an unasked listing carries its whole set of {} items, got {}",
+            served,
+            "case {case}: an unasked listing carries the first {served} of its {} items, got {}",
             whole.len(),
             page.len()
         );
         assert_eq!(
-            page, whole,
-            "case {case}: the unasked page must be the published listing itself"
+            page,
+            whole[..served],
+            "case {case}: the unasked page must be the first items of the published listing"
         );
-        assert!(
-            first["NextToken"].is_null(),
-            "case {case}: the whole listing is the last page, so no NextToken follows it, got {}",
-            first["NextToken"]
+        assert_eq!(
+            !first["NextToken"].as_str().unwrap_or_default().is_empty(),
+            served < whole.len(),
+            "case {case}: a NextToken follows the unasked page exactly while items remain \
+             ({served} of {} served), got {first}",
+            whole.len()
         );
 
         // A page a CALLER cut short is followed by a token that resumes exactly where

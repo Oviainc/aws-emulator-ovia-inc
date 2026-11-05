@@ -18,9 +18,10 @@
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
 //!   issue is `InvalidPaginationTokenException`. `MaxResults` bounds what a CALLER may
 //!   ask for, not what this listing serves when none is named: a caller that names no
-//!   `MaxResults` is served the service's WHOLE applied-quota list in one page with no
-//!   `NextToken` ([`crate::state::UNASKED_PAGE_SIZE`]). The quotas come back in the
-//!   order the catalog publishes them.
+//!   `MaxResults` is served this listing's own unasked page
+//!   ([`crate::state::APPLIED_QUOTA_PAGE_SIZE`]), which is BOUNDED, so a `NextToken`
+//!   follows it whenever the applied-quota set it selected has records past it. The
+//!   quotas come back in the order the catalog publishes them.
 //!
 //! Before answering it materialises the increase decisions the clock has already made
 //! due, so the value listed here is the value in force at the instant of the call and
@@ -29,8 +30,8 @@
 //! The listing is the service's WHOLE applied-quota list (every quota the catalog
 //! seeded in [`crate::state`] publishes for the service, with any approved increase
 //! laid over it), which for a service such as EC2 runs past the largest page the
-//! model allows, so a walk with a caller-named page size takes many
-//! `NextToken`-chained pages.
+//! model allows, so a walk of it takes many `NextToken`-chained pages whether or not
+//! the caller names a page size.
 //!
 //! ---
 //!
@@ -235,11 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             ],
         );
-        let page = crate::state::paginate_after(
+        let page = crate::state::paginate_after_bounded(
             &listing,
             quotas,
             input.max_results,
             input.next_token.as_deref(),
+            crate::state::APPLIED_QUOTA_PAGE_SIZE,
         )
         .map_err(|_| {
             ListServiceQuotasErrorModeled::InvalidPaginationTokenException(

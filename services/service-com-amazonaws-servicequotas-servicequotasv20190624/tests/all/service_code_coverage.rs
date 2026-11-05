@@ -23,6 +23,8 @@ use std::collections::BTreeSet;
 
 use serde_json::json;
 
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::MAX_PAGE_SIZE;
+
 use crate::quota_workflow::{client, emulator, service_inventory, walk_pages, Client};
 
 /// Service codes AWS's Service Quotas inventory publishes, each row differing in the
@@ -156,20 +158,32 @@ async fn every_published_service_code_resolves_its_quota_listings() {
             );
 
             for operation in ["ListAWSDefaultServiceQuotas", "ListServiceQuotas"] {
-                let (status, body) = client.call(operation, &json!({"ServiceCode": code})).await;
+                let base = json!({"ServiceCode": code});
+                let (status, body) = client.call(operation, &base).await;
                 assert_eq!(
                     status, 200,
                     "case {case}: {operation} must serve a published code, got HTTP {status} with \
                      {body}"
                 );
-                assert!(
-                    body["Quotas"].is_array(),
-                    "case {case}: {operation} must carry a Quotas list, got {body}"
-                );
-                assert!(
-                    body["NextToken"].is_null(),
-                    "case {case}: {operation} serves the whole listing unasked, so no NextToken \
-                     follows it, got {body}"
+                let served = body["Quotas"]
+                    .as_array()
+                    .unwrap_or_else(|| {
+                        panic!("case {case}: {operation} must carry a Quotas list, got {body}")
+                    })
+                    .len();
+                // The whole set of the code, walked with the tokens the service itself
+                // issues at the largest page a caller may ask for (the model's
+                // `MaxResults` @range 1..100): the unasked page is its first records, and a
+                // `NextToken` follows it exactly while records remain past it.
+                let whole =
+                    walk_pages(&client, operation, &base, "Quotas", Some(MAX_PAGE_SIZE as i64))
+                        .await;
+                assert_eq!(
+                    !body["NextToken"].as_str().unwrap_or_default().is_empty(),
+                    served < whole.len(),
+                    "case {case}: {operation} follows its unasked page with a NextToken exactly \
+                     while records remain ({served} of {} served), got {body}",
+                    whole.len()
                 );
             }
 

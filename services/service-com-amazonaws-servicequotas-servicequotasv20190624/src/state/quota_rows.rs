@@ -546,11 +546,40 @@ fn events_request_rate(code: &str, api_name: &str, transactions_per_second: f64)
 /// sentence for the rate quota of its `DeleteDeliveryStream` API. It is the wording of
 /// the whole class, so one constructor fills it and two rows of the class cannot drift
 /// apart.
+///
+/// The sentence is PER SERVICE: a service whose recorded rows word their rate differently
+/// has its own constructor beside this one ([`api_rate_description`] for the service whose
+/// rows read "The maximum number of <Api> API requests per second."), so a third copy is
+/// never needed — pick the one the service's own recorded rows carry.
 fn request_rate_description(api_name: &str) -> String {
     format!(
         "The maximum number of {api_name} requests you can make per second in this account \
          in the current Region."
     )
+}
+
+/// The `Description` Service Quotas publishes for a quota that throttles ONE API operation
+/// to so many requests PER SECOND, for the service whose recorded rows word it this way.
+///
+/// The per-second wording is what distinguishes a RATE quota from a count of the same name,
+/// and it is fixed text around the operation's own name — the recorded applied-quota
+/// listing of `lambda` carries exactly this sentence for its `Rate of <Api> API requests`
+/// rows — so every row of the class is described through this one function rather than by a
+/// sentence written out per row. It sits beside [`request_rate_description`] because the
+/// two are the SAME fact worded as two services publish it.
+fn api_rate_description(api_name: &str) -> String {
+    format!("The maximum number of {api_name} API requests per second.")
+}
+
+/// The `Description` of the BURST allowance beside such a rate.
+///
+/// This one is this catalog's OWN wording, in the form AWS's rate descriptions take: the
+/// service's published text for a burst-rate quota is not among the data available here, so
+/// a later fidelity pass that gets it should replace this sentence. It names the burst
+/// rather than the per-second rate, since a burst quota caps how many requests may arrive
+/// at once rather than the steady rate they may keep up.
+fn api_burst_rate_description(api_name: &str) -> String {
+    format!("The maximum burst rate of {api_name} API requests.")
 }
 
 /// One per-API REQUEST-RATE quota of a service that publishes its API throttles under
@@ -1341,6 +1370,206 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
         quota("Parameters per image workflow", 25.0)
             .code("L-E49825CC")
             .describe("The maximum number of parameters per image workflow."),
+    ]
+}
+
+/// AWS Lambda's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `lambda` service code — the
+/// quota names, default values, units and adjustability of the "Lambda quotas" page —
+/// and the recorded applied-quota listing of that code for WHICH `QuotaCode` names
+/// which quota and for the `Description` each carries. A `QuotaCode` IDENTIFIES one
+/// quota, so a row claims AWS's code only where the recorded response for that pair
+/// says which quota the code names; every other row takes the descriptive code
+/// ([`super::descriptive_quota_code`]) rather than a pairing this catalog would be
+/// guessing at.
+///
+/// The rows are in the order the service reports them, which is the order a recorded
+/// listing of this service carries: the rate and MicroVM quotas AWS's own codes name
+/// first, then the function-shape quotas.
+pub(super) fn lambda_quotas() -> Vec<QuotaRow> {
+    vec![
+        // Most of the API request-rate quotas AWS publishes as not adjustable, each
+        // with its own `Period`: so many requests per second.
+        quota(
+            "Rate of control plane API requests (excludes invocation, GetFunction, \
+             and GetPolicy requests)",
+            15.0,
+        )
+        .code("L-B2AA0F47")
+        .fixed()
+        .period(1, "SECOND")
+        .describe(
+            "The maximum number of API requests per second (excluding invocation, \
+             GetFunction, and GetPolicy requests).",
+        ),
+        // Lambda builds a MicroVM image before it can run one, and publishes
+        // how many of those builds may be in flight: a `Count`, adjustable,
+        // over the one-second window this row carries.
+        quota("Number of concurrent MicroVM image builds", 10.0)
+            .code("L-72E0D058")
+            .unit("Count")
+            .describe("Number of concurrent MicroVM image builds per account per region"),
+        // The capacity-provider control plane is rate limited over ALL of its
+        // write APIs together, which is what this quota's own description
+        // says, so the limit is one combined requests-per-second figure.
+        quota("Rate of capacity provider write API requests", 1.0)
+            .code("L-F55076EC")
+            .fixed()
+            .period(1, "SECOND")
+            .describe(
+                "The maximum combined rate (requests per second) for all capacity \
+                 provider write APIs.",
+            ),
+        // A durable execution reports a completed callback through this API;
+        // AWS publishes its rate as adjustable and counted in plain requests.
+        quota("Rate of SendDurableExecutionCallbackSuccess API requests", 6000.0)
+            .code("L-B82A30EA")
+            .describe(&api_rate_description("SendDurableExecutionCallbackSuccess")),
+        // The burst allowance of the MicroVM resume API, which AWS publishes beside
+        // that API's sustained rate as a quota of its own.
+        quota("Burst rate of ResumeMicrovm API requests", 5.0)
+            .code("L-25EEC0A4")
+            .describe(&api_burst_rate_description("ResumeMicrovm")),
+        quota("Rate of GetPolicy API requests", 15.0)
+            .code("L-4273958C")
+            .fixed()
+            .period(1, "SECOND")
+            .describe(&api_rate_description("GetPolicy")),
+        // How long one MicroVM may run: published in hours, and not adjustable.
+        quota("Max Execution Duration of a MicroVM (in Hours)", 8.0)
+            .code("L-B430C318")
+            .fixed()
+            .describe("The maximum execution duration of a MicroVM (in Hours)."),
+        // The published function-shape quotas. AWS's `QuotaCode`s for them are
+        // NOT in this catalog: the codes it used to carry on these rows are
+        // AWS's codes for other quotas of this service, so each row takes its
+        // derived code instead of asserting a pairing nothing here can source.
+        quota("Function layers", 5.0)
+            .fixed()
+            .describe("The maximum number of layers that a function can use."),
+        quota("Environment variable size", 4.0)
+            .unit("Kilobytes")
+            .fixed()
+            .describe("The maximum total size of the environment variables of a function."),
+        quota("Function resource-based policy", 20.0)
+            .unit("Kilobytes")
+            .fixed()
+            .describe("The maximum size of the resource-based policy of a function."),
+        quota("Invocation payload (synchronous)", 6.0)
+            .unit("Megabytes")
+            .fixed()
+            .describe(
+                "The maximum size of the request and response payload of a \
+                 synchronous invocation.",
+            ),
+        quota("Invocation payload (asynchronous)", 256.0)
+            .unit("Kilobytes")
+            .fixed()
+            .describe("The maximum size of the event payload of an asynchronous invocation."),
+        quota("Function timeout", 900.0)
+            .unit("Seconds")
+            .fixed()
+            .describe(
+                "The maximum amount of time that a function can run before Lambda \
+                 stops it.",
+            ),
+        quota("Rate of GetFunction API requests", 100.0)
+            .fixed()
+            .period(1, "SECOND")
+            .describe(&api_rate_description("GetFunction")),
+        quota("Function and layer storage", 75.0)
+            .code("L-2ACBD22F")
+            .unit("Gigabytes")
+            .describe(
+                "The maximum total storage for the .zip deployment packages and layers \
+                 of this account in this Region.",
+            ),
+        quota("Concurrent executions", 1000.0)
+            .code("L-B99A9384")
+            .describe(
+                "The maximum number of function invocations that can run concurrently \
+                 in this Region.",
+            )
+            .metric(usage_metric(
+                "Lambda",
+                &[
+                    ("Class", "None"),
+                    ("Resource", "ConcurrentExecutions"),
+                    ("Type", "Resource"),
+                ],
+            )),
+        quota("Elastic network interfaces per VPC", 250.0).describe(
+            "The maximum number of elastic network interfaces that the functions of \
+             this account can attach to one VPC.",
+        ),
+        // The rest of the quotas the AWS Lambda quotas page publishes, with
+        // the names, values and units it publishes for them. None of them carries
+        // AWS's own `QuotaCode` here, so each takes its descriptive one.
+        //
+        // Their `Description`s are this catalog's own wording — the quotas
+        // page publishes the limit, not a Service Quotas description string —
+        // so a later fidelity pass that gets AWS's text should replace them.
+        quota("Function memory allocation", 10240.0)
+            .unit("Megabytes")
+            .fixed()
+            .describe("The maximum memory that can be allocated to a function."),
+        quota("Deployment package size (direct upload)", 50.0)
+            .unit("Megabytes")
+            .fixed()
+            .describe(
+                "The maximum size of a .zip deployment package uploaded directly to \
+                 Lambda.",
+            ),
+        quota("Deployment package size (unzipped, including layers)", 250.0)
+            .unit("Megabytes")
+            .fixed()
+            .describe(
+                "The maximum unzipped size of a function's deployment package and its \
+                 layers.",
+            ),
+        quota("Container image code package size", 10.0)
+            .unit("Gigabytes")
+            .fixed()
+            .describe("The maximum size of a container image deployment package."),
+        quota("/tmp directory storage", 512.0)
+            .unit("Megabytes")
+            .fixed()
+            .describe(
+                "The ephemeral storage a function's /tmp directory holds unless the \
+                 function configures more.",
+            ),
+        quota("File descriptors", 1024.0).fixed().describe(
+            "The maximum number of file descriptors one execution environment can \
+             hold open.",
+        ),
+        quota("Execution processes/threads", 1024.0).fixed().describe(
+            "The maximum number of processes and threads one execution environment \
+             can run.",
+        ),
+        // The AWS Lambda quotas page publishes this one as a rate over a TEN
+        // SECOND window ("1,000 execution environment instances every 10
+        // seconds"), which is the `Period` it carries.
+        quota("Concurrency scaling rate", 1000.0)
+            .fixed()
+            .period(10, "SECOND")
+            .describe("The rate at which a function can add execution environment instances."),
+        quota("Maximum event age", 21600.0)
+            .unit("Seconds")
+            .fixed()
+            .describe(
+                "The longest an asynchronous invocation request stays in the event \
+                 queue before Lambda discards it.",
+            ),
+        quota("Retry attempts for asynchronous invocation", 2.0)
+            .fixed()
+            .describe(
+                "The maximum number of times Lambda retries an asynchronous invocation \
+                 whose function returned an error.",
+            ),
+        quota("Test events (console editor)", 10.0)
+            .fixed()
+            .describe("The maximum number of saved test events per function."),
     ]
 }
 

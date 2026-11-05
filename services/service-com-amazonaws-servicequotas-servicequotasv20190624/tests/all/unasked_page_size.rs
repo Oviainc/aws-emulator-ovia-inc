@@ -7,18 +7,21 @@
 //! emulator serves with, over ONE shared engine, so what is exercised is the wire
 //! behaviour.
 //!
-//! The RULE, asserted over a TABLE spanning every listing this service paginates and
+//! The RULE, asserted over a TABLE spanning the listings this service answers WHOLE and
 //! listing lengths from empty to past the largest page a caller may ask for:
-//! `MaxResults` bounds what a CALLER may ask for and NOT what a listing serves when
+//! `MaxResults` bounds what a CALLER may ask for and NOT what such a listing serves when
 //! the caller names none, so an unasked listing carries its WHOLE set in one body with
 //! no `NextToken`, and a `NextToken` follows only a page a caller cut short with
 //! `MaxResults` — which still resumes exactly where it stopped.
 //!
+//! The APPLIED-quota listing is not among them: `ListServiceQuotas` has an unasked page
+//! of its own (`crate::state::APPLIED_QUOTA_PAGE_SIZE`), and `applied_quota_listing_pages.rs`
+//! pins that half of the contract.
+//!
 //! The rows differ along what the rule generalises over: the operation (the service
-//! inventory, the default and the applied quota listings, both request histories), the
-//! length of the set (none, one, a handful, dozens, hundreds) and the narrowing the
-//! request asks for. The harness (`Client`, `walk_pages`) is the one
-//! `quota_workflow.rs` owns.
+//! inventory, the default quota listing, both request histories), the length of the set
+//! (none, one, a handful, dozens, hundreds) and the narrowing the request asks for. The
+//! harness (`Client`, `walk_pages`) is the one `quota_workflow.rs` owns.
 
 use std::time::Duration;
 
@@ -41,8 +44,8 @@ const HISTORY: &str = "ListRequestedServiceQuotaChangeHistory";
 /// The per-quota request history.
 const HISTORY_BY_QUOTA: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
 
-/// Service codes whose quota listings span the lengths this rule generalises over:
-/// `iam` publishes a handful of quotas, `acm` and `lambda` dozens, `ec2` hundreds —
+/// Service codes whose default-quota listings span the lengths this rule generalises
+/// over: `iam` publishes a handful of quotas, `acm` and `lambda` dozens, `ec2` hundreds —
 /// more than the largest page a caller may ask for. None of them is the code the
 /// reproduction used.
 const QUOTA_SERVICES: &[&str] = &["iam", "acm", "lambda", "ec2"];
@@ -148,14 +151,12 @@ async fn rows(client: &Client) -> Vec<Row> {
     }];
 
     for service_code in QUOTA_SERVICES {
-        for operation in ["ListAWSDefaultServiceQuotas", "ListServiceQuotas"] {
-            rows.push(Row {
-                case: format!("{operation} {service_code}"),
-                operation,
-                body: json!({"ServiceCode": service_code}),
-                items: "Quotas",
-            });
-        }
+        rows.push(Row {
+            case: format!("ListAWSDefaultServiceQuotas {service_code}"),
+            operation: "ListAWSDefaultServiceQuotas",
+            body: json!({"ServiceCode": service_code}),
+            items: "Quotas",
+        });
     }
 
     // A service the catalog lists but publishes no quotas for: the empty set is a

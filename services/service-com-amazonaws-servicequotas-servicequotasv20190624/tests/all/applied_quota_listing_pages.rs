@@ -8,25 +8,29 @@
 //! `MultiServiceRouter` the emulator serves with, over ONE shared engine, so what is
 //! exercised is the wire behaviour.
 //!
-//! The RULE, asserted over a TABLE rather than over one recorded request: `MaxResults`
-//! (`@range 1..100`) bounds what a CALLER may ask for and NOT what the applied-quota
-//! listing serves when the caller names none, so an unasked call carries the WHOLE set
-//! the narrowing selects in one body with no `NextToken`, and a `NextToken` follows only
-//! a page a caller cut short — which resumes exactly where that page stopped.
+//! The RULE, asserted over a TABLE rather than over one recorded request: every page of
+//! this listing is BOUNDED — by the caller's `MaxResults` (`@range 1..100`) where it
+//! names one, else by this listing's own unasked page size
+//! (`crate::state::APPLIED_QUOTA_PAGE_SIZE`) — and a `NextToken` follows a page exactly
+//! when the narrowed set has records past it, so chaining the token walks the whole
+//! selected set, in the published order, reporting every record exactly once and none
+//! twice.
 //!
-//! `unasked_page_size.rs` pins the same rule across every listing of this service; what
-//! this suite adds is the dimensions `ListServiceQuotas` narrows its OWN set along, each
-//! of which changes how long the set is: the `ServiceCode` (a handful of quotas, dozens,
-//! hundreds), the `QuotaAppliedAtLevel` plane (`ACCOUNT`, `RESOURCE`, `ALL` — the last
-//! reporting one record per quota PLUS one per resource context a value was applied to,
-//! so it is the longest), and the `QuotaCode` filter that cuts the set to one quota.
+//! `unasked_page_size.rs` pins the sibling rule for the listings whose unasked answer is
+//! their whole set; what this suite adds is the dimensions `ListServiceQuotas` narrows
+//! its OWN set along, each of which changes how long the set is: the `ServiceCode` (a
+//! handful of quotas, dozens, hundreds), the `QuotaAppliedAtLevel` plane (`ACCOUNT`,
+//! `RESOURCE`, `ALL` — the last reporting one record per quota PLUS one per resource
+//! context a value was applied to, so it is the longest), and the `QuotaCode` filter that
+//! cuts the set to one quota.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
-    CONTEXT_ID_EVERY_RESOURCE, LEVEL_ACCOUNT, LEVEL_ALL, LEVEL_RESOURCE, MAX_PAGE_SIZE,
+    APPLIED_QUOTA_PAGE_SIZE, CONTEXT_ID_EVERY_RESOURCE, LEVEL_ACCOUNT, LEVEL_ALL, LEVEL_RESOURCE,
+    MAX_PAGE_SIZE,
 };
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client, ACCOUNT};
@@ -179,10 +183,12 @@ async fn rows(caller: &Client) -> Vec<Row> {
     rows
 }
 
-/// RULE: an applied-quota listing called with no `MaxResults` carries the WHOLE set its
-/// narrowing selects in one body, with no `NextToken` after it, however long that set is.
+/// RULE: an applied-quota listing called with no `MaxResults` serves this listing's own
+/// unasked page — the first records of the narrowed set, bounded by
+/// `APPLIED_QUOTA_PAGE_SIZE` — followed by a `NextToken` exactly while that set has
+/// records past the page, and chaining that token yields the whole set once over.
 #[tokio::test]
-async fn an_unasked_applied_listing_carries_its_whole_set_in_one_page() {
+async fn an_unasked_applied_listing_serves_a_bounded_page_and_a_token_while_records_remain() {
     let engine = emulator();
     let caller = client(&engine, "us-east-1");
     let rows = rows(&caller).await;
@@ -205,21 +211,34 @@ async fn an_unasked_applied_listing_carries_its_whole_set_in_one_page() {
 
         let unasked = caller.ok(OPERATION, body.clone()).await;
         let page = quotas(case, &unasked);
+        let served = APPLIED_QUOTA_PAGE_SIZE.min(whole.len());
         assert_eq!(
             page.len(),
-            whole.len(),
-            "case {case}: an unasked listing carries the whole set of {} records, got {}",
+            served,
+            "case {case}: an unasked page holds the first {served} of the {} records \
+             selected, got {}",
             whole.len(),
             page.len()
         );
         assert_eq!(
-            page, whole,
-            "case {case}: the unasked page must be the selected listing itself"
+            page,
+            whole[..served],
+            "case {case}: the unasked page must be the first records of the selected order"
         );
-        assert!(
-            unasked["NextToken"].is_null(),
-            "case {case}: the whole set is the last page, so no NextToken follows it, got {}",
-            unasked["NextToken"]
+        assert_eq!(
+            !unasked["NextToken"].as_str().unwrap_or_default().is_empty(),
+            served < whole.len(),
+            "case {case}: a NextToken follows this page exactly while records remain ({served} \
+             of {} served), got {unasked}",
+            whole.len()
+        );
+
+        // Chaining that token — every continuation naming no page size either — walks
+        // the selected set exactly once over, in the published order.
+        let walked = walk_pages(&caller, OPERATION, body, "Quotas", None).await;
+        assert_eq!(
+            walked, whole,
+            "case {case}: the unasked token chain must yield the selected set exactly once"
         );
 
         // Every record belongs to the plane the narrowing asked for, so "the whole set"
@@ -252,8 +271,8 @@ async fn an_unasked_applied_listing_carries_its_whole_set_in_one_page() {
     }
 
     // The table must span the lengths the rule generalises over: an empty set, sets
-    // past a handful of records, and a set past the largest page a caller may ask for
-    // (which no caller-nameable `MaxResults` could have served in one body).
+    // past a handful of records (so past the unasked page, which is what makes the
+    // token mandatory), and a set past the largest page a caller may ask for.
     assert!(
         empty == 1 && past_a_handful >= 4 && past_the_largest_asked_page >= 1,
         "case table: expected rows spanning an empty set, sets past a handful and one past \
@@ -264,8 +283,8 @@ async fn an_unasked_applied_listing_carries_its_whole_set_in_one_page() {
 
 /// RULE, the other half: a caller that DOES name `MaxResults` gets exactly that page
 /// size out of the same narrowed set, with a `NextToken` while records remain that
-/// resumes where the page stopped — and a continuation naming no page size serves the
-/// whole remainder in one page.
+/// resumes where the page stopped — and a continuation naming no page size is bounded by
+/// this listing's own unasked page.
 #[tokio::test]
 async fn an_asked_page_size_cuts_the_same_narrowed_set() {
     let engine = emulator();
@@ -325,8 +344,9 @@ async fn an_asked_page_size_cuts_the_same_narrowed_set() {
                 continue;
             }
 
-            // The continuation names no page size, so it serves the whole remainder in
-            // one page: the unasked page size governs a continuation the same way.
+            // The continuation names no page size, so this listing's own unasked page
+            // bounds it the same way the first page is bounded — and it resumes exactly
+            // where the asked page stopped.
             let resumed = caller
                 .ok(OPERATION, {
                     let mut resume = body.clone();
@@ -335,18 +355,20 @@ async fn an_asked_page_size_cuts_the_same_narrowed_set() {
                 })
                 .await;
             let rest = quotas(&format!("{case} resumed"), &resumed);
+            let remaining = whole.len() - taken;
+            let served = APPLIED_QUOTA_PAGE_SIZE.min(remaining);
             assert_eq!(
                 rest,
-                whole[taken..],
-                "case {case} resumed: an unasked continuation carries the remaining {} records, \
-                 got {}",
-                whole.len() - taken,
+                whole[taken..taken + served],
+                "case {case} resumed: an unasked continuation carries the next {served} of the \
+                 {remaining} records left, got {}",
                 rest.len()
             );
-            assert!(
-                resumed["NextToken"].is_null(),
-                "case {case} resumed: the remainder is the last page, got {}",
-                resumed["NextToken"]
+            assert_eq!(
+                !resumed["NextToken"].as_str().unwrap_or_default().is_empty(),
+                served < remaining,
+                "case {case} resumed: a NextToken follows the continuation exactly while records \
+                 remain, got {resumed}"
             );
         }
     }
