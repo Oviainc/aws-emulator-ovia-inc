@@ -55,16 +55,20 @@ const MODELLED_POWER_NAMES: &[&str] = &["nano", "micro", "small", "medium", "lar
 ///
 /// SOURCE: the container services table of the Lightsail pricing page — nano with
 /// 0.25 vCPUs and 0.5 GB for $7 a month, micro with 0.25 vCPUs and 1 GB for $10,
-/// small with 0.5 vCPUs and 2 GB for $20, medium with 1 vCPU and 4 GB for $40,
-/// large with 2 vCPUs and 8 GB for $80 and xlarge with 4 vCPUs and 16 GB for $160;
+/// small with 0.5 vCPUs and 1 GB for $15, medium with 1 vCPU and 2 GB for $40,
+/// large with 2 vCPUs and 4 GB for $80 and xlarge with 4 vCPUs and 8 GB for $160;
 /// the id form is the `ContainerServicePower$powerId` documentation's (`nano-1`).
+///
+/// The rows are each plan's OWN figures: the plans do not step in lockstep (micro
+/// and small carry the same RAM and differ in vCPUs and price), so nothing here
+/// may be derived from the row above or below it.
 const PUBLISHED_PLANS: &[(&str, &str, f64, f64, f64)] = &[
     ("nano", "nano-1", 0.25, 0.5, 7.0),
     ("micro", "micro-1", 0.25, 1.0, 10.0),
-    ("small", "small-1", 0.5, 2.0, 20.0),
-    ("medium", "medium-1", 1.0, 4.0, 40.0),
-    ("large", "large-1", 2.0, 8.0, 80.0),
-    ("xlarge", "xlarge-1", 4.0, 16.0, 160.0),
+    ("small", "small-1", 0.5, 1.0, 15.0),
+    ("medium", "medium-1", 1.0, 2.0, 40.0),
+    ("large", "large-1", 2.0, 4.0, 80.0),
+    ("xlarge", "xlarge-1", 4.0, 8.0, 160.0),
 ];
 
 /// The powers `GetContainerServicePowers` reports, keyed by `powerId`.
@@ -467,4 +471,126 @@ async fn reporting_the_powers_changes_nothing_a_later_caller_sees() {
         in_process, on_the_wire,
         "case the accessor and the wire: expected the same catalog, got {in_process:?}"
     );
+}
+
+/// The hours AWS prices one Lightsail monthly plan at: a monthly plan is billed by
+/// the hour at `price / 730`, so a window of 730 hours is exactly one plan's worth.
+const BILLING_MONTH_HOURS: f64 = 730.0;
+
+/// How far after the call the estimated window starts, so the service under test
+/// already exists for the whole of it and the figures are exact.
+const WINDOW_STARTS_IN_SECONDS: f64 = 86_400.0;
+
+/// Now, in epoch seconds.
+fn now_epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64())
+        .unwrap_or_default()
+}
+
+/// RULE: every figure a reported power carries is that plan's OWN published one —
+/// no entry carries a neighbouring plan's RAM, vCPUs or price — and the price it
+/// publishes is the price every operation that charges for that power charges.
+///
+/// This is the case a table built by stepping one column past its own row cannot
+/// pass: the rows differ along what the rule generalises over (the plan, and so its
+/// vCPU count, its RAM and its price), and two plans share a RAM figure while
+/// differing in vCPUs and price, so no entry follows from the one beside it. The
+/// price is then driven through a SECOND operation, `GetCostEstimate`, which bills
+/// a container service at the catalog's price for the power it runs on.
+#[tokio::test]
+async fn each_power_carries_its_own_figures_and_is_billed_at_its_own_price() {
+    let emulator = Emulator::new();
+    let powers = reported(&emulator).await;
+
+    // The published RAM ladder, read off the rows above: it is NOT one figure per
+    // step — `micro` and `small` both carry 1 GB — so a catalog whose entries each
+    // carried the next plan's RAM would differ here on every tier above nano.
+    let reported_ram: Vec<(&str, Option<f64>)> = PUBLISHED_PLANS
+        .iter()
+        .map(|(_, power_id, ..)| {
+            (
+                *power_id,
+                powers
+                    .get(*power_id)
+                    .and_then(|power| power["ramSizeInGb"].as_f64()),
+            )
+        })
+        .collect();
+    let published_ram: Vec<(&str, Option<f64>)> = PUBLISHED_PLANS
+        .iter()
+        .map(|(_, power_id, _, ram_size_in_gb, _)| (*power_id, Some(*ram_size_in_gb)))
+        .collect();
+    assert!(
+        reported_ram
+            .iter()
+            .zip(published_ram.iter())
+            .all(|((_, reported), (_, published))| match (reported, published) {
+                (Some(reported), Some(published)) => (reported - published).abs() < 0.005,
+                _ => false,
+            }),
+        "case the published RAM ladder: expected {published_ram:?}, got {reported_ram:?}"
+    );
+
+    // Two plans that share a RAM figure must still differ in the figures that do
+    // distinguish them, so a reader cannot infer one plan from another.
+    let micro = powers
+        .get("micro-1")
+        .unwrap_or_else(|| panic!("case micro-1: expected the plan to be reported"));
+    let small = powers
+        .get("small-1")
+        .unwrap_or_else(|| panic!("case small-1: expected the plan to be reported"));
+    assert!(
+        is_close(micro["ramSizeInGb"].as_f64(), 1.0) && is_close(small["ramSizeInGb"].as_f64(), 1.0),
+        "case micro-1 and small-1: both plans publish 1 GB of RAM, got {micro:?} and {small:?}"
+    );
+    assert!(
+        micro["cpuCount"].as_f64() < small["cpuCount"].as_f64()
+            && micro["price"].as_f64() < small["price"].as_f64(),
+        "case micro-1 and small-1: the dearer of two plans with the same RAM must carry more \
+         vCPUs, got {micro:?} and {small:?}"
+    );
+
+    // One billing month of each power, estimated through the operation that prices
+    // it: the charge is the catalog's price for that power, times the nodes the
+    // service runs.
+    let start = now_epoch_seconds() + WINDOW_STARTS_IN_SECONDS;
+    let end = start + BILLING_MONTH_HOURS * 3_600.0;
+    let scale = 2;
+
+    for (name, power_id, _, _, price) in PUBLISHED_PLANS {
+        let service_name = format!("billed-{name}");
+        let (status, created) = emulator
+            .call(
+                "CreateContainerService",
+                json!({"serviceName": service_name, "power": name, "scale": scale}),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "case {power_id}: expected the create to be accepted, got {status} {created:?}"
+        );
+
+        let body = emulator
+            .ok(
+                "GetCostEstimate",
+                json!({"resourceName": service_name, "startTime": start, "endTime": end}),
+            )
+            .await;
+        let charge = &body["resourcesBudgetEstimate"][0]["costEstimates"][0];
+        assert_eq!(
+            charge["usageType"].as_str(),
+            Some(format!("PowerUsage:{power_id}").as_str()),
+            "case {power_id}: expected the charge to name the power it is for, got {charge:?}"
+        );
+        let expected = price * f64::from(scale);
+        assert!(
+            charge["resultsByTime"][0]["usageCost"]
+                .as_f64()
+                .is_some_and(|cost| (cost - expected).abs() < 1e-6),
+            "case {power_id}: expected ${expected} for {scale} nodes over a billing month, \
+             got {charge:?}"
+        );
+    }
 }
