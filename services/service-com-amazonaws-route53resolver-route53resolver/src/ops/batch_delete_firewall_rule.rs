@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteFirewallRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteFirewallRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteFirewallRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Each entry is decided on its own through the
+//! one firewall-rule delete the store owns
+//! ([`crate::state::ComAmazonawsRoute53resolverRoute53resolverState::delete_firewall_rule`]),
+//! so the rule this call removes is the rule `DeleteFirewallRule` would have
+//! removed for that entry, and an entry it cannot remove is reported in the
+//! response body instead of failing the whole call. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteFirewallRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteFirewallRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteFirewallRule"))
+        // The engine is reachable from `&self` (constructor-injected); a rule is
+        // not an ARN-bearing resource of its own, so this operation takes
+        // nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteFirewallRuleErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One request asks for a bounded number of rules, so no single call can
+        // ask this emulator for unbounded work. Past that bound the request is
+        // refused WHOLE, which leaves the stored rules exactly as they were.
+        let asked_for = input.delete_firewall_rule_entries.len();
+        if asked_for > crate::state::MAX_FIREWALL_RULE_ENTRIES_PER_BATCH {
+            return Err(BatchDeleteFirewallRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator deletes at most {} firewall rules in one batch; this \
+                         request carries {asked_for}",
+                        crate::state::MAX_FIREWALL_RULE_ENTRIES_PER_BATCH
+                    )),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_FIREWALL_RULE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut deleted_firewall_rules = Vec::new();
+        let mut delete_errors = Vec::new();
+        let mut store = state.lock();
+
+        // The entries are decided IN ORDER, each against the store as the
+        // entries before it left it: a rule one entry deleted is a rule the
+        // next entry can no longer name. An entry the delete refuses is
+        // reported with the code and the sentence the single delete answers for
+        // it, beside the entry that caused it — and the entries around it are
+        // deleted all the same, which is what makes one call able to succeed in
+        // part.
+        for entry in &input.delete_firewall_rule_entries {
+            let named = crate::state::FirewallRuleMatchSource {
+                firewall_rule_group_id: &entry.firewall_rule_group_id,
+                firewall_domain_list_id: entry.firewall_domain_list_id.as_deref(),
+                firewall_threat_protection_id: entry.firewall_threat_protection_id.as_deref(),
+                qtype: entry.qtype.as_deref(),
+                action: crate::state::FIREWALL_RULE_ACTION_WORD_DELETE,
+            };
+
+            match store.delete_firewall_rule(named, now) {
+                Ok(rule) => deleted_firewall_rules.push(rule),
+                // "The firewall rule entry that caused the error", as the
+                // request stated it.
+                Err(refusal) => delete_errors.push(BatchDeleteFirewallRuleError2 {
+                    firewall_rule: Some(entry.clone()),
+                    code: Some(refusal.code().to_string()),
+                    message: refusal.message(),
+                }),
+            }
+        }
+
+        Ok(BatchDeleteFirewallRuleOutput {
+            // Both lists are reported for every call, so a caller reads the
+            // rules this request deleted and the entries it could not delete
+            // from the same two members whether either is empty or not.
+            deleted_firewall_rules: Some(deleted_firewall_rules),
+            delete_errors: Some(delete_errors),
+        })
     }
 }
