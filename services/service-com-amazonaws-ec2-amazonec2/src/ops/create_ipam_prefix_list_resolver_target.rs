@@ -162,6 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::prefix_list_not_found;
         use crate::scaffolded::Scaffolded;
         use crate::state;
 
@@ -281,11 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of them — including a prefix list Amazon Web Services publishes for its own services,
         // which no account manages — is refused with the prefix list's own `NotFound` code.
         if !store.managed_prefix_lists.contains_key(prefix_list_id) {
-            return Err(
-                crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::prefix_list_not_found(
-                    prefix_list_id,
-                ),
-            );
+            return Err(prefix_list_not_found(prefix_list_id));
         }
 
         // Idempotency: one token names the one target it minted, so a replay reports that
