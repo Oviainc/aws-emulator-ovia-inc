@@ -5,7 +5,10 @@
 //! Reports the entry set of ONE prefix list the caller can see — a list the account created
 //! or one the Region publishes for a service, the two sources
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::visible_prefix_list_entries`] reads — in
-//! ascending order of the CIDR block's text, cut into `MaxResults`-sized pages. A reporting
+//! ascending order of the CIDR block's text, cut into `MaxResults`-sized pages. A version
+//! earlier than the one the list stands at is answered with the entry set that version had,
+//! which the revision that superseded it kept
+//! ([`crate::ops::modify_managed_prefix_list::managed_prefix_list_entries`]). A reporting
 //! operation only: it writes nothing at all, no move the clock owes a prefix list touching
 //! the entries of a version.
 //!
@@ -139,6 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::{
+            prefix_list_not_found, require_prefix_list_versions,
+        };
         use crate::state;
 
         // The request's own FORM first, before anything is resolved: "not a prefix list id at
@@ -202,29 +208,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .visible_prefix_list_entries(&region, &input.prefix_list_id);
         // A prefix list nothing the caller can see carries is an error, not an empty entry
         // set — an empty entry set is what a list holding no entry reports.
-        let found =
-            found.ok_or_else(|| state::invalid_prefix_list_id_not_found(&input.prefix_list_id))?;
+        let found = found.ok_or_else(|| prefix_list_not_found(&input.prefix_list_id))?;
 
         // "The version of the prefix list for which to return the entries. The default is
         // the current version" (`$TargetVersion`): a request naming no version is answered
-        // with the version the list stands at, and one naming a version the list has no
-        // entry set for is refused — there is nothing to report for it, and answering the
-        // current version's entries instead would report an entry set the caller did not ask
-        // for. A list this emulator holds has exactly ONE version while the operations that
-        // revise an entry set — `ModifyManagedPrefixList` and
-        // `RestoreManagedPrefixListVersion` — are scaffold stubs; when they land they store
-        // the earlier versions, and an earlier version is then answered with ITS entries
-        // rather than refused here.
-        if let Some(target) = input
+        // with the version the list stands at; one naming an EARLIER version is answered with
+        // the entry set that version had, which `ModifyManagedPrefixList` kept when it
+        // superseded it; and one naming a version the list has never had is refused — there is
+        // nothing to report for it, and answering another version's entries instead would
+        // report an entry set the caller did not ask for. The version store is taken only
+        // after the main store's lock has been let go of, so the two are never held at once.
+        let entries = match input
             .target_version
             .filter(|target| *target != found.version)
         {
-            return Err(state::invalid_parameter_value(format!(
-                "Invalid value '{target}' for targetVersion. \
-                 The prefix list '{prefix_list_id}' has no version {target}",
-                prefix_list_id = input.prefix_list_id,
-            )));
-        }
+            None => found.entries,
+            Some(target) => {
+                let versions = require_prefix_list_versions(&*self.engine)?;
+                let superseded = versions
+                    .lock()
+                    .entries_of(&input.prefix_list_id, target)
+                    .cloned();
+                superseded.ok_or_else(|| {
+                    state::invalid_parameter_value(format!(
+                        "Invalid value '{target}' for targetVersion. \
+                         The prefix list '{prefix_list_id}' has no version {target}",
+                        prefix_list_id = input.prefix_list_id,
+                    ))
+                })?
+            }
+        };
 
         // One entry is one CIDR block — a prefix list cannot carry one block twice — so the
         // block is both the order the entry set is reported in and the cursor a page resumes
@@ -232,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // LEXICOGRAPHIC order of the block's text, the order AWS reports a prefix list's
         // entries in (`10.0.0.0/8` ahead of `9.0.0.0/8`) — not the numeric order of the
         // addresses, and changing it would strand every page token already minted.
-        let mut entries = found.entries;
+        let mut entries = entries;
         entries.sort_by(|left, right| left.cidr.cmp(&right.cidr));
         // Both sources fill the block in — `CreateManagedPrefixList` stores its canonical
         // form and a published list derives it from the Region's ranges — and the cursor is

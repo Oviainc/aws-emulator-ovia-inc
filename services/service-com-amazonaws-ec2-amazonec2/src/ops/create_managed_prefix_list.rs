@@ -139,6 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::read_entries;
         use crate::state;
 
         // "The tags to apply to the prefix list during creation"
@@ -222,8 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "One or more entries for the prefix list"
         // (`CreateManagedPrefixListRequest$Entries`), read into the shape
-        // `GetManagedPrefixListEntries` reports them as. The modelled `length 0..100` has
-        // already bounded how many there may be; what each one carries is read here.
+        // `GetManagedPrefixListEntries` reports them as, by the crate's ONE reader of the
+        // entries a request names for a prefix list — the same one the operation that ADDS an
+        // entry to a list reads its own with. The modelled `length 0..100` has already bounded
+        // how many there may be; what each one carries is read there.
         let entries = read_entries(
             input.entries.as_deref().unwrap_or_default(),
             &input.address_family,
@@ -347,68 +350,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })
     }
-}
-
-/// The request's `Entries` as the stored, reported [`PrefixListEntry`] shape, or the refusal
-/// one of them earns.
-///
-/// Each entry is "a CIDR block and an optional description" (`CreateManagedPrefixList`), and
-/// the CIDR is read against the list's own `AddressFamily`: a block of the other family — or
-/// a value that is no CIDR block at all — is refused rather than stored, an entry of the
-/// wrong family having no address the list could ever be consulted for. A block is stored in
-/// CANONICAL form, with its host bits clear, the way every other caller-supplied range of
-/// this service is ([`crate::state::canonical_cidr_block`]), so two spellings of one range
-/// are one entry. `family` is one of [`crate::state::PREFIX_LIST_ADDRESS_FAMILIES`].
-fn read_entries(
-    entries: &[AddPrefixListEntry],
-    family: &str,
-) -> Result<Vec<PrefixListEntry>, CreateManagedPrefixListError> {
-    use crate::state;
-
-    let wants_ipv6 = family == state::PREFIX_LIST_ADDRESS_FAMILY_IPV6;
-    let mut read: Vec<PrefixListEntry> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let canonical = match state::canonical_cidr_block(&entry.cidr) {
-            Some(canonical) if entry.cidr.contains(':') == wants_ipv6 => canonical,
-            _ => {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({cidr}) for parameter cidr is invalid. \
-                     This is not a valid {family} CIDR block.",
-                    cidr = entry.cidr,
-                )))
-            }
-        };
-        if entry
-            .description
-            .as_deref()
-            .is_some_and(|description| {
-                description.chars().count() > state::MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS
-            })
-        {
-            return Err(state::invalid_parameter_value(format!(
-                "The description of entry {cidr} accepts at most {max} characters",
-                cidr = entry.cidr,
-                max = state::MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS,
-            )));
-        }
-        // One range is one entry: a second entry for a range the list already carries has no
-        // defined winner, so it is refused rather than stored twice.
-        if read
-            .iter()
-            .any(|stored| stored.cidr.as_deref() == Some(canonical.as_str()))
-        {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({cidr}) for parameter cidr is invalid. \
-                 The prefix list cannot carry one CIDR block twice.",
-                cidr = entry.cidr,
-            )));
-        }
-        read.push(PrefixListEntry {
-            cidr: Some(canonical),
-            description: entry.description.clone(),
-        });
-    }
-    Ok(read)
 }
 
 /// Does `stored` — the prefix list a replayed `ClientToken` names — hold what THIS request

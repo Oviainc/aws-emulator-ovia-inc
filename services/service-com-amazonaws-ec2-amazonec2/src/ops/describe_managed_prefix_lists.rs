@@ -265,7 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|list| list.prefix_list_id.as_deref() == Some(id.as_str()))
         }) {
-            return Err(state::invalid_prefix_list_id_not_found(unknown));
+            return Err(
+                crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::prefix_list_not_found(
+                    unknown,
+                ),
+            );
         }
 
         // `PrefixListIds` narrows the candidates to the ids named, and every filter must then

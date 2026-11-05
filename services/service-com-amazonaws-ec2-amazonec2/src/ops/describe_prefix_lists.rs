@@ -285,7 +285,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|list| list.prefix_list_id == id.as_str())
         }) {
-            return Err(crate::state::invalid_prefix_list_id_not_found(unknown));
+            return Err(
+                crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::prefix_list_not_found(
+                    unknown,
+                ),
+            );
         }
 
         // "The default is to describe all your prefix lists": `PrefixListIds` narrows

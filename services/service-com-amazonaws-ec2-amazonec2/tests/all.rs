@@ -120,8 +120,6 @@ mod instance_id_forms;
 // types, scope options, accounts and tags the request names — the `pending` -> `available`
 // move the clock owes it, the 30-day deletion it carries, its `ClientToken` idempotency and
 // what it refuses. Declared beside `prefix_lists` for the reason the note above gives: the
-// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
-// lines.
 #[path = "all/create_image_usage_report.rs"]
 mod create_image_usage_report;
 // What `EnableFastSnapshotRestores` stores for each (snapshot, Availability Zone) pair, the
@@ -223,8 +221,6 @@ mod security_group_rule_quota_buckets;
 mod reserved_instances_exchanges;
 // What `ModifyCapacityReservationFleet` changes about a stored Capacity Reservation Fleet,
 // what a describe then reports of it, and what the modification refuses. Declared beside
-// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
-// of this file are where every new ec2 suite inserts its lines.
 #[path = "all/modify_capacity_reservation_fleet.rs"]
 mod modify_capacity_reservation_fleet;
 // What `RevokeSecurityGroupEgress` removes from a group, which requests it admits and
@@ -410,7 +406,6 @@ mod describe_network_insights_paths;
 // which parameter pairings it refuses and what a dry run of it performs. Declared beside the
 // three path suites above — topically its neighbours — rather than in sorted position or at
 // the tail, for the reason this file's header note gives: both are contended regions where a
-// serialized squash merge is lost.
 #[path = "all/create_network_insights_path.rs"]
 mod create_network_insights_path;
 // The transit gateway prefix list reference slice (create, then read it back) and the
@@ -1309,3 +1304,10 @@ mod unmonitor_instances;
 // it refuses, and the minting outcome the clock owes an AFI it is read through. Declared beside
 #[path = "all/describe_fpga_images.rs"]
 mod describe_fpga_images;
+// What `ModifyManagedPrefixList` revises on one managed prefix list of the account: the entry
+// set it computes from the one the list holds, the version a revision of that set mints while a
+// rename leaves it alone, the entries the superseded version keeps, the state the clock settles
+// and what the operation refuses. Declared beside the suite above rather than in sorted
+// position, for the reason the note at the top of this file gives.
+#[path = "all/modify_managed_prefix_list.rs"]
+mod modify_managed_prefix_list;

@@ -326,7 +326,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so it is refused rather than stored.
         if let Some(prefix_list_id) = input.destination_prefix_list_id.as_deref() {
             if !store.managed_prefix_lists.contains_key(prefix_list_id) {
-                return Err(state::invalid_prefix_list_id_not_found(prefix_list_id));
+                return Err(
+                    crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::prefix_list_not_found(
+                        prefix_list_id,
+                    ),
+                );
             }
         }
 

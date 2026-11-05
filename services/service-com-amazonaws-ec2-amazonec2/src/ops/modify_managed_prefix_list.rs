@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyManagedPrefixList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyManagedPrefixList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyManagedPrefixList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Revises ONE managed prefix list of the account in [`crate::state`]: the entries it carries,
+//! its name, its maximum size and whether it synchronizes with an IPAM prefix list resolver.
+//! "Adding or removing entries in a prefix list creates a new version of the prefix list.
+//! Changing the name of the prefix list does not affect the version" — so a revision of the
+//! entry set moves the list to the NEXT version and keeps the entry set it replaced under the
+//! version that had it ([`managed_prefix_list_entries`]), while a request that only renames
+//! the list leaves its version where it stands. The list is answered in the non-terminal
+//! `modify-in-progress` state the model publishes, and the clock — not a later call — owes it
+//! `modify-complete` one [`crate::state::TRANSITION_DELAY`] later.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +84,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// A managed prefix list's entry sets: the ONE reader of the entries a request names, and the
+/// store that keeps the entry set of a version a revision here supersedes.
+///
+/// The `#[path]` is what points the declaration into this operation's own directory: the ops
+/// modules are themselves declared with a path, so a bare `mod` here would resolve beside
+/// them rather than inside `modify_managed_prefix_list/`.
+#[path = "modify_managed_prefix_list/managed_prefix_list_entries.rs"]
+pub mod managed_prefix_list_entries;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +160,370 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyManagedPrefixList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyManagedPrefixListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyManagedPrefixList"))
+        use crate::state;
+        use managed_prefix_list_entries::{
+            PREFIX_LIST_STATE_MODIFY_COMPLETE, PREFIX_LIST_STATE_MODIFY_IN_PROGRESS,
+            PREFIX_LIST_STATES_ADMITTING_A_REVISION, prefix_list_not_found, read_entries,
+            read_entry_block, require_prefix_list_versions,
+        };
+
+        // The request's own FORM first, before anything is resolved: "not a prefix list id at
+        // all" is a fact about the request, while "no such prefix list" is a fact about what
+        // the caller can see — the order every resource of this crate asks the two questions
+        // in (`crate::state::require_well_formed_id`).
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            &input.prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+
+        // "One or more entries to add to the prefix list" / "to remove from the prefix list"
+        // (`$AddEntries`, `$RemoveEntries`). The modelled `length 0..100` has already bounded
+        // how many each may carry; naming either at all is what makes this request a revision
+        // of the ENTRY SET, which is the one change that moves the list to a new version.
+        let added = input.add_entries.as_deref().unwrap_or_default();
+        let removed = input.remove_entries.as_deref().unwrap_or_default();
+        let revises_entries = !added.is_empty() || !removed.is_empty();
+
+        // "Modifies the specified managed prefix list": every member but the id is the
+        // modification itself, so a request naming none asks for nothing and is told which
+        // parameters carry a modification rather than answered with an untouched list.
+        if !revises_entries
+            && input.prefix_list_name.is_none()
+            && input.max_entries.is_none()
+            && input.ipam_prefix_list_resolver_sync_enabled.is_none()
+        {
+            return Err(state::missing_parameter(
+                "The request must contain at least one of the parameters prefixListName, \
+                 addEntry, removeEntry, maxEntries and ipamPrefixListResolverSyncEnabled",
+            ));
+        }
+
+        // "A name for the prefix list" (`$PrefixListName`), held to exactly what the create
+        // holds a name to — the bound and the reserved namespace are facts of a prefix list
+        // name, not of the operation that writes one.
+        if let Some(prefix_list_name) = input.prefix_list_name.as_deref() {
+            if prefix_list_name.is_empty() {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter prefixListName",
+                ));
+            }
+            if prefix_list_name.chars().count() > state::MAX_PREFIX_LIST_NAME_CHARS {
+                return Err(state::invalid_parameter_value(format!(
+                    "prefixListName accepts at most {max} characters",
+                    max = state::MAX_PREFIX_LIST_NAME_CHARS,
+                )));
+            }
+            if prefix_list_name.starts_with(state::RESERVED_PREFIX_LIST_NAME_PREFIX) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{prefix_list_name}' for prefixListName. \
+                     The name cannot start with {reserved}",
+                    reserved = state::RESERVED_PREFIX_LIST_NAME_PREFIX,
+                )));
+            }
+        }
+
+        if let Some(max_entries) = input.max_entries {
+            // "You cannot modify the entries of a prefix list and modify the size of a prefix
+            // list at the same time" (`$MaxEntries`): the two changes are refused TOGETHER
+            // rather than one of them silently winning.
+            if revises_entries {
+                return Err(state::invalid_parameter_combination(
+                    "You cannot modify the entries of a prefix list and modify the size of a \
+                     prefix list at the same time",
+                ));
+            }
+            // "The maximum number of entries for the prefix list" (`$MaxEntries`). The model
+            // declares no `@range` on the member, so the handler is the only place a list
+            // that could hold no entry at all is refused — the same floor the create holds.
+            if max_entries < state::MIN_PREFIX_LIST_MAX_ENTRIES {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{max_entries}' for maxEntries. It must be at least {min}",
+                    min = state::MIN_PREFIX_LIST_MAX_ENTRIES,
+                )));
+            }
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the caller
+        // signed for is the Region whose PUBLISHED prefix lists it can see beside its own, and
+        // one of those is a list this operation cannot revise.
+        let region = state::request_region(ctx.parts());
+
+        // The version store's record ceiling, asked BEFORE the main store is taken so the two
+        // locks are never held at once: a revision retains the entry set it replaces, and
+        // nothing reclaims one, so the store that keeps them has a ceiling like every other
+        // store of this crate and a revision past it is refused with the quota code.
+        if revises_entries {
+            let versions = require_prefix_list_versions(&*self.engine)?;
+            let full = !versions.lock().has_capacity();
+            if full {
+                return Err(state::prefix_list_limit_exceeded(format!(
+                    "This emulator holds {max} superseded prefix list versions, which is as \
+                     many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                )));
+            }
+        }
+
+        // The whole revision — what it is refused for, and the write itself — happens under
+        // ONE hold of the main store, so what the request was validated against is what it
+        // writes. The entry set it supersedes comes back out to be kept, after the lock has
+        // been let go of.
+        let (superseded, prefix_list) = {
+            let state_handle = state::require_service_state(&*self.engine)?;
+            let mut store = state_handle.lock();
+            // The clock-owed move a stored list may already be due: a list an earlier call
+            // answered `create-in-progress` or `modify-in-progress` is settled once its due
+            // instant has passed, whether or not anybody called — so applying it here is what
+            // keeps this revision from being refused for a state the list has already left.
+            store.materialize_due_transitions();
+
+            let record = match store.managed_prefix_lists.get(&input.prefix_list_id) {
+                Some(record) => record,
+                None => {
+                    // A list the REGION publishes for one of its services is visible to this
+                    // caller but is not the account's to revise: "the ID of the owner of the
+                    // prefix list" (`ManagedPrefixList$OwnerId`) is Amazon Web Services
+                    // itself, and nothing adds or withdraws an entry of one. That is a
+                    // refusal about the resource rather than about the id, so it is
+                    // `UnsupportedOperation` and not the not-found every unresolvable id
+                    // earns.
+                    if state::service_prefix_lists_in_region(&region)
+                        .iter()
+                        .any(|published| published.prefix_list_id == input.prefix_list_id)
+                    {
+                        return Err(state::unsupported_operation(format!(
+                            "The prefix list '{prefix_list_id}' is an Amazon Web Services-managed \
+                             prefix list, which cannot be modified",
+                            prefix_list_id = input.prefix_list_id,
+                        )));
+                    }
+                    return Err(prefix_list_not_found(&input.prefix_list_id));
+                }
+            };
+
+            // A list whose creation or whose last revision is still owed to the clock has no
+            // settled entry set for this one to start from, so it is refused with the state it
+            // is in — EC2's `IncorrectState`, worded the way every refusal of this crate that
+            // turns solely on a resource's state is.
+            let current_state = record.view.state.clone().unwrap_or_default();
+            if !PREFIX_LIST_STATES_ADMITTING_A_REVISION.contains(&current_state.as_str()) {
+                return Err(state::incorrect_state_of(
+                    "Prefix list",
+                    &input.prefix_list_id,
+                    &current_state,
+                ));
+            }
+
+            // "The current version of the prefix list" (`$CurrentVersion`): "if you specify a
+            // current version number that does not match the true current version number, the
+            // request fails" — the caller's way of revising the version it last read and
+            // nothing later, so a mismatch is refused rather than applied to a version it has
+            // not seen. A request naming none revises whatever version the list stands at.
+            // EC2's model declares no error for this operation, so the code is this service's
+            // choice: the version is part of the list's state, and `IncorrectState` is what EC2
+            // answers when the resource a request names is not in the state it needs — the same
+            // code this crate's other refusals that turn on a resource's state answer.
+            let current_version = record
+                .view
+                .version
+                .unwrap_or(state::FIRST_PREFIX_LIST_VERSION);
+            if let Some(named) = input
+                .current_version
+                .filter(|named| *named != current_version)
+            {
+                return Err(state::incorrect_state(format!(
+                    "The prefix list '{prefix_list_id}' is at version {current_version}, \
+                     not the version {named} the request names",
+                    prefix_list_id = input.prefix_list_id,
+                )));
+            }
+
+            // "When a prefix list becomes IPAM managed, its CIDRs are automatically
+            // synchronized based on the IPAM prefix list resolver's CIDR selection rules, and
+            // direct CIDR modifications are restricted"
+            // (`ManagedPrefixList$IpamPrefixListResolverTargetId`): the resolver owns the
+            // entry set of such a list, so a request that would write it directly is refused.
+            let resolver_target_id = record.view.ipam_prefix_list_resolver_target_id.clone();
+            if revises_entries {
+                if let Some(target_id) = resolver_target_id.as_deref() {
+                    return Err(state::unsupported_operation(format!(
+                        "The prefix list '{prefix_list_id}' is managed by IPAM prefix list \
+                         resolver target '{target_id}', so its entries cannot be modified \
+                         directly",
+                        prefix_list_id = input.prefix_list_id,
+                    )));
+                }
+            }
+            // "Indicates whether synchronization with an IPAM prefix list resolver should be
+            // enabled for this managed prefix list. When enabled, the prefix list CIDRs are
+            // automatically updated based on the associated resolver's CIDR selection rules"
+            // (`$IpamPrefixListResolverSyncEnabled`): the synchronization is with the
+            // ASSOCIATED resolver, so the flag is a modification only a list that has one can
+            // take — on a list with no resolver target it would report a synchronization with
+            // nothing.
+            if let Some(sync_enabled) = input.ipam_prefix_list_resolver_sync_enabled {
+                if resolver_target_id.is_none() {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Invalid value '{sync_enabled}' for \
+                         ipamPrefixListResolverSyncEnabled. The prefix list \
+                         '{prefix_list_id}' is not associated with an IPAM prefix list \
+                         resolver target",
+                        prefix_list_id = input.prefix_list_id,
+                    )));
+                }
+            }
+
+            // The entry set this revision leaves behind, computed from the one the list HOLDS:
+            // the removals first and the additions after, so a request that names one range in
+            // both replaces that entry rather than being refused for it.
+            let address_family = record.view.address_family.clone().unwrap_or_default();
+            let held_name = record.view.prefix_list_name.clone().unwrap_or_default();
+            let held_max_entries = record.view.max_entries.unwrap_or_default();
+            let mut entries = record.entries.clone();
+            let additions = read_entries(added, &address_family)?;
+            for entry in removed {
+                let canonical = read_entry_block(&entry.cidr, &address_family)?;
+                let before = entries.len();
+                entries.retain(|held| held.cidr.as_deref() != Some(canonical.as_str()));
+                // A range the list does not carry has no entry to remove, so the request is
+                // told that rather than answered as though it had removed one.
+                if entries.len() == before {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({cidr}) for parameter cidr is invalid. The prefix list \
+                         '{prefix_list_id}' carries no entry for that CIDR block.",
+                        cidr = entry.cidr,
+                        prefix_list_id = input.prefix_list_id,
+                    )));
+                }
+            }
+            for addition in additions {
+                // One range is one entry: an addition of a range the revised list already
+                // carries has no defined winner, so it is refused rather than stored twice.
+                if entries
+                    .iter()
+                    .any(|held| held.cidr.as_deref() == addition.cidr.as_deref())
+                {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({cidr}) for parameter cidr is invalid. The prefix list \
+                         '{prefix_list_id}' already carries an entry for that CIDR block.",
+                        cidr = addition.cidr.clone().unwrap_or_default(),
+                        prefix_list_id = input.prefix_list_id,
+                    )));
+                }
+                entries.push(addition);
+            }
+
+            // "The maximum number of entries for the prefix list" is the most the list may
+            // hold, so neither adding entries past it nor lowering it below the entries the
+            // list already holds is applied. The two can never be asked for together (refused
+            // above), so the ceiling asked about is the one this request leaves in place.
+            let max_entries = input.max_entries.unwrap_or(held_max_entries);
+            if entries.len() > usize::try_from(max_entries).unwrap_or(usize::MAX) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The prefix list '{prefix_list_id}' would carry {count} entries, which is \
+                     more than its maximum of {max_entries} entries",
+                    prefix_list_id = input.prefix_list_id,
+                    count = entries.len(),
+                )));
+            }
+
+            // What this revision would retain, counted by the ONE definition of a prefix
+            // list's charge: the entry set it stores, plus the name when it writes one. The
+            // entry set it SUPERSEDES stays charged, because the version store keeps it; the
+            // name it replaces is given back, because nothing keeps that.
+            let charge = state::managed_prefix_list_payload_bytes(
+                input.prefix_list_name.as_deref().unwrap_or_default(),
+                if revises_entries { &entries } else { &[] },
+                &[],
+                None,
+            );
+            let refund = state::managed_prefix_list_payload_bytes(
+                if input.prefix_list_name.is_some() {
+                    held_name.as_str()
+                } else {
+                    ""
+                },
+                &[],
+                &[],
+                None,
+            );
+            if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+                return Err(state::prefix_list_limit_exceeded(format!(
+                    "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                     data, so it cannot store {charge} more",
+                    held = store.stored_bytes(),
+                    max = state::MAX_STORED_BYTES,
+                )));
+            }
+
+            // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+            // the flag asks whether the request WOULD have worked, so one that would have been
+            // refused is refused with that reason instead, and one that would have succeeded
+            // leaves the store untouched. "If you have the required permissions, the error
+            // response is DryRunOperation" (`$DryRun`), and every caller of this emulator
+            // holds them.
+            if input.dry_run == Some(true) {
+                return Err(state::dry_run_operation());
+            }
+
+            store.add_stored_bytes(charge);
+            store.release_stored_bytes(refund);
+            let record = store
+                .managed_prefix_lists
+                .get_mut(&input.prefix_list_id)
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "the prefix list '{prefix_list_id}' this request resolved could not be \
+                         written",
+                        prefix_list_id = input.prefix_list_id,
+                    ))
+                })?;
+            // "Adding or removing entries in a prefix list creates a new version of the prefix
+            // list": the revised entry set belongs to the NEXT version, and the one it
+            // replaced belongs to the version it was the entry set of, which comes back out of
+            // here to be kept.
+            let superseded = if revises_entries {
+                let previous = ::std::mem::replace(&mut record.entries, entries);
+                record.view.version = Some(current_version.saturating_add(1));
+                Some((current_version, previous))
+            } else {
+                None
+            };
+            // "Changing the name of the prefix list does not affect the version": the name,
+            // the maximum size and the synchronization flag are written without touching it.
+            if let Some(prefix_list_name) = input.prefix_list_name.clone() {
+                record.view.prefix_list_name = Some(prefix_list_name);
+            }
+            if let Some(max_entries) = input.max_entries {
+                record.view.max_entries = Some(max_entries);
+            }
+            if let Some(sync_enabled) = input.ipam_prefix_list_resolver_sync_enabled {
+                record.view.ipam_prefix_list_resolver_sync_enabled = Some(sync_enabled);
+            }
+            // The revision is answered in the transient state the model publishes for it, and
+            // the clock — not a later call — owes the list the settled one, so a caller reading
+            // straight after this call still sees `modify-in-progress`.
+            record.view.state = Some(PREFIX_LIST_STATE_MODIFY_IN_PROGRESS.to_string());
+            record.pending = Some(state::ClockTransition::starting_now(
+                PREFIX_LIST_STATE_MODIFY_COMPLETE,
+            ));
+            (superseded, record.view.clone())
+        };
+
+        // The entry set the revision replaced, kept under the version that had it — so
+        // `GetManagedPrefixListEntries` can still be asked for that version and answer ITS
+        // entries. Written after the main store's lock has been let go of: the two stores are
+        // never held at once.
+        if let Some((version, entries)) = superseded {
+            let versions = require_prefix_list_versions(&*self.engine)?;
+            versions
+                .lock()
+                .record(&input.prefix_list_id, version, entries);
+        }
+
+        Ok(ModifyManagedPrefixListOutput {
+            prefix_list: Some(prefix_list),
+        })
     }
 }
