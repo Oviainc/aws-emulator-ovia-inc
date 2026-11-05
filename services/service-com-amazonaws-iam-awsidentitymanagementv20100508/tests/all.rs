@@ -55,6 +55,8 @@ mod composed_condition_context;
 mod conflict_and_certificate_refusal_wording;
 #[path = "all/credential_report_generation.rs"]
 mod credential_report_generation;
+#[path = "all/credential_report_reads.rs"]
+mod credential_report_reads;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
 #[path = "all/delegation_request_acceptance.rs"]

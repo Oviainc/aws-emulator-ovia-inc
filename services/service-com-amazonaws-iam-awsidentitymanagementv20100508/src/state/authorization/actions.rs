@@ -193,6 +193,9 @@ pub const GET_ROLE_TEMPLATE_VERSION: &str = "iam:GetRoleTemplateVersion";
 /// `iam:GenerateCredentialReport`.
 pub const GENERATE_CREDENTIAL_REPORT: &str = "iam:GenerateCredentialReport";
 
+/// `iam:GetCredentialReport`.
+pub const GET_CREDENTIAL_REPORT: &str = "iam:GetCredentialReport";
+
 /// `iam:GenerateOrganizationsAccessReport`.
 pub const GENERATE_ORGANIZATIONS_ACCESS_REPORT: &str = "iam:GenerateOrganizationsAccessReport";
 

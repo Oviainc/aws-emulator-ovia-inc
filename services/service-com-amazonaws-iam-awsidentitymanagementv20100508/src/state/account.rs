@@ -109,6 +109,13 @@ pub struct ServiceLinkedRoleDeletionTask {
 pub struct CredentialReportGeneration {
     /// The instant the generation was asked for, which is what the once-every-four-hours
     /// rate ([`CREDENTIAL_REPORT_REGENERATION_SECONDS`]) is measured from.
+    ///
+    /// It is also the instant the report this generation produces reports as its
+    /// `GeneratedTime`: the report is the snapshot of the account taken when the
+    /// generation was asked for ([`Self::content`]), so the artifact and the instant it
+    /// names are one, and the window the report stays readable for
+    /// ([`CREDENTIAL_REPORT_VALIDITY_SECONDS`]) runs from that same instant — which is
+    /// why it ends exactly where this record stops holding a new generation back.
     pub requested: ::aws_smithy_types::DateTime,
     /// The instant the generation is DUE: until it, a call reports the generation
     /// `INPROGRESS`; from it, the report exists. Stored rather than slept for, so a caller
@@ -125,6 +132,16 @@ pub struct CredentialReportGeneration {
     /// answered `COMPLETE` for the rest of it, so the completion cannot be the window's
     /// standing answer.
     pub reported_complete: bool,
+    /// The report this generation produces: the `text/csv` artifact
+    /// `GetCredentialReport$Content` carries, rendered from the account's credentials by
+    /// the call that STARTED the generation
+    /// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::credential_report_csv`]).
+    ///
+    /// Held here, rather than rendered per read, because a report is a SNAPSHOT: it is
+    /// made once, and from the instant it is due every read of it answers the same bytes
+    /// and the same [`Self::requested`] as its `GeneratedTime` — so reading one changes
+    /// nothing a later caller sees, and two reads cannot disagree about one report.
+    pub content: String,
 }
 
 /// One persisted server certificate: the metadata every operation reports about it,
@@ -837,7 +854,11 @@ fn ambient_user() -> User {
 /// process. A FIXED instant keeps it stable, and the epoch is the value this repository
 /// already gives a record nothing created — the same choice
 /// [`SERVICE_PROVISIONED_ROLE_CREATE_MILLIS`] states for a service-linked role.
-const ACCOUNT_BOOTSTRAP_CREATE_MILLIS: i64 = 0;
+///
+/// Shared with [`super::credential_report`], which reports the account's root user: that
+/// user is the account itself, which nothing here created either, so its reported creation
+/// instant is this same one rather than a second fixed instant beside it.
+pub(crate) const ACCOUNT_BOOTSTRAP_CREATE_MILLIS: i64 = 0;
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Mint the next user's `UserId`.

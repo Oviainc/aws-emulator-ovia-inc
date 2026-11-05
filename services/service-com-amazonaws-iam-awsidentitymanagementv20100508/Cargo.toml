@@ -48,6 +48,9 @@ data-encoding = "2"
 # Hashes a console password into the salted verifier the account holds in place of it, so
 # `ChangePassword` can check the caller's current password without the password being kept.
 sha2 = { workspace = true }
+# Writes the account's credential report as the `text/csv` artifact `GetCredentialReport`
+# serves, so the quoting of a cell is RFC 4180's and not hand-rolled.
+csv = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -35,3 +35,9 @@ handler returns an error, so it never has to construct a value.
 wires the operation in from that file's `//! @op GenerateCredentialReport` header like any
 other. The decline line above records only that the GENERATOR did not emit it, so the
 operation is no longer modeled-but-unwired.
+
+`GetCredentialReport` — the READ of that same feature — is hand-authored the same way, in
+`src/ops/get_credential_report.rs` with its shapes in
+`src/ops/types/get_credential_report_types.rs`, and is wired in from its own
+`//! @op GetCredentialReport` header. Its decline line above likewise records only that the
+generator did not emit it.

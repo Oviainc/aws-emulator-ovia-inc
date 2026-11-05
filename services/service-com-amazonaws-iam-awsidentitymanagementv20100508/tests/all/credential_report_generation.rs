@@ -46,7 +46,10 @@ const COMPLETE: &str = "COMPLETE";
 /// One `GenerateCredentialReport` call, presented as signed by `akid` when a row names
 /// one. The operation takes no input, so the call carries no form parameter beyond the
 /// action.
-async fn generate(router: &MultiServiceRouter, akid: Option<&str>) -> (u16, String) {
+///
+/// `pub(crate)` because the suite about READING the report
+/// (`tests/all/credential_report_reads.rs`) starts its generations through this same call.
+pub(crate) async fn generate(router: &MultiServiceRouter, akid: Option<&str>) -> (u16, String) {
     call_signed_by(router, akid, "GenerateCredentialReport", &[]).await
 }
 
@@ -54,7 +57,10 @@ async fn generate(router: &MultiServiceRouter, akid: Option<&str>) -> (u16, Stri
 /// row can stand the clock where it needs it without sleeping: the record holds the
 /// instant the generation was asked for and the instant it is due, and every state a call
 /// reports is read off those two.
-fn rewind(engine: &engine::InMemoryEngine, seconds: i64) {
+///
+/// `pub(crate)` because the suite about READING the report stands the clock the same way:
+/// one rewind, so the two suites cannot disagree about where the clock is.
+pub(crate) fn rewind(engine: &engine::InMemoryEngine, seconds: i64) {
     let store = state::service_state(engine).expect("the IAM store");
     let mut held = store.lock();
     let generation = held

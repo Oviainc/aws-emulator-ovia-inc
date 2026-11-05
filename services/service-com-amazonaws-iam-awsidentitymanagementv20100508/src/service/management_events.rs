@@ -27,6 +27,7 @@
 //! drops it, because event history is the record of the calls an account's APIs actually
 //! served.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
@@ -226,6 +227,86 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ManagementEventLog>)
 }
 
+/// The suffix CloudTrail's `eventSource` carries after the service's own namespace: a
+/// record names the service that served a call as `<endpoint-prefix>.amazonaws.com`
+/// ([`ServedApiCall::event_source`]), while the namespace a reader of a key's usage reports
+/// is that service's name alone (`iam`).
+const EVENT_SOURCE_SUFFIX: &str = ".amazonaws.com";
+
+/// The service namespace `event_source` names — the `<prefix>` of its
+/// `<prefix>.amazonaws.com` form, and the whole value for a source not in that form, since
+/// no namespace is invented for one here.
+fn service_namespace(event_source: &str) -> &str {
+    event_source
+        .strip_suffix(EVENT_SOURCE_SUFFIX)
+        .unwrap_or(event_source)
+}
+
+/// One recorded USE of an access key: when the call was served, by which service, in which
+/// Region.
+///
+/// What `GetAccessKeyLastUsed` reports about one key and what a credential report's usage
+/// columns carry for every key, so the shape of that fact is declared once here beside the
+/// log it is read off.
+#[derive(Debug, Clone)]
+pub struct AccessKeyUse {
+    /// The instant the call was served, as the record stamped it.
+    pub at: ::std::time::SystemTime,
+    /// The service namespace the call was made to ([`service_namespace`]).
+    pub service_name: String,
+    /// The Region the call was served in, as the record carries it.
+    pub region: String,
+}
+
+/// The most recent recorded use of EVERY access key the account's calls were signed with,
+/// keyed by access key id.
+///
+/// `None` for a log this process cannot reach at all, which says nothing about any key
+/// either way and is a server failure rather than an answer about usage; a key the log was
+/// READ and holds no call for is simply absent from the map — it has not been used.
+///
+/// "Most recent" is by the instant the record was stamped with, with the log's own ordinal
+/// breaking a tie between two calls served in the same millisecond — so the use reported is
+/// the latest one whatever order the records were written in. That is why the whole log is
+/// walked rather than scanned backwards to the first match: the log's order is the order
+/// calls were RECORDED, which a recorder stamping an instant of its own (a call it served
+/// earlier, replayed state) need not have in the order of their instants, and the rule is
+/// about the instants.
+///
+/// ONE reading of that rule, for the two readers of it: the operation that reports one
+/// key's last use and the credential report that carries every key's. A READ of the shared
+/// log: nothing is written.
+pub fn last_use_by_access_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<BTreeMap<String, AccessKeyUse>> {
+    let log = management_event_log(engine)?;
+    let held = log.lock();
+    let mut latest: BTreeMap<String, (::std::time::SystemTime, u64)> = BTreeMap::new();
+    let mut uses: BTreeMap<String, AccessKeyUse> = BTreeMap::new();
+    for event in held.iter() {
+        let Some(access_key_id) = event.call.access_key_id.as_deref() else {
+            continue;
+        };
+        let stamp = (event.event_time, event.seq);
+        if latest
+            .get(access_key_id)
+            .is_some_and(|held| *held >= stamp)
+        {
+            continue;
+        }
+        latest.insert(access_key_id.to_string(), stamp);
+        uses.insert(
+            access_key_id.to_string(),
+            AccessKeyUse {
+                at: event.event_time,
+                service_name: service_namespace(&event.call.event_source).to_string(),
+                region: event.call.aws_region.clone(),
+            },
+        );
+    }
+    Some(uses)
+}
+
 /// The account's SESSION directory in that same shared engine: the sessions STS minted,
 /// each keyed by the access key id it was minted under, which is what lets a record of a
 /// call made with one name the session it was made by.
@@ -357,6 +438,7 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         get_account_properties::GetAccountProperties => reports,
         get_context_keys_for_custom_policy::GetContextKeysForCustomPolicy => reports,
         get_context_keys_for_principal_policy::GetContextKeysForPrincipalPolicy => reports,
+        get_credential_report::GetCredentialReport => reports,
         get_delegation_request::GetDelegationRequest => reports,
         get_group::GetGroup => reports,
         get_group_policy::GetGroupPolicy => reports,

@@ -91,63 +91,11 @@ use super::types::*;
 /// (`smithy_query(query="doc",shape="AccessKeyLastUsed",member="ServiceName")`).
 const NEVER_USED: &str = "N/A";
 
-/// The suffix CloudTrail's `eventSource` carries after the service's own namespace: a
-/// record names the service that served a call as `<endpoint-prefix>.amazonaws.com`
-/// (`service_common::management_events::ServedApiCall::event_source`), while
-/// `AccessKeyLastUsed$ServiceName` names that service by the namespace alone (`iam`).
-const EVENT_SOURCE_SUFFIX: &str = ".amazonaws.com";
-
-/// The service namespace `event_source` names — the `<prefix>` of its
-/// `<prefix>.amazonaws.com` form, and the whole value for a source not in that form,
-/// since no namespace is invented for one here.
-fn service_namespace(event_source: &str) -> &str {
-    event_source
-        .strip_suffix(EVENT_SOURCE_SUFFIX)
-        .unwrap_or(event_source)
-}
-
-/// One recorded USE of an access key: when the call was served, by which service, in
-/// which Region.
-struct RecordedUse {
-    /// The instant the call was served, as the record stamped it.
-    at: ::std::time::SystemTime,
-    /// The service namespace the call was made to ([`service_namespace`]).
-    service_name: String,
-    /// The Region the call was served in, as the record carries it.
-    region: String,
-}
-
-/// What the account's record of its calls says about `access_key_id`: `Some(Some(use))`
-/// for the most recent call recorded as signed with it, `Some(None)` for a log that was
-/// READ and holds no such call — the key has not been used — and `None` for a log this
-/// process cannot reach at all, which says nothing about the key either way and is a
-/// server failure rather than an answer about usage.
-///
-/// "Most recent" is by the instant the record was stamped with, with the log's own
-/// ordinal breaking a tie between two calls served in the same millisecond — so the use
-/// reported is the latest one whatever order the records were written in. That is why the
-/// whole log is walked rather than scanned backwards to the first match: the log's order
-/// is the order calls were RECORDED, which a recorder stamping an instant of its own
-/// (a call it served earlier, replayed state) need not have in the order of their
-/// instants, and the rule is about the instants. A READ of the shared log: nothing is
-/// written.
-fn last_recorded_use<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
-    engine: &Eng,
-    access_key_id: &str,
-) -> Option<Option<RecordedUse>> {
-    let log = crate::service::management_events::management_event_log(engine)?;
-    let held = log.lock();
-    let used = held
-        .iter()
-        .filter(|event| event.call.access_key_id.as_deref() == Some(access_key_id))
-        .max_by_key(|event| (event.event_time, event.seq))
-        .map(|event| RecordedUse {
-            at: event.event_time,
-            service_name: service_namespace(&event.call.event_source).to_string(),
-            region: event.call.aws_region.clone(),
-        });
-    Some(used)
-}
+// What the account recorded about a key being used — the shape of that fact, and the one
+// reading of "the most recent recorded use" — lives beside the log it is read off
+// (`crate::service::management_events::last_use_by_access_key`), because a credential
+// report carries the same fact for every key of the account and the two readers must not
+// answer differently.
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -302,7 +250,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // as a key nothing was recorded against, and must not be answered as one: it is
         // reported as the modelled server failure, exactly as an unreachable IAM store
         // is above.
-        let Some(recorded) = last_recorded_use(&*self.engine, &input.access_key_id) else {
+        let Some(recorded) = crate::service::management_events::last_use_by_access_key(&*self.engine)
+        else {
             return Err(GetAccessKeyLastUsedErrorModeled::ServiceFailureException(
                 ServiceFailureException {
                     message: Some("the account's management event log is unavailable".to_string()),
@@ -310,11 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let (last_used_date, service_name, region) = match recorded {
+        let (last_used_date, service_name, region) = match recorded.get(&input.access_key_id) {
             Some(used) => (
                 Some(::aws_smithy_types::DateTime::from(used.at)),
-                used.service_name,
-                used.region,
+                used.service_name.clone(),
+                used.region.clone(),
             ),
             // "This field is null" when "an access key exists but has not been used",
             // and the two required members carry `N/A` for that same case.

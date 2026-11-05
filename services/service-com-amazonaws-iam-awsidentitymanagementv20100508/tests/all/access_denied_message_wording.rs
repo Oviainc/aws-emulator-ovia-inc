@@ -273,6 +273,30 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             reason: no_allow("iam:PutAccountProperties"),
             details: true,
         },
+        // The two halves of the account's credential report: both are decided on the
+        // account-wide resource, like the account property above, and both are refused with
+        // the pointer — the read as well as the write, so nothing about the direction of the
+        // call selects the wording.
+        Case {
+            case: "implicit deny generating the account's credential report",
+            policies: Vec::new(),
+            action: "GenerateCredentialReport",
+            params: Vec::new(),
+            iam_action: "iam:GenerateCredentialReport",
+            named_as: "*".to_string(),
+            reason: no_allow("iam:GenerateCredentialReport"),
+            details: true,
+        },
+        Case {
+            case: "implicit deny reading the account's credential report",
+            policies: Vec::new(),
+            action: "GetCredentialReport",
+            params: Vec::new(),
+            iam_action: "iam:GetCredentialReport",
+            named_as: "*".to_string(),
+            reason: no_allow("iam:GetCredentialReport"),
+            details: true,
+        },
         // A caller holding a document that grants something ELSE: the same withholding,
         // reached with a document in force rather than none. Which wording the refusal
         // takes is the action's, so these two rows differ from their no-document twins

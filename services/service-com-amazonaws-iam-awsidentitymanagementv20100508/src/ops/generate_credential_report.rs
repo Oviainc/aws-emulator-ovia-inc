@@ -30,7 +30,9 @@
 //!   calls again straight away still sees the generation in flight;
 //! * a generation that has become due and whose completion no call has reported yet: the
 //!   call reports it [`STATE_COMPLETE`], which is the transition the CLOCK already made
-//!   due being materialised rather than new work;
+//!   due being materialised rather than new work — while the report it produced is still
+//!   readable ([`crate::state::CREDENTIAL_REPORT_VALIDITY_SECONDS`]), since a completion
+//!   the account can no longer read is not what a caller asking for a report needs;
 //! * a report the account already has, asked for again before the published rate allows a
 //!   new one ("you can generate a credential report as often as once every four hours",
 //!   [`crate::state::CREDENTIAL_REPORT_REGENERATION_SECONDS`]): refused with the modelled
@@ -38,6 +40,12 @@
 //!   describes the limit exceeded ([`crate::state::credential_report_rate_exceeded`]);
 //! * from the end of that window: a new generation is started, so the account can get a
 //!   fresh report, and the call reports it [`STATE_STARTED`] again.
+//!
+//! A call that STARTS a generation is also what renders the report that generation
+//! produces ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::credential_report_csv`]):
+//! a credential report is a snapshot of the account's credentials, so it is made once and
+//! kept on the record, and `GetCredentialReport` serves those same bytes from the instant
+//! the generation is due until the report's window ends.
 //!
 //! A caller whose identity-based policies do not permit the call is refused before
 //! anything is recorded, `403` `<Code>AccessDenied</Code>`
@@ -196,6 +204,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // What the account recorded about each of its access keys being used, read BEFORE
+        // the store is locked, because it lives in another store — the account's event
+        // history — and the report this call may render carries it. A record of the
+        // account's calls this process cannot reach is not the same fact as a key nothing
+        // was recorded against, so it is reported as the modelled server failure, exactly
+        // as an unreachable IAM store is above.
+        let Some(key_uses) = crate::service::management_events::last_use_by_access_key(&*self.engine)
+        else {
+            return Err(GenerateCredentialReportErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the account's management event log is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
         // A mutation: the operation generates the account's credential report, so the
         // lock is held for write across the decision and the write — two calls cannot
         // both start a generation for one account.
@@ -227,7 +251,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A generation the clock has made due whose completion nothing has reported
             // yet: the transition is materialised here and reported once, because from
             // now on the account HAS that report.
-            Some(held) if !held.reported_complete => {
+            //
+            // Only while that report is still readable, though: a generation whose report
+            // has already passed its validity window is not news a caller can act on —
+            // `GetCredentialReport` refuses such a report `ReportExpired` — so the call
+            // falls through to the arms below, which start the new generation the account
+            // now needs.
+            Some(held)
+                if !held.reported_complete
+                    && now.secs()
+                        < held.requested.secs()
+                            + crate::state::CREDENTIAL_REPORT_VALIDITY_SECONDS =>
+            {
                 held.reported_complete = true;
                 (STATE_COMPLETE, DESCRIPTION_COMPLETE)
             }
@@ -253,17 +288,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Either the account has never asked for a report, or the rate now allows a
             // new one: a generation is started, due after the span this emulator gives
-            // one. Which of the two it was decides the description: the sentence the
+            // one, and the REPORT itself is rendered here — a credential report is a
+            // snapshot of the account's credentials, so it is made once, by the call that
+            // starts the generation, and every later read of it answers those same bytes
+            // ([`crate::state::CredentialReportGeneration::content`]).
+            //
+            // Which of the two cases it was decides the description: the sentence the
             // recorded first call carries states that no report exists, which is true only
             // of an account that has never had one.
             _ => {
                 let first = store.credential_report.is_none();
+                // A report that could not be written is no report: nothing is started and
+                // the call reports the modelled server failure, rather than recording a
+                // generation whose read would hand a client a file it cannot tell from the
+                // report of an account holding nothing.
+                let Some(content) = store.credential_report_csv(&key_uses) else {
+                    return Err(GenerateCredentialReportErrorModeled::ServiceFailureException(
+                        ServiceFailureException {
+                            message: Some(
+                                "the account's credential report could not be generated"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
                 store.credential_report = Some(crate::state::CredentialReportGeneration {
                     requested: now,
                     completes: ::aws_smithy_types::DateTime::from_secs(
                         now.secs() + crate::state::CREDENTIAL_REPORT_GENERATION_SECONDS,
                     ),
                     reported_complete: false,
+                    content,
                 });
                 (
                     STATE_STARTED,

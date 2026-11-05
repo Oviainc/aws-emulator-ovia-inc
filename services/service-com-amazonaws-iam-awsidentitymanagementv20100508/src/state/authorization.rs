@@ -615,6 +615,8 @@ pub fn authorize_written(
 /// call with, where it carries the pointer.
 /// `tests/all/access_denied_message_wording.rs` is the table that reads both wordings back.
 const NAMES_AUTHORIZATION_DETAILS: &[&str] = &[
+    GENERATE_CREDENTIAL_REPORT,
+    GET_CREDENTIAL_REPORT,
     GET_USER,
     LIST_ACCESS_KEYS,
     LIST_OPEN_ID_CONNECT_PROVIDERS,

@@ -78,6 +78,7 @@ pub mod get_account_authorization_details_types;
 pub mod get_account_properties_types;
 pub mod get_context_keys_for_custom_policy_types;
 pub mod get_context_keys_for_principal_policy_types;
+pub mod get_credential_report_types;
 pub mod get_delegation_request_types;
 pub mod get_group_policy_types;
 pub mod get_group_types;
@@ -317,6 +318,8 @@ pub use get_account_properties_types::*;
 pub use get_context_keys_for_custom_policy_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_context_keys_for_principal_policy_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_credential_report_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_delegation_request_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

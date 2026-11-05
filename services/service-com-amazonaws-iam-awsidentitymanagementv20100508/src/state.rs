@@ -21,11 +21,13 @@ use crate::ops::types::{
 
 pub mod account;
 pub mod authorization;
+pub mod credential_report;
 pub mod reported_services;
 pub mod role_templates;
 pub mod virtual_mfa_devices;
 
 pub use account::*;
+pub use credential_report::*;
 pub use reported_services::*;
 pub use role_templates::*;
 pub use virtual_mfa_devices::*;
