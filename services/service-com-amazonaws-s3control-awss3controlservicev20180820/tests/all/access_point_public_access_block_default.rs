@@ -30,7 +30,7 @@
 //! readers a client's request meets.
 
 use crate::access_point_lifecycle::{
-    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
+    call_in_region, xml_escape, Emulator, Reply, ACCOUNT, NO_CONTENT, OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 /// The four settings of `PublicAccessBlockConfiguration`, in the order the shape
@@ -463,8 +463,9 @@ async fn a_public_policy_is_refused_exactly_where_block_public_policy_is_in_forc
                 )
                 .await;
             assert_eq!(
-                put.status, 200,
-                "case {source:?}: expected PutPublicAccessBlock to answer 200, got {} with body {}",
+                put.status, NO_CONTENT,
+                "case {source:?}: expected PutPublicAccessBlock to answer {NO_CONTENT}, got {} \
+                 with body {}",
                 put.status, put.body
             );
         }
@@ -511,7 +512,7 @@ async fn a_public_policy_is_refused_exactly_where_block_public_policy_is_in_forc
                 );
             } else {
                 assert_eq!(
-                    put.status, 200,
+                    put.status, NO_CONTENT,
                     "case {source:?}/{:?}: expected the document stored, got {} with body {}",
                     policy.case, put.status, put.body
                 );
@@ -566,7 +567,7 @@ async fn policy_status_reports_whether_the_stored_policy_grants_public_access() 
             put_policy(&emulator, ACCOUNT, &name, policy.document)
                 .await
                 .status,
-            200,
+            NO_CONTENT,
             "case {:?}: expected the document stored",
             policy.case
         );

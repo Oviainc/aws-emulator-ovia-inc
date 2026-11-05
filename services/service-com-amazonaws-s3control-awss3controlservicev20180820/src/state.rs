@@ -360,14 +360,23 @@ pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 /// maximum of 50 tags."
 pub const MAX_STORAGE_LENS_TAGS: usize = 50;
 
-/// The status an operation of the S3 Storage Lens configuration surface whose
-/// response carries NO document answers a success with: `204 No Content`.
+/// The status an operation of this service whose response carries NO document
+/// answers a success with: `204 No Content`.
 ///
-/// The model's `http.code` for each of them is 200, which is stale for a member
-/// that carries no body — the wire answers No Content, which is what a client
-/// distinguishing the two reads "there is no document to parse" from. The
-/// operations that DO report a document (the configuration and its tag set)
-/// keep the modelled 200, because they answer one.
+/// This holds for every member whose modelled output is `smithy.api#Unit`: the
+/// model declares no response shape at all for it, so a success has nothing to
+/// put in a body, and the wire answers No Content. The model's `http.code` for
+/// most of them is the Smithy default of 200, which is stale for a member that
+/// carries no body — and the model itself codes the same empty-body answer 204
+/// where it states a code (`CreateStorageLensGroup`,
+/// `DeleteBucketTagging`, `DeleteStorageLensGroup`, `UpdateStorageLensGroup`,
+/// `TagResource`, `UntagResource`). A 200 there promises a document the
+/// response does not carry, so a client that distinguishes the two — one that
+/// parses a body only when there is one, or that asserts the status it was
+/// told — takes the wrong branch.
+///
+/// The operations that DO report a document keep the modelled 200, because they
+/// answer one.
 pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
 
 /// How many entries one page of `ListStorageLensConfigurations` carries.

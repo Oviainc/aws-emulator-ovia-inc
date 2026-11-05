@@ -98,6 +98,18 @@ pub(crate) const OTHER_ACCOUNT: &str = "210987654321";
 /// The XML namespace this service's model declares.
 pub(crate) const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 
+/// The status this service answers a success that carries NO document with, as
+/// the service states it
+/// ([`::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS`]).
+///
+/// Every operation whose modelled output is `smithy.api#Unit` answers one: the
+/// deletes, and the puts that report nothing back.
+///
+/// `pub(crate)` because every suite in `tests/all/` that drives such a call
+/// asserts the same status rather than each spelling a number.
+pub(crate) const NO_CONTENT: u16 =
+    ::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS;
+
 /// The answer S3 Control gives a request addressed in an account the caller
 /// holds no credentials for: the account a request names says whose control
 /// plane it is for, and it is authorized ahead of the resource the request
@@ -685,8 +697,9 @@ async fn a_policy_round_trips_byte_for_byte_and_the_last_put_wins() {
     for (label, policy) in policies {
         let put = emulator.put_policy(ACCOUNT, case.name, policy).await;
         assert_eq!(
-            put.status, 200,
-            "case {label:?}: expected PutAccessPointPolicy to answer 200, got {} with body {}",
+            put.status, NO_CONTENT,
+            "case {label:?}: expected PutAccessPointPolicy to answer {NO_CONTENT}, got {} with \
+             body {}",
             put.status, put.body
         );
 
@@ -912,15 +925,15 @@ async fn delete_removes_the_access_point_and_its_policy() {
                 .put_policy(ACCOUNT, case.name, r#"{"Version":"2012-10-17","Statement":[]}"#)
                 .await
                 .status,
-            200,
+            NO_CONTENT,
             "case {:?}: expected the policy put to succeed",
             case.case
         );
 
         let deleted = emulator.delete(ACCOUNT, case.name).await;
         assert_eq!(
-            deleted.status, 200,
-            "case {:?}: expected DeleteAccessPoint to answer 200, got {} with body {}",
+            deleted.status, NO_CONTENT,
+            "case {:?}: expected DeleteAccessPoint to answer {NO_CONTENT}, got {} with body {}",
             case.case, deleted.status, deleted.body
         );
 
@@ -1150,7 +1163,7 @@ async fn the_retained_policy_document_is_bounded() {
         let policy = policy_of_length(bytes);
         let put = emulator.put_policy(ACCOUNT, case.name, &policy).await;
         assert_eq!(
-            put.status, 200,
+            put.status, NO_CONTENT,
             "case {bytes} bytes: expected a document within the bound to be stored, got {} with body {}",
             put.status, put.body
         );
@@ -1229,7 +1242,10 @@ async fn the_number_of_stored_access_points_is_bounded_and_a_delete_releases_the
     );
 
     // Deleting a record releases the bound, so the store cannot wedge.
-    assert_eq!(emulator.delete(ACCOUNT, "bulk-ap-0").await.status, 200);
+    assert_eq!(
+        emulator.delete(ACCOUNT, "bulk-ap-0").await.status,
+        NO_CONTENT
+    );
     let after = emulator
         .create(ACCOUNT, &CreateCase::new("after a delete", "over-the-bound-ap", "bulk"))
         .await;

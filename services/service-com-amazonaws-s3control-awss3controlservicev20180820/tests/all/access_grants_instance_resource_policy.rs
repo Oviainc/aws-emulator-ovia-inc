@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 use crate::access_grants_data_plane::create_instance;
 use crate::access_point_lifecycle::{
     assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
-    OTHER_ACCOUNT, REGION, XMLNS,
+    NO_CONTENT, OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 /// A second signing Region, used to pin that a policy belongs to the instance of
@@ -503,8 +503,8 @@ async fn a_deleted_policy_is_gone_and_can_be_put_again() {
 
         let deleted = delete_policy(&emulator, case.account_id, case.region).await;
         assert_eq!(
-            deleted.status, 200,
-            "case {:?}: expected the delete to answer 200, got {} with body {}",
+            deleted.status, NO_CONTENT,
+            "case {:?}: expected the delete to answer {NO_CONTENT}, got {} with body {}",
             case.case, deleted.status, deleted.body
         );
         assert_no_policy(
@@ -517,8 +517,8 @@ async fn a_deleted_policy_is_gone_and_can_be_put_again() {
         // none: the delete asks for a state, not for a record to exist.
         let again = delete_policy(&emulator, case.account_id, case.region).await;
         assert_eq!(
-            again.status, 200,
-            "case {:?}: expected a second delete to answer 200, got {} with body {}",
+            again.status, NO_CONTENT,
+            "case {:?}: expected a second delete to answer {NO_CONTENT}, got {} with body {}",
             case.case, again.status, again.body
         );
 

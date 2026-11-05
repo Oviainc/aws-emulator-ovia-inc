@@ -28,8 +28,8 @@
 //! than copied.
 
 use crate::access_point_lifecycle::{
-    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
-    XMLNS,
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, NO_CONTENT,
+    OTHER_ACCOUNT, REGION, XMLNS,
 };
 use crate::storage_lens_configuration::{leaf, tag, tags_xml};
 use crate::storage_lens_group_update::update_body;
@@ -259,12 +259,12 @@ async fn a_policy_refusal_names_the_access_point_the_request_addressed() {
             if emptied == Emptied::PolicyRemoved {
                 assert_eq!(
                     put_policy(&emulator, ACCOUNT, &name).await.status,
-                    200,
+                    NO_CONTENT,
                     "case {label:?} {emptied:?}: expected the document to be stored"
                 );
                 assert_eq!(
                     delete_policy(&emulator, ACCOUNT, &name).await.status,
-                    200,
+                    NO_CONTENT,
                     "case {label:?} {emptied:?}: expected the document to be removed"
                 );
             }
@@ -323,7 +323,7 @@ async fn a_policy_refusal_names_the_access_point_asked_about_not_another_one() {
     }
     assert_eq!(
         put_policy(&emulator, ACCOUNT, holds_a_policy).await.status,
-        200,
+        NO_CONTENT,
         "expected the document to be stored"
     );
 
@@ -403,7 +403,7 @@ async fn the_account_configuration_refusal_names_the_account_the_request_address
     let holder = ACCOUNT;
     assert_eq!(
         put_public_access_block(&emulator, holder).await.status,
-        200,
+        NO_CONTENT,
         "expected the configuration to be stored for {holder}"
     );
     let served = get_public_access_block(&emulator, holder).await;
@@ -434,7 +434,7 @@ async fn the_account_configuration_refusal_names_the_account_the_request_address
     // naming itself.
     assert_eq!(
         delete_public_access_block(&emulator, holder).await.status,
-        200,
+        NO_CONTENT,
         "expected the configuration to be removed for {holder}"
     );
     let after = get_public_access_block(&emulator, holder).await;

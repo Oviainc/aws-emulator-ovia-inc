@@ -26,7 +26,8 @@
 //! readers a client's request meets.
 
 use crate::access_point_lifecycle::{
-    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, XMLNS,
+    assert_foreign_account_refused, xml_escape, Emulator, Reply, ACCOUNT, NO_CONTENT,
+    OTHER_ACCOUNT, XMLNS,
 };
 
 /// One access point this suite removes a policy from, and the document put on
@@ -229,7 +230,7 @@ async fn deleting_the_policy_leaves_the_access_point_carrying_none() {
             put_policy(&emulator, ACCOUNT, case.name, case.policy)
                 .await
                 .status,
-            200,
+            NO_CONTENT,
             "case {:?}: expected the document to be stored before it is removed",
             case.case
         );
@@ -244,8 +245,9 @@ async fn deleting_the_policy_leaves_the_access_point_carrying_none() {
 
         let deleted = delete_policy(&emulator, ACCOUNT, case.name).await;
         assert_eq!(
-            deleted.status, 200,
-            "case {:?}: expected DeleteAccessPointPolicy to answer 200, got {} with body {}",
+            deleted.status, NO_CONTENT,
+            "case {:?}: expected DeleteAccessPointPolicy to answer {NO_CONTENT}, got {} with \
+             body {}",
             case.case, deleted.status, deleted.body
         );
 
@@ -306,7 +308,7 @@ async fn deleting_the_policy_leaves_the_access_point_carrying_none() {
             put_policy(&emulator, ACCOUNT, case.name, ACCOUNT_POLICY)
                 .await
                 .status,
-            200,
+            NO_CONTENT,
             "case {:?}: expected a policy to be storable again after the removal",
             case.case
         );
@@ -348,9 +350,9 @@ async fn deleting_a_policy_is_idempotent_however_many_times_it_is_called() {
         // the removal asks for.
         let on_nothing = delete_policy(&emulator, ACCOUNT, case.name).await;
         assert_eq!(
-            on_nothing.status, 200,
-            "case {calls} calls: expected removing a policy that is not there to answer 200, \
-             got {} with body {}",
+            on_nothing.status, NO_CONTENT,
+            "case {calls} calls: expected removing a policy that is not there to answer \
+             {NO_CONTENT}, got {} with body {}",
             on_nothing.status, on_nothing.body
         );
 
@@ -358,14 +360,15 @@ async fn deleting_a_policy_is_idempotent_however_many_times_it_is_called() {
             put_policy(&emulator, ACCOUNT, case.name, case.policy)
                 .await
                 .status,
-            200,
+            NO_CONTENT,
             "case {calls} calls: expected the document to be stored"
         );
         for call in 1..=calls {
             let deleted = delete_policy(&emulator, ACCOUNT, case.name).await;
             assert_eq!(
-                deleted.status, 200,
-                "case {calls} calls: expected removal {call} to answer 200, got {} with body {}",
+                deleted.status, NO_CONTENT,
+                "case {calls} calls: expected removal {call} to answer {NO_CONTENT}, got {} with \
+                 body {}",
                 deleted.status, deleted.body
             );
             let read = get_policy(&emulator, ACCOUNT, case.name).await;
@@ -390,7 +393,7 @@ async fn deleting_a_policy_refuses_an_access_point_the_account_does_not_own() {
         put_policy(&emulator, ACCOUNT, owned.name, owned.policy)
             .await
             .status,
-        200
+        NO_CONTENT
     );
 
     for (label, account, name) in [
@@ -467,7 +470,7 @@ async fn deleting_a_policy_touches_only_the_named_access_point() {
             put_policy(&emulator, ACCOUNT, case.name, case.policy)
                 .await
                 .status,
-            200,
+            NO_CONTENT,
             "case {:?}: expected the document to be stored",
             case.case
         );
@@ -478,8 +481,8 @@ async fn deleting_a_policy_touches_only_the_named_access_point() {
     for (removed, case) in rows.iter().enumerate() {
         assert_eq!(
             delete_policy(&emulator, ACCOUNT, case.name).await.status,
-            200,
-            "case {:?}: expected DeleteAccessPointPolicy to answer 200",
+            NO_CONTENT,
+            "case {:?}: expected DeleteAccessPointPolicy to answer {NO_CONTENT}",
             case.case
         );
 

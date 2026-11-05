@@ -47,13 +47,10 @@ const OTHER_REGION: &str = "eu-central-1";
 const THIRD_ACCOUNT: &str = "555555555555";
 
 /// The status every Storage Lens configuration call whose response carries no
-/// document answers a success with, as the service states it
-/// ([`::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS`]).
-///
-/// `pub(crate)` because the sibling Storage Lens suites assert the same status
-/// rather than each spelling a number.
-pub(crate) const NO_CONTENT: u16 =
-    ::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS;
+/// document answers a success with — the status this whole service answers an
+/// empty-body success with, re-exported here because the sibling Storage Lens
+/// suites read it from this module.
+pub(crate) use crate::access_point_lifecycle::NO_CONTENT;
 
 /// One leaf element of a document: the `/`-separated path of element names from
 /// the document's root element (exclusive), and the element's text. An empty

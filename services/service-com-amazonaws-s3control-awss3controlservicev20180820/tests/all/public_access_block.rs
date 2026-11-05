@@ -27,6 +27,12 @@ use service_com_amazonaws_s3control_awss3controlservicev20180820::ops::types::Pu
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The status a call of this surface whose response carries no document — the
+// put and the delete, whose modelled output is `smithy.api#Unit` — answers a
+// success with: the service's own constant, read through the shared test
+// harness so every suite asserts the one value.
+use crate::access_point_lifecycle::NO_CONTENT;
+
 /// The region every request in this suite is signed for.
 const REGION: &str = "us-west-2";
 
@@ -241,8 +247,9 @@ async fn put_then_get_round_trips_every_combination_of_the_four_settings() {
     for settings in every_combination() {
         let put = emulator.put(ACCOUNT, settings).await;
         assert_eq!(
-            put.status, 200,
-            "case {settings:?}: expected PutPublicAccessBlock to answer 200, got {} with body {}",
+            put.status, NO_CONTENT,
+            "case {settings:?}: expected PutPublicAccessBlock to answer {NO_CONTENT}, got {} with \
+             body {}",
             put.status, put.body
         );
 
@@ -300,7 +307,7 @@ async fn absence_is_distinct_from_a_configuration_whose_settings_are_all_false()
 
     assert_eq!(
         emulator.put(ACCOUNT, all_false).await.status,
-        200,
+        NO_CONTENT,
         "case {:?}: expected the all-false put to be accepted",
         "all four settings false"
     );
@@ -321,8 +328,8 @@ async fn absence_is_distinct_from_a_configuration_whose_settings_are_all_false()
 
     let delete = emulator.delete(ACCOUNT).await;
     assert_eq!(
-        delete.status, 200,
-        "case {:?}: expected DeletePublicAccessBlock to answer 200, got {} with body {}",
+        delete.status, NO_CONTENT,
+        "case {:?}: expected DeletePublicAccessBlock to answer {NO_CONTENT}, got {} with body {}",
         "delete a stored configuration", delete.status, delete.body
     );
     let after = emulator.get(ACCOUNT).await;
@@ -340,7 +347,7 @@ async fn absence_is_distinct_from_a_configuration_whose_settings_are_all_false()
     // account holding none ends up holding none.
     let repeat = emulator.delete(ACCOUNT).await;
     assert_eq!(
-        repeat.status, 200,
+        repeat.status, NO_CONTENT,
         "case {:?}: expected a repeat delete to succeed, got {} with body {}",
         "repeat delete", repeat.status, repeat.body
     );
@@ -390,7 +397,7 @@ async fn a_setting_the_request_omits_is_stored_and_reported_as_false() {
     for (case, members, settings) in rows {
         let put = emulator.put_body(ACCOUNT, &members).await;
         assert_eq!(
-            put.status, 200,
+            put.status, NO_CONTENT,
             "case {case:?}: expected PutPublicAccessBlock to accept the payload, got {} with \
              body {}",
             put.status, put.body
@@ -417,7 +424,7 @@ async fn a_configuration_call_addressed_in_another_account_is_refused() {
     let mine = [true, false, true, false];
     let theirs = [false, true, false, true];
 
-    assert_eq!(emulator.put(ACCOUNT, mine).await.status, 200);
+    assert_eq!(emulator.put(ACCOUNT, mine).await.status, NO_CONTENT);
 
     // One row per operation of this surface, each addressed in an account the
     // caller holds no credentials for: the answer is the same refusal, before
@@ -461,7 +468,7 @@ async fn a_configuration_call_addressed_in_another_account_is_refused() {
     );
     assert_eq!(
         emulator.delete(ACCOUNT).await.status,
-        200,
+        NO_CONTENT,
         "expected the caller's own delete to still be served"
     );
     let gone = emulator.get(ACCOUNT).await;
@@ -502,7 +509,7 @@ async fn the_store_cannot_be_grown_by_naming_accounts_the_caller_does_not_hold()
     ] {
         let stored = emulator.put(ACCOUNT, settings).await;
         assert_eq!(
-            stored.status, 200,
+            stored.status, NO_CONTENT,
             "case {case:?}: expected the caller's own put to be accepted, got {} with body {}",
             stored.status, stored.body
         );
@@ -561,7 +568,7 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     emulator.hold_configurations_for(quota - 1);
     let stored = emulator.put(ACCOUNT, [true; 4]).await;
     assert_eq!(
-        stored.status, 200,
+        stored.status, NO_CONTENT,
         "expected the put that fills the last slot to be accepted, got {} with body {}",
         stored.status, stored.body
     );
@@ -571,7 +578,7 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     let replaced = emulator.put(ACCOUNT, [false; 4]).await;
     assert_eq!(
         (replaced.status, emulator.get(ACCOUNT).await.settings()),
-        (200, expected([false; 4])),
+        (NO_CONTENT, expected([false; 4])),
         "expected a replace at the bound to be accepted and reported, got {} with body {}",
         replaced.status,
         replaced.body
@@ -581,12 +588,12 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     // that follows is accepted.
     assert_eq!(
         emulator.delete(ACCOUNT).await.status,
-        200,
+        NO_CONTENT,
         "expected the caller's own delete to be served"
     );
     let after_the_delete = emulator.put(ACCOUNT, [true; 4]).await;
     assert_eq!(
-        after_the_delete.status, 200,
+        after_the_delete.status, NO_CONTENT,
         "expected the put after the delete to be accepted, got {} with body {}",
         after_the_delete.status, after_the_delete.body
     );
@@ -594,7 +601,7 @@ async fn the_number_of_stored_configurations_is_bounded_and_a_delete_releases_th
     // With the bound reached by records the caller holds none of, one more would
     // grow the store past it, so it is refused rather than stored — and the
     // refusal names the bound it is about.
-    assert_eq!(emulator.delete(ACCOUNT).await.status, 200);
+    assert_eq!(emulator.delete(ACCOUNT).await.status, NO_CONTENT);
     emulator.hold_configurations_for(quota);
     let refused = emulator.put(ACCOUNT, [true; 4]).await;
     assert_eq!(

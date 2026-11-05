@@ -30,7 +30,8 @@ use crate::access_grants_data_plane::{
 };
 use crate::access_grants_location_update::update_location;
 use crate::access_point_lifecycle::{
-    assert_foreign_account_refused, call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
+    assert_foreign_account_refused, call_in_region, Emulator, Reply, ACCOUNT, NO_CONTENT,
+    OTHER_ACCOUNT, REGION,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -306,8 +307,9 @@ async fn a_location_is_deregistered_only_once_no_grant_references_it() {
 
             let released = delete_grant(&emulator, case.account_id, case.region, grant_id).await;
             assert_eq!(
-                released.status, 200,
-                "case {:?}: expected DeleteAccessGrant to answer 200, got {} with body {}",
+                released.status, NO_CONTENT,
+                "case {:?}: expected DeleteAccessGrant to answer {NO_CONTENT}, got {} with \
+                 body {}",
                 case.case, released.status, released.body
             );
             let gone = get_grant(&emulator, case.account_id, case.region, grant_id).await;
@@ -331,8 +333,9 @@ async fn a_location_is_deregistered_only_once_no_grant_references_it() {
         // modelled success carries no body.
         let deleted = delete_location(&emulator, case.account_id, case.region, &location_id).await;
         assert_eq!(
-            deleted.status, 200,
-            "case {:?}: expected DeleteAccessGrantsLocation to answer 200, got {} with body {}",
+            deleted.status, NO_CONTENT,
+            "case {:?}: expected DeleteAccessGrantsLocation to answer {NO_CONTENT}, got {} with \
+             body {}",
             case.case, deleted.status, deleted.body
         );
         assert!(
@@ -387,14 +390,14 @@ async fn deregistering_one_location_leaves_every_other_registration_and_grant_al
                 delete_grant(&emulator, case.account_id, case.region, grant_id)
                     .await
                     .status,
-                200,
+                NO_CONTENT,
                 "case {:?}: expected the grant to be deletable",
                 case.case
             );
         }
         let deleted = delete_location(&emulator, case.account_id, case.region, location_id).await;
         assert_eq!(
-            deleted.status, 200,
+            deleted.status, NO_CONTENT,
             "case {:?}: expected the emptied location to be deregistered, got {} with body {}",
             case.case, deleted.status, deleted.body
         );
@@ -459,7 +462,7 @@ async fn only_the_grants_on_this_location_hold_its_deregistration_back() {
     // though the instance holds a grant.
     let deleted = delete_location(&emulator, ACCOUNT, REGION, &free_id).await;
     assert_eq!(
-        deleted.status, 200,
+        deleted.status, NO_CONTENT,
         "expected a location no grant references to be deregistered, got {} with body {}",
         deleted.status, deleted.body
     );
@@ -476,12 +479,12 @@ async fn only_the_grants_on_this_location_hold_its_deregistration_back() {
         delete_grant(&emulator, ACCOUNT, REGION, &grant_id)
             .await
             .status,
-        200,
+        NO_CONTENT,
         "expected the grant to be deletable"
     );
     let deleted = delete_location(&emulator, ACCOUNT, REGION, &granted_id).await;
     assert_eq!(
-        deleted.status, 200,
+        deleted.status, NO_CONTENT,
         "expected the location to be deregistered once its grant was deleted, got {} with body {}",
         deleted.status, deleted.body
     );

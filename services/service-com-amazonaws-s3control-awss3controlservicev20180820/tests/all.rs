@@ -49,6 +49,8 @@ mod batch_job_priority;
 mod batch_job_status;
 #[path = "all/batch_job_tagging.rs"]
 mod batch_job_tagging;
+#[path = "all/empty_body_success_status.rs"]
+mod empty_body_success_status;
 #[path = "all/multi_region_access_point_lifecycle.rs"]
 mod multi_region_access_point_lifecycle;
 #[path = "all/multi_region_access_point_route_submit.rs"]

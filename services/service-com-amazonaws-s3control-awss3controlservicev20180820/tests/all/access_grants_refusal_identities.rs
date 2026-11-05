@@ -32,7 +32,7 @@ use crate::access_grants_location_delete::{delete_grant, delete_location};
 use crate::access_grants_location_update::update_location;
 use crate::access_point_lifecycle::{
     assert_foreign_account_refused, call_in_region, xml_escape, Emulator, Reply, ACCOUNT,
-    OTHER_ACCOUNT, REGION, XMLNS,
+    NO_CONTENT, OTHER_ACCOUNT, REGION, XMLNS,
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
@@ -279,7 +279,7 @@ async fn every_grant_refusal_names_the_grant_id_the_request_asked_about() {
         delete_grant(&emulator, ACCOUNT, REGION, &deleted_id)
             .await
             .status,
-        200,
+        NO_CONTENT,
         "expected the grant to be deletable"
     );
 
@@ -346,7 +346,7 @@ async fn every_location_refusal_names_the_location_id_the_request_asked_about() 
         delete_location(&emulator, ACCOUNT, REGION, &released_id)
             .await
             .status,
-        200,
+        NO_CONTENT,
         "expected the location to be deregistered"
     );
     let mut cases = unknown_ids();
@@ -510,7 +510,7 @@ async fn the_referential_integrity_refusal_is_a_bad_request_naming_the_location(
                 delete_grant(&emulator, case.account_id, case.region, grant_id)
                     .await
                     .status,
-                200,
+                NO_CONTENT,
                 "case {:?}: expected the grant to be deletable",
                 case.case
             );
@@ -519,7 +519,7 @@ async fn the_referential_integrity_refusal_is_a_bad_request_naming_the_location(
         // With nothing left referencing it the deregistration goes through.
         let deleted = delete_location(&emulator, case.account_id, case.region, &location_id).await;
         assert_eq!(
-            deleted.status, 200,
+            deleted.status, NO_CONTENT,
             "case {:?}: expected the emptied location to be deregistered, got {} with body {}",
             case.case, deleted.status, deleted.body
         );
@@ -657,9 +657,9 @@ async fn deleting_an_instance_makes_every_later_read_of_it_refuse() {
 
         let deleted = delete_instance(&emulator, account_id, region).await;
         assert_eq!(
-            deleted.status, 204,
-            "case {case:?}: expected DeleteAccessGrantsInstance to answer 204, got {} with \
-             body {}",
+            deleted.status, NO_CONTENT,
+            "case {case:?}: expected DeleteAccessGrantsInstance to answer {NO_CONTENT}, got {} \
+             with body {}",
             deleted.status, deleted.body
         );
         assert!(
@@ -811,7 +811,7 @@ async fn an_instance_that_still_holds_locations_or_grants_is_not_deleted() {
                 delete_grant(&emulator, account_id, region, grant_id)
                     .await
                     .status,
-                200,
+                NO_CONTENT,
                 "case {case:?}: expected the grant to be deletable"
             );
             assert_refused(
@@ -826,7 +826,7 @@ async fn an_instance_that_still_holds_locations_or_grants_is_not_deleted() {
                 delete_location(&emulator, account_id, region, location_id)
                     .await
                     .status,
-                200,
+                NO_CONTENT,
                 "case {case:?}: expected location {location_id:?} to be deregistered"
             );
             if index + 1 < location_ids.len() {
@@ -842,7 +842,7 @@ async fn an_instance_that_still_holds_locations_or_grants_is_not_deleted() {
         // With nothing left in it the instance is deleted, and the read refuses.
         let deleted = delete_instance(&emulator, account_id, region).await;
         assert_eq!(
-            deleted.status, 204,
+            deleted.status, NO_CONTENT,
             "case {case:?}: expected the emptied instance to be deleted, got {} with body {}",
             deleted.status, deleted.body
         );

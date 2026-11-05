@@ -85,10 +85,13 @@ impl PutAccessPointPolicyForObjectLambdaOutput {
         ::aws_smithy_schema::ShapeType::Structure,
         &[],
     )
+    // The status is the 204 No Content this service answers an empty-body
+    // success with ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]); the model's
+    // defaulted 200 is stale for a member that carries no document at all.
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/v20180820/accesspointforobjectlambda/{Name}/policy",
-        Some(200u16),
+        Some(crate::state::NO_CONTENT_SUCCESS_STATUS),
     ));
 }
 
@@ -152,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutAccessPointPolicyForObjectLambda";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_ACCESS_POINT_POLICY_FOR_OBJECT_LAMBDA_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_ACCESS_POINT_POLICY_FOR_OBJECT_LAMBDA_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

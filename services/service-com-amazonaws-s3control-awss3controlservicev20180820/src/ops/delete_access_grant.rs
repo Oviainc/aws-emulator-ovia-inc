@@ -78,10 +78,13 @@ impl DeleteAccessGrantOutput {
         ::aws_smithy_schema::ShapeType::Structure,
         &[],
     )
+    // The status is the 204 No Content this service answers an empty-body
+    // success with ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]); the model's
+    // defaulted 200 is stale for a member that carries no document at all.
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "DELETE",
         "/v20180820/accessgrantsinstance/grant/{AccessGrantId}",
-        Some(200u16),
+        Some(crate::state::NO_CONTENT_SUCCESS_STATUS),
     ));
 }
 
@@ -145,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteAccessGrant";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_ACCESS_GRANT_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_ACCESS_GRANT_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,
