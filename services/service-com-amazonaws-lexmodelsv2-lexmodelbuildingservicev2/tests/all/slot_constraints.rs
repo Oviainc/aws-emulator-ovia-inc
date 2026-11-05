@@ -76,18 +76,26 @@ async fn a_multi_value_slot_is_accepted_only_in_the_locale_the_member_documents(
             .await;
 
         // A slot that does NOT return multiple values is accepted wherever the intent is,
-        // whether the setting is absent or explicitly off.
-        let accepted: [(&str, Value); 2] = [
-            ("the setting absent", json!({ "slotTypeId": "AMAZON.Number" })),
+        // whether the setting is absent or explicitly off. The third column is the member
+        // the response must carry: `None` for the row that names no setting, since a
+        // setting the request did not carry is reported by its absence rather than as an
+        // invented default.
+        let accepted: [(&str, Value, Option<Value>); 2] = [
+            (
+                "the setting absent",
+                json!({ "slotTypeId": "AMAZON.Number" }),
+                None,
+            ),
             (
                 "the setting explicitly off",
                 json!({
                     "slotTypeId": "AMAZON.Number",
                     "multipleValuesSetting": { "allowMultipleValues": false },
                 }),
+                Some(json!({ "allowMultipleValues": false })),
             ),
         ];
-        for (index, (case, extra)) in accepted.iter().enumerate() {
+        for (index, (case, extra, expected)) in accepted.iter().enumerate() {
             let (status, answered) = call(
                 &router,
                 "PUT",
@@ -100,19 +108,11 @@ async fn a_multi_value_slot_is_accepted_only_in_the_locale_the_member_documents(
                 "locale {locale_id} case {case:?}: expected CreateSlot to answer 200, got \
                  {status} {answered:?}"
             );
-            // A setting the request named is reported back; one it did not name is
-            // reported by its absence, never as an invented default.
             assert_eq!(
-                member(&answered, "multipleValuesSetting"),
-                member(extra, "multipleValuesSetting"),
-                "locale {locale_id} case {case:?}: CreateSlot must report the stored setting, \
-                 got {answered:?}"
-            );
-            assert_eq!(
-                answered.get("multipleValuesSetting").is_none(),
-                extra.get("multipleValuesSetting").is_none(),
-                "locale {locale_id} case {case:?}: CreateSlot must omit a setting the request \
-                 did not carry, got {answered:?}"
+                answered.get("multipleValuesSetting"),
+                expected.as_ref(),
+                "locale {locale_id} case {case:?}: expected the response to carry \
+                 {expected:?}, got {answered:?}"
             );
         }
 
