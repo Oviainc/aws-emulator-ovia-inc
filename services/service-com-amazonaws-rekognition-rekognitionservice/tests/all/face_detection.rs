@@ -97,7 +97,7 @@ const CLASSIFIED_MEMBERS: [&str; 12] = [
 // ---------------------------------------------------------------------------
 
 /// A reported `BoundingBox`, as the `(left, top, width, height)` fractions it carries.
-type ReportedBox = (f64, f64, f64, f64);
+pub(crate) type ReportedBox = (f64, f64, f64, f64);
 
 /// One face as the TEST draws it: where its eyes are, how far apart, how far the eye line
 /// is rotated clockwise in the image, and whether its features are drawn at all.
@@ -276,7 +276,7 @@ impl Portrait {
 }
 
 /// Fill the ellipse of radii `rx`/`ry` around `(cx, cy)` with `tone`.
-fn fill_ellipse(image: &mut GrayImage, cx: f32, cy: f32, rx: f32, ry: f32, tone: u8) {
+pub(crate) fn fill_ellipse(image: &mut GrayImage, cx: f32, cy: f32, rx: f32, ry: f32, tone: u8) {
     let (width, height) = (image.width() as i64, image.height() as i64);
     let x_from = ((cx - rx).floor() as i64).max(0);
     let x_to = ((cx + rx).ceil() as i64).min(width - 1);
@@ -1055,7 +1055,7 @@ async fn a_drawn_face_is_found_wherever_it_is_drawn() {
 
 /// The sweep's generator: xorshift64, so every case is enumerated from the pinned seed and a
 /// failure reproduces exactly.
-fn next(state: &mut u64) -> u64 {
+pub(crate) fn next(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;

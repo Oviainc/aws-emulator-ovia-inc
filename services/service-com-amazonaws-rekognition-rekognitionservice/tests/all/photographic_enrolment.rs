@@ -28,14 +28,15 @@
 //! head-and-shoulders portrait, a close crop, a small figure in a wide frame), the tones it
 //! is lit in, and the format it is encoded in.
 
-use std::sync::Arc;
-
-use image::{DynamicImage, GrayImage, ImageFormat, Luma};
+use image::{GrayImage, ImageFormat, Luma};
 use serde_json::{json, Value};
-use service_com_amazonaws_rekognition_rekognitionservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::face_collections::{bytes_image, call, Reply};
+// The emulator harness, the request helpers, the ellipse brush, the encoder, the reported-box
+// shape and the xorshift generator all come from the suites that already own them, so one
+// picture is drawn one way and one router is built one way whichever operation is exercised.
+use crate::face_collections::{bytes_image, call, harness, Reply};
+use crate::face_detection::{encode, fill_ellipse, next, ReportedBox};
 
 /// How far a reported box's side may sit from the drawn head's own, as a ratio: the box the
 /// detector derives from the eye line is not the ellipse the test drew, so it is compared
@@ -44,15 +45,6 @@ const BOX_SIDE_TOLERANCE: (f64, f64) = (0.55, 1.45);
 
 /// The seed the grain of every picture below is drawn from, so a failure reproduces exactly.
 const GRAIN_SEED: u64 = 0x5245_4b5f_5048_4f54;
-
-/// The emulator, with this one service mounted on a shared engine.
-fn harness() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
 
 // ---------------------------------------------------------------------------
 // The photographs the tests draw
@@ -308,46 +300,13 @@ impl Photograph {
     }
 
     fn bytes(&self, format: ImageFormat) -> Vec<u8> {
-        let mut encoded = std::io::Cursor::new(Vec::new());
-        DynamicImage::ImageLuma8(self.render())
-            .write_to(&mut encoded, format)
-            .expect("encode the drawn photograph");
-        encoded.into_inner()
+        encode(&self.render(), format)
     }
-}
-
-/// Fill the ellipse of radii `rx`/`ry` around `(cx, cy)` with `tone`.
-fn fill_ellipse(image: &mut GrayImage, cx: f32, cy: f32, rx: f32, ry: f32, tone: u8) {
-    let (width, height) = (image.width() as i64, image.height() as i64);
-    let x_from = ((cx - rx).floor() as i64).max(0);
-    let x_to = ((cx + rx).ceil() as i64).min(width - 1);
-    let y_from = ((cy - ry).floor() as i64).max(0);
-    let y_to = ((cy + ry).ceil() as i64).min(height - 1);
-    for y in y_from..=y_to {
-        for x in x_from..=x_to {
-            let dx = (x as f32 - cx) / rx.max(0.5);
-            let dy = (y as f32 - cy) / ry.max(0.5);
-            if dx * dx + dy * dy <= 1.0 {
-                image.put_pixel(x as u32, y as u32, Luma([tone]));
-            }
-        }
-    }
-}
-
-/// The grain's generator: xorshift64, so every picture is enumerated from the pinned seed.
-fn next(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
 }
 
 // ---------------------------------------------------------------------------
 // Reading the answers
 // ---------------------------------------------------------------------------
-
-/// A reported `BoundingBox`, as the `(left, top, width, height)` fractions it carries.
-type ReportedBox = (f64, f64, f64, f64);
 
 async fn create_collection(router: &MultiServiceRouter, collection_id: &str) {
     let reply = call(

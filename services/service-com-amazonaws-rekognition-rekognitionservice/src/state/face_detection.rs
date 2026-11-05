@@ -238,8 +238,9 @@ pub const MIN_FACE_SKIN_FRACTION: f32 = 0.5;
 /// covers as the light falls across it.
 const MAX_SKIN_DEVIATION: f32 = 0.5;
 
-/// How many points, on a side, the skin coverage of a face box samples. NOT an AWS limit:
-/// it bounds the measurement's cost by a constant whatever the box's size.
+/// How many points, on a side, the skin coverage of a face box samples, which is never
+/// zero. NOT an AWS limit: it bounds the measurement's cost by a constant whatever the
+/// box's size.
 const SKIN_SAMPLES: usize = 32;
 
 /// How far OUTSIDE each eye, along the eye line and in multiples of the eye span, the skin
@@ -251,7 +252,7 @@ const TEMPLE_HALF_SIZE_IN_SPANS: f32 = 0.1;
 
 /// How far above the eyes the brighter of those two sides must stand, as a fraction of the
 /// contrast measured between this face's own skin and its own eyes.
-const MIN_TEMPLE_CONTRAST_RATIO: f32 = 0.5;
+pub const MIN_TEMPLE_CONTRAST_RATIO: f32 = 0.5;
 
 /// The radius of the averaging window the feature mask and every region mean read through.
 const SMOOTH_RADIUS: usize = 1;
@@ -697,39 +698,43 @@ fn faces(pixels: &Pixels) -> Vec<MeasuredFace> {
             }
         }
     }
+    // Each reading paired with the region it REPORTS — the part of its box the image holds,
+    // which is what an answer claims and so what decides both which readings stand for one
+    // face and how large each answered face is. Measured once per reading rather than once
+    // per comparison.
+    let mut found: Vec<(Candidate, FaceRect)> = found
+        .into_iter()
+        .map(|candidate| {
+            let region = reported_region(pixels, &candidate.rect);
+            (candidate, region)
+        })
+        .collect();
     // The best reading first, so the box kept for a face is that reading of it and every
     // other reading of the same pixels is suppressed rather than reported beside it. A
     // reading whose box the image holds WHOLE measured all of that face; one whose box runs
     // off the frame measured only the part of it the pixels show, so the complete reading is
     // the better measurement of the same face, and between two readings measured alike the
     // stronger-scoring one is.
-    found.sort_by(|left, right| {
-        measured_whole(pixels, &right.rect)
-            .cmp(&measured_whole(pixels, &left.rect))
+    found.sort_by(|(left, left_region), (right, right_region)| {
+        measured_whole(right, right_region)
+            .cmp(&measured_whole(left, left_region))
             .then_with(|| right.confidence.total_cmp(&left.confidence))
     });
-    let mut kept: Vec<Candidate> = Vec::new();
-    for candidate in found {
-        // What a reading REPORTS is the part of its box the image holds, so that region is
-        // what decides whether two readings stand for one face.
-        let region = reported_region(pixels, &candidate.rect);
+    let mut kept: Vec<(Candidate, FaceRect)> = Vec::new();
+    for (candidate, region) in found {
         if kept
             .iter()
-            .all(|other| !same_face(&region, &reported_region(pixels, &other.rect)))
+            .all(|(_, other)| !same_face(&region, other))
         {
-            kept.push(candidate);
+            kept.push((candidate, region));
         }
     }
     // "The faces that are returned by IndexFaces are sorted by the largest face bounding box
     // size to the smallest": the box each face reports, which is the region above.
-    kept.sort_by(|left, right| {
-        reported_region(pixels, &right.rect)
-            .area()
-            .total_cmp(&reported_region(pixels, &left.rect).area())
-    });
+    kept.sort_by(|(_, left), (_, right)| right.area().total_cmp(&left.area()));
     kept.truncate(MAX_FACES);
     kept.iter()
-        .map(|face| MeasuredFace {
+        .map(|(face, _)| MeasuredFace {
             detail: detail(pixels, face),
             appearance: appearance(pixels, &face.rect),
         })
@@ -1090,8 +1095,8 @@ fn skin_coverage(pixels: &Pixels, rect: PixelRect, skin: f32, contrast: f32) -> 
         return 0.0;
     }
     let band = MAX_SKIN_DEVIATION * contrast;
-    let step_x = ((rect.x1 - rect.x0) / SKIN_SAMPLES.max(1)).max(1);
-    let step_y = ((rect.y1 - rect.y0) / SKIN_SAMPLES.max(1)).max(1);
+    let step_x = ((rect.x1 - rect.x0) / SKIN_SAMPLES).max(1);
+    let step_y = ((rect.y1 - rect.y0) / SKIN_SAMPLES).max(1);
     let mut skin_like = 0_u32;
     let mut count = 0_u32;
     let mut y = rect.y0;
@@ -1185,10 +1190,10 @@ fn reported_region(pixels: &Pixels, rect: &FaceRect) -> FaceRect {
 }
 
 /// Whether the image holds the whole of a reading's box, so that reading measured all of
-/// the face it stands for rather than the part of it the frame carries.
-fn measured_whole(pixels: &Pixels, rect: &FaceRect) -> bool {
-    rect.area() > 0.0
-        && reported_region(pixels, rect).area() >= MIN_WHOLE_BOX_FRACTION * rect.area()
+/// the face it stands for rather than the part of it the frame carries. `region` is the
+/// reading's own [`reported_region`].
+fn measured_whole(reading: &Candidate, region: &FaceRect) -> bool {
+    reading.rect.area() > 0.0 && region.area() >= MIN_WHOLE_BOX_FRACTION * reading.rect.area()
 }
 
 /// Whether two reported regions stand for ONE face: they either share more than
