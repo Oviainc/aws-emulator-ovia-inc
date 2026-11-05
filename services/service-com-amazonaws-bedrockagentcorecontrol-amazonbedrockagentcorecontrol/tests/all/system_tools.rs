@@ -8,7 +8,11 @@
 //! The rule under test: a read of a reserved tool id reports the tool the service
 //! provides — `READY`, ARN-stamped for the region the request was signed for and with
 //! the resource type that carries no `-custom` — while a DELETE, which addresses only a
-//! tool this account created, does not find it and changes nothing.
+//! tool this account created, does not find it and changes nothing. The same rule
+//! bounds the tool: it holds none of the state a CREATE keeps for the account's own
+//! tools (so its `name` is free for a created tool), and every OTHER id — any id the
+//! shape admits for a created tool but nothing has created — is still the modelled 404
+//! on both the read and the delete route.
 //!
 //! Every test drives the service the way the router does: an `http::Request` through
 //! [`MultiServiceRouter::dispatch`], so the wire protocol (`restJson1`), the boundary
@@ -406,6 +410,174 @@ async fn a_created_tool_is_its_own_resource_beside_the_system_one() {
             "READY",
             "case {case:?}: the service-provided tool is still READY, got {}",
             text(&system, "status")
+        );
+    }
+}
+
+/// Ids of the form a CREATE mints — the second alternative of `BrowserId` /
+/// `CodeInterpreterId`, `[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10}` (`smithy_query
+/// operation=GetBrowser,GetCodeInterpreter`) — that name no tool this account created.
+///
+/// One row per way the pattern's created alternative can be spelled: the shortest name
+/// part, the longest, a name carrying the underscores it admits, and suffixes of digits,
+/// of letters and of both.
+fn ids_naming_no_created_tool() -> Vec<(String, String)> {
+    vec![
+        (
+            "the shortest id the created alternative admits".to_string(),
+            "a-0123456789".to_string(),
+        ),
+        (
+            "an id whose name part is the longest the pattern admits".to_string(),
+            format!("z{}-abcdefghij", "_".repeat(47)),
+        ),
+        (
+            "an id whose name part carries underscores".to_string(),
+            "tool_Name-ABCDEFGHIJ".to_string(),
+        ),
+        (
+            "an id whose suffix mixes letters and digits".to_string(),
+            "Tool9-a1b2C3d4e5".to_string(),
+        ),
+    ]
+}
+
+/// Only the RESERVED id resolves without a create: every other id the shape admits names
+/// nothing, so both the read and the delete route answer the modelled 404 naming the id
+/// the request carried, and the service-provided tool is still readable afterwards.
+#[tokio::test]
+async fn an_id_that_names_no_created_tool_is_the_modelled_404_on_read_and_on_delete() {
+    let router = router();
+    let region = REGIONS[2];
+
+    for tool in tools() {
+        for (form, id) in ids_naming_no_created_tool() {
+            assert_ne!(
+                id, tool.reserved_id,
+                "case {form:?}: this row must not be the reserved id"
+            );
+            let answers = [
+                ("read", get_tool(&router, &tool, &id, region).await),
+                ("delete", delete_tool(&router, &tool, &id, region).await),
+            ];
+            for (verb, (status, refused)) in answers {
+                let case = format!("{form} on the {} route ({verb})", tool.route);
+                assert_eq!(
+                    status, 404,
+                    "case {case:?}: an id naming no created tool is the modelled 404, got \
+                     {status} ({refused})"
+                );
+                assert_eq!(
+                    error_code(&refused),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected ResourceNotFoundException, got {} ({refused})",
+                    error_code(&refused)
+                );
+                assert_eq!(
+                    text(&refused, "message"),
+                    (tool.not_found_message)(&id),
+                    "case {case:?}: the refusal names the id the request carried, got {}",
+                    text(&refused, "message")
+                );
+            }
+        }
+
+        // None of those misses disturbed the tool the service provides.
+        let case = tool.case;
+        let (status, system) = get_tool(&router, &tool, tool.reserved_id, region).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the reserved id still resolves after ids that name nothing, got \
+             {status} ({system})"
+        );
+        assert_eq!(
+            text(&system, "status"),
+            "READY",
+            "case {case:?}: the service-provided tool is still READY, got {}",
+            text(&system, "status")
+        );
+    }
+}
+
+/// The tool the service provides holds none of the state a CREATE keeps for the account's
+/// own tools: the `name` it reports is free for a created tool (the uniqueness index
+/// "the name must be unique within your account" holds only created names), the created
+/// tool is a second, distinct resource readable by its minted id, and a repeat of THAT
+/// name is the conflict.
+#[tokio::test]
+async fn the_service_provided_tool_does_not_occupy_the_created_tool_name_index() {
+    let router = router();
+    let region = REGIONS[0];
+
+    for tool in tools() {
+        let case = tool.case;
+        let (status, system) = get_tool(&router, &tool, tool.reserved_id, region).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the reserved id resolves before anything is created, got {status} \
+             ({system})"
+        );
+        let system_name = text(&system, "name");
+
+        let body = (tool.create_body)(&system_name);
+        let (status, created) = create_tool(&router, &tool, &body, region).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: the name the service-provided tool reports is free for a created \
+             tool, got {status} ({created})"
+        );
+        let created_id = text(&created, tool.id_member);
+        assert_ne!(
+            created_id, tool.reserved_id,
+            "case {case:?}: a create never mints the reserved id, got {created_id:?}"
+        );
+
+        let (status, read_back) = get_tool(&router, &tool, &created_id, region).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the created tool is readable by its minted id, got {status} \
+             ({read_back})"
+        );
+        assert_eq!(
+            text(&read_back, "name"),
+            system_name,
+            "case {case:?}: the created tool keeps the name the create supplied, got {}",
+            text(&read_back, "name")
+        );
+        assert_eq!(
+            text(&read_back, tool.arn_member),
+            format!(
+                "arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:{}-custom/{created_id}",
+                tool.arn_resource
+            ),
+            "case {case:?}: the created tool carries the -custom resource type, got {}",
+            text(&read_back, tool.arn_member)
+        );
+
+        // That created name IS in the index now, so a second create of it conflicts —
+        // which is how the first create proves the service-provided tool was never there.
+        let (status, conflict) = create_tool(&router, &tool, &body, region).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a repeated created name is the modelled conflict, got {status} \
+             ({conflict})"
+        );
+        assert_eq!(
+            error_code(&conflict),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {} ({conflict})",
+            error_code(&conflict)
+        );
+
+        let (status, after) = get_tool(&router, &tool, tool.reserved_id, region).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the service-provided tool is unaffected, got {status} ({after})"
+        );
+        assert_eq!(
+            after, system,
+            "case {case:?}: a create sharing its name changes nothing about the \
+             service-provided tool, got {after} against {system}"
         );
     }
 }
