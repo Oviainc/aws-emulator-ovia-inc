@@ -201,7 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        crate::state::tagging::merge_tags(held, &input.tags).map_err(|_| {
+        crate::state::tagging::merge_tags(
+            held,
+            &input.tags,
+            crate::state::tagging::max_tags_for(&input.resource_type),
+        )
+        .map_err(|_| {
             // "The Targets parameter includes too many tags. Remove one or more tags and
             // try the command again." — messageless in the model too.
             AddTagsToResourceErrorModeled::TooManyTagsError(TooManyTagsError {})

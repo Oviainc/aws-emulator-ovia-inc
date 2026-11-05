@@ -43,6 +43,11 @@ pub const TAGGING_TYPE_OPS_ITEM: &str = "OpsItem";
 /// (`super::cloud_connectors::CLOUD_CONNECTOR_RESOURCE_TYPE`, from the same enum).
 pub const TAGGING_TYPE_CLOUD_CONNECTOR: &str = super::cloud_connectors::CLOUD_CONNECTOR_RESOURCE_TYPE;
 
+/// The `ResourceTypeForTagging` value whose id is an automation execution's own id —
+/// "Automation: example-c160-4567-8519-012345abcde" (`AddTagsToResourceRequest$ResourceId`),
+/// which is the id `StartAutomationExecution` minted (same enum).
+pub const TAGGING_TYPE_AUTOMATION: &str = "Automation";
+
 /// The `ResourceTypeForTagging` value whose id is a State Manager association's minted id
 /// (`super::associations::TAGGING_TYPE_ASSOCIATION`, from the same enum): "Adds or
 /// overwrites one or more tags for a State Manager association"
@@ -52,9 +57,22 @@ pub const TAGGING_TYPE_ASSOCIATION: &str = super::associations::TAGGING_TYPE_ASS
 
 /// How many tags one resource may carry: "Most resources can have a maximum of 50 tags"
 /// (`AddTagsToResource`'s own doc). The same doc states one exception — "Automations can
-/// have a maximum of 5 tags" — for a resource type whose records this store does not
-/// hold, so there is no automation here to measure that lower maximum against.
+/// have a maximum of 5 tags" — which [`max_tags_for`] answers for.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many tags the resources of `resource_type` may carry.
+///
+/// "Most resources can have a maximum of 50 tags… Automations can have a maximum of 5
+/// tags" (`AddTagsToResource`'s own doc), so the maximum is the resource type's rather
+/// than one number for every type — and it is the SAME maximum `StartAutomationExecution`
+/// holds the tags it carries to (`super::automation::MAX_TAGS_PER_AUTOMATION`), so the tag
+/// plane and the start cannot disagree about how many tags an automation holds.
+pub fn max_tags_for(resource_type: &str) -> usize {
+    match resource_type {
+        TAGGING_TYPE_AUTOMATION => super::automation::MAX_TAGS_PER_AUTOMATION,
+        _ => MAX_TAGS_PER_RESOURCE,
+    }
+}
 
 /// A tag set as the modelled `TagList` reports it, in key order — the order the store
 /// holds it in, so two reads of one resource report its tags alike.
@@ -71,14 +89,18 @@ pub fn to_tag_list(held: &BTreeMap<String, String>) -> Vec<Tag> {
 /// held takes the submitted value and the set grows only by the keys it did not hold.
 ///
 /// Answers `Err` with the number of tags the resource WOULD then carry when that is more
-/// than [`MAX_TAGS_PER_RESOURCE`], leaving `held` untouched: the merge is all or nothing,
-/// so a refused request writes no part of its tags.
-pub fn merge_tags(held: &mut BTreeMap<String, String>, adding: &[Tag]) -> Result<(), usize> {
+/// than `maximum` ([`max_tags_for`]), leaving `held` untouched: the merge is all or
+/// nothing, so a refused request writes no part of its tags.
+pub fn merge_tags(
+    held: &mut BTreeMap<String, String>,
+    adding: &[Tag],
+    maximum: usize,
+) -> Result<(), usize> {
     let mut merged = held.clone();
     for tag in adding {
         merged.insert(tag.key.clone(), tag.value.clone());
     }
-    if merged.len() > MAX_TAGS_PER_RESOURCE {
+    if merged.len() > maximum {
         return Err(merged.len());
     }
     *held = merged;
@@ -122,6 +144,9 @@ impl ComAmazonawsSsmAmazonssmState {
             TAGGING_TYPE_CLOUD_CONNECTOR => self
                 .cloud_connector(region, resource_id)
                 .map(|held| &held.tags),
+            TAGGING_TYPE_AUTOMATION => self
+                .automation_execution(region, resource_id)
+                .map(|held| &held.tags),
             TAGGING_TYPE_ASSOCIATION => {
                 self.association(region, resource_id).map(|held| &held.tags)
             }
@@ -152,6 +177,9 @@ impl ComAmazonawsSsmAmazonssmState {
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_CLOUD_CONNECTOR => self
                 .cloud_connector_mut(region, resource_id)
+                .map(|held| &mut held.tags),
+            TAGGING_TYPE_AUTOMATION => self
+                .automation_execution_mut(region, resource_id)
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_ASSOCIATION => self
                 .association_mut(region, resource_id)

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAutomationExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAutomationExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAutomationExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Initiates execution of an Automation runbook: the runbook the start names is resolved
+//! through this endpoint, its steps are read out of the version's own content, the
+//! execution's parameters are resolved against the ones that runbook declares, and ONE
+//! automation execution is persisted (`crate::state::automation`) and reported by the id
+//! this service minted for it. `GetAutomationExecution` reads that execution back.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +212,337 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAutomationExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAutomationExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAutomationExecution"))
+        // `DocumentName`'s and `DocumentVersion`'s patterns, `ClientToken`'s UUID form,
+        // the `Parameters` and `Tags` sizes, `MaxConcurrency`'s and `MaxErrors`'s patterns
+        // and the `Targets` and `TargetLocations` list lengths are MODELLED constraints,
+        // so the centralized walk has already refused anything outside them. What is
+        // checked here is what the model cannot say: which runbook, which version, which
+        // parameters and which targets the start actually resolves to.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartAutomationExecutionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the automation execution store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "This can be a public document or a custom document. To run a shared document
+        // belonging to another account, specify the document ARN" (`DocumentName`), so
+        // either spelling names the same document. The document is resolved through the
+        // endpoint the start was signed for by the one lookup every document read uses,
+        // which also materialises what the clock already owes.
+        let runbook_not_found = || {
+            StartAutomationExecutionErrorModeled::AutomationDefinitionNotFoundException(
+                AutomationDefinitionNotFoundException {
+                    message: Some(format!("Document {} does not exist.", input.document_name)),
+                },
+            )
+        };
+        let Some(document) = store.resolve_document_for_request(&input.document_name, &region, now)
+        else {
+            return Err(runbook_not_found().into());
+        };
+        // "Initiates execution of an Automation runbook": a document of any other type is
+        // not a runbook this operation runs, so no Automation runbook of that name exists.
+        if document.document_type != crate::state::automation::AUTOMATION_DOCUMENT_TYPE {
+            return Err(runbook_not_found().into());
+        }
+        // "You can specify $DEFAULT, $LATEST, or a specific version number": each names
+        // one of the versions the document holds, and a number it does not hold names
+        // none. A start that names no version runs the runbook's default version.
+        let requested_version = non_empty(input.document_version.as_deref())
+            .unwrap_or(crate::state::DOCUMENT_VERSION_DEFAULT);
+        let Some(version) = document.select(requested_version) else {
+            return Err(
+                StartAutomationExecutionErrorModeled::AutomationDefinitionVersionNotFoundException(
+                    AutomationDefinitionVersionNotFoundException {
+                        message: Some(format!(
+                            "Document {} version {requested_version} does not exist.",
+                            document.name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The parameters the start supplied, held to the ones the runbook declares: "The
+        // supplied parameters for invoking the specified Automation runbook are incorrect.
+        // For example, they may not match the set of parameters permitted for the
+        // specified Automation document" (`InvalidAutomationExecutionParametersException`).
+        // The same reading every document-running operation of this service applies.
+        let supplied: ::std::collections::BTreeMap<String, Vec<String>> = input
+            .parameters
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let invalid_parameters = |why: String| {
+            StartAutomationExecutionErrorModeled::InvalidAutomationExecutionParametersException(
+                InvalidAutomationExecutionParametersException { message: Some(why) },
+            )
+        };
+        let targets: Vec<Target> = input.targets.clone().unwrap_or_default();
+        let target_maps = input.target_maps.clone().unwrap_or_default();
+        let target_parameter_name = non_empty(input.target_parameter_name.as_deref());
+        if let Some(why) = crate::state::automation::target_rejection(
+            &document.name,
+            &version.parsed.parameters,
+            target_parameter_name,
+            &targets,
+            target_maps.len(),
+        ) {
+            return Err(invalid_parameters(why).into());
+        }
+        // The target parameter is the one each target's value is BOUND to, so a
+        // rate-controlled start supplies it through its targets rather than through its
+        // own parameters: it counts as named for the declared-parameter reading.
+        let mut named = supplied.clone();
+        if let Some(name) = target_parameter_name {
+            named.entry(name.to_string()).or_default();
+        }
+        if let Some(why) = crate::state::commands::parameter_rejection(
+            &document.name,
+            &version.parsed.parameters,
+            &named,
+        ) {
+            return Err(invalid_parameters(why).into());
+        }
+
+        // The steps the runbook declares, read out of the content of the version this
+        // start resolved — so the execution walks the runbook as it stood when it started,
+        // whatever a later update does to the document.
+        let steps = crate::state::automation::runbook::steps_of(&version.content)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let unknown = crate::state::automation::unknown_step_references(&steps);
+        if !unknown.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "The runbook declares no step named {}",
+                unknown.join(", ")
+            )));
+        }
+        // "Tags enable you to categorize a resource… When calling the
+        // StartAutomationExecution action, you can specify a maximum of 5 tags."
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::automation::MAX_TAGS_PER_AUTOMATION {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "A maximum of {} tags can be specified when starting an automation execution",
+                crate::state::automation::MAX_TAGS_PER_AUTOMATION
+            )));
+        }
+
+        let mode = non_empty(input.mode.as_deref())
+            .unwrap_or(crate::state::automation::EXECUTION_MODE_AUTO)
+            .to_string();
+        let max_concurrency = non_empty(input.max_concurrency.as_deref())
+            .unwrap_or(crate::state::automation::DEFAULT_MAX_CONCURRENCY)
+            .to_string();
+        let max_errors = non_empty(input.max_errors.as_deref())
+            .unwrap_or(crate::state::automation::DEFAULT_MAX_ERRORS)
+            .to_string();
+        let document_version = version.version.to_string();
+
+        // "User-provided idempotency token. The token must be unique, is case
+        // insensitive, enforces the UUID format, and can't be reused": a start carrying a
+        // token this Region has already started an execution with is that SAME execution
+        // when it asks for the same thing, and `IdempotentParameterMismatch` when it does
+        // not.
+        let fingerprint = crate::state::automation::request_fingerprint(
+            &crate::state::automation::StartedWith {
+                document_name: &document.name,
+                document_version: &document_version,
+                parameters: &supplied,
+                mode: &mode,
+                target_parameter_name,
+                targets: &targets,
+                target_maps: &target_maps,
+                target_locations: input.target_locations.as_deref().unwrap_or_default(),
+                max_concurrency: &max_concurrency,
+                max_errors: &max_errors,
+            },
+        );
+        if let Some(token) = non_empty(input.client_token.as_deref()) {
+            if let Some(held) = store.automation_execution_with_token(&region, token) {
+                if held.fingerprint != fingerprint {
+                    return Err(
+                        StartAutomationExecutionErrorModeled::IdempotentParameterMismatch(
+                            IdempotentParameterMismatch {
+                                message: Some(format!(
+                                    "The ClientToken {token} was already used to start automation \
+                                     execution {}, with different parameters",
+                                    held.execution_id
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(StartAutomationExecutionOutput {
+                    automation_execution_id: Some(held.execution_id.clone()),
+                });
+            }
+        }
+
+        // A rate-controlled start runs one execution per resolved target value: "A
+        // key-value mapping to target resources. Required if you specify
+        // TargetParameterName" (`Targets`), so the values the target resolves to are the
+        // automations this start begins.
+        let mut resolved_target_values: Vec<String> = Vec::new();
+        for target in &targets {
+            let selected = store
+                .automation_target_values(&region, target)
+                .map_err(|key| {
+                    StartAutomationExecutionErrorModeled::InvalidTarget(InvalidTarget {
+                        message: Some(format!(
+                            "Target key '{key}' isn't one of the target keys an automation \
+                             resolves its targets by: {}, {}",
+                            crate::state::automation::TARGET_KEY_PARAMETER_VALUES,
+                            crate::state::commands::supported_target_keys().join(", ")
+                        )),
+                    })
+                })?;
+            for value in selected {
+                if !resolved_target_values.iter().any(|held| held == &value) {
+                    resolved_target_values.push(value);
+                }
+            }
+        }
+        // "The target isn't valid or doesn't exist. It might not be configured for Systems
+        // Manager" (`InvalidTarget`): a target that resolves to nothing names no resource
+        // to run the automation for, so there is nothing to start.
+        if !targets.is_empty() && resolved_target_values.is_empty() {
+            return Err(StartAutomationExecutionErrorModeled::InvalidTarget(InvalidTarget {
+                message: Some(
+                    "Targets resolved no resource in this Region to run the automation for"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // "The number of simultaneously running Automation executions exceeded the
+        // allowable limit": the start begins its own execution and one per resolved
+        // target, so every one of them is admitted against the limit together.
+        let starting = 1 + resolved_target_values.len();
+        if store.running_automation_executions(&region) + starting
+            > crate::state::automation::MAX_CONCURRENT_EXECUTIONS
+        {
+            return Err(
+                StartAutomationExecutionErrorModeled::AutomationExecutionLimitExceededException(
+                    AutomationExecutionLimitExceededException {
+                        message: Some(format!(
+                            "The number of simultaneously running Automation executions exceeded \
+                             the allowable limit of {}",
+                            crate::state::automation::MAX_CONCURRENT_EXECUTIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let execution_id = store.mint_automation_id();
+        // A rate-controlled parent runs its children rather than steps of its own; every
+        // other execution walks the runbook's steps itself.
+        let own_steps = if resolved_target_values.is_empty() {
+            steps
+                .iter()
+                .map(|definition| {
+                    crate::state::automation::StepExecutionRecord::pending(
+                        definition.clone(),
+                        store.mint_automation_id(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut record = crate::state::automation::AutomationExecutionRecord {
+            execution_id: execution_id.clone(),
+            region: region.clone(),
+            // `AutomationExecution$DocumentName` is a document NAME, so the name the
+            // document is held under is reported whichever spelling the start named it by.
+            document_name: document.name.clone(),
+            document_version,
+            mode,
+            resolved_parameters: crate::state::automation::resolved_parameters(
+                &version.parsed.parameters,
+                &supplied,
+            ),
+            supplied_parameters: supplied,
+            targets,
+            target_parameter_name: target_parameter_name.map(str::to_string),
+            target: None,
+            resolved_target_values: resolved_target_values.clone(),
+            target_maps,
+            target_locations: input.target_locations.clone().unwrap_or_default(),
+            target_locations_url: input.target_locations_url.clone(),
+            parent_execution_id: None,
+            children: Vec::new(),
+            max_concurrency,
+            max_errors,
+            tags: crate::state::to_btree_map(Some(tags)),
+            alarm_configuration: input.alarm_configuration.clone(),
+            client_token: non_empty(input.client_token.as_deref()).map(str::to_string),
+            fingerprint,
+            // "The Amazon Resource Name (ARN) of the user who ran the automation": the
+            // principal this emulator's own long-term credential speaks for, which is the
+            // one identity every service here reports as the caller.
+            executed_by: ::service_common::caller_principal::ambient_user_arn(),
+            started_at: now,
+            ended_at: None,
+            // Nothing has picked the execution up yet, which is what `Pending` says; the
+            // service picks it up a span later (`crate::state::automation::PICKUP_DELAY`).
+            runnable_at: Some(now + crate::state::automation::PICKUP_DELAY),
+            status: crate::state::automation::STATUS_PENDING.to_string(),
+            failure_message: None,
+            current: (!own_steps.is_empty()).then_some(0),
+            steps: own_steps,
+            resolved_input_budget:
+                crate::state::automation::runbook::MAX_RESOLVED_INPUT_BYTES,
+        };
+
+        // One child per resolved target value, each with the target parameter bound to its
+        // own value and its own step executions. `MaxConcurrency` is how many of them run
+        // at a time, so the rest are queued until the parent releases them
+        // (`ComAmazonawsSsmAmazonssmState::advance_automations`).
+        let concurrency = crate::state::automation::rate_count(
+            &record.max_concurrency,
+            resolved_target_values.len(),
+        )
+        .max(1);
+        let mut children = Vec::with_capacity(resolved_target_values.len());
+        for (position, value) in resolved_target_values.iter().enumerate() {
+            let child_id = store.mint_automation_id();
+            let child_steps = steps
+                .iter()
+                .map(|definition| {
+                    crate::state::automation::StepExecutionRecord::pending(
+                        definition.clone(),
+                        store.mint_automation_id(),
+                    )
+                })
+                .collect();
+            let runnable_at =
+                (position < concurrency).then(|| now + crate::state::automation::PICKUP_DELAY);
+            children.push(record.child(child_id.clone(), value.clone(), child_steps, runnable_at));
+            record.children.push(child_id);
+        }
+        store.insert_automation_execution(record);
+        for child in children {
+            store.insert_automation_execution(child);
+        }
+
+        Ok(StartAutomationExecutionOutput {
+            automation_execution_id: Some(execution_id),
+        })
     }
+}
+
+/// `value` when the start set it to something, and `None` when it set it to nothing: an
+/// optional member sent EMPTY names no version, no mode and no idempotency token, the same
+/// way an omitted one does.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
 }

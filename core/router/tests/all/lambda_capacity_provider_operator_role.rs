@@ -261,8 +261,13 @@ fn rows() -> Vec<Row> {
         },
         Row {
             // Nothing is KNOWN about another account's role — its IAM is not this
-            // emulator's to ask — and a refusal has to be grounded in an answer, so this
-            // one is served.
+            // emulator's to ask, and the shared reading resolves no role of THIS account
+            // from such an ARN — so a refusal would be grounded in nothing and this one is
+            // served. AWS refuses it too, but with its own answer (403
+            // `AccessDeniedException`, "Cross-account pass role is not allowed."), which
+            // `CreateCapacityProvider` does not model here yet: that half is tracked by
+            // `issues/things-that-do-not-work/human-lambda-createcapacityprovider-refuses-an-operator-role-absen.md`,
+            // and the code and this row have to change together when it lands.
             case: "a well-formed role ARN of another account",
             role: Role::AnotherAccount,
             accepted: true,

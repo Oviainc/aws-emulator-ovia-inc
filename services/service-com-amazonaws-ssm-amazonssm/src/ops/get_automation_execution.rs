@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAutomationExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAutomationExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAutomationExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Get detailed information about a particular Automation execution: the execution
+//! `StartAutomationExecution` persisted (`crate::state::automation`), reported by the id
+//! that start minted, with every step execution the walk has reached.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +135,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAutomationExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAutomationExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAutomationExecution"))
+        // `AutomationExecutionId`'s length is a MODELLED constraint, so the centralized
+        // walk has already refused anything outside it. What is left is whether this
+        // endpoint holds an execution of that id.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAutomationExecutionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the automation execution store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The one write this report makes: everything the clock already owed at `now` —
+        // an execution's pickup and the steps of its walk that have come due — was owed
+        // whether or not anybody called, so it is materialised before anything is read.
+        store.materialize_due(now);
+        let Some(execution) = store.automation_execution(&region, &input.automation_execution_id)
+        else {
+            return Err(
+                GetAutomationExecutionErrorModeled::AutomationExecutionNotFoundException(
+                    AutomationExecutionNotFoundException {
+                        message: Some(format!(
+                            "Automation execution {} does not exist.",
+                            input.automation_execution_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetAutomationExecutionOutput {
+            automation_execution: Some(execution.to_automation_execution()),
+        })
     }
 }

@@ -135,6 +135,10 @@ pub mod secure_string;
 /// those nodes holds of it.
 pub mod commands;
 
+/// An automation execution a caller started, the step executions it is made of, and the
+/// walk through them the clock owes.
+pub mod automation;
+
 /// The State Manager associations this service holds, each with the versions a create and
 /// its updates wrote.
 pub mod associations;
@@ -1917,7 +1921,10 @@ fn default_value_string(
 }
 
 /// A document node as the JSON value that renders it.
-fn document_as_json(node: &::yaml_rust2::Yaml, budget: usize) -> Option<::serde_json::Value> {
+pub(crate) fn document_as_json(
+    node: &::yaml_rust2::Yaml,
+    budget: usize,
+) -> Option<::serde_json::Value> {
     use ::serde_json::Value;
     use ::yaml_rust2::Yaml;
     let budget = budget.checked_sub(1)?;
@@ -3013,6 +3020,17 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// one ([`ComAmazonawsSsmAmazonssmState::mint_command_id`]).
     pub minted_command_ids: u64,
 
+    /// Every automation execution a caller started, keyed by `(region, execution id)`: an
+    /// automation runs at the Systems Manager endpoint of one Region and is identified
+    /// there by the id the start minted. A `BTreeMap` so a listing walks a stable, total
+    /// order. See [`automation`].
+    pub automation_executions: BTreeMap<(String, String), automation::AutomationExecutionRecord>,
+
+    /// How many automation execution and step-execution ids this store has minted, which
+    /// is the entropy behind the next one
+    /// ([`ComAmazonawsSsmAmazonssmState::mint_automation_id`]).
+    pub minted_automation_ids: u64,
+
     /// Every managed node, keyed by `(region, node id)`: a node is registered with the
     /// Systems Manager endpoint of one Region and is identified there by its node id. A
     /// `BTreeMap` so a describe walks a stable, total order — ascending by node id
@@ -3139,6 +3157,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             documents: BTreeMap::new(),
             commands: BTreeMap::new(),
             minted_command_ids: 0,
+            automation_executions: BTreeMap::new(),
+            minted_automation_ids: 0,
             managed_nodes: BTreeMap::new(),
             activations: BTreeMap::new(),
             cloud_connectors: BTreeMap::new(),
@@ -3172,6 +3192,9 @@ impl ComAmazonawsSsmAmazonssmState {
         // at `now`, whether or not anybody called.
         self.commands
             .retain(|_, command| now < command.retained_until());
+        // An automation execution's pickup and every step of its walk that `now` allows
+        // were owed whether or not anybody called (`automation`).
+        self.advance_automations(now);
     }
 
     /// The command `command_id` names in `region`, or `None` when that Region holds none.
