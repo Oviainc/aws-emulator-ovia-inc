@@ -123,7 +123,10 @@ pub(crate) fn expression(stated: &str) -> String {
 }
 
 /// `Member must satisfy enum value set: [<values>]`.
-fn value_set(stated: &[&str]) -> String {
+///
+/// Reached by a sibling suite as `super::constraint_refusal_messages::value_set`, so the
+/// crate states that sentence in ONE place.
+pub(crate) fn value_set(stated: &[&str]) -> String {
     format!("Member must satisfy enum value set: [{}]", stated.join(", "))
 }
 

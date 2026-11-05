@@ -254,7 +254,10 @@ fn domain_entity(name: &str) -> Value {
 }
 
 /// `POST /2021-01-01/opensearch/insights` with `body`.
-async fn list(emulator: &Emulator, body: Value) -> Answer {
+///
+/// Reached by a sibling suite as `super::insights::list`, so the crate drives a listing
+/// of ANY entity through ONE request helper.
+pub(crate) async fn list(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call("POST", &format!("{PREFIX}/opensearch/insights"), Some(body))
         .await

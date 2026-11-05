@@ -123,6 +123,8 @@ mod index_modelled_answers;
 mod index_registry;
 #[path = "all/index_schema_updates.rs"]
 mod index_schema_updates;
+#[path = "all/insight_detail_answerability.rs"]
+mod insight_detail_answerability;
 #[path = "all/insight_details.rs"]
 mod insight_details;
 #[path = "all/insight_feedback.rs"]
