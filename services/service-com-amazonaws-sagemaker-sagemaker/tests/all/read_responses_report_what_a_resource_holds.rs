@@ -57,12 +57,12 @@ enum Expect {
 }
 
 /// The member at `path` (dotted, e.g. `Source.SourceTypes`) of a read response.
+///
+/// Resolved through `serde_json`'s own JSON-pointer walk rather than a hand-rolled one,
+/// so no second path walker lives here (`service_resolved_members` reads its members the
+/// same way).
 fn member<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut here = body;
-    for segment in path.split('.') {
-        here = here.get(segment)?;
-    }
-    Some(here)
+    body.pointer(&format!("/{}", path.replace('.', "/")))
 }
 
 /// Assert one member of a read response against the rule, naming the case and the value
