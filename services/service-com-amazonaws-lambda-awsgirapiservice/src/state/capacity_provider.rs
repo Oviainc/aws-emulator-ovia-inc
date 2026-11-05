@@ -124,11 +124,12 @@ pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
 ///
 /// It is the reading of the ONE shared question (`service_common::iam_role`) that the
 /// cross-service suite `core/router/tests/all/lambda_capacity_provider_operator_role.rs`
-/// pins over its table of trust documents: the role a provider manages compute as is part
-/// of what the client provisions in this account, and this operation is recorded refusing an
-/// operator role that does not exist, so "this account's IAM holds no role under that name"
-/// IS an answer about the role the request named. Neither reading restates which role of
-/// this account an ARN names, how IAM is asked, or how a trust document is read.
+/// pins over its table of operator roles: the role a provider manages compute as is part of
+/// what the client provisions in this account, so "this account's IAM holds no role under
+/// that name" IS an answer about the role the request named. That separates it from a
+/// function's EXECUTION role ([`super::execution_role_is_unassumable`]), which is routinely
+/// provisioned out of band and so serves such a create. Neither reading restates which role
+/// of this account an ARN names, how IAM is asked, or how a trust document is read.
 ///
 /// `false` — do not refuse — wherever nothing is KNOWN: a value that names no role of THIS
 /// account (another account's IAM is not this emulator's to ask), an emulator with no IAM
@@ -140,7 +141,7 @@ pub async fn operator_role_is_unassumable(
     region: &str,
     operator_role_arn: &str,
 ) -> bool {
-    ::service_common::iam_role::held_role_is_unassumable(
+    ::service_common::iam_role::role_is_unassumable(
         ctx,
         region,
         operator_role_arn,

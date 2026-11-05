@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMetricWidgetImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMetricWidgetImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: renders the widget definition the request carries into a PNG bitmap of the
+//! series this service's store holds. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMetricWidgetImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The definition is a JSON document, so it is parsed and resolved by
+//! [`crate::state::metric_widget`]: its `metrics` array becomes the `MetricDataQuery` array
+//! the SHARED resolution answers (`crate::state::metric_query`, which `GetMetricData` and a
+//! metric-math alarm are answered from as well), and the resolved series are drawn into the
+//! graph by [`crate::state::metric_widget::render`]. So every pixel of the plot comes from the
+//! datapoints `PutMetricData` stored: a store holding nothing in the window draws an empty
+//! graph, and the same definition over the same store always draws the same bytes.
+//!
+//! Nothing is written. "You can use the GetMetricWidgetImage API to retrieve a snapshot graph"
+//! — the call reports a graph of the series, so a later caller sees exactly what it would have
+//! seen had this call not happened.
+//!
+//! A definition this service cannot render — one that is not a JSON object, names no metric,
+//! or carries a value its member does not take — is REFUSED in this service's own refusal code
+//! rather than answered with an image of nothing: this operation's model declares no error
+//! shape for a bad parameter, so the refusal is `crate::scaffolded`'s `ValidationError`, the
+//! code CloudWatch answers such a request with.
+//!
+//! Two deviations this handler states rather than hides. `OutputFormat: image/png` renders the
+//! same PNG as `png` and carries it in the modelled `MetricWidgetImage` blob: the raw
+//! `image/png` BODY that value documents is the HTTP framing of the answer, which belongs to
+//! this service's protocol rather than to a handler. And the `view` values whose layout is
+//! lettering ([`crate::state::metric_widget`] draws no text, because no font is shipped) are
+//! served with the graph of the same resolved series instead of being refused.
 //!
 //! ## Shape of an operation
 //!
@@ -96,17 +114,28 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetMetricWidgetImageError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetMetricWidgetImage")]
+// here — hence the `GetMetricWidgetImageError` alias below.
+//
+// The operation shape itself declares none, so `InternalServiceFault` — the server fault this
+// SERVICE models, which every other reader of the metric store answers an unreachable store
+// with — is widened in through `extra_errors`: a graph of a store this process cannot reach is
+// a fault of the service and not of the request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetMetricWidgetImage",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum GetMetricWidgetImageErrorModeled {
+    /// "Request processing has failed due to some unknown error, exception, or failure."
+    /// (`InternalServiceFault`) — a store this process cannot reach.
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::get_metric_widget_image::GetMetricWidgetImageError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::get_metric_widget_image::GetMetricWidgetImageError`). The wrapper is what
+/// carries this service's own refusal code for a widget definition it cannot render: the
+/// operation's model declares no client-input error, so there is no modelled shape to refuse
+/// one with.
 pub type GetMetricWidgetImageError = crate::scaffolded::Scaffolded<GetMetricWidgetImageErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -155,18 +184,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMetricWidgetImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMetricWidgetImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMetricWidgetImage"))
+        // `ctx` carries only request metadata; the graph is drawn from the store.
+        let _ = ctx;
+
+        // "The format of the resulting image. Only PNG images are supported."
+        // (`GetMetricWidgetImageInput$OutputFormat`) — the member is an unconstrained string
+        // in the model, so the two values it documents are judged here. Both name the same
+        // image: what differs between them is the HTTP framing the image travels in, which is
+        // this service's protocol's rather than this handler's, and the modelled output
+        // carries the image in its `MetricWidgetImage` blob either way.
+        if let Some(requested) = input.output_format.as_deref() {
+            if !OUTPUT_FORMATS.contains(&requested) {
+                return Err(GetMetricWidgetImageError::validation_error(
+                    crate::state::value_in_set_message(
+                        OUTPUT_FORMAT_MEMBER,
+                        &OUTPUT_FORMATS.map(String::from),
+                    ),
+                ));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| fault("the CloudWatch metric store is unavailable".to_string()))?;
+
+        let now = crate::state::now_secs();
+        let widget =
+            crate::state::metric_widget::MetricWidget::parse(&input.metric_widget, now)
+                .map_err(GetMetricWidgetImageError::validation_error)?;
+
+        // One acquisition of the store for the whole graph: a definition carries at most
+        // `MAX_WIDGET_METRICS` entries ("As many as 100 metrics in the graph"), so neither the
+        // critical section nor the work inside it grows without bound with the request.
+        let series = {
+            let store = state.lock();
+            crate::state::metric_widget::plotted_series(&store, &widget, now)
+        }
+        .map_err(refusal)?;
+
+        // Rasterising the graph is millions of pixel writes and a deflate of the whole
+        // bitmap, with no await point in it, so it runs on the BLOCKING pool rather than
+        // occupying the async worker serving this request: a timeout, a cancellation, the
+        // health endpoint and this service's own alarm clock all keep their worker while a
+        // large graph is drawn. The size of that work is already bounded (the graph's sides
+        // are refused past `MAX_IMAGE_SIDE`, the series and datapoints by the shared
+        // resolution's own caps); what this seam adds is that the bound can be ENFORCED.
+        let image = match ::tokio::task::spawn_blocking(move || {
+            crate::state::metric_widget::render::png(&widget, &series)
+        })
+        .await
+        {
+            Ok(rendered) => rendered.map_err(fault)?,
+            // The render panicked or the task was cancelled: neither is anything the caller
+            // can repair, so it is reported as the server fault it is.
+            Err(error) => return Err(fault(format!("rendering the graph failed: {error}"))),
+        };
+
+        // "The image of the graph, in the output format specified. The output is
+        // base64-encoded." — the blob member carries the PNG bytes, and this protocol's
+        // serializer is what base64-encodes a blob on the wire.
+        Ok(GetMetricWidgetImageOutput {
+            metric_widget_image: Some(image),
+        })
+    }
+}
+
+/// The request member the image's format arrives on, as a refusal of its value names it.
+const OUTPUT_FORMAT_MEMBER: &str = "OutputFormat";
+
+/// Report a failure of the SERVICE rather than of the request: "Request processing has failed
+/// due to some unknown error, exception, or failure." (`InternalServiceFault`) — a store this
+/// process cannot reach, and a render that could not be carried out.
+fn fault(message: String) -> GetMetricWidgetImageError {
+    GetMetricWidgetImageErrorModeled::InternalServiceFault(InternalServiceFault {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The values `OutputFormat` takes: "Only PNG images are supported. The default is png. …
+/// If you specify image/png, the HTTP response has a content-type set to image/png"
+/// (`GetMetricWidgetImageInput$OutputFormat`).
+const OUTPUT_FORMATS: [&str; 2] = ["png", "image/png"];
+
+/// The refusal this operation answers a widget definition that does not resolve over the store
+/// with ([`crate::state::metric_query::QueryRefusal`]).
+///
+/// The operation's model declares no parameter fault, so every class is answered in this
+/// service's own refusal code — the one a CloudWatch client branches on — carrying the
+/// sentence the shared resolution worded.
+fn refusal(refused: crate::state::metric_query::QueryRefusal) -> GetMetricWidgetImageError {
+    use crate::state::metric_query::QueryRefusal;
+
+    match refused {
+        QueryRefusal::InvalidValue(message) | QueryRefusal::InvalidCombination(message) => {
+            GetMetricWidgetImageError::validation_error(message)
+        }
+        QueryRefusal::Expression { id, detail } => GetMetricWidgetImageError::validation_error(
+            format!("Error in expression '{id}': {detail}"),
+        ),
+        QueryRefusal::Circular(cycle) => GetMetricWidgetImageError::validation_error(format!(
+            "Circular dependency between expressions: {}",
+            cycle.join(" -> ")
+        )),
+        // A Metrics Insights query is a `SELECT` statement in its own language, which this
+        // service does not run — the same signal `GetMetricData` gives for one.
+        QueryRefusal::MetricsInsights => crate::scaffolded::Scaffolded::not_implemented(
+            "GetMetricWidgetImage over a Metrics Insights query",
+        ),
     }
 }

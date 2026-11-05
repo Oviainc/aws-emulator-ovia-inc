@@ -85,6 +85,10 @@ pub mod metric_math;
 /// alarm's configuration is — resolved over the series this store holds.
 pub mod metric_query;
 
+/// The metric widget definition `GetMetricWidgetImage` renders, resolved over the series this
+/// store holds and drawn into the graph it answers with.
+pub mod metric_widget;
+
 /// The usage telemetry this service publishes about its own API: the `CallCount` series every
 /// served call is counted into.
 pub mod usage;

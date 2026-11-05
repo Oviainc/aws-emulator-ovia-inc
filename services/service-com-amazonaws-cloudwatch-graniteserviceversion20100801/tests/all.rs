@@ -159,6 +159,8 @@ mod metric_stream_unknown_names;
 mod metric_stream_value_rules;
 #[path = "all/metric_streams.rs"]
 mod metric_streams;
+#[path = "all/metric_widget_image.rs"]
+mod metric_widget_image;
 #[path = "all/metrics_and_alarms.rs"]
 mod metrics_and_alarms;
 #[path = "all/metrics_scalar_exclusion.rs"]

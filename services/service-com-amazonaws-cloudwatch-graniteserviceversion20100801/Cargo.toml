@@ -40,11 +40,22 @@ aws-sdk-sns = { version = "1", default-features = false }
 # GetMetricData's cursor carries a fixed-size digest of the request it was minted for, so a
 # token replayed against a different request is refused at constant token size.
 sha2 = { workspace = true }
+# `state::metric_widget::render`: the graph `GetMetricWidgetImage` answers with IS a data plot,
+# so the maintained plotting library rasterises it (its lines, columns and markers) instead of
+# a second rasteriser being written here. Only the in-memory bitmap backend is taken: no file
+# or SVG output, and no system font lookup.
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend"] }
+# The bitmap that backend draws into is encoded as the PNG the `MetricWidgetImage` blob
+# carries by the maintained encoder.
+png = "0.17"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The `MetricWidgetImage` blob arrives base64-encoded on this service's JSON wire, so the
+# widget-image suite decodes it with the maintained codec before it decodes the PNG.
+base64 = "0.22"
 # SNS is mounted beside CloudWatch on one engine in the alarm-action tests, because an
 # alarm's action is an SNS topic and a notification is asserted where a client sees it: on
 # the topic's subscription.
