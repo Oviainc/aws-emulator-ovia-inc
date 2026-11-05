@@ -459,12 +459,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minted. The name is checked BEFORE anything is minted, so a refused create
         // consumes no id.
         if !private && store.domain_names.contains_key(&input.domain_name) {
-            return Err(CreateDomainNameErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "The domain name you provided already exists: {}",
-                        input.domain_name
-                    )),
+            return Err(CreateDomainNameErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::DOMAIN_NAME_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

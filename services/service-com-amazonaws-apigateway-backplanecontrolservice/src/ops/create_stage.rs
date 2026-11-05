@@ -388,10 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateDeployment`'s `stageName` are for).
         if api.stages.contains_key(&input.stage_name) {
             return Err(CreateStageErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Stage already exists for this API: {}",
-                    input.stage_name
-                )),
+                message: Some(crate::state::STAGE_ALREADY_EXISTS.to_string()),
             })
             .into());
         }

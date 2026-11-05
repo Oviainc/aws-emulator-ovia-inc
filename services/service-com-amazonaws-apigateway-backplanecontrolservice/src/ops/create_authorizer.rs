@@ -273,9 +273,10 @@ pub const AUTHORIZER_TYPE_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
 ///   COGNITO_USER_POOLS authorizer": the pools whose tokens are accepted, so that type
 ///   cannot authorize without at least one.
 ///
-/// Every one of them is refused with [`INVALID_REQUEST_INPUT`]: API Gateway answers an
-/// authorizer whose members its type does not admit with that one sentence and names
-/// neither the member it missed nor the type that wanted it.
+/// Every one of them is refused with [`INVALID_REQUEST_INPUT`] — except the missing
+/// `authorizerUri`, which has a sentence of its own ([`AUTHORIZER_URI_REQUIRED`]): API
+/// Gateway names THAT field in the refusal and makes no claim about which member is at
+/// fault in the others.
 ///
 /// The check reads the STORED record rather than one request's members, because the same
 /// rule has to hold however the record came to look that way: the TTL it is judged
@@ -290,7 +291,7 @@ pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
         AUTHORIZER_TYPE_TOKEN | AUTHORIZER_TYPE_REQUEST
     ) && !supplied(&entry.authorizer_uri)
     {
-        return Err(INVALID_REQUEST_INPUT.to_string());
+        return Err(AUTHORIZER_URI_REQUIRED.to_string());
     }
     let caching_enabled = ttl > MIN_AUTHORIZER_RESULT_TTL_SECONDS;
     let identity_source_required = match authorizer_type {
@@ -311,6 +312,29 @@ pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
 /// one sentence API Gateway answers every one of them with, which makes no claim about
 /// which member is at fault.
 pub const INVALID_REQUEST_INPUT: &str = "Invalid request input";
+
+/// The refusal for an authorizer whose `type` needs a Lambda to call and that carries no
+/// `authorizerUri`.
+///
+/// `authorizerUri` is "the authorizer's Uniform Resource Identifier (URI) ... For TOKEN or
+/// REQUEST authorizers, this must be a well-formed Lambda function URI": those two types
+/// authorize by CALLING that URI, so an authorizer of either without one is incomplete, and
+/// API Gateway states a fixed sentence naming the field that is required. Shared by every
+/// writer of the member — the create and the patched record `UpdateAuthorizer` judges — so
+/// the same missing field is refused the same way whichever call left it out.
+pub const AUTHORIZER_URI_REQUIRED: &str = "URI is a required field in an Authorizer";
+
+/// The refusal for a value outside `AuthorizerType`, wherever that member is written.
+///
+/// `type` is "the authorizer type" and targets the modelled `AuthorizerType` enum
+/// (`smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")`), whose
+/// values are [`AUTHORIZER_TYPE_VALUES`]. API Gateway checks this member in its OWN request
+/// handling rather than leaving it to the generic constraint layer, so a value outside the
+/// catalog earns the operation's own `BadRequestException` carrying this fixed sentence —
+/// which quotes back neither the rejected value nor the catalog. The sentence belongs to the
+/// MEMBER, so the create's boundary refusal (`crate::service::validation`) and
+/// `UpdateAuthorizer`'s patch of `/type` both answer it.
+pub const INVALID_AUTHORIZER_TYPE: &str = "Invalid AuthorizerType specified.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

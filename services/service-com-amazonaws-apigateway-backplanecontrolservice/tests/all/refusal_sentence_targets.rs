@@ -528,10 +528,10 @@ async fn a_value_this_service_cannot_read_as_an_arn_earns_one_fixed_sentence() {
     const EXPECTED: &str = "Invalid ARN specified in the request";
 
     // Rows differ along the FORM of the value: a plain string and an ARN of too few fields
-    // are no ARN at all, so every member that takes an ARN refuses them; an ARN of another
-    // service and an API Gateway ARN whose resource portion names nothing taggable are
-    // well-formed ARNs that are not the ARN the TAG operations take, so those three refuse
-    // them too.
+    // are no ARN at all, so every member that takes an ARN of a STORED record refuses them;
+    // an ARN of another service and an API Gateway ARN whose resource portion names nothing
+    // taggable are well-formed ARNs that are not the ARN the TAG operations take, so those
+    // three refuse them too.
     let no_arn_at_all = ["not-a-valid-arn", "arn:aws:apigateway"];
     let not_a_taggable_resource = [
         "arn:aws:s3:::a-bucket".to_string(),
@@ -564,9 +564,10 @@ async fn a_value_this_service_cannot_read_as_an_arn_earns_one_fixed_sentence() {
         assert_refusal(&read, BAD_REQUEST, EXPECTED, &format!("GetTags({value:?})"));
     }
 
-    // The same sentence for a `targetArns` entry that is no ARN, so the refusal is the
-    // service's and not one operation's. A VPC link's target is a load balancer of any
-    // service, so only a value that is no ARN at all is one it cannot read.
+    // A `targetArns` entry that is no ARN has the MEMBER's own sentence instead: a VPC
+    // link's target is the ARN of a load balancer rather than of a record this service
+    // stores, and API Gateway states that the ARN is not well formed, quoting the value
+    // back. See the `vpc_link_target_arns` rows of `refusal_contract_sentences`.
     for value in no_arn_at_all {
         let linked = crate::vpc_links::create_vpc_link(
             &gateway,
@@ -576,7 +577,7 @@ async fn a_value_this_service_cannot_read_as_an_arn_earns_one_fixed_sentence() {
         assert_refusal(
             &linked,
             BAD_REQUEST,
-            EXPECTED,
+            &format!("Invalid ARN. ARN is not well formed {value}"),
             &format!("CreateVpcLink(targetArns {value:?})"),
         );
     }

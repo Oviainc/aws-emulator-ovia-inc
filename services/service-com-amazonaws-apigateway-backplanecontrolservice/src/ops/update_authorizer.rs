@@ -189,11 +189,12 @@ fn apply_patch(entry: &mut AuthorizerEntry, patch: &Patch) -> Result<(), PatchFa
                 patch.require_single_valued()?;
                 let value = patch.require_value()?;
                 if !AUTHORIZER_TYPE_VALUES.contains(&value) {
-                    return Err(PatchFailure::BadRequest(format!(
-                        "{} takes one of {}, got {value:?}",
-                        patch.path,
-                        AUTHORIZER_TYPE_VALUES.join(", ")
-                    )));
+                    // The sentence belongs to the MEMBER, not to the call that wrote it:
+                    // a value outside `AuthorizerType` reads the same here as it does on
+                    // the create.
+                    return Err(PatchFailure::BadRequest(
+                        crate::ops::create_authorizer::INVALID_AUTHORIZER_TYPE.to_string(),
+                    ));
                 }
             }
             patch_required_string(&mut entry.r#type, patch, MAX_STRING_CHARS)

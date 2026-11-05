@@ -172,15 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account-wide; one that names no link is the modelled not-found, including a
         // second delete of the same id, which names no link once the first one has taken
         // it away.
-        let Some(link) = store.vpc_links.get(&input.vpc_link_id) else {
+        if !store.vpc_links.contains_key(&input.vpc_link_id) {
             return Err(DeleteVpcLinkErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_VPC_LINK.to_string()),
             })
             .into());
-        };
-        // The refusal below NAMES the blocked link, and the name comes from the record
-        // resolved here rather than from the request, which carries only its id.
-        let name = link.name.clone();
+        }
 
         // An `Integration` that still names this link in its `connectionId` DEPENDS on
         // it: deleting the link would leave that integration unable to reach the VPC it
@@ -188,9 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // way this service refuses every delete a stored record still depends on. The
         // integrations are left exactly as the caller wrote them; clearing the reference
         // is the caller's own `UpdateIntegration` or `DeleteIntegration`.
-        if let Some((_, referencing)) = store.integration_referencing_vpc_link(&input.vpc_link_id) {
+        if let Some((rest_api_id, referencing)) =
+            store.integration_referencing_vpc_link(&input.vpc_link_id)
+        {
             return Err(DeleteVpcLinkErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::vpc_link_in_use(&name, &referencing)),
+                message: Some(crate::state::vpc_link_in_use(
+                    &input.vpc_link_id,
+                    &rest_api_id,
+                    &referencing,
+                )),
             })
             .into());
         }

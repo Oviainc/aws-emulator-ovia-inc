@@ -182,6 +182,9 @@ async fn an_authorizer_configuration_its_type_does_not_admit_is_refused_with_one
     const TTL_RANGE: &str =
         "Authorizer result TTL outside allowable range. TTL must be between 0 and 3600 seconds.";
     const INVALID_INPUT: &str = "Invalid request input";
+    // The one member of the three whose absence API Gateway names in the refusal; see
+    // the `authorizer_required_members` suite for the rule.
+    const URI_REQUIRED: &str = "URI is a required field in an Authorizer";
 
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "authorizer-sentences").await;
@@ -238,10 +241,10 @@ async fn an_authorizer_configuration_its_type_does_not_admit_is_refused_with_one
 
     // Rows differ along which member the authorizer's own `type` requires and the request
     // leaves out — the catalog is
-    // `smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")` — and
-    // every one of them is the SAME sentence: the service makes no claim about which member
-    // is at fault.
-    let rows: Vec<(&str, Value)> = vec![
+    // `smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")`. The
+    // missing `authorizerUri` is the one API Gateway names the field for; for the others the
+    // service makes no claim about which member is at fault.
+    let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a TOKEN authorizer with no identitySource",
             json!({
@@ -249,6 +252,7 @@ async fn an_authorizer_configuration_its_type_does_not_admit_is_refused_with_one
                 "type": "TOKEN",
                 "authorizerUri": lambda_uri("authorize"),
             }),
+            INVALID_INPUT,
         ),
         (
             "a TOKEN authorizer with no authorizerUri",
@@ -257,6 +261,7 @@ async fn an_authorizer_configuration_its_type_does_not_admit_is_refused_with_one
                 "type": "TOKEN",
                 "identitySource": "method.request.header.Auth",
             }),
+            URI_REQUIRED,
         ),
         (
             "a REQUEST authorizer with caching on and no identitySource",
@@ -265,6 +270,7 @@ async fn an_authorizer_configuration_its_type_does_not_admit_is_refused_with_one
                 "type": "REQUEST",
                 "authorizerUri": lambda_uri("authorize"),
             }),
+            INVALID_INPUT,
         ),
         (
             "a COGNITO_USER_POOLS authorizer with no providerARNs",
@@ -273,12 +279,13 @@ async fn an_authorizer_configuration_its_type_does_not_admit_is_refused_with_one
                 "type": "COGNITO_USER_POOLS",
                 "identitySource": "method.request.header.Auth",
             }),
+            INVALID_INPUT,
         ),
     ];
 
-    for (case, request) in rows {
+    for (case, request, expected) in rows {
         let answer = create_authorizer(&gateway, &api, request).await;
-        assert_refusal(&answer, BAD_REQUEST, INVALID_INPUT, case);
+        assert_refusal(&answer, BAD_REQUEST, expected, case);
     }
 }
 

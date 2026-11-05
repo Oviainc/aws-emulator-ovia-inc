@@ -361,3 +361,7 @@ mod stage_canary_and_patch_grammar;
 // invoke with, on an emulator that verifies request signatures.
 #[path = "all/stage_invoke_signed.rs"]
 mod stage_invoke_signed;
+// Appended for the reason the note above gives: the SENTENCE and the error CLASS each
+// refusal of this control plane carries.
+#[path = "all/refusal_contract_sentences.rs"]
+mod refusal_contract_sentences;

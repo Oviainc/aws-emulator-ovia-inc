@@ -246,9 +246,14 @@ async fn deleting_a_vpc_link_removes_it_unless_an_integration_still_reaches_it()
         "DeleteVpcLink while an integration reaches it",
     );
     let message = refused.body["message"].as_str().unwrap_or_default();
-    for fragment in ["the-referenced-one", "GET//pets"] {
+    // The refusal names the link by its ID and the reference as the triple API Gateway
+    // states it in — `[RESTApiId:Method:Resource]`; see the `vpc_link_in_use` rule.
+    for fragment in [
+        referenced.clone(),
+        format!("[{api}:GET:{resource}]"),
+    ] {
         assert!(
-            message.contains(fragment),
+            message.contains(&fragment),
             "case DeleteVpcLink while an integration reaches it: expected the refusal to \
              name {fragment:?}, got {message:?}"
         );

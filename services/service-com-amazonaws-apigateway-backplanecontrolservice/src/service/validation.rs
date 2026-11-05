@@ -12,8 +12,9 @@
 //!    modelled constraint is refused by the layer in FRONT of the operation, under that
 //!    layer's own class (`ValidationException`) rather than the operation's modelled
 //!    `BadRequestException` — except for the few members this service checks in its own
-//!    request handling ahead of that layer; see [`VALIDATION_EXCEPTION`] and
-//!    [`BAD_REQUEST_EXCEPTION`].
+//!    request handling ahead of that layer, which earn the operation's class AND the one
+//!    sentence it words that refusal with; see [`VALIDATION_EXCEPTION`],
+//!    [`BAD_REQUEST_EXCEPTION`] and [`SELF_VALIDATED_MEMBERS`].
 //! 1. **The member path is rooted at the operation's input shape.** AWS's own model
 //!    names an operation's input `<Operation>Input`, and the clause names the member by
 //!    its path from that root in lowerCamel — `updateDocumentationVersionInput.
@@ -58,17 +59,23 @@ pub(super) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 /// The input members this service is RECORDED checking in its own request handling,
 /// ahead of the generic constraint layer — so a value outside the member's modelled
 /// constraint is the OPERATION's semantic refusal ([`BAD_REQUEST_EXCEPTION`]) and not the
-/// layer's ([`VALIDATION_EXCEPTION`]).
+/// layer's ([`VALIDATION_EXCEPTION`]), stated in the SENTENCE that operation words it
+/// with rather than in the constraint envelope.
 ///
 /// Each entry is `(operation, the violated member's path from the operation's input
-/// shape)`. `CreateAuthorizer`'s `type` is the one such member of this service: its
-/// recorded refusal of a value outside `AuthorizerType` carries `BadRequestException`,
-/// while the recorded refusals of `CreateRestApi.endpointConfiguration.types`,
+/// shape, the sentence the operation answers)`. `CreateAuthorizer`'s `type` is the one
+/// such member of this service: its recorded refusal of a value outside `AuthorizerType`
+/// carries `BadRequestException` and the member's own sentence, while the recorded
+/// refusals of `CreateRestApi.endpointConfiguration.types`,
 /// `PutGatewayResponse.statusCode`, `PutIntegrationResponse.contentHandling` and
 /// `UpdateVpcLink.patchOperations[].op` — four members of four other operations — carry
-/// `ValidationException`. The set is therefore a property of the MEMBER and is listed,
-/// not derived.
-const SELF_VALIDATED_MEMBERS: [(&str, &str); 1] = [("CreateAuthorizer", "type")];
+/// `ValidationException` and the envelope. The set is therefore a property of the MEMBER
+/// and is listed, not derived.
+const SELF_VALIDATED_MEMBERS: [(&str, &str, &str); 1] = [(
+    "CreateAuthorizer",
+    "type",
+    crate::ops::create_authorizer::INVALID_AUTHORIZER_TYPE,
+)];
 
 /// The one enum of this service whose value set the recordings show in an order the
 /// public Smithy model does not list it in.
@@ -87,6 +94,15 @@ const OP_VALUE_SET: [&str; 6] = ["add", "remove", "move", "test", "replace", "co
 /// This service's wording for the violations the framework found on `operation`'s
 /// request, or `None` when there are none to word.
 pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refused> {
+    // A member the OPERATION checks itself is its own semantic refusal, and that refusal
+    // is one sentence of the operation's own: the constraint envelope reports which
+    // constraint a value broke, which is not what such a refusal says.
+    if let Some(stated) = stated_by_the_operation(operation, violations) {
+        return Some(Refused {
+            code: BAD_REQUEST_EXCEPTION.to_string(),
+            message: stated.to_string(),
+        });
+    }
     let root = input_root(operation);
     let stated: Vec<Violation> = violations
         .iter()
@@ -98,25 +114,28 @@ pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refus
     // cannot arrive here with wording of its own.
     let message = aws_smithy_schema_server::envelope(&stated)?;
     Some(Refused {
-        code: code_for(operation, violations).to_string(),
+        code: VALIDATION_EXCEPTION.to_string(),
         message,
     })
 }
 
-/// Which error class `operation`'s refusal belongs to: the operation's own semantic
-/// refusal when ANY violated member is one this service checks itself
-/// ([`SELF_VALIDATED_MEMBERS`]), and the constraint layer's otherwise.
-fn code_for(operation: &str, violations: &[Violation]) -> &'static str {
-    let self_validated = violations.iter().any(|violation| {
-        SELF_VALIDATED_MEMBERS
-            .iter()
-            .any(|(owner, member)| *owner == operation && *member == violation.path)
-    });
-    if self_validated {
-        BAD_REQUEST_EXCEPTION
-    } else {
-        VALIDATION_EXCEPTION
-    }
+/// The sentence `operation` words this refusal with itself, or `None` when the refusal
+/// belongs to the constraint layer.
+///
+/// A request can break more than one constraint at once; the first violated member
+/// `operation` checks itself, in the order [`SELF_VALIDATED_MEMBERS`] lists them, is the
+/// one stated — the refusal that operation makes before the layer in front of it is
+/// reached.
+fn stated_by_the_operation(operation: &str, violations: &[Violation]) -> Option<&'static str> {
+    SELF_VALIDATED_MEMBERS
+        .iter()
+        .find(|(owner, member, _)| {
+            *owner == operation
+                && violations
+                    .iter()
+                    .any(|violation| violation.path == *member)
+        })
+        .map(|(_, _, sentence)| *sentence)
 }
 
 /// The root segment of every validation path of `operation`: its input shape, named as
@@ -491,6 +510,78 @@ mod tests {
         assert!(
             stated.is_none(),
             "case no violations: expected None, got {stated:?}"
+        );
+    }
+
+    /// A member this service checks ITSELF is stated in the operation's own sentence,
+    /// whatever the constraint the value broke and whatever else the request broke with
+    /// it: the envelope reports a constraint, which is not what that refusal says.
+    #[test]
+    fn a_self_validated_member_is_stated_in_the_operations_own_sentence() {
+        let expected = crate::ops::create_authorizer::INVALID_AUTHORIZER_TYPE;
+        let outside_the_catalog = Violation {
+            path: "type".to_string(),
+            kind: ViolationKind::EnumValue(
+                ["COGNITO_USER_POOLS", "REQUEST", "TOKEN"]
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            ),
+            value: Some("NOT_A_REAL_TYPE".to_string()),
+            sensitive: false,
+        };
+        let absent = Violation {
+            path: "type".to_string(),
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+            sensitive: false,
+        };
+        let another_member = Violation {
+            path: "name".to_string(),
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+            sensitive: false,
+        };
+
+        // (case, the violations the framework found)
+        let rows: [(&str, Vec<Violation>); 3] = [
+            (
+                "a value outside the catalog",
+                vec![outside_the_catalog.clone()],
+            ),
+            ("the member left out", vec![absent]),
+            (
+                "the member and another one together",
+                vec![another_member, outside_the_catalog.clone()],
+            ),
+        ];
+
+        for (case, found) in rows {
+            let stated = refusal("CreateAuthorizer", &found)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert_eq!(
+                stated.code, BAD_REQUEST_EXCEPTION,
+                "case {case:?}: expected the code {BAD_REQUEST_EXCEPTION}, got {:?}",
+                stated.code
+            );
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
+
+        // The same member on another operation stays on the envelope, so the sentence is
+        // this member's and not the name's.
+        let elsewhere = refusal(
+            "CreateDocumentationPart",
+            std::slice::from_ref(&outside_the_catalog),
+        )
+        .expect("case another operation: expected a reworded refusal");
+        assert_ne!(
+            elsewhere.message, expected,
+            "case another operation: expected the constraint envelope, got {:?}",
+            elsewhere.message
         );
     }
 }

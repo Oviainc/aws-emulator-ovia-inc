@@ -16,7 +16,8 @@
 //! emitted without the whole-value anchors the public model adds, and an enum value set
 //! listed in the order the service declares the enum in. The ONE member this service
 //! checks itself ahead of that layer (`CreateAuthorizer$type`) carries the operation's own
-//! `BadRequestException` instead, which is the exception the last table below pins.
+//! `BadRequestException` and the operation's own SENTENCE for that member instead, which is
+//! the exception the last table below pins.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
 //! seven different operations (so the root is shown to be derived per operation, not a
@@ -91,6 +92,11 @@ const GATEWAY_RESPONSE_TYPE_VALUES: [&str; 21] = [
 /// The `AuthorizerType` value set, in the order the model declares it. Source:
 /// `smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")`.
 const AUTHORIZER_TYPE_VALUES: [&str; 3] = ["TOKEN", "REQUEST", "COGNITO_USER_POOLS"];
+
+/// The sentence `CreateAuthorizer` answers a `type` outside that value set with, written
+/// out here rather than read from the crate so a change of wording is caught rather than
+/// followed. Source: API Gateway's recorded refusal of a `type` outside the catalog.
+const INVALID_AUTHORIZER_TYPE_SENTENCE: &str = "Invalid AuthorizerType specified.";
 
 /// The `StatusCode` shape's regular expression as the service emits it: the modelled
 /// `^[1-5]\d\d$` without the whole-value anchors. Source:
@@ -293,9 +299,11 @@ async fn a_refused_request_names_the_member_by_its_path_from_the_operations_inpu
 async fn a_member_this_service_checks_itself_is_refused_as_the_operations_own_bad_request() {
     // The ONE violated member of this service whose refusal is the OPERATION's rather
     // than the constraint layer's: `CreateAuthorizer$type`, whose recorded refusal carries
-    // `BadRequestException`. The rows span the ways a value can miss that enum — an
-    // unknown word, a declared value in the wrong case, the empty string — so the code
-    // follows the MEMBER and not one recorded value.
+    // `BadRequestException` AND the operation's own sentence for that member — which
+    // reports no constraint and quotes back neither the rejected value nor the catalog.
+    // The rows span the ways a value can miss that enum — an unknown word, a declared
+    // value in the wrong case, the empty string — so both follow the MEMBER and not one
+    // recorded value.
     let rows: [(&str, &str); 3] = [
         ("an unknown word", "NOT_A_REAL_TYPE"),
         ("a declared value in the wrong case", "token"),
@@ -319,12 +327,21 @@ async fn a_member_this_service_checks_itself_is_refused_as_the_operations_own_ba
             &answer,
             case,
             BAD_REQUEST_EXCEPTION,
-            &one(&clause(
-                authorizer_type,
-                "createAuthorizerInput.type",
-                &enum_value_set(&AUTHORIZER_TYPE_VALUES),
-            )),
+            INVALID_AUTHORIZER_TYPE_SENTENCE,
         );
+        let message = answer.body["message"].as_str().unwrap_or_default();
+        // The sentence states the member and nothing else: not the rejected value, not
+        // the catalog it missed, and not the constraint envelope.
+        for absent in AUTHORIZER_TYPE_VALUES
+            .iter()
+            .copied()
+            .chain([authorizer_type, "validation error"])
+        {
+            assert!(
+                absent.is_empty() || !message.contains(absent),
+                "case {case}: expected the sentence to carry no {absent:?}, got {message:?}"
+            );
+        }
     }
 
     // Another member of the SAME operation stays on the constraint layer's class, which

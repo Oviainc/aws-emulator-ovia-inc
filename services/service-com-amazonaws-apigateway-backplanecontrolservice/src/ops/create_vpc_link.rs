@@ -156,7 +156,7 @@ fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
     for target in &input.target_arns {
         bound_chars("a targetArns entry", target, MAX_STRING_CHARS)?;
         if ::service_common::arn::parse(target).is_none() {
-            return Err(crate::state::INVALID_ARN.to_string());
+            return Err(crate::state::target_arn_is_not_well_formed(target));
         }
     }
     // The tags a create carries are checked by the SAME rule `TagResource` applies, so

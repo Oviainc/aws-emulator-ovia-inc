@@ -24,7 +24,7 @@
 //! * `domainName` is read as a domain name, over a table of names spanning the DNS
 //!   grammar's bounds — each published label and total length bound and one past each, a
 //!   wildcard name, and the ways a name is not one;
-//! * a name identifies at most one non-private record (a second create is a conflict)
+//! * a name identifies at most one non-private record (a second create is refused)
 //!   while a private record is addressed by its `domainNameId` as well, so several
 //!   private records may carry one name;
 //! * a read changes nothing a later caller sees.
@@ -51,7 +51,6 @@ use crate::tag_reads_by_arn::{apigateway_arn, get_tags};
 
 const BAD_REQUEST: &str = "BadRequestException";
 const NOT_FOUND: &str = "NotFoundException";
-const CONFLICT: &str = "ConflictException";
 
 /// `CreateDomainName` with `body`.
 async fn create_domain(gateway: &Gateway, body: Value) -> Answer {
@@ -766,7 +765,7 @@ async fn a_name_identifies_one_public_record_and_a_private_one_by_its_id_as_well
 
     let public = created_domain(&gateway, domain_name, json!({})).await;
 
-    // A second create of the same non-private name is the conflict `ConflictException`
+    // A second create of the same non-private name is the refusal `BadRequestException`
     // states for this operation, not a second record.
     for case in ["the same name again", "the same name, regional"] {
         let body = if case.ends_with("regional") {
@@ -775,7 +774,7 @@ async fn a_name_identifies_one_public_record_and_a_private_one_by_its_id_as_well
             json!({ "domainName": domain_name })
         };
         let answer = create_domain(&gateway, body).await;
-        assert_failure(&answer, 409, CONFLICT, case);
+        assert_failure(&answer, 400, BAD_REQUEST, case);
     }
 
     // A private record carries a `domainNameId`, so several of them may carry one name.
@@ -798,7 +797,7 @@ async fn a_name_identifies_one_public_record_and_a_private_one_by_its_id_as_well
     // The rule in both orders: at most ONE non-private record per name, however many
     // private records carry it. A private record already stored (this suite created two
     // AFTER the public one above, the other order) therefore does not block the first
-    // non-private create of that name, and the second one is still the conflict.
+    // non-private create of that name, and the second one is still refused.
     let mixed = "mixed.example.com";
     created_domain(
         &gateway,
@@ -815,8 +814,8 @@ async fn a_name_identifies_one_public_record_and_a_private_one_by_its_id_as_well
     let twice = create_domain(&gateway, json!({ "domainName": mixed })).await;
     assert_failure(
         &twice,
-        409,
-        CONFLICT,
+        400,
+        BAD_REQUEST,
         "a second non-private create of a name a non-private record already holds",
     );
 

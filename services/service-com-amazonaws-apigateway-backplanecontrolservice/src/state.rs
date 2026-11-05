@@ -483,6 +483,7 @@ impl RestApiEntry {
                     MethodReference {
                         http_method: verb.clone(),
                         resource_path: resource.path.clone(),
+                        resource_id: resource.id.clone(),
                     },
                     method,
                 ));
@@ -497,13 +498,19 @@ impl RestApiEntry {
 }
 
 /// One method of an API, as a refusal that is BLOCKED BY it names it: the verb and the
-/// resource path, which is how API Gateway identifies a method in such a sentence.
+/// resource the method sits on, which is how API Gateway identifies a method in such a
+/// sentence — by the resource's PATH in some of them and by its ID in others, so the
+/// reference carries both and each refusal takes the one its own sentence states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodReference {
     /// The method's uppercase HTTP verb.
     pub http_method: String,
     /// The materialised path of the resource the method sits on, leading `/` included.
     pub resource_path: String,
+    /// The id of the resource the method sits on — the `Resource$id` a refusal that
+    /// identifies the method by its RESOURCE IDENTIFIER names (see
+    /// [`vpc_link_in_use`]).
+    pub resource_id: String,
 }
 
 impl ::std::fmt::Display for MethodReference {
@@ -4013,6 +4020,16 @@ pub const NO_SUCH_METHOD_RESPONSE: &str = "Invalid Response status code specifie
 /// The `NotFoundException` message for a `stageName` that names no stage of the API.
 pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";
 
+/// The `ConflictException` message for a `stageName` the addressed API already has a stage
+/// under: a stage name names ONE stage of an API, so creating a second one under that name
+/// is refused rather than replacing the stage the first one stored.
+///
+/// A SENTENCE OF ITS OWN, like [`METHOD_RESPONSE_ALREADY_EXISTS`]: API Gateway states this
+/// collision as entirely fixed text and quotes back neither the name the request sent nor
+/// the API it was sent to. One copy, so every call that refuses a stage-name collision
+/// words it the same way.
+pub const STAGE_ALREADY_EXISTS: &str = "Stage already exists";
+
 /// The `NotFoundException` message for a `deploymentId` that names no stored deployment.
 /// The resource type is CAPITALISED here, as it is in the `Resource` / `Method` /
 /// `Integration` siblings above and unlike the `stage` one below: that is the spelling the
@@ -4111,6 +4128,17 @@ pub fn usage_plan_has_api_stages(usage_plan_id: &str, api_id: &str, stage_name: 
 /// identifier messages above. Shared by every operation that resolves a domain name, so
 /// all of them say the same thing about the same failure.
 pub const NO_SUCH_DOMAIN_NAME: &str = "Invalid domain name identifier specified";
+
+/// The `BadRequestException` message for a `domainName` this account already holds a
+/// non-private custom domain name under.
+///
+/// `CreateDomainName` declares both `BadRequestException` (400) and `ConflictException`
+/// (409) (`smithy_query(query="operation", operation="CreateDomainName")`), and API Gateway
+/// answers THIS condition with the 400: a domain name is a globally unique name, so a
+/// second create under one name is a request that cannot be served rather than a transient
+/// conflict a caller retries. A SENTENCE OF ITS OWN, ending in a full stop and quoting back
+/// neither the name the request sent nor the record it collided with.
+pub const DOMAIN_NAME_ALREADY_EXISTS: &str = "The domain name you provided already exists.";
 
 /// The `NotFoundException` message for a `basePath` the addressed custom domain name
 /// carries no mapping for, in the shape of the sibling identifier messages above. Shared
@@ -4283,7 +4311,7 @@ pub fn invalid_model_name(name: &str) -> String {
 /// payload the model describes, so a value that is not one types nothing. BUILT FROM THE
 /// REQUEST, in the shape of the sibling invalid-value messages above.
 pub fn invalid_model_content_type(content_type: &str) -> String {
-    format!("Invalid content type specified {content_type}")
+    format!("Invalid content type specified: {content_type}")
 }
 
 /// The `BadRequestException` message for a `schema` that is not a schema document for the
@@ -4298,6 +4326,20 @@ pub fn invalid_model_content_type(content_type: &str) -> String {
 /// an update made it.
 pub const INVALID_MODEL_SCHEMA: &str = "Invalid model specified: Validation Result: \
      warnings : [], errors : [Invalid model schema specified]";
+
+/// The `BadRequestException` message for a `targetArns` entry a VPC-link create could not
+/// read as an ARN.
+///
+/// A VPC link's target is "The ARN of the network load balancer of the VPC targeted by the
+/// VPC link" (`VpcLink$targetArns`), and API Gateway states this member's own sentence for
+/// a value that is no ARN: fixed text saying the ARN is not well formed, then the offending
+/// value exactly as the request spelled it, which is the only variable part. It is NOT the
+/// service-wide [`INVALID_ARN`] sentence — that one is what the members an ARN of a STORED
+/// resource rides on answer (a `resourceArn`, a patch value), as their own recorded refusals
+/// show.
+pub fn target_arn_is_not_well_formed(target_arn: &str) -> String {
+    format!("Invalid ARN. ARN is not well formed {target_arn}")
+}
 
 /// The `NotFoundException` message for a `vpcLinkId` that names no stored VPC link, in
 /// the shape of the sibling identifier messages above.
@@ -4323,12 +4365,21 @@ pub const VPC_LINK_NEEDS_A_TARGET: &str = "Need at least one target arn to creat
 /// reference stands (see
 /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::integration_referencing_vpc_link`]).
 ///
-/// BUILT FROM STATE, in the shape of the sibling in-use refusals ([`authorizer_in_use`],
-/// [`model_in_use`]): the fixed text names the condition and the variable parts are the
-/// link's own name and the method whose integration still reaches it, so a client is told
-/// which integration has to be changed first.
-pub fn vpc_link_in_use(vpc_link_name: &str, referencing: &MethodReference) -> String {
-    format!("Cannot delete VPC link '{vpc_link_name}', is referenced in integration: {referencing}")
+/// BUILT FROM STATE: the fixed text names the condition and the FORMAT the reference is
+/// stated in, and the variable parts are the link's own id — the identifier the caller
+/// addressed it by — and the reference as that format spells it: the id of the API, the
+/// method's verb and the id of the resource the method sits on, so a client is told which
+/// integration has to be changed first and can address each part of it.
+pub fn vpc_link_in_use(
+    vpc_link_id: &str,
+    rest_api_id: &str,
+    referencing: &MethodReference,
+) -> String {
+    format!(
+        "Cannot delete vpc link. Vpc link '{vpc_link_id}', is referenced in \
+         [{rest_api_id}:{}:{}] in format of [RESTApiId:Method:Resource].",
+        referencing.http_method, referencing.resource_id
+    )
 }
 
 /// The `statusMessage` of a VPC link whose provisioning FAILED because one of its target
