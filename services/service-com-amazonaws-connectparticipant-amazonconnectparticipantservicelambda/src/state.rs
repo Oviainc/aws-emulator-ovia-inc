@@ -120,10 +120,10 @@ pub struct ChatSession {
     pub participant_role: String,
     /// That participant's chat display name, when one is known.
     ///
-    /// Always absent for now: no input this service models carries a display name — it
-    /// reaches a chat through `StartChatContact` on the connect service, whose own
-    /// bootstrap is a separate gap. The field exists so `Item$DisplayName` has one
-    /// source once that lands, rather than being invented per item.
+    /// Its one source is the `ParticipantDetails` the chat was started with on the
+    /// connect service (`StartChatContact`), which writes the session here: no input
+    /// THIS service models carries a display name, so a session created by
+    /// `CreateParticipantConnection` for a token no started chat registered has none.
     pub display_name: Option<String>,
     /// False once `DisconnectParticipant` ran: every later call is refused.
     pub connected: bool,
@@ -367,6 +367,17 @@ fn millisecond_precision(rendered: &str) -> String {
             format!("{head}.{digits}Z")
         }
     }
+}
+
+/// The websocket URL a connection token is reached on, as the `Websocket$Url` of this
+/// service's `CreateParticipantConnection` and of the connect service's
+/// `StartChatContact` — both of which mint a connection token and report the URL for
+/// it, so the form lives here and neither spells it itself.
+///
+/// `host` is the endpoint the URL names; the token travels in the query string, which is
+/// how a client that can only open a URL carries it.
+pub fn websocket_url(host: &str, connection_token: &str) -> String {
+    format!("wss://{host}/participant/websocket?connectionToken={connection_token}")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

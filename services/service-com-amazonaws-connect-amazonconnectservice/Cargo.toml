@@ -26,6 +26,13 @@ hex = { workspace = true }
 # SHA-256: the minted instance and queue identifiers are a digest of the store's
 # mint counter, laid out in the v4-UUID form the model's id members carry.
 sha2 = { workspace = true }
+# The endpoint host a request reached this emulator on, for the websocket URL
+# `StartChatContact` reports.
+service-common = { path = "../common" }
+# The chat session a started chat hands the Connect Participant Service: that service
+# owns the transcript and the connection tokens a chat participant calls with, and its
+# own API has no call that creates a chat.
+service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

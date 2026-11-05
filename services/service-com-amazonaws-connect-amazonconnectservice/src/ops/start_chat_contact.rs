@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartChatContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartChatContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Starts a chat: mints the contact, the participant and the participant
+//! token, records the chat on its instance, and writes the chat SESSION into the Connect
+//! Participant Service's store — the service that serves the chat's data plane and whose
+//! own API has no call that creates one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartChatContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this slice does, and what it leaves alone:
+//!
+//! * The chat is REAL on both sides: the participant token this returns resolves there
+//!   to the session recorded here, so the transcript carries this participant's id, role
+//!   and display name, and an `InitialMessage` is the chat's first transcript item.
+//! * `ConnectionTypes` is served for the two values the member documents as the ones
+//!   "this operation acts on" — `CONNECTION_CREDENTIALS` and `WEBSOCKET` — by minting a
+//!   connection token bound to the session, which is the same token
+//!   `CreateParticipantConnection` would hand out. No websocket listener is mounted for
+//!   the URL in this slice (that data plane is the participant service's own gap); any
+//!   other `ConnectionType` returns no connection information, as the member states.
+//! * A persistent chat continues the session its `SourceContactId` names: the new
+//!   contact keeps that session's initial contact, reports it as
+//!   `ContinuedFromContactId` and is rehydrated with its transcript.
+//! * `ChatStreamingConfiguration` is recorded with a `StreamingId`; publishing the
+//!   stream to an SNS topic is `StartContactStreaming`'s own gap, so nothing is
+//!   published and no success is reported for it beyond the recorded configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +190,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The Connect Participant Service, whose store holds the chat's data-plane half: the
+/// session this operation writes, its transcript and the connection tokens that reach it.
+use ::service_com_amazonaws_connectparticipant_amazonconnectparticipantservicelambda as participant;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -249,18 +266,434 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartChatContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartChatContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartChatContact"))
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // Every rule the model cannot state is checked before anything is minted or
+        // stored, so a refused request leaves no chat and no identifier behind.
+        let wanted = wanted_connection_information(input.connection_types.as_deref());
+        let supported_content_types = supported_content_types(&input)?;
+        if let Some(message) = input.initial_message.as_ref() {
+            if !crate::state::CHAT_MESSAGE_CONTENT_TYPES.contains(&message.content_type.as_str()) {
+                return Err(invalid_parameter(format!(
+                    "InitialMessage.ContentType is '{}', which is not a supported chat message \
+                     content type; expected one of [{}]",
+                    message.content_type,
+                    crate::state::CHAT_MESSAGE_CONTENT_TYPES.join(", ")
+                )));
+            }
+        }
+        if let Some(problem) = input
+            .attributes
+            .as_ref()
+            .and_then(crate::state::attributes_problem)
+        {
+            return Err(invalid_parameter(problem));
+        }
+        // "You cannot provide data for both RelatedContactId and PersistentChat"
+        // (`StartChatContactRequest$RelatedContactId`).
+        if input.related_contact_id.is_some() && input.persistent_chat.is_some() {
+            return Err(StartChatContactErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You cannot provide data for both RelatedContactId and PersistentChat"
+                            .to_string(),
+                    ),
+                    // The modelled `reason` union carries only an attached-file reason,
+                    // which this refusal is not one of.
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        let rehydration = rehydration_type(input.persistent_chat.as_ref())?;
+
+        let Some(contacts) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable_store("the Amazon Connect store"));
+        };
+        let Some(chats) = crate::state::chat_session_state(&*self.engine) else {
+            return Err(unavailable_store("the chat-session store"));
+        };
+        // LOCK ORDER: this service's store first, the chat-session store second — the
+        // order `crate::state::chat_session_state` documents. Both are held for the
+        // whole write, so the contact and the session it hands over land together.
+        let mut store = contacts.lock();
+        let mut sessions = chats.lock();
+        // Reclaim what the clock has already retired on the data-plane side before
+        // anything new is written there.
+        sessions.prune_expired(now);
+
+        // Minted before the instance is borrowed, so the borrow below is the only one.
+        // Identifiers need not be contiguous: a refused start leaves its ids unused.
+        let contact_id = store.mint_resource_id();
+        let participant_id = store.mint_resource_id();
+        let streaming_id = store.mint_resource_id();
+        let participant_token = store.mint_participant_token();
+
+        let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
+            StartChatContactErrorModeled::ResourceNotFoundException(
+                crate::state::instance_not_found(&input.instance_id),
+            )
+        })?;
+        // The chat is started by a flow of the instance, so an identifier that names no
+        // flow starts nothing.
+        if instance
+            .contact_flow_for_label(&input.contact_flow_id)
+            .is_none()
+        {
+            return Err(StartChatContactErrorModeled::ResourceNotFoundException(
+                crate::state::contact_flow_not_found(&input.contact_flow_id, &input.instance_id),
+            )
+            .into());
+        }
+
+        // A repeat of a request reports the contact that request already started: "When
+        // you retry a request with the same ClientToken, the response repeats the
+        // original contact" (`StartChatContactRequest$ConnectionTypes`).
+        let client_token = input.client_token.as_deref().filter(|it| !it.is_empty());
+        if let Some(started) = client_token
+            .and_then(|token| instance.chat_contact_started_with_token(token))
+            .cloned()
+        {
+            return answer(&started, &mut sessions, wanted, &region, ctx, now);
+        }
+
+        // A persistent chat continues a past chat of this instance. `FROM_SEGMENT`
+        // rehydrates "the past chat contact that is specified in the sourceContactId
+        // field"; `ENTIRE_PAST_SESSION` rehydrates "the most recently terminated past
+        // chat contact of the specified past ended chat session", whose `sourceContactId`
+        // is that session's initial contact.
+        let continued_from = match rehydration.as_ref() {
+            None => None,
+            Some((kind, source)) => {
+                let source = instance.chat_contacts.get(source).ok_or_else(|| {
+                    StartChatContactErrorModeled::ResourceNotFoundException(
+                        crate::state::chat_contact_not_found(source, &input.instance_id),
+                    )
+                })?;
+                let continued = if kind == REHYDRATION_FROM_SEGMENT {
+                    source.clone()
+                } else {
+                    instance
+                        .newest_chat_contact_of_session(&source.initial_contact_id)
+                        .unwrap_or(source)
+                        .clone()
+                };
+                Some(continued)
+            }
+        };
+
+        // Both stores are bounded, and a start that neither can hold is refused with the
+        // error this operation documents for an exhausted chat quota rather than served.
+        if !instance.reserve_chat_contact_slot(now) {
+            return Err(chat_quota_exceeded(format!(
+                "The maximum number of concurrent active chats ({}) for this instance has been \
+                 reached; end a chat before starting another",
+                crate::state::CHAT_CONTACTS_PER_INSTANCE_QUOTA
+            )));
+        }
+        if sessions.sessions.len() >= participant::state::MAX_SESSIONS {
+            return Err(chat_quota_exceeded(format!(
+                "The maximum number of concurrent active chats ({}) has been reached; end a chat \
+                 before starting another",
+                participant::state::MAX_SESSIONS
+            )));
+        }
+        // The transcript the new chat starts from: a persistent chat is rehydrated with
+        // the past session's items. It is bounded like any other transcript, so a chat
+        // that would start already past that bound is refused before anything is written
+        // rather than stored over it.
+        let rehydrated = continued_from
+            .as_ref()
+            .and_then(|past| sessions.sessions.get(&past.id))
+            .map(|past| past.transcript.clone())
+            .unwrap_or_default();
+        if rehydrated.len() + usize::from(input.initial_message.is_some())
+            > participant::state::MAX_TRANSCRIPT_ITEMS
+        {
+            return Err(chat_quota_exceeded(format!(
+                "A chat transcript holds up to {} items, and rehydrating this chat would start it \
+                 past that",
+                participant::state::MAX_TRANSCRIPT_ITEMS
+            )));
+        }
+
+        let record = crate::state::ChatContactRecord {
+            id: contact_id.clone(),
+            initial_contact_id: continued_from
+                .as_ref()
+                .map_or_else(|| contact_id.clone(), |past| past.initial_contact_id.clone()),
+            continued_from_contact_id: continued_from.as_ref().map(|past| past.id.clone()),
+            related_contact_id: input.related_contact_id.clone(),
+            participant_id,
+            participant_token: participant_token.clone(),
+            display_name: input.participant_details.display_name.clone(),
+            attributes: crate::state::tags_in(input.attributes.clone()),
+            segment_attributes: input
+                .segment_attributes
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            customer_id: input.customer_id.clone(),
+            disconnect_on_customer_exit: input
+                .disconnect_on_customer_exit
+                .clone()
+                .unwrap_or_default(),
+            participant_response_mode: input
+                .participant_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.response_mode.clone()),
+            supported_messaging_content_types: supported_content_types,
+            streaming: input
+                .chat_streaming_configuration
+                .as_ref()
+                .map(|configuration| crate::state::ChatStreaming {
+                    id: streaming_id,
+                    streaming_endpoint_arn: configuration.streaming_endpoint_arn.clone(),
+                }),
+            client_token: client_token.map(str::to_string),
+            started_at: now,
+            ends_at: now + crate::state::chat_duration(input.chat_duration_in_minutes),
+        };
+        instance.chat_contacts.insert(contact_id.clone(), record.clone());
+
+        // The data-plane half: the session the participant token reaches, its rehydrated
+        // transcript and the chat's first message.
+        let mut session = crate::state::chat_session_for(&record);
+        session.transcript = rehydrated;
+        if let Some(message) = input.initial_message {
+            session.append(
+                participant::state::CHAT_ITEM_TYPE_MESSAGE,
+                Some(message.content),
+                message.content_type,
+                None,
+                now,
+            );
+        }
+        sessions.sessions.insert(contact_id.clone(), session);
+        sessions
+            .participant_tokens
+            .insert(participant_token, contact_id);
+
+        answer(&record, &mut sessions, wanted, &region, ctx, now)
     }
+}
+
+/// `RehydrationType$FROM_SEGMENT`, the form that rehydrates the contact named rather
+/// than the newest one of its session.
+const REHYDRATION_FROM_SEGMENT: &str = "FROM_SEGMENT";
+
+/// Which kinds of connection information one call reports.
+#[derive(Debug, Clone, Copy)]
+struct WantedConnectionInformation {
+    /// `CONNECTION_CREDENTIALS` was requested: "Returns a connection token."
+    credentials: bool,
+    /// `WEBSOCKET` was requested: "Returns a websocket URL."
+    websocket: bool,
+}
+
+impl WantedConnectionInformation {
+    /// Whether this call reports connection information at all — and so whether it mints
+    /// the connection token that information carries.
+    fn any(self) -> bool {
+        self.credentials || self.websocket
+    }
+}
+
+/// The connection information `connection_types` asks for.
+///
+/// "WEBSOCKET and CONNECTION_CREDENTIALS are the values this operation acts on. No other
+/// value returns connection information" (`StartChatContactRequest$ConnectionTypes`), so
+/// a request naming another member of the enum is served and simply reports none. A
+/// value the enum does not carry at all never reaches here: the boundary validator
+/// refuses it as a `ValidationException` before this handler runs.
+fn wanted_connection_information(
+    connection_types: Option<&[String]>,
+) -> WantedConnectionInformation {
+    let requested = connection_types.unwrap_or_default();
+    WantedConnectionInformation {
+        credentials: requested
+            .iter()
+            .any(|value| value == CONNECTION_TYPE_CONNECTION_CREDENTIALS),
+        websocket: requested
+            .iter()
+            .any(|value| value == CONNECTION_TYPE_WEBSOCKET),
+    }
+}
+
+/// `CONNECTION_CREDENTIALS` and `WEBSOCKET`, the two `ConnectionType` values this
+/// operation acts on.
+const CONNECTION_TYPE_CONNECTION_CREDENTIALS: &str = "CONNECTION_CREDENTIALS";
+/// See [`CONNECTION_TYPE_CONNECTION_CREDENTIALS`].
+const CONNECTION_TYPE_WEBSOCKET: &str = "WEBSOCKET";
+
+/// The content types the chat is started with.
+///
+/// "Content types must always contain text/plain" and the supported set is the one
+/// `SupportedMessagingContentTypes` documents, so a list missing the required type or
+/// naming an unsupported one is refused. A request that sends no list gets the one type
+/// every chat has to support.
+fn supported_content_types(input: &StartChatContactInput) -> Result<Vec<String>, StartChatContactError> {
+    let Some(requested) = input.supported_messaging_content_types.as_ref() else {
+        return Ok(vec![
+            crate::state::REQUIRED_MESSAGING_CONTENT_TYPE.to_string()
+        ]);
+    };
+    if let Some(unsupported) = requested
+        .iter()
+        .find(|value| !crate::state::SUPPORTED_MESSAGING_CONTENT_TYPES.contains(&value.as_str()))
+    {
+        return Err(invalid_parameter(format!(
+            "SupportedMessagingContentTypes contains '{unsupported}', which is not a supported \
+             chat message content type; expected one of [{}]",
+            crate::state::SUPPORTED_MESSAGING_CONTENT_TYPES.join(", ")
+        )));
+    }
+    if !requested
+        .iter()
+        .any(|value| value == crate::state::REQUIRED_MESSAGING_CONTENT_TYPE)
+    {
+        return Err(invalid_parameter(format!(
+            "SupportedMessagingContentTypes must always contain {}",
+            crate::state::REQUIRED_MESSAGING_CONTENT_TYPE
+        )));
+    }
+    Ok(requested.clone())
+}
+
+/// The rehydration a `PersistentChat` asks for: its type and the past contact it names.
+///
+/// Both members are required of a persistent chat: "RehydrationType is required for
+/// persistent chat", and each of its two forms rehydrates the chat the `sourceContactId`
+/// field names (`PersistentChat$RehydrationType`) — rules the model states in prose and
+/// does not express, so they are checked here. Which values the type may carry the
+/// boundary validator already settles.
+fn rehydration_type(
+    persistent_chat: Option<&PersistentChat>,
+) -> Result<Option<(String, String)>, StartChatContactError> {
+    let Some(persistent_chat) = persistent_chat else {
+        return Ok(None);
+    };
+    let Some(kind) = persistent_chat.rehydration_type.as_ref() else {
+        return Err(invalid_parameter(
+            "RehydrationType is required for persistent chat",
+        ));
+    };
+    let Some(source) = persistent_chat.source_contact_id.as_ref() else {
+        return Err(invalid_parameter(
+            "SourceContactId is required for persistent chat",
+        ));
+    };
+    Ok(Some((kind.clone(), source.clone())))
+}
+
+/// The response for the chat `record` holds, minting the connection token the
+/// information this call reports is carried by.
+///
+/// A retry of a request mints a fresh connection token the same way
+/// `CreateParticipantConnection` does — a connection token belongs to the call that
+/// reported it, not to the chat — and the contact, participant and participant token it
+/// repeats are the ones the first call stored.
+///
+/// A chat whose own window the clock has closed reports no connection information: there
+/// is no live session for a token to reach, which is the case the member's own note
+/// names — "can omit a websocket URL if the chat has already ended".
+fn answer(
+    record: &crate::state::ChatContactRecord,
+    sessions: &mut participant::state::ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState,
+    wanted: WantedConnectionInformation,
+    region: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    now: ::std::time::SystemTime,
+) -> Result<StartChatContactOutput, StartChatContactError> {
+    let mut output = StartChatContactOutput {
+        contact_id: Some(record.id.clone()),
+        participant_id: Some(record.participant_id.clone()),
+        participant_token: Some(record.participant_token.clone()),
+        continued_from_contact_id: record.continued_from_contact_id.clone(),
+        connection_credentials: None,
+        websocket: None,
+        streaming_id: record.streaming.as_ref().map(|streaming| streaming.id.clone()),
+    };
+    let live = record.is_active(now)
+        && sessions
+            .sessions
+            .get(&record.id)
+            .is_some_and(|session| session.connected);
+    if !wanted.any() || !live {
+        return Ok(output);
+    }
+    if sessions.connection_count(&record.id) >= participant::state::MAX_CONNECTIONS_PER_SESSION {
+        return Err(chat_quota_exceeded(format!(
+            "This participant already holds its {} open-connection limit",
+            participant::state::MAX_CONNECTIONS_PER_SESSION
+        )));
+    }
+
+    let expiry = crate::state::connection_token_expiry(record, now);
+    let connection_token = participant::state::new_id();
+    sessions.connections.insert(
+        connection_token.clone(),
+        participant::state::ConnectionBinding {
+            contact_id: record.id.clone(),
+            expiry,
+        },
+    );
+    if wanted.credentials {
+        output.connection_credentials = Some(ConnectionCredentials {
+            connection_token: Some(connection_token.clone()),
+            expiry: Some(participant::state::format_instant(expiry)),
+        });
+    }
+    if wanted.websocket {
+        // The URL names the host the caller actually reached, so it addresses an endpoint
+        // the caller can already talk to rather than one this emulator does not serve.
+        let host = ::service_common::data_plane_addressing::reached_endpoint_host(
+            &ctx.parts().uri.to_string(),
+            ctx.parts()
+                .headers
+                .get(::http::header::HOST)
+                .and_then(|value| value.to_str().ok()),
+            PARTICIPANT_ENDPOINT_PREFIX,
+            region,
+        );
+        output.websocket = Some(Websocket {
+            url: Some(participant::state::websocket_url(&host, &connection_token)),
+            connection_expiry: Some(participant::state::format_instant(
+                now + participant::state::WEBSOCKET_CONNECT_TTL,
+            )),
+        });
+    }
+    Ok(output)
+}
+
+/// The endpoint prefix of the Connect Participant Service, which the websocket URL names
+/// when the request itself named no host to report it on.
+const PARTICIPANT_ENDPOINT_PREFIX: &str = "participant.connect";
+
+/// Refuse the request: one or more of its parameters are not valid.
+fn invalid_parameter(message: impl Into<String>) -> StartChatContactError {
+    StartChatContactErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse the start: a store this chat needs is full. The error this operation documents
+/// for an exhausted chat quota — "The quota for concurrent active chats is exceeded.
+/// Active chat throttling returns a LimitExceededException."
+fn chat_quota_exceeded(message: impl Into<String>) -> StartChatContactError {
+    StartChatContactErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Fail the request: a store this operation reads is unavailable.
+fn unavailable_store(store: &str) -> StartChatContactError {
+    StartChatContactErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some(format!("{store} is unavailable")),
+    })
+    .into()
 }

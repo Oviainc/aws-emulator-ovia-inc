@@ -31,5 +31,7 @@ mod instance_registry_seam;
 mod instance_storage_config;
 #[path = "all/phone_number_inventory.rs"]
 mod phone_number_inventory;
+#[path = "all/start_chat_contact.rs"]
+mod start_chat_contact;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

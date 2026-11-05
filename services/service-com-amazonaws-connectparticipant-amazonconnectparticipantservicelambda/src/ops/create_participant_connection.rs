@@ -387,9 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         Ok(CreateParticipantConnectionOutput {
             websocket: websocket_host.map(|host| Websocket {
-                url: Some(format!(
-                    "wss://{host}/participant/websocket?connectionToken={connection_token}"
-                )),
+                url: Some(crate::state::websocket_url(&host, &connection_token)),
                 connection_expiry: Some(crate::state::format_instant(websocket_expiry)),
             }),
             connection_credentials: wants_credentials.then(|| ConnectionCredentials {

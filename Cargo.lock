@@ -8298,6 +8298,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

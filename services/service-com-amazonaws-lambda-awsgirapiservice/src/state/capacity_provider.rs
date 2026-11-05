@@ -131,10 +131,9 @@ pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
 /// this account an ARN names, how IAM is asked, or how a trust document is read.
 ///
 /// `false` — do not refuse — wherever nothing is KNOWN: a value that names no role of THIS
-/// account (another account's IAM is not this emulator's to ask), a name this account's IAM
-/// holds no role under, an emulator with no IAM mounted to ask at all, and an answer this
-/// emulator could not read. The principal that has to be admitted is the one a function's
-/// execution role admits
+/// account (another account's IAM is not this emulator's to ask), an emulator with no IAM
+/// mounted to ask at all, and an answer this emulator could not read. The principal that has
+/// to be admitted is the one a function's execution role admits
 /// ([`super::EXECUTION_ROLE_PRINCIPAL`]): this service is what assumes both.
 pub async fn operator_role_is_unassumable(
     ctx: &smithy_server_runtime::OperationContext<'_>,

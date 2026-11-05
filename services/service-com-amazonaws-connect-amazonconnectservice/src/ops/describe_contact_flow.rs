@@ -172,12 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contact_flow_for_label(&input.contact_flow_id)
             .ok_or_else(|| {
                 DescribeContactFlowErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Flow not found: {} in instance {}",
-                            input.contact_flow_id, input.instance_id
-                        )),
-                    },
+                    crate::state::contact_flow_not_found(
+                        &input.contact_flow_id,
+                        &input.instance_id,
+                    ),
                 )
             })?;
 

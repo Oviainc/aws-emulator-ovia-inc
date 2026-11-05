@@ -23,6 +23,18 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// The chat half of the instance: what `StartChatContact` records here and what it
+/// hands the Connect Participant Service. Its own file because it is one concern of
+/// its own, and it is re-exported so a handler reaches it through `crate::state` like
+/// everything else here.
+mod chat_contacts;
+pub use chat_contacts::{
+    attributes_problem, chat_contact_not_found, chat_duration, chat_session_for,
+    chat_session_state, connection_token_expiry, ChatContactRecord, ChatStreaming,
+    CHAT_CONTACTS_PER_INSTANCE_QUOTA, CHAT_DURATION_DEFAULT_MINUTES, CHAT_MESSAGE_CONTENT_TYPES,
+    MAX_ATTRIBUTES_BYTES, REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
+};
+
 use crate::ops::types::{
     AvailableNumberSummary, ClaimedPhoneNumberSummary, ContactFlow, ContactFlowSummary,
     HoursOfOperation, HoursOfOperationConfig, HoursOfOperationSummary, HoursOfOperationTimeSlice,
@@ -885,6 +897,9 @@ pub struct InstanceRecord {
     /// why the default queue's hours live here rather than beside it. Bounded by
     /// [`HOURS_OF_OPERATIONS_PER_INSTANCE_QUOTA`].
     pub hours_of_operations: BTreeMap<String, HoursOfOperationRecord>,
+    /// The chats `StartChatContact` started in this instance, keyed by contact id.
+    /// Bounded by [`CHAT_CONTACTS_PER_INSTANCE_QUOTA`].
+    pub chat_contacts: BTreeMap<String, ChatContactRecord>,
     /// This instance's storage configurations, keyed by association id — the one
     /// record `AssociateInstanceStorageConfig` writes and
     /// `DescribeInstanceStorageConfig` projects.
@@ -931,6 +946,7 @@ impl InstanceRecord {
             queues: BTreeMap::new(),
             contact_flows: BTreeMap::new(),
             hours_of_operations: BTreeMap::new(),
+            chat_contacts: BTreeMap::new(),
             storage_configs: BTreeMap::new(),
         }
     }
@@ -1525,6 +1541,23 @@ pub fn instance_access_url(alias: Option<&str>, instance_id: &str) -> String {
 pub fn instance_not_found(instance_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Instance {instance_id} not found")),
+    }
+}
+
+/// Connect's refusal for a `ContactFlowId` that names no flow of `instance_id` —
+/// including one of the forms `DescribeContactFlow` documents for the label (the bare
+/// id, the flow's ARN, either with the `$SAVED` alias) that resolves to no stored flow.
+///
+/// One spelling for every handler that resolves a `ContactFlowId`, for the reason
+/// [`instance_not_found`] gives.
+pub fn contact_flow_not_found(
+    contact_flow_id: &str,
+    instance_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Flow not found: {contact_flow_id} in instance {instance_id}"
+        )),
     }
 }
 
