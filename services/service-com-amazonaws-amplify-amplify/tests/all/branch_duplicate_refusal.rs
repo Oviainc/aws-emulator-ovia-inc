@@ -83,14 +83,19 @@ fn branch_name_cases() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Branch names the modelled `pattern ^(?s).+$` admits that a URI label cannot carry
-/// unencoded, so they are exercised through `CreateBranch`'s BODY and read back
-/// through `ListBranches` rather than through `GetBranch`.
+/// Branch names a URI label cannot carry unencoded, so they are exercised through
+/// `CreateBranch`'s BODY and read back through `ListBranches` rather than through
+/// `GetBranch`.
+///
+/// A branch name is drawn from letters, digits and the symbols `/_.-`
+/// (`service_com_amazonaws_amplify_amplify::state::is_branch_name`), of which only `/`
+/// has to be percent-encoded to travel in a path segment, so every row here is a
+/// slashed name — at one, two and three segments.
 fn body_only_branch_name_cases() -> Vec<(&'static str, String)> {
     vec![
         ("slashed feature name", "feature/login-v2".to_string()),
-        ("name with a space", "my branch".to_string()),
-        ("name with a question mark", "what?now".to_string()),
+        ("dated release path", "release/2026/01".to_string()),
+        ("single-character segments", "a/b".to_string()),
     ]
 }
 

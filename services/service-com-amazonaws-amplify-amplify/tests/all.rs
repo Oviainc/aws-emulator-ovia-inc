@@ -47,6 +47,8 @@ mod hosted_branch_rewrites;
 mod hosted_branch_site;
 #[path = "all/hosted_site_custom_rules.rs"]
 mod hosted_site_custom_rules;
+#[path = "all/request_refusal_wording.rs"]
+mod request_refusal_wording;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/resource_untagging.rs"]

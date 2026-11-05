@@ -90,9 +90,87 @@
 //! which publishes the site of a deployment whose job the clock has finished.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+/// `refusal` with every enumerated value set stated in the order THIS service states
+/// one, and everything else — the member paths, the values echoed, every other
+/// requirement — untouched.
+///
+/// A refusal of a value outside an enumerated type names the values that type admits,
+/// and the order it names them in belongs to the SERVICE rather than to the model: the
+/// order a value set reaches this seam in is the order the model happens to declare that
+/// enum's members in, which is an artefact of how the model was written. The sets this
+/// service is recorded stating in an order of its own are listed in
+/// [`STATED_VALUE_SET_ORDERS`]; every other set of this model keeps the order it arrived
+/// in, because nothing shows this service stating it differently.
+///
+/// The CLAUSE stays the framework's — only the order inside it changes — so the member
+/// path, the echoed value and the requirement's wording keep coming from the one place
+/// that writes them.
+fn in_stated_value_order(refusal: &Refusal) -> Refusal {
+    let Refusal::Invalid(violations) = refusal else {
+        return refusal.clone();
+    };
+    Refusal::Invalid(violations.iter().map(in_this_services_order).collect())
+}
+
+/// The enumerated value sets this service states in an order the model does not declare,
+/// each written in the order its own refusals state it.
+///
+/// Source: the refusals recorded for this service. The order belongs to the TYPE — one
+/// set, one order, whatever member or operation carried the value — so a set is
+/// recognised by the values it admits and by nothing about the request.
+const STATED_VALUE_SET_ORDERS: &[&[&str]] = &[
+    // `com.amazonaws.amplify#Stage`, which the model declares `PRODUCTION, BETA,
+    // DEVELOPMENT, EXPERIMENTAL, PULL_REQUEST`
+    // (`smithy_query(query="shape",shape="Stage")`).
+    &[
+        "EXPERIMENTAL",
+        "BETA",
+        "PULL_REQUEST",
+        "PRODUCTION",
+        "DEVELOPMENT",
+    ],
+    // `com.amazonaws.amplify#Platform`, which the model declares `WEB, WEB_DYNAMIC,
+    // WEB_COMPUTE` (`smithy_query(query="shape",shape="Platform")`).
+    &["WEB_COMPUTE", "WEB_DYNAMIC", "WEB"],
+];
+
+/// One violation with its enumerated value set in the order this service states it, or
+/// the violation unchanged when it carries no value set this service publishes an order
+/// for.
+fn in_this_services_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(declared) = &violation.kind else {
+        return violation.clone();
+    };
+    match stated_order(declared) {
+        Some(stated) => Violation {
+            kind: ViolationKind::EnumValue(stated),
+            ..violation.clone()
+        },
+        None => violation.clone(),
+    }
+}
+
+/// The order [`STATED_VALUE_SET_ORDERS`] states the set `declared` in, or `None` for a
+/// set it does not name.
+///
+/// Matched on MEMBERSHIP and size, never on position, so a model revision that reordered
+/// its own declaration of the same enum is still stated in the published order.
+fn stated_order(declared: &[String]) -> Option<Vec<String>> {
+    STATED_VALUE_SET_ORDERS
+        .iter()
+        .find(|stated| {
+            stated.len() == declared.len()
+                && stated
+                    .iter()
+                    .all(|value| declared.iter().any(|admitted| admitted == value))
+        })
+        .map(|stated| stated.iter().map(|value| (*value).to_string()).collect())
+}
 
 /// The `com-amazonaws-amplify-amplify` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -360,16 +438,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) BEFORE any handler ran.
+        // AWS answers that class as the `ValidationException` envelope the framework
+        // already renders, with one difference in how a requirement is QUOTED: a
+        // `@pattern` is stated WITHOUT the anchors a whole-value expression wraps it in,
+        // so a client that re-applies the reported expression gets the one AWS reports.
+        // That rendering is shared by every service on a JSON protocol, so it lives in
+        // `service-common` rather than here; the CHECK still uses the model's pattern as
+        // written, and the code, the status, the envelope, the member paths and every
+        // other requirement stay the framework's.
+        //
+        // What this service chooses beyond that is the ORDER an enumerated value set is
+        // stated in ([`in_stated_value_order`]), which is not the order the model
+        // declares it in.
+        ::service_common::aws_validation_refusal(&in_stated_value_order(refusal))
     }
 
     fn override_routing_error(

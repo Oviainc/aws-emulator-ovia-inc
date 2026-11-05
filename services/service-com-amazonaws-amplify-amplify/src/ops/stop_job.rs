@@ -198,8 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to `CANCELLED` (see `crate::state::BranchJob::cancel`), so a caller that reads
         // the job straight after this call still observes the cancellation in flight.
         job.cancel();
-        Ok(StopJobOutput {
-            job_summary: job.job.summary.clone(),
-        })
+        // A deployment that was created and never started is cancelled as a whole: its
+        // reservation is spent by this call, so the upload destinations
+        // `CreateDeployment` handed out can no longer be started. A job that was already
+        // running holds no reservation and this removes nothing.
+        branch.deployments.remove(&input.job_id);
+        let job_summary = branch
+            .jobs
+            .get(&input.job_id)
+            .map(|stopped| stopped.job.summary.clone())
+            .ok_or_else(|| absent(crate::state::JOB_ENTITY, &input.job_id))?;
+        Ok(StopJobOutput { job_summary })
     }
 }

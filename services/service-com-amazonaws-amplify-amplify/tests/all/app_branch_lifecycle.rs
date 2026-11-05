@@ -705,7 +705,9 @@ fn branch_cases() -> Vec<BranchCase> {
         BranchCase {
             case: "only the required branchName",
             request: json!({ "branchName": "dev" }),
-            stage: "DEVELOPMENT",
+            // A branch created without a stage is assigned none: `NONE`, not one of
+            // the five values `Stage` models (see `create_branch`'s `DEFAULT_STAGE`).
+            stage: "NONE",
             display_name: "dev",
             ttl: "5",
             framework: Value::Null,

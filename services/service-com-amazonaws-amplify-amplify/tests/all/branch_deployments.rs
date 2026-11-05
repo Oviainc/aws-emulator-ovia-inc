@@ -15,15 +15,22 @@
 //!    destination for the zipped deployment. Every destination is unique and inside
 //!    `UploadUrl`'s modelled length bound, whatever the request named its files.
 //! 2. A reservation takes a `jobId` out of its branch's id sequence — decimal digits,
-//!    as `JobId` is modelled — and that id is SPENT: a later reservation and a later
+//!    as `JobId` is modelled — and that id is SPENT: a later deployment and a later
 //!    `StartJob` on the same branch are handed different ones.
-//! 3. A reservation is not a job: nothing is readable through `GetJob` under the
-//!    reserved id, and the branch has still started no job, until a start call runs it.
+//! 3. A reservation CREATES the deployment's job: "the maximum duration between the
+//!    CreateDeployment call and the StartDeployment call cannot exceed 8 hours. If the
+//!    duration exceeds 8 hours, the StartDeployment call and the associated Job will
+//!    fail" (`smithy_query(query="doc",shape="CreateDeployment")`), so the job is
+//!    readable through `GetJob` under the reserved id, in the `CREATED` status nothing
+//!    has started — while the branch has still STARTED no job.
 //! 4. A deployment is reserved on a branch of an app, so an app id or a branch name
-//!    that names nothing is refused with this operation's modelled 400 rather than
-//!    created on the way.
-//! 5. One branch's unstarted reservations are BOUNDED: past the cap, one more is
-//!    refused with the modelled `LimitExceededException`.
+//!    that names nothing is refused with HTTP 404 and the not-found error type rather
+//!    than created on the way.
+//! 5. One branch's deployments are SERIALIZED: while the branch's last job is
+//!    unfinished — created and unstarted, or started and still running — a further
+//!    `CreateDeployment` is refused with the modelled 400 naming that job, and finishing
+//!    it (by stopping it, or by letting the clock settle it) frees the branch again. The
+//!    rule is per branch: another branch of the same app still reserves.
 //!
 //! The harness (`Emulator`, `Reply`) is the one `app_branch_lifecycle` already drives;
 //! only the cases are new.
@@ -32,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_amplify_amplify::state::MAX_PENDING_DEPLOYMENTS_PER_BRANCH;
+use service_com_amazonaws_amplify_amplify::state::{JOB_SETTLE_MILLIS, JOB_STATUS_CREATED};
 
 use crate::app_branch_lifecycle::{string_member, Emulator, Reply};
 
@@ -82,6 +89,30 @@ async fn get_job(emulator: &Emulator, app_id: &str, branch: &str, job_id: &str) 
             None,
         )
         .await
+}
+
+/// `StopJob` over the wire, then wait for the clock to settle the cancellation: a stop
+/// is asynchronous, so the job reaches its terminal status after the service's own
+/// settle span rather than when the call answers.
+async fn stop_the_job(emulator: &Emulator, app_id: &str, branch: &str, job_id: &str) {
+    let stopped = emulator
+        .call(
+            "DELETE",
+            &format!("/apps/{app_id}/branches/{branch}/jobs/{job_id}/stop"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        stopped.status, 200,
+        "stopping job {job_id:?} on {branch:?}: expected HTTP 200 from StopJob, got {stopped:?}"
+    );
+    std::thread::sleep(past_the_settle_span());
+}
+
+/// Long enough for the clock to have settled a job out of its non-terminal status: the
+/// service's own span plus a margin, so the case reads what the clock already owed.
+fn past_the_settle_span() -> std::time::Duration {
+    std::time::Duration::from_millis(u64::try_from(JOB_SETTLE_MILLIS).unwrap_or(500) + 250)
 }
 
 /// An app with one branch on it.
@@ -241,13 +272,25 @@ async fn reserves_one_upload_destination_per_thing_to_upload() {
     let app_id = app_with_branch(&emulator, "deployment-destinations", "main").await;
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for DeploymentCase {
+    for (index, DeploymentCase {
         case,
         request,
         expected_files,
-    } in deployment_cases()
+    }) in deployment_cases().into_iter().enumerate()
     {
-        let reply = create_deployment(&emulator, &app_id, "main", &request).await;
+        // One row per BRANCH: a branch serializes its deployments (rule 5), and what
+        // this rule is about is the shape of ONE answer, so each row gets a branch with
+        // no job of its own.
+        let branch = format!("row-{index}");
+        let created = emulator
+            .create_branch(&app_id, &json!({ "branchName": branch }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateBranch, got {created:?}"
+        );
+
+        let reply = create_deployment(&emulator, &app_id, &branch, &request).await;
         assert_eq!(
             reply.status, 200,
             "case {case:?}: expected HTTP 200 from CreateDeployment, got {reply:?}"
@@ -300,13 +343,16 @@ async fn reserves_one_upload_destination_per_thing_to_upload() {
     }
 }
 
-/// Rules 2 and 3: a reserved `jobId` is spent and is not a job.
+/// Rules 2 and 3: a reserved `jobId` is spent, and the deployment it reserves HAS a job
+/// — readable, in the status nothing has started, and not counted as a started job.
 #[tokio::test]
-async fn a_reserved_job_id_is_spent_and_is_not_a_job() {
+async fn a_reserved_job_id_is_spent_and_names_the_deployments_job() {
     let emulator = Emulator::new();
     let app_id = repository_app_with_branch(&emulator, "deployment-ids", "main").await;
 
-    // Three reservations, differing in what each asked to upload.
+    // Three deployments, differing in what each asked to upload. A branch serializes
+    // its deployments, so each is stopped before the next is created — which is what
+    // the refusal of a second deployment tells a caller to do.
     let mut reserved: Vec<String> = Vec::new();
     for request in [
         json!({}),
@@ -318,13 +364,36 @@ async fn a_reserved_job_id_is_spent_and_is_not_a_job() {
             reply.status, 200,
             "case {request:?}: expected HTTP 200 from CreateDeployment, got {reply:?}"
         );
-        reserved.push(string_member(&reply.body, "jobId"));
+        let job_id = string_member(&reply.body, "jobId");
+
+        // Rule 3: the deployment's job exists under the reserved id, created and not
+        // started.
+        let job = get_job(&emulator, &app_id, "main", &job_id).await;
+        assert_eq!(
+            job.status, 200,
+            "case {request:?}: a deployment creates its job, got {job:?}"
+        );
+        let summary = job.member("job").get("summary").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            string_member(&summary, "status"),
+            JOB_STATUS_CREATED,
+            "case {request:?}: a deployment nothing started carries the created status, \
+             got {summary:?}"
+        );
+        assert_eq!(
+            string_member(&summary, "jobType"),
+            "MANUAL",
+            "case {request:?}: a manual deployment's job is a MANUAL job, got {summary:?}"
+        );
+
+        reserved.push(job_id.clone());
+        stop_the_job(&emulator, &app_id, "main", &job_id).await;
     }
 
     assert_eq!(
         reserved.iter().collect::<BTreeSet<&String>>().len(),
         reserved.len(),
-        "case \"three reservations\": each reservation spends its own jobId, got {reserved:?}"
+        "case \"three deployments\": each deployment spends its own jobId, got {reserved:?}"
     );
     let numeric: Vec<u64> = reserved
         .iter()
@@ -332,73 +401,51 @@ async fn a_reserved_job_id_is_spent_and_is_not_a_job() {
         .collect();
     assert!(
         numeric.windows(2).all(|pair| pair[0] < pair[1]),
-        "case \"three reservations\": ids come from the branch's sequence, got {reserved:?}"
+        "case \"three deployments\": ids come from the branch's sequence, got {reserved:?}"
     );
 
-    // A reservation is not a job: nothing answers under the reserved id, and the
-    // branch has still started nothing.
-    for job_id in &reserved {
-        let reply = get_job(&emulator, &app_id, "main", job_id).await;
-        assert_eq!(
-            reply.status, 404,
-            "case \"reserved {job_id}\": a reservation starts no job, got {reply:?}"
-        );
-        assert_eq!(
-            reply.error_code.as_deref(),
-            Some("NotFoundException"),
-            "case \"reserved {job_id}\": expected the modelled 404, got {:?}",
-            reply.error_code
-        );
-    }
+    // Rule 3's other half: a deployment nobody started is not a job the branch has
+    // STARTED, so `totalNumberOfJobs` still counts none.
     let record = emulator.get_branch(&app_id, "main").await.member("branch");
     assert_eq!(
         string_member(&record, "totalNumberOfJobs"),
         "0",
-        "case \"reservations only\": a reserved deployment is not a started job, got {record:?}"
+        "case \"deployments only\": a created deployment is not a started job, got {record:?}"
     );
 
-    // The next job this branch starts is handed a DIFFERENT id, and only that started
-    // job is readable.
+    // The next job this branch starts is handed a DIFFERENT id.
     let started = start_job(&emulator, &app_id, "main", &json!({ "jobType": "MANUAL" })).await;
     assert_eq!(
         started.status, 200,
-        "case \"StartJob after reservations\": expected HTTP 200, got {started:?}"
+        "case \"StartJob after deployments\": expected HTTP 200, got {started:?}"
     );
     let started_id = string_member(&started.member("jobSummary"), "jobId");
     assert!(
         !reserved.contains(&started_id),
-        "case \"StartJob after reservations\": a reserved id is spent, got {started_id:?} \
+        "case \"StartJob after deployments\": a reserved id is spent, got {started_id:?} \
          among {reserved:?}"
     );
     assert!(
         started_id.parse::<u64>().expect("a modelled jobId parses")
-            > *numeric.last().expect("three reservations"),
-        "case \"StartJob after reservations\": the id sequence only moves forward, \
+            > *numeric.last().expect("three deployments"),
+        "case \"StartJob after deployments\": the id sequence only moves forward, \
          got {started_id:?} after {reserved:?}"
     );
     assert_eq!(
         get_job(&emulator, &app_id, "main", &started_id).await.status,
         200,
-        "case \"StartJob after reservations\": the started job is readable"
+        "case \"StartJob after deployments\": the started job is readable"
     );
     let record = emulator.get_branch(&app_id, "main").await.member("branch");
     assert_eq!(
         string_member(&record, "totalNumberOfJobs"),
         "1",
-        "case \"StartJob after reservations\": only started jobs are counted, got {record:?}"
-    );
-
-    // And a reservation taken AFTER a job still gets an unspent id.
-    let later = create_deployment(&emulator, &app_id, "main", &json!({})).await;
-    let later_id = string_member(&later.body, "jobId");
-    assert!(
-        later_id != started_id && !reserved.contains(&later_id),
-        "case \"reservation after a job\": every id is handed out once, got {later_id:?}"
+        "case \"StartJob after deployments\": only started jobs are counted, got {record:?}"
     );
 }
 
 /// Rule 4: a deployment is reserved on a branch of an app, so an identifier that
-/// names nothing is refused with this operation's modelled 400.
+/// names nothing is refused with HTTP 404 and the not-found error type.
 #[tokio::test]
 async fn refuses_an_app_or_branch_that_names_nothing() {
     let emulator = Emulator::new();
@@ -442,13 +489,14 @@ async fn refuses_an_app_or_branch_that_names_nothing() {
             let reply =
                 create_deployment(&emulator, &addressed_app, &addressed_branch, &request).await;
             assert_eq!(
-                reply.status, 400,
-                "case {case:?}: expected the modelled HTTP 400, got {reply:?}"
+                reply.status, 404,
+                "case {case:?}: expected HTTP 404 for a target that names nothing, \
+                 got {reply:?}"
             );
             assert_eq!(
                 reply.error_code.as_deref(),
-                Some("BadRequestException"),
-                "case {case:?}: expected the modelled BadRequestException, got {:?}",
+                Some("NotFoundException"),
+                "case {case:?}: expected the not-found error type, got {:?}",
                 reply.error_code
             );
             let expected = format!("{entity} {identifier} not found.");
@@ -471,37 +519,48 @@ async fn refuses_an_app_or_branch_that_names_nothing() {
     );
 }
 
-/// Rule 5: one branch's unstarted reservations are bounded.
+/// Rule 5: one branch's deployments are serialized.
 #[tokio::test]
-async fn unstarted_reservations_are_bounded() {
+async fn a_branch_serializes_its_deployments() {
     let emulator = Emulator::new();
-    let app_id = app_with_branch(&emulator, "deployment-cap", "main").await;
+    let app_id = app_with_branch(&emulator, "deployment-serialization", "main").await;
 
-    for reservation in 1..=MAX_PENDING_DEPLOYMENTS_PER_BRANCH {
-        let reply = create_deployment(&emulator, &app_id, "main", &json!({})).await;
+    let reserved = create_deployment(&emulator, &app_id, "main", &json!({})).await;
+    assert_eq!(
+        reserved.status, 200,
+        "case \"the first deployment\": expected HTTP 200, got {reserved:?}"
+    );
+    let outstanding = string_member(&reserved.body, "jobId");
+
+    // One row per shape of the second request: the refusal is about the branch's
+    // unfinished job, not about what the second request asked to upload.
+    for request in [
+        json!({}),
+        json!({ "fileMap": {} }),
+        json!({ "fileMap": { "index.html": "d41d8cd98f00b204e9800998ecf8427e" } }),
+    ] {
+        let refused = create_deployment(&emulator, &app_id, "main", &request).await;
         assert_eq!(
-            reply.status, 200,
-            "case \"reservation {reservation} of {MAX_PENDING_DEPLOYMENTS_PER_BRANCH}\": \
-             expected HTTP 200, got {reply:?}"
+            refused.status, 400,
+            "case {request:?}: expected the modelled HTTP 400, got {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("BadRequestException"),
+            "case {request:?}: expected BadRequestException, got {:?}",
+            refused.error_code
+        );
+        let expected = format!(
+            "The last job(deployment) {outstanding} was not finished, please wait until it \
+             finish or use StopJob operation to cancel it before creating a new deployment."
+        );
+        assert_eq!(
+            refused.message().as_deref(),
+            Some(expected.as_str()),
+            "case {request:?}: expected {expected:?}, got {:?}",
+            refused.message()
         );
     }
-
-    let refused = create_deployment(&emulator, &app_id, "main", &json!({})).await;
-    assert_eq!(
-        refused.status, 429,
-        "case \"past the cap\": expected the modelled quota refusal, got {refused:?}"
-    );
-    assert_eq!(
-        refused.error_code.as_deref(),
-        Some("LimitExceededException"),
-        "case \"past the cap\": expected LimitExceededException, got {:?}",
-        refused.error_code
-    );
-    let message = refused.message().unwrap_or_default();
-    assert!(
-        message.contains(&MAX_PENDING_DEPLOYMENTS_PER_BRANCH.to_string()) && message.contains("main"),
-        "case \"past the cap\": the refusal must name the limit and the branch, got {message:?}"
-    );
 
     // The cap is PER BRANCH: another branch of the same app still reserves.
     let created = emulator
@@ -514,6 +573,61 @@ async fn unstarted_reservations_are_bounded() {
     let reply = create_deployment(&emulator, &app_id, "other", &json!({})).await;
     assert_eq!(
         reply.status, 200,
-        "case \"another branch\": one branch's cap does not bind another, got {reply:?}"
+        "case \"another branch\": one branch's outstanding job does not bind another, \
+         got {reply:?}"
+    );
+
+    // Stopping the outstanding job frees the branch — which is what the refusal told the
+    // caller to do — and the identical request then succeeds.
+    stop_the_job(&emulator, &app_id, "main", &outstanding).await;
+    let again = create_deployment(&emulator, &app_id, "main", &json!({})).await;
+    assert_eq!(
+        again.status, 200,
+        "case \"after StopJob\": a finished job frees the branch, got {again:?}"
+    );
+    assert_ne!(
+        string_member(&again.body, "jobId"),
+        outstanding,
+        "case \"after StopJob\": the new deployment gets its own id, got {again:?}"
+    );
+
+    // STARTING the outstanding deployment does not free the branch either: its job is
+    // now running, which is the other half of "was not finished".
+    let second = string_member(&again.body, "jobId");
+    let started = emulator
+        .call(
+            "POST",
+            &format!("/apps/{app_id}/branches/main/deployments/start"),
+            Some(&json!({ "jobId": second })),
+        )
+        .await;
+    assert_eq!(
+        started.status, 200,
+        "case \"while the deployment runs\": expected HTTP 200 from StartDeployment, \
+         got {started:?}"
+    );
+    let while_running = create_deployment(&emulator, &app_id, "main", &json!({})).await;
+    assert_eq!(
+        while_running.status, 400,
+        "case \"while the deployment runs\": a running job holds the branch, \
+         got {while_running:?}"
+    );
+    assert!(
+        while_running
+            .message()
+            .unwrap_or_default()
+            .contains(&format!("The last job(deployment) {second} was not finished")),
+        "case \"while the deployment runs\": the refusal must name the running job, \
+         got {:?}",
+        while_running.message()
+    );
+
+    // Once the clock has settled that job, the branch is free again.
+    std::thread::sleep(past_the_settle_span());
+    let third = create_deployment(&emulator, &app_id, "main", &json!({})).await;
+    assert_eq!(
+        third.status, 200,
+        "case \"after the job settles\": a finished job holds the branch no longer, \
+         got {third:?}"
     );
 }

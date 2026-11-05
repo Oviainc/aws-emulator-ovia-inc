@@ -197,6 +197,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let created = crate::state::now();
+
+        // A branch name is drawn from a character set the model's `@pattern ^(?s).+$`
+        // does not express, so the boundary validator passes a name this service
+        // refuses: it is checked HERE, before the app is looked up and before the branch
+        // is built or stored, because a name outside the set would become a default
+        // domain prefix no visitor could address. See
+        // [`crate::state::is_branch_name`].
+        if !crate::state::is_branch_name(&input.branch_name) {
+            return Err(CreateBranchErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::branch_name_not_supported_message(
+                    &input.branch_name,
+                )),
+            })
+            .into());
+        }
+
         let mut store = state.lock();
 
         // A branch only exists as part of an app, so an unknown `appId` is a 404
@@ -306,11 +322,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The stage a branch created without one carries.
 ///
-/// `Stage` is modelled `BETA | DEVELOPMENT | EXPERIMENTAL | PRODUCTION |
-/// PULL_REQUEST` (`smithy_query(query="shape",shape="Stage")`) and `Branch$stage` is
-/// @required, so a branch created without one still has to carry a value from that
-/// closed set; `DEVELOPMENT` is the one that claims nothing about a deployment.
-const DEFAULT_STAGE: &str = "DEVELOPMENT";
+/// `Stage` is modelled `BETA | DEVELOPMENT | EXPERIMENTAL | PRODUCTION | PULL_REQUEST`
+/// (`smithy_query(query="shape",shape="Stage")`) and `Branch$stage` is @required, but
+/// none of those five is what a branch created without a stage carries: recorded
+/// behaviour shows such a branch reporting `NONE`, the value that says the branch has
+/// been assigned no stage at all, so the recording overrides the model's value list.
+/// A request that names a stage still decides it.
+const DEFAULT_STAGE: &str = "NONE";
 
 /// Whether a branch created without `enableAutoBuild` auto-builds on push.
 ///

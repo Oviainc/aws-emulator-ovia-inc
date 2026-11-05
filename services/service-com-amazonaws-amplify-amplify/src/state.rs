@@ -87,10 +87,12 @@ pub struct AmplifyBranch {
     ///
     /// A deployment is reserved by one call and started by another, so what the first
     /// call minted — the job id and the upload destinations — has to outlive it; this
-    /// is where it lives until `StartDeployment` names that job id. The map is
-    /// BOUNDED: a reservation the clock has let expire is dropped (see
-    /// [`AmplifyBranch::expire_deployments`]) and a branch holds at most
-    /// [`MAX_PENDING_DEPLOYMENTS_PER_BRANCH`] live reservations at once.
+    /// is where it lives until `StartDeployment` names that job id. The map holds AT
+    /// MOST ONE reservation, structurally: `CreateDeployment` refuses a deployment while
+    /// the branch's last job is unfinished ([`AmplifyBranch::last_unfinished_job`]), and
+    /// each of the three ways that job reaches a terminal status also spends its
+    /// reservation — `StartDeployment` takes it, `StopJob` cancels it, and the closing of
+    /// its window drops it ([`AmplifyBranch::expire_deployments`]).
     pub deployments: BTreeMap<String, PendingDeployment>,
     /// The jobs started on this branch, keyed by `jobId`.
     ///
@@ -294,6 +296,27 @@ impl AmplifyBranch {
             .fold(0usize, usize::saturating_add)
     }
 
+    /// The `jobId` of this branch's LAST job when that job has not reached a terminal
+    /// status, or `None` when the branch has no job or its last one is over.
+    ///
+    /// Deployments of one branch are SERIALIZED on this: the last job is the one with the
+    /// highest id — a branch's ids are a decimal sequence ([`Self::reserve_job_id`]), so
+    /// numeric order is the order they were handed out — and while it is still in flight
+    /// a further deployment cannot be ordered against it.
+    ///
+    /// The clock-owed work is materialised first, because a job the clock has already
+    /// finished is a finished job here too even if nobody has read it yet: a reservation
+    /// whose window has closed is dropped, and the job that window failed settles.
+    pub fn last_unfinished_job(&mut self) -> Option<String> {
+        self.expire_deployments();
+        self.settle();
+        let (job_id, last) = self
+            .jobs
+            .iter()
+            .max_by_key(|(job_id, _)| job_id.parse::<u128>().unwrap_or(0))?;
+        (!is_terminal_job_status(&last.job.summary.status)).then(|| job_id.clone())
+    }
+
     /// Retire old jobs until this branch can hold one more, and report whether it can.
     ///
     /// The retention policy of [`AmplifyBranch::jobs`], applied: the map never exceeds
@@ -319,7 +342,7 @@ impl AmplifyBranch {
             let Some(oldest) = self
                 .jobs
                 .iter()
-                .filter(|(_, stored)| stored.settles_at.is_none())
+                .filter(|(_, stored)| is_terminal_job_status(&stored.job.summary.status))
                 .min_by_key(|(job_id, _)| job_id.parse::<u128>().unwrap_or(0))
                 .map(|(job_id, _)| job_id.clone())
             else {
@@ -545,17 +568,6 @@ pub fn deployment_upload_url(host: &str, app_id: &str, job_id: &str, token: &str
 /// reservation carries is exactly those 8 hours.
 pub const DEPLOYMENT_WINDOW_MILLIS: i64 = 8 * 60 * 60 * 1_000;
 
-/// How many deployments one branch may have reserved and unstarted at once, past
-/// which reserving another answers the modelled `LimitExceededException` (HTTP 429,
-/// "A resource could not be created because service quotas were exceeded").
-///
-/// CHOSEN, not a published quota: a reservation holds state for up to
-/// [`DEPLOYMENT_WINDOW_MILLIS`] whether or not it is ever started, so without a bound
-/// one branch's reservation map could grow without limit inside that window. It is
-/// [`MAX_JOBS_PER_BRANCH`], because every reservation that IS started becomes one job
-/// of that branch's equally bounded history.
-pub const MAX_PENDING_DEPLOYMENTS_PER_BRANCH: usize = MAX_JOBS_PER_BRANCH;
-
 /// How many bytes of DEPLOYMENT CONTENT this service's store retains AT ONCE, across
 /// every reservation's uploads and every branch's published and staged site.
 ///
@@ -623,6 +635,26 @@ impl BranchJob {
             settles_at: Some(now_millis().saturating_add(JOB_SETTLE_MILLIS)),
             conclusion,
             deployed_assets,
+        }
+    }
+
+    /// The job a `CreateDeployment` call creates: the deployment exists and nothing has
+    /// started it, which is what [`JOB_STATUS_CREATED`] says.
+    ///
+    /// The clock already owes this job one status change: "the maximum duration between
+    /// the CreateDeployment call and the StartDeployment call cannot exceed 8 hours. If
+    /// the duration exceeds 8 hours, the StartDeployment call and the associated Job will
+    /// fail" (`smithy_query(query="doc",shape="CreateDeployment")`), so the job settles
+    /// to `FAILED` when the reservation's window closes — `window_closes_at`, the same
+    /// instant [`PendingDeployment::expires_at`] drops the reservation. A deployment that
+    /// IS started replaces this record with the started job's own
+    /// ([`Self::settling`]).
+    pub fn reserved(job: Job, window_closes_at: i64) -> Self {
+        Self {
+            job,
+            settles_at: Some(window_closes_at),
+            conclusion: JobConclusion::not_deployed(DEPLOYMENT_WINDOW_CLOSED_REASON),
+            deployed_assets: BTreeSet::new(),
         }
     }
 
@@ -761,6 +793,25 @@ impl JobConclusion {
 /// after starting it still sees the `PENDING` status a real client has to poll through.
 pub const JOB_SETTLE_MILLIS: i64 = 500;
 
+/// The status the job of a deployment carries from `CreateDeployment` until something
+/// starts it, stops it, or its window closes.
+///
+/// `JobStatus` is modelled `CREATED | PENDING | PROVISIONING | RUNNING | FAILED |
+/// SUCCEED | CANCELLING | CANCELLED` (`smithy_query(query="shape",shape="JobStatus")`),
+/// and `CreateDeployment` "creates a deployment" without running it: the job exists and
+/// no work has been asked of it, which is what `CREATED` says.
+pub const JOB_STATUS_CREATED: &str = "CREATED";
+
+/// Why the job of a deployment nobody started ends in [`JOB_STATUS_FAILED`].
+///
+/// The duration is the documented one, not a chosen one: "the maximum duration between
+/// the CreateDeployment call and the StartDeployment call cannot exceed 8 hours. If the
+/// duration exceeds 8 hours, the StartDeployment call and the associated Job will fail"
+/// (`smithy_query(query="doc",shape="CreateDeployment")`) — see
+/// [`DEPLOYMENT_WINDOW_MILLIS`].
+pub const DEPLOYMENT_WINDOW_CLOSED_REASON: &str =
+    "The deployment was not started before its upload window closed.";
+
 /// The status a job carries from `StartJob` until the clock settles it.
 ///
 /// `JobStatus` is modelled `CREATED | PENDING | PROVISIONING | RUNNING | FAILED |
@@ -815,6 +866,21 @@ pub const JOB_CANCELLED_REASON: &str = "The job was stopped by a StopJob request
 /// is built in ([`not_found_message`]).
 pub fn job_not_in_progress_message(job_id: &str) -> String {
     format!("Job {job_id} is not in progress.")
+}
+
+/// The `message` a `CreateDeployment` `BadRequestException` carries for a branch whose
+/// last job has not finished.
+///
+/// Deployments of one branch are SERIALIZED: a new one cannot be created while the
+/// branch's last job is still in flight, because the two could not be ordered against
+/// each other. The sentence is fixed text apart from `job_id`, which is read out of the
+/// branch's own job history, and it states the two ways out AWS offers — wait for that
+/// job, or `StopJob` it.
+pub fn unfinished_job_message(job_id: &str) -> String {
+    format!(
+        "The last job(deployment) {job_id} was not finished, please wait until it finish \
+         or use StopJob operation to cancel it before creating a new deployment."
+    )
 }
 
 /// The name of the execution step a settled job carries its failure reason on.
@@ -1095,8 +1161,49 @@ pub fn domain_name_violation(member: &str, name: &str) -> Option<String> {
     ))
 }
 
-/// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].
+/// The symbols a branch name may carry beside letters and digits.
 ///
+/// Source: the refusal AWS answers a name outside the set with, which states the set as
+/// "letters, numbers, and the symbols /_.-" ([`BRANCH_NAME_CHARACTERS_MESSAGE`]).
+const BRANCH_NAME_SYMBOLS: &str = "/_.-";
+
+/// Whether `name` is a branch name this service accepts: letters, digits and
+/// [`BRANCH_NAME_SYMBOLS`], and nothing else.
+///
+/// The letters and digits are ASCII because a branch name becomes the branch's default
+/// domain PREFIX (`Branch$displayName` "is used as the default domain prefix", and the
+/// site of a branch answers at `<displayName>.<defaultDomain>`), and a host label is
+/// ASCII: a name outside this set would name a branch no visitor could address.
+///
+/// The `@length` half of `BranchName`'s modelled constraint (`length 1..255`) is enforced
+/// upstream by the boundary validator, so it is not repeated here.
+pub fn is_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || BRANCH_NAME_SYMBOLS.contains(c))
+}
+
+/// The sentence a branch name outside [`is_branch_name`] is refused with.
+///
+/// `BranchName` is modelled `@length 1..255, pattern ^(?s).+$`
+/// (`smithy_query(query="operation",operation="CreateBranch")`), which admits any
+/// non-empty value, so the character set is a rule the service enforces and the model
+/// does not express: the refusal is the service's own, and its text is fixed apart from
+/// the name the request sent.
+pub fn branch_name_not_supported_message(branch_name: &str) -> String {
+    format!(
+        "The requested branch name is not supported. Failed to create branch. The branch \
+         name {branch_name} is invalid. {BRANCH_NAME_CHARACTERS_MESSAGE}"
+    )
+}
+
+/// The clause [`branch_name_not_supported_message`] closes with: the character set a
+/// branch name is drawn from, as AWS states it.
+const BRANCH_NAME_CHARACTERS_MESSAGE: &str =
+    "The name can only contain letters, numbers, and the symbols /_.-";
+
+/// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].///
 /// The apps map is NOT partitioned by region: an app's ARN records the region of the
 /// request that created it, but any later call reaches every app in the store
 /// whatever region it is signed for. Partitioning the control plane by region is a

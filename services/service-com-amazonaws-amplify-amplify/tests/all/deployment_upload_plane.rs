@@ -195,16 +195,30 @@ impl Deployments {
     /// Close the window of the reservation `job_id` names, as the clock does after the
     /// documented 8 hours: the instant is the one the service itself stores, so a case
     /// about a closed window does not have to wait for it.
+    ///
+    /// Both records the window governs are moved: the reservation, which stops being
+    /// writable, and the deployment's JOB, which the closing window fails (the documented
+    /// "if the duration exceeds 8 hours, the StartDeployment call and the associated Job
+    /// will fail").
     fn close_the_window_of(&self, app_id: &str, branch: &str, job_id: &str) {
         let state = self.engine.state::<ComAmazonawsAmplifyAmplifyState>();
         let mut store = state.lock();
-        let reservation = store
+        let now = service_com_amazonaws_amplify_amplify::state::now_millis();
+        let branch = store
             .apps
             .get_mut(app_id)
             .and_then(|app| app.branches.get_mut(branch))
-            .and_then(|branch| branch.deployments.get_mut(job_id))
-            .expect("the reservation just made is in the store");
-        reservation.expires_at = service_com_amazonaws_amplify_amplify::state::now_millis();
+            .expect("the branch just reserved on is in the store");
+        branch
+            .deployments
+            .get_mut(job_id)
+            .expect("the reservation just made is in the store")
+            .expires_at = now;
+        branch
+            .jobs
+            .get_mut(job_id)
+            .expect("the deployment just created has a job")
+            .settles_at = Some(now);
     }
 }
 
@@ -591,12 +605,24 @@ async fn the_bytes_this_store_retains_are_bounded_and_released() {
     let app_id = deployments.app_with_branch("upload-budget", "main").await;
 
     // Each upload is at the per-deployment clamp, so filling the store takes exactly as
-    // many reservations as the ceiling is multiples of that clamp.
+    // many reservations as the ceiling is multiples of that clamp. One reservation per
+    // BRANCH, because a branch serializes its deployments (a new one is refused while
+    // the branch's last job is unfinished) and the bound under test is the whole store's,
+    // not one branch's.
     let per_upload = MAX_ARCHIVE_BYTES;
     let fills = MAX_STORED_DEPLOYMENT_BYTES / per_upload;
     for index in 0..fills {
         let case = format!("filling upload {index}");
-        let url = deployments.zip_destination_on(&app_id, "main").await;
+        let branch = format!("fill-{index}");
+        let created = deployments
+            .emulator
+            .create_branch(&app_id, &json!({ "branchName": branch }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateBranch, got {created:?}"
+        );
+        let url = deployments.zip_destination_on(&app_id, &branch).await;
         deployments.upload(&case, &url, &vec![0u8; per_upload]).await;
     }
 
@@ -614,16 +640,17 @@ async fn the_bytes_this_store_retains_are_bounded_and_released() {
         "case \"past the store's budget\": expected the plane's refusal code, got {refused:?}"
     );
 
-    // Deleting the branch releases everything it held, so the same write is accepted on
-    // a branch of its own afterwards.
-    let deleted = deployments
-        .emulator
-        .delete_branch(&app_id, "main")
-        .await;
-    assert_eq!(
-        deleted.status, 200,
-        "case \"after DeleteBranch\": expected HTTP 200 from DeleteBranch, got {deleted:?}"
-    );
+    // Deleting the branches releases everything they held, so the same write is accepted
+    // on a branch of its own afterwards.
+    for index in 0..fills {
+        let branch = format!("fill-{index}");
+        let deleted = deployments.emulator.delete_branch(&app_id, &branch).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case \"after DeleteBranch\": expected HTTP 200 from DeleteBranch on \
+             {branch:?}, got {deleted:?}"
+        );
+    }
     let created = deployments
         .emulator
         .create_branch(&app_id, &json!({ "branchName": "next" }))

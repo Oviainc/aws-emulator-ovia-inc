@@ -1165,8 +1165,11 @@ pub const BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS: &str =
     "The bucket policy is either missing or has insufficient permissions for this operation";
 
 /// Why a request that names neither a reservation nor a source URL is refused.
-pub const NO_SOURCE_MESSAGE: &str =
-    "A deployment requires either the jobId of a CreateDeployment request or a sourceUrl.";
+///
+/// Entirely FIXED text, as recorded behaviour words this modelled 400: it names the
+/// request shape whose two optional members the caller has to pick between and carries
+/// nothing from the request or the store.
+pub const NO_SOURCE_MESSAGE: &str = "Must specify jobId or sourceUrl for StartDeploymentRequest.";
 
 /// What a `BUCKET_PREFIX` deployment is refused with when the bucket holds no
 /// [`ROOT_DOCUMENT`] under the prefix the request named.
@@ -1234,7 +1237,10 @@ const OBJECT_NOT_FOUND_STATUS: u16 = 404;
 
 /// The `jobType` of a job this operation starts: "If the value is MANUAL, the job is for
 /// a manually deployed app" (`smithy_query(query="shape",shape="JobType")`).
-const MANUAL_JOB_TYPE: &str = "MANUAL";
+///
+/// Shared with `CreateDeployment`, which creates the job of the deployment this operation
+/// later runs, so the two report one `jobType` for one job.
+pub const MANUAL_JOB_TYPE: &str = "MANUAL";
 
 /// The document a hosted Amplify branch serves at the root of its site, and so the one
 /// file a deployment has to carry at its own root to be servable.

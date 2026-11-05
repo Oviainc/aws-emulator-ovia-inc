@@ -72,6 +72,10 @@
 //!   to an internal issue.
 //! * `LimitExceededException` (HTTP 429) — A resource could not be created because service
 //!   quotas were exceeded.
+//! * `NotFoundException` (HTTP 404) — An entity was not found during an operation. Widened
+//!   onto the error enum through `extra_errors` (see below): this operation's modelled
+//!   `errors` list omits it, while recorded behaviour answers an `appId` or `branchName`
+//!   that names nothing with the 404 and the not-found error type.
 //! * `UnauthorizedException` (HTTP 401) — An operation failed due to a lack of access.
 
 #[allow(unused_imports)]
@@ -88,12 +92,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplify-amplify.json");
 // here — hence the `CreateDeploymentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplify#CreateDeployment")]
+//
+// `NotFoundException` is widened in through `extra_errors`: this SERVICE models that
+// shape (HTTP 404, "An entity was not found during an operation") and `GetApp`,
+// `CreateBranch` and `StartDeployment` all declare it, while `CreateDeployment`'s own
+// `errors` list does not. Recorded behaviour answers 404 with the not-found error type
+// for an `appId` or a `branchName` that names nothing, so the recording overrides the
+// model's list and this operation needs the shape — a client branches on the error CODE,
+// and a not-found target is retried, not re-sent as a corrected request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplify#CreateDeployment",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateDeploymentErrorModeled {
     BadRequestException(BadRequestException),
     InternalFailureException(InternalFailureException),
     LimitExceededException(LimitExceededException),
+    NotFoundException(NotFoundException),
     UnauthorizedException(UnauthorizedException),
 }
 
@@ -175,28 +191,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The reservation is refused BEFORE anything is minted or stored, so a refused
         // call leaves the store exactly as it was.
-        let job_id = {
+        let (job_id, branch_arn) = {
             let branch = branch_of(&mut store, &input.app_id, &input.branch_name)?;
-            // The reservations the clock has already let expire are dropped first:
-            // that is owed whether or not anybody called, and a reservation that can
-            // no longer be started must not hold a branch at its cap.
-            branch.expire_deployments();
-            if branch.deployments.len() >= crate::state::MAX_PENDING_DEPLOYMENTS_PER_BRANCH {
+            // Deployments of one branch are SERIALIZED: while the branch's last job is
+            // still in flight a further deployment cannot be ordered against it, so it
+            // is refused with the modelled 400 and the id of the job to wait for or
+            // stop. `last_unfinished_job` materialises the clock-owed work first — an
+            // expired reservation, and the job its closing window failed — so nothing
+            // the clock has already ended refuses a deployment.
+            if let Some(unfinished) = branch.last_unfinished_job() {
+                return Err(CreateDeploymentErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::unfinished_job_message(&unfinished)),
+                    },
+                )
+                .into());
+            }
+            // A deployment's job is one more job of this branch's BOUNDED history, so
+            // the room for it is made (the oldest finished job retired) first.
+            if !branch.make_room_for_a_job() {
                 return Err(CreateDeploymentErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "Number of pending deployments exceeds the limit of {} for branch {}",
-                            crate::state::MAX_PENDING_DEPLOYMENTS_PER_BRANCH,
-                            input.branch_name
-                        )),
+                        message: Some(crate::state::job_limit_message(&input.branch_name)),
                     },
                 )
                 .into());
             }
             // The id the caller "will supply to start deployment api": it is spent on
             // this reservation, so no job started on this branch afterwards is handed
-            // it, and no job exists under it until that start call.
-            branch.reserve_job_id()
+            // it, and the job this call creates runs under it.
+            (branch.reserve_job_id(), branch.branch.branch_arn.clone())
         };
 
         // One destination per file the request named, or one for the zipped
@@ -238,9 +262,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Persisted on the branch, because the call that STARTS this deployment is a
         // later one that knows only the job id handed back here — and because the
         // plane serving these destinations writes what is uploaded into this record.
-        branch_of(&mut store, &input.app_id, &input.branch_name)?
+        // The deployment's JOB is created with it: "the maximum duration between the
+        // CreateDeployment call and the StartDeployment call cannot exceed 8 hours. If
+        // the duration exceeds 8 hours, the StartDeployment call and the associated Job
+        // will fail" — the job is associated with THIS call, so it is readable through
+        // `GetJob`, listed by `ListJobs`, cancellable through `StopJob`, and it is what
+        // the serialization above waits for.
+        let branch = branch_of(&mut store, &input.app_id, &input.branch_name)?;
+        branch
             .deployments
             .insert(pending.job_id.clone(), pending.clone());
+        branch.jobs.insert(
+            pending.job_id.clone(),
+            crate::state::BranchJob::reserved(
+                Job {
+                    summary: reserved_job_summary(&branch_arn, &pending, created_at),
+                    // The steps of a job are what its execution produced, and nothing
+                    // has executed: the deployment has not been started.
+                    steps: Vec::new(),
+                },
+                pending.expires_at,
+            ),
+        );
 
         Ok(CreateDeploymentOutput {
             // The id of the job this deployment runs under once it is started, which
@@ -265,20 +308,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// A deployment is reserved ON a branch of an app
 /// (`POST /apps/{appId}/branches/{branchName}/deployments`), so neither an unknown app
 /// nor a branch that app does not carry is created on the way. `NotFoundException` is
-/// NOT among this operation's modelled errors
+/// not among this operation's MODELLED errors
 /// (`smithy_query(query="operation",operation="CreateDeployment")` lists
 /// `BadRequestException`, `InternalFailureException`, `LimitExceededException` and
-/// `UnauthorizedException`), so an identifier that names nothing is refused with the
-/// modelled 400 — the refusal a client of THIS operation can branch on — and the
-/// message names the entity and the identifier the request used for it, as every other
-/// refusal in this crate words it.
+/// `UnauthorizedException`), but recorded behaviour answers an absent app or branch with
+/// HTTP 404 and the not-found error type, so the recording overrides the model's list:
+/// the shape is widened in through `extra_errors` above and answered here, with the
+/// message naming the entity and the identifier the request used for it — the wording
+/// every other 404 in this crate is built with ([`crate::state::not_found_message`]).
 fn branch_of<'store>(
     store: &'store mut crate::state::ComAmazonawsAmplifyAmplifyState,
     app_id: &str,
     branch_name: &str,
 ) -> Result<&'store mut crate::state::AmplifyBranch, CreateDeploymentErrorModeled> {
     fn absent(entity: &str, identifier: &str) -> CreateDeploymentErrorModeled {
-        CreateDeploymentErrorModeled::BadRequestException(BadRequestException {
+        CreateDeploymentErrorModeled::NotFoundException(NotFoundException {
             message: Some(crate::state::not_found_message(entity, identifier)),
         })
     }
@@ -292,8 +336,42 @@ fn branch_of<'store>(
         .ok_or_else(|| absent(crate::state::BRANCH_ENTITY, branch_name))
 }
 
-/// Where ONE upload of a reserved deployment goes.
+/// The `JobSummary` of the job this call creates for the deployment it reserves.
 ///
+/// Every member mirrors the one `StartDeployment` reports for the job that deploys the
+/// same content, with the two differences this call's job has: it carries
+/// [`crate::state::JOB_STATUS_CREATED`] rather than a running status, because nothing has
+/// started it, and it names no source URL, because the content of a reserved deployment
+/// is uploaded to the destinations this call hands back.
+fn reserved_job_summary(
+    branch_arn: &str,
+    pending: &crate::state::PendingDeployment,
+    created_at: i64,
+) -> JobSummary {
+    let created = ::aws_smithy_types::DateTime::from_millis(created_at);
+    JobSummary {
+        job_arn: format!("{branch_arn}/jobs/{}", pending.job_id),
+        // A manual deployment deploys content, not a commit of a repository: each
+        // member is @required on `JobSummary` with a length minimum of 0, so the job
+        // carries the empty value rather than none — and `commitTime` has no empty
+        // value, so it records the instant the deployment was created.
+        commit_id: String::new(),
+        commit_message: String::new(),
+        commit_time: created,
+        start_time: created,
+        status: crate::state::JOB_STATUS_CREATED.to_string(),
+        end_time: None,
+        // "If the value is MANUAL, the job is for a manually deployed app"
+        // (`smithy_query(query="shape",shape="JobSummary",member="jobType")`), which is
+        // the only kind of app this operation reserves a deployment for.
+        job_type: crate::ops::start_deployment::MANUAL_JOB_TYPE.to_string(),
+        source_url: None,
+        source_url_type: None,
+        job_id: pending.job_id.clone(),
+    }
+}
+
+/// Where ONE upload of a reserved deployment goes.///
 /// A deployment's content is uploaded to a destination THIS EMULATOR SERVES — the
 /// endpoint the reserving caller reached, under the reservation's own path
 /// (`crate::state::deployment_upload_path`) — because a URL this operation hands back
