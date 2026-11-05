@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCommands
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCommands`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the commands a Region's Run Command history holds — the listing half of this
+//! service's Run Command slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCommands::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What `SendCommand` persisted is what this reports, through the one store in
+//! [`crate::state::commands`]: every command of the Region the request was signed for,
+//! narrowed by the criteria the request names — the one command a `CommandId` names, the
+//! commands that hold an invocation for an `InstanceId`, and the filters
+//! ([`crate::state::commands::CommandRecord::matches_filter`]), which narrow together.
+//! A criterion no stored command meets selects none rather than refusing the read; an id
+//! no command of the Region carries is the one refusal (`InvalidCommandId`), because
+//! "lists only the specified command" names a command rather than describing one.
+//!
+//! The history is reported most recent first and paged by `MaxResults`, with the next
+//! page's first command id handed back as the `NextToken` — a cursor on the result rather
+//! than an offset into it.
+//!
+//! The one write this report makes is the drop the clock already owed: a command whose
+//! history Run Command no longer retains
+//! ([`crate::state::commands::COMMAND_HISTORY_RETENTION`]) was already gone at the instant
+//! of the call, whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +173,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCommands` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCommandsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCommands"))
+        use crate::state::commands::{
+            command_filter_value_rejection, command_page_size, is_command_filter_key,
+            is_command_id, CommandRecord, COMMAND_FILTER_KEY_STATUS, COMMAND_STATUS_PENDING,
+            NODE_ID_WITH_PENDING_STATUS,
+        };
+        use crate::state::{request_region, INVALID_NEXT_TOKEN};
+
+        // `CommandId`'s length, `InstanceId`'s pattern, `MaxResults`'s range, the filter
+        // list's length and each filter's `CommandFilterKey` are MODELLED constraints, so
+        // the centralized walk has already refused anything outside them. What is read
+        // here is which commands of this Region the request's criteria select.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCommandsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the command store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for (position, filter) in filters.iter().enumerate() {
+            // A filter has to name one of the keys the model declares: a key outside that
+            // set names no property of a command, so the filter cannot be served. The
+            // modelled enum is refused before this handler runs, so this is a backstop.
+            if !is_command_filter_key(&filter.key) {
+                return Err(
+                    ListCommandsErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
+                );
+            }
+            // A value outside what the key may carry is a validation of the request: the
+            // key is one the operation knows, so it is the value that cannot be served.
+            // The refusal names the filter's place in the list the request sent.
+            if let Some(why) =
+                command_filter_value_rejection(position + 1, &filter.key, &filter.value)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(why));
+            }
+        }
+
+        let node = input.instance_id.as_deref().filter(|id| !id.is_empty());
+        // "You can't specify a managed node ID in the same command that you specify
+        // `Status` = `Pending`. This is because the command hasn't reached the managed
+        // node yet" (`ListCommandsRequest$InstanceId`): the two criteria cannot hold
+        // together, which is a validation of the request rather than a filter the
+        // operation does not know.
+        if node.is_some()
+            && filters.iter().any(|filter| {
+                filter.key == COMMAND_FILTER_KEY_STATUS && filter.value == COMMAND_STATUS_PENDING
+            })
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                NODE_ID_WITH_PENDING_STATUS,
+            ));
+        }
+
+        let page_size =
+            command_page_size(input.max_results).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the command the next page starts
+        // at, so a token that is not shaped like a command id was not one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_command_id(token) => Some(token.to_string()),
+            Some(_) => {
+                return Err(ListCommandsErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some(INVALID_NEXT_TOKEN.to_string()),
+                })
+                .into())
+            }
+        };
+
+        // Systems Manager is regional: a command is reported through the endpoint it was
+        // sent to, which is the Region this request was signed for.
+        let region = request_region(ctx.parts());
+        let mut store = state.lock();
+        // The one write a report makes: the drop the clock already owed of a command whose
+        // history is no longer retained.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // "(Optional) If provided, lists only the specified command"
+        // (`ListCommandsRequest$CommandId`): a command id NAMES a command, so an id no
+        // command of this Region carries names none to list.
+        let only = input.command_id.as_deref().filter(|id| !id.is_empty());
+        if let Some(id) = only {
+            if store.command(&region, id).is_none() {
+                // The modelled `InvalidCommandId` carries no message member, so the
+                // refusal is the error code alone.
+                return Err(ListCommandsErrorModeled::InvalidCommandId(InvalidCommandId {}).into());
+            }
+        }
+
+        let mut matching: Vec<&CommandRecord> = store
+            .commands_in_region(&region)
+            .map(|(_, command)| command)
+            .filter(|command| only.is_none_or(|id| command.command_id == id))
+            // "(Optional) Lists commands issued against this managed node ID": a command
+            // was issued against the nodes it holds an invocation for. A node id is
+            // CRITERIA here rather than an identity — a command's history outlives the
+            // node it ran on, so what the id selects is read off the stored invocations
+            // and an id nothing was issued against selects no command.
+            .filter(|command| node.is_none_or(|id| command.invocation(id).is_some()))
+            // Two filters narrow together: each is a criterion the command has to meet.
+            .filter(|command| {
+                filters
+                    .iter()
+                    .all(|filter| command.matches_filter(&filter.key, &filter.value))
+            })
+            .collect();
+        // Run Command reports a history, so the most recently requested command comes
+        // first; two commands requested at the one instant are ordered by their ids, which
+        // is what makes the order total and the resume cursor below unambiguous.
+        matching.sort_by(|left, right| {
+            right
+                .requested_at
+                .cmp(&left.requested_at)
+                .then_with(|| left.command_id.cmp(&right.command_id))
+        });
+
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(at) = matching
+                    .iter()
+                    .position(|command| command.command_id == token)
+                else {
+                    // The token is shaped like a command id but names no command this
+                    // result holds, so it is not a page of this result to resume.
+                    return Err(ListCommandsErrorModeled::InvalidNextToken(InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    })
+                    .into());
+                };
+                at
+            }
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page: &[&CommandRecord] = matching.get(start..).unwrap_or_default();
+        let commands = page
+            .iter()
+            .take(page_size)
+            .map(|command| command.to_command())
+            .collect();
+        // A command is still waiting past this page: hand the caller the id it resumes at,
+        // so the next request continues where this one stopped.
+        let next_token = page
+            .get(page_size)
+            .map(|command| command.command_id.clone());
+
+        Ok(ListCommandsOutput {
+            commands: Some(commands),
+            next_token,
+        })
     }
 }

@@ -215,18 +215,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PermissionsConfig` names "the IAM role ARN used by the capacity provider to
         // manage compute instances and other Amazon Web Services resources", and this
         // service makes those calls AS that role — so the role is resolved against this
-        // account's IAM before anything is written: a role this account HOLDS whose stored
-        // trust policy does not let this service assume it is the modelled 400 and no
-        // provider is stored
-        // (`crate::state::capacity_provider::operator_role_is_unassumable`).
+        // account's IAM before anything is written: a role this account's IAM holds none
+        // of, or one whose stored trust policy does not let this service assume it, is the
+        // modelled 400 and no provider is stored
+        // (`crate::state::capacity_provider::operator_role_is_unassumable`, which states
+        // why an ABSENT IAM record answers here where it does not for a function's
+        // execution role, and that those answers are AWS's recorded ones).
         //
-        // That reading refuses only what a trust document IAM ANSWERED with withholds, as a
-        // function's execution role does: a name this account's IAM holds no role under is
-        // evidence about this emulator's store rather than about the role the caller named,
-        // an operator role being normally provisioned outside the client that creates the
-        // provider. It is put to the emulator's OWN IAM over its OWN in-process transport
-        // (that reading asks through `service_common::iam_role`, whose client is built from
-        // the operation callback): nothing here opens a socket, resolves a host or reads an
+        // It is put to the emulator's OWN IAM over its OWN in-process transport (that
+        // reading asks through `service_common::iam_role`, whose client is built from the
+        // operation callback): nothing here opens a socket, resolves a host or reads an
         // ambient credential. An emulator with no IAM mounted to ask refuses nothing, so a
         // missing answer never becomes a refusal. It is awaited with no store guard held.
         if crate::state::capacity_provider::operator_role_is_unassumable(

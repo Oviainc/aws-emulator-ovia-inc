@@ -3,9 +3,11 @@
 //! The Run Command slice: a command a caller sent, and the one invocation it holds per
 //! managed node the send resolved.
 //!
-//! `SendCommand` writes a [`CommandRecord`] here and `GetCommandInvocation` reports the
-//! [`CommandInvocationRecord`] one of its nodes holds, so what a send persisted is what a
-//! later read reports. A command is keyed by `(region, command id)`: a command is sent to
+//! `SendCommand` writes a [`CommandRecord`] here, `GetCommandInvocation` reports the
+//! [`CommandInvocationRecord`] one of its nodes holds and `ListCommands` reports the
+//! commands a Region holds, narrowed by the criteria a request names
+//! ([`CommandRecord::matches_filter`]), so what a send persisted is what a later read
+//! reports. A command is keyed by `(region, command id)`: a command is sent to
 //! the Systems Manager endpoint of one Region and identified there by the id this service
 //! minted for it.
 //!
@@ -258,6 +260,44 @@ impl CommandRecord {
         self.invocations.get(instance_id)
     }
 
+    /// Whether a `Status` filter value selects this command.
+    ///
+    /// A command carries two readings of its status: the modelled `CommandStatus`, and the
+    /// detailed status `Command$StatusDetails` spells in words ("Delivery Timed Out"). The
+    /// documented filter values cover both readings and carry no spaces
+    /// ([`LIST_COMMANDS_STATUS_FILTER_VALUES`]), so a value selects this command when it
+    /// names either of them.
+    pub fn matches_status_filter(&self, value: &str) -> bool {
+        self.status == value || self.status_details.replace(' ', "") == value
+    }
+
+    /// Whether the filter `key`=`value` selects this command.
+    ///
+    /// Each key narrows by one property of the command: when it was requested, the status
+    /// it holds, whether that status is terminal, or the document it runs. A key this
+    /// service does not know selects nothing — its caller refuses such a key before
+    /// anything is asked about the history.
+    pub fn matches_filter(&self, key: &str, value: &str) -> bool {
+        match key {
+            COMMAND_FILTER_KEY_INVOKED_AFTER => {
+                parse_filter_instant(value).is_some_and(|at| self.requested_at >= at)
+            }
+            COMMAND_FILTER_KEY_INVOKED_BEFORE => {
+                parse_filter_instant(value).is_some_and(|at| self.requested_at <= at)
+            }
+            COMMAND_FILTER_KEY_STATUS => self.matches_status_filter(value),
+            // "Executing … currently still running" is every status that is not terminal;
+            // "Complete … already completed" is every status that is.
+            COMMAND_FILTER_KEY_EXECUTION_STAGE => match value {
+                EXECUTION_STAGE_EXECUTING => !is_terminal_status(&self.status),
+                EXECUTION_STAGE_COMPLETE => is_terminal_status(&self.status),
+                _ => false,
+            },
+            COMMAND_FILTER_KEY_DOCUMENT_NAME => self.document_name == value,
+            _ => false,
+        }
+    }
+
     /// The modelled `Command` for this command: every member either echoed from the
     /// request as it was received, resolved by the send, or counted from the invocations
     /// the store holds. A member the request left unset is left unset here too rather
@@ -445,6 +485,166 @@ pub fn unsupported_platform(
         "Document {document_name} doesn't support platform type {platform}"
     ))
 }
+
+/// The `CommandFilterKey` that narrows the history by when a command was requested:
+/// "InvokedAfter: Specify a timestamp to limit your results … occurring July 7, 2021, and
+/// later" (`CommandFilter$value`). From the modelled enum
+/// (`crate::ops::types::COMMAND_FILTER_KEY_VALUES`).
+pub const COMMAND_FILTER_KEY_INVOKED_AFTER: &str = "InvokedAfter";
+
+/// The same narrowing from the other side: "InvokedBefore: Specify a timestamp to limit
+/// your results … from before July 7, 2021" (same doc).
+pub const COMMAND_FILTER_KEY_INVOKED_BEFORE: &str = "InvokedBefore";
+
+/// The `CommandFilterKey` that narrows the history by a command's status: "Specify a valid
+/// command status to see a list of all command executions with that status" (same doc).
+pub const COMMAND_FILTER_KEY_STATUS: &str = "Status";
+
+/// The `CommandFilterKey` that narrows the history by whether a command is still running
+/// (same doc), whose values are [`EXECUTION_STAGE_VALUES`].
+pub const COMMAND_FILTER_KEY_EXECUTION_STAGE: &str = "ExecutionStage";
+
+/// The `CommandFilterKey` that narrows the history by the document a command runs:
+/// "Specify name of the … document … for which you want to see command execution results"
+/// (same doc).
+pub const COMMAND_FILTER_KEY_DOCUMENT_NAME: &str = "DocumentName";
+
+/// Whether `key` is a filter key a command history read accepts: the modelled
+/// `CommandFilterKey` enum is that whole set, so nothing else names a property of a
+/// command to narrow by.
+pub fn is_command_filter_key(key: &str) -> bool {
+    crate::ops::types::COMMAND_FILTER_KEY_VALUES.contains(&key)
+}
+
+/// The values a `Status` filter of a COMMAND history read may name, in the order
+/// `CommandFilter$value` lists them ("The status values you can specify for
+/// `ListCommands` are …") — a wider set than the modelled `CommandStatus` enum, because
+/// the detailed status a command reports in words is also named here, spelled without its
+/// spaces ([`CommandRecord::matches_status_filter`]).
+pub const LIST_COMMANDS_STATUS_FILTER_VALUES: &[&str] = &[
+    "Pending",
+    "InProgress",
+    "Success",
+    "Cancelled",
+    "Failed",
+    "TimedOut",
+    "AccessDenied",
+    "DeliveryTimedOut",
+    "ExecutionTimedOut",
+    "Incomplete",
+    "NoInstancesInTag",
+    "LimitExceeded",
+];
+
+/// The `ExecutionStage` value that selects the commands still running: "Executing:
+/// Returns a list of command executions that are currently still running"
+/// (`CommandFilter$value`).
+pub const EXECUTION_STAGE_EXECUTING: &str = "Executing";
+
+/// The `ExecutionStage` value that selects the commands that are done: "Complete: Returns
+/// a list of command executions that have already completed" (same doc).
+pub const EXECUTION_STAGE_COMPLETE: &str = "Complete";
+
+/// The values an `ExecutionStage` filter may name (same doc). What a refusal of another
+/// value lists.
+pub const EXECUTION_STAGE_VALUES: &[&str] = &[EXECUTION_STAGE_EXECUTING, EXECUTION_STAGE_COMPLETE];
+
+/// Whether `status` is one of the terminal states, which a command and one of its
+/// invocations reach by the same names: `Command$StatusDetails` and
+/// `CommandInvocation$StatusDetails` both end at "Success", "Cancelled", "Failed" and the
+/// timed-out states, so this reads the one set ([`TERMINAL_INVOCATION_STATUSES`]).
+pub fn is_terminal_status(status: &str) -> bool {
+    TERMINAL_INVOCATION_STATUSES.contains(&status)
+}
+
+/// Whether `id` is shaped like a `CommandId`: the modelled length is exactly 36, and this
+/// service mints the hyphenated UUID form ([`super::ComAmazonawsSsmAmazonssmState::mint_command_id`]),
+/// read by the one reader of that form this crate has.
+pub fn is_command_id(id: &str) -> bool {
+    super::is_activation_id(id)
+}
+
+/// The bounds the modelled `CommandMaxResults` carries (range 1..50).
+pub const MIN_COMMAND_PAGE_SIZE: i32 = 1;
+
+/// See [`MIN_COMMAND_PAGE_SIZE`]. It is also the page size a request that names no
+/// `MaxResults` gets, the way every other read of this service serves one.
+pub const MAX_COMMAND_PAGE_SIZE: i32 = 50;
+
+/// The page size a command history read serves, or the refusal message for a `MaxResults`
+/// outside the modelled range — which the protocol's boundary validator already refuses,
+/// so this is a backstop rather than the first line of defence.
+pub fn command_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(max_results, MIN_COMMAND_PAGE_SIZE, MAX_COMMAND_PAGE_SIZE)
+}
+
+/// The instant a timestamp filter value names, or `None` when the value names none.
+///
+/// "Specify a timestamp to limit your results. For example, specify
+/// `2024-07-07T00:00:00Z`" (`CommandFilter$value`) — the ISO 8601 spelling
+/// `::aws_smithy_types::date_time::Format::DateTime` reads, which is the one the service
+/// renders `RequestedDateTime` in.
+pub fn parse_filter_instant(value: &str) -> Option<SystemTime> {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        value,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    SystemTime::try_from(parsed).ok()
+}
+
+/// Why `value` is not a value the filter key `key` may carry, or `None` when it is one.
+/// `position` is the filter's place in the request's `Filters` list, counted from one.
+///
+/// A filter value has to be a legal value of what it filters: a timestamp for the two
+/// instant keys, one of the status values the operation documents for a `Status` filter,
+/// and one of the two stages for an `ExecutionStage` filter. `DocumentName` filters a
+/// document name, which constrains nothing here — a name no document carries selects no
+/// command rather than refusing the read.
+///
+/// The sentence is worded the way a request-validation refusal of this API is: the value,
+/// the member it was carried in — spelled as the emulator's own boundary validator spells a
+/// list member's path — and the constraint it failed, as the page-size refusal of every read
+/// of this service already states one (`super::page_size`). The enum clause lists the values
+/// the operation documents; the timestamp clause is this emulator's own wording of what
+/// `CommandFilter$value` documents the two instant keys as taking ("Specify a timestamp …
+/// For example, specify 2024-07-07T00:00:00Z"), which no model constraint states.
+pub fn command_filter_value_rejection(position: usize, key: &str, value: &str) -> Option<String> {
+    let failed = |constraint: String| {
+        Some(format!(
+            "Value '{value}' at 'filters.{position}.member.value' failed to satisfy \
+             constraint: {constraint}"
+        ))
+    };
+    let enumerated =
+        |values: &[&str]| format!("Member must satisfy enum value set: [{}]", values.join(", "));
+    match key {
+        COMMAND_FILTER_KEY_INVOKED_AFTER | COMMAND_FILTER_KEY_INVOKED_BEFORE
+            if parse_filter_instant(value).is_none() =>
+        {
+            failed(
+                "Member must be a timestamp, for example 2024-07-07T00:00:00Z".to_string(),
+            )
+        }
+        COMMAND_FILTER_KEY_STATUS if !LIST_COMMANDS_STATUS_FILTER_VALUES.contains(&value) => {
+            failed(enumerated(LIST_COMMANDS_STATUS_FILTER_VALUES))
+        }
+        COMMAND_FILTER_KEY_EXECUTION_STAGE if !EXECUTION_STAGE_VALUES.contains(&value) => {
+            failed(enumerated(EXECUTION_STAGE_VALUES))
+        }
+        _ => None,
+    }
+}
+
+/// How this service states that a node id cannot be named beside a `Pending` status
+/// filter: the sentence `ListCommandsRequest$InstanceId` states the rule in, verbatim —
+/// "You can't specify a managed node ID in the same command that you specify Status =
+/// Pending. This is because the command hasn't reached the managed node yet." It carries
+/// nothing of the request, because the rule is about the two criteria and not about which
+/// node or which filter was named.
+pub const NODE_ID_WITH_PENDING_STATUS: &str =
+    "You can't specify a managed node ID in the same command that you specify Status = \
+     Pending. This is because the command hasn't reached the managed node yet.";
 
 /// How this service states that the managed nodes a request NAMED cannot take the call.
 ///

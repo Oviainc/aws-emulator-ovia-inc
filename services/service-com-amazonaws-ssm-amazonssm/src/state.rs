@@ -48,8 +48,9 @@
 //!
 //! The third is **Run Command** ([`commands`]): `SendCommand` resolves the document and
 //! the managed nodes a send names or describes, persists the command and one invocation
-//! per resolved node, and `GetCommandInvocation` reports one of those invocations — so
-//! what a send persisted is what a later read reports, per Region.
+//! per resolved node, `GetCommandInvocation` reports one of those invocations and
+//! `ListCommands` reports the commands a Region holds — so what a send persisted is what
+//! a later read reports, per Region.
 //!
 //! The fourth is the **managed nodes** the node describes report
 //! ([`ManagedNodeRecord`]), keyed by `(region, node id)`: `DescribeInstanceProperties`
@@ -3096,6 +3097,19 @@ impl ComAmazonawsSsmAmazonssmState {
     pub fn command(&self, region: &str, command_id: &str) -> Option<&commands::CommandRecord> {
         self.commands
             .get(&(region.to_string(), command_id.to_string()))
+    }
+
+    /// Every command `region` holds, as `(command id, record)`: the history that Region's
+    /// endpoint reports, in the store's own ascending command-id order. A read that
+    /// reports them in another order ranks them itself.
+    pub fn commands_in_region<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a commands::CommandRecord)> + 'a {
+        self.commands
+            .iter()
+            .filter(move |((held, _), _)| held == region)
+            .map(|((_, id), record)| (id.as_str(), record))
     }
 
     /// Store `record` as `region`'s command of that id.
