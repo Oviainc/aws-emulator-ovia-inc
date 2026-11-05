@@ -7,17 +7,19 @@
 //! publishes for the filter that selects on that very state — "`vpc-endpoint-state` - The
 //! state of the endpoint (`pendingAcceptance` | `pending` | `available` | `deleting` |
 //! `deleted` | `rejected` | `failed`)" (`DescribeVpcEndpointsRequest$Filters`) — so an
-//! endpoint a create answers is `pending` and the one the clock has carried past its span is
-//! `available`, under exactly those spellings, and the `vpc-endpoint-state` filter selects an
-//! endpoint by the value it reports. A client that waits for an endpoint to be in service
+//! endpoint is reported in the state its type is CREATED in and in the one the clock has
+//! carried it to, under exactly those spellings, and the `vpc-endpoint-state` filter selects
+//! an endpoint by the value it reports. A client that waits for an endpoint to be in service
 //! compares against that value, so the spelling is the contract.
 //!
 //! Each table row is a distinct input along what that rule generalises over: which endpoint
 //! type (each one this service creates), which endpoint service the endpoint is to —
 //! including the dedicated regional PrivateLink service a syslog ingestion endpoint is
-//! created to — and how many subnets and security groups the endpoint was given. The state
-//! an endpoint reports is a fact about the endpoint, not about any of those, so every row
-//! reports the same two values.
+//! created to — and how many subnets and security groups the endpoint was given. What varies
+//! with the row is the state the endpoint STARTS in: a gateway endpoint stands up no endpoint
+//! network interface, so it is in service as soon as it exists, while an endpoint that does
+//! is `pending` until the clock has carried those interfaces into service. Every row ends
+//! `available`.
 
 use std::time::Duration;
 
@@ -90,6 +92,10 @@ struct EndpointCase {
     subnets: usize,
     /// Whether the create names the VPC's own security group.
     with_group: bool,
+    /// The state the create answers and the describe reports until the clock moves it: an
+    /// endpoint that stands up endpoint network interfaces starts `pending`, and one that
+    /// stands up none is in service at once.
+    created_state: &'static str,
 }
 
 /// The rows: every endpoint type this service creates, and the service names a client uses —
@@ -103,6 +109,7 @@ fn endpoint_cases() -> Vec<EndpointCase> {
             service_name: "com.amazonaws.us-east-1.syslog-logs",
             subnets: 1,
             with_group: true,
+            created_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
         EndpointCase {
             case: "an interface endpoint in two subnets, with no group of its own",
@@ -110,6 +117,7 @@ fn endpoint_cases() -> Vec<EndpointCase> {
             service_name: "com.amazonaws.us-east-1.logs",
             subnets: 2,
             with_group: false,
+            created_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
         EndpointCase {
             case: "a gateway endpoint, the documented default type",
@@ -117,6 +125,7 @@ fn endpoint_cases() -> Vec<EndpointCase> {
             service_name: "com.amazonaws.us-east-1.s3",
             subnets: 0,
             with_group: false,
+            created_state: ec2::state::VPC_ENDPOINT_STATE_AVAILABLE,
         },
         EndpointCase {
             case: "a Gateway Load Balancer endpoint to a partner service",
@@ -124,13 +133,14 @@ fn endpoint_cases() -> Vec<EndpointCase> {
             service_name: "com.amazonaws.vpce.us-east-1.vpce-svc-0123456789abcdef0",
             subnets: 1,
             with_group: false,
+            created_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
     ]
 }
 
-/// A created endpoint is `pending`, the clock carries it to `available`, and both values are
-/// the ones the filter's published list spells — for every row, and read back through the
-/// describe and through the filter.
+/// A created endpoint reports the state its type is created in, the clock carries the one
+/// that owes a move to `available`, and both values are the ones the filter's published list
+/// spells — for every row, and read back through the describe and through the filter.
 #[tokio::test]
 async fn an_endpoint_reports_its_state_in_the_published_vocabulary() {
     let router = super::ec2_query::emulator().0;
@@ -177,7 +187,7 @@ async fn an_endpoint_reports_its_state_in_the_published_vocabulary() {
         member("the network", &body, "groupId")
     };
 
-    let mut created: Vec<(&str, String)> = Vec::new();
+    let mut created: Vec<(&str, String, &str)> = Vec::new();
     for row in endpoint_cases() {
         let case = row.case;
         let mut params = vec![
@@ -199,15 +209,16 @@ async fn an_endpoint_reports_its_state_in_the_published_vocabulary() {
         // The create ANSWERS the stored record, so the state it reports is the stored one.
         assert_eq!(
             member(case, &body, "state"),
-            ec2::state::VPC_ENDPOINT_STATE_PENDING,
-            "case {case:?}: a created endpoint is in the non-terminal pending state, got {body}"
+            row.created_state,
+            "case {case:?}: expected the create to answer {state:?}, got {body}",
+            state = row.created_state
         );
         assert_eq!(
             described_state(case, &router, &endpoint_id).await,
-            ec2::state::VPC_ENDPOINT_STATE_PENDING,
+            row.created_state,
             "case {case:?}: the describe reports the state the create answered"
         );
-        created.push((case, endpoint_id));
+        created.push((case, endpoint_id, row.created_state));
     }
 
     // Every value reported here is one the published list spells — the catalog is
@@ -223,24 +234,36 @@ async fn an_endpoint_reports_its_state_in_the_published_vocabulary() {
         );
     }
 
-    // The filter selects an endpoint by the value it reports, and nothing is in service yet.
-    let pending = ids_in_state("the pending filter", &router, "pending").await;
-    assert_eq!(
-        pending.len(),
-        created.len(),
-        "case the pending filter: every created endpoint is pending, got {pending:?}"
-    );
-    assert!(
-        ids_in_state("the available filter", &router, "available")
-            .await
-            .is_empty(),
-        "case the available filter: no endpoint is in service before its span has passed"
-    );
+    // The filter selects an endpoint by the value it reports, so each endpoint is selected by
+    // the state it was created in and by no other.
+    for state in [
+        ec2::state::VPC_ENDPOINT_STATE_PENDING,
+        ec2::state::VPC_ENDPOINT_STATE_AVAILABLE,
+    ] {
+        let selected = ids_in_state("the created-state filter", &router, state).await;
+        let expected: Vec<&String> = created
+            .iter()
+            .filter(|(_, _, created_state)| *created_state == state)
+            .map(|(_, endpoint_id, _)| endpoint_id)
+            .collect();
+        assert_eq!(
+            selected.len(),
+            expected.len(),
+            "case the {state:?} filter: expected {expected:?}, got {selected:?}"
+        );
+        for endpoint_id in expected {
+            assert!(
+                selected.contains(endpoint_id),
+                "case the {state:?} filter: expected it to select {endpoint_id:?}, got \
+                 {selected:?}"
+            );
+        }
+    }
 
-    // The move the clock owed each of them falls due on its own, with nothing called in
-    // between to make it happen.
+    // The move the clock owed each endpoint that was not in service yet falls due on its own,
+    // with nothing called in between to make it happen.
     tokio::time::sleep(SETTLE_WAIT).await;
-    for (case, endpoint_id) in &created {
+    for (case, endpoint_id, _) in &created {
         assert_eq!(
             described_state(case, &router, endpoint_id).await,
             ec2::state::VPC_ENDPOINT_STATE_AVAILABLE,

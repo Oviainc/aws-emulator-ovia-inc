@@ -464,6 +464,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "To connect a function to a VPC, Lambda creates an elastic network interface for
+        // each subnet in your function's VPC configuration" (`VpcConfig`) — created by Lambda
+        // acting as the function's OWN execution role, so a function whose role could never
+        // stand up the attachment it asks for is refused here, before anything is stored,
+        // rather than left to an invocation with no network. The same reading
+        // `UpdateFunctionConfiguration` makes of a configuration added later (see
+        // [`crate::state::vpc_attachment_authorization`], including the cases that show
+        // nothing about the role and refuse nothing).
+        if let Some(vpc_config) = input.vpc_config.as_ref() {
+            if let Some(message) = crate::state::unattachable_vpc_config(
+                &*self.engine,
+                &region,
+                &input.role,
+                vpc_config,
+            ) {
+                return Err(invalid_parameter(message));
+            }
+        }
+
         let mut store = state.lock();
 
         if store.functions.contains_key(&reference.name) {

@@ -11,6 +11,9 @@
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::ensure_default_network`], which is
 //! idempotent per Region).
 //!
+//! Each VPC is reported as the record holds it, minus an association set it has no
+//! association in ([`reported`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -268,10 +271,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::encode_page_token);
 
         Ok(DescribeVpcsOutput {
-            vpcs: Some(page.iter().take(limit).map(|vpc| (*vpc).clone()).collect()),
+            vpcs: Some(page.iter().take(limit).map(|vpc| reported(vpc)).collect()),
             next_token,
         })
     }
+}
+
+/// The stored VPC as this report carries it: every member the record holds, minus an
+/// association set the VPC has no association in.
+///
+/// "Information about the IPv6 CIDR blocks associated with the VPC"
+/// (`Vpc$Ipv6CidrBlockAssociationSet`) — a VPC that has associated none has no such
+/// information, so the member is left out of what this operation reports rather than carried
+/// as an empty list, and a client that tests for the member to decide whether a VPC is
+/// dual-stack reads the VPC it actually has. The IPv4 member beside it
+/// (`Vpc$CidrBlockAssociationSet`) always carries the block the VPC was created with, so
+/// there is no empty set of it to leave out.
+fn reported(vpc: &Vpc) -> Vpc {
+    let mut reported = vpc.clone();
+    if reported
+        .ipv6_cidr_block_association_set
+        .as_deref()
+        .is_some_and(<[VpcIpv6CidrBlockAssociation]>::is_empty)
+    {
+        reported.ipv6_cidr_block_association_set = None;
+    }
+    reported
 }
 
 /// The page size a request that names no `MaxResults` gets: the largest the model

@@ -243,6 +243,12 @@ pub use batch_item_failures::{
 pub mod event_source_authorization;
 pub use event_source_authorization::unreadable_event_source;
 
+/// Whether a function's execution role may do what attaching it to a VPC takes lives in
+/// [`vpc_attachment_authorization`], beside the reading above, and is re-exported for the
+/// same reason: a handler names it as `crate::state::…`.
+pub mod vpc_attachment_authorization;
+pub use vpc_attachment_authorization::unattachable_vpc_config;
+
 /// What the account's CONCURRENCY does with no client action at all — the series Lambda
 /// publishes about how much of the Region's capacity the account has claimed, and how much
 /// of its unreserved pool is in use — lives in [`concurrency_metering`], beside the

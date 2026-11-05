@@ -120,8 +120,6 @@ mod capacity_reservation_cancellation;
 // `DescribeAddressesAttribute` as the projection of an Elastic IP address's `domain-name`
 // attribute state it is: which addresses carry a row, how `AllocationIds` filters them, what
 // it refuses, and how it pages. Declared beside `prefix_lists` for the reason the note above
-// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
-// inserts its lines.
 #[path = "all/describe_addresses_attribute.rs"]
 mod describe_addresses_attribute;
 // What `CancelConversionTask` cancels — the form it judges a conversion task id by, the
@@ -173,8 +171,6 @@ mod interruptible_allocation_capacity_reservation_ids;
 // What `CreateTransitGatewayConnect` computes a Connect attachment from — the transport
 // attachment it names, that attachment's own transit gateway, the requested tunnel protocol
 // and tags — the `pending` -> `available` move the clock owes it, and what it refuses.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/create_transit_gateway_connect.rs"]
 mod create_transit_gateway_connect;
 // What `DeleteVpnConcentrator` takes away, what it refuses and what it leaves alone.
@@ -1353,3 +1349,18 @@ mod delete_transit_gateway_route_table;
 // a request that would otherwise have succeeded. Declared at the tail of this file, which is
 #[path = "all/refusal_paths_answer_modelled_codes.rs"]
 mod refusal_paths_answer_modelled_codes;
+// The state a GATEWAY VPC endpoint is created in: one that stands up no endpoint network
+// interface is in service from the moment it exists, whatever route tables it was associated
+// with. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+#[path = "all/gateway_endpoint_availability.rs"]
+mod gateway_endpoint_availability;
+// What `DescribeVpcs` reports for a VPC's IPv6 associations: the association set of a VPC that
+// has one, and no such member at all for a VPC that has none. Declared beside `prefix_lists`
+#[path = "all/describe_vpcs_ipv6_associations.rs"]
+mod describe_vpcs_ipv6_associations;
+// The prefix list a security group rule grants: resolved against the lists the account can
+// see, on both sides of the group, and refused with the prefix list's own not-found class
+// when it names none of them. Declared beside `prefix_lists` for the reason the note above
+// gives.
+#[path = "all/security_group_rule_prefix_lists.rs"]
+mod security_group_rule_prefix_lists;

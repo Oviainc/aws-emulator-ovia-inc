@@ -178,6 +178,10 @@ struct CreateCase {
     subnets: usize,
     /// The type the created endpoint must report.
     reported_type: &'static str,
+    /// The state the created endpoint must report: a gateway endpoint stands up no endpoint
+    /// network interface, so it is in service at once, while an endpoint that does is
+    /// `pending` until the clock has carried its interfaces into service.
+    reported_state: &'static str,
 }
 
 /// The rows: the two spellings of a gateway endpoint (named and defaulted), an interface
@@ -191,6 +195,7 @@ fn create_cases() -> Vec<CreateCase> {
             service_name: "com.amazonaws.us-east-1.s3",
             subnets: 0,
             reported_type: "Gateway",
+            reported_state: ec2::state::VPC_ENDPOINT_STATE_AVAILABLE,
         },
         CreateCase {
             case: "no type at all, which defaults to Gateway",
@@ -198,6 +203,7 @@ fn create_cases() -> Vec<CreateCase> {
             service_name: "com.amazonaws.us-east-1.dynamodb",
             subnets: 0,
             reported_type: "Gateway",
+            reported_state: ec2::state::VPC_ENDPOINT_STATE_AVAILABLE,
         },
         CreateCase {
             case: "an interface endpoint in one subnet",
@@ -205,6 +211,7 @@ fn create_cases() -> Vec<CreateCase> {
             service_name: "com.amazonaws.us-east-1.logs",
             subnets: 1,
             reported_type: "Interface",
+            reported_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
         CreateCase {
             case: "an interface endpoint in two subnets",
@@ -212,6 +219,7 @@ fn create_cases() -> Vec<CreateCase> {
             service_name: "com.amazonaws.us-east-1.execute-api",
             subnets: 2,
             reported_type: "Interface",
+            reported_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
         CreateCase {
             case: "an interface endpoint to a service name of the partner form",
@@ -219,6 +227,7 @@ fn create_cases() -> Vec<CreateCase> {
             service_name: "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f6a7b8",
             subnets: 1,
             reported_type: "Interface",
+            reported_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
         CreateCase {
             case: "a Gateway Load Balancer endpoint in its one subnet",
@@ -226,13 +235,14 @@ fn create_cases() -> Vec<CreateCase> {
             service_name: "com.amazonaws.vpce.us-east-1.vpce-svc-1234567890abcdef0",
             subnets: 1,
             reported_type: "GatewayLoadBalancer",
+            reported_state: ec2::state::VPC_ENDPOINT_STATE_PENDING,
         },
     ]
 }
 
-/// Every row is created, answered in `Pending` with a minted `vpce-` id, and read back
-/// member for member through `DescribeVpcEndpoints` — so the answer is the record the store
-/// holds rather than a value assembled for the reply.
+/// Every row is created, answered in the state its type is created in with a minted `vpce-`
+/// id, and read back member for member through `DescribeVpcEndpoints` — so the answer is the
+/// record the store holds rather than a value assembled for the reply.
 #[tokio::test]
 async fn each_endpoint_type_is_created_persisted_and_read_back() {
     let router = emulator();
@@ -273,7 +283,7 @@ async fn each_endpoint_type_is_created_persisted_and_read_back() {
             ("vpcEndpointType", row.reported_type),
             ("vpcId", built.vpc_id.as_str()),
             ("serviceName", row.service_name),
-            ("state", ec2::state::VPC_ENDPOINT_STATE_PENDING),
+            ("state", row.reported_state),
             ("serviceRegion", REGION),
             ("ownerId", engine::emulator_account_id()),
             ("requesterManaged", "false"),

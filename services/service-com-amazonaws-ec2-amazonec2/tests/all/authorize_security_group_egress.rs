@@ -32,6 +32,21 @@ use super::wire::{child, child_text, document, is_long_id, param, Param};
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
 
+/// The id of the prefix list `REGION` publishes at position `index` of its own catalog, in
+/// `PrefixListName` order.
+///
+/// A rule may only grant a prefix list the account can SEE — the lists it created and the
+/// ones the Region publishes for its services, which is what `DescribeManagedPrefixLists`
+/// reports — so the rows below name one of those rather than an id of the right shape that
+/// resolves to nothing.
+fn published_prefix_list(index: usize) -> String {
+    let published = ec2::state::service_prefix_lists_in_region(REGION);
+    published
+        .get(index)
+        .map(|list| list.prefix_list_id.clone())
+        .unwrap_or_else(|| panic!("the Region publishes no prefix list at index {index}"))
+}
+
 /// The kind of destination a rule names. "You must specify exactly one of the following
 /// destinations: an IPv4 or IPv6 address range, a prefix list, or a security group"
 /// (`AuthorizeSecurityGroupEgress`), and a group may be named by id or by name.
@@ -517,7 +532,7 @@ async fn each_destination_of_each_permission_becomes_one_stored_rule() {
                 vec![Permission::new(
                     "tcp",
                     Some((80, 80)),
-                    vec![Dest::prefix_list("pl-0123456789abcdef0").described("S3 endpoints")],
+                    vec![Dest::prefix_list(&published_prefix_list(0)).described("S3 endpoints")],
                 )]
             },
         },
@@ -550,7 +565,7 @@ async fn each_destination_of_each_permission_becomes_one_stored_rule() {
                     vec![
                         Dest::ipv4("172.16.0.0/12"),
                         Dest::ipv6("2001:db8::/32"),
-                        Dest::prefix_list("pl-0abcdef0123456789"),
+                        Dest::prefix_list(&published_prefix_list(1)),
                         Dest::group_by_id(target),
                     ],
                 )]
@@ -1299,6 +1314,17 @@ async fn a_request_the_service_cannot_satisfy_is_refused_and_adds_nothing() {
             )]),
             names_group: false,
             code: ec2::state::INVALID_PARAMETER_VALUE,
+            status: 400,
+        },
+        Case {
+            name: "a well-formed prefix list id no prefix list answers to",
+            params: permission_params(&[Permission::new(
+                "tcp",
+                Some((443, 443)),
+                vec![Dest::prefix_list("pl-00000000000000bad")],
+            )]),
+            names_group: false,
+            code: ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
             status: 400,
         },
         Case {

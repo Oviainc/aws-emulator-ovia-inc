@@ -499,30 +499,85 @@ async fn every_direction_and_family_pair_is_its_own_quota_bucket() {
     }
 }
 
+/// Assert an authorize naming a prefix list the account cannot see was refused with that
+/// resource's own not-found class, with nothing stored.
+async fn expect_unknown_prefix_list(
+    router: &MultiServiceRouter,
+    case: &str,
+    direction: Direction,
+    group_id: &str,
+    grants: &[Grant],
+    before: &[ReportedRule],
+) {
+    let (status, body) = authorize(router, direction, group_id, grants).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 for a prefix list the account cannot see, got \
+         {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        ec2::state::INVALID_PREFIX_LIST_ID_NOT_FOUND,
+        "case {case:?}: expected the prefix list's not-found code, got {body}"
+    );
+    let after = reported_rules(router, case, group_id).await;
+    assert_eq!(
+        after, before,
+        "case {case:?}: a refused authorize must store nothing, got {after:?}"
+    );
+}
+
 /// The rule, for the sources that name no address range of their own: a prefix list is
 /// counted in the bucket of the family its own `AddressFamily` names, while a referenced
 /// security group — which admits that group's traffic of either family — is counted in every
-/// bucket, and so is a prefix list this account holds no record of.
+/// bucket. A prefix list this account holds no record of is never counted at all: it grants
+/// nothing, so it is refused with that resource's own not-found class before any bucket is
+/// asked about (the suite `security_group_rule_prefix_lists.rs` is that rule's own).
 #[tokio::test]
 async fn a_source_that_names_no_range_is_counted_in_the_buckets_it_admits() {
     let quota = ec2::state::MAX_SECURITY_GROUP_RULES_PER_DIRECTION;
-    // A well-formed prefix list id this account holds no list for: which family it admits
-    // is not knowable, so it is counted in every bucket.
+    // A well-formed prefix list id this account holds no list for.
     const UNKNOWN_PREFIX_LIST: &str = "pl-0abcd1234ef567890";
+    /// What the authorize of the row's source must answer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Outcome {
+        /// The bucket the source charges has room, so the rule is stored.
+        Served,
+        /// The bucket the source charges is full.
+        OverQuota,
+        /// The source names a prefix list the account cannot see.
+        UnknownList,
+    }
     // Each row: the family whose inbound bucket is filled to the quota, the kind of source
-    // the next rule names, and whether that rule is served.
-    let rows: [(Family, &str, bool); 8] = [
-        (Family::Ipv4, "an IPv6 prefix list", true),
-        (Family::Ipv4, "an IPv4 prefix list", false),
-        (Family::Ipv4, "a referenced security group", false),
-        (Family::Ipv4, "an unknown prefix list", false),
-        (Family::Ipv6, "an IPv4 prefix list", true),
-        (Family::Ipv6, "an IPv6 prefix list", false),
-        (Family::Ipv6, "a referenced security group", false),
-        (Family::Ipv6, "an unknown prefix list", false),
+    // the next rule names, and what the authorize of it answers.
+    let rows: [(Family, &str, Outcome); 8] = [
+        (Family::Ipv4, "an IPv6 prefix list", Outcome::Served),
+        (Family::Ipv4, "an IPv4 prefix list", Outcome::OverQuota),
+        (
+            Family::Ipv4,
+            "a referenced security group",
+            Outcome::OverQuota,
+        ),
+        (
+            Family::Ipv4,
+            "an unknown prefix list",
+            Outcome::UnknownList,
+        ),
+        (Family::Ipv6, "an IPv4 prefix list", Outcome::Served),
+        (Family::Ipv6, "an IPv6 prefix list", Outcome::OverQuota),
+        (
+            Family::Ipv6,
+            "a referenced security group",
+            Outcome::OverQuota,
+        ),
+        (
+            Family::Ipv6,
+            "an unknown prefix list",
+            Outcome::UnknownList,
+        ),
     ];
 
-    for (full, source, served) in rows {
+    for (full, source, outcome) in rows {
         let case = format!("{full:?} inbound at the quota, granting {source}");
         let case = case.as_str();
         let (router, _engine) = super::ec2_query::emulator();
@@ -558,7 +613,7 @@ async fn a_source_that_names_no_range_is_counted_in_the_buckets_it_admits() {
              rules {at_quota:?}"
         );
 
-        if served {
+        if outcome == Outcome::Served {
             expect_accepted(
                 &router,
                 case,
@@ -583,6 +638,16 @@ async fn a_source_that_names_no_range_is_counted_in_the_buckets_it_admits() {
                 "case {case:?}: expected the added rule to name {grant:?}, got {:?}",
                 added[0]
             );
+        } else if outcome == Outcome::UnknownList {
+            expect_unknown_prefix_list(
+                &router,
+                case,
+                Direction::Inbound,
+                &group_id,
+                &[grant],
+                &at_quota,
+            )
+            .await;
         } else {
             expect_over_quota(
                 &router,

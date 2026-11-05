@@ -72,7 +72,10 @@ pub type IamState =
 /// The IAM store in the SAME shared engine, which is where the account's roles live.
 /// `None` means the engine carries no such store — a deployment with no IAM to ask, which
 /// is evidence of nothing.
-fn iam_state<Eng: Send + Sync + 'static>(
+///
+/// Reached by [`super::vpc_attachment_authorization`] too, which asks the same store what a
+/// function's execution role may do to attach it to a VPC.
+pub(super) fn iam_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<IamState>> {
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)

@@ -87,6 +87,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Whether the prefix list a rule names as its source or destination is one the account can
+/// reference at all — the reading BOTH directions of an authorize make, so one id is
+/// resolved the same way inbound and outbound.
+///
+/// The `#[path]` is what points the declaration into this operation's own directory: the ops
+/// modules are themselves declared with a path, so a bare `mod` here would resolve beside
+/// them rather than inside `authorize_security_group_egress/`.
+#[path = "authorize_security_group_egress/referenced_prefix_lists.rs"]
+pub mod referenced_prefix_lists;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -250,6 +260,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &store, &vpc_id, permission, protocol, position, IS_EGRESS,
             )?);
         }
+        // "The prefix list IDs" (`IpPermission$PrefixListIds`): a rule grants the ranges the
+        // list it names holds, so an id naming no prefix list the account can see grants
+        // nothing and is refused rather than stored — see
+        // [`referenced_prefix_lists::refuse_unknown_prefix_lists`].
+        referenced_prefix_lists::refuse_unknown_prefix_lists(&store, &region, &prepared)?;
 
         // How many rules the request asks for is how many destinations it names, and that is
         // bounded HERE, before any work proportional to it: "inbound or outbound rules per

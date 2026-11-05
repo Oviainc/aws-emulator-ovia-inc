@@ -243,3 +243,5 @@ mod update_function_configuration;
 mod version_delete_alias_reference;
 #[path = "all/version_publishing.rs"]
 mod version_publishing;
+#[path = "all/vpc_config_execution_role_permissions.rs"]
+mod vpc_config_execution_role_permissions;

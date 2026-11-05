@@ -522,6 +522,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "To connect a function to a VPC, Lambda creates an elastic network interface for
+        // each subnet in your function's VPC configuration" (`VpcConfig`) — created by
+        // Lambda acting as the function's OWN execution role, so a configuration that role
+        // could never stand up is refused here, before the configuration is written, rather
+        // than leaving it to an invocation with no network (see
+        // [`crate::state::vpc_attachment_authorization`], including the cases that show
+        // nothing about the role and refuse nothing). The role asked about is the one the
+        // function would RUN as: the one this request installs, or the stored one it leaves
+        // alone.
+        if let Some(vpc_config) = input.vpc_config.as_ref() {
+            let role = input
+                .role
+                .clone()
+                .unwrap_or_else(|| record.config.role.clone());
+            if let Some(message) = crate::state::unattachable_vpc_config(
+                &*self.engine,
+                &region,
+                &role,
+                vpc_config,
+            ) {
+                return Err(invalid_parameter(message));
+            }
+        }
+
         // Every member the request carries replaces the stored value, and every member
         // it omits leaves the stored value alone.
         let config = &mut record.config;

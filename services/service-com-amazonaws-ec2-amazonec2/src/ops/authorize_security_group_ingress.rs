@@ -305,6 +305,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &store, &vpc_id, permission, protocol, position, IS_EGRESS,
             )?);
         }
+        // "The prefix list IDs" (`IpPermission$PrefixListIds`): a rule grants the ranges the
+        // list it names holds, so an id naming no prefix list the account can see grants
+        // nothing and is refused rather than stored. The reading is the one both directions
+        // share, so an inbound rule resolves a prefix list exactly as an outbound one does
+        // ([`crate::ops::authorize_security_group_egress::referenced_prefix_lists`]).
+        crate::ops::authorize_security_group_egress::referenced_prefix_lists::refuse_unknown_prefix_lists(
+            &store, &region, &prepared,
+        )?;
 
         // How many rules the request asks for is how many sources it names, and that is
         // bounded HERE, before any work proportional to it: "inbound or outbound rules per

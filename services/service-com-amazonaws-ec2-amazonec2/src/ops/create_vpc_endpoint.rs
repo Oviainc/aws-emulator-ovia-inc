@@ -4,15 +4,17 @@
 //! IMPLEMENTED: creates the VPC endpoint the request describes in the VPC it names, stores
 //! it as the modelled [`VpcEndpoint`] shape — the endpoint service it connects to, the
 //! subnets and security groups the request named, the policy attached to it, and the
-//! endpoint network interface created in each subnet — and answers it in `pending` with the
-//! instant the clock owes it `available` recorded beside it (see
+//! endpoint network interface created in each subnet — and answers it in the state its type
+//! is created in ([`created_state`]): a gateway endpoint stands up no interface, so it is
+//! `available` at once, while an endpoint that does is `pending` with the instant the clock
+//! owes it `available` recorded beside it (see
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoint_moves`]).
 //! `DescribeVpcEndpoints` reports the record this operation stored.
 //!
 //! An endpoint of a type that points at a resource configuration or a service network, and
-//! a request member naming state this slice does not hold (a VPC route table, an IPv6
-//! address), is answered with a 501 rather than an endpoint that silently lacks what was
-//! asked for — the same rule the siblings of this operation follow. The account's OWN
+//! a request member naming state this slice does not hold (an IPv6 address), is answered
+//! with a 501 rather than an endpoint that silently lacks what was asked for — the same rule
+//! the siblings of this operation follow. The account's OWN
 //! endpoint services are created by `CreateVpcEndpointServiceConfiguration`, still a
 //! scaffold, so no name resolves to one yet: when it lands, an endpoint to one of them also
 //! owes the `pendingAcceptance` state and a `VpcEndpointConnection` row, which is that
@@ -821,16 +823,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The record itself. The endpoint is stored `pending` — the non-terminal state this
-        // call ANSWERS with — and "Indicates whether the endpoint is being managed by its
+        // The record itself. It is stored in the state this call ANSWERS with — the
+        // terminal one for an endpoint that stands up nothing, the non-terminal one for an
+        // endpoint whose network interfaces are still being provisioned
+        // ([`created_state`]) — and "Indicates whether the endpoint is being managed by its
         // service" (`RequesterManaged`) is false for one a caller created. Only the members
         // the endpoint's own TYPE has are set, so a gateway endpoint does not report an
         // address type it has none of.
+        let created_state = created_state(gateway);
         let endpoint = VpcEndpoint {
             vpc_endpoint_type: Some(endpoint_type.clone()),
             vpc_id: Some(input.vpc_id.clone()),
             service_name: Some(service_name.to_string()),
-            state: Some(state::VPC_ENDPOINT_STATE_PENDING.to_string()),
+            state: Some(created_state.to_string()),
             policy_document: policy_document.clone(),
             // "(Gateway endpoint) The IDs of the route tables associated with the
             // endpoint": the tables the request named, each of which the endpoint's own
@@ -884,11 +889,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the clock now owes this endpoint: `available`, one TRANSITION_DELAY from now
         // — the same span, off the same monotonic clock, as every other move this store
         // owes. The span is never zero, so a caller that reads the endpoint straight after
-        // this call still sees it `pending`.
-        store.vpc_endpoint_moves.insert(
-            endpoint_id.clone(),
-            state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
-        );
+        // this call still sees it `pending`. An endpoint this call already answered
+        // `available` owes no move at all ([`created_state`]).
+        if created_state != state::VPC_ENDPOINT_STATE_AVAILABLE {
+            store.vpc_endpoint_moves.insert(
+                endpoint_id.clone(),
+                state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
+            );
+        }
         // "We automatically add a route to the route table with a destination of the prefix
         // list for the service and a target of the gateway endpoint" (Amazon Web Services
         // PrivateLink User Guide, "Gateway endpoints"): the endpoint is only REACHED through
@@ -984,6 +992,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_endpoint: Some(stored),
             client_token: input.client_token.clone(),
         })
+    }
+}
+
+/// The state an endpoint of this type is CREATED in: the state this call answers and the
+/// store holds from the moment the endpoint exists.
+///
+/// A gateway endpoint is nothing but an entry a route table routes to — it creates no
+/// endpoint network interface in any subnet and reserves no address — so it is in service as
+/// soon as it exists, whether or not any route table was associated with it: availability is
+/// not reachability, and the route tables that reach it are changed by `ModifyVpcEndpoint`
+/// for the whole life of the endpoint. An interface or Gateway Load Balancer endpoint, by
+/// contrast, is only in service once the endpoint network interfaces it stood up in its
+/// subnets are, so it is answered in the non-terminal `pending` state with the move to
+/// `available` owed by the clock (see the caller).
+fn created_state(gateway: bool) -> &'static str {
+    if gateway {
+        crate::state::VPC_ENDPOINT_STATE_AVAILABLE
+    } else {
+        crate::state::VPC_ENDPOINT_STATE_PENDING
     }
 }
 
