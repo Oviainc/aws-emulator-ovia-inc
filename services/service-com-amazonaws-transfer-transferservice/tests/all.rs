@@ -138,3 +138,7 @@ mod connector_plane;
 // every concurrent change inserts. Fold it into the list once the churn settles.
 #[path = "all/connector_gated_workflow.rs"]
 mod connector_gated_workflow;
+// `end_to_end_transfer_flow`, likewise appended rather than inserted: the whole documented
+// connector flow, polled the way a client polls it.
+#[path = "all/end_to_end_transfer_flow.rs"]
+mod end_to_end_transfer_flow;
