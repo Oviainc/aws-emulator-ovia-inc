@@ -209,7 +209,13 @@ async fn get_policy_status(emulator: &Emulator, region: &str, account: &str, nam
     .await
 }
 
-async fn get_routes(emulator: &Emulator, region: &str, account: &str, mrap: &str) -> Reply {
+/// The routing configuration of the Multi-Region Access Point `mrap` resolves
+/// to, read through its own route.
+///
+/// `pub(crate)`, with [`route_entries`] and [`leaf`] below: the sibling suite
+/// that SUBMITS routing changes reads them back through the same call rather
+/// than building a second request.
+pub(crate) async fn get_routes(emulator: &Emulator, region: &str, account: &str, mrap: &str) -> Reply {
     call_in_region(
         &emulator.router,
         region,
@@ -274,7 +280,7 @@ async fn delete_access_point(
 }
 
 /// The text of the one leaf at `path`, or `None` when the answer carries none.
-fn leaf(leaves: &[Leaf], path: &str) -> Option<String> {
+pub(crate) fn leaf(leaves: &[Leaf], path: &str) -> Option<String> {
     leaves
         .iter()
         .find(|(leaf_path, _)| leaf_path == path)
@@ -288,7 +294,7 @@ fn leaf(leaves: &[Leaf], path: &str) -> Option<String> {
 /// <TrafficDialPercentage/></Route>`, so the entries are read from the leaf
 /// PATHS: a new entry starts at each `Bucket`, the first member the model
 /// declares.
-fn route_entries(leaves: &[Leaf]) -> Vec<(String, String, String)> {
+pub(crate) fn route_entries(leaves: &[Leaf]) -> Vec<(String, String, String)> {
     let mut entries: Vec<(String, String, String)> = Vec::new();
     for (path, value) in leaves {
         let Some(member) = path.strip_prefix("Routes/Route/") else {
@@ -477,7 +483,7 @@ fn create_cases() -> Vec<CreateCase> {
 
 /// The alias `GetMultiRegionAccessPoint` reports for a created access point —
 /// the `MultiRegionAccessPointId` its routing configuration is read by.
-async fn alias_of(emulator: &Emulator, case: &CreateCase) -> String {
+pub(crate) async fn alias_of(emulator: &Emulator, case: &CreateCase) -> String {
     let read = get_access_point(emulator, case.region, case.account, case.name).await;
     assert_eq!(
         read.status, 200,

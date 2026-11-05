@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitMultiRegionAccessPointRoutes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitMultiRegionAccessPointRoutes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitMultiRegionAccessPointRoutes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the routing configuration of the Multi-Region Access Point the
+//! request's `Mrap` resolves to: each submitted update names one or more of the
+//! access point's associated routes — by bucket, by Region, or by both — and
+//! sets that route's traffic dial, leaving every route no update names
+//! unchanged. At least one Region must stay active.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitMultiRegionAccessPointRoutes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitMultiRegionAccessPointRoutesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // BOUNDED FIRST: how many updates one call may carry is capped before
+        // anything is allocated or any lock is taken, so the work this handler
+        // does is bounded by a constant and not by the size of the list a caller
+        // sent.
+        if input.route_updates.len() > crate::state::MAX_ROUTE_UPDATES {
+            return Err(crate::state::too_many_route_updates());
+        }
+
+        // The submitted updates, resolved into the keys they name routes by —
+        // done BEFORE the lock is taken, so the state of this service is held
+        // only for the pass that applies them.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitMultiRegionAccessPointRoutes"))
+        // Keying the updates is what makes the cost of a submit the SUM of the
+        // updates it carries and the routes the access point holds rather than
+        // their product: a route is matched with at most three lookups, one per
+        // form an update can name it in.
+        let mut submitted: ::std::collections::BTreeMap<RouteKey, Submitted> =
+            ::std::collections::BTreeMap::new();
+        for (sequence, update) in input.route_updates.iter().enumerate() {
+            let Some(key) = RouteKey::of(update) else {
+                // An update carrying neither member names no route at all.
+                return Err(crate::state::invalid_route_update());
+            };
+            // A later update naming the same routes is the one they end up
+            // carrying, so it replaces the earlier one under the same key.
+            submitted.insert(
+                key,
+                Submitted {
+                    sequence,
+                    traffic_dial_percentage: update.traffic_dial_percentage,
+                    names_a_route: false,
+                },
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let mut store = state.lock();
+        // The transitions the clock already owed at this instant, run before the
+        // access point is resolved, so a submit cannot write a record a delete's
+        // span has already released (see
+        // `crate::ops::get_multi_region_access_point_routes`).
+        store.settle_multi_region_access_points(::std::time::SystemTime::now());
+
+        // `Mrap` is a `MultiRegionAccessPointId` — the service-assigned alias of
+        // an access point, not the name its owner chose — resolved against the
+        // aliases this account holds, exactly as the routing READ resolves it. A
+        // value that resolves to none is a request this service will not carry
+        // out.
+        let Some(record) =
+            store.multi_region_access_point_by_alias_mut(&input.account_id, &input.mrap)
+        else {
+            return Err(crate::state::invalid_multi_region_access_point_request());
+        };
+
+        // The updates are applied to a COPY of the configuration: a submit this
+        // service refuses leaves the one it was given exactly as it was, so a
+        // caller never sees half a submitted change. Where more than one
+        // submitted update names a route, the one that arrived LAST is the dial
+        // that route ends up with.
+        let mut routes = record.routes.clone();
+        for route in &mut routes {
+            // The (sequence, dial) of the latest submitted update that names
+            // this route, if any names it.
+            let mut applied: Option<(usize, i32)> = None;
+            for key in RouteKey::naming(route).into_iter().flatten() {
+                let Some(update) = submitted.get_mut(&key) else {
+                    continue;
+                };
+                update.names_a_route = true;
+                if applied.is_none_or(|(sequence, _)| update.sequence > sequence) {
+                    applied = Some((update.sequence, update.traffic_dial_percentage));
+                }
+            }
+            if let Some((_, traffic_dial_percentage)) = applied {
+                route.traffic_dial_percentage = traffic_dial_percentage;
+            }
+        }
+
+        // An update that names no route of this access point's configuration —
+        // a bucket or a Region it does not associate, or a bucket paired with a
+        // Region it is not in — is a request this service will not carry out.
+        if submitted.values().any(|update| !update.names_a_route) {
+            return Err(crate::state::invalid_route_update());
+        }
+
+        // "At least one Region must be active at all times": a configuration in
+        // which every associated Region is passive is refused rather than
+        // stored, whether the submit made the last active Region passive
+        // directly or through an update naming only its bucket or only its
+        // Region.
+        if !routes.iter().any(crate::state::route_is_active) {
+            return Err(crate::state::no_active_route());
+        }
+
+        // The configuration the next read reports. The model declares no member
+        // for a routing change still propagating — neither this operation's
+        // output nor the routing read carries a pending configuration — so the
+        // submitted routes ARE this access point's routes once they are stored.
+        record.routes = routes;
+        Ok(SubmitMultiRegionAccessPointRoutesOutput {})
     }
+}
+
+/// One submitted update, under the key it names its routes by.
+#[derive(Debug, Clone, Copy)]
+struct Submitted {
+    /// Its position in the request, which is what decides between two updates
+    /// naming one route: the later one wins.
+    sequence: usize,
+    traffic_dial_percentage: i32,
+    /// Whether the access point's configuration holds a route this update
+    /// names. An update that names none is a request this service will not
+    /// carry out.
+    names_a_route: bool,
+}
+
+/// How a `MultiRegionAccessPointRoute` names the routes it changes.
+///
+/// "Either the `Bucket` or the `Region` value must be provided. If both are
+/// provided, the bucket must be in the specified Region."
+/// (`MultiRegionAccessPointRoute`) — so an update names a route when EVERY
+/// member it carries matches that route's, which is these three forms: a bucket
+/// in a Region, a bucket wherever it is associated, and every bucket associated
+/// in a Region (a Region being what a routing status is submitted for).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RouteKey {
+    BucketInRegion(String, String),
+    Bucket(String),
+    Region(String),
+}
+
+impl RouteKey {
+    /// The key `update` names its routes by, or `None` when it carries neither
+    /// member and so names nothing.
+    fn of(update: &MultiRegionAccessPointRoute) -> Option<Self> {
+        match (named(&update.bucket), named(&update.region)) {
+            (Some(bucket), Some(region)) => {
+                Some(Self::BucketInRegion(bucket.to_string(), region.to_string()))
+            }
+            (Some(bucket), None) => Some(Self::Bucket(bucket.to_string())),
+            (None, Some(region)) => Some(Self::Region(region.to_string())),
+            (None, None) => None,
+        }
+    }
+
+    /// Every key an update could name `route` by. An update names `route`
+    /// exactly when its own key is one of these, so the updates that reach a
+    /// route are found with these lookups rather than with a scan of them all.
+    fn naming(route: &MultiRegionAccessPointRoute) -> [Option<Self>; 3] {
+        let bucket = named(&route.bucket);
+        let region = named(&route.region);
+        [
+            bucket.zip(region).map(|(bucket, region)| {
+                Self::BucketInRegion(bucket.to_string(), region.to_string())
+            }),
+            bucket.map(|bucket| Self::Bucket(bucket.to_string())),
+            region.map(|region| Self::Region(region.to_string())),
+        ]
+    }
+}
+
+/// `value` as the identity it carries, or `None` when it carries none: an empty
+/// member identifies nothing, so a request that sent `<Bucket/>` named no
+/// bucket and is read as having omitted the member.
+fn named(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }

@@ -1017,6 +1017,34 @@ impl MultiRegionAccessPointRecord {
 /// (`MultiRegionAccessPointRoute$TrafficDialPercentage`).
 pub const TRAFFIC_DIAL_ACTIVE: i32 = 100;
 
+/// The traffic dial of a PASSIVE route: "a value of `0` indicates a passive
+/// state, which means that no new traffic will be routed to the Region"
+/// (`MultiRegionAccessPointRoute$TrafficDialPercentage`). It is the ONE dial
+/// the member documents as passive, so every other value its range (0..100)
+/// admits leaves the Region taking traffic — which is what
+/// [`route_is_active`] reads.
+pub const TRAFFIC_DIAL_PASSIVE: i32 = 0;
+
+/// Whether `route` is ACTIVE: its traffic dial is anything other than
+/// [`TRAFFIC_DIAL_PASSIVE`], the one value the member documents as passive.
+///
+/// This is what "at least one Region must be active at all times"
+/// (`SubmitMultiRegionAccessPointRoutes`) is decided by, so a routing submit
+/// and a routing read cannot disagree about which Regions take traffic.
+pub fn route_is_active(route: &MultiRegionAccessPointRoute) -> bool {
+    route.traffic_dial_percentage != TRAFFIC_DIAL_PASSIVE
+}
+
+/// How many route updates one `SubmitMultiRegionAccessPointRoutes` call may
+/// carry.
+///
+/// `RouteList` carries no modelled length, so this is the emulator's OWN bound
+/// on the work one request can ask for, and it is what stops a caller spending
+/// this process's time on a single call. It is set far above any routing
+/// configuration a Multi-Region Access Point can have — one route per
+/// associated bucket — so no workflow an emulator serves reaches it.
+pub const MAX_ROUTE_UPDATES: usize = 1_000;
+
 /// The routes a Multi-Region Access Point carries when it is created: one per
 /// associated bucket, in the order the create request listed them, each active.
 pub fn default_routes(regions: &[RegionReport]) -> Vec<MultiRegionAccessPointRoute> {
@@ -2082,6 +2110,23 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
     ) -> Option<&MultiRegionAccessPointRecord> {
         self.multi_region_access_points
             .values()
+            .find(|record| record.account_id == account_id && record.alias == alias)
+    }
+
+    /// The Multi-Region Access Point of `account_id` that `alias` names, for a
+    /// call that WRITES it.
+    ///
+    /// The same resolution [`Self::multi_region_access_point_by_alias`]
+    /// performs — an `Mrap` member is an alias, scoped to the account that owns
+    /// it — so a routing submit reaches exactly the record a routing read
+    /// reports, and neither can resolve a value the other would not.
+    pub fn multi_region_access_point_by_alias_mut(
+        &mut self,
+        account_id: &str,
+        alias: &str,
+    ) -> Option<&mut MultiRegionAccessPointRecord> {
+        self.multi_region_access_points
+            .values_mut()
             .find(|record| record.account_id == account_id && record.alias == alias)
     }
 
@@ -3549,6 +3594,48 @@ pub fn no_such_multi_region_access_point<E>(
 /// this service answers a request it will not carry out with.
 pub fn invalid_multi_region_access_point_request<E>() -> crate::scaffolded::Scaffolded<E> {
     request_invalid()
+}
+
+/// `InvalidRequest` (HTTP 400): a submitted route update names no route of the
+/// Multi-Region Access Point's routing configuration — because it identifies
+/// neither a bucket nor a Region ("either the `Bucket` or the `Region` value
+/// must be provided"), because the access point associates no such bucket or
+/// Region, or because it names a bucket together with a Region the bucket is
+/// not in ("if both are provided, the bucket must be in the specified
+/// Region" — `MultiRegionAccessPointRoute`).
+///
+/// An update that resolves to no route is a request this service will not carry
+/// out, which is [`request_invalid`].
+pub fn invalid_route_update<E>() -> crate::scaffolded::Scaffolded<E> {
+    request_invalid()
+}
+
+/// `InvalidRequest` (HTTP 400): the submitted routing configuration would leave
+/// every associated Region passive — "at least one Region must be active at all
+/// times", and "if all Regions in the routing configuration are designated as
+/// passive, you'll receive an `InvalidRequest` error"
+/// (`SubmitMultiRegionAccessPointRoutes`,
+/// `MultiRegionAccessPointRoute$TrafficDialPercentage`).
+pub fn no_active_route<E>() -> crate::scaffolded::Scaffolded<E> {
+    request_invalid()
+}
+
+/// `InvalidRequest` (HTTP 400): the submit carries more route updates than this
+/// emulator accepts in one call ([`MAX_ROUTE_UPDATES`]), so carrying it out
+/// would spend this process's time on one request.
+///
+/// The code and status are the ones this service answers a submit it will not
+/// carry out with ([`request_invalid`]); the message states the bound, which is
+/// this emulator's own rather than anything the model declares.
+pub fn too_many_route_updates<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        format!(
+            "This emulator accepts at most {MAX_ROUTE_UPDATES} route updates in one \
+             request."
+        ),
+    )
 }
 
 /// `MultiRegionAccessPointAlreadyOwnedByYou` (HTTP 409): the account already
