@@ -207,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(bad_request)?;
         if let Some(semantic_version) = input.semantic_version.as_deref() {
             if !crate::state::is_semantic_version(semantic_version) {
-                return Err(bad_request(format!(
-                    "SemanticVersion must be a semantic version (https://semver.org/): \
-                     {semantic_version}"
-                )));
+                return Err(bad_request(crate::state::INVALID_SEMANTIC_VERSION_MESSAGE));
             }
         }
         exclusive(
@@ -412,7 +409,7 @@ fn internal_error(message: &str) -> CreateApplicationError {
 
 /// The 400 this operation answers for a parameter the model does not constrain but the
 /// service documents.
-fn bad_request(message: String) -> CreateApplicationError {
+fn bad_request(message: impl Into<String>) -> CreateApplicationError {
     CreateApplicationErrorModeled::BadRequestException(crate::state::bad_request(message)).into()
 }
 

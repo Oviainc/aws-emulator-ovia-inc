@@ -33,6 +33,8 @@ mod empty_response_framing;
 mod error_bodies;
 #[path = "all/presigned_locators.rs"]
 mod presigned_locators;
+#[path = "all/semantic_version_wording.rs"]
+mod semantic_version_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/version_publish_surface.rs"]

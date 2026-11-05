@@ -188,12 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let host = crate::state::request_host(ctx, &region);
         // The semantic version is the key this version is stored under and is echoed
         // back, so it must be one: "The semantic version of the new version" per
-        // https://semver.org/.
+        // https://semver.org/. The refusal is the service's fixed sentence for the
+        // version grammar ([`crate::state::INVALID_SEMANTIC_VERSION_MESSAGE`]), which
+        // carries nothing of the request.
         if !crate::state::is_semantic_version(&input.semantic_version) {
-            return Err(bad_request(format!(
-                "SemanticVersion must be a semantic version (https://semver.org/): {}",
-                input.semantic_version
-            )));
+            return Err(bad_request(crate::state::INVALID_SEMANTIC_VERSION_MESSAGE));
         }
         // The inline template is retained for the life of the version, so its size is
         // bounded before it is parsed and before it is stored, at the documented maximum
@@ -295,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The 400 this operation answers for a parameter outside the contract.
-fn bad_request(message: String) -> CreateApplicationVersionError {
+fn bad_request(message: impl Into<String>) -> CreateApplicationVersionError {
     CreateApplicationVersionErrorModeled::BadRequestException(crate::state::bad_request(message))
         .into()
 }

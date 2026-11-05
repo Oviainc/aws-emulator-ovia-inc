@@ -252,13 +252,15 @@ impl Repo {
 
 /// An `ApplicationId` is an ARN, and the model binds it to a single, non-greedy URI
 /// label — so a client percent-encodes its `:` and `/` to keep it one path segment,
-/// exactly as an AWS SDK does.
+/// exactly as an AWS SDK does. The same encoding serves any other single-segment label a
+/// suite sends (a `SemanticVersion` that carries a space, say).
 pub(crate) fn path_label(application_id: &str) -> String {
     application_id
         .chars()
         .map(|c| match c {
             ':' => "%3A".to_string(),
             '/' => "%2F".to_string(),
+            ' ' => "%20".to_string(),
             other => other.to_string(),
         })
         .collect()

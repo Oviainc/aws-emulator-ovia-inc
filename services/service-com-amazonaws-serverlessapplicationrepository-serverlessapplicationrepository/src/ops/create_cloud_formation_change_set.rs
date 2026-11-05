@@ -210,13 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // The version is named by its semantic version, so a value that is not one names
-        // nothing: "The semantic version of the application: https://semver.org/".
+        // nothing: "The semantic version of the application: https://semver.org/". The
+        // refusal is the service's fixed sentence for the version grammar
+        // ([`crate::state::INVALID_SEMANTIC_VERSION_MESSAGE`]).
         if let Some(semantic_version) = &input.semantic_version {
             if !crate::state::is_semantic_version(semantic_version) {
-                return Err(bad_request(format!(
-                    "SemanticVersion must be a semantic version (https://semver.org/): \
-                     {semantic_version}"
-                )));
+                return Err(bad_request(crate::state::INVALID_SEMANTIC_VERSION_MESSAGE));
             }
         }
         // The application and the version this call deploys, read out of the store and

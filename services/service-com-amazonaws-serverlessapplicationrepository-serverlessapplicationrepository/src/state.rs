@@ -1066,6 +1066,20 @@ pub fn version_not_found_message(application_id: &str, semantic_version: &str) -
     format!("Application {application_id} does not have a version {semantic_version}")
 }
 
+/// The wording the modelled 400 carries for a `SemanticVersion` that is not a semantic
+/// version ([`is_semantic_version`]).
+///
+/// Stated once here because every operation that validates the member refuses the same
+/// condition — CreateApplication, CreateApplicationVersion and
+/// CreateCloudFormationChangeSet — and the condition is about the version GRAMMAR, not
+/// about this request: the sentence is entirely fixed text, naming neither the rejected
+/// value, nor the input member, nor the application, and ending in the syntax reference
+/// that is part of it. `ErrorCode` is the one condition for every invalid parameter
+/// ([`ErrorCode::InvalidRequest`]), so this sentence is the only thing that tells a client
+/// which parameter was wrong.
+pub const INVALID_SEMANTIC_VERSION_MESSAGE: &str =
+    "Version name is a not valid semantic version. See https://semver.org/ for syntax";
+
 /// The wording a 404 carries for a prepared template the store does not hold, naming the
 /// `TemplateId` the caller asked for and nothing else.
 ///

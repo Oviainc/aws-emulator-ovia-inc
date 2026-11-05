@@ -534,8 +534,10 @@ async fn a_message_names_the_subject_of_the_condition() {
         }
     }
 
-    // A refusal of a non-semver version names the member and the syntax it must follow
-    // — a rule the request itself produces, so the wording is a requirement here.
+    // A refusal of a non-semver version reports the version GRAMMAR and the syntax it
+    // must follow — a rule about the member, not about this request, so the sentence is
+    // fixed and carries nothing of the request. Its exact wording, over every operation
+    // that validates the member, is `tests/all/semantic_version_wording.rs`.
     let application_id = created(&repo, "message-app", minimal("message-app")).await;
     for semantic_version in ["1.0", "1.0.0.0", "v1.0.0", "01.0.0", "1.0.0-"] {
         let answer = repo
@@ -560,10 +562,11 @@ async fn a_message_names_the_subject_of_the_condition() {
             answer.error_code()
         );
         assert!(
-            answer.message().contains("SemanticVersion")
-                && answer.message().contains("semver.org"),
-            "case {semantic_version:?}: the refusal must name SemanticVersion and the semver \
-             syntax, got {:?}",
+            answer.message().contains("semantic version")
+                && answer.message().contains("semver.org")
+                && !answer.message().contains(semantic_version),
+            "case {semantic_version:?}: the refusal must report the semantic-version \
+             grammar and its syntax reference and name no request value, got {:?}",
             answer.message()
         );
     }
