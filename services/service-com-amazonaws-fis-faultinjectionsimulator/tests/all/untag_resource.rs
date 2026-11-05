@@ -418,8 +418,8 @@ async fn an_arn_naming_no_record_is_a_miss_and_writes_nothing() {
             );
             assert_eq!(
                 answer.error_code(),
-                "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException for {arn:?}, got {:?}",
+                "NotFoundException",
+                "case {case:?}: expected NotFoundException for {arn:?}, got {:?}",
                 answer.body
             );
 

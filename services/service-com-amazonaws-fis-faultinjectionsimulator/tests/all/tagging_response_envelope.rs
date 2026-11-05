@@ -17,11 +17,15 @@
 //!    `BadRequestException` and the fixed sentence `Invalid input resource arn`, which
 //!    echoes no part of the request.
 //! 3. An ARN that IS one of this service's, naming a resource the store holds no record
-//!    of, is a miss: **HTTP 404** under the modelled `ResourceNotFoundException` with the
+//!    of, is a miss: **HTTP 404** under the error code `NotFoundException` with the
 //!    fixed sentence `Resource was not found`. The tagging surface addresses its resource
 //!    by ARN rather than by a typed id, so this sentence names no resource type and
-//!    interpolates nothing — unlike `GetExperimentTemplate`'s or `GetExperiment`'s own
-//!    refusal, which was asked for a resource of one named kind.
+//!    interpolates nothing — and the code is the one that surface answers for every
+//!    resource class it addresses, not the modelled `ResourceNotFoundException` of
+//!    `GetExperimentTemplate` or `GetExperiment`, which were asked for a resource of one
+//!    named kind (`smithy_query(query="operation", operation="TagResource,
+//!    ListTagsForResource,UntagResource")` lists NO error for any of the three, so no
+//!    modelled shape is theirs to answer).
 //!
 //! The rows differ along everything the three rules generalise over: WHICH of the three
 //! tag operations serves the call, which kind of taggable resource it addresses (an
@@ -47,30 +51,30 @@ use crate::resource_tagging::{
 };
 
 /// The header a restJson1 client resolves an error SHAPE from.
-const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+pub(crate) const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
 /// The one sentence the ARN layer refuses a `resourceArn` with.
-const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
+pub(crate) const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
 
 /// The one sentence a tag call answers for an ARN of this service naming no record.
-const NOT_FOUND: &str = "Resource was not found";
+pub(crate) const NOT_FOUND: &str = "Resource was not found";
 
 /// What the emulator answered: the status, the header a client resolves an error shape
 /// from, and the parsed body.
-struct Envelope {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
+pub(crate) struct Envelope {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Envelope {
     /// The wire error code in the body (`__type`), or the empty string.
-    fn code(&self) -> &str {
+    pub(crate) fn code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
 
     /// The refusal's sentence, or the empty string.
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         self.body["message"].as_str().unwrap_or_default()
     }
 
@@ -88,7 +92,7 @@ impl Envelope {
 }
 
 /// One call to this service, answered with its whole envelope.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -133,14 +137,14 @@ async fn call(
 
 /// Which of the three tag operations a row calls, and how it spells that call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Operation {
+pub(crate) enum Operation {
     Tag,
     Untag,
     List,
 }
 
 impl Operation {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Tag => "TagResource",
             Self::Untag => "UntagResource",
@@ -150,7 +154,7 @@ impl Operation {
 
     /// The same request every rule's table sends through this operation: one that would
     /// succeed if the ARN named a live resource.
-    async fn call_on(self, router: &MultiServiceRouter, resource_arn: &str) -> Envelope {
+    pub(crate) async fn call_on(self, router: &MultiServiceRouter, resource_arn: &str) -> Envelope {
         match self {
             Self::Tag => {
                 call(
@@ -184,7 +188,7 @@ impl Operation {
 }
 
 /// Every operation of the tagging surface, so each table runs over all three.
-fn operations() -> [Operation; 3] {
+pub(crate) fn operations() -> [Operation; 3] {
     [Operation::Tag, Operation::Untag, Operation::List]
 }
 
@@ -471,9 +475,15 @@ async fn an_arn_naming_no_record_is_one_generic_miss() {
             );
             assert_eq!(
                 answer.code(),
-                "ResourceNotFoundException",
-                "case {case:?}: expected the modelled 404 shape for {arn:?}, got {:?}",
+                "NotFoundException",
+                "case {case:?}: expected the tagging surface's 404 shape for {arn:?}, got {:?}",
                 answer.body
+            );
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some("NotFoundException"),
+                "case {case:?}: expected the NotFoundException error type for {arn:?}, got {:?}",
+                answer.error_type
             );
             assert_eq!(
                 answer.message(),

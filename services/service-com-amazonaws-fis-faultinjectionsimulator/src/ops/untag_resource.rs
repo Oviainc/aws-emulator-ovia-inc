@@ -75,8 +75,9 @@
 //!
 //! * `BadRequestException` (HTTP 400) — the `resourceArn` is not an ARN this service could
 //!   have issued for a resource that carries tags.
-//! * `ResourceNotFoundException` (HTTP 404) — the ARN names a resource of this service
-//!   that the store holds no record of.
+//! * `NotFoundException` (HTTP 404) — the ARN names a resource of this service that the
+//!   store holds no record of, reported generically rather than through the modelled
+//!   `ResourceNotFoundException` of an operation asked for one named kind.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -89,20 +90,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-fis-faultinjectionsimul
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UntagResourceError` alias below. This operation shape lists NO
-// errors, so the one this service models for an ARN naming a resource the store does not
-// hold is widened in through `extra_errors`. The OTHER refusal this operation answers —
-// the ARN layer's `BadRequestException` for a `resourceArn` this service could not have
-// issued — is no shape in this model at all and travels through the error channel's own
-// variant (`crate::scaffolded::Scaffolded::bad_request`).
-#[smithy_macros::operation_error(
-    "com.amazonaws.fis#UntagResource",
-    extra_errors = ["ResourceNotFoundException"]
-)]
+// here — hence the `UntagResourceError` alias below. This operation shape lists NO errors,
+// and neither refusal it answers is a shape in this model: the ARN layer's
+// `BadRequestException` for a `resourceArn` this service could not have issued, and the
+// `NotFoundException` it answers for an ARN naming no stored record, both travel through
+// the error channel's own variants (`crate::scaffolded::Scaffolded::bad_request`,
+// `::not_found`). So nothing is widened in through `extra_errors`.
+#[smithy_macros::operation_error("com.amazonaws.fis#UntagResource")]
 #[derive(Debug)]
-pub enum UntagResourceErrorModeled {
-    ResourceNotFoundException(ResourceNotFoundException),
-}
+pub enum UntagResourceErrorModeled {}
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
@@ -175,10 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(tags) = store.tags_mut(resource) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(),
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::TAGGED_RESOURCE_NOT_FOUND,
+            ));
         };
 
         // Remove exactly the keys the request names, and nothing else: a key the resource

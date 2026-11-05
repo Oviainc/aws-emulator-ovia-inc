@@ -8,7 +8,7 @@
 //! tags (not an ARN at all, another vendor's, a resource type this service holds no caller
 //! tags for, or a resource id outside the form this service mints) addresses nothing here
 //! and is refused as a bad request (400 `BadRequestException`), an ARN naming a resource of
-//! this service the store holds no record of is a miss (404 `ResourceNotFoundException`),
+//! this service the store holds no record of is a miss (404 `NotFoundException`),
 //! and otherwise the request's tags are MERGED onto that resource's own tag map — a key it
 //! already carries takes the new value, a key the request does not name keeps the value it
 //! had, and nothing else about the record changes. A successful application answers 204 No
@@ -584,8 +584,8 @@ async fn an_arn_naming_no_record_is_a_miss_and_writes_nothing() {
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException for {arn:?}, got {:?}",
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException for {arn:?}, got {:?}",
             answer.body
         );
     }

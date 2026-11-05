@@ -7,9 +7,9 @@
 //! the answer is the tag map that resource PERSISTS — the same map a tag call wrote and
 //! the resource's own reader (`GetExperimentTemplate`, `GetExperiment`) reports, always
 //! present and empty when the resource carries no tags. An ARN that addresses nothing in
-//! this namespace is a bad request (400 `ValidationException`) and an ARN naming a
+//! this namespace is a bad request (400 `BadRequestException`) and an ARN naming a
 //! resource of this service the store holds no record of is a miss (404
-//! `ResourceNotFoundException`) — the same two refusals a tag WRITE of that ARN earns, so
+//! `NotFoundException`) — the same two refusals a tag WRITE of that ARN earns, so
 //! a read and a write cannot disagree about which ARNs this service addresses. Being a
 //! read, it changes nothing: a second call, and the resource's own reader afterwards,
 //! report exactly what the first call did.
@@ -266,8 +266,8 @@ async fn an_arn_naming_no_record_is_a_miss() {
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException for {arn:?}, got {:?}",
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException for {arn:?}, got {:?}",
             answer.body
         );
 

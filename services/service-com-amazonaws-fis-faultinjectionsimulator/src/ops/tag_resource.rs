@@ -59,15 +59,18 @@
 //!
 //! ## Errors
 //!
-//! The operation shape lists none, so the refusals below are shapes this SERVICE models,
-//! widened in through `extra_errors`, plus the ARN layer's own bad request:
+//! The operation shape lists none, so the refusals below are the one shape this SERVICE
+//! models for a tag it cannot accept, widened in through `extra_errors`, plus the two the
+//! ARN-addressed tagging surface answers itself:
 //!
 //! * `BadRequestException` (HTTP 400) — the `resourceArn` is not an ARN this service could
 //!   have issued for a resource that carries tags (`crate::state::tagged_resource`).
 //! * `ValidationException` (HTTP 400) — a tag key is outside `TagKey`'s modelled bounds, or
 //!   the request would leave the resource with more tags than a `TagMap` holds.
-//! * `ResourceNotFoundException` (HTTP 404) — the ARN names a resource of this service
-//!   that the store holds no record of.
+//! * `NotFoundException` (HTTP 404) — the ARN names a resource of this service that the
+//!   store holds no record of. The tagging surface reports that generically, through the
+//!   code it answers for every resource class it addresses, rather than through the
+//!   modelled `ResourceNotFoundException` of an operation asked for one named kind.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -81,20 +84,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-fis-faultinjectionsimul
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `TagResourceError` alias below. This operation shape lists NO errors,
-// so the two this service models for a request it will not store are widened in through
-// `extra_errors`: `ValidationException` for a TAG this service cannot accept, and
-// `ResourceNotFoundException` for an ARN naming a resource the store does not hold. The
-// third refusal — the ARN layer's `BadRequestException` for a `resourceArn` this service
-// could not have issued — is no shape in this model at all and travels through the error
-// channel's own variant (`crate::scaffolded::Scaffolded::bad_request`).
+// so the one this service models for a TAG it cannot accept is widened in through
+// `extra_errors`: `ValidationException`. The two other refusals — the ARN layer's
+// `BadRequestException` for a `resourceArn` this service could not have issued, and the
+// `NotFoundException` it answers for an ARN naming no stored record — are no shapes in
+// this model at all and travel through the error channel's own variants
+// (`crate::scaffolded::Scaffolded::bad_request`, `::not_found`).
 #[smithy_macros::operation_error(
     "com.amazonaws.fis#TagResource",
-    extra_errors = ["ValidationException", "ResourceNotFoundException"]
+    extra_errors = ["ValidationException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ValidationException(ValidationException),
-    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -179,10 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(tags) = store.tags_mut(resource) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(),
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::TAGGED_RESOURCE_NOT_FOUND,
+            ));
         };
 
         // Judged against what the resource would carry AFTERWARDS, before anything is
