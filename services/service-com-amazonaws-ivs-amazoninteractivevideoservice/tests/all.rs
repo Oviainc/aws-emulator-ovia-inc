@@ -31,6 +31,8 @@ mod error_envelope;
 mod generated_ingest_secrets;
 #[path = "all/live_stream_reads.rs"]
 mod live_stream_reads;
+#[path = "all/not_found_envelope.rs"]
+mod not_found_envelope;
 #[path = "all/playback_key_pair_import.rs"]
 mod playback_key_pair_import;
 #[path = "all/playback_key_pair_lifecycle.rs"]

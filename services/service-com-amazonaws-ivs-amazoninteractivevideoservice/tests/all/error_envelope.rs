@@ -192,7 +192,7 @@ fn pattern_refusal(operation: &str, path: &str, pattern: &str) -> String {
 
 /// Whether `id` takes the 8-4-4-4-12 lowercase-hex form of the version-4 UUID an AWS
 /// request id is.
-fn is_request_id_shaped(id: &str) -> bool {
+pub(crate) fn is_request_id_shaped(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.iter().map(|group| group.len()).collect::<Vec<usize>>() == vec![8, 4, 4, 4, 12]
         && groups.iter().all(|group| {
