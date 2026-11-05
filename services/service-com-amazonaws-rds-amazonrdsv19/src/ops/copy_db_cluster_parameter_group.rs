@@ -198,12 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can't copy a default DB cluster parameter group": a name of that form is a
         // group AWS provides, so the refusal names the restriction rather than reporting
-        // the group as missing.
+        // the group as missing. The name is read out of the value whether it came as a name
+        // or as an ARN, and tested by the ONE reading of a default group's name in this
+        // crate (`crate::state::is_default_parameter_group_name`).
         let source_named = input.source_db_cluster_parameter_group_identifier.clone();
-        if crate::state::arn_resource_name_of(&source_named)
-            .to_ascii_lowercase()
-            .starts_with("default.")
-        {
+        if crate::state::is_default_parameter_group_name(crate::state::arn_resource_name_of(
+            &source_named,
+        )) {
             return Err(CopyDBClusterParameterGroupError::invalid_parameter_value(
                 format!(
                     "invalid value '{source_named}' for \

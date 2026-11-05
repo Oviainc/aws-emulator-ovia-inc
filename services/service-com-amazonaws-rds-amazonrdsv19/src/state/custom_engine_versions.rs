@@ -109,6 +109,11 @@ pub fn check_custom_engine(engine: &str) -> Result<(), String> {
 /// is not a major engine version resolves no engine version at all, which the service
 /// refuses with the same fixed `Invalid DB engine` sentence an `Engine` that names no engine
 /// gets ([`check_custom_engine`]): in both cases the pair names no DB engine to build on.
+///
+/// That the two halves of the pair share ONE sentence is what the corpus records for this
+/// operation's refusal, read as a statement about the pair rather than about the member;
+/// should a later recording word the name-format half differently, this is the one place
+/// that changes.
 pub fn check_custom_engine_version_name(engine_version: &str) -> Result<(), String> {
     let (major, customized) = match engine_version.split_once('.') {
         Some(halves) => halves,

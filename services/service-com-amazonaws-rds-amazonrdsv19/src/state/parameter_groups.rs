@@ -14,11 +14,15 @@ pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
 
 /// Whether `name` names one of the parameter groups Amazon RDS provides itself.
 ///
-/// Those groups EXIST for every family the engine-version catalogue publishes, so a request
-/// that names one names a group that is there — which is why a name of this form is not
-/// answered as missing — but they are RDS's, not the account's, so a request that would
-/// change one is refused ([`CANNOT_MODIFY_DEFAULT_PARAMETER_GROUP_MESSAGE`]). The name is
-/// compared without case, the way a group name is stored.
+/// It is the NAME that decides this, and only the name: RDS provides such a group for every
+/// engine-version family, and the family half is not resolved against the engine-version
+/// catalogue because that catalogue is a SAMPLE of the families this front door serves —
+/// `CreateDBParameterGroup` admits a family it publishes no row for (see
+/// [`super::validate_parameter_group_family`]), so refusing `default.<that family>` here
+/// would deny a group RDS does provide. A group of this form is therefore never answered as
+/// missing, and never changed either: it is RDS's, not the account's, so a request that
+/// would change one is refused ([`CANNOT_MODIFY_DEFAULT_PARAMETER_GROUP_MESSAGE`]). The name
+/// is compared without case, the way a group name is stored.
 pub fn is_default_parameter_group_name(name: &str) -> bool {
     name.to_ascii_lowercase()
         .starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)

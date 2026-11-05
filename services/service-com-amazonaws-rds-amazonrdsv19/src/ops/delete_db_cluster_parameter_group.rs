@@ -184,11 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can't delete a default cluster parameter group." The engine's own groups are
-        // the `default.<family>` ones. No such group can be in state today —
+        // the ones named for an engine-version family
+        // (`crate::state::is_default_parameter_group_name`, the ONE reading of that name in
+        // this crate). No such group can be in state today —
         // `validate_parameter_group_name` admits no `.` in a created name — so this guard is
         // what makes the rule hold once the engine's default groups are materialised, and
         // is not live behaviour yet.
-        if name.starts_with("default.") {
+        if crate::state::is_default_parameter_group_name(&name) {
             return Err(
                 DeleteDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
                     InvalidDBParameterGroupStateFault {

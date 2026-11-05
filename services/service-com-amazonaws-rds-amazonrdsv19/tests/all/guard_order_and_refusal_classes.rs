@@ -27,6 +27,7 @@
 //!    that names the member and states the rule, except for the members Amazon RDS words by
 //!    their own subject.
 
+use service_com_amazonaws_rds_amazonrdsv19::ops::types::SOURCE_TYPE_VALUES;
 use service_com_amazonaws_rds_amazonrdsv19::state::EVENT_SUBSCRIPTION_SOURCE_TYPES;
 
 use crate::db_instances::{call, call_in, emulator, expect_error, expect_ok, text, REGION};
@@ -713,12 +714,17 @@ async fn an_unpublished_event_source_type_is_refused_with_the_published_list() {
     let router = emulator();
 
     // The list the refusal names is the one the model's `SourceType` enum carries, so the
-    // sentence this test pins and the set the service admits cannot drift apart.
+    // sentence this test pins and the set the service admits cannot drift apart: the two
+    // are the same VALUES (the service lists them in its own order, which is why the
+    // constant is not the generated one).
+    let mut admitted: Vec<&str> = EVENT_SUBSCRIPTION_SOURCE_TYPES.to_vec();
+    admitted.sort_unstable();
+    let mut modelled: Vec<&str> = SOURCE_TYPE_VALUES.to_vec();
+    modelled.sort_unstable();
     assert_eq!(
-        EVENT_SUBSCRIPTION_SOURCE_TYPES.len(),
-        11,
-        "expected the eleven source types the model publishes, got \
-         {EVENT_SUBSCRIPTION_SOURCE_TYPES:?}"
+        admitted, modelled,
+        "expected the admitted source types to be exactly the model's SourceType values, \
+         got {admitted:?} against {modelled:?}"
     );
     for source_type in EVENT_SUBSCRIPTION_SOURCE_TYPES {
         assert!(

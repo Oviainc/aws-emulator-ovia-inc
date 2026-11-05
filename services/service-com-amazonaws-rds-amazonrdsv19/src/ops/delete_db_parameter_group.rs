@@ -192,13 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "You can't delete a default DB parameter group" — the groups RDS mints per engine
-        // version, named `default.` followed by the family
-        // (`crate::state::default_db_parameter_group_name`). No such group can be in state
-        // today, since `validate_parameter_group_name` admits no `.` in a created name, so
-        // this guard is what makes the rule hold once those groups are materialised rather
-        // than live behaviour.
-        if name.starts_with("default.") {
+        // "You can't delete a default DB parameter group" — the groups RDS provides per
+        // engine-version family, named for that family
+        // (`crate::state::is_default_parameter_group_name`, the ONE reading of that name in
+        // this crate). No such group can be in state today, since
+        // `validate_parameter_group_name` admits no `.` in a created name, so this guard is
+        // what makes the rule hold once those groups are materialised rather than live
+        // behaviour.
+        if crate::state::is_default_parameter_group_name(&name) {
             return Err(
                 DeleteDBParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
                     InvalidDBParameterGroupStateFault {
