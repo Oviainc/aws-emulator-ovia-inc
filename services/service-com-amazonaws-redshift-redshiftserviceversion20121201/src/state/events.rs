@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! The event surface: the published source types, categories and severities, the
+//! catalog of events a control-plane write raises, and the subscriptions that
+//! are scoped to them.
+
 use super::*;
 
 /// How many entries one request's `SourceIds` list may carry.

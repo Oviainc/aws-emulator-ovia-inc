@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! Reserved nodes: the published offerings and their pricing, the terms and
+//! offering types, the states a purchased node moves through and the
+//! reserved-node exchange surface.
+
 use super::*;
 
 /// The currency every price in the reserved-node catalog is quoted in.

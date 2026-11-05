@@ -73,17 +73,31 @@ pub mod notifications;
 /// Whether the serverless namespace a registration change names exists, resolved
 /// against the control plane that owns it.
 pub mod serverless;
+
+/// The store's own operations, on the state struct this module declares.
 mod store;
+/// The cluster record: its derived members, its IAM roles and its shape.
 mod clusters;
+/// The published event surface and the subscriptions scoped to it.
 mod events;
+/// The reserved-node offerings, their pricing and the exchange surface.
 mod reserved_nodes;
+/// The engine parameters a cluster parameter group holds.
 mod parameters;
+/// The resources a tag can be put on, and the tags they carry.
 mod tags;
-pub use tags::*;
+/// The members a cluster record reports that are COMPUTED rather than stored.
+mod derived;
+/// The syntax every name this service admits has to satisfy.
+mod naming;
+
+pub use clusters::*;
+pub use derived::*;
+pub use events::*;
+pub use naming::*;
 pub use parameters::*;
 pub use reserved_nodes::*;
-pub use events::*;
-pub use clusters::*;
+pub use tags::*;
 
 /// How long after the call that starts it a provisioning transition falls due:
 /// a cluster or a snapshot reported `creating` becomes `available` this long
@@ -741,10 +755,9 @@ pub const STATUS_DELETING: &str = "deleting";
 ///
 /// The fault's status (404) and awsQuery code (`ClusterNotFound`) are what the
 /// model fixes; the MESSAGE is an attribute of the OPERATION rather than of the
-/// service. Every one of the sentences below interpolates the
-/// `ClusterIdentifier` the request named — that part is the rule — but the fixed
-/// text around it differs from operation to operation, and recorded refusals
-/// show these four sentences in use. Naming each wording here keeps the choice
+/// service. Most of the sentences below interpolate the `ClusterIdentifier` the
+/// request named, while one leaves the refusal constant — which part is variable
+/// is itself per-operation. Naming each wording here keeps the choice
 /// at the handler that makes it, so no operation can quietly inherit another
 /// one's sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,6 +783,13 @@ pub enum ClusterNotFoundWording {
     /// exchange operations answer (reached through
     /// [`exchange_cluster_not_found_message`]).
     TheClusterWasNotFound,
+    /// `The specified cluster identifier can't be found.` — what the endpoint
+    /// AUTHORIZATION operations (`AuthorizeEndpointAccess`,
+    /// `RevokeEndpointAccess`, `DescribeEndpointAuthorization`) answer. The one
+    /// wording with NO variable part: the refusal does not echo the identifier
+    /// the request named, so it is passed one only to keep every caller of
+    /// [`cluster_not_found_message`] uniform.
+    SpecifiedIdentifierCannotBeFound,
 }
 
 /// Which sentence a `ClusterSnapshotNotFoundFault` is worded with.
@@ -832,6 +852,9 @@ pub fn cluster_not_found_message(
         }
         ClusterNotFoundWording::TheClusterWasNotFound => {
             format!("The cluster {cluster_identifier} was not found.")
+        }
+        ClusterNotFoundWording::SpecifiedIdentifierCannotBeFound => {
+            "The specified cluster identifier can't be found.".to_string()
         }
     }
 }
@@ -2520,369 +2543,6 @@ pub fn availability_zone_relocation_status(requested: Option<bool>) -> String {
 /// name the option. See [`availability_zone_relocation_status`].
 pub const RELOCATION_ENABLED_BY_DEFAULT: bool = true;
 
-/// The syntax rule Redshift documents for one identifier member.
-#[derive(Debug, Clone, Copy)]
-pub struct IdentifierRule {
-    /// The input member the rule belongs to, named in the refusal.
-    pub member: &'static str,
-    /// The documented maximum length, in characters.
-    pub max_len: usize,
-    /// Whether the documented rule forbids uppercase letters.
-    pub lowercase_only: bool,
-}
-
-/// The rule for a cluster identifier (`ClusterIdentifier`, `NewClusterIdentifier`).
-///
-/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
-/// member="ClusterIdentifier")` — "Must contain from 1 to 63 alphanumeric
-/// characters or hyphens. Alphabetic characters must be lowercase. First
-/// character must be a letter. Cannot end with a hyphen or contain two
-/// consecutive hyphens."
-pub const CLUSTER_IDENTIFIER_RULE: IdentifierRule = IdentifierRule {
-    member: "ClusterIdentifier",
-    max_len: 63,
-    lowercase_only: true,
-};
-
-/// The rule for a cluster parameter group name (`ParameterGroupName`).
-///
-/// Source: `smithy_query(query="doc", shape="CreateClusterParameterGroupMessage",
-/// member="ParameterGroupName")` — "Must be 1 to 255 alphanumeric characters or
-/// hyphens First character must be a letter. Cannot end with a hyphen or contain
-/// two consecutive hyphens." Mixed case is ACCEPTED and folded by
-/// [`normalized_parameter_group_name`] rather than refused, because the same doc
-/// says the value "is stored as a lower-case string".
-pub const PARAMETER_GROUP_NAME_RULE: IdentifierRule = IdentifierRule {
-    member: "ParameterGroupName",
-    max_len: 255,
-    lowercase_only: false,
-};
-
-/// The form a cluster parameter group name is STORED and reported in.
-///
-/// Source: the same doc sentence as [`PARAMETER_GROUP_NAME_RULE`] — "This value
-/// is stored as a lower-case string." The rule admits only ASCII alphanumerics
-/// and hyphens, so ASCII folding is the whole of it.
-pub fn normalized_parameter_group_name(requested: &str) -> String {
-    requested.to_ascii_lowercase()
-}
-
-/// The rule for a cluster subnet group name (`ClusterSubnetGroupName`).
-///
-/// Source: `smithy_query(query="doc", shape="CreateClusterSubnetGroupMessage",
-/// member="ClusterSubnetGroupName")` — "Must contain no more than 255
-/// alphanumeric characters or hyphens. Must not be "Default". Must be unique for
-/// all subnet groups that are created by your Amazon Web Services account."
-/// Mixed case is ACCEPTED and folded by [`normalized_subnet_group_name`] rather
-/// than refused, because the same doc says "Amazon Redshift stores the value as a
-/// lowercase string".
-pub const SUBNET_GROUP_NAME_RULE: IdentifierRule = IdentifierRule {
-    member: "ClusterSubnetGroupName",
-    max_len: 255,
-    lowercase_only: false,
-};
-
-/// The one name a cluster subnet group may not take, compared in the stored
-/// (folded) form.
-///
-/// Source: the same doc sentence as [`SUBNET_GROUP_NAME_RULE`] — "Must not be
-/// "Default"".
-pub const RESERVED_SUBNET_GROUP_NAME: &str = "default";
-
-/// The form a cluster subnet group name is STORED and reported in.
-///
-/// Source: `smithy_query(query="doc", shape="CreateClusterSubnetGroupMessage",
-/// member="ClusterSubnetGroupName")` — "Amazon Redshift stores the value as a
-/// lowercase string." The rule admits only ASCII alphanumerics and hyphens, so
-/// ASCII folding is the whole of it.
-pub fn normalized_subnet_group_name(requested: &str) -> String {
-    requested.to_ascii_lowercase()
-}
-
-/// The rule for a snapshot identifier (`SnapshotIdentifier`,
-/// `FinalClusterSnapshotIdentifier`).
-///
-/// Source: `smithy_query(query="doc", shape="CreateClusterSnapshotMessage",
-/// member="SnapshotIdentifier")` — "Must contain from 1 to 255 alphanumeric
-/// characters or hyphens. First character must be a letter. Cannot end with a
-/// hyphen or contain two consecutive hyphens." (No lowercase restriction.)
-pub const SNAPSHOT_IDENTIFIER_RULE: IdentifierRule = IdentifierRule {
-    member: "SnapshotIdentifier",
-    max_len: 255,
-    lowercase_only: false,
-};
-
-/// The rule for a snapshot copy grant name (`SnapshotCopyGrantName`).
-///
-/// Source: `smithy_query(query="doc", shape="CreateSnapshotCopyGrantMessage",
-/// member="SnapshotCopyGrantName")` — "Must contain from 1 to 63 alphanumeric
-/// characters or hyphens. Alphabetic characters must be lowercase. First
-/// character must be a letter. Cannot end with a hyphen or contain two
-/// consecutive hyphens."
-pub const SNAPSHOT_COPY_GRANT_NAME_RULE: IdentifierRule = IdentifierRule {
-    member: "SnapshotCopyGrantName",
-    max_len: 63,
-    lowercase_only: true,
-};
-
-/// The rule for an event notification subscription name (`SubscriptionName`).
-///
-/// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
-/// member="SubscriptionName")` — "Cannot be null, empty, or blank. Must contain
-/// from 1 to 255 alphanumeric characters or hyphens. First character must be a
-/// letter. Cannot end with a hyphen or contain two consecutive hyphens." (No
-/// lowercase restriction.)
-pub const EVENT_SUBSCRIPTION_NAME_RULE: IdentifierRule = IdentifierRule {
-    member: "SubscriptionName",
-    max_len: 255,
-    lowercase_only: false,
-};
-
-/// Check `value` against `rule`, naming the member and the constraint it broke.
-///
-/// `member` overrides the rule's own member name, so `NewClusterIdentifier` and
-/// `FinalClusterSnapshotIdentifier` are refused under the same rule as the
-/// member it was documented on, while still naming themselves.
-pub fn check_identifier(rule: IdentifierRule, member: &str, value: &str) -> Result<(), String> {
-    let refuse = |why: &str| {
-        Err(format!(
-            "Invalid value for {member}: '{value}'. {why} (allowed: 1 to {} {}alphanumeric characters or hyphens, first character a letter, no trailing hyphen and no two consecutive hyphens)",
-            rule.max_len,
-            if rule.lowercase_only { "lowercase " } else { "" },
-        ))
-    };
-    if value.is_empty() {
-        return refuse("The identifier cannot be null, empty, or blank.");
-    }
-    if value.chars().count() > rule.max_len {
-        return refuse("The identifier is longer than allowed.");
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return refuse("The identifier contains a character that is neither alphanumeric nor a hyphen.");
-    }
-    if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
-        return refuse("Alphabetic characters must be lowercase.");
-    }
-    if !value
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-    {
-        return refuse("The first character must be a letter.");
-    }
-    if value.ends_with('-') {
-        return refuse("The identifier cannot end with a hyphen.");
-    }
-    if value.contains("--") {
-        return refuse("The identifier cannot contain two consecutive hyphens.");
-    }
-    Ok(())
-}
-
-/// The syntax rule Redshift documents for a DATABASE object name — a database
-/// user, a database name or a database group name.
-///
-/// A different alphabet from [`IdentifierRule`]'s, which is why it is its own
-/// rule: a control-plane identifier admits alphanumerics and hyphens, while a
-/// database object name also admits underscore, plus sign, period, at symbol and
-/// hyphen, and the three members differ only in whether an uppercase letter is
-/// admitted.
-#[derive(Debug, Clone, Copy)]
-pub struct DatabaseNameRule {
-    /// The input member the rule belongs to, named in the refusal.
-    pub member: &'static str,
-    /// Whether the documented rule forbids uppercase letters.
-    pub lowercase_only: bool,
-    /// Whether the documented rule forbids the value `PUBLIC`, the group every
-    /// database user is in ([`PUBLIC_DATABASE_GROUP`]).
-    pub forbids_public: bool,
-}
-
-/// The documented maximum length, in characters, of every database object name
-/// below: "Must be 1 to 64 alphanumeric characters or hyphens".
-pub const DATABASE_NAME_MAX_LEN: usize = 64;
-
-/// The rule for the database user a credential is issued for (`DbUser`).
-///
-/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
-/// member="DbUser")` — "Must be 1 to 64 alphanumeric characters or hyphens. The
-/// user name can't be PUBLIC. Must contain uppercase or lowercase letters,
-/// numbers, underscore, plus sign, period (dot), at symbol (@), or hyphen. First
-/// character must be a letter. Must not contain a colon ( : ) or slash ( / )."
-pub const DB_USER_RULE: DatabaseNameRule = DatabaseNameRule {
-    member: "DbUser",
-    lowercase_only: false,
-    forbids_public: true,
-};
-
-/// The rule for the database a credential authorises logging on to (`DbName`).
-///
-/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
-/// member="DbName")` — the same sentences as [`DB_USER_RULE`]'s, without the
-/// `PUBLIC` exclusion: "Must be 1 to 64 alphanumeric characters or hyphens Must
-/// contain uppercase or lowercase letters, numbers, underscore, plus sign,
-/// period (dot), at symbol (@), or hyphen. First character must be a letter.
-/// Must not contain a colon ( : ) or slash ( / )."
-pub const DB_NAME_RULE: DatabaseNameRule = DatabaseNameRule {
-    member: "DbName",
-    lowercase_only: false,
-    forbids_public: false,
-};
-
-/// The rule for one database group a session joins (`DbGroups`).
-///
-/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
-/// member="DbGroups")` — "Must be 1 to 64 alphanumeric characters or hyphens
-/// Must contain ONLY LOWERCASE letters, numbers, underscore, plus sign, period
-/// (dot), at symbol (@), or hyphen. First character must be a letter. Must not
-/// contain a colon ( : ) or slash ( / )."
-pub const DB_GROUP_RULE: DatabaseNameRule = DatabaseNameRule {
-    member: "DbGroups",
-    lowercase_only: true,
-    forbids_public: false,
-};
-
-/// Check one database object name against `rule`, naming the member and the
-/// constraint it broke.
-///
-/// The documented alphabet is the whole of what is admitted, so the colon and
-/// the slash the same documentation calls out separately cannot pass it either.
-/// The documentation's remaining constraint, "cannot be a reserved word", is a
-/// list published in the Amazon Redshift Database Developer Guide rather than
-/// anything the API model carries, so it is not checked here.
-pub fn check_database_name(rule: DatabaseNameRule, value: &str) -> Result<(), String> {
-    let member = rule.member;
-    let refuse = |why: &str| {
-        Err(format!(
-            "Invalid value for {member}: '{value}'. {why} (allowed: 1 to {DATABASE_NAME_MAX_LEN} {}letters, numbers, underscore, plus sign, period, at symbol or hyphen, first character a letter)",
-            if rule.lowercase_only { "lowercase " } else { "" },
-        ))
-    };
-    if value.is_empty() {
-        return refuse("The name cannot be null, empty, or blank.");
-    }
-    if value.chars().count() > DATABASE_NAME_MAX_LEN {
-        return refuse("The name is longer than allowed.");
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '@' | '-'))
-    {
-        return refuse("The name contains a character that is not allowed in it.");
-    }
-    if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
-        return refuse("Alphabetic characters must be lowercase.");
-    }
-    if !value.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-        return refuse("The first character must be a letter.");
-    }
-    // Redshift folds an unquoted database identifier to lower case, so the
-    // excluded name is matched without regard to the case it arrived in.
-    if rule.forbids_public && value.eq_ignore_ascii_case(PUBLIC_DATABASE_GROUP) {
-        return refuse("The name cannot be PUBLIC.");
-    }
-    Ok(())
-}
-
-/// The window `GetClusterCredentials` documents for the lifetime of the
-/// temporary database credentials it issues: the lifetime a request that names
-/// none gets, and the inclusive bounds a request may ask for.
-///
-/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
-/// member="DurationSeconds")` — "The number of seconds until the returned
-/// temporary password expires. Constraint: minimum 900, maximum 3600. Default:
-/// 900". A documented duration, so these are Amazon Redshift's numbers rather
-/// than this emulator's choice.
-pub const CREDENTIAL_DURATION_DEFAULT_SECONDS: i32 = 900;
-/// The smallest `DurationSeconds` a request may name. See
-/// [`CREDENTIAL_DURATION_DEFAULT_SECONDS`].
-pub const CREDENTIAL_DURATION_MIN_SECONDS: i32 = 900;
-/// The largest `DurationSeconds` a request may name. See
-/// [`CREDENTIAL_DURATION_DEFAULT_SECONDS`].
-pub const CREDENTIAL_DURATION_MAX_SECONDS: i32 = 3600;
-
-/// How long the credentials a request asks for last, or why the request's
-/// `DurationSeconds` is outside the documented window.
-pub fn credential_duration(requested: Option<i32>) -> Result<Duration, String> {
-    let seconds = requested.unwrap_or(CREDENTIAL_DURATION_DEFAULT_SECONDS);
-    if !(CREDENTIAL_DURATION_MIN_SECONDS..=CREDENTIAL_DURATION_MAX_SECONDS).contains(&seconds) {
-        return Err(format!(
-            "Invalid value for DurationSeconds: {seconds}. DurationSeconds must be between {CREDENTIAL_DURATION_MIN_SECONDS} and {CREDENTIAL_DURATION_MAX_SECONDS}."
-        ));
-    }
-    Ok(Duration::from_secs(seconds.unsigned_abs().into()))
-}
-
-/// The `DbUser` a `GetClusterCredentials` response reports for the user named in
-/// its request.
-///
-/// Source: `smithy_query(query="doc", operation="GetClusterCredentials")` — "The
-/// action returns the database user name prefixed with `IAM:` if `AutoCreate` is
-/// `False` or `IAMA:` if `AutoCreate` is `True`" — so the prefix is decided by
-/// the request's own `AutoCreate` and by nothing else.
-pub fn credential_db_user(db_user: &str, auto_create: bool) -> String {
-    let prefix = if auto_create { "IAMA:" } else { "IAM:" };
-    format!("{prefix}{db_user}")
-}
-
-/// The fewest cluster identifiers a token request may scope its token to.
-///
-/// Source: `smithy_query(query="doc", shape="GetIdentityCenterAuthTokenRequest",
-/// member="ClusterIds")` — "`ClusterIds` must contain at least 1 cluster
-/// identifier. `ClusterIds` can hold a maximum of 20 cluster identifiers." The
-/// member's list shape carries no `@length` trait, so the MAXIMUM is Amazon
-/// Redshift's number checked in the handler
-/// ([`check_token_scope_clusters`]) rather than at the boundary; the minimum is
-/// the member's own `@required` trait, which the boundary validator refuses a
-/// request without before any handler runs.
-pub const MIN_TOKEN_SCOPE_CLUSTERS: usize = 1;
-
-/// The most cluster identifiers a token request may scope its token to. See
-/// [`MIN_TOKEN_SCOPE_CLUSTERS`].
-pub const MAX_TOKEN_SCOPE_CLUSTERS: usize = 20;
-
-/// The syntax rule ONE entry of that list follows.
-///
-/// Source: the same doc as [`MIN_TOKEN_SCOPE_CLUSTERS`] — "Cluster identifiers
-/// must be 1 to 63 characters in length", "the characters accepted … are …
-/// alphanumeric characters … hyphens", "must start with a letter" and "can't end
-/// with a hyphen or contain two consecutive hyphens". The sentence
-/// [`CLUSTER_IDENTIFIER_RULE`] carries about lowercase letters is NOT among them,
-/// so an entry naming a cluster in mixed case is admitted rather than refused for
-/// its case.
-pub const TOKEN_SCOPE_CLUSTER_ID_RULE: IdentifierRule = IdentifierRule {
-    member: "ClusterIds",
-    max_len: 63,
-    lowercase_only: false,
-};
-
-/// The documented constraints on the clusters a token request scopes its token
-/// to, or why the list breaks one of them.
-///
-/// The size bound is judged before the entries, so a list that could not be a
-/// scope at all is refused for being the wrong size rather than for the first
-/// entry that also happens to be malformed.
-pub fn check_token_scope_clusters(cluster_ids: &[String]) -> Result<(), String> {
-    if cluster_ids.len() > MAX_TOKEN_SCOPE_CLUSTERS {
-        return Err(format!(
-            "Invalid value for {}: ClusterIds can hold a maximum of {MAX_TOKEN_SCOPE_CLUSTERS} cluster identifiers; the request named {}.",
-            TOKEN_SCOPE_CLUSTER_ID_RULE.member,
-            cluster_ids.len()
-        ));
-    }
-    for cluster_id in cluster_ids {
-        check_identifier(
-            TOKEN_SCOPE_CLUSTER_ID_RULE,
-            TOKEN_SCOPE_CLUSTER_ID_RULE.member,
-            cluster_id,
-        )?;
-    }
-    Ok(())
-}
-
 /// What an Identity Center auth token request from a caller whose credentials
 /// carry NO embedded IAM Identity Center identity is refused with.
 ///
@@ -3004,724 +2664,6 @@ pub fn page_bounds(
     total: usize,
 ) -> Result<(usize, usize, Option<String>), String> {
     page_bounds_within(MAX_RECORDS_WINDOW, marker, max_records, total)
-}
-
-/// The region this request was signed for, from its SigV4 credential scope.
-///
-/// Falls back to `us-east-1`, the region a generated emulator presents when a
-/// request carries no scope to read one from.
-pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map(|scope| scope.region)
-        .unwrap_or_else(|| "us-east-1".to_string())
-}
-
-/// `n` lowercase hex characters of the SHA-256 of `seed`.
-///
-/// Used only to derive the stable, content-addressed parts of an endpoint
-/// hostname and a namespace id: the same cluster always renders the same value,
-/// so nothing here is a per-run value.
-fn short_digest(seed: &str, n: usize) -> String {
-    let digest = Sha256::digest(seed.as_bytes());
-    hex::encode(digest).chars().take(n).collect()
-}
-
-/// The SHA-256 of `seed` rendered in the 8-4-4-4-12 lowercase-hex form AWS
-/// identifies a reserved node offering and a namespace by.
-///
-/// Content-addressed from the resource's own identity, so the same resource
-/// always renders the same value and nothing here is a per-run value.
-fn content_uuid(seed: &str) -> String {
-    let hexed = short_digest(seed, 32);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hexed[0..8],
-        &hexed[8..12],
-        &hexed[12..16],
-        &hexed[16..20],
-        &hexed[20..32]
-    )
-}
-
-/// The first byte of the SHA-256 of `seed`, for picking a stable default out of
-/// a documented set.
-fn digest_byte(seed: &str) -> u8 {
-    Sha256::digest(seed.as_bytes())[0]
-}
-
-/// The DNS address of a cluster's connection endpoint, in Redshift's
-/// `<cluster>.<id>.<region>.redshift.amazonaws.com` form.
-///
-/// Derived from the cluster identifier and region, so renaming a cluster moves
-/// its endpoint exactly as the real hostname does.
-pub fn endpoint_address(cluster_identifier: &str, region: &str) -> String {
-    let token = short_digest(&format!("endpoint/{cluster_identifier}/{region}"), 12);
-    format!("{cluster_identifier}.{token}.{region}.redshift.amazonaws.com")
-}
-
-/// The namespace ARN of a cluster: `arn:aws:redshift:<region>:<account>:namespace:<uuid>`.
-///
-/// Computed ONCE, when the cluster is created, and then persisted on the stored
-/// cluster — the namespace identifies the cluster's data, so it must survive a
-/// rename.
-pub fn namespace_arn(cluster_identifier: &str, region: &str) -> String {
-    let hexed = short_digest(&format!("namespace/{cluster_identifier}/{region}"), 32);
-    let uuid = format!(
-        "{}-{}-{}-{}-{}",
-        &hexed[0..8],
-        &hexed[8..12],
-        &hexed[12..16],
-        &hexed[16..20],
-        &hexed[20..32]
-    );
-    engine::emulator_arn("redshift", region, &format!("namespace:{uuid}"))
-}
-
-/// The ARN of a snapshot: `arn:aws:redshift:<region>:<account>:snapshot:<cluster>/<snapshot>`.
-pub fn snapshot_arn(cluster_identifier: &str, snapshot_identifier: &str, region: &str) -> String {
-    engine::emulator_arn(
-        "redshift",
-        region,
-        &format!("snapshot:{cluster_identifier}/{snapshot_identifier}"),
-    )
-}
-
-/// The ARN of a cluster: `arn:aws:redshift:<region>:<account>:cluster:<cluster>`.
-///
-/// Source: the Amazon Redshift Cluster Management Guide, "Constructing an Amazon
-/// Redshift Amazon Resource Name (ARN)" (the page
-/// `smithy_query(query="doc", shape="TaggedResource", member="ResourceType")`
-/// links to) — `arn:aws:redshift:region:account-id:cluster:cluster-name` — which
-/// is also the example on `smithy_query(query="doc",
-/// shape="CreateTagsMessage", member="ResourceName")`:
-/// "arn:aws:redshift:us-east-2:123456789:cluster:t1".
-pub fn cluster_arn(cluster_identifier: &str, region: &str) -> String {
-    engine::emulator_arn(
-        "redshift",
-        region,
-        &format!("{ARN_SEGMENT_CLUSTER}:{cluster_identifier}"),
-    )
-}
-
-/// The ARN of a cluster parameter group:
-/// `arn:aws:redshift:<region>:<account>:parametergroup:<name>`.
-///
-/// Source: as [`cluster_arn`] —
-/// `arn:aws:redshift:region:account-id:parametergroup:parameter-group-name`.
-pub fn parameter_group_arn(parameter_group_name: &str, region: &str) -> String {
-    engine::emulator_arn(
-        "redshift",
-        region,
-        &format!("{ARN_SEGMENT_PARAMETER_GROUP}:{parameter_group_name}"),
-    )
-}
-
-/// The ARN of a cluster subnet group:
-/// `arn:aws:redshift:<region>:<account>:subnetgroup:<name>`.
-///
-/// Source: as [`cluster_arn`] —
-/// `arn:aws:redshift:region:account-id:subnetgroup:subnet-group-name`.
-pub fn subnet_group_arn(subnet_group_name: &str, region: &str) -> String {
-    engine::emulator_arn(
-        "redshift",
-        region,
-        &format!("{ARN_SEGMENT_SUBNET_GROUP}:{subnet_group_name}"),
-    )
-}
-
-/// The ARN of an HSM configuration:
-/// `arn:aws:redshift:<region>:<account>:hsmconfiguration:<identifier>`.
-///
-/// Source: as [`cluster_arn`] —
-/// `arn:aws:redshift:region:account-id:hsmconfiguration:hsm-configuration-name`.
-pub fn hsm_configuration_arn(hsm_configuration_identifier: &str, region: &str) -> String {
-    engine::emulator_arn(
-        "redshift",
-        region,
-        &format!("{ARN_SEGMENT_HSM_CONFIGURATION}:{hsm_configuration_identifier}"),
-    )
-}
-
-/// The ARN of the Secrets Manager secret holding a cluster's admin credentials,
-/// used only when `ManageMasterPassword` is on.
-pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> String {
-    let token = short_digest(&format!("secret/{cluster_identifier}/{region}"), 6);
-    engine::emulator_arn(
-        "secretsmanager",
-        region,
-        &format!("secret:redshift!{cluster_identifier}-{token}"),
-    )
-}
-
-/// The connection endpoint a cluster serves on: its DNS address, the port it
-/// listens on and the VPC interface endpoint it is reached through.
-///
-/// The ONE rule for the whole `Endpoint` structure, so the create, the modify
-/// and the restore paths cannot build one differently. The endpoint is a
-/// property of the cluster's own configuration — its identifier, its Region, the
-/// port it was asked for, and the VPC and Availability Zone its subnet group put
-/// it in — so it is DECIDED when the cluster is allocated and
-/// [`StoredCluster::endpoint`] holds it from then on, whether or not the cluster
-/// is serving yet (see [`StoredCluster::publish_endpoint`]).
-pub fn cluster_endpoint(
-    cluster_identifier: &str,
-    region: &str,
-    port: i32,
-    vpc_id: &str,
-    availability_zone: &str,
-) -> Endpoint {
-    Endpoint {
-        address: Some(endpoint_address(cluster_identifier, region)),
-        port: Some(port),
-        vpc_endpoints: Some(cluster_vpc_endpoints(
-            cluster_identifier,
-            vpc_id,
-            availability_zone,
-        )),
-    }
-}
-
-/// The Availability Zones of one Region, in name order.
-///
-/// A Region's zones are `<region>` followed by consecutive letters from `a`, as
-/// many as that Region publishes ([`region_zone_count`]). Derived from the
-/// Region alone, so the same Region always reports the same zones.
-pub fn region_availability_zones(region: &str) -> Vec<String> {
-    (0..region_zone_count(region))
-        .map(|index| format!("{region}{}", ZONE_LETTERS[index]))
-        .collect()
-}
-
-/// The letters a zone name may end in, in order; a Region uses the first
-/// [`region_zone_count`] of them.
-const ZONE_LETTERS: [char; 6] = ['a', 'b', 'c', 'd', 'e', 'f'];
-
-/// How many Availability Zones AWS publishes for one Region.
-///
-/// Source: the AWS global-infrastructure reference "Regions, Availability Zones,
-/// and Local Zones" (also `aws ec2 describe-availability-zones` per Region): the
-/// count differs BY REGION, so a caller choosing a zone from a Region's list
-/// gets that Region's zones and not a fixed three. [`REGION_ZONE_COUNTS`] names
-/// every Region that publishes more than [`DEFAULT_ZONE_COUNT`]; any other
-/// Region publishes that default, which is the smallest count AWS publishes for
-/// a Region.
-pub fn region_zone_count(region: &str) -> usize {
-    REGION_ZONE_COUNTS
-        .iter()
-        .find(|(named, _)| *named == region)
-        .map_or(DEFAULT_ZONE_COUNT, |(_, count)| *count)
-}
-
-/// The number of Availability Zones a Region publishes unless
-/// [`REGION_ZONE_COUNTS`] names it.
-pub const DEFAULT_ZONE_COUNT: usize = 3;
-
-/// Every Region that publishes more Availability Zones than
-/// [`DEFAULT_ZONE_COUNT`], with the number it publishes.
-///
-/// Source: as [`region_zone_count`] — the AWS Regions and Availability Zones
-/// reference. Kept to the Regions whose count differs from the default, so a
-/// Region added to AWS later still reports a well-formed zone list.
-pub const REGION_ZONE_COUNTS: [(&str, usize); 4] = [
-    ("us-east-1", 6),
-    ("us-west-2", 4),
-    ("ap-northeast-1", 4),
-    ("ap-northeast-2", 4),
-];
-
-/// Whether `value` has the form of an Amazon Web Services Region code, which is
-/// what makes it the name of a Region at all.
-///
-/// A Region code is an AREA code ([`REGION_AREA_CODES`]), then — in the
-/// partitions that have one — a partition qualifier, then the LOCATION within
-/// the area ([`REGION_LOCATIONS`]), then the Region's number, counting from 1:
-/// `us-east-1`, `eu-west-3`, `ap-southeast-4`, `us-gov-west-1`, `cn-north-1`,
-/// `us-iso-east-1`.
-///
-/// Source: the Amazon Web Services General Reference's Region code list (the
-/// "Regions and Endpoints" reference that
-/// `smithy_query(query="doc", shape="EnableSnapshotCopyMessage",
-/// member="DestinationRegion")` points at for "Must be the name of a valid
-/// Amazon Web Services Region").
-///
-/// Decided from the form and those two published vocabularies rather than from a
-/// closed list of today's Region codes, for the same reason
-/// [`region_zone_count`] derives a Region's zones from its name: AWS adds
-/// Regions, and one added after this emulator was built is still a Region. A
-/// value outside the form names no Region at all.
-pub fn names_a_region(value: &str) -> bool {
-    let segments: ::std::vec::Vec<&str> = value.split('-').collect();
-    let [area, qualifiers @ .., location, number] = segments.as_slice() else {
-        return false;
-    };
-    REGION_AREA_CODES.contains(area)
-        // At most one qualifier, and a qualifier is a partition name: letters.
-        && qualifiers.len() <= 1
-        && qualifiers.iter().all(|qualifier| {
-            !qualifier.is_empty() && qualifier.bytes().all(|byte| byte.is_ascii_lowercase())
-        })
-        && REGION_LOCATIONS.contains(location)
-        // The Region number is a decimal count from 1, so neither an empty
-        // segment, a signed one, a zero nor a zero-padded one is one.
-        && !number.starts_with('0')
-        && number.parse::<u32>().is_ok_and(|ordinal| ordinal >= 1)
-}
-
-/// The area codes an Amazon Web Services Region code starts with.
-///
-/// Source: as [`names_a_region`] — the published Region code list, reduced to
-/// the distinct area codes it uses.
-pub const REGION_AREA_CODES: [&str; 10] = [
-    "af", "ap", "ca", "cn", "eu", "il", "me", "mx", "sa", "us",
-];
-
-/// The location words an Amazon Web Services Region code names inside its area.
-///
-/// Source: as [`REGION_AREA_CODES`].
-pub const REGION_LOCATIONS: [&str; 9] = [
-    "central",
-    "east",
-    "north",
-    "northeast",
-    "northwest",
-    "south",
-    "southeast",
-    "southwest",
-    "west",
-];
-
-/// The only platform a cluster can be launched on today.
-///
-/// Source: `smithy_query(query="shape", shape="SupportedPlatform")` — "A list of
-/// supported platforms for orderable clusters". EC2-Classic is retired, so every
-/// zone a cluster is orderable in supports exactly the VPC platform.
-pub const PLATFORM_VPC: &str = "VPC";
-
-/// The platforms a cluster placed in an Availability Zone can run on.
-pub fn zone_supported_platforms() -> Vec<SupportedPlatform> {
-    [PLATFORM_VPC]
-        .into_iter()
-        .map(|name| SupportedPlatform {
-            name: Some(name.to_string()),
-        })
-        .collect()
-}
-
-/// The platform a cluster ran on OUTSIDE a VPC, before EC2-Classic was retired.
-///
-/// Named here only so the capabilities that existed for that platform alone can
-/// be decided from the published platform list rather than from a flag: EC2's
-/// `supported-platforms` account attribute reports `EC2` for EC2-Classic and
-/// `VPC` for the VPC platform, and [`zone_supported_platforms`] publishes only
-/// the latter.
-pub const PLATFORM_EC2_CLASSIC: &str = "EC2";
-
-/// Whether this service offers the platform a cluster security group governs.
-///
-/// A cluster security group is EC2-Classic's access-control mechanism: it
-/// "control[s] access to non-VPC clusters"
-/// (`smithy_query(query="doc", shape="CreateClusterSecurityGroup")`), and a
-/// cluster inside a VPC is governed by VPC security groups
-/// (`Cluster$VpcSecurityGroups`) instead. So the question "can this account hold
-/// a cluster security group at all?" is the question "does any zone it can place
-/// a cluster in offer the EC2-Classic platform?", answered from the one
-/// published platform list rather than from a second, independently maintained
-/// fact.
-pub fn cluster_security_groups_available() -> bool {
-    zone_supported_platforms()
-        .iter()
-        .any(|platform| platform.name.as_deref() == Some(PLATFORM_EC2_CLASSIC))
-}
-
-/// Why any call in the cluster-security-group family is refused.
-///
-/// The text says the capability is gone and names the one that replaced it,
-/// because that — not any value the request carried — is what the caller has to
-/// act on: no name, description, rule or tag list could make such a call
-/// succeed. Only the status (400) and the error code (`InvalidParameterValue`)
-/// are wire requirements; this sentence is the service's own standing notice,
-/// identical for every request and every operation of the family, which is why
-/// it lives here once rather than being spelled at a call site.
-pub const CLUSTER_SECURITY_GROUPS_UNAVAILABLE: &str =
-    "Amazon Redshift has discontinued cluster security groups. For security group \
-     configuration, associate VPC security groups when creating or modifying your cluster.";
-
-/// One Availability Zone as this service reports it: its name AND the platforms
-/// a cluster in it can run on.
-///
-/// `AvailabilityZone` is `{Name, SupportedPlatforms}`
-/// (`smithy_query(query="shape", shape="AvailabilityZone")`), and a client
-/// branching on platform support reads the second member — so every
-/// `AvailabilityZone` this service emits is built here rather than from the name
-/// alone.
-pub fn availability_zone(name: &str) -> AvailabilityZone {
-    AvailabilityZone {
-        name: Some(name.to_string()),
-        supported_platforms: Some(zone_supported_platforms()),
-    }
-}
-
-/// The Availability Zones of one Region as modelled records, in name order:
-/// [`region_availability_zones`] through [`availability_zone`].
-pub fn region_availability_zone_records(region: &str) -> Vec<AvailabilityZone> {
-    region_availability_zones(region)
-        .iter()
-        .map(|name| availability_zone(name))
-        .collect()
-}
-
-/// The Availability Zone Redshift picks when the request names none.
-///
-/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
-/// member="AvailabilityZone")` — "Default: A random, system-chosen Availability
-/// Zone in the region that is specified by the endpoint." The emulator's choice
-/// is derived from the cluster identifier rather than drawn per run, so it is
-/// stable across reads.
-pub fn default_availability_zone(cluster_identifier: &str, region: &str) -> String {
-    let zones = region_availability_zones(region);
-    let index = digest_byte(&format!("az/{cluster_identifier}")) as usize % zones.len();
-    zones[index].clone()
-}
-
-/// The 30-minute weekly maintenance window Redshift assigns when the request
-/// names none, in the `ddd:hh24:mi-ddd:hh24:mi` form Redshift reports.
-///
-/// Derived from the cluster identifier, so it is stable across reads.
-pub fn default_maintenance_window(cluster_identifier: &str) -> String {
-    let days = MAINTENANCE_WINDOW_DAYS;
-    let seed = digest_byte(&format!("window/{cluster_identifier}"));
-    let day = days[usize::from(seed) % days.len()];
-    // 0..=22, so the window's end hour is always a valid same-day hour.
-    let hour = (usize::from(seed) / days.len()) % 23;
-    format!("{day}:{hour:02}:30-{day}:{:02}:00", hour + 1)
-}
-
-/// The VPC a cluster launched into a subnet group reports.
-///
-/// Every provisioned cluster lives in a VPC (see
-/// [`DEFAULT_CLUSTER_SUBNET_GROUP`]), and the VPC it is in is the one its subnet
-/// group's subnets belong to, so the id is derived from the subnet group name
-/// alone: two clusters in the same subnet group report the same VPC.
-pub fn derived_vpc_id(cluster_subnet_group_name: &str) -> String {
-    format!(
-        "vpc-{}",
-        short_digest(&format!("vpc/{cluster_subnet_group_name}"), 17)
-    )
-}
-
-/// The cluster subnet group a cluster joins when the request names none.
-///
-/// Source: `smithy_query(query="doc", operation="CreateCluster")` — "To create a
-/// cluster in Virtual Private Cloud (VPC), you must provide a cluster subnet
-/// group name. The cluster subnet group identifies the subnets of your VPC that
-/// Amazon Redshift uses when creating the cluster." Amazon Redshift creates every
-/// provisioned cluster in a VPC and an account that names no subnet group gets
-/// its DEFAULT one, which Redshift names `default` — so a cluster's
-/// `ClusterSubnetGroupName` and, with it, its `VpcId` are always reported.
-pub const DEFAULT_CLUSTER_SUBNET_GROUP: &str = "default";
-
-/// The `VpcSecurityGroupMembership$Status` of a security group a cluster is in.
-const SECURITY_GROUP_STATUS_ACTIVE: &str = "active";
-
-/// The VPC security group a cluster joins when the request names none: the
-/// default security group of the VPC its subnet group is in.
-///
-/// Derived from the VPC id, so every cluster of one VPC reports the same default
-/// group, exactly as the VPC's own default group is shared.
-pub fn default_vpc_security_group_id(vpc_id: &str) -> String {
-    format!("sg-{}", short_digest(&format!("sg/{vpc_id}"), 17))
-}
-
-/// The `KmsKeyId` of a cluster encrypted with the key Amazon Web Services owns
-/// rather than a customer managed key.
-///
-/// `smithy_query(query="doc", shape="Cluster", member="KmsKeyId")` — "The Key
-/// Management Service (KMS) key ID of the encryption key used to encrypt data in
-/// the cluster": an encrypted cluster always has one, and a cluster whose request
-/// named no `KmsKeyId` is encrypted under the service-owned key, which Redshift
-/// reports by this id rather than by an ARN.
-pub const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
-
-/// The `KmsKeyId` a snapshot copy grant carries when its create named none.
-///
-/// Source: `smithy_query(query="doc", shape="CreateSnapshotCopyGrantMessage",
-/// member="KmsKeyId")` — "If no key is specified, the default key is used." The
-/// default key of a Redshift account is the Amazon Web Services managed key for
-/// this service, which callers name by its alias, so that alias is the key such
-/// a grant permits Redshift to use. Resolved once at CREATE time and stored on
-/// the grant, so every later read of it reports the same key.
-pub const DEFAULT_SNAPSHOT_COPY_GRANT_KMS_KEY: &str = "alias/aws/redshift";
-
-/// What a `PendingModifiedValues$MasterUserPassword` carries while an admin
-/// password change is still being applied: the member is `@sensitive`, so the
-/// pending change is reported as a MASK and the password itself never reaches the
-/// wire.
-pub const REDACTED_MASTER_USER_PASSWORD: &str = "****";
-
-/// `ClusterNode$NodeRole` of the one node of a single-node cluster, which is its
-/// own leader and its own compute node.
-pub const NODE_ROLE_SHARED: &str = "SHARED";
-/// `ClusterNode$NodeRole` of the node that runs the query planner of a
-/// multi-node cluster.
-pub const NODE_ROLE_LEADER: &str = "LEADER";
-
-/// The nodes of a cluster, in the order Redshift reports them.
-///
-/// Source: `smithy_query(query="doc", shape="ClusterNode", member="NodeRole")` —
-/// "Whether the node is a leader node or a compute node", and
-/// `smithy_query(query="doc", shape="CreateClusterMessage", member="ClusterType")`
-/// — "When cluster type is specified as single-node, the NumberOfNodes parameter
-/// is not required". So a `single-node` cluster is ONE node that is both roles at
-/// once ([`NODE_ROLE_SHARED`]), and a `multi-node` cluster is its leader node
-/// ([`NODE_ROLE_LEADER`]) followed by its `NumberOfNodes` compute nodes, each
-/// numbered from zero.
-///
-/// The addresses are derived from the cluster identifier and the node's position,
-/// so a cluster always reports the same topology and no address is a per-run
-/// value.
-///
-/// The loop is bounded by [`MAX_NODES_PER_CLUSTER`] whatever it is handed, so the
-/// per-node work this does can never be sized by a request: a node count above
-/// that bound is refused with the modelled
-/// `NumberOfNodesPerClusterLimitExceededFault` before any cluster is written (see
-/// [`exceeds_nodes_per_cluster_limit`]), and this clamp keeps the bound at the
-/// allocation site for every other caller.
-pub fn cluster_nodes(
-    cluster_identifier: &str,
-    cluster_type: &str,
-    number_of_nodes: i32,
-) -> Vec<ClusterNode> {
-    let node = |role: String, index: i32| ClusterNode {
-        node_role: Some(role),
-        private_ip_address: Some(derived_ipv4(
-            10,
-            &format!("private/{cluster_identifier}/{index}"),
-        )),
-        public_ip_address: Some(derived_ipv4(
-            54,
-            &format!("public/{cluster_identifier}/{index}"),
-        )),
-    };
-    if cluster_type == CLUSTER_TYPE_SINGLE_NODE || number_of_nodes <= 1 {
-        return vec![node(NODE_ROLE_SHARED.to_string(), 0)];
-    }
-    let compute_nodes = number_of_nodes.clamp(2, MAX_NODES_PER_CLUSTER);
-    let mut nodes = Vec::with_capacity(compute_nodes as usize + 1);
-    nodes.push(node(NODE_ROLE_LEADER.to_string(), 0));
-    for index in 0..compute_nodes {
-        nodes.push(node(format!("COMPUTE-{index}"), index + 1));
-    }
-    nodes
-}
-
-/// The largest `NumberOfNodes` one cluster may have.
-///
-/// Amazon Redshift bounds the compute nodes of a provisioned cluster by node
-/// type, and 128 is the largest count any node type offers (the published
-/// "Nodes per cluster" quota of the largest RA3 and DC2 node types), so it is the
-/// bound this service enforces for every node type rather than a per-type table
-/// it would have to invent. A request above it is refused with the operation's
-/// own modelled `NumberOfNodesPerClusterLimitExceededFault` — "The operation
-/// would exceed the number of nodes allowed for a cluster" — so no request can
-/// size the work a handler does.
-pub const MAX_NODES_PER_CLUSTER: i32 = 128;
-
-/// Whether a request's `NumberOfNodes` is above [`MAX_NODES_PER_CLUSTER`], which
-/// every operation that writes a cluster checks BEFORE it derives anything from
-/// the count.
-pub fn exceeds_nodes_per_cluster_limit(number_of_nodes: i32) -> bool {
-    number_of_nodes > MAX_NODES_PER_CLUSTER
-}
-
-/// The refusal a `NumberOfNodes` above [`MAX_NODES_PER_CLUSTER`] carries.
-pub fn nodes_per_cluster_limit_message(requested: i32) -> String {
-    format!(
-        "The operation would exceed the number of nodes allowed for a cluster ({MAX_NODES_PER_CLUSTER}): {requested} were requested."
-    )
-}
-
-/// A dotted-quad IPv4 address in the `first`.0.0.0/8 space, derived from `seed`.
-///
-/// The last octet is kept inside 1..=254, so the address is never a network or a
-/// broadcast address of its /24.
-fn derived_ipv4(first: u8, seed: &str) -> String {
-    let digest = Sha256::digest(seed.as_bytes());
-    format!(
-        "{first}.{}.{}.{}",
-        digest[0],
-        digest[1],
-        1 + u32::from(digest[2]) % 254
-    )
-}
-
-/// The SSH public key of a cluster, in the `ssh-rsa <key> Amazon-Redshift` form
-/// Redshift reports.
-///
-/// Source: `smithy_query(query="doc", shape="Cluster", member="ClusterPublicKey")`
-/// — "The public key for the cluster". The key material is generated per cluster
-/// by the service; here it is DERIVED from the cluster identifier so the same
-/// cluster always reports the same key and nothing is drawn per run. The body
-/// opens with the fixed prefix every `ssh-rsa` key carries.
-pub fn cluster_public_key(cluster_identifier: &str) -> String {
-    let body = short_digest(&format!("public-key/{cluster_identifier}"), 48);
-    format!("ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB{body}= Amazon-Redshift")
-}
-
-/// The database revision a cluster runs, as the six-digit number Redshift
-/// reports.
-///
-/// Source: `smithy_query(query="doc", shape="Cluster",
-/// member="ClusterRevisionNumber")` — "The specific revision number of the
-/// database in the cluster". Derived from the engine version and the cluster, so
-/// two clusters of one version can report different revisions (the service
-/// patches them independently) and a cluster's own revision is stable across
-/// reads.
-pub fn cluster_revision_number(cluster_identifier: &str, cluster_version: &str) -> String {
-    let digest = Sha256::digest(format!("revision/{cluster_version}/{cluster_identifier}"));
-    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
-    format!("{}", 100_000 + value % 900_000)
-}
-
-/// The VPC interface endpoint a VPC-resident cluster is reached through, with the
-/// network interface it has in the cluster's Availability Zone.
-///
-/// Source: `smithy_query(query="doc", shape="Endpoint", member="VpcEndpoints")`
-/// and `smithy_query(query="doc", shape="VpcEndpoint")` — "The connection
-/// endpoint for connecting to an Amazon Redshift cluster through the proxy",
-/// whose `NetworkInterfaces` are "one or more network interfaces of the endpoint.
-/// Also known as an interface endpoint." Every id is derived from the cluster and
-/// its VPC, so the topology is stable across reads.
-pub fn cluster_vpc_endpoints(
-    cluster_identifier: &str,
-    vpc_id: &str,
-    availability_zone: &str,
-) -> Vec<VpcEndpoint> {
-    vec![vpc_interface_endpoint(
-        cluster_identifier,
-        vpc_id,
-        availability_zone,
-        None,
-    )]
-}
-
-/// ONE VPC interface endpoint, as [`cluster_vpc_endpoints`] reports it, for the
-/// resource `owner` names.
-///
-/// The same derivation serves a cluster's own endpoint and a Redshift-managed
-/// VPC endpoint of that cluster (`EndpointAccess$VpcEndpoint`), because both are
-/// the same kind of thing — "the connection endpoint for connecting to an Amazon
-/// Redshift cluster through the proxy" — so `owner` is whichever resource the
-/// interface belongs to and every id stays derived from it. `subnet_id` is the
-/// subnet the interface was placed in where the caller KNOWS it (an endpoint
-/// deployed into a subnet of its subnet group); `None` derives it from the VPC
-/// and the zone, which is what a cluster whose subnets this service does not
-/// enumerate per interface reports.
-pub fn vpc_interface_endpoint(
-    owner: &str,
-    vpc_id: &str,
-    availability_zone: &str,
-    subnet_id: Option<&str>,
-) -> VpcEndpoint {
-    VpcEndpoint {
-        vpc_endpoint_id: Some(format!(
-            "vpce-{}",
-            short_digest(&format!("vpce/{owner}/{vpc_id}"), 17)
-        )),
-        vpc_id: Some(vpc_id.to_string()),
-        network_interfaces: Some(vec![NetworkInterface {
-            network_interface_id: Some(format!(
-                "eni-{}",
-                short_digest(&format!("eni/{owner}/{availability_zone}"), 17)
-            )),
-            subnet_id: Some(subnet_id.map_or_else(
-                || {
-                    format!(
-                        "subnet-{}",
-                        short_digest(&format!("subnet/{vpc_id}/{availability_zone}"), 17)
-                    )
-                },
-                str::to_string,
-            )),
-            private_ip_address: Some(derived_ipv4(
-                10,
-                &format!("eni-address/{owner}/{availability_zone}"),
-            )),
-            availability_zone: Some(availability_zone.to_string()),
-            // The emulator presents IPv4 subnets only, so an endpoint interface
-            // has no IPv6 address to report.
-            ipv6_address: None,
-        }]),
-    }
-}
-
-/// The `AquaConfiguration` every cluster reports.
-///
-/// Source: `smithy_query(query="doc", shape="Cluster", member="AquaConfiguration")`
-/// — "This field is retired. Amazon Redshift automatically determines whether to
-/// use AQUA (Advanced Query Accelerator)", and the identical sentence on
-/// `CreateClusterMessage$AquaConfigurationStatus`: "This parameter is retired. It
-/// does not set the AQUA configuration status." So the configuration status a
-/// request asks for is IGNORED and the cluster reports the automatic
-/// configuration (`auto`, of the `AquaConfigurationStatus` enum) with AQUA not in
-/// use (`disabled`, of the `AquaStatus` enum).
-pub fn retired_aqua_configuration() -> AquaConfiguration {
-    AquaConfiguration {
-        aqua_status: Some("disabled".to_string()),
-        aqua_configuration_status: Some("auto".to_string()),
-    }
-}
-
-/// The next UTC instant at which a cluster's weekly maintenance window opens,
-/// strictly after `after`.
-///
-/// Source: `smithy_query(query="doc", shape="Cluster",
-/// member="NextMaintenanceWindowStartTime")` — "The date and time in UTC when
-/// system maintenance can begin" — computed from the cluster's own
-/// `PreferredMaintenanceWindow`, whose documented form is
-/// `ddd:hh24:mi-ddd:hh24:mi` (`smithy_query(query="doc",
-/// shape="CreateClusterMessage", member="PreferredMaintenanceWindow")`). `None`
-/// when the window is not in that form, so an unparsable window reports no next
-/// start rather than a made-up one.
-///
-/// Every value is bounded before it is used and every instant is computed with
-/// CHECKED arithmetic, so no window a request can carry — and no instant the
-/// clock can reach — overflows or panics: an input that would is one this
-/// reports no next start for.
-pub fn next_maintenance_window_start(
-    window: &str,
-    after: ::aws_smithy_types::DateTime,
-) -> Option<::aws_smithy_types::DateTime> {
-    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
-
-    let start = window.split('-').next()?;
-    let mut parts = start.split(':');
-    let day = parts.next()?.to_ascii_lowercase();
-    // Parsed UNSIGNED and bounded on both ends: `hh24` is 00..=23 and `mi` is
-    // 00..=59, so a negative or out-of-range field is a window this reports
-    // nothing for rather than a value the arithmetic below has to survive.
-    let hour: u32 = parts.next()?.parse().ok()?;
-    let minute: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || hour > 23 || minute > 59 {
-        return None;
-    }
-    let second_of_day = i64::from(hour) * 3600 + i64::from(minute) * 60;
-    let target_day = MAINTENANCE_WINDOW_DAYS
-        .iter()
-        .position(|candidate| *candidate == day)? as i64;
-
-    let after_secs = after.secs();
-    // Epoch day 0 (1970-01-01) was a Thursday, index 3 of a Monday-first week.
-    let day_index = after_secs.div_euclid(SECONDS_PER_DAY);
-    let weekday = (day_index + 3).rem_euclid(7);
-    let ahead = (target_day - weekday).rem_euclid(7);
-    let mut start_secs = day_index
-        .checked_add(ahead)?
-        .checked_mul(SECONDS_PER_DAY)?
-        .checked_add(second_of_day)?;
-    if start_secs <= after_secs {
-        start_secs = start_secs.checked_add(7 * SECONDS_PER_DAY)?;
-    }
-    Some(::aws_smithy_types::DateTime::from_secs(start_secs))
 }
 
 /// The fewest nodes a `multi-node` cluster may have.
@@ -4234,11 +3176,62 @@ pub fn endpoint_security_groups(
         .collect()
 }
 
-/// What every operation on a Redshift-managed VPC endpoint answers when the
-/// `EndpointName` it resolves names none.
-pub fn endpoint_not_found_message(endpoint_name: &str) -> String {
-    format!("Endpoint {endpoint_name} not found.")
+/// Which sentence an `EndpointNotFoundFault` is worded with.
+///
+/// The same split as [`ClusterNotFoundWording`]: the fault's status (404) and
+/// awsQuery code (`EndpointNotFound`) are what the model fixes, while the fixed
+/// text around the `EndpointName` is an attribute of the OPERATION, and recorded
+/// refusals show both sentences below in use. Naming each wording here keeps the
+/// choice at the handler that makes it, so no operation can quietly inherit
+/// another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointNotFoundWording {
+    /// `Endpoint <EndpointName> can't be found` — what the endpoint READ,
+    /// `DescribeEndpointAccess`, answers. No trailing period.
+    EndpointCannotBeFound,
+    /// `The endpoint name <EndpointName> can't be found.` — what the operations
+    /// that ACT on the endpoint they name answer (`DeleteEndpointAccess`,
+    /// `ModifyEndpointAccess`): the same split a read and a write make for a
+    /// snapshot ([`ClusterSnapshotNotFoundWording`]).
+    TheEndpointNameCannotBeFound,
 }
+
+/// The `EndpointNotFoundFault` message `wording` words, naming the
+/// `EndpointName` the request asked about.
+pub fn endpoint_not_found_message(
+    wording: EndpointNotFoundWording,
+    endpoint_name: &str,
+) -> String {
+    match wording {
+        EndpointNotFoundWording::EndpointCannotBeFound => {
+            format!("Endpoint {endpoint_name} can't be found")
+        }
+        EndpointNotFoundWording::TheEndpointNameCannotBeFound => {
+            format!("The endpoint name {endpoint_name} can't be found.")
+        }
+    }
+}
+
+/// What `ModifyUsageLimit` and `DeleteUsageLimit` answer when the
+/// `UsageLimitId` they resolve names no stored limit.
+///
+/// The fault's status (404) and awsQuery code (`UsageLimitNotFound`) are what
+/// the model fixes; this is the fixed text around the id, with no trailing
+/// period.
+pub fn usage_limit_not_found_message(usage_limit_id: &str) -> String {
+    format!("Usage limit {usage_limit_id} is not found")
+}
+
+/// What `AuthorizeEndpointAccess` and `RevokeEndpointAccess` answer when the
+/// `Account` the request names is the caller's own.
+///
+/// An endpoint authorization grants one account access to ANOTHER account's
+/// cluster, so the grantee can never be the grantor: the guard is a judgement on
+/// the request's own argument and is made before any name the request carries is
+/// resolved. A FIXED sentence — the refusal names no account, because the only
+/// account it could name is the caller's own.
+pub const SELF_ACCOUNT_NOT_GRANTABLE: &str =
+    "Specify an AWS account that is different from the current AWS account.";
 
 /// What `CreateEndpointAccess` answers when the account already holds an
 /// endpoint under the requested name.

@@ -206,6 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(started);
 
+        // An endpoint authorization grants ANOTHER account access to this
+        // account's cluster, so the grantee can never be the grantor. That is a
+        // judgement on the request's own argument rather than on anything the
+        // store holds, and AWS makes it BEFORE resolving the cluster: a caller
+        // probing the guard learns the real reason, not a not-found.
+        if input.account.as_deref() == Some(::engine::emulator_account_id()) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::SELF_ACCOUNT_NOT_GRANTABLE,
+            ));
+        }
+
         // "The cluster to revoke access from": resolved BEFORE the authorization,
         // so a request naming neither an existing cluster nor an existing
         // authorization is refused on the cluster.
@@ -213,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(RevokeEndpointAccessErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
                     message: Some(st::cluster_not_found_message(
-                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        st::ClusterNotFoundWording::SpecifiedIdentifierCannotBeFound,
                         &cluster_identifier,
                     )),
                 },

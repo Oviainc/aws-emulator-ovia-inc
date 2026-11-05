@@ -191,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.endpoint_access(wanted).is_none() {
                 return Err(DescribeEndpointAccessErrorModeled::EndpointNotFoundFault(
                     EndpointNotFoundFault {
-                        message: Some(st::endpoint_not_found_message(wanted)),
+                        message: Some(st::endpoint_not_found_message(
+                            st::EndpointNotFoundWording::EndpointCannotBeFound,
+                            wanted,
+                        )),
                     },
                 )
                 .into());

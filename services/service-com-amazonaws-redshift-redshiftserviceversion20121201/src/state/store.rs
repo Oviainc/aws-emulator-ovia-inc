@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! The store's own operations: how every operation of this service reaches,
+//! resolves and settles the records
+//! [`ComAmazonawsRedshiftRedshiftserviceversion20121201State`] holds.
+
 use super::*;
 
 impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {

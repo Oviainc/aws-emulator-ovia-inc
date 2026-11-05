@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DescribeEndpointAuthorizationErrorModeled::ClusterNotFoundFault(
                         ClusterNotFoundFault {
                             message: Some(st::cluster_not_found_message(
-                                st::ClusterNotFoundWording::IdentifierThenNotFound,
+                                st::ClusterNotFoundWording::SpecifiedIdentifierCannotBeFound,
                                 wanted,
                             )),
                         },

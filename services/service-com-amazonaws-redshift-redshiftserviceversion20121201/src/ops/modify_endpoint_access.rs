@@ -190,7 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = store.endpoint_access_position(&input.endpoint_name) else {
             return Err(ModifyEndpointAccessErrorModeled::EndpointNotFoundFault(
                 EndpointNotFoundFault {
-                    message: Some(st::endpoint_not_found_message(&input.endpoint_name)),
+                    message: Some(st::endpoint_not_found_message(
+                        st::EndpointNotFoundWording::TheEndpointNameCannotBeFound,
+                        &input.endpoint_name,
+                    )),
                 },
             )
             .into());

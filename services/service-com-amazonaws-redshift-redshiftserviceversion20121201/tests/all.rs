@@ -59,6 +59,8 @@ mod default_cluster_parameters;
 mod delete_cluster_snapshot;
 #[path = "all/endpoint_access.rs"]
 mod endpoint_access;
+#[path = "all/endpoint_and_usage_limit_refusal_wording.rs"]
+mod endpoint_and_usage_limit_refusal_wording;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/event_categories.rs"]

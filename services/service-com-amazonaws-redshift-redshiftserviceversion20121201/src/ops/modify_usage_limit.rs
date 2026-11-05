@@ -198,10 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = store.usage_limit_position(&input.usage_limit_id) else {
             return Err(ModifyUsageLimitErrorModeled::UsageLimitNotFoundFault(
                 UsageLimitNotFoundFault {
-                    message: Some(format!(
-                        "Usage limit {} not found.",
-                        input.usage_limit_id
-                    )),
+                    message: Some(st::usage_limit_not_found_message(&input.usage_limit_id)),
                 },
             )
             .into());

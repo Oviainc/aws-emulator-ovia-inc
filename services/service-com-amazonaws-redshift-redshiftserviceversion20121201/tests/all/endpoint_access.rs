@@ -24,11 +24,17 @@ use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 use crate::cluster_lifecycle::{all_text, Answer, Emulator, REGION};
 
 /// An account id other than the emulator's own, for a grant to somebody else.
-const OTHER_ACCOUNT: &str = "111122223333";
+///
+/// `pub(crate)` so the sibling suite about this family's refusal WORDING grants
+/// to the same third-party account rather than repeating the literal.
+pub(crate) const OTHER_ACCOUNT: &str = "111122223333";
 
 /// A name of exactly `len` characters that satisfies every other part of the
 /// documented endpoint-name syntax: a leading letter and then alphanumerics.
-fn name_of_length(len: usize) -> String {
+///
+/// `pub(crate)` so the sibling suite about this family's refusal WORDING builds
+/// its length rows the same way rather than writing a second copy.
+pub(crate) fn name_of_length(len: usize) -> String {
     std::iter::once('g')
         .chain(std::iter::repeat_n('x', len - 1))
         .collect()
@@ -36,7 +42,7 @@ fn name_of_length(len: usize) -> String {
 
 /// `call` takes borrowed pairs, so a case that builds owned parameters borrows
 /// them through this.
-fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
     params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -60,7 +66,7 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 }
 
 /// Assert one served answer.
-fn assert_served(case: &str, answer: &Answer) {
+pub(crate) fn assert_served(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected status 200, got {} with body {}",
@@ -74,14 +80,18 @@ fn assert_served(case: &str, answer: &Answer) {
 /// The clock-owed `creating` -> `available` transition falls due
 /// [`state::PROVISIONING_SPAN`] after the create, so this waits that span out
 /// (plus a margin for a loaded runner) rather than reaching into the store.
-async fn available_cluster(emulator: &Emulator, identifier: &str) {
+pub(crate) async fn available_cluster(emulator: &Emulator, identifier: &str) {
     let created = emulator.create_minimal(identifier).await;
     assert_served(&format!("seed cluster {identifier}"), &created);
     tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
 }
 
 /// Create one cluster subnet group holding `subnet_ids`.
-async fn create_subnet_group(emulator: &Emulator, name: &str, subnet_ids: &[&str]) -> Answer {
+pub(crate) async fn create_subnet_group(
+    emulator: &Emulator,
+    name: &str,
+    subnet_ids: &[&str],
+) -> Answer {
     let mut params: Vec<(String, String)> = vec![
         ("ClusterSubnetGroupName".to_string(), name.to_string()),
         ("Description".to_string(), format!("subnets for {name}")),
@@ -99,7 +109,7 @@ async fn create_subnet_group(emulator: &Emulator, name: &str, subnet_ids: &[&str
 
 /// `CreateEndpointAccess` for one cluster and subnet group, with the security
 /// groups `security_group_ids` names (none when it is empty).
-async fn create_endpoint(
+pub(crate) async fn create_endpoint(
     emulator: &Emulator,
     endpoint_name: &str,
     cluster_identifier: &str,
