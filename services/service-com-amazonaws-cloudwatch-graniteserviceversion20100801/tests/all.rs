@@ -61,6 +61,8 @@ mod anomaly_band_alarm_evaluation;
 mod anomaly_band_alarms;
 #[path = "all/anomaly_detectors.rs"]
 mod anomaly_detectors;
+#[path = "all/comparison_operator_threshold_split.rs"]
+mod comparison_operator_threshold_split;
 #[path = "all/composite_alarms.rs"]
 mod composite_alarms;
 #[path = "all/composite_rule_child_datapoints.rs"]

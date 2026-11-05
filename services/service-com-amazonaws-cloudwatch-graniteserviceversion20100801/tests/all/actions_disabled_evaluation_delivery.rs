@@ -227,7 +227,7 @@ impl Row {
 }
 
 /// The metric alarm `DescribeAlarms` reports under `name`.
-async fn described(emulator: &Emulator, name: &str) -> Value {
+pub async fn described(emulator: &Emulator, name: &str) -> Value {
     let reported = cw(emulator, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
     reported["MetricAlarms"][0].clone()
 }
@@ -526,11 +526,22 @@ fn assert_reports_transition(
 
 /// The state value one `StateUpdate` history item records the alarm as having moved to.
 pub fn recorded_state(item: &Value) -> String {
+    recorded_state_at(item, "/newState/stateValue")
+}
+
+/// The state value the same item records the alarm as having moved FROM.
+pub fn recorded_previous_state(item: &Value) -> String {
+    recorded_state_at(item, "/oldState/stateValue")
+}
+
+/// One state value out of a `StateUpdate` item's `HistoryData` document: the ONE reading of
+/// that document, so the two sides of a recorded transition are not parsed two ways.
+fn recorded_state_at(item: &Value, pointer: &str) -> String {
     let data = item["HistoryData"].as_str().unwrap_or_default();
     let document: Value = serde_json::from_str(data)
         .unwrap_or_else(|error| panic!("HistoryData is not JSON ({error}): {data}"));
     document
-        .pointer("/newState/stateValue")
+        .pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
