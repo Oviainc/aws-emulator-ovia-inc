@@ -16,9 +16,9 @@
 
 use std::io::Read;
 
+use crate::cbor::CborCodec;
 use crate::json::JsonCodec;
 use crate::protocol::{ProtocolError, ServerProtocol};
-use aws_smithy_cbor::codec::CborCodec;
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::codec::{Codec, FinishSerializer};
 use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer, ShapeSerializer};

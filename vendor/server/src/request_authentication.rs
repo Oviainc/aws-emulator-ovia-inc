@@ -528,6 +528,11 @@ pub fn write_credentials_file(
 /// Writes `text` to `<emulator home>/<port>/<name>`, owner-only on Unix, replacing (never
 /// following) whatever is already there; the file is removed when the returned guard drops.
 pub fn write_emulator_file(port: u16, name: &str, text: &str) -> std::io::Result<EmulatorFile> {
+    write_emulator_bytes(port, name, text.as_bytes())
+}
+
+/// [`write_emulator_file`] for binary content, such as the Java trust store.
+pub fn write_emulator_bytes(port: u16, name: &str, bytes: &[u8]) -> std::io::Result<EmulatorFile> {
     let home = emulator_paths::emulator_home().ok_or(std::io::ErrorKind::NotFound)?;
     let folder = home.join(port.to_string());
     std::fs::create_dir_all(&folder)?;
@@ -542,7 +547,7 @@ pub fn write_emulator_file(port: u16, name: &str, text: &str) -> std::io::Result
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    std::io::Write::write_all(&mut options.open(&path)?, text.as_bytes())?;
+    std::io::Write::write_all(&mut options.open(&path)?, bytes)?;
     Ok(EmulatorFile(path))
 }
 

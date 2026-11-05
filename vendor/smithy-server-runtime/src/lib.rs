@@ -23,6 +23,7 @@ pub mod operation;
 pub mod pre_dispatch;
 pub mod router;
 pub mod service;
+pub mod virtual_host;
 pub mod wire;
 pub mod wire_protocol;
 
@@ -44,6 +45,8 @@ pub use service::{
 // The multi-service router: the emulator core that mounts N services and
 // dispatches each request to the one service that claims it.
 pub use multi_service_router::MultiServiceRouter;
+// The virtual-hosted addresses a service's endpoint rules declare, and the host split.
+pub use virtual_host::{VirtualHost, VirtualHostAddressing};
 // Per-request protocol selection. The `#[smithy_service]` expansion builds a
 // `DeclaredProtocols` from the model's protocol traits and names the other
 // types.

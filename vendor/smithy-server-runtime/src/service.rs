@@ -59,6 +59,7 @@ impl<P> ServerHttpProtocol for P where P: ServerProtocol<Request = RtRequest, Re
 pub struct ServiceIdentity {
     shape_id: &'static str,
     signing_name: &'static str,
+    virtual_host_addressing: Option<crate::VirtualHostAddressing>,
 }
 
 impl ServiceIdentity {
@@ -68,7 +69,31 @@ impl ServiceIdentity {
         Self {
             shape_id,
             signing_name,
+            virtual_host_addressing: None,
         }
+    }
+
+    /// This identity, with the virtual-hosted addresses the service's model declares.
+    /// `#[smithy_service]` calls this with the host templates it derived from the model's
+    /// endpoint rule set, for a service that declares any.
+    pub const fn with_virtual_host_addressing(
+        mut self,
+        addressing: crate::VirtualHostAddressing,
+    ) -> Self {
+        self.virtual_host_addressing = Some(addressing);
+        self
+    }
+
+    /// The virtual-hosted addresses this service's model declares: hosts that name a
+    /// request parameter (S3's bucket) in front of the endpoint instead of in the path.
+    /// `None` when the model declares none, and for an identity built without them, whose
+    /// requests are then routed exactly as they arrive.
+    ///
+    /// It is carried on the identity, not on the definition, because a tenant that wraps
+    /// the generated definition (to word errors, audit, or refuse callers) forwards
+    /// `identity()` to it: the addressing reaches the router through every such wrapper.
+    pub fn virtual_host_addressing(&self) -> Option<&crate::VirtualHostAddressing> {
+        self.virtual_host_addressing.as_ref()
     }
 
     /// The service's Smithy shape id, e.g. `com.amazonaws.s3#AmazonS3`.

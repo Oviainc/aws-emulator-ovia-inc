@@ -29,6 +29,7 @@ aws-credential-types = "1"
 aws-lc-rs = "1"
 percent-encoding = "2"
 time = { version = "0.3.55", default-features = false, features = ["parsing", "std"] }
+yasna = "0.5"
 emulator-paths = { path = "../emulator-paths", package = "aws-emulator-emulator-paths", version = "*" }
 emulator-telemetry = { path = "../emulator-telemetry", package = "aws-emulator-emulator-telemetry", version = "*" }
 aws-smithy-schema-server = { path = "../smithy-schema-server", package = "aws-emulator-smithy-schema-server", version = "*" }

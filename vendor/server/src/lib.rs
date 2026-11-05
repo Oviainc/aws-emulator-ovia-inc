@@ -25,6 +25,9 @@ pub use emulator_paths::set_emulator_home_dir;
 
 pub mod embedded;
 
+/// The PKCS#12 trust store published next to `ca.pem` for JVM clients.
+pub mod java_truststore;
+
 /// Resource-listener surfaces: the agent-facing `tcp()`/`http()` listeners a generated
 /// service opens for a resource (RDS Postgres port, API Gateway invoke URL),
 /// plus the pure transport-safety enforcement the core owns for them.
@@ -1257,6 +1260,14 @@ pub async fn serve_production_on_address<S: EmulatorService>(
     let port = data_addr.port();
     let ca_file = request_authentication::write_emulator_file(port, "ca.pem", &cert.cert.pem())
         .map_err(ServeError::Io)?;
+    // JVMs ignore `ca.pem`; they trust the emulator through this store, named by
+    // `-Djavax.net.ssl.trustStore` (see `java_truststore`).
+    let java_truststore_file = request_authentication::write_emulator_bytes(
+        port,
+        java_truststore::FILE_NAME,
+        &java_truststore::emulator_only(cert.cert.der()),
+    )
+    .map_err(ServeError::Io)?;
     let config_text = shared_config_text(SocketAddr::new(client_host, port), &ca_file.0);
     let config_file = request_authentication::write_emulator_file(port, "config", &config_text)
         .map_err(ServeError::Io)?;
@@ -1265,6 +1276,7 @@ pub async fn serve_production_on_address<S: EmulatorService>(
         %data_addr,
         config_file = %config_file.0.display(),
         ca_file = %ca_file.0.display(),
+        java_truststore_file = %java_truststore_file.0.display(),
         health_addr = %data_addr,
         %bind_address,
         "emulator server starting: serving the API and {HEALTH_PATH} over HTTPS on one port"
@@ -2550,6 +2562,109 @@ mod tests {
             .danger_accept_invalid_certs(true)
             .build()
             .expect("tls client")
+    }
+
+    /// A JVM with no TLS code reaches the production listener once
+    /// `JAVA_TOOL_OPTIONS` names the published `truststore.p12`, and fails the
+    /// handshake without it. Skipped when no `JAVA_HOME/bin/java` is present.
+    /// Multi-threaded because the JVM runs as a blocking child process while the
+    /// server task must keep answering it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_jvm_trusts_the_emulator_through_the_published_truststore() {
+        let Some(java) = std::env::var_os("JAVA_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("bin").join("java"))
+            .filter(|path| path.exists())
+        else {
+            eprintln!("skipped: no JAVA_HOME/bin/java");
+            return;
+        };
+        // `java Health.java` (single-file source launch) needs JDK 11 or later.
+        let version = std::process::Command::new(&java)
+            .arg("-version")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+            .unwrap_or_default();
+        let major = java_major_version(&version);
+        if major.is_none_or(|major| major < 11) {
+            eprintln!("skipped: needs JDK 11 or later, found {major:?}");
+            return;
+        }
+        let data_port: u16 = 18451;
+        let server = tokio::spawn(async move {
+            let _ = serve_production_on(EchoService, data_port).await;
+        });
+        let health_url = format!("https://127.0.0.1:{data_port}{HEALTH_PATH}");
+        check!(
+            wait_until_serving(&tls_client(), &health_url).await,
+            "the listener must bind"
+        );
+
+        let store = emulator_paths::emulator_home()
+            .unwrap()
+            .join(data_port.to_string())
+            .join(java_truststore::FILE_NAME);
+        check!(store.exists(), "{} must be published", store.display());
+
+        // Single-file source launch: plain HttpsURLConnection, default trust only.
+        let dir = std::env::temp_dir().join(format!("jvm-trust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("Health.java");
+        std::fs::write(
+            &source,
+            "public class Health { public static void main(String[] a) throws Exception {\n\
+             var c = (javax.net.ssl.HttpsURLConnection) new java.net.URL(a[0]).openConnection();\n\
+             System.out.print(new String(c.getInputStream().readAllBytes()));\n} }\n",
+        )
+        .unwrap();
+        let run = |tool_options: Option<String>| {
+            let mut cmd = std::process::Command::new(&java);
+            cmd.arg(&source)
+                .arg(&health_url)
+                .env_remove("JAVA_TOOL_OPTIONS");
+            if let Some(options) = tool_options {
+                cmd.env("JAVA_TOOL_OPTIONS", options);
+            }
+            cmd.output().unwrap()
+        };
+
+        let trusted = run(Some(format!(
+            "-Djavax.net.ssl.trustStore={} -Djavax.net.ssl.trustStoreType=PKCS12",
+            store.display()
+        )));
+        let untrusted = run(None);
+        let _ = std::fs::remove_dir_all(&dir);
+        server.abort();
+
+        check!(
+            trusted.status.success() && trusted.stdout == b"ok",
+            "trusted run: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+        check!(
+            !untrusted.status.success(),
+            "without the store the handshake must fail"
+        );
+        check!(String::from_utf8_lossy(&untrusted.stderr).contains("PKIX"));
+    }
+
+    /// The major version from `java -version` output: `"1.8.0_402"` is 8,
+    /// `"11.0.33"` and `"21"` are 11 and 21.
+    fn java_major_version(output: &str) -> Option<u32> {
+        let quoted = output.split('"').nth(1)?;
+        let mut parts = quoted.split(['.', '_', '-', '+']);
+        match parts.next()?.parse().ok()? {
+            1 => parts.next()?.parse().ok(),
+            major => Some(major),
+        }
+    }
+
+    #[test]
+    fn java_major_version_reads_old_and_new_formats() {
+        check!(java_major_version("java version \"1.8.0_402\"") == Some(8));
+        check!(java_major_version("openjdk version \"11.0.33\" 2026-10-20 LTS") == Some(11));
+        check!(java_major_version("openjdk version \"21\" 2023-09-19") == Some(21));
+        check!(java_major_version("openjdk version \"17-ea\"") == Some(17));
+        check!(java_major_version("no version here").is_none());
     }
 
     // -----------------------------------------------------------------------

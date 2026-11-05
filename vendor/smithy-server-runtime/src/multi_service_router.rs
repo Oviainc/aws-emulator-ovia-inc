@@ -158,6 +158,22 @@ impl MultiServiceRouter {
         // deserialization see identical bytes.
         let mut rt_req = runtime_api_request_from_parts(&parts, _body.to_vec());
 
+        // A virtual-hosted request names its bucket in the host, but the operations are
+        // modeled path-style, so the bucket moves into the path here, before anything routes
+        // on the path. Only this routing copy changes: authentication reads `parts`, which
+        // still carries the host and path the client signed. The addresses come from the
+        // claiming service's own model (its endpoint rules); a service that declares none
+        // gets its request as it arrived.
+        if path_style_for_virtual_hosted(
+            &mut rt_req,
+            &parts,
+            svc.definition().identity().virtual_host_addressing(),
+        )
+        .is_err()
+        {
+            return invalid_virtual_hosted_address_response();
+        }
+
         // The protocol this request is served in (see `crate::wire_protocol`):
         // every step below, from operation lookup to every error, uses it. Read
         // from the headers and path alone, so it is decided before the body is
@@ -477,6 +493,65 @@ fn ambiguous_service_response(
 /// Build a runtime-API request from buffered parts + body, preserving URI,
 /// method, and headers (so URI-routed protocols and `@httpHeader` bindings see
 /// what the client sent).
+/// Rewrites `req` from virtual-hosted to path-style when its host is one of the service's
+/// virtual-hosted addresses (see [`crate::VirtualHostAddressing`]): `PUT /dir/k1` on
+/// `b.s3.us-east-1.amazonaws.com` becomes `PUT /b/dir/k1` on `s3.us-east-1.amazonaws.com`.
+/// The host comes from the `Host` header, else the URI authority (HTTP/2, and the
+/// absolute URI the embedded front door's SDK requests carry). Any other request is left
+/// alone, and so is any request to a service that declares no virtual-hosted address.
+///
+/// `Err` when the rewritten URI cannot be built. The request must then be refused, not
+/// served as the path-style request it is not: that would read or write the wrong bucket.
+fn path_style_for_virtual_hosted(
+    req: &mut RtRequest,
+    parts: &http::request::Parts,
+    addressing: Option<&crate::VirtualHostAddressing>,
+) -> Result<(), ()> {
+    let Some(addressing) = addressing else {
+        return Ok(());
+    };
+    let host = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.authority().map(|authority| authority.as_str()));
+    let Some(virtual_host) = host.and_then(|host| addressing.split(host)) else {
+        return Ok(());
+    };
+    let path_and_query = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
+    // `/` and `/?sub` name the bucket itself, addressed path-style as `/b` and `/b?sub`.
+    let rest = match path_and_query.strip_prefix('/') {
+        Some(rest) if rest.is_empty() || rest.starts_with('?') => rest.to_string(),
+        _ => path_and_query.to_string(),
+    };
+    let path = format!("/{}{rest}", virtual_host.bucket);
+    let uri = match parts.uri.scheme_str() {
+        Some(scheme) => format!("{scheme}://{}{path}", virtual_host.endpoint),
+        None => path,
+    };
+    req.set_uri(uri.as_str()).map_err(|_| ())?;
+    if req.headers().contains_key("host") {
+        req.headers_mut()
+            .insert("host", virtual_host.endpoint.to_string());
+    }
+    Ok(())
+}
+
+/// The refusal for a virtual-hosted address whose path-style form cannot be built. The
+/// address is validated before it gets here, so this is a guard that stays closed, not a
+/// path a client reaches.
+fn invalid_virtual_hosted_address_response() -> http::Response<bytes::Bytes> {
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidURI</Code>\
+                <Message>Couldn't parse the specified URI.</Message></Error>";
+    let mut response = http::Response::new(bytes::Bytes::from_static(body.as_bytes()));
+    *response.status_mut() = http::StatusCode::BAD_REQUEST;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/xml"),
+    );
+    response
+}
+
 fn runtime_api_request_from_parts(parts: &http::request::Parts, body: Vec<u8>) -> RtRequest {
     let mut req = RtRequest::new(aws_smithy_types::body::SdkBody::from(body));
     let uri_str = parts.uri.to_string();
@@ -558,6 +633,61 @@ mod tests {
     use super::*;
     use crate::service::{ErasedOperation, ServiceIdentity};
     use aws_smithy_runtime_api::http::Request as RtRequest;
+
+    /// A request to `uri` carrying `host`, as both the routing copy and the signed `parts`.
+    fn request_to(uri: &str, host: &str) -> (RtRequest, http::request::Parts) {
+        let (parts, ()) = http::Request::builder()
+            .uri(uri)
+            .header("host", host)
+            .body(())
+            .expect("valid request")
+            .into_parts();
+        (runtime_api_request_from_parts(&parts, Vec::new()), parts)
+    }
+
+    const S3_LIKE: crate::VirtualHostAddressing =
+        crate::VirtualHostAddressing::new(&["s3.{region}.{dnsSuffix}", "s3.{dnsSuffix}"]);
+
+    #[test]
+    fn a_service_that_declares_virtual_hosted_addresses_has_its_request_rewritten() {
+        let (mut req, parts) = request_to("/dir/k1?uploads", "bucket.s3.us-east-1.amazonaws.com");
+        path_style_for_virtual_hosted(&mut req, &parts, Some(&S3_LIKE)).expect("rewritable");
+        assert_eq!(req.uri(), "/bucket/dir/k1?uploads");
+        assert_eq!(
+            req.headers().get("host"),
+            Some("s3.us-east-1.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn a_service_that_declares_none_has_its_request_left_as_it_arrived() {
+        let host = "bucket.s3.us-east-1.amazonaws.com";
+        let (mut req, parts) = request_to("/dir/k1?uploads", host);
+        path_style_for_virtual_hosted(&mut req, &parts, None).expect("left alone");
+        assert_eq!(req.uri(), "/dir/k1?uploads");
+        assert_eq!(req.headers().get("host"), Some(host));
+    }
+
+    #[test]
+    fn a_host_that_is_not_one_of_the_declared_addresses_is_left_as_it_arrived() {
+        for host in [
+            "s3.us-east-1.amazonaws.com",
+            "127.0.0.1:4566",
+            "a?x.s3.amazonaws.com",
+            "bucket.sqs.us-east-1.amazonaws.com",
+        ] {
+            let (mut req, parts) = request_to("/b/k", host);
+            path_style_for_virtual_hosted(&mut req, &parts, Some(&S3_LIKE)).expect("left alone");
+            assert_eq!(req.uri(), "/b/k", "{host}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_for_an_unbuildable_address_is_a_400_xml_error() {
+        let response = invalid_virtual_hosted_address_response();
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(response.body()).contains("<Code>InvalidURI</Code>"));
+    }
 
     /// How a test double decides whether it claims a request.
     #[derive(Clone, Copy)]

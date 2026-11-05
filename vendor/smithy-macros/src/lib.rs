@@ -7,6 +7,7 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, GenericArgument, PathArg
 
 mod client;
 mod codegen;
+mod endpoint_rules;
 
 // =============================================================================
 // The single #[smithy(...)] attribute macro
@@ -3861,6 +3862,20 @@ fn smithy_service_impl(
     let service_traits = service_shape.get("traits").and_then(|t| t.as_object());
     let has_trait = |id: &str| service_traits.is_some_and(|t| t.contains_key(id));
 
+    // The virtual-hosted addresses the model's endpoint rules declare (a bucket named in
+    // the host), as host templates the router recognizes a request's `Host` against. A
+    // service whose model states none gets `None`, and its requests are routed as sent.
+    let virtual_host_templates = endpoint_rules::virtual_host_templates(&model, service_traits);
+    let virtual_host_addressing = if virtual_host_templates.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            .with_virtual_host_addressing(
+                ::smithy_server_runtime::VirtualHostAddressing::new(&[#(#virtual_host_templates),*]),
+            )
+        }
+    };
+
     // The XML namespace the restXml codec stamps on the root element and on the
     // error envelopes comes from the SERVICE's `@xmlNamespace` trait — S3 says
     // `http://s3.amazonaws.com/doc/2006-03-01/`, Route 53 says
@@ -4450,10 +4465,12 @@ fn smithy_service_impl(
                 let mut routing_table = ::smithy_server_runtime::OperationRoutingTable::new();
                 #(#table_inits)*
                 #service_entry_name {
+                    // The identity carries the virtual-hosted addresses derived from the
+                    // model's endpoint rules, when it declares any.
                     identity: ::smithy_server_runtime::ServiceIdentity::new(
                         #service_shape_id,
                         #signing_name,
-                    ),
+                    )#virtual_host_addressing,
                     protocols: ::smithy_server_runtime::DeclaredProtocols::new(
                         ::std::vec![#(#declared_protocols),*],
                     ),

@@ -29,6 +29,7 @@
 //!   the awsJson1_0 / awsJson1_1 server protocols.
 
 pub mod aws_chunked;
+pub mod cbor;
 pub mod constraints;
 pub mod http_binding;
 pub mod json;
@@ -39,7 +40,7 @@ pub mod rest_xml;
 pub mod rpc;
 pub mod xml;
 
-pub use aws_smithy_cbor::codec::CborCodec;
+pub use cbor::CborCodec;
 pub use constraints::{
     envelope, missing_member_message, validate, validate_to_message, Constrained, LengthTrait,
     ValidatingSerializer, Violation, ViolationKind,
