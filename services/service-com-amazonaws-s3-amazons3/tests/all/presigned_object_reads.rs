@@ -349,11 +349,13 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
         );
     }
 
-    // The boundary of the rule: a host whose first label is NOT a bucket this emulator holds
-    // is a PATH-STYLE address, so its first path segment is still the bucket. That is what
-    // leaves an endpoint whose own name nothing here knows resolving as it always did — and
-    // what a host-style request for a bucket that does not exist is read as too (it resolves
-    // from the bare path, so it answers about the address the path names).
+    // The boundary of the rule. A host that is NOT one of this service's virtual-hosted
+    // addresses carries no bucket at all, so its first path segment is the bucket and an
+    // endpoint whose own name nothing here knows resolves as it always did. A host that IS
+    // one names the bucket in its first label whether or not this emulator holds it — the
+    // address is read off the host before any store is consulted (the core's
+    // `VirtualHostAddressing`) — so a request for a bucket that is not there answers about
+    // THAT bucket rather than resolving from the path.
     let path_style = send_signed(
         &router,
         "GET",
@@ -383,11 +385,19 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
     )
     .await;
     assert_eq!(
-        absent_host_bucket.body.as_ref(),
-        written.as_slice(),
-        "case \"a host label naming no bucket\": the read must resolve from the path, got {} \
-         bytes with status {}",
-        absent_host_bucket.body.len(),
-        absent_host_bucket.status
+        absent_host_bucket.error_code(),
+        "NoSuchBucket",
+        "case \"a host label naming no bucket\": the read must be about the bucket the HOST \
+         names, got {:?} with status {} and body {:?}",
+        absent_host_bucket.error_code(),
+        absent_host_bucket.status,
+        text(&absent_host_bucket)
+    );
+    assert_eq!(
+        absent_host_bucket.element("BucketName").as_deref(),
+        Some("absent-host-bucket"),
+        "case \"a host label naming no bucket\": the refusal must name the host's bucket, got \
+         {:?}",
+        text(&absent_host_bucket)
     );
 }

@@ -534,6 +534,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The bytes of an SSE-KMS object are readable only THROUGH the KMS key the write
+        // stored it under, so serving them performs `kms:Decrypt` on that key as this
+        // request's caller — the principal of the session the credential speaks for — and
+        // through this service's own path to it. A caller no authority in force reaches
+        // that action for is refused with KMS's own denial sentence on S3's `AccessDenied`
+        // channel ([`crate::state::sse_kms`] carries the rule), rather than being handed
+        // the plaintext. An object stored under any other encryption asks KMS nothing.
+        if let Some(denial) = crate::state::sse_kms::decrypt_refusal(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            crate::state::sse_kms::EncryptedObject {
+                bucket: &input.bucket,
+                key: &input.key,
+                encryption: &object.encryption,
+            },
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                denial,
+            ));
+        }
+
         // WHICH BYTES this read answers with, and what it reports about them.
         //
         // A `partNumber` "effectively performs a 'ranged' GET request for the part

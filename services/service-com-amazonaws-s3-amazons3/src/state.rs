@@ -46,6 +46,11 @@ pub mod request_ids;
 // the source version then reports — lives in `state/replication.rs`.
 pub mod replication;
 
+// Whether the KMS key an SSE-KMS object was stored under lets THIS caller have its
+// plaintext — the `kms:Decrypt` every read that serves such an object's bytes performs on
+// the caller's behalf — lives in `state/sse_kms.rs`.
+pub mod sse_kms;
+
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
 ///

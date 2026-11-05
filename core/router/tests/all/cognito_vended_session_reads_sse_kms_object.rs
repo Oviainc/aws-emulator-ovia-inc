@@ -252,14 +252,29 @@ fn pool_trust_policy(pool_id: &str) -> String {
     )
 }
 
-/// `iam:CreateRole` for the role the pool `pool_id` vends sessions of, answering its ARN.
+/// The identity policy the first suite's pool role carries, so a session of it may have the
+/// plaintext of the SSE-KMS objects those rows read: the objects' key carries its DEFAULT
+/// key policy, which delegates the decision to this account's own identity-based policies,
+/// and a read that serves an SSE-KMS object's bytes performs `kms:Decrypt` on that key as
+/// the session's principal. A pool role carrying NO such policy is refused that plaintext,
+/// which is what [`a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object`]
+/// drives below; what the rows are about is what a read the key DOES permit reports about
+/// the object's encryption.
+///
+/// Compact and carrying none of the characters that are significant in an
+/// `application/x-www-form-urlencoded` body, exactly like [`pool_trust_policy`].
+const POOL_ROLE_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+     \"Action\":\"kms:Decrypt\",\"Resource\":\"*\"}]}";
+
+/// `iam:CreateRole` for a role an identity pool vends sessions of, carrying `policy` as its
+/// inline policy when one is given, and answering its ARN.
 fn create_pool_role(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
-    pool_name: &str,
+    role_name: &str,
     pool_id: &str,
+    policy: Option<&str>,
 ) -> String {
-    let role_name = format!("{pool_name}-unauth");
     let created = dispatch(
         router,
         runtime,
@@ -280,6 +295,27 @@ fn create_pool_role(
         created.status,
         created.text()
     );
+    if let Some(policy) = policy {
+        let attached = dispatch(
+            router,
+            runtime,
+            as_setup("iam"),
+            "POST",
+            "/",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            bytes::Bytes::from(format!(
+                "Action=PutRolePolicy&Version=2010-05-08&RoleName={role_name}\
+                 &PolicyName=read-sse-kms-objects&PolicyDocument={policy}"
+            )),
+        );
+        assert_eq!(
+            attached.status,
+            200,
+            "setup: PutRolePolicy({role_name:?}) must succeed, got {} with {:?}",
+            attached.status,
+            attached.text()
+        );
+    }
     let body = created.text();
     let open = "<Arn>";
     let close = "</Arn>";
@@ -294,15 +330,8 @@ fn create_pool_role(
     body[start..end].to_string()
 }
 
-/// The access key id of a session vended to a fresh identity of a fresh identity pool,
-/// reached the way a client reaches it: `GetId` and `GetCredentialsForIdentity` sent with
-/// NO credential scope.
-///
-/// A vend is a session of the pool's role, so the pool is first given one: the role is
-/// created by `iam:CreateRole` and attached by `cognito-identity:SetIdentityPoolRoles`,
-/// both over the wire, so the trust policy the vend's assume is decided against is the
-/// document IAM's own handler stored.
-fn vended_access_key_id(
+/// `cognito-identity:CreateIdentityPool`, answering the pool's id.
+fn create_identity_pool(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     pool_name: &str,
@@ -321,21 +350,26 @@ fn vended_access_key_id(
         pool.status,
         pool.text()
     );
-    let pool_id = pool.json()["IdentityPoolId"]
+    pool.json()["IdentityPoolId"]
         .as_str()
         .expect("CreateIdentityPool reports an IdentityPoolId")
-        .to_string();
+        .to_string()
+}
 
-    let role_arn = create_pool_role(router, runtime, pool_name, &pool_id);
+/// `cognito-identity:SetIdentityPoolRoles` — which role the pool vends sessions of for each
+/// kind of identity.
+fn set_pool_roles(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    pool_id: &str,
+    roles: Value,
+) {
     let configured = rpc(
         router,
         runtime,
         as_setup("cognito-identity"),
         "AWSCognitoIdentityService.SetIdentityPoolRoles",
-        &json!({
-            "IdentityPoolId": &pool_id,
-            "Roles": { "unauthenticated": &role_arn },
-        }),
+        &json!({ "IdentityPoolId": pool_id, "Roles": roles }),
     );
     assert_eq!(
         configured.status,
@@ -344,7 +378,18 @@ fn vended_access_key_id(
         configured.status,
         configured.text()
     );
+}
 
+/// The access key id of a session vended to a fresh identity of `pool_id`, reached the way a
+/// client reaches it: `GetId` and `GetCredentialsForIdentity` sent with NO credential scope.
+///
+/// A vend with no `Logins` is an UNAUTHENTICATED exchange, so the session is one of the
+/// pool's unauthenticated (guest) role.
+fn vend_guest_session(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    pool_id: &str,
+) -> String {
     let identity = rpc(
         router,
         runtime,
@@ -400,6 +445,36 @@ fn vended_access_key_id(
         );
     }
     access_key_id
+}
+
+/// The access key id of a guest session of a fresh pool whose unauthenticated role carries
+/// `unauthenticated_policy`, with the ARN of that role.
+///
+/// A vend is a session of the pool's role, so the pool is first given one: the role is
+/// created by `iam:CreateRole` and attached by `cognito-identity:SetIdentityPoolRoles`,
+/// both over the wire, so the trust policy the vend's assume is decided against is the
+/// document IAM's own handler stored.
+fn vended_access_key_id(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    pool_name: &str,
+    unauthenticated_policy: Option<&str>,
+) -> (String, String) {
+    let pool_id = create_identity_pool(router, runtime, pool_name);
+    let role_arn = create_pool_role(
+        router,
+        runtime,
+        &format!("{pool_name}-unauth"),
+        &pool_id,
+        unauthenticated_policy,
+    );
+    set_pool_roles(
+        router,
+        runtime,
+        &pool_id,
+        json!({ "unauthenticated": &role_arn }),
+    );
+    (vend_guest_session(router, runtime, &pool_id), role_arn)
 }
 
 /// `s3:GetObject` signed with the session `access_key_id` names — the read the vended
@@ -541,7 +616,12 @@ fn a_vended_session_reads_the_encryption_each_object_was_stored_under() {
             let bucket = "vended-session-encryption";
             let (key_id, key_arn) = create_key(&router, &runtime);
             create_bucket(&router, &runtime, bucket);
-            let access_key_id = vended_access_key_id(&router, &runtime, "vended-session-pool");
+            let (access_key_id, _role_arn) = vended_access_key_id(
+                &router,
+                &runtime,
+                "vended-session-pool",
+                Some(POOL_ROLE_POLICY),
+            );
 
             for row in rows(&key_id, &key_arn) {
                 let payload = format!("bytes of {}", row.key).into_bytes();
@@ -661,4 +741,230 @@ fn a_vended_session_reads_the_encryption_each_object_was_stored_under() {
         .expect("spawn the vended-session read thread")
         .join()
         .expect("a vended session must read every object's stored encryption");
+}
+
+/// The text of the first `<name>…</name>` element of a restXml body — S3's error document
+/// carries its `<Code>` and `<Message>` there.
+fn element(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
+}
+
+/// `kms:CreateKey` carrying `policy` as the key's own key policy, answering `(key id, key
+/// ARN)`.
+///
+/// The document is the one UNDER TEST: it names the roles the case is about and need not
+/// leave the creating caller a path to a later `kms:PutKeyPolicy`, which KMS's policy-lockout
+/// safety check otherwise requires — so the key is created the way the KMS model provides
+/// for.
+fn create_key_with_policy(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    policy: &str,
+) -> (String, String) {
+    let created = rpc(
+        router,
+        runtime,
+        as_setup("kms"),
+        "TrentService.CreateKey",
+        &json!({
+            "Description": "the CMK whose policy decides the vended session's read",
+            "Policy": policy,
+            "BypassPolicyLockoutSafetyCheck": true,
+        }),
+    );
+    assert_eq!(
+        created.status,
+        200,
+        "setup: CreateKey must succeed, got {} with {:?}",
+        created.status,
+        created.text()
+    );
+    let metadata = created.json();
+    (
+        metadata["KeyMetadata"]["KeyId"]
+            .as_str()
+            .expect("CreateKey reports a KeyId")
+            .to_string(),
+        metadata["KeyMetadata"]["Arn"]
+            .as_str()
+            .expect("CreateKey reports the key ARN")
+            .to_string(),
+    )
+}
+
+/// A key policy document granting `kms:Decrypt` to each principal in `roles`, beside the
+/// statement every manageable key carries: the account's root user, which delegates every
+/// other decision to this account's own identity-based policies.
+fn key_policy(roles: &[&str]) -> String {
+    let account = engine::emulator_account_id();
+    let mut statements = vec![json!({
+        "Sid": "EnableIAMUserPermissions",
+        "Effect": "Allow",
+        "Principal": {"AWS": format!("arn:aws:iam::{account}:root")},
+        "Action": "kms:*",
+        "Resource": "*",
+    })];
+    for role in roles {
+        statements.push(json!({
+            "Effect": "Allow",
+            "Principal": {"AWS": role},
+            "Action": "kms:Decrypt",
+            "Resource": "*",
+        }));
+    }
+    json!({"Version": "2012-10-17", "Statement": statements}).to_string()
+}
+
+/// A Cognito-vended GUEST session reading an object encrypted under a CMK whose key policy
+/// grants `kms:Decrypt` to the pool's AUTHENTICATED role only.
+///
+/// RULE: a read that serves an SSE-KMS object's BYTES performs `kms:Decrypt` on the object's
+/// key as the principal the request's credential speaks for — for a vended session, the role
+/// it is a session of — so a key policy that reaches only another role refuses it with HTTP
+/// 403 `AccessDenied` and serves no bytes, and the very next read is served once the policy
+/// reaches the session's own role. Only a cross-service suite can pin this: the credential
+/// is minted by `cognito-identity:GetCredentialsForIdentity`, the session is recorded by STS,
+/// the roles and their policies by IAM, the key policy by KMS, and the read is S3's.
+///
+/// The S3 crate's `sse_kms_decrypt_authorization` suite tables the same rule over the
+/// authorities, callers, conditions and operations it generalises over; this is the one leg
+/// only the assembled router can drive.
+#[test]
+fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
+    std::thread::Builder::new()
+        .name("cognito-vended-sse-kms-denied".to_string())
+        .stack_size(BOOT_STACK_SIZE)
+        .spawn(|| {
+            let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+            let mut router = build_router(engine);
+            router.set_request_authentication(false);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime");
+
+            let bucket = "vended-session-key-policy";
+            let key = "private/ledger.csv";
+            let payload = b"the bytes the key policy protects";
+            create_bucket(&router, &runtime, bucket);
+
+            // The pool and its two roles. The guest session below is a session of the
+            // unauthenticated one, which carries no identity policy of its own.
+            let pool_name = "vended-session-denied-pool";
+            let pool_id = create_identity_pool(&router, &runtime, pool_name);
+            let guest_role = create_pool_role(
+                &router,
+                &runtime,
+                &format!("{pool_name}-unauth"),
+                &pool_id,
+                None,
+            );
+            let authenticated = create_pool_role(
+                &router,
+                &runtime,
+                &format!("{pool_name}-auth"),
+                &pool_id,
+                None,
+            );
+            set_pool_roles(
+                &router,
+                &runtime,
+                &pool_id,
+                json!({
+                    "unauthenticated": &guest_role,
+                    "authenticated": &authenticated,
+                }),
+            );
+            // The key grants the decrypt to the AUTHENTICATED role alone.
+            let (key_id, _key_arn) =
+                create_key_with_policy(&router, &runtime, &key_policy(&[&authenticated]));
+            let guest_key_id = vend_guest_session(&router, &runtime, &pool_id);
+
+            let written = dispatch(
+                &router,
+                &runtime,
+                as_setup("s3"),
+                "PUT",
+                &format!("/{bucket}/{key}"),
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    ("x-amz-server-side-encryption-aws-kms-key-id", &key_id),
+                ],
+                bytes::Bytes::from(payload.to_vec()),
+            );
+            assert_eq!(
+                written.status,
+                200,
+                "setup: the SSE-KMS write must succeed, got {} with {:?}",
+                written.status,
+                written.text()
+            );
+
+            let refused = vended_get_object(&router, &runtime, &guest_key_id, bucket, key);
+            assert_eq!(
+                refused.status,
+                403,
+                "the guest session's read must be refused with HTTP 403, got {} with {:?}",
+                refused.status,
+                refused.text()
+            );
+            assert_eq!(
+                element(&refused.text(), "Code").as_deref(),
+                Some("AccessDenied"),
+                "the refusal must carry S3's AccessDenied code, got {:?}",
+                refused.text()
+            );
+            assert!(
+                !refused
+                    .body
+                    .as_ref()
+                    .windows(payload.len())
+                    .any(|at| at == payload),
+                "a refused read must carry none of the object's bytes, got {:?}",
+                refused.text()
+            );
+
+            // The one call that changes the decision: the key policy now reaches the role
+            // the guest session is a session of, and the very next read is served.
+            let granted = rpc(
+                &router,
+                &runtime,
+                as_setup("kms"),
+                "TrentService.PutKeyPolicy",
+                &json!({
+                    "KeyId": &key_id,
+                    "Policy": key_policy(&[&authenticated, &guest_role]),
+                    "BypassPolicyLockoutSafetyCheck": true,
+                }),
+            );
+            assert_eq!(
+                granted.status,
+                200,
+                "setup: PutKeyPolicy must succeed, got {} with {:?}",
+                granted.status,
+                granted.text()
+            );
+
+            let served = vended_get_object(&router, &runtime, &guest_key_id, bucket, key);
+            assert_eq!(
+                served.status,
+                200,
+                "the read must be served once the key policy reaches the session's role, got \
+                 {} with {:?}",
+                served.status,
+                served.text()
+            );
+            assert_eq!(
+                served.body.as_ref(),
+                payload.as_slice(),
+                "the served read must answer the stored bytes, got {:?}",
+                served.text()
+            );
+        })
+        .expect("spawn the vended-session refusal thread")
+        .join()
+        .expect("a vended session the key policy does not reach must be refused the plaintext");
 }

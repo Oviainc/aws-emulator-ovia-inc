@@ -836,6 +836,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             return Err(crate::scaffolded::Scaffolded::precondition_failed(unmet));
         }
 
+        // A copy READS the source object's bytes, so an SSE-KMS source is read through the
+        // KMS key it was stored under: "if the source object for the copy is stored using
+        // SSE-KMS … the requester must have permission to the kms:Decrypt action"
+        // (`UploadPartCopy`'s own documentation of the same copy read). The decision is the
+        // one every read of such an object's bytes is made with
+        // ([`crate::state::sse_kms`]), about the SOURCE object, and a caller it refuses is
+        // answered S3's `AccessDenied` carrying KMS's sentence instead of the copy.
+        if let Some(denial) = crate::state::sse_kms::decrypt_refusal(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            crate::state::sse_kms::EncryptedObject {
+                bucket: &source.bucket,
+                key: &source.key,
+                encryption: &source_object.encryption,
+            },
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                denial,
+            ));
+        }
+
         // S3 refuses a copy of an object onto ITSELF that would change nothing about it:
         // the request names no new metadata, no new tag set, no storage class, no website
         // redirect location and no encryption, so the write would replace the object with

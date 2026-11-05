@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Whether the KMS key an object was stored under lets THIS caller have its plaintext.
+//!
+//! An object stored with server-side encryption using a customer-managed KMS key
+//! ([`super::KMS_SSE_ALGORITHMS`], the two `ServerSideEncryption` values a KMS key id
+//! belongs to) is readable only THROUGH that key — its plaintext comes of opening the
+//! object's data key — so every read that serves such an object's BYTES performs
+//! `kms:Decrypt` on that key, as the caller and through S3's own service path. "If the
+//! object is encrypted with SSE-KMS, you must also have the
+//! kms:GenerateDataKey and kms:Decrypt permissions in IAM identity-based policies and KMS
+//! key policies for the KMS key" (`HeadObject`'s own documentation of the permissions an
+//! SSE-KMS object's read needs). A caller no authority in force reaches that action for is
+//! refused — S3 surfaces KMS's denial rather than the body — and the refusal is S3's own
+//! `AccessDenied` (HTTP 403) carrying the sentence KMS worded for it.
+//!
+//! WHO the caller is comes from the credential the request presents, which for a session
+//! another service vended (a role session an identity pool hands out, one `sts:AssumeRole`
+//! minted) is the principal of that session rather than the account: the decision is made
+//! against the role the session is of, so a key policy that grants `kms:Decrypt` to one
+//! role admits that role's sessions and leaves every other session to the policy's other
+//! statements.
+//!
+//! Both halves are the KMS service's OWN ([`kms_store::authorization`]), made against the
+//! key policy, caller identity policies and grants that KMS's and IAM's handlers wrote, so
+//! this service and KMS cannot disagree about a key and the refusal a caller sees is the
+//! sentence KMS itself words for it. This module reaches no state of THIS service, so a
+//! handler asks it while still holding its own store guard — the object whose bytes are
+//! about to be served is the one the guard is held for, and the stores this reads (KMS's,
+//! and through it STS's and IAM's) belong to services that do not read this one's, so no
+//! call here can come back round to the guard a caller holds.
+//!
+//! What is NOT decided here: a read that serves no bytes. "A HEAD request has the same
+//! options as a GET operation on an object" (`HeadObject`'s own documentation) except that
+//! it answers no body at all, and the metadata it reports is S3's own record of the object
+//! rather than anything the key has to open — which is also the recorded behaviour of the
+//! real service, where a HEAD of an object keeps reporting its size and its key id while
+//! the key itself can no longer open it.
+
+use std::collections::HashMap;
+
+use ::service_com_amazonaws_kms_trentservice::state as kms_store;
+
+/// The KMS operation a read that serves an SSE-KMS object's bytes performs on its key.
+const DECRYPT_OPERATION: &str = "Decrypt";
+
+/// This service's endpoint prefix, the first label of its regional endpoint
+/// (`smithy_query(query="service_info")` reports `endpointPrefix: "s3"`) — which is what
+/// [`via_service`] names.
+const ENDPOINT_PREFIX: &str = "s3";
+
+/// The encryption-context entry S3 binds an SSE-KMS object's data key to: the Amazon
+/// Resource Name of what is being encrypted, under this entry name.
+///
+/// Amazon S3 User Guide, *Using server-side encryption with KMS keys*, "Encryption
+/// context": S3 "uses the object or bucket Amazon Resource Name (ARN) as the encryption
+/// context pair", `aws:s3:arn` naming it — the bucket's ARN for an object using an S3
+/// Bucket Key, and the object's own otherwise.
+const ARN_CONTEXT_KEY: &str = "aws:s3:arn";
+
+/// One stored object a read is about to serve the bytes of: where it lives, and the
+/// encryption configuration the write that stored it settled on.
+#[derive(Debug, Clone, Copy)]
+pub struct EncryptedObject<'a> {
+    /// The bucket holding the object — for a copy, the SOURCE bucket, since the key that
+    /// has to open the bytes is the source object's.
+    pub bucket: &'a str,
+    /// The object's key.
+    pub key: &'a str,
+    /// What [`super::Object::encryption`] records for it.
+    pub encryption: &'a super::ObjectEncryption,
+}
+
+/// Why KMS refuses to open `object` for the principal this request speaks for, or `None`
+/// when the read may be served. Served: an object that is not SSE-KMS at all; one under a
+/// key AWS MANAGES, whose policy AWS manages for the service that owns it, so a caller
+/// needs no grant of its own on it — which is also what an SSE-KMS write naming no key id
+/// is stored under, the Amazon Web Services managed key for Amazon S3; and one whose key
+/// does permit the caller the decrypt.
+///
+/// Refused: a caller no authority on the key reaches `kms:Decrypt` for, and an identifier
+/// whose account segment is not an account id, which KMS refuses for want of permission
+/// BEFORE the resource it names is looked up — so no key is resolved for it and nothing can
+/// open the object's bytes for this caller.
+///
+/// A well-formed identifier this endpoint holds no key for is left to be served: WHICH key
+/// a write may name at all, and what a read answers when that key is gone, is the subject of
+/// the object-write path rather than of this decision.
+///
+/// `region` is the Region the request was signed for, which is where the object's key is
+/// resolved: an object and the key it is encrypted under live at the same endpoint.
+///
+/// An engine carrying no KMS service holds no key to ask and no policy to read, so nothing
+/// is refused on evidence that is not there.
+pub fn decrypt_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    object: EncryptedObject<'_>,
+) -> Option<String> {
+    if !object.encryption.uses_kms() {
+        return None;
+    }
+    let key_id = object.encryption.kms_key_id.as_deref()?;
+    let kms = kms_store::service_state(engine)?;
+    // The caller is resolved before the KMS store is locked, because resolving it reads
+    // the STS and IAM stores.
+    let caller = kms_store::authorization::caller(engine, ctx);
+    let store = kms.lock();
+    let key = match store.resolve(region, key_id) {
+        kms_store::KeyRef::Found(key) => key,
+        // An identifier whose account segment is not an account id is refused for want of
+        // permission before any key is looked up, with KMS's own sentence for it, so the
+        // object's bytes cannot be opened under it at all.
+        kms_store::KeyRef::UnauthorizedAccount => {
+            return Some(kms_store::unauthorized_account_message(DECRYPT_OPERATION))
+        }
+        kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => return None,
+    };
+    if key.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
+        return None;
+    }
+    kms_store::authorization::authorize_use(
+        &caller,
+        &store,
+        region,
+        key,
+        kms_store::authorization::RequestedUse::through_service(
+            DECRYPT_OPERATION,
+            &via_service(region),
+        ),
+        Some(&encryption_context(&object)),
+        None,
+    )
+    .err()
+}
+
+/// The encryption context the data key of `object` is bound to, which is what a key policy
+/// statement scoped to one bucket or one object is decided against.
+///
+/// [`ARN_CONTEXT_KEY`] names the resource being encrypted, and the pairs the write supplied
+/// in `x-amz-server-side-encryption-context` come beside it: that header carries "the
+/// Amazon Web Services KMS Encryption Context as an additional encryption context to use
+/// for object encryption" (`PutObjectRequest$SSEKMSEncryptionContext`), so what a read
+/// decrypts under is the one entry S3 always binds plus whatever the write added.
+fn encryption_context(object: &EncryptedObject<'_>) -> HashMap<String, String> {
+    let encrypted = match object.encryption.bucket_key_enabled {
+        // "Setting this header to true causes Amazon S3 to use an S3 Bucket Key"
+        // (`PutObjectRequest$BucketKeyEnabled`), and a bucket-level key is bound to the
+        // bucket rather than to each object under it.
+        Some(true) => super::bucket_arn(object.bucket),
+        _ => super::object_arn(object.bucket, object.key),
+    };
+    let mut context = HashMap::from([(ARN_CONTEXT_KEY.to_string(), encrypted)]);
+    context.extend(supplied_context(
+        object.encryption.kms_encryption_context.as_deref(),
+    ));
+    context
+}
+
+/// The pairs an object's stored `SSEKMSEncryptionContext` names: "a Base64-encoded string
+/// holding a UTF-8 encoded JSON of additional encryption context key-value pairs"
+/// (`PutObjectRequest$SSEKMSEncryptionContext`), decoded.
+///
+/// A value that is not that — the member is stored verbatim as the write sent it — adds no
+/// pair, so a read is decided under the entry S3 itself binds and nothing invented.
+fn supplied_context(header: Option<&str>) -> Vec<(String, String)> {
+    let Some(decoded) = header.and_then(|value| ::aws_smithy_types::base64::decode(value).ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(::serde_json::Value::Object(pairs)) =
+        ::serde_json::from_slice::<::serde_json::Value>(&decoded)
+    else {
+        return Vec::new();
+    };
+    pairs
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value.as_str()?.to_string())))
+        .collect()
+}
+
+/// The value of the `kms:ViaService` condition key for a cryptographic operation this
+/// service performs on a caller's behalf: this service's regional endpoint name, which is
+/// what a key policy confining a key to S3's use of it names.
+fn via_service(region: &str) -> String {
+    format!("{ENDPOINT_PREFIX}.{region}.amazonaws.com")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One row of [`the_encryption_context_names_what_was_encrypted`]: the case, whether an
+    /// S3 Bucket Key is in force, the context the write supplied, the ARN the entry must
+    /// name, and how many entries the context must hold.
+    type ContextRow = (&'static str, Option<bool>, Option<String>, &'static str, usize);
+
+    /// The context an object's record is decrypted under: the rows differ along whether an
+    /// S3 Bucket Key binds it to the bucket, and along what the write supplied beside it
+    /// (nothing, one pair, several, and a value that is not an encoded JSON object).
+    #[test]
+    fn the_encryption_context_names_what_was_encrypted() {
+        let pairs = ::aws_smithy_types::base64::encode(br#"{"tenant":"payments","zone":"a"}"#);
+        let one = ::aws_smithy_types::base64::encode(br#"{"tenant":"payments"}"#);
+        let rows: [ContextRow; 5] = [
+            (
+                "an object key, no supplied context",
+                None,
+                None,
+                "arn:aws:s3:::ledger/reports/held.csv",
+                1,
+            ),
+            (
+                "an S3 Bucket Key binds the bucket",
+                Some(true),
+                None,
+                "arn:aws:s3:::ledger",
+                1,
+            ),
+            (
+                "an S3 Bucket Key switched off binds the object",
+                Some(false),
+                None,
+                "arn:aws:s3:::ledger/reports/held.csv",
+                1,
+            ),
+            (
+                "one supplied pair beside the object entry",
+                None,
+                Some(one),
+                "arn:aws:s3:::ledger/reports/held.csv",
+                2,
+            ),
+            (
+                "several supplied pairs",
+                None,
+                Some(pairs),
+                "arn:aws:s3:::ledger/reports/held.csv",
+                3,
+            ),
+        ];
+        for (case, bucket_key_enabled, supplied, arn, entries) in rows {
+            let encryption = super::super::ObjectEncryption {
+                sse_algorithm: Some(super::super::KMS_SSE_ALGORITHMS[0].to_string()),
+                kms_key_id: Some("alias/ledger".to_string()),
+                kms_encryption_context: supplied,
+                bucket_key_enabled,
+            };
+            let context = encryption_context(&EncryptedObject {
+                bucket: "ledger",
+                key: "reports/held.csv",
+                encryption: &encryption,
+            });
+            assert_eq!(
+                context.get(ARN_CONTEXT_KEY).map(String::as_str),
+                Some(arn),
+                "case {case:?}: expected {arn:?}, got {context:?}"
+            );
+            assert_eq!(
+                context.len(),
+                entries,
+                "case {case:?}: expected {entries} entries, got {context:?}"
+            );
+        }
+    }
+
+    /// A stored context that is not an encoded JSON object of strings adds no pair rather
+    /// than inventing one: the rows differ along how the value fails to be one.
+    #[test]
+    fn a_stored_context_that_is_not_encoded_pairs_adds_nothing() {
+        let rows: [(&str, Option<String>); 5] = [
+            ("no header at all", None),
+            ("not base64", Some("not base64 at all".to_string())),
+            (
+                "base64 of something that is not JSON",
+                Some(::aws_smithy_types::base64::encode(b"tenant=payments")),
+            ),
+            (
+                "base64 of a JSON array",
+                Some(::aws_smithy_types::base64::encode(br#"["tenant"]"#)),
+            ),
+            (
+                "base64 of a JSON object whose value is not a string",
+                Some(::aws_smithy_types::base64::encode(br#"{"tenant":7}"#)),
+            ),
+        ];
+        for (case, header) in rows {
+            let supplied = supplied_context(header.as_deref());
+            assert!(
+                supplied.is_empty(),
+                "case {case:?}: expected no pair, got {supplied:?}"
+            );
+        }
+    }
+}

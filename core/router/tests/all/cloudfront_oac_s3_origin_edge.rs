@@ -173,12 +173,19 @@ fn origin_domain(bucket: &str) -> String {
     format!("{bucket}.s3.{REGION}.amazonaws.com")
 }
 
+/// The PATH-STYLE endpoint of this Region, which carries no bucket in its host: the address
+/// a call that names its bucket in the PATH has to use, since a virtual-hosted host names the
+/// bucket itself and leaves the path to be the key (the core's `VirtualHostAddressing`).
+fn regional_endpoint() -> String {
+    format!("s3.{REGION}.amazonaws.com")
+}
+
 /// `s3:CreateBucket`.
 async fn create_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
     let created = call(
         router,
         "s3",
-        &origin_domain(bucket),
+        &regional_endpoint(),
         "PUT",
         &format!("/{bucket}"),
         &[],
@@ -206,7 +213,7 @@ async fn put_object(
     let written = call(
         router,
         "s3",
-        &origin_domain(bucket),
+        &regional_endpoint(),
         "PUT",
         &format!("/{bucket}/{key}"),
         encryption,
@@ -227,7 +234,7 @@ async fn put_bucket_policy(router: &MultiServiceRouter, case: &str, bucket: &str
     let stored = call(
         router,
         "s3",
-        &origin_domain(bucket),
+        &regional_endpoint(),
         "PUT",
         &format!("/{bucket}?policy"),
         &[("content-type", "application/json")],
@@ -405,11 +412,12 @@ struct Row {
     expected: Expected,
 }
 
-/// The CMK an SSE-KMS object names. The key is not created here, and no read in this emulator
-/// consults a key policy (S3 never asks KMS), so what an SSE-KMS row pins is the EDGE's half
-/// alone: the object's own bytes are served through the distribution, exactly as for an
-/// SSE-S3 object. The algorithm and key id a write recorded are members the S3 crate's own
-/// suites pin.
+/// The CMK an SSE-KMS object names. The key is not created in KMS here — the ARN names no
+/// key this endpoint holds, so no key policy decides these reads — and what an SSE-KMS row
+/// pins is the EDGE's half alone: the object's own bytes are served through the
+/// distribution, exactly as for an SSE-S3 object. The algorithm and key id a write recorded
+/// are members the S3 crate's own suites pin, and which callers a key that DOES exist lets
+/// read its objects is that crate's `sse_kms_decrypt_authorization` suite.
 fn kms_key_arn() -> String {
     format!("arn:aws:kms:{REGION}:{ACCOUNT_ID}:key/0d8a1e3f-1111-4a1b-9c2d-5e6f70819203")
 }

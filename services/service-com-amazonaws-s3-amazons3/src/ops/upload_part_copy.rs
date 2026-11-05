@@ -498,6 +498,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::precondition_failed(unmet));
         }
 
+        // A part copy READS the source object's bytes, so an SSE-KMS source is read through
+        // the KMS key it was stored under: "if the source object is encrypted with
+        // server-side encryption using a Key Management Service key, the requester must
+        // have permission to the kms:Decrypt … action" (this operation's own
+        // documentation). The decision is the one every read of such an object's bytes is
+        // made with ([`crate::state::sse_kms`]), about the SOURCE object.
+        if let Some(denial) = crate::state::sse_kms::decrypt_refusal(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            crate::state::sse_kms::EncryptedObject {
+                bucket: &source.bucket,
+                key: &source.key,
+                encryption: &source_object.encryption,
+            },
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                denial,
+            ));
+        }
+
         // WHICH of the source's bytes this part is: "the range of bytes to copy from the
         // source object. The range value must use the form bytes=first-last, where the first
         // and last are the zero-based byte offsets to copy"

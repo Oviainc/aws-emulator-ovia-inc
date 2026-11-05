@@ -11,6 +11,11 @@ engine = { workspace = true }
 # The shared ARN parse: a notification destination's stored ARN is read for the Region it
 # names and the queue it addresses through the one parse every service reads an ARN with.
 service-common = { path = "../common" }
+# The KMS store holds the key an SSE-KMS object was encrypted under, its key policy and
+# the authorization decision over it: a read that serves such an object's bytes asks that
+# service's own `kms:Decrypt` gate rather than keeping a second copy of either
+# (`state::sse_kms`).
+service-com-amazonaws-kms-trentservice = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -79,6 +84,11 @@ emulator-core-build-support = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# The SSE-KMS read suite makes the principals its key policies name through IAM's and STS's
+# own operations (`CreateRole` + `PutRolePolicy` + `AssumeRole`), so the role sessions and
+# the documents the decision reads are the ones those services wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true
