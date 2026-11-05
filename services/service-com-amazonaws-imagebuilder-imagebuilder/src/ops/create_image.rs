@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Queues one build of a stored image recipe and files the image build version it
+//! creates.
 //!
 //! ## Shape of an operation
 //!
@@ -156,12 +149,19 @@ use super::types::*;
 // `CreateImageError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuilder.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateImageError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#CreateImage")]
+// The operation's MODELED errors, plus the one this SERVICE models for a reference that
+// names nothing. Every resource this create references — the infrastructure
+// configuration, the recipe, a distribution configuration, a workflow — may name nothing
+// stored, and `com.amazonaws.imagebuilder#ResourceNotFoundException` (HTTP 404, "At least
+// one of the resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`) is the shape this service models for exactly that case, which
+// this operation's own `errors` list omits. So a reference that resolves to nothing is
+// reported MISSING rather than dressed up as an invalid request, which is a different
+// claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#CreateImage",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateImageErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -170,6 +170,7 @@ pub enum CreateImageErrorModeled {
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -226,18 +227,252 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImage"))
+        // Every modelled constraint on this input — the ARN patterns, the token length,
+        // the tag-map bounds — has been refused by the centralized walk before this body
+        // runs, so what is checked here is only what the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateImageErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // Exactly one recipe is what a create names, which the model cannot say.
+        let named_recipe = named_recipe(&input)?;
+
+        // "If you specify workflows, they replace the default workflows that Image Builder
+        // otherwise runs for the build, and you must also provide an executionRole."
+        if input.workflows.is_some() && input.execution_role.is_none() {
+            return Err(CreateImageErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::workflows_without_execution_role_message()),
+                },
+            )
+            .into());
+        }
+
+        let fingerprint = crate::state::create_image_request_fingerprint(&input);
+
+        // The idempotency check, the reference resolution, the build-number assignment and
+        // the filing of the new build version happen under ONE lock, so two builds of one
+        // recipe are serialized and each gets a build number of its own.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — so a retry names the
+        // build version the first call created, and no second build is queued.
+        if let Some(receipt) = store.create_receipt(
+            crate::state::CREATE_IMAGE_OPERATION,
+            &region,
+            &input.client_token,
+        ) {
+            if receipt.fingerprint != fingerprint {
+                return Err(CreateImageErrorModeled::IdempotentParameterMismatchException(
+                    IdempotentParameterMismatchException {
+                        message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                    },
+                )
+                .into());
+            }
+            return Ok(answer(
+                receipt.request_id.clone(),
+                receipt.client_token.clone(),
+                receipt.arn.clone(),
+            ));
+        }
+
+        // Every resource the build references has to BE a stored resource of this Region,
+        // so a reference naming nothing is reported MISSING rather than built from.
+        if store
+            .infrastructure_configuration(&input.infrastructure_configuration_arn, &region)
+            .is_none()
+        {
+            return Err(missing(&input.infrastructure_configuration_arn));
+        }
+
+        // The image a build produces takes its name and its three assigned version nodes
+        // from the recipe it builds, and the reference is resolved AT THE START, so a
+        // wildcard version builds the newest recipe that reference reaches now.
+        let (name, version, platform, image_recipe_arn) = match named_recipe {
+            NamedRecipe::Image(reference) => match store.resolve_image_recipe(reference, &region) {
+                Some(recipe) => (
+                    recipe.name.clone(),
+                    recipe.version.clone(),
+                    Some(recipe.platform.clone()),
+                    Some(recipe.arn.clone()),
+                ),
+                None => return Err(missing(reference)),
+            },
+            // A CONTAINER recipe is a resource this store does not hold at all, so such a
+            // reference names nothing — the answer any reference to a resource that was
+            // never created gets.
+            NamedRecipe::Container(reference) => return Err(missing(reference)),
+        };
+
+        // A distribution configuration and a workflow are resources of this service too,
+        // and this store holds neither yet, so a reference to one names nothing.
+        if let Some(reference) = &input.distribution_configuration_arn {
+            return Err(missing(reference));
+        }
+        if let Some(configuration) = input.workflows.iter().flatten().next() {
+            return Err(missing(&configuration.workflow_arn));
+        }
+
+        // The store is finite: a build that would take it past this emulator's own cap is
+        // refused rather than growing it, and nothing is queued.
+        if store.image_store_is_full() {
+            return Err(store_full());
+        }
+
+        // "Image Builder automatically assigns the build number to the fourth node", so
+        // each build of one name+version pair counts up from the greatest build stored —
+        // whether a pipeline execution or this operation queued it.
+        let build_version = store.next_image_build_version(
+            &region,
+            &crate::state::normalized_name(&name),
+            &version,
+        );
+        let arn = crate::state::image_build_version_arn(&region, &name, &version, build_version);
+
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+        let queued_at = ::std::time::SystemTime::now();
+
+        // "The response returns as soon as Image Builder creates the new image resource.
+        // The image build process runs asynchronously", so the record is filed now,
+        // carrying the instant its build is due to finish — which is what a later read of
+        // its status is answered from, with nothing to poll.
+        let filed = store.file_image_build(
+            crate::state::CREATE_IMAGE_OPERATION,
+            crate::state::ImageBuildVersionRecord {
+                arn: arn.clone(),
+                region,
+                name,
+                version,
+                build_version,
+                // The modelled `sourcePipelineArn` "is only present for images that a
+                // pipeline execution created", and this build is one a caller asked for
+                // directly.
+                source_pipeline_arn: None,
+                image_recipe_arn,
+                infrastructure_configuration_arn: Some(
+                    input.infrastructure_configuration_arn.clone(),
+                ),
+                // "Specifies whether to collect additional information about the image
+                // being created ... Defaults to true."
+                enhanced_image_metadata_enabled: input
+                    .enhanced_image_metadata_enabled
+                    .unwrap_or(crate::state::DEFAULT_ENHANCED_IMAGE_METADATA_ENABLED),
+                // "Image tests are enabled by default", and of the timeout: "If you don't
+                // specify a value, Image Builder stores and returns 720" — so what is
+                // stored is that configuration with both defaults filled in.
+                image_tests_configuration: ImageTestsConfiguration {
+                    image_tests_enabled: Some(
+                        input
+                            .image_tests_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.image_tests_enabled)
+                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
+                    ),
+                    timeout_minutes: Some(
+                        input
+                            .image_tests_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.timeout_minutes)
+                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES),
+                    ),
+                },
+                execution_role: input.execution_role,
+                logging_configuration: input.logging_configuration,
+                platform,
+                // "For an image recipe, this is always AMI": the kind of recipe a build
+                // builds decides what kind of image it produces, and a build reaching here
+                // built an image recipe.
+                image_type: Some(crate::state::IMAGE_TYPE_AMI.to_string()),
+                // "USER_INITIATED" is the build type of a build request a caller made by
+                // hand, which is exactly what this operation serves.
+                build_type: Some(crate::state::BUILD_TYPE_USER_INITIATED.to_string()),
+                date_created: crate::state::iso8601(queued_at),
+                available_at: queued_at.checked_add(crate::state::IMAGE_BUILD_SPAN),
+                // "The tags of the image": the image carries exactly what this request
+                // named.
+                tags: input.tags.map(crate::state::into_ordered_tags),
+                // "The packages that are associated with an image build version, as
+                // determined by Amazon Web Services Systems Manager Inventory at build
+                // time": the build was only just queued, so nothing has been inventoried
+                // on a build instance yet.
+                packages: ::std::collections::BTreeMap::new(),
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+        if !filed {
+            return Err(store_full());
+        }
+
+        Ok(answer(request_id, client_token, arn))
     }
+}
+
+/// The answer a queued build is reported by, which a retry of its request repeats
+/// verbatim.
+///
+/// `latestVersionReferences` is "a set of wildcard version ARNs that always reference the
+/// latest version of the resource", so it is derived from the build version's own ARN
+/// ([`crate::state::latest_version_references`]) rather than held anywhere.
+fn answer(request_id: String, client_token: String, arn: String) -> CreateImageOutput {
+    CreateImageOutput {
+        latest_version_references: crate::state::latest_version_references(
+            &arn,
+            crate::state::IMAGE_ARN_PREFIX,
+        ),
+        request_id: Some(request_id),
+        client_token: Some(client_token),
+        image_build_version_arn: Some(arn),
+    }
+}
+
+/// The ONE recipe a create names, of the two kinds a recipe may be.
+enum NamedRecipe<'a> {
+    /// An image recipe, which an image build distributes an AMI from.
+    Image(&'a str),
+    /// A container recipe, which an image build pushes a container image from.
+    Container(&'a str),
+}
+
+/// The one recipe `input` names, or the refusal a request naming neither or both earns.
+///
+/// "You must specify exactly one recipe for your image, using either a containerRecipeArn
+/// or an imageRecipeArn", which each of the two members repeats as "You must specify either
+/// this property or … but not both" — and the model can say neither that one of them is
+/// required nor that they exclude each other.
+fn named_recipe(input: &CreateImageInput) -> Result<NamedRecipe<'_>, CreateImageError> {
+    match (&input.image_recipe_arn, &input.container_recipe_arn) {
+        (Some(reference), None) => Ok(NamedRecipe::Image(reference)),
+        (None, Some(reference)) => Ok(NamedRecipe::Container(reference)),
+        _ => Err(
+            CreateImageErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::exactly_one_recipe_message()),
+            })
+            .into(),
+        ),
+    }
+}
+
+/// The refusal a request naming no resource of the calling Region is answered with.
+fn missing(reference: &str) -> CreateImageError {
+    CreateImageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(reference)),
+    })
+    .into()
+}
+
+/// The refusal a build this emulator will not keep another record for is answered with.
+fn store_full() -> CreateImageError {
+    CreateImageErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(crate::state::image_store_full_message()),
+    })
+    .into()
 }

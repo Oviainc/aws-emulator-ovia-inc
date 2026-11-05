@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.image_recipe_arn.is_some() == input.container_recipe_arn.is_some() {
             return Err(CreateImagePipelineErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(crate::state::pipeline_recipe_message()),
+                    message: Some(crate::state::exactly_one_recipe_message()),
                 },
             )
             .into());

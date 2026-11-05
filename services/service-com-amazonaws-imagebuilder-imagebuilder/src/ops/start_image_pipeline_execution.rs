@@ -234,6 +234,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| pipeline.container_recipe_arn.clone());
         let pipeline_builds_a_container = pipeline.image_recipe_arn.is_none();
+        // The build the pipeline queues is configured by the pipeline: the environment it
+        // runs in, whether it collects the additional image metadata, the tests it runs,
+        // the role its workflow actions run under, and the log group its image build logs
+        // go to — which for a pipeline is its `imageLogGroupName`, "the Amazon CloudWatch
+        // log group where Image Builder sends the image build logs". Read here, while the
+        // pipeline is borrowed, so the record filed below carries what the pipeline said.
+        let infrastructure_configuration_arn =
+            Some(pipeline.infrastructure_configuration_arn.clone());
+        let enhanced_image_metadata_enabled = pipeline.enhanced_image_metadata_enabled;
+        let image_tests_configuration = pipeline.image_tests_configuration.clone();
+        let execution_role = pipeline.execution_role.clone();
+        let logging_configuration = pipeline
+            .logging_configuration
+            .as_ref()
+            .and_then(|logging| logging.image_log_group_name.clone())
+            .map(|log_group_name| ImageLoggingConfiguration {
+                log_group_name: Some(log_group_name),
+            });
         // A stored pipeline always names exactly one recipe, which is what its create
         // enforced; a record naming neither has nothing for a run to build, so the
         // pipeline the request named is what it has no buildable resource under.
@@ -243,6 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let (name, version) = (recipe.name.clone(), recipe.version.clone());
         let platform = Some(recipe.platform.clone());
+        // The reference is resolved AT THE START, so the build records the recipe version
+        // it actually built rather than the wildcard reference the pipeline holds.
+        let image_recipe_arn = Some(recipe.arn.clone());
         // "For an image recipe, this is always AMI": which kind of recipe the pipeline
         // builds decides what its images are.
         let image_type = if pipeline_builds_a_container {
@@ -281,7 +302,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and queues the build", so the record is filed now, carrying the instant its
         // build is due to finish — which is what a later read of its status is answered
         // from, with nothing to poll.
-        let filed = store.start_pipeline_run(
+        let filed = store.file_image_build(
+            crate::state::START_IMAGE_PIPELINE_EXECUTION_OPERATION,
             crate::state::ImageBuildVersionRecord {
                 arn: arn.clone(),
                 region,
@@ -289,6 +311,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 version,
                 build_version,
                 source_pipeline_arn: Some(input.image_pipeline_arn),
+                image_recipe_arn,
+                infrastructure_configuration_arn,
+                enhanced_image_metadata_enabled,
+                image_tests_configuration,
+                execution_role,
+                logging_configuration,
                 platform,
                 image_type: Some(image_type.to_string()),
                 // "USER_INITIATED" is the build type of a manual pipeline build request,

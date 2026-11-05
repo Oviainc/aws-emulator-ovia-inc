@@ -83,9 +83,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdditionalInstanceConfiguration, Component, ComponentConfiguration, ComponentParameterDetail,
-    ComponentState, ComponentVersion, CreateComponentInput, CreateImagePipelineInput,
-    CreateImageRecipeInput,
-    CreateInfrastructureConfigurationInput, Filter, ImagePipeline, ImageRecipe, ImageRecipeSummary,
+    ComponentState, ComponentVersion, CreateComponentInput, CreateImageInput,
+    CreateImagePipelineInput, CreateImageRecipeInput,
+    CreateInfrastructureConfigurationInput, Filter, ImageLoggingConfiguration, ImagePipeline,
+    ImageRecipe, ImageRecipeSummary,
     ImageScanningConfiguration, ImageState, ImageSummary, ImageTestsConfiguration,
     InfrastructureConfiguration, InstanceBlockDeviceMapping, InstanceMetadataOptions,
     LatestVersionReferences, Logging, ParentInstanceConfiguration, PipelineLoggingConfiguration,
@@ -144,6 +145,11 @@ pub const CREATE_IMAGE_PIPELINE_OPERATION: &str = "CreateImagePipeline";
 /// `clientToken` of its own and mints an image build version, so its receipts are filed
 /// under its own name like any other create's.
 pub const START_IMAGE_PIPELINE_EXECUTION_OPERATION: &str = "StartImagePipelineExecution";
+
+/// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`]. An image build a caller asks
+/// for by hand carries a `clientToken` of its own, so its receipts are filed under its
+/// own name and never read a pipeline execution's.
+pub const CREATE_IMAGE_OPERATION: &str = "CreateImage";
 
 /// The listing a page token belongs to, so a token issued by one list operation cannot
 /// be spent on another ([`encode_page_token`]).
@@ -817,6 +823,29 @@ pub struct ImageBuildVersionRecord {
     /// modelled `sourcePipelineArn` is "only present for images that a pipeline execution
     /// created".
     pub source_pipeline_arn: Option<String>,
+    /// The image recipe this build version was built from, as the reference the build
+    /// resolved to at the instant it started: "this is the image recipe that Image
+    /// Builder used to create the image" (the modelled `imageRecipe` member of `Image`).
+    /// A build of a container recipe, which this store holds none of, carries none.
+    pub image_recipe_arn: Option<String>,
+    /// The infrastructure configuration the build ran under: "the infrastructure that
+    /// Image Builder used to create this image" (`Image`'s `infrastructureConfiguration`).
+    pub infrastructure_configuration_arn: Option<String>,
+    /// Whether the build collected the additional image metadata, as the request or the
+    /// pipeline that asked for it named it, with the documented default filled in
+    /// ([`DEFAULT_ENHANCED_IMAGE_METADATA_ENABLED`]).
+    pub enhanced_image_metadata_enabled: bool,
+    /// The test settings the build applied, with the documented defaults already filled in
+    /// ([`DEFAULT_IMAGE_TESTS_ENABLED`], [`DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES`]): "the
+    /// image test settings that Image Builder used when it created this image".
+    pub image_tests_configuration: ImageTestsConfiguration,
+    /// The role the build's workflow actions ran under, when the request or the pipeline
+    /// named one: "the name or Amazon Resource Name (ARN) for the IAM role you create that
+    /// grants Image Builder access to perform workflow actions".
+    pub execution_role: Option<String>,
+    /// Where the build's logs were directed: "the logging configuration that's defined for
+    /// the image", which for a pipeline's build is that pipeline's `imageLogGroupName`.
+    pub logging_configuration: Option<ImageLoggingConfiguration>,
     /// The platform the image was built for, taken from the recipe it was built from.
     pub platform: Option<String>,
     /// Whether the build produced an AMI or a container image, from the kind of recipe it
@@ -1519,14 +1548,19 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             .max_by_key(|record| parse_semantic_version(&record.version).unwrap_or_default())
     }
 
-    /// File the image build version one pipeline execution queued, together with the
-    /// receipt for the request that queued it.
+    /// File one image build version a caller's request queued, under the `operation` whose
+    /// `clientToken` earned it, together with the receipt for that request.
+    ///
+    /// Both paths that queue a build — a pipeline execution and a build the caller asked
+    /// for by hand — file one record and one receipt, so they differ only in which
+    /// operation's receipt index the token is spent in.
     ///
     /// Answers `false` and files NOTHING when the build-version store is full, for the
-    /// reason [`Self::insert_image`] states \u2014 so the receipt is filed only for a run that
+    /// reason [`Self::insert_image`] states, so the receipt is filed only for a run that
     /// really was queued.
-    pub fn start_pipeline_run(
+    pub fn file_image_build(
         &mut self,
+        operation: &str,
         record: ImageBuildVersionRecord,
         client_token: &str,
         fingerprint: String,
@@ -1537,7 +1571,7 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             return false;
         }
         self.file_create_receipt(
-            START_IMAGE_PIPELINE_EXECUTION_OPERATION,
+            operation,
             &region,
             client_token,
             fingerprint,
@@ -2877,35 +2911,11 @@ pub fn image_pipeline_request_fingerprint(input: &CreateImagePipelineInput) -> S
     fields.insert("imageTags", tag_map(input.image_tags.as_ref()));
     fields.insert(
         "imageTestsConfiguration",
-        input.image_tests_configuration.as_ref().map_or_else(
-            || ABSENT.to_string(),
-            |configuration| {
-                group(&[
-                    flag(configuration.image_tests_enabled),
-                    number(configuration.timeout_minutes),
-                ])
-            },
-        ),
+        image_tests_fingerprint(input.image_tests_configuration.as_ref()),
     );
     fields.insert(
         "imageScanningConfiguration",
-        input.image_scanning_configuration.as_ref().map_or_else(
-            || ABSENT.to_string(),
-            |configuration| {
-                group(&[
-                    flag(configuration.image_scanning_enabled),
-                    configuration.ecr_configuration.as_ref().map_or_else(
-                        || ABSENT.to_string(),
-                        |ecr| {
-                            group(&[
-                                text(ecr.repository_name.as_deref()),
-                                list(ecr.container_tags.as_deref()),
-                            ])
-                        },
-                    ),
-                ])
-            },
-        ),
+        image_scanning_fingerprint(input.image_scanning_configuration.as_ref()),
     );
     fields.insert(
         "schedule",
@@ -2936,42 +2946,55 @@ pub fn image_pipeline_request_fingerprint(input: &CreateImagePipelineInput) -> S
             },
         ),
     );
+    fields.insert("workflows", workflows_fingerprint(input.workflows.as_deref()));
+    fields
+        .iter()
+        .map(|(member, rendered)| format!("{member}={rendered};"))
+        .collect()
+}
+
+/// A deterministic rendering of the creation parameters one `CreateImage` request
+/// carries: everything the build it queues is defined by. See
+/// [`infrastructure_configuration_request_fingerprint`] for what a fingerprint leaves out
+/// and why.
+#[must_use]
+pub fn create_image_request_fingerprint(input: &CreateImageInput) -> String {
+    let mut fields: BTreeMap<&'static str, String> = BTreeMap::new();
+    fields.insert("imageRecipeArn", text(input.image_recipe_arn.as_deref()));
     fields.insert(
-        "workflows",
-        input.workflows.as_ref().map_or_else(
+        "containerRecipeArn",
+        text(input.container_recipe_arn.as_deref()),
+    );
+    fields.insert(
+        "infrastructureConfigurationArn",
+        text(Some(input.infrastructure_configuration_arn.as_str())),
+    );
+    fields.insert(
+        "distributionConfigurationArn",
+        text(input.distribution_configuration_arn.as_deref()),
+    );
+    fields.insert("executionRole", text(input.execution_role.as_deref()));
+    fields.insert(
+        "enhancedImageMetadataEnabled",
+        flag(input.enhanced_image_metadata_enabled),
+    );
+    fields.insert("tags", tag_map(input.tags.as_ref()));
+    fields.insert(
+        "imageTestsConfiguration",
+        image_tests_fingerprint(input.image_tests_configuration.as_ref()),
+    );
+    fields.insert(
+        "imageScanningConfiguration",
+        image_scanning_fingerprint(input.image_scanning_configuration.as_ref()),
+    );
+    fields.insert(
+        "loggingConfiguration",
+        input.logging_configuration.as_ref().map_or_else(
             || ABSENT.to_string(),
-            |workflows| {
-                group(
-                    &workflows
-                        .iter()
-                        .map(|configuration| {
-                            group(&[
-                                text(Some(configuration.workflow_arn.as_str())),
-                                text(configuration.parallel_group.as_deref()),
-                                text(configuration.on_failure.as_deref()),
-                                configuration.parameters.as_ref().map_or_else(
-                                    || ABSENT.to_string(),
-                                    |parameters| {
-                                        group(
-                                            &parameters
-                                                .iter()
-                                                .map(|parameter| {
-                                                    group(&[
-                                                        text(Some(parameter.name.as_str())),
-                                                        list(Some(parameter.value.as_slice())),
-                                                    ])
-                                                })
-                                                .collect::<Vec<_>>(),
-                                        )
-                                    },
-                                ),
-                            ])
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            },
+            |logging| group(&[text(logging.log_group_name.as_deref())]),
         ),
     );
+    fields.insert("workflows", workflows_fingerprint(input.workflows.as_deref()));
     fields
         .iter()
         .map(|(member, rendered)| format!("{member}={rendered};"))
@@ -3062,6 +3085,80 @@ fn tag_map(values: Option<&HashMap<String, String>>) -> String {
                     .into_iter()
                     .map(|(key, value)| {
                         format!("{}={}", text(Some(key)), text(Some(value)))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )
+}
+
+/// The `imageTestsConfiguration` member, as every fingerprint that carries one renders
+/// it: the two settings a build's tests are configured by.
+fn image_tests_fingerprint(configuration: Option<&ImageTestsConfiguration>) -> String {
+    configuration.map_or_else(
+        || ABSENT.to_string(),
+        |configuration| {
+            group(&[
+                flag(configuration.image_tests_enabled),
+                number(configuration.timeout_minutes),
+            ])
+        },
+    )
+}
+
+/// The `imageScanningConfiguration` member, as every fingerprint that carries one renders
+/// it.
+fn image_scanning_fingerprint(configuration: Option<&ImageScanningConfiguration>) -> String {
+    configuration.map_or_else(
+        || ABSENT.to_string(),
+        |configuration| {
+            group(&[
+                flag(configuration.image_scanning_enabled),
+                configuration.ecr_configuration.as_ref().map_or_else(
+                    || ABSENT.to_string(),
+                    |ecr| {
+                        group(&[
+                            text(ecr.repository_name.as_deref()),
+                            list(ecr.container_tags.as_deref()),
+                        ])
+                    },
+                ),
+            ])
+        },
+    )
+}
+
+/// The `workflows` member, as every fingerprint that carries one renders it: each
+/// configuration in the order the request carried it, down to its parameters.
+fn workflows_fingerprint(workflows: Option<&[WorkflowConfiguration]>) -> String {
+    workflows.map_or_else(
+        || ABSENT.to_string(),
+        |workflows| {
+            group(
+                &workflows
+                    .iter()
+                    .map(|configuration| {
+                        group(&[
+                            text(Some(configuration.workflow_arn.as_str())),
+                            text(configuration.parallel_group.as_deref()),
+                            text(configuration.on_failure.as_deref()),
+                            configuration.parameters.as_ref().map_or_else(
+                                || ABSENT.to_string(),
+                                |parameters| {
+                                    group(
+                                        &parameters
+                                            .iter()
+                                            .map(|parameter| {
+                                                group(&[
+                                                    text(Some(parameter.name.as_str())),
+                                                    list(Some(parameter.value.as_slice())),
+                                                ])
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                },
+                            ),
+                        ])
                     })
                     .collect::<Vec<_>>(),
             )
@@ -3309,13 +3406,14 @@ pub fn image_pipeline_exists_message(name: &str) -> String {
     format!("An image pipeline named {name} already exists in this Amazon Web Services Region.")
 }
 
-/// Why a `CreateImagePipeline` naming neither recipe, or both, is refused.
+/// Why a create naming neither recipe, or both, is refused.
 ///
-/// The rule is the operation's own: "You must specify exactly one recipe for the pipeline,
-/// using either a containerRecipeArn or an imageRecipeArn", which each of the two members
-/// repeats as "You must specify either this property or … but not both".
+/// The rule is the one `CreateImagePipeline` and `CreateImage` each state for themselves:
+/// "You must specify exactly one recipe" "using either a containerRecipeArn or an
+/// imageRecipeArn", which each of the two members repeats as "You must specify either this
+/// property or … but not both".
 #[must_use]
-pub fn pipeline_recipe_message() -> String {
+pub fn exactly_one_recipe_message() -> String {
     "The request must specify exactly one of imageRecipeArn and containerRecipeArn.".to_string()
 }
 
