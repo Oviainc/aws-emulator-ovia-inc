@@ -19,6 +19,8 @@ mod component_image_recipe;
 mod component_listing;
 #[path = "all/component_policy.rs"]
 mod component_policy;
+#[path = "all/distribution_configuration.rs"]
+mod distribution_configuration;
 #[path = "all/image_creation.rs"]
 mod image_creation;
 #[path = "all/image_packages.rs"]

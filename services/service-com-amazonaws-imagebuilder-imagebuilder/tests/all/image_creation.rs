@@ -884,8 +884,8 @@ async fn a_reference_naming_nothing_is_reported_missing() {
         assert_missing(case, status, &answer, resource_type, &arn);
     }
 
-    // A distribution configuration and a workflow are resources of this service too, and
-    // this store holds neither, so a reference to one names nothing either.
+    // A distribution configuration is a resource of this service too, and this store holds
+    // none under this ARN, so a reference to it names nothing either.
     let distribution =
         format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:distribution-configuration/spread");
     let (status, answer) = create_image_with(

@@ -310,10 +310,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             NamedRecipe::Container(reference) => return Err(missing(reference)),
         };
 
-        // A distribution configuration and a workflow are resources of this service too,
-        // and this store holds neither yet, so a reference to one names nothing.
+        // A distribution configuration is a resource of this service, so a reference to one
+        // has to name a stored configuration of this Region; a workflow is one this store
+        // does not hold yet, so a reference to one names nothing.
         if let Some(reference) = &input.distribution_configuration_arn {
-            return Err(missing(reference));
+            if store.distribution_configuration(reference, &region).is_none() {
+                return Err(missing(reference));
+            }
         }
         if let Some(configuration) = input.workflows.iter().flatten().next() {
             return Err(missing(&configuration.workflow_arn));

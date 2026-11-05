@@ -21,6 +21,16 @@
 //!   reaches only the configurations of its own Region
 //!   ([`ComAmazonawsImagebuilderImagebuilderState::infrastructure_configuration`]).
 //!
+//! A **distribution configuration** is stored the same way, keyed by its own ARN, and for
+//! the same two reasons: `CreateDistributionConfiguration`'s `name` documents "Distribution
+//! configuration names must be unique to your account in each Amazon Web Services Region.
+//! Image Builder generates the distribution configuration ARN from a normalized form of the
+//! name", so [`normalized_name`] serves both the ARN and the uniqueness test, and the
+//! configuration belongs to the Region its ARN names
+//! ([`ComAmazonawsImagebuilderImagebuilderState::distribution_configuration`]). What it
+//! holds is the per-Region settings a create carried, in that order, which is what a read
+//! reports back ([`DistributionConfigurationRecord::view`]).
+//!
 //! Beside it the store holds the two authoring resources an image build starts from.
 //! A **component** is the YAML document Image Builder runs on a build or test instance,
 //! and an **image recipe** names the parent image a build starts from together with the
@@ -82,10 +92,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AdditionalInstanceConfiguration, Component, ComponentConfiguration, ComponentParameterDetail,
-    ComponentState, ComponentVersion, CreateComponentInput, CreateImageInput,
+    AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
+    ComponentConfiguration, ComponentParameterDetail,
+    ComponentState, ComponentVersion, CreateComponentInput,
+    CreateDistributionConfigurationInput, CreateImageInput,
     CreateImagePipelineInput, CreateImageRecipeInput,
-    CreateInfrastructureConfigurationInput, Filter, ImageLoggingConfiguration, ImagePipeline,
+    CreateInfrastructureConfigurationInput, Distribution, DistributionConfiguration, Filter,
+    FastLaunchConfiguration, ImageLoggingConfiguration, ImagePipeline,
     ImageRecipe, ImageRecipeSummary,
     ImageScanningConfiguration, ImageState, ImageSummary, ImageTestsConfiguration,
     InfrastructureConfiguration, InstanceBlockDeviceMapping, InstanceMetadataOptions,
@@ -105,6 +118,11 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// from the modelled `InfrastructureConfigurationArn` pattern
 /// `^arn:aws[^:]*:imagebuilder:[^:]+:(?:[0-9]{12}|aws):infrastructure-configuration/[a-z0-9-_]+$`.
 pub const INFRASTRUCTURE_CONFIGURATION_ARN_PREFIX: &str = "infrastructure-configuration/";
+
+/// The resource portion a distribution-configuration ARN carries before its name, from
+/// the modelled `DistributionConfigurationArn` pattern
+/// `^arn:aws[^:]*:imagebuilder:[^:]+:(?:[0-9]{12}|aws):distribution-configuration/[a-z0-9-_]+$`.
+pub const DISTRIBUTION_CONFIGURATION_ARN_PREFIX: &str = "distribution-configuration/";
 
 /// The resource portion a component ARN carries before its name, from the modelled
 /// `ComponentBuildVersionArn` pattern
@@ -131,6 +149,9 @@ pub const IMAGE_PIPELINE_ARN_PREFIX: &str = "image-pipeline/";
 /// never read each other's.
 pub const CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION: &str =
     "CreateInfrastructureConfiguration";
+
+/// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`].
+pub const CREATE_DISTRIBUTION_CONFIGURATION_OPERATION: &str = "CreateDistributionConfiguration";
 
 /// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`].
 pub const CREATE_COMPONENT_OPERATION: &str = "CreateComponent";
@@ -415,6 +436,21 @@ pub const RESERVED_RESOURCE_TAG_KEYS: &[&str] =
 /// realistic use and exists only so a caller-driven store cannot grow without bound.
 pub const MAX_INFRASTRUCTURE_CONFIGURATIONS: usize = 1_000;
 
+/// The most distribution configurations this emulator will hold. An emulator resource
+/// guard, for the same reason as [`MAX_INFRASTRUCTURE_CONFIGURATIONS`].
+pub const MAX_DISTRIBUTION_CONFIGURATIONS: usize = 1_000;
+
+/// The value a read reports for a distribution configuration's `timeoutMinutes`.
+///
+/// The member is REQUIRED on the modelled `DistributionConfiguration` yet is not a
+/// creation parameter: "A property that Image Builder doesn't use. You can't set this
+/// property when you create or update a distribution configuration, and it has no effect
+/// on distribution behavior." So a read reports one value for every configuration, and it
+/// is the maximum of the member's own modelled range
+/// (`smithy_query(query="shape",shape="DistributionTimeoutMinutes")`: 30..720) — the value
+/// a property that bounds nothing carries.
+pub const DISTRIBUTION_TIMEOUT_MINUTES: i32 = 720;
+
 /// The most components this emulator will hold, counting every build version.
 ///
 /// An emulator resource guard like [`MAX_INFRASTRUCTURE_CONFIGURATIONS`], not an AWS
@@ -531,6 +567,53 @@ impl InfrastructureConfigurationRecord {
             placement: self.placement.clone(),
             terminate_instance_on_completion: Some(self.terminate_instance_on_completion),
             parent_instance: self.parent_instance.clone(),
+        }
+    }
+}
+
+/// One stored distribution configuration: what a create wrote, which is what every later
+/// read reports.
+///
+/// The ARN carries the [`normalized_name`] for the same reason an infrastructure
+/// configuration's does — `CreateDistributionConfiguration`'s `name` member documents
+/// "Distribution configuration names must be unique to your account in each Amazon Web
+/// Services Region. Image Builder generates the distribution configuration ARN from a
+/// normalized form of the name" — so the uniqueness test and the ARN agree by
+/// construction.
+#[derive(Debug, Clone)]
+pub struct DistributionConfigurationRecord {
+    /// This configuration's own ARN, which is also its key in the store.
+    pub arn: String,
+    /// The Region whose endpoint created it, and the only one that can reach it.
+    pub region: String,
+    /// The name as the caller submitted it; the ARN carries its [`normalized_name`].
+    pub name: String,
+    pub description: Option<String>,
+    /// The per-Region distribution settings, in the order the request carried them: "Each
+    /// entry defines how output images are distributed in one target Amazon Web Services
+    /// Region."
+    pub distributions: Vec<Distribution>,
+    pub tags: Option<BTreeMap<String, String>>,
+    /// When it was created, as the modelled string `DateTime` carries an instant.
+    pub date_created: String,
+    /// When it was last written. The create IS the last write until an update replaces
+    /// it, so a freshly created configuration reports its creation instant.
+    pub date_updated: String,
+}
+
+impl DistributionConfigurationRecord {
+    /// This record as the modelled `DistributionConfiguration` a read reports.
+    #[must_use]
+    pub fn view(&self) -> DistributionConfiguration {
+        DistributionConfiguration {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            distributions: Some(self.distributions.clone()),
+            timeout_minutes: DISTRIBUTION_TIMEOUT_MINUTES,
+            date_created: Some(self.date_created.clone()),
+            date_updated: Some(self.date_updated.clone()),
+            tags: Some(reported_tags(self.tags.as_ref())),
         }
     }
 }
@@ -1018,6 +1101,8 @@ pub struct CreateReceipt {
 pub enum TaggedResource {
     /// An infrastructure configuration ([`INFRASTRUCTURE_CONFIGURATION_ARN_PREFIX`]).
     InfrastructureConfiguration,
+    /// A distribution configuration ([`DISTRIBUTION_CONFIGURATION_ARN_PREFIX`]).
+    DistributionConfiguration,
     /// One component build version ([`COMPONENT_ARN_PREFIX`]).
     Component,
     /// An image recipe ([`IMAGE_RECIPE_ARN_PREFIX`]).
@@ -1035,6 +1120,10 @@ pub struct ComAmazonawsImagebuilderImagebuilderState {
     /// carries both its Region and its normalized name, so one key says where a
     /// configuration lives and which name is taken there.
     pub infrastructure_configurations: BTreeMap<String, InfrastructureConfigurationRecord>,
+    /// Every stored distribution configuration, keyed by its own ARN — which carries both
+    /// its Region and its normalized name, so one key says where a configuration lives
+    /// and which name is taken there.
+    pub distribution_configurations: BTreeMap<String, DistributionConfigurationRecord>,
     /// Every stored component build version, keyed by its own build version ARN — which
     /// carries its Region, its normalized name, its version and its build number.
     pub components: BTreeMap<String, ComponentRecord>,
@@ -1126,6 +1215,65 @@ impl ComAmazonawsImagebuilderImagebuilderState {
     #[must_use]
     pub fn infrastructure_configuration_store_is_full(&self) -> bool {
         self.infrastructure_configurations.len() >= MAX_INFRASTRUCTURE_CONFIGURATIONS
+    }
+
+    /// The distribution configuration `arn` names, but only when it belongs to
+    /// `request_region`.
+    ///
+    /// A regional endpoint serves only its own Region's resources, so a configuration of
+    /// another Region answers as if it did not exist.
+    #[must_use]
+    pub fn distribution_configuration(
+        &self,
+        arn: &str,
+        request_region: &str,
+    ) -> Option<&DistributionConfigurationRecord> {
+        self.distribution_configurations
+            .get(arn)
+            .filter(|record| record.region == request_region)
+    }
+
+    /// Store a newly created distribution configuration together with the receipt for the
+    /// request that created it.
+    pub fn insert_distribution_configuration(
+        &mut self,
+        record: DistributionConfigurationRecord,
+        client_token: &str,
+        fingerprint: String,
+        request_id: String,
+    ) {
+        self.file_create_receipt(
+            CREATE_DISTRIBUTION_CONFIGURATION_OPERATION,
+            &record.region,
+            client_token,
+            fingerprint,
+            request_id,
+            record.arn.clone(),
+        );
+        self.distribution_configurations
+            .insert(record.arn.clone(), record);
+    }
+
+    /// The receipt `client_token` already earned from `CreateDistributionConfiguration`
+    /// in `request_region`, if any.
+    #[must_use]
+    pub fn distribution_configuration_receipt(
+        &self,
+        request_region: &str,
+        client_token: &str,
+    ) -> Option<&CreateReceipt> {
+        self.create_receipt(
+            CREATE_DISTRIBUTION_CONFIGURATION_OPERATION,
+            request_region,
+            client_token,
+        )
+    }
+
+    /// Whether the store is already holding as many distribution configurations as this
+    /// emulator will keep ([`MAX_DISTRIBUTION_CONFIGURATIONS`]).
+    #[must_use]
+    pub fn distribution_configuration_store_is_full(&self) -> bool {
+        self.distribution_configurations.len() >= MAX_DISTRIBUTION_CONFIGURATIONS
     }
 
     /// The receipt `client_token` already earned from `operation` in `request_region`,
@@ -1630,6 +1778,9 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         if self.infrastructure_configuration(arn, request_region).is_some() {
             return Some(TaggedResource::InfrastructureConfiguration);
         }
+        if self.distribution_configuration(arn, request_region).is_some() {
+            return Some(TaggedResource::DistributionConfiguration);
+        }
         if self.component(arn, request_region).is_some() {
             return Some(TaggedResource::Component);
         }
@@ -1665,6 +1816,10 @@ impl ComAmazonawsImagebuilderImagebuilderState {
                 .infrastructure_configurations
                 .get(arn)
                 .and_then(|record| record.tags.clone()),
+            TaggedResource::DistributionConfiguration => self
+                .distribution_configurations
+                .get(arn)
+                .and_then(|record| record.tags.clone()),
             TaggedResource::Component => {
                 self.components.get(arn).and_then(|record| record.tags.clone())
             }
@@ -1697,6 +1852,10 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         match self.tagged_resource(arn, request_region)? {
             TaggedResource::InfrastructureConfiguration => self
                 .infrastructure_configurations
+                .get_mut(arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::DistributionConfiguration => self
+                .distribution_configurations
                 .get_mut(arn)
                 .map(|record| &mut record.tags),
             TaggedResource::Component => {
@@ -1754,6 +1913,19 @@ pub fn infrastructure_configuration_arn(region: &str, name: &str) -> String {
         region,
         &format!(
             "{INFRASTRUCTURE_CONFIGURATION_ARN_PREFIX}{}",
+            normalized_name(name)
+        ),
+    )
+}
+
+/// The ARN of the distribution configuration `name` names in `region`.
+#[must_use]
+pub fn distribution_configuration_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{DISTRIBUTION_CONFIGURATION_ARN_PREFIX}{}",
             normalized_name(name)
         ),
     )
@@ -2748,6 +2920,27 @@ pub fn infrastructure_configuration_request_fingerprint(
         .collect()
 }
 
+/// A deterministic rendering of the creation parameters one
+/// `CreateDistributionConfiguration` request carries. See
+/// [`infrastructure_configuration_request_fingerprint`] for what it leaves out and why.
+#[must_use]
+pub fn distribution_configuration_request_fingerprint(
+    input: &CreateDistributionConfigurationInput,
+) -> String {
+    let mut fields: BTreeMap<&'static str, String> = BTreeMap::new();
+    fields.insert("name", text(Some(input.name.as_str())));
+    fields.insert("description", text(input.description.as_deref()));
+    fields.insert("tags", tag_map(input.tags.as_ref()));
+    fields.insert(
+        "distributions",
+        distributions_fingerprint(&input.distributions),
+    );
+    fields
+        .iter()
+        .map(|(member, rendered)| format!("{member}={rendered};"))
+        .collect()
+}
+
 /// A deterministic rendering of the creation parameters one `CreateComponent` request
 /// carries. See [`infrastructure_configuration_request_fingerprint`] for what it leaves
 /// out and why.
@@ -3092,6 +3285,156 @@ fn tag_map(values: Option<&HashMap<String, String>>) -> String {
     )
 }
 
+/// The `distributions` member, as a distribution configuration's fingerprint renders it:
+/// every entry in the order the request carried it, down to each setting it holds — a
+/// list's order is part of its value, so two orders are two different requests.
+fn distributions_fingerprint(distributions: &[Distribution]) -> String {
+    group(
+        &distributions
+            .iter()
+            .map(|distribution| {
+                group(&[
+                    text(Some(distribution.region.as_str())),
+                    distribution
+                        .ami_distribution_configuration
+                        .as_ref()
+                        .map_or_else(|| ABSENT.to_string(), ami_distribution_fingerprint),
+                    distribution
+                        .container_distribution_configuration
+                        .as_ref()
+                        .map_or_else(|| ABSENT.to_string(), |container| {
+                            group(&[
+                                text(container.description.as_deref()),
+                                list(container.container_tags.as_deref()),
+                                text(Some(container.target_repository.service.as_str())),
+                                text(Some(
+                                    container.target_repository.repository_name.as_str(),
+                                )),
+                            ])
+                        }),
+                    list(distribution.license_configuration_arns.as_deref()),
+                    distribution
+                        .launch_template_configurations
+                        .as_ref()
+                        .map_or_else(
+                            || ABSENT.to_string(),
+                            |configurations| {
+                                group(
+                                    &configurations
+                                        .iter()
+                                        .map(|configuration| {
+                                            group(&[
+                                                text(Some(
+                                                    configuration.launch_template_id.as_str(),
+                                                )),
+                                                text(configuration.account_id.as_deref()),
+                                                flag(Some(configuration.set_default_version)),
+                                            ])
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            },
+                        ),
+                    distribution.s3_export_configuration.as_ref().map_or_else(
+                        || ABSENT.to_string(),
+                        |export| {
+                            group(&[
+                                text(Some(export.role_name.as_str())),
+                                text(Some(export.disk_image_format.as_str())),
+                                text(Some(export.s3_bucket.as_str())),
+                                text(export.s3_prefix.as_deref()),
+                            ])
+                        },
+                    ),
+                    distribution
+                        .fast_launch_configurations
+                        .as_ref()
+                        .map_or_else(
+                            || ABSENT.to_string(),
+                            |configurations| {
+                                group(
+                                    &configurations
+                                        .iter()
+                                        .map(fast_launch_fingerprint)
+                                        .collect::<Vec<_>>(),
+                                )
+                            },
+                        ),
+                    distribution
+                        .ssm_parameter_configurations
+                        .as_ref()
+                        .map_or_else(
+                            || ABSENT.to_string(),
+                            |configurations| {
+                                group(
+                                    &configurations
+                                        .iter()
+                                        .map(|configuration| {
+                                            group(&[
+                                                text(Some(
+                                                    configuration.parameter_name.as_str(),
+                                                )),
+                                                text(configuration.ami_account_id.as_deref()),
+                                                text(configuration.data_type.as_deref()),
+                                            ])
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            },
+                        ),
+                ])
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// One entry's `amiDistributionConfiguration`, as [`distributions_fingerprint`] renders
+/// it.
+fn ami_distribution_fingerprint(ami: &AmiDistributionConfiguration) -> String {
+    group(&[
+        text(ami.name.as_deref()),
+        text(ami.description.as_deref()),
+        text(ami.kms_key_id.as_deref()),
+        list(ami.target_account_ids.as_deref()),
+        tag_map(ami.ami_tags.as_ref()),
+        ami.launch_permission.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |permission| {
+                group(&[
+                    list(permission.user_ids.as_deref()),
+                    list(permission.user_groups.as_deref()),
+                    list(permission.organization_arns.as_deref()),
+                    list(permission.organizational_unit_arns.as_deref()),
+                ])
+            },
+        ),
+    ])
+}
+
+/// One entry's `fastLaunchConfigurations` element, as [`distributions_fingerprint`]
+/// renders it.
+fn fast_launch_fingerprint(configuration: &FastLaunchConfiguration) -> String {
+    group(&[
+        flag(Some(configuration.enabled)),
+        number(configuration.max_parallel_launches),
+        text(configuration.account_id.as_deref()),
+        configuration.snapshot_configuration.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |snapshot| number(snapshot.target_resource_count),
+        ),
+        configuration.launch_template.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |template| {
+                group(&[
+                    text(template.launch_template_id.as_deref()),
+                    text(template.launch_template_name.as_deref()),
+                    text(template.launch_template_version.as_deref()),
+                ])
+            },
+        ),
+    ])
+}
+
 /// The `imageTestsConfiguration` member, as every fingerprint that carries one renders
 /// it: the two settings a build's tests are configured by.
 fn image_tests_fingerprint(configuration: Option<&ImageTestsConfiguration>) -> String {
@@ -3204,6 +3547,30 @@ pub fn infrastructure_configuration_exists_message(name: &str) -> String {
     )
 }
 
+/// Why a create whose distribution-configuration name is already taken in this Region is
+/// refused.
+#[must_use]
+pub fn distribution_configuration_exists_message(name: &str) -> String {
+    format!(
+        "A distribution configuration named {name} already exists in this Amazon Web Services \
+         Region."
+    )
+}
+
+/// Why a create whose distributions name one Region twice is refused.
+///
+/// The rule is the `distributions` member's own: "Each entry defines how output images are
+/// distributed in one target Amazon Web Services Region. A Region can appear at most once
+/// in the list." The wording names the member, the requirement and the Region the request
+/// repeated.
+#[must_use]
+pub fn duplicate_distribution_region_message(region: &str) -> String {
+    format!(
+        "The distributions list can name each target Region at most once, and it names \
+         {region} more than once."
+    )
+}
+
 /// Why a create was not performed because the request asked only for validation.
 ///
 /// From the `dryRun` member's own documentation: "Validates the required permissions
@@ -3226,6 +3593,15 @@ pub fn infrastructure_configuration_store_full_message() -> String {
     format!(
         "This account already holds the maximum of {MAX_INFRASTRUCTURE_CONFIGURATIONS} \
          infrastructure configurations."
+    )
+}
+
+/// Why a create is refused once the distribution-configuration store is full.
+#[must_use]
+pub fn distribution_configuration_store_full_message() -> String {
+    format!(
+        "This account already holds the maximum of {MAX_DISTRIBUTION_CONFIGURATIONS} \
+         distribution configurations."
     )
 }
 

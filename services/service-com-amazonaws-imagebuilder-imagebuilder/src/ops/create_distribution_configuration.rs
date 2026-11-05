@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDistributionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDistributionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDistributionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the distribution configuration this service's state then holds, so a later
+//! `GetDistributionConfiguration` reports what this request stored.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * the ARN is derived from a NORMALIZED form of the name
+//!   (`crate::state::normalized_name`), and that normalized name must be unique in the
+//!   Region — a second create under it is `ResourceAlreadyExistsException`;
+//! * a target Region may appear at most once in `distributions`;
+//! * `clientToken` is an idempotency token: a retry carrying it answers with the ORIGINAL
+//!   response, and the same token carrying different creation parameters is
+//!   `IdempotentParameterMismatchException`;
+//! * `dryRun` validates the request and then answers `DryRunOperationException`, having
+//!   stored nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +208,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDistributionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDistributionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDistributionConfiguration"))
+        // Every modelled constraint on this input — `name`'s pattern, the string lengths,
+        // the tag-key pattern, the 1..50 map bound, every constraint inside a distribution
+        // entry — has been refused by the centralized walk before this body runs, so what
+        // is checked here is only what the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDistributionConfigurationErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `distributions`' own rule: "Each entry defines how output images are distributed
+        // in one target Amazon Web Services Region. A Region can appear at most once in the
+        // list." Two entries for one Region are two settings for the same target, which is
+        // a combination of parameters the service does not accept.
+        let mut targets: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for distribution in &input.distributions {
+            if !targets.insert(distribution.region.as_str()) {
+                return Err(
+                    CreateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(crate::state::duplicate_distribution_region_message(
+                                &distribution.region,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let fingerprint = crate::state::distribution_configuration_request_fingerprint(&input);
+        let arn = crate::state::distribution_configuration_arn(&region, &input.name);
+
+        // The idempotency check, the name-uniqueness check and the insert happen under ONE
+        // lock, so concurrent creates are serialized: the first to take the lock stores the
+        // Region's configuration and every other one sees it.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — so a retry answers with
+        // the ORIGINAL response, down to its `requestId`. The same token carrying different
+        // creation parameters is the modelled mismatch instead.
+        if let Some(receipt) = store.distribution_configuration_receipt(&region, &input.client_token)
+        {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    CreateDistributionConfigurationErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(CreateDistributionConfigurationOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                distribution_configuration_arn: Some(receipt.arn.clone()),
+            });
+        }
+
+        // "Distribution configuration names must be unique to your account in each Amazon
+        // Web Services Region", compared in the normalized form the ARN carries — so a name
+        // differing from a stored one only in case, spaces or underscores is the SAME name
+        // and is refused.
+        if store.distribution_configurations.contains_key(&arn) {
+            return Err(
+                CreateDistributionConfigurationErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::distribution_configuration_exists_message(
+                            &input.name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is finite: a create that would take it past this emulator's own cap is
+        // refused rather than growing it. Checked BEFORE the dry-run branch, so a dry run
+        // reports the same outcome the real create would have.
+        if store.distribution_configuration_store_is_full() {
+            return Err(
+                CreateDistributionConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::distribution_configuration_store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `dryRun`: "Validates the required permissions and request parameters without
+        // performing the operation. If validation succeeds, the operation returns a
+        // DryRunOperationException error response." Every validation above has passed by
+        // here, and nothing has been written — including the request's receipt, so a dry
+        // run leaves the token free for the real request.
+        if input.dry_run {
+            return Err(
+                CreateDistributionConfigurationErrorModeled::DryRunOperationException(
+                    DryRunOperationException {
+                        message: Some(crate::state::dry_run_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instant the configuration was created. It is also its last write until an
+        // update replaces it, so `dateUpdated` reports the same instant.
+        let created_at = crate::state::iso8601(::std::time::SystemTime::now());
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+
+        store.insert_distribution_configuration(
+            crate::state::DistributionConfigurationRecord {
+                arn: arn.clone(),
+                region,
+                name: input.name,
+                description: input.description,
+                distributions: input.distributions,
+                tags: input.tags.map(crate::state::into_ordered_tags),
+                date_created: created_at.clone(),
+                date_updated: created_at,
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(CreateDistributionConfigurationOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            distribution_configuration_arn: Some(arn),
+        })
     }
 }
