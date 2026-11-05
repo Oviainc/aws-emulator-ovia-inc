@@ -351,3 +351,5 @@ mod user_tag_listing;
 mod user_tag_removal;
 #[path = "all/user_tags.rs"]
 mod user_tags;
+#[path = "all/virtual_mfa_devices.rs"]
+mod virtual_mfa_devices;

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVirtualMFADevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVirtualMFADevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVirtualMFADevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a virtual MFA device for the account: "after creating the virtual MFA, use
+//! EnableMFADevice to attach the MFA device to an IAM user", so the device this operation
+//! records is held by the ACCOUNT and assigned to nobody until that call.
+//!
+//! The device's identity is its path and name together — "the name of the virtual MFA
+//! device, which must be unique. Use with path to uniquely identify a virtual MFA device"
+//! (`$VirtualMFADeviceName`) — which is exactly what its serial number, the `mfa` ARN of
+//! that path and name, spells; a second create under one path and name is therefore the
+//! modelled `EntityAlreadyExists` conflict rather than a second device.
+//!
+//! The SEED is minted here and reported only here: "the seed information contained in the
+//! QR code and the Base32 string should be treated like any other secret access
+//! information … after you provision your virtual device, you should ensure that the
+//! information is destroyed following secure procedures". The material comes from the
+//! emulator's credential store ([`crate::state::mint_virtual_mfa_device_seed`]) and the
+//! QR code is a real image of the `otpauth://` URI that carries it
+//! ([`crate::state::virtual_mfa_device_qr_code`]), so an authenticator app that scans the
+//! response provisions the device this account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +185,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVirtualMFADevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVirtualMFADeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVirtualMFADevice"))
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as, and the credential
+        // store the seed material is minted by. The device is named in the request — IAM
+        // is global, so not even the ARN's region segment comes from it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVirtualMFADeviceErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter" — and "if any one of the tags is
+        // invalid or if you exceed the allowed maximum number of tags, then the entire
+        // request fails and the resource is not created" (`$Tags`), which is why this is
+        // checked before anything is written.
+        let tags = input.tags.filter(|tags| !tags.is_empty());
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(tags.iter().flatten().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreateVirtualMFADeviceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // "This parameter is optional. If it is not included, it defaults to a slash (/)"
+        // (`$Path`).
+        let path = input
+            .path
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // The serial number the device is addressed by from here on: the `mfa` ARN of the
+        // path and the name, which is also the key the account holds it under.
+        let serial_number =
+            crate::state::virtual_mfa_device_arn(&path, &input.virtual_mfa_device_name);
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before the device is created and before the store is consulted, on the ARN the
+        // device WOULD carry, with the tags this request attaches handed to the gate — the
+        // same decision the other creates in this crate make. Nothing is created when it
+        // refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_VIRTUAL_MFA_DEVICE,
+            &serial_number,
+            &format!("mfa device {}", input.virtual_mfa_device_name),
+            crate::state::authorization::WrittenTags::Pairs(tags.as_deref().unwrap_or_default()),
+        )?;
+
+        // The path and the name together identify the device, so a create for a pair the
+        // account already holds a device under is a conflict rather than a second device.
+        // Every word of the refusal is fixed: what it reports is that the account already
+        // holds a device at that path and name, which the request itself names.
+        if store.virtual_mfa_devices.contains_key(&serial_number) {
+            return Err(
+                CreateVirtualMFADeviceErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(
+                            "MFADevice entity at the same path and name already exists."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An account holds a bounded number of virtual MFA devices, so a caller cannot
+        // grow the account without limit; past the quota IAM refuses the create.
+        if store.virtual_mfa_devices.len() >= crate::state::MAX_VIRTUAL_MFA_DEVICES_PER_ACCOUNT {
+            return Err(CreateVirtualMFADeviceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for VirtualMFADevicesPerAccount: {}",
+                        crate::state::MAX_VIRTUAL_MFA_DEVICES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The seed material comes from the emulator's credential store, never from this
+        // handler, and the QR code is rendered from the seed it minted. A device whose
+        // seed or image this emulator could not produce is not created and not reported:
+        // the request failed "because of an unknown error, exception or failure", which is
+        // what the modelled server fault says.
+        let server_fault = || {
+            CreateVirtualMFADeviceError::from(
+                CreateVirtualMFADeviceErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some(
+                            "the virtual MFA device's seed could not be generated".to_string(),
+                        ),
+                    },
+                ),
+            )
+        };
+        let base32_string_seed = crate::state::mint_virtual_mfa_device_seed(ctx.credential_store())
+            .ok_or_else(server_fault)?;
+        // "`AccountName` is the user name if set (otherwise, the account ID otherwise)"
+        // (`VirtualMFADevice$QRCodePNG`): a device this call creates is assigned to no
+        // user yet — `EnableMFADevice` is what assigns one — so the account id is the name
+        // the URI carries.
+        let qr_code_png = crate::state::virtual_mfa_device_qr_code(
+            &input.virtual_mfa_device_name,
+            ::engine::emulator_account_id(),
+            &base32_string_seed,
+        )
+        .ok_or_else(server_fault)?;
+
+        // What the account keeps: the device as it stands, holding the seed and assigned
+        // to nobody. The QR code is NOT kept — it is a rendering of the seed, so keeping
+        // it would be a second copy of the same secret.
+        let record = crate::state::VirtualMfaDeviceRecord {
+            device_name: input.virtual_mfa_device_name.clone(),
+            path,
+            base32_string_seed: base32_string_seed.clone(),
+            user_key: None,
+            enable_date: None,
+            tags: tags.clone(),
+        };
+
+        // The response is the record that was stored, plus the two secrets this response
+        // is the only place to read: the base32 seed and the QR code image of the
+        // `otpauth://` URI carrying it. `User` and `EnableDate` are absent because no user
+        // holds the device until `EnableMFADevice` assigns one.
+        let virtual_mfa_device = VirtualMFADevice {
+            serial_number: serial_number.clone(),
+            base32_string_seed: Some(base32_string_seed.into_bytes()),
+            qr_code_png: Some(qr_code_png),
+            user: None,
+            enable_date: None,
+            tags,
+        };
+        store.virtual_mfa_devices.insert(serial_number, record);
+        Ok(CreateVirtualMFADeviceOutput { virtual_mfa_device })
     }
 }

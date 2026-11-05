@@ -242,7 +242,7 @@ async fn every_served_call_is_recorded_and_an_unimplemented_one_is_not() {
             // Still a stub in this emulator: it answers 501, so nothing was served and
             // nothing is recorded.
             "an unimplemented operation",
-            "ListVirtualMFADevices",
+            "ListMFADevices",
             Vec::new(),
             501,
             None,

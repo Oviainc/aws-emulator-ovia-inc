@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVirtualMFADevices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVirtualMFADevices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the virtual MFA devices the ACCOUNT holds — the ones
+//! `CreateVirtualMFADevice` recorded — narrowed by whether a user holds each
+//! (`$AssignmentStatus`) and paged over the serial numbers they are keyed by.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVirtualMFADevices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: the store is only consulted. The seed and the QR code a device was
+//! provisioned with are NOT reported, because the create that minted them is the only
+//! place they are available.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVirtualMFADevices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVirtualMFADevicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation models NO error at all, so there is no modelled fault to answer
+        // a store this emulator cannot reach with: the honest answer is that this
+        // emulator did not serve the call.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListVirtualMFADevices",
+            ));
+        };
+
+        // The page resumes strictly after the POSITION in the device order the marker
+        // names, exactly as every other list operation in this service does
+        // (`crate::ops::list_users`), so a token this service's encoding cannot have
+        // produced is refused rather than silently read as "start from the beginning". A
+        // token that decodes but names a device deleted since the previous page is NOT an
+        // error: the position still orders the remainder.
+        let resume_after = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(
+                    crate::state::MARKER_SCOPE_VIRTUAL_MFA_DEVICES,
+                    marker,
+                ) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Invalid Marker: the value is not a marker this service issued",
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // "The status (`Unassigned` or `Assigned`) of the devices to list. If you do not
+        // specify an `AssignmentStatus`, the operation defaults to `Any`, which lists both
+        // assigned and unassigned virtual MFA devices": a device is ASSIGNED exactly while
+        // a user holds it, which is the record `EnableMFADevice` leaves.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVirtualMFADevices"))
+        // Matched against the three values the enum declares rather than derived by
+        // inequality, so a value outside them selects nothing by accident: the constraint
+        // walk refuses an off-enum `AssignmentStatus` before this handler runs, and this
+        // match is what keeps that true here too.
+        let (want_assigned, want_unassigned) = match input.assignment_status.as_deref() {
+            None | Some(crate::state::ASSIGNMENT_STATUS_ANY) => (true, true),
+            Some(crate::state::ASSIGNMENT_STATUS_ASSIGNED) => (true, false),
+            Some(crate::state::ASSIGNMENT_STATUS_UNASSIGNED) => (false, true),
+            Some(_) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Invalid AssignmentStatus: the value is not one this operation accepts",
+                ));
+            }
+        };
+
+        // A read: it reports the devices the account persists and writes nothing, so a
+        // later caller sees exactly what this one did.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any device is reported, so a caller that may not make this call
+        // learns that rather than learning which devices the account holds. The request
+        // names no device, so the resource the decision is made on — and the one the
+        // refusal names — is EVERY device in the account: the `mfa` ARN with its name a
+        // wildcard.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_VIRTUAL_MFA_DEVICES,
+            &crate::state::virtual_mfa_device_arn(
+                crate::state::DEFAULT_PATH,
+                ANY_VIRTUAL_MFA_DEVICE,
+            ),
+        )?;
+
+        let tail = store.virtual_mfa_devices.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+        let selected = tail.filter(|(_, record)| {
+            if record.user_key.is_some() {
+                want_assigned
+            } else {
+                want_unassigned
+            }
+        });
+
+        let mut virtual_mfa_devices = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (serial_number, record) in selected {
+            if virtual_mfa_devices.len() == page_size {
+                // There is at least one more device the request selected, so the caller
+                // needs another page to see it.
+                is_truncated = true;
+                break;
+            }
+            virtual_mfa_devices.push(store.virtual_mfa_device_report(serial_number, record));
+            last_key = Some(serial_number.clone());
+        }
+
+        Ok(ListVirtualMFADevicesOutput {
+            // The member is required, and empty is the answer for an account holding no
+            // device the request's `AssignmentStatus` selects.
+            virtual_mfa_devices,
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(
+                            crate::state::MARKER_SCOPE_VIRTUAL_MFA_DEVICES,
+                            key,
+                        )
+                    })
+                })
+                .flatten(),
+            is_truncated,
+        })
     }
 }
+
+/// The device name the authorization decision for a call that names no single device is
+/// made on: every device of the account, which is the wildcard a policy statement's
+/// `Resource` matches against the `mfa` ARN space — the same stand-in `ListSAMLProviders`
+/// makes its decision on.
+const ANY_VIRTUAL_MFA_DEVICE: &str = "*";

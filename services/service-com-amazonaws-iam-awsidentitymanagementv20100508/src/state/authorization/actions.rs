@@ -427,6 +427,12 @@ pub const CHANGE_PASSWORD: &str = "iam:ChangePassword";
 /// `iam:GetMFADevice`.
 pub const GET_MFA_DEVICE: &str = "iam:GetMFADevice";
 
+/// `iam:CreateVirtualMFADevice`.
+pub const CREATE_VIRTUAL_MFA_DEVICE: &str = "iam:CreateVirtualMFADevice";
+
+/// `iam:ListVirtualMFADevices`.
+pub const LIST_VIRTUAL_MFA_DEVICES: &str = "iam:ListVirtualMFADevices";
+
 /// `iam:UploadSigningCertificate`.
 pub const UPLOAD_SIGNING_CERTIFICATE: &str = "iam:UploadSigningCertificate";
 

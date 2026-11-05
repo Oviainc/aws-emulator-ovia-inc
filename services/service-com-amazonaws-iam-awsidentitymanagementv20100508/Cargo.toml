@@ -37,6 +37,14 @@ pkcs8 = { version = "0.10", features = ["pem", "std"] }
 pkcs1 = "0.7"
 # The SEC1 elliptic-curve private key structure, for that same match on an EC key pair.
 sec1 = "0.7"
+# Encodes the `otpauth://` URI of a virtual MFA device as the QR code
+# `CreateVirtualMFADevice` answers with (`VirtualMFADevice$QRCodePNG`).
+qrcode = { version = "0.14", default-features = false }
+# Writes that QR code as the PNG image the same member carries.
+png = "0.18"
+# Spells a minted virtual MFA device seed in base32, "as specified in RFC3548"
+# (`VirtualMFADevice$Base32StringSeed`).
+data-encoding = "2"
 # Hashes a console password into the salted verifier the account holds in place of it, so
 # `ChangePassword` can check the caller's current password without the password being kept.
 sha2 = { workspace = true }
