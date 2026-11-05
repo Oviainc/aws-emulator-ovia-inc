@@ -167,8 +167,8 @@ async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Answer {
     }
 }
 
-/// The host a bucket of this Region is addressed at, which is what an S3 origin's
-/// `DomainName` carries.
+/// The host a bucket of this Region is addressed at VIRTUAL-HOSTED style, which is what an S3
+/// origin's `DomainName` carries and what the edge's own origin fetch is addressed to.
 fn origin_domain(bucket: &str) -> String {
     format!("{bucket}.s3.{REGION}.amazonaws.com")
 }

@@ -28,7 +28,11 @@
 //! * the third is the permission boundary as a DIFFERENTIAL, the shape a client verifies it
 //!   with: two sibling rules on one stream, one permitted and one not, with the permitted
 //!   leg's message delivered and the unpermitted leg's never — over several message pairs,
-//!   so neither leg can be right by accident.
+//!   so neither leg can be right by accident;
+//! * the fourth varies WHICH RULES the store holds when the message is published — one rule
+//!   as created, a second rule whose filter also covers the topic, a rule enabled or disabled
+//!   through `EnableTopicRule` / `DisableTopicRule` after it was created, one `DeleteTopicRule`
+//!   removed, a publish carrying the MQTT RETAIN flag, and a publish the broker refuses.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -170,20 +174,71 @@ impl Emulator {
     /// `Publish` of the IoT data plane: `POST /topics/{topic}` at QoS 1, the call the
     /// rules engine runs on. An accepted publish is a 200 whatever the rules did with it.
     async fn publish(&self, case: &str, topic: &str, payload: &[u8]) {
+        let answer = self.publish_message(topic, payload, false).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: Publish({topic}) answered {} {}",
+            answer.status,
+            answer.text()
+        );
+    }
+
+    /// The same `Publish`, with the MQTT RETAIN flag `retain` (the `retain` query parameter
+    /// the operation binds it to), answered with whatever the broker said — so a case can
+    /// assert both an accepted publish and one the broker refuses.
+    async fn publish_message(&self, topic: &str, payload: &[u8], retain: bool) -> Answer {
+        self.send(
+            "POST",
+            &format!("/topics/{}?qos=1&retain={retain}", encode_component(topic)),
+            "iotdata",
+            "application/octet-stream",
+            &[],
+            payload.to_vec(),
+        )
+        .await
+    }
+
+    /// `EnableTopicRule` (`POST /rules/{ruleName}/enable`) and `DisableTopicRule`
+    /// (`POST /rules/{ruleName}/disable`): the calls that move a stored rule's
+    /// `ruleDisabled` after it was created.
+    async fn set_rule_enabled(&self, case: &str, rule_name: &str, enabled: bool) {
+        let leaf = if enabled { "enable" } else { "disable" };
         let answer = self
             .send(
                 "POST",
-                &format!("/topics/{}?qos=1", encode_component(topic)),
-                "iotdata",
-                "application/octet-stream",
+                &format!("/rules/{rule_name}/{leaf}"),
+                "iot",
+                "application/json",
                 &[],
-                payload.to_vec(),
+                Vec::new(),
             )
             .await;
         assert_eq!(
             answer.status,
             200,
-            "case {case:?}: Publish({topic}) answered {} {}",
+            "case {case:?}: {leaf} of {rule_name} answered {} {}",
+            answer.status,
+            answer.text()
+        );
+    }
+
+    /// `DeleteTopicRule`: the `DELETE /rules/{ruleName}` that takes a rule out of the store.
+    async fn delete_topic_rule(&self, case: &str, rule_name: &str) {
+        let answer = self
+            .send(
+                "DELETE",
+                &format!("/rules/{rule_name}"),
+                "iot",
+                "application/json",
+                &[],
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: DeleteTopicRule({rule_name}) answered {} {}",
             answer.status,
             answer.text()
         );
@@ -983,4 +1038,200 @@ async fn only_the_permitted_sibling_rules_messages_reach_the_stream() {
         markers.len(),
         "case {case:?}: expected one record per permitted publish and no others, got {held:?}"
     );
+}
+
+/// The topic the store table publishes to, and the rules it stores for it: one whose filter
+/// names the topic exactly and one whose multi-level filter also covers it.
+const STORE_TOPIC: &str = "sensors/store";
+const STORE_RULE: &str = "to_the_store_stream";
+const SECOND_STORE_RULE: &str = "also_to_the_store_stream";
+const SECOND_KEY: &str = "by-fleet";
+
+/// The SQL version a client writes on a rule, as the two recorded checks send it.
+const SQL_VERSION: &str = "2016-03-23";
+
+/// What the case leaves in the RULE STORE before it publishes. The rules a message runs are
+/// the ones the store holds at that moment, whatever control-plane calls got it there — so
+/// each variant is one history, not one request shape.
+#[derive(Debug, Clone, Copy)]
+enum History {
+    /// The one rule, exactly as `CreateTopicRule` stored it.
+    AsCreated,
+    /// A second enabled rule, whose multi-level filter ALSO covers the topic: both rules are
+    /// about this message, so both perform their actions.
+    SecondCoveringRule,
+    /// The rule was created disabled and then enabled through `EnableTopicRule`.
+    EnabledAfterCreate,
+    /// The rule was created enabled and then disabled through `DisableTopicRule`.
+    DisabledAfterCreate,
+    /// The rule was taken out of the store through `DeleteTopicRule`.
+    DeletedAfterCreate,
+}
+
+/// One row of the store table: the history, the publish, and the records the stream holds
+/// afterwards.
+struct StoreRow {
+    case: &'static str,
+    history: History,
+    /// Whether the publish sets the MQTT RETAIN flag: a retained message is still a message
+    /// the broker accepted, so the rules engine runs on it too.
+    retain: bool,
+    /// The topic published to and the status the broker answers it with. A topic carrying a
+    /// subscription wildcard is one the broker refuses, and a refused publish is no message
+    /// at all, so no rule runs for it even where a filter covers its text.
+    topic: &'static str,
+    status: u16,
+    /// The partition keys of the records the stream must hold afterwards — one per action
+    /// performed, each carrying [`MESSAGE`].
+    expected: Vec<&'static str>,
+}
+
+impl StoreRow {
+    /// A row publishing [`STORE_TOPIC`] without the RETAIN flag, accepted, delivering the
+    /// message once under [`KEY`].
+    fn new(case: &'static str, history: History) -> Self {
+        Self {
+            case,
+            history,
+            retain: false,
+            topic: STORE_TOPIC,
+            status: 200,
+            expected: vec![KEY],
+        }
+    }
+
+    fn delivers_nothing(mut self) -> Self {
+        self.expected = Vec::new();
+        self
+    }
+
+    fn delivering(mut self, keys: Vec<&'static str>) -> Self {
+        self.expected = keys;
+        self
+    }
+
+    fn retained(mut self) -> Self {
+        self.retain = true;
+        self
+    }
+
+    /// The publish the broker refuses with `status`, which therefore runs no rule.
+    fn refused(mut self, topic: &'static str, status: u16) -> Self {
+        self.topic = topic;
+        self.status = status;
+        self.expected = Vec::new();
+        self
+    }
+}
+
+fn store_rows() -> Vec<StoreRow> {
+    vec![
+        StoreRow::new("one enabled rule, as created", History::AsCreated),
+        StoreRow::new(
+            "two enabled rules whose filters both cover the topic",
+            History::SecondCoveringRule,
+        )
+        .delivering(vec![KEY, SECOND_KEY]),
+        StoreRow::new(
+            "a rule created disabled and then enabled",
+            History::EnabledAfterCreate,
+        ),
+        StoreRow::new(
+            "a rule created enabled and then disabled",
+            History::DisabledAfterCreate,
+        )
+        .delivers_nothing(),
+        StoreRow::new("a rule the store no longer holds", History::DeletedAfterCreate)
+            .delivers_nothing(),
+        StoreRow::new("a publish carrying the RETAIN flag", History::AsCreated).retained(),
+        StoreRow::new(
+            "a publish the broker refuses for a wildcard topic",
+            History::SecondCoveringRule,
+        )
+        // `sensors/#` covers the text `sensors/+`, but the broker never takes a publish to a
+        // topic carrying a subscription wildcard, so neither rule runs.
+        .refused("sensors/+", 400),
+    ]
+}
+
+/// The rules a published message runs are the ENABLED rules the store holds when it is
+/// published — every one of them whose filter covers the topic, none that was disabled or
+/// deleted, and only for a message the broker accepted.
+#[tokio::test]
+async fn the_rules_a_publish_runs_are_the_enabled_ones_the_store_holds_then() {
+    for row in store_rows() {
+        let emulator = emulator();
+        let stream_arn = given_stream(&emulator, row.case, STREAM).await;
+        let role_arn = given_writer_role(&emulator, row.case, &stream_arn).await;
+        emulator
+            .create_topic_rule(
+                row.case,
+                STORE_RULE,
+                &json!({
+                    "sql": format!("SELECT * FROM '{STORE_TOPIC}'"),
+                    "awsIotSqlVersion": SQL_VERSION,
+                    "ruleDisabled": matches!(row.history, History::EnabledAfterCreate),
+                    "actions": [kinesis_action(&role_arn, Some(KEY))],
+                }),
+            )
+            .await;
+        match row.history {
+            History::AsCreated => {}
+            History::SecondCoveringRule => {
+                emulator
+                    .create_topic_rule(
+                        row.case,
+                        SECOND_STORE_RULE,
+                        &json!({
+                            "sql": "SELECT * FROM 'sensors/#'",
+                            "awsIotSqlVersion": SQL_VERSION,
+                            "ruleDisabled": false,
+                            "actions": [kinesis_action(&role_arn, Some(SECOND_KEY))],
+                        }),
+                    )
+                    .await;
+            }
+            History::EnabledAfterCreate => {
+                emulator.set_rule_enabled(row.case, STORE_RULE, true).await;
+            }
+            History::DisabledAfterCreate => {
+                emulator.set_rule_enabled(row.case, STORE_RULE, false).await;
+            }
+            History::DeletedAfterCreate => {
+                emulator.delete_topic_rule(row.case, STORE_RULE).await;
+            }
+        }
+
+        let answer = emulator
+            .publish_message(row.topic, MESSAGE.as_bytes(), row.retain)
+            .await;
+        assert_eq!(
+            answer.status,
+            row.status,
+            "case {:?}: Publish({}) answered {} {}, expected {}",
+            row.case,
+            row.topic,
+            answer.status,
+            answer.text(),
+            row.status
+        );
+
+        let held = records(&emulator, row.case, STREAM).await;
+        let mut keys: Vec<&str> = held.iter().map(|record| record.key.as_str()).collect();
+        keys.sort_unstable();
+        let mut expected = row.expected.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "case {:?}: expected records under {expected:?}, got {held:?}",
+            row.case
+        );
+        for record in &held {
+            assert!(
+                data_matches(MESSAGE, &record.data),
+                "case {:?}: a record must carry the published message, got {record:?}",
+                row.case
+            );
+        }
+    }
 }
