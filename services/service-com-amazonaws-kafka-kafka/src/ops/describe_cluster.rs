@@ -187,6 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // The cluster's own resource-based policy is in force on this action too
+        // — it is one of the actions an MSK cluster policy governs — and an
+        // explicit deny in it refuses the read before anything about the cluster
+        // is reported. See [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
+        crate::state::authorization::authorize_cluster_policy(Self::NAME, cluster)?;
         // `ClusterInfo` describes a provisioned cluster's broker nodes, ZooKeeper
         // ensemble and Apache Kafka version, so it cannot describe a cluster that
         // has none: a serverless cluster is reported by `DescribeClusterV2`,

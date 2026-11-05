@@ -18,8 +18,8 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    sleep_past_vpc_connection_activation, vpc_connection_uri, ClusterRequest, ConnectionRequest,
-    Emulator, ACCOUNT, REGION,
+    sleep_past_vpc_connection_activation, vpc_connection_uri, ConnectionRequest, Emulator, ACCOUNT,
+    REGION,
 };
 
 /// Every member `DescribeVpcConnectionResponse` declares, so a suite can assert
@@ -36,10 +36,14 @@ const DESCRIBE_MEMBERS: &[&str] = &[
     "tags",
 ];
 
-/// A minimal provisioned cluster in this suite's signing region: a VPC
-/// connection is always made to one, so every suite below needs a target.
+/// A provisioned cluster in this suite's signing region that Amazon MSK admits a
+/// VPC connection to — settled, and with every client authentication a connection
+/// may ask for turned on, which is what MSK requires of the target. A VPC
+/// connection is always made to one, so every suite below needs such a target;
+/// the preconditions themselves are the subject of
+/// `vpc_connection_admission.rs`.
 async fn cluster(emulator: &Emulator, name: &str) -> String {
-    emulator.create_ok(&ClusterRequest::named(name)).await
+    emulator.vpc_connection_target(name).await
 }
 
 /// RULE: a created VPC connection is persisted whole, and `DescribeVpcConnection`
@@ -498,9 +502,7 @@ async fn delete_is_observable_by_every_later_reader() {
 async fn create_refuses_a_request_it_cannot_act_on() {
     let emulator = Emulator::new();
     let target = cluster(&emulator, "valid-target").await;
-    let elsewhere = emulator
-        .create_ok_in("eu-west-1", &ClusterRequest::named("other-region"))
-        .await;
+    let elsewhere = emulator.vpc_connection_target_in("eu-west-1", "other-region").await;
     let valid = ConnectionRequest::to(&target);
 
     // Rows: one per way a request can be unusable, plus the shapes that must
@@ -612,15 +614,11 @@ async fn create_refuses_a_request_it_cannot_act_on() {
             },
             false,
         ),
-        // Target cluster: not an ARN, a well-formed cluster ARN nothing holds,
-        // and a live cluster belonging to ANOTHER region.
-        (
-            ConnectionRequest {
-                target_cluster_arn: "not-an-arn".to_string(),
-                ..valid.clone()
-            },
-            false,
-        ),
+        // Target cluster: a well-formed cluster ARN nothing holds, and a live
+        // cluster belonging to ANOTHER region. A value that is not a cluster ARN
+        // at all never reaches this validation — the authorization decision over
+        // the resource the request names answers it first
+        // (`vpc_connection_admission.rs`).
         (
             ConnectionRequest {
                 target_cluster_arn: format!(

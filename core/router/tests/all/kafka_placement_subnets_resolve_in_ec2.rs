@@ -228,6 +228,10 @@ fn v2_serverless_body(name: &str, vpc_configs: &[Vec<String>]) -> Value {
 }
 
 /// A `CreateVpcConnection` body reaching `cluster` from `subnets`.
+///
+/// Amazon MSK serves a connection only for a client-authentication scheme the target
+/// cluster turns on, so the cluster this body names is created with SASL/IAM on
+/// ([`v1_body_with_sasl_iam`]).
 fn connection_body(cluster: &str, vpc: &str, subnets: &[String]) -> Value {
     json!({
         "targetClusterArn": cluster,
@@ -236,6 +240,15 @@ fn connection_body(cluster: &str, vpc: &str, subnets: &[String]) -> Value {
         "clientSubnets": subnets,
         "securityGroups": ["sg-0a1b2c3d"],
     })
+}
+
+/// The same `CreateCluster` body with SASL/IAM client authentication turned on — the
+/// scheme the VPC connection below asks for, which Amazon MSK requires the target cluster
+/// to turn on before it serves the connection.
+fn v1_body_with_sasl_iam(name: &str, brokers: u32, subnets: &[String]) -> Value {
+    let mut body = v1_body(name, brokers, subnets);
+    body["clientAuthentication"] = json!({ "sasl": { "iam": { "enabled": true } } });
+    body
 }
 
 /// Create a cluster through `CreateCluster`, assert it succeeded, and answer its ARN.
@@ -474,7 +487,7 @@ async fn msk_placement_subnets_resolve_against_ec2() {
     // was placed in.
     let provisioned = create_v1_ok(
         &router,
-        v1_body("resolved-v1", 3, &network.subnets),
+        v1_body_with_sasl_iam("resolved-v1", 3, &network.subnets),
         "a v1 create placed in EC2's own three subnets",
     )
     .await;
@@ -528,6 +541,13 @@ async fn msk_placement_subnets_resolve_against_ec2() {
         );
     }
 
+    // Amazon MSK manages a VPC connection only from a cluster state in which the cluster
+    // HAS brokers, so the connection below is made once the clock owes this cluster its
+    // `CREATING` -> `ACTIVE` transition — the span the cluster record stored.
+    std::thread::sleep(
+        service_com_amazonaws_kafka_kafka::state::CLUSTER_ACTIVATION_DELAY
+            + std::time::Duration::from_millis(250),
+    );
     let connected = kafka(
         &router,
         "POST",

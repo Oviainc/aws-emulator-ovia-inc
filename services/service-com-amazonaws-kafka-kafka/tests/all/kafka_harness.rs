@@ -229,6 +229,23 @@ impl Emulator {
             .to_string()
     }
 
+    /// A cluster Amazon MSK would admit a VPC connection to, settled: the target
+    /// [`ClusterRequest::vpc_connection_target`] builds, created and then waited
+    /// past its `CREATING` span, which is what MSK requires before any
+    /// VPC-connection operation on it is served. Hands back the minted ARN.
+    pub async fn vpc_connection_target(&self, name: &str) -> String {
+        self.vpc_connection_target_in(REGION, name).await
+    }
+
+    /// The same target, created under `region`'s endpoint.
+    pub async fn vpc_connection_target_in(&self, region: &str, name: &str) -> String {
+        let arn = self
+            .create_ok_in(region, &ClusterRequest::vpc_connection_target(name))
+            .await;
+        sleep_past_activation();
+        arn
+    }
+
     /// `CreateConfiguration`, which the model binds to
     /// `POST /v1/configurations`. `description` is `None` where the request
     /// omits the member; a blob member travels base64-encoded in a restJson1
@@ -708,6 +725,24 @@ impl ClusterRequest {
             vpc_scram: None,
             vpc_iam: None,
             tags: Vec::new(),
+        }
+    }
+
+    /// A cluster Amazon MSK admits a VPC connection to: every client
+    /// authentication a connection may ask for
+    /// (`VPC_CONNECTION_AUTHENTICATION_TYPES`) is turned on for the cluster's
+    /// multi-VPC connectivity, and the two SASL schemes at the cluster level too.
+    /// MSK serves `CreateVpcConnection` only for a scheme the target cluster turns
+    /// on, so every suite whose rule is about the CONNECTION rather than about
+    /// that precondition builds its target from this.
+    pub fn vpc_connection_target(name: &str) -> Self {
+        Self {
+            sasl_scram: Some(true),
+            sasl_iam: Some(true),
+            vpc_tls: Some(true),
+            vpc_scram: Some(true),
+            vpc_iam: Some(true),
+            ..Self::named(name)
         }
     }
 

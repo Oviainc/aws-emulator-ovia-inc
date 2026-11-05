@@ -117,6 +117,8 @@ mod topic_lookup_miss_refusal;
 mod topic_replication;
 #[path = "all/version_catalog_consistency.rs"]
 mod version_catalog_consistency;
+#[path = "all/vpc_connection_admission.rs"]
+mod vpc_connection_admission;
 #[path = "all/vpc_connection_contention.rs"]
 mod vpc_connection_contention;
 #[path = "all/vpc_connection_lifecycle.rs"]

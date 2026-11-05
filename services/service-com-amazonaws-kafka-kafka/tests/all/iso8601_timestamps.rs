@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use crate::kafka_harness::{
     configuration_rows, pct, reported_instant_secs, sleep_past_activation, sleep_past_update,
-    sleep_past_vpc_connection_activation, ClusterRequest, ConnectionRequest, Emulator, Reply,
+    sleep_past_vpc_connection_activation, ConnectionRequest, Emulator, Reply,
 };
 
 /// Now, in seconds since the epoch: the clock a row's window is taken from.
@@ -248,9 +248,7 @@ async fn every_configuration_path_reports_iso8601_date_times() {
 async fn every_other_timestamp_member_is_an_iso8601_date_time() {
     let emulator = Emulator::new();
     let before = now_secs();
-    let cluster_arn = emulator
-        .create_ok(&ClusterRequest::named("timestamp-forms"))
-        .await;
+    let cluster_arn = emulator.vpc_connection_target("timestamp-forms").await;
     sleep_past_activation();
     let window = (before - 1.0, now_secs() + 1.0);
 

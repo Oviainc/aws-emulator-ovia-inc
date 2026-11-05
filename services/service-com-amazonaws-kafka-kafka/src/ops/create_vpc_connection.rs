@@ -7,6 +7,16 @@
 //! [`crate::state::VpcConnection`]; this handler validates the request and
 //! mints it.
 //!
+//! The TARGET CLUSTER is what admits the request, so it is asked first and in
+//! Amazon MSK's own order: whether the caller may perform
+//! `kafka:CreateVpcConnection` on the resource the request names at all
+//! ([`crate::state::authorization`], the cluster's resource-based policy
+//! included), then whether the cluster's STATE serves a VPC-connection operation,
+//! then whether the cluster turns on the client authentication the connection asks
+//! for ([`crate::state::vpc_connection_admission`] for both). Only then is the
+//! rest of the body read, so a cluster that cannot serve private connectivity is
+//! reported as such whatever else the request carried.
+//!
 //! `ClientSubnets` names the subnets the connection's elastic network interfaces
 //! are created in. Those subnets are EC2's, not this service's, so they are
 //! resolved against the account's EC2 inventory
@@ -162,11 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Decided FIRST, on the target cluster's ARN as submitted and from the
-        // request alone: the caller holds no resource-based policy over a cluster
-        // of another account, so such a request is refused rather than answered
-        // out of what this registry happens to hold under that ARN. See
-        // [`crate::state::authorization`].
-        crate::state::authorization::authorize_operation(Self::NAME, &input.target_cluster_arn)?;
+        // request alone: `kafka:CreateVpcConnection` applies to a CLUSTER, so a
+        // request naming a cluster of another account — or naming no cluster of
+        // this one at all — reaches no grant, and is refused rather than answered
+        // out of what this registry happens to hold under that ARN or told which
+        // of its members looks wrong. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_target_cluster(
+            Self::NAME,
+            &input.target_cluster_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateVpcConnectionErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -177,28 +191,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
-        // Everything that depends on the request alone is checked before the
-        // registry lock is taken. `CreateVpcConnection` models no
-        // `NotFoundException`, so every unusable request member — including a
-        // target cluster that does not exist — is refused as a bad request.
-        if !crate::state::is_cluster_arn(&input.target_cluster_arn) {
-            return Err(CreateVpcConnectionErrorModeled::BadRequestException(
-                crate::state::malformed_arn(crate::state::TARGET_CLUSTER_ARN_MEMBER),
-            )
-            .into());
-        }
-        let authentication_types = crate::state::VPC_CONNECTION_AUTHENTICATION_TYPES;
-        if !authentication_types.contains(&input.authentication.as_str()) {
-            return Err(bad_request(
-                "Authentication",
-                format!(
-                    "Authentication must be one of {}, not '{}'.",
-                    authentication_types.join(", "),
-                    input.authentication
-                ),
-            ));
-        }
+        // The TARGET CLUSTER is what decides whether a VPC connection can be made
+        // at all, so it is resolved and asked BEFORE the rest of the body is
+        // validated: a caller that wired up private connectivity before the
+        // cluster could serve it is told about the cluster, and told the same
+        // thing whether or not the rest of its request was usable.
+        //
+        // The registry lock is held for these decisions only, and released before
+        // the subnet resolution below, which calls out over the in-process
+        // callback.
+        let (cluster_arn, cluster_name) = {
+            let mut state = state.lock();
+
+            // A regional endpoint only knows its own region's clusters, so a
+            // target ARN from another region is as unusable as one that names
+            // nothing. Reading the cluster through the settling lookup
+            // materialises the `CREATING` -> `ACTIVE` transition the clock
+            // already owed THAT cluster, which was due at the same instant
+            // whether or not anybody called.
+            let Some(cluster) = state.settled_cluster_in(&region, &input.target_cluster_arn, now)
+            else {
+                // `CreateVpcConnection` models no `NotFoundException`, so a
+                // reference this endpoint cannot resolve is refused as a bad
+                // parameter, in the service's one fixed sentence for one — which
+                // carries nothing of the request.
+                return Err(bad_request(
+                    crate::state::TARGET_CLUSTER_ARN_MEMBER,
+                    crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+                ));
+            };
+            cluster_admits_connection(Self::NAME, cluster, &input.authentication)?;
+            (cluster.arn.clone(), cluster.name.clone())
+        };
+
+        // What is left depends on the request alone, and is checked before
+        // anything is minted.
         if !crate::state::is_ec2_resource_id("vpc", &input.vpc_id) {
             return Err(bad_request(
                 "VpcId",
@@ -253,26 +282,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
 
-        // A regional endpoint only knows its own region's clusters, so a target
-        // ARN from another region is as unusable as one that names nothing.
-        // Reading the cluster through the settling lookup materialises the
-        // `CREATING` -> `ACTIVE` transition the clock already owed THAT cluster,
-        // which was due at the same instant whether or not anybody called.
-        let now = std::time::SystemTime::now();
-        let (cluster_arn, cluster_name) =
-            match state.settled_cluster_in(&region, &input.target_cluster_arn, now) {
-                Some(cluster) => (cluster.arn.clone(), cluster.name.clone()),
-                None => {
-                    return Err(bad_request(
-                        "TargetClusterArn",
-                        // This operation models no `NotFoundException`, so the
-                        // reference is refused as a bad parameter, in the
-                        // service's one fixed sentence for one — which carries
-                        // nothing of the request.
-                        crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
-                    ))
-                }
-            };
+        // Asked again, under the lock the connection is registered with: the
+        // cluster has to still be there to be connected to, and every decision it
+        // took above is a function of its record, which another request may have
+        // changed while the subnets were resolved. So the connection is registered
+        // only against a cluster that admits it at the instant it is registered.
+        match state.settled_cluster_in(&region, &cluster_arn, now) {
+            Some(cluster) => {
+                cluster_admits_connection(Self::NAME, cluster, &input.authentication)?
+            }
+            None => {
+                return Err(bad_request(
+                    crate::state::TARGET_CLUSTER_ARN_MEMBER,
+                    crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+                ))
+            }
+        }
 
         // The monotonic counter is what makes each connection's ARN distinct; it
         // advances whether or not anything else about the request repeats an
@@ -350,4 +375,59 @@ fn bad_request(parameter: &str, message: String) -> CreateVpcConnectionError {
         message: Some(message),
     })
     .into()
+}
+
+/// Every decision the TARGET CLUSTER takes about this create, in Amazon MSK's
+/// order: the cluster's own resource-based policy, then its state, then the
+/// client authentication the connection asks for — with the scheme checked
+/// against the published set in between, since a scheme this service does not
+/// publish is a bad parameter rather than something a cluster can be asked
+/// about.
+///
+/// A function of the STORED record and the request alone: it writes nothing, so
+/// it is taken on the cluster as the first lock saw it and again on the cluster
+/// as the lock that registers the connection sees it.
+fn cluster_admits_connection(
+    operation: &str,
+    cluster: &crate::state::Cluster,
+    authentication: &str,
+) -> Result<(), CreateVpcConnectionError> {
+    // An explicit deny refuses the call ahead of every precondition below: a
+    // caller told its permissions are the problem must not also learn how the
+    // cluster is configured.
+    crate::state::authorization::authorize_cluster_policy(operation, cluster)?;
+
+    // The cluster's STATE next: a connection is placed onto brokers the cluster
+    // has, and a cluster still being provisioned has none yet.
+    if !crate::state::vpc_connection_admission::vpc_connections_managed_from_cluster_state(
+        &cluster.state,
+    ) {
+        return Err(bad_request(
+            crate::state::TARGET_CLUSTER_ARN_MEMBER,
+            crate::state::vpc_connection_admission::invalid_cluster_state_for_vpc_connection_message(),
+        ));
+    }
+
+    let authentication_types = crate::state::VPC_CONNECTION_AUTHENTICATION_TYPES;
+    if !authentication_types.contains(&authentication) {
+        return Err(bad_request(
+            "Authentication",
+            format!(
+                "Authentication must be one of {}, not '{authentication}'.",
+                authentication_types.join(", ")
+            ),
+        ));
+    }
+    if !crate::state::vpc_connection_admission::client_authentication_enabled(
+        cluster,
+        authentication,
+    ) {
+        return Err(bad_request(
+            crate::state::TARGET_CLUSTER_ARN_MEMBER,
+            crate::state::vpc_connection_admission::client_authentication_not_enabled_message(
+                authentication,
+            ),
+        ));
+    }
+    Ok(())
 }

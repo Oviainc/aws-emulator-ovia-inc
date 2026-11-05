@@ -148,9 +148,7 @@ const MAX_PLACEMENT_SUBNETS: usize =
 #[tokio::test]
 async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
     let emulator = Emulator::new();
-    let cluster = emulator
-        .create_ok(&ClusterRequest::named("ceiling-connection-target"))
-        .await;
+    let cluster = emulator.vpc_connection_target("ceiling-connection-target").await;
 
     // Distinct ids in Amazon EC2's 8-hex form, as many as the row needs.
     let ids = |count: usize| -> Vec<String> {
@@ -240,9 +238,7 @@ async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
 #[tokio::test]
 async fn a_vpc_connection_keeps_the_subnets_it_was_given() {
     let emulator = Emulator::new();
-    let cluster = emulator
-        .create_ok(&ClusterRequest::named("ungrounded-connection-target"))
-        .await;
+    let cluster = emulator.vpc_connection_target("ungrounded-connection-target").await;
 
     for (index, (form, subnet)) in UNRESOLVED_SUBNETS.iter().enumerate() {
         let subnets = vec![*subnet, UNRESOLVED_SUBNETS[1 - index].1];

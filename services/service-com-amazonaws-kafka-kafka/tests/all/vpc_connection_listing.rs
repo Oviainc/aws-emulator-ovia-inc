@@ -18,7 +18,7 @@ use serde_json::json;
 use service_com_amazonaws_kafka_kafka::state::VPC_CONNECTION_AUTHENTICATION_TYPES;
 
 use crate::kafka_harness::{
-    pct, sleep_past_vpc_connection_activation, ClusterRequest, ConnectionRequest, Emulator, REGION,
+    pct, sleep_past_vpc_connection_activation, ConnectionRequest, Emulator, REGION,
 };
 
 /// The largest page `MaxResults` may ask for, from that member's `range` in the
@@ -119,8 +119,8 @@ async fn walk_pages(
 #[tokio::test]
 async fn the_listing_reports_the_stored_record_of_every_connection() {
     let emulator = Emulator::new();
-    let target_one = emulator.create_ok(&ClusterRequest::named("listed-one")).await;
-    let target_two = emulator.create_ok(&ClusterRequest::named("listed-two")).await;
+    let target_one = emulator.vpc_connection_target("listed-one").await;
+    let target_two = emulator.vpc_connection_target("listed-two").await;
 
     // The rows differ along everything the rule generalises over: the
     // authentication type, the EC2 id form, the subnet and security-group
@@ -236,7 +236,7 @@ async fn the_listing_pages_every_connection_exactly_once() {
     // count.
     for count in 1..=4usize {
         let emulator = Emulator::new();
-        let target = emulator.create_ok(&ClusterRequest::named("paged")).await;
+        let target = emulator.vpc_connection_target("paged").await;
         let mut created = BTreeSet::new();
         for index in 0..count {
             // The rows differ in authentication type and subnet count, so
@@ -277,7 +277,7 @@ async fn the_listing_pages_every_connection_exactly_once() {
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
     let emulator = Emulator::new();
-    let target = emulator.create_ok(&ClusterRequest::named("bounded")).await;
+    let target = emulator.vpc_connection_target("bounded").await;
     emulator
         .create_vpc_connection_ok(&ConnectionRequest::to(&target))
         .await;
@@ -328,7 +328,7 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn the_listing_reports_the_state_the_clock_owes() {
     let emulator = Emulator::new();
-    let target = emulator.create_ok(&ClusterRequest::named("clocked")).await;
+    let target = emulator.vpc_connection_target("clocked").await;
     // Rows differ in authentication type and size, so the transition is not
     // keyed to one shape of input.
     let rows = [
@@ -394,9 +394,7 @@ async fn the_listing_is_regional() {
     let rows: Vec<(&str, usize)> = vec![("us-west-2", 1), ("eu-west-1", 3), ("ap-southeast-2", 2)];
     let mut by_region: Vec<(&str, BTreeSet<String>)> = Vec::new();
     for (region, count) in &rows {
-        let target = emulator
-            .create_ok_in(region, &ClusterRequest::named("regional"))
-            .await;
+        let target = emulator.vpc_connection_target_in(region, "regional").await;
         let mut arns = BTreeSet::new();
         for index in 0..*count {
             let request = ConnectionRequest {
@@ -436,7 +434,7 @@ async fn the_listing_is_regional() {
 #[tokio::test]
 async fn a_deleted_connection_leaves_the_listing() {
     let emulator = Emulator::new();
-    let target = emulator.create_ok(&ClusterRequest::named("shrinking")).await;
+    let target = emulator.vpc_connection_target("shrinking").await;
     let mut live: Vec<String> = Vec::new();
     for index in 0..3 {
         let request = ConnectionRequest {
@@ -472,15 +470,13 @@ async fn a_deleted_connection_leaves_the_listing() {
 #[tokio::test]
 async fn a_pagination_token_from_elsewhere_is_refused() {
     let emulator = Emulator::new();
-    let target = emulator.create_ok(&ClusterRequest::named("tokens")).await;
+    let target = emulator.vpc_connection_target("tokens").await;
     emulator
         .create_vpc_connection_ok(&ConnectionRequest::to(&target))
         .await;
     // A second cluster, so `ListClusters` has a page to break and mints a token
     // of its own.
-    emulator
-        .create_ok(&ClusterRequest::named("tokens-two"))
-        .await;
+    emulator.vpc_connection_target("tokens-two").await;
     let clusters_page = emulator.list("?maxResults=1").await;
     let foreign_token = clusters_page
         .at("/nextToken")

@@ -237,6 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The cluster's own resource-based policy is in force on this action too
+        // — it is one of the actions an MSK cluster policy governs — and an
+        // explicit deny in it refuses the read before any endpoint is reported.
+        // See [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
+        crate::state::authorization::authorize_cluster_policy(Self::NAME, cluster)?;
+
         // A cluster the service is still provisioning has no brokers yet, so
         // there are no endpoints to bootstrap against: the reader refuses rather
         // than reporting hostnames nothing is serving on. Checked for either

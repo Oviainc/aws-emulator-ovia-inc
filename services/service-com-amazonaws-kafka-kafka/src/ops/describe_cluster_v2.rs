@@ -198,6 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // The cluster's own resource-based policy is in force on this action too
+        // — it is one of the actions an MSK cluster policy governs — and an
+        // explicit deny in it refuses the read before anything about the cluster
+        // is reported. See [`crate::state::authorization::CLUSTER_POLICY_ACTIONS`].
+        crate::state::authorization::authorize_cluster_policy(Self::NAME, cluster)?;
         Ok(DescribeClusterV2Output {
             cluster_info: Some(cluster.to_cluster_v2()),
         })

@@ -5,6 +5,14 @@
 //! every later reader answers as if it never existed. The record is
 //! [`crate::state::VpcConnection`].
 //!
+//! Amazon MSK admits a delete from the same cluster states it admits a create
+//! from ([`crate::state::vpc_connection_admission`], whose one sentence names all
+//! three VPC-connection operations). No gate is applied here because no record
+//! this emulator holds can fail it: a connection exists only on a cluster that
+//! reached `ACTIVE`, and a cluster of this registry never leaves the states that
+//! serve a VPC-connection operation afterwards — the create is where the
+//! precondition is observable.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

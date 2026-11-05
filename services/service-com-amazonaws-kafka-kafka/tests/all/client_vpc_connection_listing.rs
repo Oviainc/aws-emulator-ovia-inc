@@ -26,8 +26,7 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    pct, sleep_past_vpc_connection_activation, ClusterRequest, ConnectionRequest, Emulator, Reply,
-    ACCOUNT, REGION,
+    pct, sleep_past_vpc_connection_activation, ConnectionRequest, Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// Every member the `ClientVpcConnection` shape carries (from
@@ -146,7 +145,7 @@ fn listed_state(listed: &Reply, arn: &str) -> Option<serde_json::Value> {
 #[tokio::test]
 async fn the_listing_reports_the_stored_record_of_every_connection_of_the_cluster() {
     let emulator = Emulator::new();
-    let target = emulator.create_ok(&ClusterRequest::named("client-listed")).await;
+    let target = emulator.vpc_connection_target("client-listed").await;
 
     // The rows differ along everything the rule generalises over: the
     // authentication type, the EC2 id form, the subnet and security-group
@@ -273,7 +272,7 @@ async fn the_listing_reports_only_the_named_clusters_connections() {
     let rows: Vec<(&str, usize)> = vec![("client-one", 1), ("client-two", 3), ("client-none", 0)];
     let mut by_cluster: Vec<(String, BTreeSet<String>)> = Vec::new();
     for (name, count) in &rows {
-        let cluster = emulator.create_ok(&ClusterRequest::named(name)).await;
+        let cluster = emulator.vpc_connection_target(name).await;
         let mut arns = BTreeSet::new();
         for index in 0..*count {
             let request = ConnectionRequest {
@@ -317,12 +316,10 @@ async fn the_listing_pages_every_connection_exactly_once() {
     // and exceeding the result count.
     for count in 1..=4usize {
         let emulator = Emulator::new();
-        let target = emulator.create_ok(&ClusterRequest::named("client-paged")).await;
+        let target = emulator.vpc_connection_target("client-paged").await;
         // A second cluster with connections of its own, so a page that leaked
         // across clusters would show up as a count that is too high.
-        let other = emulator
-            .create_ok(&ClusterRequest::named("client-paged-other"))
-            .await;
+        let other = emulator.vpc_connection_target("client-paged-other").await;
         let mut created = BTreeSet::new();
         for index in 0..count {
             // The rows differ in authentication type and subnet count, so
@@ -374,9 +371,7 @@ async fn the_listing_pages_every_connection_exactly_once() {
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
     let emulator = Emulator::new();
-    let target = emulator
-        .create_ok(&ClusterRequest::named("client-bounded"))
-        .await;
+    let target = emulator.vpc_connection_target("client-bounded").await;
     emulator
         .create_vpc_connection_ok(&ConnectionRequest::to(&target))
         .await;
@@ -423,9 +418,7 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn the_listing_reports_the_state_the_clock_owes() {
     let emulator = Emulator::new();
-    let target = emulator
-        .create_ok(&ClusterRequest::named("client-clocked"))
-        .await;
+    let target = emulator.vpc_connection_target("client-clocked").await;
     // Rows differ in authentication type and size, so the transition is not
     // keyed to one shape of input.
     let rows = [
@@ -477,9 +470,7 @@ async fn the_listing_is_regional() {
     let rows: Vec<(&str, usize)> = vec![("us-west-2", 1), ("eu-west-1", 3), ("ap-southeast-2", 2)];
     let mut by_region: Vec<(&str, String, BTreeSet<String>)> = Vec::new();
     for (region, count) in &rows {
-        let cluster = emulator
-            .create_ok_in(region, &ClusterRequest::named("client-regional"))
-            .await;
+        let cluster = emulator.vpc_connection_target_in(region, "client-regional").await;
         let mut arns = BTreeSet::new();
         for index in 0..*count {
             let request = ConnectionRequest {
@@ -533,9 +524,7 @@ async fn the_listing_is_regional() {
 #[tokio::test]
 async fn a_deleted_connection_leaves_the_listing() {
     let emulator = Emulator::new();
-    let target = emulator
-        .create_ok(&ClusterRequest::named("client-shrinking"))
-        .await;
+    let target = emulator.vpc_connection_target("client-shrinking").await;
     let mut live: Vec<String> = Vec::new();
     for index in 0..3 {
         let request = ConnectionRequest {
@@ -573,12 +562,8 @@ async fn a_deleted_connection_leaves_the_listing() {
 #[tokio::test]
 async fn an_unresolvable_request_is_refused() {
     let emulator = Emulator::new();
-    let live = emulator
-        .create_ok(&ClusterRequest::named("client-refusals"))
-        .await;
-    let other = emulator
-        .create_ok(&ClusterRequest::named("client-refusals-other"))
-        .await;
+    let live = emulator.vpc_connection_target("client-refusals").await;
+    let other = emulator.vpc_connection_target("client-refusals-other").await;
     for _ in 0..2 {
         emulator
             .create_vpc_connection_ok(&ConnectionRequest::to(&live))

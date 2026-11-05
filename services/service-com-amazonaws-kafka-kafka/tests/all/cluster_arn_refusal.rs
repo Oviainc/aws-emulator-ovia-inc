@@ -18,13 +18,15 @@
 //!
 //! The rows span both dimensions the rule generalises over: which operation
 //! answers (every cluster-scoped reader, update, delete and policy call, the two
-//! cluster-operation readers, plus the two that carry the ARN outside the URI
-//! path — `GetCompatibleKafkaVersions` in a query parameter and
-//! `CreateVpcConnection` in a body member of its own name) and what makes the
+//! cluster-operation readers, plus `GetCompatibleKafkaVersions`, which carries the
+//! ARN in a query parameter rather than in the URI path) and what makes the
 //! value unparsable (not an ARN at all, another service's namespace, another
 //! resource kind of this service, a cluster ARN missing or carrying an extra
 //! segment, one with an empty region, a truncated ARN, a very long opaque string
 //! and a non-ASCII one).
+//!
+//! `CreateVpcConnection` is outside this rule: its target is decided by
+//! authorization before anything parses it (`vpc_connection_admission.rs`).
 
 use std::collections::BTreeSet;
 
@@ -34,7 +36,7 @@ use serde_json::{json, Value};
 // by, so the suite and the handlers cannot drift apart on what the service says.
 use service_com_amazonaws_kafka_kafka::state::{
     BAD_REQUEST_MESSAGE, CLUSTER_ARN_MEMBER, CLUSTER_ARN_NOT_VALID_MESSAGE,
-    CLUSTER_OPERATION_ARN_MEMBER, TARGET_CLUSTER_ARN_MEMBER,
+    CLUSTER_OPERATION_ARN_MEMBER,
 };
 
 // The router harness, the signing region, the account id and the URI encoder
@@ -53,11 +55,6 @@ enum Carrier {
     },
     /// An `@httpQuery` member of `path`, under the query name the model gives it.
     Query {
-        path: &'static str,
-        name: &'static str,
-    },
-    /// A body member of `path`, under the member's own `jsonName`.
-    Member {
         path: &'static str,
         name: &'static str,
     },
@@ -82,21 +79,13 @@ impl Operation {
         match &self.carrier {
             Carrier::Label { prefix, suffix } => format!("{prefix}{}{suffix}", pct(arn)),
             Carrier::Query { path, name } => format!("{path}?{name}={}", pct(arn)),
-            Carrier::Member { path, .. } => (*path).to_string(),
         }
     }
 
-    /// The request body for `arn`: the row's body as given, with the ARN written
-    /// into the member that carries it where the operation takes it there.
-    fn body(&self, arn: &str) -> Option<Value> {
-        let mut body = self.body.clone();
-        if let Carrier::Member { name, .. } = &self.carrier {
-            let body = body
-                .as_mut()
-                .expect("an operation carrying the ARN in its body has a body");
-            body[*name] = json!(arn);
-        }
-        body
+    /// The request body the row sends, which carries no ARN: every operation this
+    /// rule covers takes the ARN in its URI.
+    fn body(&self) -> Option<Value> {
+        self.body.clone()
     }
 }
 
@@ -351,9 +340,15 @@ fn operations() -> Vec<Operation> {
             member: CLUSTER_ARN_MEMBER,
             message: CLUSTER_ARN_NOT_VALID_MESSAGE,
         },
-        // The two operations that carry the cluster ARN OUTSIDE the URI path:
-        // the rule is about the member that carried the value, not about where
-        // the request put it.
+        // The operation that carries the cluster ARN OUTSIDE the URI path and
+        // is still answered as a parameter problem: the rule is about the member
+        // that carried the value, not about where the request put it.
+        //
+        // `CreateVpcConnection` is NOT here. Amazon MSK decides whether the
+        // caller may perform `kafka:CreateVpcConnection` on the resource that
+        // request names before it resolves or parses the target, so a value that
+        // names no cluster is answered with the authorization refusal rather
+        // than with a parameter sentence — which is `vpc_connection_admission.rs`.
         Operation {
             name: "GetCompatibleKafkaVersions",
             method: "GET",
@@ -363,23 +358,6 @@ fn operations() -> Vec<Operation> {
             },
             body: None,
             member: CLUSTER_ARN_MEMBER,
-            message: BAD_REQUEST_MESSAGE,
-        },
-        Operation {
-            name: "CreateVpcConnection",
-            method: "POST",
-            carrier: Carrier::Member {
-                path: "/v1/vpc-connection",
-                name: "targetClusterArn",
-            },
-            body: Some(json!({
-                "targetClusterArn": "",
-                "authentication": "SASL_IAM",
-                "vpcId": "vpc-0a1b2c3d",
-                "clientSubnets": ["subnet-0a1b2c3d", "subnet-1a2b3c4d"],
-                "securityGroups": ["sg-0a1b2c3d"],
-            })),
-            member: TARGET_CLUSTER_ARN_MEMBER,
             message: BAD_REQUEST_MESSAGE,
         },
     ]
@@ -488,11 +466,7 @@ async fn every_cluster_operation_refuses_an_unparsable_arn_alike() {
     for (case, value) in malformed_values() {
         for operation in operations() {
             let reply = emulator
-                .call(
-                    operation.method,
-                    &operation.uri(&value),
-                    operation.body(&value),
-                )
+                .call(operation.method, &operation.uri(&value), operation.body())
                 .await;
             assert_unparsable_arn(
                 &reply,
@@ -540,11 +514,7 @@ async fn each_surface_answers_one_byte_identical_message() {
         let mut messages: BTreeSet<String> = BTreeSet::new();
         for (case, value) in malformed_values() {
             let reply = emulator
-                .call(
-                    operation.method,
-                    &operation.uri(&value),
-                    operation.body(&value),
-                )
+                .call(operation.method, &operation.uri(&value), operation.body())
                 .await;
             assert_eq!(
                 reply.status, 400,

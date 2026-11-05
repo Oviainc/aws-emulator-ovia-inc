@@ -25,8 +25,20 @@
 //! An ARN whose account segment IS the caller's is the owning account's own
 //! request, which this emulator has no identity-based policies to refuse it by, so
 //! it passes the gate and is resolved as usual. A value that is not an ARN at all
-//! carries no account to decide against; it passes too, and the handler's own ARN
-//! check answers it.
+//! carries no account to decide against, so the account test passes it; whether it
+//! is then refused depends on where the request carried it. An `@httpLabel` ARN
+//! names a path segment the caller can only have mistyped, and the handler's own
+//! ARN check answers it as the bad parameter it is. The TARGET of
+//! `CreateVpcConnection` is decided instead by [`authorize_target_cluster`]: the
+//! action applies to a cluster, so a value naming none leaves nothing for a policy
+//! to grant it on, and the decision — taken over [`ANY_RESOURCE`] — refuses the
+//! call before any member of the body is read.
+//!
+//! A cluster also carries a resource-based policy OF ITS OWN
+//! ([`authorize_cluster_policy`]), which the operations MSK's cluster policy
+//! governs ([`CLUSTER_POLICY_ACTIONS`]) take into account once the cluster is
+//! resolved: an explicit deny in it refuses the call whatever else allows it, and
+//! before the operation looks at anything else about the cluster or the request.
 //!
 //! Passing a ROLE to the service ([`authorize_pass_role`]) is the same question
 //! read the other way round, and it is the one case where a value that names no
@@ -34,10 +46,12 @@
 //! own account for the service to assume, so anything the account cannot be read
 //! out of names no such role.
 //!
-//! The refusal's wording is the shared IAM sentence
-//! ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]), so
-//! this service cannot drift from the other services that refuse an unauthorized
-//! request.
+//! A refusal that rests on a resource-based policy is worded in the shared IAM
+//! sentence ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]),
+//! so this service cannot drift from the other services that refuse an
+//! unauthorized request; the two sentences AWS words the other decisions in — a
+//! request nothing grants, and one an attached document explicitly denied — are
+//! built here from the same parts.
 //!
 //! The decision is taken by the operations whose target IS a cluster — the ones
 //! whose action applies to it. The TAGGING operations take any MSK resource ARN
@@ -127,6 +141,139 @@ pub fn authorize_operation<E>(
     authorize_action(
         &format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}"),
         target_arn,
+    )
+}
+
+/// The resource an authorization decision is taken over when the request named
+/// none this service can act on: IAM's wildcard, which is what an action with no
+/// resource to scope it is decided against, and what the refusal then names.
+pub const ANY_RESOURCE: &str = "*";
+
+/// The decision for the control-plane action of `operation` on the CLUSTER
+/// `target_arn` is meant to name, taken before anything resolves or parses that
+/// target.
+///
+/// `kafka:<ApiName>` applies to a cluster resource, so the decision needs one: a
+/// value that names a cluster of another account is refused as
+/// [`authorize_action`] refuses it, and a value that names no cluster of this
+/// account AT ALL leaves the action with no resource to be granted on — the
+/// decision is then taken over [`ANY_RESOURCE`], which nothing in this account
+/// grants, and the refusal names what it was decided over. Either way the answer is
+/// the authorization refusal rather than a complaint about the value's shape: the
+/// decision comes first, so the request never reaches the parameter validation
+/// that would describe the target, and nothing of what this registry holds is
+/// disclosed.
+pub fn authorize_target_cluster<E>(
+    operation: &str,
+    target_arn: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    authorize_operation(operation, target_arn)?;
+    if crate::state::is_cluster_arn(target_arn) {
+        return Ok(());
+    }
+    let action = format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}");
+    // A value this account's ARN reading can make nothing of names no resource;
+    // one it can read names that resource, whatever kind it is, so the decision
+    // reports the resource it was actually taken over.
+    let resource = if ::service_common::arn::parse(target_arn).is_some() {
+        target_arn
+    } else {
+        ANY_RESOURCE
+    };
+    Err(access_denied(not_authorized(&action, resource)))
+}
+
+/// The IAM actions an MSK CLUSTER POLICY governs — the resource-based policy
+/// `PutClusterPolicy` attaches to a cluster, which Amazon MSK documents as granting
+/// another account's principals multi-VPC private connectivity to it: creating a
+/// VPC connection, and the two cluster readers plus the bootstrap-broker reader a
+/// client needs to use one.
+///
+/// Spelled as API names, which is what the operations taking the decision pass as
+/// their own `Operation::NAME`; `kafka:` prefixed, they are the actions a stored
+/// document is evaluated for.
+pub const CLUSTER_POLICY_ACTIONS: [&str; 4] = [
+    "CreateVpcConnection",
+    "GetBootstrapBrokers",
+    "DescribeCluster",
+    "DescribeClusterV2",
+];
+
+/// The decision the cluster's OWN resource-based policy takes about the
+/// control-plane action of `operation` on `cluster`, after the cluster has been
+/// resolved and before the operation does anything else.
+///
+/// IAM's order, through the tree's one evaluation of policy documents
+/// ([`::service_common::iam_authorization`]): an explicit `Deny` about this request
+/// refuses it whatever else allows it, while the owning account's own request is
+/// allowed by its identity-based policies, so a document that merely states nothing
+/// about the request — or no document at all — leaves the call served. The
+/// principals a document may name the caller by are the calling principal itself
+/// and the account it belongs to, which is what a resource policy may name in its
+/// place.
+///
+/// Taken by the operations [`CLUSTER_POLICY_ACTIONS`] names, which are the ones a
+/// cluster policy governs. The work it does is bounded by the stored document
+/// rather than by the request: `PutClusterPolicy` caps what one cluster may hold
+/// ([`crate::state::MAX_CLUSTER_POLICY_BYTES`]), and the shared evaluation reads no
+/// document longer than its own ceiling.
+pub fn authorize_cluster_policy<E>(
+    operation: &str,
+    cluster: &crate::state::Cluster,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    let Some(policy) = cluster.policy.as_ref() else {
+        return Ok(());
+    };
+    let action = format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}");
+    let caller = caller_principal();
+    let mut principals = vec![caller.clone()];
+    principals.extend(::service_common::iam_authorization::account_principals(
+        &caller,
+    ));
+    let stated = ::service_common::iam_authorization::resource_decision(
+        &policy.document,
+        &::service_common::iam_authorization::Request::new(&action, &cluster.arn, &principals),
+    );
+    // The resource belongs to the account this emulator serves, so that account's
+    // identity-based policies are the grant the combined decision starts from; only
+    // an explicit deny in the attached document overturns it.
+    if ::service_common::iam_authorization::is_allowed(
+        ::service_common::iam_authorization::Decision::Allowed,
+        stated,
+    ) {
+        return Ok(());
+    }
+    Err(access_denied(not_authorized_by_explicit_deny(
+        &action,
+        &cluster.arn,
+    )))
+}
+
+/// The refusal an authorization decision leaves, carrying `message`: the code and
+/// status the real service answers, through the unmodeled channel this service's
+/// model gives no shape for.
+fn access_denied<E>(message: String) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(ACCESS_DENIED_CODE, ACCESS_DENIED_STATUS, message)
+}
+
+/// The sentence AWS refuses a request NOTHING grants with: fixed connectives
+/// around the calling principal, the action asked for and the resource the decision
+/// was taken over — and no clause about a document, because none of them refused
+/// it; the request simply reaches no grant.
+fn not_authorized(action: &str, resource: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {action} on resource: {resource}",
+        caller_principal()
+    )
+}
+
+/// The same sentence for a request a resource-based policy explicitly DENIED,
+/// closed by the clause AWS names that document with: a client reading the message
+/// learns that fixing its own permissions will not help.
+fn not_authorized_by_explicit_deny(action: &str, resource: &str) -> String {
+    format!(
+        "{} with an explicit deny in a resource-based policy",
+        not_authorized(action, resource)
     )
 }
 
