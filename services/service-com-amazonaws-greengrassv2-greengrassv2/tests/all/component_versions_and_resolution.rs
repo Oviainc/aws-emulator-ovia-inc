@@ -68,6 +68,35 @@ async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Va
     call(router, "POST", path, bytes).await
 }
 
+/// `ResolveComponentCandidates` as the ONE caller class AWS authorizes for it reaches it:
+/// a Greengrass core device on the data-plane endpoint, whose identity is its IoT device
+/// certificate, so the request carries no IAM credential in either SigV4 carrier.
+///
+/// A request that DOES carry one is refused 403 before any component is looked at, which
+/// is the rule `core_device_data_plane_authorization.rs` pins.
+async fn resolve(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://greengrass.{REGION}.amazonaws.com/greengrass/v2/resolveComponentCandidates"
+        ))
+        .header("content-type", "application/json")
+        .body(Bytes::from(
+            serde_json::to_vec(body).expect("a serializable request body"),
+        ))
+        .expect("a well-formed test request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let raw = response.into_body();
+    let value = if raw.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&raw)
+            .unwrap_or(Value::String(String::from_utf8_lossy(&raw).into_owned()))
+    };
+    (status, value)
+}
+
 async fn get(router: &MultiServiceRouter, path: &str) -> (u16, Value) {
     call(router, "GET", path, Vec::new()).await
 }
@@ -574,9 +603,8 @@ async fn resolve_component_candidates_picks_the_greatest_version_every_requireme
     }
 
     for case in CANDIDATES {
-        let (status, body) = post(
+        let (status, body) = resolve(
             &router,
-            "/greengrass/v2/resolveComponentCandidates",
             &json!({ "componentCandidates": candidate_member(name, case) }),
         )
         .await;
@@ -658,9 +686,8 @@ async fn resolve_component_candidates_resolves_every_candidate_the_request_names
         publish(&router, &recipe(name, version)).await;
     }
 
-    let (status, body) = post(
+    let (status, body) = resolve(
         &router,
-        "/greengrass/v2/resolveComponentCandidates",
         &json!({
             "componentCandidates": [
                 { "componentName": "com.example.First" },
@@ -686,12 +713,7 @@ async fn resolve_component_candidates_resolves_every_candidate_the_request_names
     );
 
     // An empty candidate list resolves nothing, and is not an error.
-    let (status, body) = post(
-        &router,
-        "/greengrass/v2/resolveComponentCandidates",
-        &json!({ "componentCandidates": [] }),
-    )
-    .await;
+    let (status, body) = resolve(&router, &json!({ "componentCandidates": [] })).await;
     assert_eq!(status, 200, "expected 200, got {status} {body}");
     assert_eq!(
         array(&body, "resolvedComponentVersions").len(),
@@ -753,12 +775,7 @@ async fn resolve_component_candidates_only_resolves_a_version_the_platform_suppo
         if !platform.is_null() {
             request.insert("platform".to_string(), platform.clone());
         }
-        let (status, body) = post(
-            &router,
-            "/greengrass/v2/resolveComponentCandidates",
-            &Value::Object(request),
-        )
-        .await;
+        let (status, body) = resolve(&router, &Value::Object(request)).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status} {body}"
@@ -778,9 +795,8 @@ async fn a_candidate_no_published_component_answers_is_reported_as_missing() {
     let router = emulator();
     publish(&router, &recipe("com.example.Known", "1.0.0")).await;
 
-    let (status, body) = post(
+    let (status, body) = resolve(
         &router,
-        "/greengrass/v2/resolveComponentCandidates",
         &json!({ "componentCandidates": [{ "componentName": "com.example.Unknown" }] }),
     )
     .await;
@@ -796,12 +812,7 @@ async fn a_candidate_no_published_component_answers_is_reported_as_missing() {
     let too_many: Vec<Value> = (0..=MAX_RESOLVE_CANDIDATES)
         .map(|index| json!({ "componentName": format!("com.example.Bulk{index}") }))
         .collect();
-    let (status, body) = post(
-        &router,
-        "/greengrass/v2/resolveComponentCandidates",
-        &json!({ "componentCandidates": too_many }),
-    )
-    .await;
+    let (status, body) = resolve(&router, &json!({ "componentCandidates": too_many })).await;
     assert_eq!(
         status, 400,
         "case \"one candidate past the bound\": expected 400, got {status} {body}"
@@ -817,12 +828,7 @@ async fn a_candidate_no_published_component_answers_is_reported_as_missing() {
     let at_the_bound: Vec<Value> = (0..MAX_RESOLVE_CANDIDATES)
         .map(|index| json!({ "componentName": format!("com.example.Bulk{index}") }))
         .collect();
-    let (status, body) = post(
-        &router,
-        "/greengrass/v2/resolveComponentCandidates",
-        &json!({ "componentCandidates": at_the_bound }),
-    )
-    .await;
+    let (status, body) = resolve(&router, &json!({ "componentCandidates": at_the_bound })).await;
     assert_eq!(
         status, 404,
         "case \"exactly the bound\": expected 404, got {status} {body}"
@@ -834,9 +840,8 @@ async fn a_candidate_no_published_component_answers_is_reported_as_missing() {
     for index in 0..=MAX_RESOLVE_REQUIREMENTS {
         requirements.insert(format!("com.example.Requester{index}"), json!(">=1.0.0"));
     }
-    let (status, body) = post(
+    let (status, body) = resolve(
         &router,
-        "/greengrass/v2/resolveComponentCandidates",
         &json!({
             "componentCandidates": [{
                 "componentName": "com.example.Known",
@@ -858,9 +863,8 @@ async fn a_candidate_no_published_component_answers_is_reported_as_missing() {
     // A requirement that is not a semantic-version requirement is bad input, not a
     // missing resource.
     for case in ["not-a-requirement", ">=", "1.0.0 || 2.0.0"] {
-        let (status, body) = post(
+        let (status, body) = resolve(
             &router,
-            "/greengrass/v2/resolveComponentCandidates",
             &json!({
                 "componentCandidates": [{
                     "componentName": "com.example.Known",

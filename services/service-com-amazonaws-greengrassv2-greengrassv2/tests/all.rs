@@ -15,6 +15,12 @@
 mod component_publish_and_deploy;
 #[path = "all/component_versions_and_resolution.rs"]
 mod component_versions_and_resolution;
+#[path = "all/core_device_data_plane_authorization.rs"]
+mod core_device_data_plane_authorization;
+#[path = "all/deployment_cancellation.rs"]
+mod deployment_cancellation;
+#[path = "all/resource_tag_writes.rs"]
+mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/shared_endpoint_routing.rs"]

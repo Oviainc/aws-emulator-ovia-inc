@@ -10,13 +10,18 @@
 //!
 //! The rule under test: the tag listing reports the tag set stored ON the resource the
 //! `resourceArn` names — the same set the resource's own reader reports — and a
-//! `resourceArn` naming no stored resource is a 404.
+//! `resourceArn` naming no stored resource is a 404 carrying the tagging route's own
+//! not-found class (`resource_tag_writes.rs` states that rule and spans it over the
+//! route's operations).
 
 use std::sync::Arc;
 
 use aws_smithy_types::base64;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_greengrassv2_greengrassv2::state::{
+    TAGGING_NOT_FOUND_CODE, TAGGING_NOT_FOUND_MESSAGE,
+};
 use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -402,45 +407,38 @@ async fn an_arn_that_names_no_stored_resource_is_not_found() {
         (
             "a component version of a component never published",
             version_arn("com.example.Absent", "1.0.0"),
-            "COMPONENT_VERSION",
         ),
         (
             "a version never published of a component that exists",
             version_arn("com.example.Present", "9.9.9"),
-            "COMPONENT_VERSION",
         ),
         (
             "a published component version in another region",
             format!(
                 "arn:aws:greengrass:eu-west-1:{ACCOUNT}:components:com.example.Present:versions:1.0.0"
             ),
-            "COMPONENT_VERSION",
         ),
         (
             "a published component version under another account",
             format!(
                 "arn:aws:greengrass:{REGION}:111111111111:components:com.example.Present:versions:1.0.0"
             ),
-            "COMPONENT_VERSION",
         ),
         (
             "a component ARN with no version, which names no taggable resource",
             format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:components:com.example.Present"),
-            "RESOURCE",
         ),
         (
             "a deployment id nothing created",
             deployment_arn("44444444-4444-4444-4444-444444444444"),
-            "DEPLOYMENT",
         ),
         (
             "a core device, which no operation registers",
             format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:coreDevices:PresentCore"),
-            "CORE_DEVICE",
         ),
     ];
 
-    for (case, arn, resource_type) in rows {
+    for (case, arn) in rows {
         let (status, body) = list_tags(&router, &arn).await;
         assert_eq!(
             status, 404,
@@ -448,18 +446,13 @@ async fn an_arn_that_names_no_stored_resource_is_not_found() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body}"
+            TAGGING_NOT_FOUND_CODE,
+            "case {case:?}: expected the tagging route's not-found code, got {body}"
         );
         assert_eq!(
-            body["resourceId"].as_str(),
-            Some(arn.as_str()),
-            "case {case:?}: the refusal names the ARN the caller sent, got {body}"
-        );
-        assert_eq!(
-            body["resourceType"].as_str(),
-            Some(resource_type),
-            "case {case:?}: the refusal names the resource kind the ARN addressed, got {body}"
+            body["message"].as_str(),
+            Some(TAGGING_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the tagging route's fixed sentence, got {body}"
         );
     }
 
@@ -515,8 +508,8 @@ async fn a_deleted_component_versions_tags_are_no_longer_listed() {
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
-        "case after the delete: expected ResourceNotFoundException, got {body}"
+        TAGGING_NOT_FOUND_CODE,
+        "case after the delete: expected the tagging route's not-found code, got {body}"
     );
 }
 

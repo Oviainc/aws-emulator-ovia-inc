@@ -88,17 +88,98 @@ pub enum ListTagsForResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`).
+///
+/// Two channels, not one: the scaffold wrapper (this operation's modelled errors, plus
+/// the `ValidationException` a handler needs for a refusal its model cannot express) and
+/// this route's own refusal of an ARN that names nothing
+/// ([`crate::state::TaggingNotFound`], which the whole tagging route shares).
+#[derive(Debug)]
+pub enum ListTagsForResourceError {
+    /// A modelled error, or a refusal the scaffold channel words.
+    Scaffolded(crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>),
+    /// The refusal of an ARN that names no resource this service holds.
+    NotFound(crate::state::TaggingNotFound),
+}
+
+impl ::std::fmt::Display for ListTagsForResourceError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::NotFound(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for ListTagsForResourceError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::NotFound(error) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the channel the active variant belongs to, so the scaffold
+/// wrapper keeps rendering exactly as it does for every other operation and only this
+/// route's own variant answers its own code and status.
+impl smithy_server_runtime::OperationError for ListTagsForResourceError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::NotFound(error) => error,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::NotFound(_) => &crate::state::TAGGING_NOT_FOUND_SCHEMA,
+        }
+    }
+
+    /// The wire error code (`__type`, and the `x-amzn-errortype` header restJson1
+    /// resolves an error shape from). Keep the literal as it is: it is what a client
+    /// branches on.
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::NotFound(_) => crate::state::TAGGING_NOT_FOUND_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::NotFound(_) => crate::state::TAGGING_NOT_FOUND_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            // No `awsQueryError` trait to honour: the shape is in no model, and this
+            // service speaks restJson1 in any case.
+            Self::NotFound(_) => None,
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
+impl From<crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>>
+    for ListTagsForResourceError
+{
+    fn from(scaffolded: crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -155,10 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // callers at the same instant see the same tags and a listing changes nothing.
         let store = state.lock();
         let Some(tags) = store.resource_tags(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                st::named_resource_not_found(&input.resource_arn),
-            )
-            .into());
+            return Err(ListTagsForResourceError::NotFound(
+                st::TaggingNotFound::new(),
+            ));
         };
 
         Ok(ListTagsForResourceOutput {

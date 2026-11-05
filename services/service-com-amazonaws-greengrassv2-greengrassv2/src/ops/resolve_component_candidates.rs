@@ -3,7 +3,9 @@
 //! @op ResolveComponentCandidates
 //! Resolves each candidate component to the greatest published version that satisfies
 //! every version requirement the request carries and that supports the platform it
-//! names, and answers with that version's recipe.
+//! names, and answers with that version's recipe — for the one caller class AWS
+//! authorizes here, a core device on the data-plane endpoint; an IAM caller is refused
+//! 403 before any component is looked at.
 //!
 //! ## Shape of an operation
 //!
@@ -158,8 +160,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         use crate::state as st;
+
+        // The CREDENTIAL CLASS this operation authorizes, decided before anything is
+        // read: Greengrass serves component resolution on the data-plane endpoint to a
+        // core device that authenticates with its own IoT device certificate (this
+        // operation's own documentation, quoted in the contract above: "To use this
+        // operation, you must use the data plane API endpoint and authenticate with an
+        // IoT device certificate"). An IAM caller — an SDK, a CLI, anything signing
+        // with control-plane credentials — is therefore not a principal this operation
+        // can authorize at all, and is refused before any candidate, platform or
+        // component state is looked at, so the answer is the same whether the candidate
+        // names a published version, an unpublished one or a component that never
+        // existed.
+        if presents_iam_credentials(ctx.parts()) {
+            return Err(ResolveComponentCandidatesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: NOT_AUTHORIZED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
 
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(ResolveComponentCandidatesErrorModeled::InternalServerException(
@@ -328,6 +349,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolved_component_versions: Some(resolved),
         })
     }
+}
+
+/// What this operation answers a caller it cannot authorize: the authorization layer's
+/// own sentence, entirely fixed text that reports no value of the request or of state.
+const NOT_AUTHORIZED_MESSAGE: &str = "Unable to determine service/operation name to be authorized";
+
+/// The query-parameter names a SigV4 credential arrives under when it is carried in a
+/// presigned URL instead of a header (SigV4 "Authenticating Requests: Using Query
+/// Parameters").
+const PRESIGNED_SIGV4_PARAMETERS: &[&str] = &["x-amz-algorithm", "x-amz-credential"];
+
+/// Whether the request presents IAM control-plane credentials, in either carrier SigV4
+/// uses: the `Authorization` header an SDK signs with, or a presigned URL's query.
+///
+/// This is a classification of what the REQUEST carries, not a signature check — the
+/// emulator verifies signatures itself, and a service never does. A core device's own
+/// identity is an X.509 certificate presented on the data-plane connection, which is a
+/// property of the transport and carries no IAM credential, so a request that presents
+/// one of these is an IAM caller and nothing else can be.
+fn presents_iam_credentials(parts: &::http::request::Parts) -> bool {
+    if parts.headers.contains_key(::http::header::AUTHORIZATION) {
+        return true;
+    }
+    parts.uri.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let name = pair.split('=').next().unwrap_or_default();
+            PRESIGNED_SIGV4_PARAMETERS
+                .iter()
+                .any(|parameter| name.eq_ignore_ascii_case(parameter))
+        })
+    })
 }
 
 /// Whether `version` satisfies every requirement in `requirements`, and the version the

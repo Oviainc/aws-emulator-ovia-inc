@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the tags a request carries onto the resource its `resourceArn` names, and
+//! refuses an ARN that names no resource this service holds with the tagging surface's
+//! own not-found class.
 //!
 //! ## Shape of an operation
 //!
@@ -92,17 +86,96 @@ pub enum TagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// (`crate::ops::tag_resource::TagResourceError`).
+///
+/// Two channels, not one: the scaffold wrapper (this operation's modelled errors, plus
+/// the `ValidationException` a handler needs for a refusal its model cannot express) and
+/// this route's own refusal of an ARN that names nothing
+/// ([`crate::state::TaggingNotFound`], which the whole tagging route shares).
+#[derive(Debug)]
+pub enum TagResourceError {
+    /// A modelled error, or a refusal the scaffold channel words.
+    Scaffolded(crate::scaffolded::Scaffolded<TagResourceErrorModeled>),
+    /// The refusal of an ARN that names no resource this service holds.
+    NotFound(crate::state::TaggingNotFound),
+}
+
+impl ::std::fmt::Display for TagResourceError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::NotFound(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for TagResourceError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::NotFound(error) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the channel the active variant belongs to, so the scaffold
+/// wrapper keeps rendering exactly as it does for every other operation and only this
+/// route's own variant answers its own code and status.
+impl smithy_server_runtime::OperationError for TagResourceError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::NotFound(error) => error,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::NotFound(_) => &crate::state::TAGGING_NOT_FOUND_SCHEMA,
+        }
+    }
+
+    /// The wire error code (`__type`, and the `x-amzn-errortype` header restJson1
+    /// resolves an error shape from). Keep the literal as it is: it is what a client
+    /// branches on.
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::NotFound(_) => crate::state::TAGGING_NOT_FOUND_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::NotFound(_) => crate::state::TAGGING_NOT_FOUND_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            // No `awsQueryError` trait to honour: the shape is in no model, and this
+            // service speaks restJson1 in any case.
+            Self::NotFound(_) => None,
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
+impl From<crate::scaffolded::Scaffolded<TagResourceErrorModeled>> for TagResourceError {
+    fn from(scaffolded: crate::scaffolded::Scaffolded<TagResourceErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -142,18 +215,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        let requested = st::tags_in(Some(&input.tags));
+        let mut store = state.lock();
+        // Tags belong to the resource, so they are written onto the ONE copy that
+        // resource holds and that its own reader and the tag listing report. An ARN
+        // that names no resource this service holds is refused with the tagging route's
+        // own not-found class, and nothing is written.
+        let Some(stored) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceError::NotFound(st::TaggingNotFound::new()));
+        };
+
+        // A tag whose key the resource already carries UPDATES that tag's value rather
+        // than adding a second entry, so the resulting size is what the stored keys the
+        // request does not name add to the keys it does.
+        let resulting = requested.len()
+            + stored
+                .keys()
+                .filter(|key| !requested.contains_key(*key))
+                .count();
+        if resulting > st::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "A resource may carry at most {} tags; this request would leave \
+                     {resulting}.",
+                    st::MAX_TAGS_PER_RESOURCE
+                ),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "tags".to_string(),
+                    message: format!(
+                        "at most {} tags may be stored on one resource.",
+                        st::MAX_TAGS_PER_RESOURCE
+                    ),
+                }]),
+            })
+            .into());
+        }
+        for (key, value) in requested {
+            stored.insert(key, value);
+        }
+        let written = stored.len();
+        drop(store);
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The presented access-key id is an identifier, never a secret.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "tagged",
+            principal = %::engine::extract_akid(&ctx.parts().headers),
+            resource = %input.resource_arn,
+            tags = written,
+            "wrote a resource's tags"
+        );
+
+        Ok(TagResourceOutput {})
     }
 }

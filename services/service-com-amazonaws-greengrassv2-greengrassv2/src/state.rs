@@ -52,6 +52,24 @@ pub const STATUS_MESSAGE_NONE: &str = "NONE";
 pub const SCOPE_PRIVATE: &str = "PRIVATE";
 /// `DeploymentStatus` of the deployment that is current for its target.
 pub const DEPLOYMENT_STATUS_ACTIVE: &str = "ACTIVE";
+/// `DeploymentStatus` of a deployment whose caller cancelled it
+/// (`smithy_query(query="shape",shape="DeploymentStatus")`: `ACTIVE`, `COMPLETED`,
+/// `CANCELED`, `FAILED`, `INACTIVE`).
+pub const DEPLOYMENT_STATUS_CANCELED: &str = "CANCELED";
+
+/// What every operation keyed by a `deploymentId` reports for an id this service holds
+/// no deployment for: one fixed sentence that names no value of the request, so the
+/// refusal is the same whichever id was asked about and whichever operation asked.
+pub const DEPLOYMENT_NOT_FOUND_MESSAGE: &str = "Deployment not found";
+
+/// The most tags one resource's stored tag set may hold.
+///
+/// The model's `TagMap` is `length 1..200`
+/// (`smithy_query(query="shape",shape="TagMap")`), so a larger set is not a value this
+/// service's own shape can carry. One request is already bounded by that constraint;
+/// what this bounds is the stored set a caller grows by tagging the same resource
+/// repeatedly with different keys.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// The largest `inlineRecipe` this emulator will parse.
 ///
@@ -350,6 +368,33 @@ impl ComAmazonawsGreengrassv2Greengrassv2State {
             NamedResource::ComponentVersion { .. } => Some(&self.component_version(arn)?.tags),
             NamedResource::Deployment { deployment_id } => {
                 Some(&self.deployments.get(&deployment_id)?.tags)
+            }
+            NamedResource::CoreDevice { .. } => None,
+        }
+    }
+
+    /// The stored version a component-version ARN names, for an operation that WRITES
+    /// to it. The same lookup [`Self::component_version`] does, so a reader and a
+    /// writer address one entry.
+    pub fn component_version_mut(&mut self, arn: &str) -> Option<&mut ComponentVersionEntry> {
+        let (name, version) = parse_component_version_arn(arn)?;
+        let entry = self.components.get_mut(&name)?.versions.get_mut(&version)?;
+        (entry.arn == arn).then_some(entry)
+    }
+
+    /// The tag set stored for the resource a `GenericV2ARN` names, for an operation
+    /// that writes tags, or `None` when this service holds no such resource.
+    ///
+    /// The write side of [`Self::resource_tags`], resolving the ARN the same way: the
+    /// tag set a mutation changes is the ONE copy the resource holds, so a later
+    /// listing reports what was written rather than a second map beside it.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        match NamedResource::from_arn(arn)? {
+            NamedResource::ComponentVersion { .. } => {
+                Some(&mut self.component_version_mut(arn)?.tags)
+            }
+            NamedResource::Deployment { deployment_id } => {
+                Some(&mut self.deployments.get_mut(&deployment_id)?.tags)
             }
             NamedResource::CoreDevice { .. } => None,
         }
@@ -705,33 +750,119 @@ impl NamedResource {
     }
 }
 
-/// What an operation taking a `GenericV2ARN` reports for an ARN that names no
-/// resource this service holds: a 404 naming the resource kind the ARN addressed,
-/// worded for that kind as the operations dedicated to it word it.
-pub fn named_resource_not_found(arn: &str) -> ResourceNotFoundException {
-    let named = NamedResource::from_arn(arn);
-    let message = match &named {
-        Some(NamedResource::ComponentVersion { name, version }) => format!(
-            "Component [{name} : {version}] in the accountId [{}] does not exist",
-            account_id()
+// ---------------------------------------------------------------------------
+// The tagging route's own refusal
+// ---------------------------------------------------------------------------
+
+/// The error code the tagging route (`/tags/{resourceArn}`) answers for an ARN that
+/// names no resource this service holds.
+///
+/// RECORDED behaviour, not modelled: this service's model declares no shape of that
+/// name (`smithy_query(query="shape",shape="NotFoundException")` finds none) and lists
+/// `ResourceNotFoundException` on the three tagging operations, yet the tagging layer
+/// answers its OWN not-found class — distinct from the code the id-keyed component and
+/// deployment operations carry for the same missing resource. A client of the tagging
+/// route branches on this code, so it is what the route answers.
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The sentence that refusal carries: entirely fixed text, the same whichever ARN was
+/// presented, so the refusal reports no value of the request.
+pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The HTTP status that refusal carries.
+pub const TAGGING_NOT_FOUND_STATUS: u16 = 404;
+
+/// The `message` member of [`TaggingNotFound`].
+static TAGGING_NOT_FOUND_MESSAGE_MEMBER: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#NotFoundException$message",
+            "smithy.framework",
+            "message",
         ),
-        Some(NamedResource::Deployment { deployment_id }) => {
-            format!("The deployment {deployment_id} does not exist.")
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    )
+    .with_xml_name("Message");
+
+/// Schema for the shape [`TaggingNotFound`] serializes as.
+///
+/// Deliberately in the `smithy.framework` namespace, as `crate::scaffolded`'s synthetic
+/// shapes are, so it cannot collide with a modelled shape; the wire `__type` and the
+/// `x-amzn-errortype` header come from each tagging operation's own
+/// `OperationError::shape_name`, which answers [`TAGGING_NOT_FOUND_CODE`], not from here.
+pub static TAGGING_NOT_FOUND_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#NotFoundException",
+            "smithy.framework",
+            "NotFoundException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&TAGGING_NOT_FOUND_MESSAGE_MEMBER],
+    );
+
+/// The refusal every operation on the tagging route answers an ARN that names no
+/// resource this service holds with.
+///
+/// Stated here once rather than per operation: the three operations the model binds to
+/// `/tags/{resourceArn}` refuse a missing resource identically, so two of them cannot
+/// answer differently.
+#[derive(Debug, Clone)]
+pub struct TaggingNotFound {
+    pub message: String,
+}
+
+impl TaggingNotFound {
+    /// The refusal, carrying [`TAGGING_NOT_FOUND_MESSAGE`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            message: TAGGING_NOT_FOUND_MESSAGE.to_string(),
         }
-        Some(NamedResource::CoreDevice {
-            core_device_thing_name,
-        }) => format!("The core device {core_device_thing_name} does not exist."),
-        // In the pattern's resource space, but not the shape any kind's ARN has, so
-        // there is no identifier to name beyond the ARN the caller sent.
-        None => format!("The resource {arn} does not exist."),
-    };
+    }
+}
+
+impl Default for TaggingNotFound {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TaggingNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{TAGGING_NOT_FOUND_CODE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for TaggingNotFound {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for TaggingNotFound {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&TAGGING_NOT_FOUND_MESSAGE_MEMBER, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// What an operation keyed by a `deploymentId` reports for an id this service holds no
+/// deployment for.
+///
+/// Stated once for the whole deployment surface: the refusal is the modelled 404
+/// carrying [`DEPLOYMENT_NOT_FOUND_MESSAGE`], the id the caller asked about as its
+/// `resourceId` and the kind that id addressed as its `resourceType`.
+pub fn deployment_not_found(deployment_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message,
-        resource_id: arn.to_string(),
-        resource_type: named
-            .as_ref()
-            .map_or("RESOURCE", NamedResource::resource_type)
-            .to_string(),
+        message: DEPLOYMENT_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: deployment_id.to_string(),
+        resource_type: NamedResource::Deployment {
+            deployment_id: deployment_id.to_string(),
+        }
+        .resource_type()
+        .to_string(),
     }
 }
 

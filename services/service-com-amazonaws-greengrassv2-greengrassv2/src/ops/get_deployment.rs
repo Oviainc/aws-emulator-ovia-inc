@@ -183,11 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(entry) = store.deployments.get(&input.deployment_id) else {
             return Err(GetDeploymentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("The deployment {} does not exist.", input.deployment_id),
-                    resource_id: input.deployment_id.clone(),
-                    resource_type: "DEPLOYMENT".to_string(),
-                },
+                st::deployment_not_found(&input.deployment_id),
             )
             .into());
         };

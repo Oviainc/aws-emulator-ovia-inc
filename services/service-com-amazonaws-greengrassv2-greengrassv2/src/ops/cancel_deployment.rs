@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the deployment a `deploymentId` names, moving it to the `CANCELED` status its
+//! own reader reports, and refuses an id this service holds no deployment for.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelDeployment"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CancelDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        // The cancel is a WRITE on the one deployment record the deployment surface
+        // reads, so an id nothing created is refused before anything changes, and the
+        // status a later `GetDeployment` reports is the one stored here.
+        let mut store = state.lock();
+        let Some(entry) = store.deployments.get_mut(&input.deployment_id) else {
+            return Err(CancelDeploymentErrorModeled::ResourceNotFoundException(
+                st::deployment_not_found(&input.deployment_id),
+            )
+            .into());
+        };
+        // Cancelling what is already cancelled changes nothing and is not a failure:
+        // the operation asks for a terminal status, which the deployment already has.
+        let previous = ::std::mem::replace(
+            &mut entry.deployment_status,
+            st::DEPLOYMENT_STATUS_CANCELED.to_string(),
+        );
+        drop(store);
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The presented access-key id is an identifier, never a secret.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "canceled",
+            principal = %::engine::extract_akid(&ctx.parts().headers),
+            resource = %input.deployment_id,
+            previous_status = %previous,
+            "cancelled a deployment"
+        );
+
+        Ok(CancelDeploymentOutput {
+            message: Some(CANCEL_ACCEPTED_MESSAGE.to_string()),
+        })
     }
 }
+
+/// What the response's `message` member — "A message that communicates if the cancel was
+/// successful" — says once the deployment is recorded as cancelled: the one word
+/// Greengrass answers a successful cancel with, fixed text that reports no value of the
+/// request or of state.
+const CANCEL_ACCEPTED_MESSAGE: &str = "SUCCESS";
