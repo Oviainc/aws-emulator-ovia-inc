@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartNetworkMigrationMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartNetworkMigrationMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartNetworkMigrationMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the mapping run of ONE execution of ONE network migration definition of the
+//! caller's account: it records a mapping job, moves that execution onto the mapping
+//! stage, and answers the job's minted `jobID`. A definition or an execution the
+//! account holds no record of is refused with 404 `ResourceNotFoundException` rather
+//! than starting work on a resource that does not exist. `@idempotent` with no
+//! idempotency token, so a repeat of the same request while that job is still running
+//! answers the job it started instead of starting a second one, and a start that would
+//! run a different mapping strategy on an execution whose mapping job is still running
+//! is refused with 409 `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -94,9 +94,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `StartNetworkMigrationMappingError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#StartNetworkMigrationMapping")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#StartNetworkMigrationMapping",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum StartNetworkMigrationMappingErrorModeled {
+    InternalServerException(InternalServerException),
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -156,18 +163,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartNetworkMigrationMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartNetworkMigrationMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartNetworkMigrationMapping"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartNetworkMigrationMappingErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The operation models no `accountID` member, so it acts only on the records of
+        // the account the request is signed for — the same account key every other
+        // network-migration operation uses.
+        let account = crate::state::account_key(None);
+        let definition_id = input.network_migration_definition_id;
+        let execution_id = input.network_migration_execution_id;
+        let strategy = input.security_group_mapping_strategy;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The mapping run is a run OF an execution OF a definition: a request naming
+        // either one the account holds no record of asked for work on a resource that
+        // does not exist, which is a refusal rather than a job nothing can be read back
+        // from. The definition is checked first, because the execution is only
+        // addressable within it.
+        if store
+            .network_migration_definition_of(&account, &definition_id)
+            .is_none()
+        {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &definition_id,
+                "refused: ResourceNotFoundException",
+            );
+            return Err(
+                StartNetworkMigrationMappingErrorModeled::ResourceNotFoundException(
+                    crate::state::network_migration_definition_not_found(&definition_id),
+                )
+                .into(),
+            );
+        }
+        if store
+            .network_migration_execution_of(&account, &definition_id, &execution_id)
+            .is_none()
+        {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &execution_id,
+                "refused: ResourceNotFoundException",
+            );
+            return Err(
+                StartNetworkMigrationMappingErrorModeled::ResourceNotFoundException(
+                    crate::state::network_migration_execution_not_found(&execution_id),
+                )
+                .into(),
+            );
+        }
+
+        // One execution runs one mapping job at a time. While that job is running, the
+        // same request again is the `@idempotent` retry of the call that started it — the
+        // operation models no idempotency token, so the request's own members are the
+        // only thing a retry can be recognised by — and answers that job's id. A request
+        // that would run the mapping under another `securityGroupMappingStrategy`
+        // conflicts with the execution's current state instead.
+        if let Some(running) = store.running_network_migration_mapping_job(
+            &account,
+            &definition_id,
+            &execution_id,
+            now,
+        ) {
+            let job_id = running.job_id.clone();
+            if running.security_group_mapping_strategy == strategy {
+                crate::state::audit(ctx.parts(), Self::NAME, &account, &job_id, "replayed");
+                return Ok(StartNetworkMigrationMappingOutput {
+                    job_id: Some(job_id),
+                });
+            }
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &execution_id,
+                "refused: ConflictException",
+            );
+            return Err(StartNetworkMigrationMappingErrorModeled::ConflictException(
+                crate::state::network_migration_mapping_job_in_progress(&execution_id, &job_id),
+            )
+            .into());
+        }
+
+        // The job store is bounded per account AND in total: see
+        // `crate::state::NETWORK_MIGRATION_MAPPING_JOB_QUOTA`.
+        if store.network_migration_mapping_job_store_is_full(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &execution_id,
+                "refused: ServiceQuotaExceededException",
+            );
+            return Err(
+                StartNetworkMigrationMappingErrorModeled::ServiceQuotaExceededException(
+                    crate::state::network_migration_mapping_job_quota_exceeded(&account),
+                )
+                .into(),
+            );
+        }
+
+        let job_id = store.mint_network_migration_job_id();
+        let stored = store.insert_network_migration_mapping_job(
+            crate::state::NetworkMigrationMappingJob::started(
+                job_id.clone(),
+                &definition_id,
+                &execution_id,
+                &account,
+                strategy,
+                now,
+            ),
+        );
+        debug_assert!(stored, "the store bound is checked above this insert");
+        // The execution is now running the mapping stage, so what a later read of it
+        // reports is the work this call started rather than the staged `PENDING` the
+        // definition's create left.
+        if let Some(execution) =
+            store.network_migration_execution_of_mut(&account, &definition_id, &execution_id)
+        {
+            execution.start_stage(
+                crate::state::EXECUTION_STAGE_MAPPING,
+                crate::state::EXECUTION_ACTIVITY_MAPPING,
+                now,
+            );
+        }
+        crate::state::audit(ctx.parts(), Self::NAME, &account, &job_id, "started");
+
+        Ok(StartNetworkMigrationMappingOutput {
+            job_id: Some(job_id),
+        })
     }
 }

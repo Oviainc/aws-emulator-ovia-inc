@@ -9,6 +9,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+/// The network-migration JOB concern: the jobs a pipeline stage records against an
+/// execution, and the refusals the operations that start them word. Re-exported, so a
+/// handler reaches every part of this service's state through `crate::state`.
+mod network_migration_jobs;
+pub use network_migration_jobs::*;
+
 use crate::ops::types::{
     ApplicationAggregatedStatus, CidrMapping, ConflictException, CreateApplicationOutput,
     CreateNetworkMigrationDefinitionOutput, DataReplicationInfo, InternalServerException,
@@ -100,11 +106,22 @@ pub const NETWORK_MIGRATION_DEFINITION_QUOTA: usize = 1_000;
 /// values are `PENDING`, `STARTED`, `SUCCEEDED`, `FAILED`).
 pub const EXECUTION_STATUS_PENDING: &str = "PENDING";
 
+/// The `ExecutionStatus` value an execution carries while a stage of it is running: a
+/// `Start*` operation of the pipeline has started work on it and that work has not
+/// finished the whole run.
+pub const EXECUTION_STATUS_STARTED: &str = "STARTED";
+
 /// The `ExecutionStage` value a staged execution waits at: the first stage of the
 /// network migration pipeline, which a definition's execution is staged for (the
 /// model's `ExecutionStage` values are `MAPPING`, `CODE_GENERATION`, `DEPLOY`,
 /// `DEPLOYED_STACKS_DELETION`, `ANALYZE`).
 pub const EXECUTION_STAGE_MAPPING: &str = "MAPPING";
+
+/// The `ExecutionStageActivity` value an execution carries while its mapping run is
+/// the work in flight (the model's `ExecutionStageActivity` values are `MAPPING`,
+/// `MAPPING_UPDATE`, `CODE_GENERATION`, `DEPLOY`, `DEPLOYED_STACKS_DELETION`,
+/// `ANALYZE`).
+pub const EXECUTION_ACTIVITY_MAPPING: &str = "MAPPING";
 
 /// The most network migration executions this store holds at a time — per account AND
 /// in total.
@@ -141,6 +158,11 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `networkMigrationExecutionID`s in creation order, so a listing pages in a
     /// stable order and a `nextToken` resumes where the previous page stopped.
     pub network_migration_execution_order: Vec<String>,
+    /// Every network migration mapping job, by `jobID`.
+    pub network_migration_mapping_jobs: HashMap<String, NetworkMigrationMappingJob>,
+    /// The `jobID`s in creation order, so a listing pages in a stable order and the
+    /// job a retry replays is the last one started.
+    pub network_migration_mapping_job_order: Vec<String>,
 }
 
 impl ComAmazonawsMgnApplicationmigrationserviceState {
@@ -405,12 +427,46 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
             .collect()
     }
 
+    /// The execution `execution_id` names under the definition `definition_id` within
+    /// `account_id`, or `None` — an execution of another account, or of another
+    /// definition, is not visible here.
+    pub fn network_migration_execution_of(
+        &self,
+        account_id: &str,
+        definition_id: &str,
+        execution_id: &str,
+    ) -> Option<&NetworkMigrationExecution> {
+        self.network_migration_executions
+            .get(execution_id)
+            .filter(|execution| {
+                execution.account_id == account_id
+                    && execution.network_migration_definition_id == definition_id
+            })
+    }
+
+    /// [`Self::network_migration_execution_of`], for a write: the record of this
+    /// account and definition, so what a start stores is what every reader of the same
+    /// store reports afterwards.
+    pub fn network_migration_execution_of_mut(
+        &mut self,
+        account_id: &str,
+        definition_id: &str,
+        execution_id: &str,
+    ) -> Option<&mut NetworkMigrationExecution> {
+        self.network_migration_executions
+            .get_mut(execution_id)
+            .filter(|execution| {
+                execution.account_id == account_id
+                    && execution.network_migration_definition_id == definition_id
+            })
+    }
+
     /// A fresh `networkMigrationExecutionID` no stored execution holds: 32 `[0-9a-f]`
     /// characters grouped 8-4-4-4-12, as the model's `NetworkMigrationExecutionID`
     /// pattern requires.
     pub fn mint_network_migration_execution_id(&self) -> String {
         loop {
-            let candidate = mint_execution_id();
+            let candidate = mint_uuid_shaped_id();
             if !self.network_migration_executions.contains_key(&candidate) {
                 return candidate;
             }
@@ -606,6 +662,19 @@ impl NetworkMigrationExecution {
             updated_at: Some(at),
             tags: BTreeMap::new(),
         }
+    }
+
+    /// Record that `activity` has started at `stage`: the execution is running from
+    /// `at`, which is also when it was last updated.
+    ///
+    /// What a `Start*` operation of the pipeline leaves on the execution it acts on, so
+    /// a later read reports the stage and the activity that operation started rather
+    /// than the staged `PENDING` the definition's create left.
+    pub fn start_stage(&mut self, stage: &str, activity: &str, at: ::std::time::SystemTime) {
+        self.status = Some(EXECUTION_STATUS_STARTED.to_string());
+        self.stage = Some(stage.to_string());
+        self.activity = Some(activity.to_string());
+        self.updated_at = Some(at);
     }
 
     /// The `tags` member: the stored tags, or absent when the execution carries none.
@@ -1053,10 +1122,11 @@ fn mint_id(prefix: &str, body_len: usize) -> String {
     format!("{prefix}{body}")
 }
 
-/// A fresh `NetworkMigrationExecutionID`: [`mint_id`]'s hex body, grouped 8-4-4-4-12 to
-/// match the model's pattern
-/// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
-fn mint_execution_id() -> String {
+/// A fresh id in the model's uuid-shaped id form: [`mint_id`]'s hex body, grouped
+/// 8-4-4-4-12 to match the pattern
+/// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` that every one of
+/// them declares (`NetworkMigrationExecutionID`, `NetworkMigrationJobID`).
+fn mint_uuid_shaped_id() -> String {
     let hex = mint_id("", 32);
     format!(
         "{}-{}-{}-{}-{}",
@@ -1184,6 +1254,18 @@ pub fn application_quota_exceeded(account_id: &str) -> ServiceQuotaExceededExcep
 pub fn network_migration_definition_not_found(definition_id: &str) -> ResourceNotFoundException {
     resource_not_found(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE, definition_id)
 }
+
+/// The modelled refusal for a `networkMigrationExecutionID` the named definition of the
+/// account holds no record of.
+pub fn network_migration_execution_not_found(execution_id: &str) -> ResourceNotFoundException {
+    resource_not_found(NETWORK_MIGRATION_EXECUTION_RESOURCE_TYPE, execution_id)
+}
+
+/// The `resourceType` a network-migration-execution refusal names: the modelled shape
+/// `com.amazonaws.mgn#NetworkMigrationExecution`, as the API spells the kind (the model
+/// binds no `NetworkMigrationExecutionResource`, so the structure's own name is how the
+/// API names it).
+pub(crate) const NETWORK_MIGRATION_EXECUTION_RESOURCE_TYPE: &str = "NetworkMigrationExecution";
 
 /// The modelled refusal for a `resourceArn` naming no resource the account holds — the
 /// ONE wording the tag operations state a missing resource with.

@@ -23,6 +23,8 @@ mod network_migration_definition_listing;
 mod network_migration_definition_update;
 #[path = "all/network_migration_execution_listing.rs"]
 mod network_migration_execution_listing;
+#[path = "all/network_migration_mapping_start.rs"]
+mod network_migration_mapping_start;
 #[path = "all/request_body_validation.rs"]
 mod request_body_validation;
 #[path = "all/resource_not_found_payload.rs"]

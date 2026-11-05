@@ -13,6 +13,15 @@ CreateCapacityProvider
 - The test row "a role this account's IAM holds none of" expects the create to be REFUSED (`accepted: false`). That is AWS's behavior; see Evidence.
 - The code accepts it: `crate::state::capacity_provider::operator_role_is_unassumable` calls `service_common::iam_role::held_role_is_unassumable`, which answers `false` (do not refuse) for `RoleAnswer::Absent`.
 
+STATUS UPDATE (absent-role cause closed): the code now refuses it —
+`operator_role_is_unassumable` calls `service_common::iam_role::role_is_unassumable`, whose
+`Absent` answer refuses — and the row "a role this account's IAM holds none of" expects that
+refusal again, with a comment saying the expectation is AWS's recorded answer and must not be
+flipped for another fix. `cargo test -p aws-emulator-router --test all` is green. WHAT REMAINS
+is the cross-account cause below: a well-formed role ARN of ANOTHER account is still served,
+where AWS refuses it with HTTP 403 `AccessDeniedException` and the message
+`Cross-account pass role is not allowed.`, and that row still expects the create to be served.
+
 Fix the CODE, not the test: make `operator_role_is_unassumable` refuse an operator role ARN of THIS account that IAM reports absent, with HTTP 400 `InvalidParameterValueException` and the fixed message `The operator role is invalid or doesn't have sufficient permissions. Verify the role and permissions and try again.`, persisting nothing. The test's row "a well-formed role ARN of another account" (`accepted: true`) is also wrong for AWS: AWS refuses it with HTTP 403 `AccessDeniedException`, message `Cross-account pass role is not allowed.`, persisting nothing. Make the code refuse it that way and change that row to expect the refusal with that code and message. An emulator with no IAM mounted still refuses nothing.
 
 Do not change `held_role_is_unassumable` for its other callers (a function's execution role); answer the absent case inside the capacity-provider reading only.
