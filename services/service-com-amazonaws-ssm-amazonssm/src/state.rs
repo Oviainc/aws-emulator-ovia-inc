@@ -85,10 +85,14 @@
 //! Then **OpsCenter's OpsItems**, which live in [`ops_items`]: `CreateOpsItem`
 //! mints one and `GetOpsItem` reports it, keyed by `(region, ops item id)` the same way,
 //! and everything a read reports — the status, the version, who created it and when —
-//! comes from what the create persisted. The resources associated with an OpsItem as its
-//! **related items** live beside them in [`ops_item_related_items`], keyed by
-//! `(region, ops item id, association id)`: `AssociateOpsItemRelatedItem` creates one and
-//! `ListOpsItemRelatedItems` reports what it persisted.
+//! comes from what the create persisted. Each write to an OpsItem also appends one event
+//! to that OpsItem's **event trail** ([`ops_item_events`]), which is what
+//! `ListOpsItemEvents` reports: the trail holds what the writes persisted, so an account
+//! that has written no OpsItem has no event to list and a listing appends none. The
+//! resources associated with an OpsItem as its **related items** live beside them in
+//! [`ops_item_related_items`], keyed by `(region, ops item id, association id)`:
+//! `AssociateOpsItemRelatedItem` creates one and `ListOpsItemRelatedItems` reports what it
+//! persisted.
 //!
 //! Then the **patch baselines** Patch Manager holds ([`patch_baselines`]):
 //! `CreatePatchBaseline` mints one the account owns, keyed by `(region, baseline id)`,
@@ -138,6 +142,10 @@ pub mod resource_policies;
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
 pub mod ops_items;
+
+/// The event trail OpsCenter keeps for an OpsItem: the event a write appends and the
+/// store `ListOpsItemEvents` projects.
+pub mod ops_item_events;
 
 /// The related-item resources an OpsItem carries: the record an association persists, the
 /// rules it is held to and the store a listing projects.
@@ -2954,6 +2962,32 @@ pub fn node_page_size(max_results: Option<i32>) -> Result<usize, String> {
 /// documentation is "The specified token isn't valid".
 pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
 
+/// The name this service is reported by in the envelope that follows a refusal worded by
+/// the service's own validation: the name its wire protocol carries as the `X-Amz-Target`
+/// prefix (`OPERATIONS.md`, "Wire protocol").
+pub const SDK_ENVELOPE_SERVICE: &str = "AmazonSSM";
+
+/// `body` followed by the envelope that trails a refusal of this service worded by its own
+/// validation: ` (Service: AmazonSSM; Status Code: <status>; Error Code: <code>; Request
+/// ID: <id>; Proxy: null)`.
+///
+/// `status_code` and `error_code` are the status and the code the response itself carries,
+/// so the envelope cannot disagree with the wire. The request id is the ONLY per-run field:
+/// a request id is minted by the service per call — nothing in the request carries one — so
+/// it comes from the emulator's one request-id mint
+/// ([`service_common::query_error_envelope::new_request_id`]), a fresh v4 UUID
+/// indistinguishable from the one the framework's own renderers report. Nothing of the
+/// request is interpolated.
+///
+/// One function, so every refusal worded this way carries the envelope in the same shape.
+pub fn with_sdk_error_envelope(body: &str, status_code: u16, error_code: &str) -> String {
+    format!(
+        "{body} (Service: {SDK_ENVELOPE_SERVICE}; Status Code: {status_code}; \
+         Error Code: {error_code}; Request ID: {}; Proxy: null)",
+        ::service_common::query_error_envelope::new_request_id()
+    )
+}
+
 /// Per-service state for com-amazonaws-ssm-amazonssm. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsSsmAmazonssmState {
@@ -3012,6 +3046,17 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// from ([`ComAmazonawsSsmAmazonssmState::next_ops_item_id`]) — so two OpsItems of one
     /// store never carry one id.
     pub ops_item_sequence: u64,
+
+    /// Every event an OpsItem write appended, keyed by `(region, event id)`: an event
+    /// belongs to the Region of the OpsItem it is about and is identified there by the id
+    /// the append minted ([`ComAmazonawsSsmAmazonssmState::mint_ops_item_event_id`]). A
+    /// `BTreeMap` so a listing walks a stable, total order. See [`ops_item_events`].
+    pub ops_item_events: BTreeMap<(String, String), ops_item_events::OpsItemEventRecord>,
+
+    /// How many OpsItem event ids this store has minted, which is what the next mint is
+    /// drawn from and the order two events of one instant are reported in
+    /// ([`ComAmazonawsSsmAmazonssmState::record_ops_item_event`]).
+    pub ops_item_event_sequence: u64,
 
     /// Every related-item association, keyed by `(region, ops item id, association id)`:
     /// an association belongs to the OpsItem it was created against and is identified
@@ -3088,6 +3133,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             cloud_connectors: BTreeMap::new(),
             ops_items: BTreeMap::new(),
             ops_item_sequence: 0,
+            ops_item_events: BTreeMap::new(),
+            ops_item_event_sequence: 0,
             ops_item_related_items: BTreeMap::new(),
             ops_item_related_item_sequence: 0,
             service_settings: BTreeMap::new(),

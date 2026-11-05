@@ -301,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_by = ::service_common::caller_principal::ambient_user_arn();
         let record = ops_items::OpsItemRecord {
             ops_item_id: store.next_ops_item_id(now),
-            region,
+            region: region.clone(),
             title: input.title.clone(),
             description: input.description.clone(),
             source: input.source.clone(),
@@ -323,12 +323,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_by: created_by.clone(),
             created_time: now,
             // Nothing has edited this OpsItem yet, so its last edit IS its create.
-            last_modified_by: created_by,
+            last_modified_by: created_by.clone(),
             last_modified_time: now,
             version: ops_items::FIRST_OPS_ITEM_VERSION,
         };
         let (ops_item_id, ops_item_arn) = (record.ops_item_id.clone(), record.arn());
+        let (status, version) = (record.status.clone(), record.version);
         store.insert_ops_item(record).map_err(limit_exceeded)?;
+
+        // A write to an OpsItem is an event of that OpsItem's trail, which is what
+        // `ListOpsItemEvents` reports: this create appends the first one, carrying what it
+        // persisted — the version the OpsItem is now at and the status it is now in.
+        store.record_ops_item_event(
+            &region,
+            &ops_item_id,
+            crate::state::ops_item_events::DETAIL_TYPE_CREATE,
+            crate::state::ops_item_events::written_detail(version, &status),
+            &created_by,
+            now,
+        );
 
         Ok(CreateOpsItemOutput {
             ops_item_id: Some(ops_item_id),

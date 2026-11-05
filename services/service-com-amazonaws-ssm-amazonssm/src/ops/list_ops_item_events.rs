@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOpsItemEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOpsItemEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the OpsItem events a Region holds — the reading half of OpsCenter's event
+//! trail. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOpsItemEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What the writes to this service's OpsItems appended is what this reports, through the
+//! one store in [`crate::state::ops_item_events`]: "a list of all OpsItem events in the
+//! current Amazon Web Services Region and Amazon Web Services account", narrowed by the
+//! filters the request names. A filter's `OpsItemId` values are OpsItem ids, so they
+//! select the trails of those OpsItems; two filters narrow together. An id no OpsItem of
+//! the Region carries is the one refusal (`OpsItemNotFoundException`, which the model
+//! declares for this operation precisely because its filter values are OpsItem ids),
+//! because a filter value NAMES an OpsItem rather than describing one — so a request is
+//! served in full or refused, never served as if an id it named had been a criterion
+//! nothing met.
+//!
+//! The trail is reported most recent first and paged by `MaxResults`, with the next page's
+//! first event id handed back as the `NextToken` — a cursor on the result rather than an
+//! offset into it.
+//!
+//! This is a report: it appends no event and writes nothing. An event enters the store
+//! only by a write to an OpsItem, so an account that has written no OpsItem is reported as
+//! holding no events.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +166,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOpsItemEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOpsItemEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOpsItemEvents"))
+        use crate::state::ops_item_events::{event_page_size, is_event_id, OpsItemEventRecord};
+        use crate::state::{request_region, INVALID_NEXT_TOKEN};
+
+        // Each filter's `OpsItemEventFilterKey`, `OpsItemEventFilterOperator` and the
+        // `^(oi)-[0-9a-f]{12}$` pattern of its values, and `MaxResults`'s 1..50 range, are
+        // MODELLED constraints, so the centralized walk has already refused anything
+        // outside them. What is read here is which events of this Region the request's
+        // criteria select.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListOpsItemEventsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the OpsItem event store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let invalid_parameter = |parameter: &str, message: String| {
+            ListOpsItemEventsError::from(
+                ListOpsItemEventsErrorModeled::OpsItemInvalidParameterException(
+                    OpsItemInvalidParameterException {
+                        parameter_names: Some(vec![parameter.to_string()]),
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // "Currently, the only supported value is `OpsItemId`" (`OpsItemEventFilter$Key`)
+        // and "the only supported value is `Equal`" (`$Operator`): a filter outside those
+        // names no property of an event and no comparison this operation can make, so it
+        // cannot be served. Both are modelled enums the walk refuses first, so these are
+        // backstops.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            if !OPS_ITEM_EVENT_FILTER_KEY_VALUES.contains(&filter.key.as_str()) {
+                return Err(invalid_parameter(
+                    "Filters",
+                    format!(
+                        "The filter key {} isn't supported. The supported filter keys are: {}",
+                        filter.key,
+                        OPS_ITEM_EVENT_FILTER_KEY_VALUES.join(", ")
+                    ),
+                ));
+            }
+            if !OPS_ITEM_EVENT_FILTER_OPERATOR_VALUES.contains(&filter.operator.as_str()) {
+                return Err(invalid_parameter(
+                    "Filters",
+                    format!(
+                        "The filter operator {} isn't supported. The supported filter operators \
+                         are: {}",
+                        filter.operator,
+                        OPS_ITEM_EVENT_FILTER_OPERATOR_VALUES.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        let page_size = event_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // How many OpsItems one listing may be narrowed to, which is also what keeps the
+        // work of holding every criterion against every event of the Region finite.
+        let filtered = crate::state::ops_item_events::filtered_ops_items(
+            filters.iter().map(|filter| filter.values.len()),
+        );
+        if let Some(why) = crate::state::ops_item_events::filters_rejection(filtered) {
+            return Err(invalid_parameter("Filters", why));
+        }
+
+        // The token this operation hands out is the id of the event the next page starts
+        // at, so a token that is not shaped like an event id was not one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_event_id(token) => Some(token.to_string()),
+            Some(_) => return Err(invalid_parameter("NextToken", INVALID_NEXT_TOKEN.to_string())),
+        };
+
+        // Systems Manager is regional: an event is reported through the endpoint of the
+        // Region the OpsItem it is about lives in, which is the Region this request was
+        // signed for.
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+
+        // "The values for the filter, consisting of one or more OpsItem IDs"
+        // (`OpsItemEventFilter$Values`): a value NAMES an OpsItem, so an id this Region
+        // holds no OpsItem under names none whose trail could be read.
+        for filter in filters {
+            if filter
+                .values
+                .iter()
+                .any(|id| store.ops_item(&region, id).is_none())
+            {
+                return Err(ListOpsItemEventsErrorModeled::OpsItemNotFoundException(
+                    OpsItemNotFoundException {
+                        // The sentence `OpsItemNotFoundException`'s own documentation
+                        // states, which is what every read of this service answers for an
+                        // OpsItem id its Region holds none under.
+                        message: Some(
+                            "The specified OpsItem ID doesn't exist. Verify the ID and try again."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Two filters narrow together: each is a criterion the event has to meet, and the
+        // values of one filter are the alternatives that criterion accepts.
+        let matching: Vec<&OpsItemEventRecord> = store
+            .ops_item_events_in_region(&region)
+            .into_iter()
+            .filter(|event| {
+                filters
+                    .iter()
+                    .all(|filter| filter.values.contains(&event.ops_item_id))
+            })
+            .collect();
+
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(at) = matching.iter().position(|event| event.event_id == token) else {
+                    // The token is shaped like an event id but names no event this result
+                    // holds, so it is not a page of this result to resume.
+                    return Err(invalid_parameter("NextToken", INVALID_NEXT_TOKEN.to_string()));
+                };
+                at
+            }
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page: &[&OpsItemEventRecord] = matching.get(start..).unwrap_or_default();
+        let summaries = page
+            .iter()
+            .take(page_size)
+            .map(|event| event.to_summary())
+            .collect();
+        // An event is still waiting past this page: hand the caller the id it resumes at,
+        // so the next request continues where this one stopped.
+        let next_token = page.get(page_size).map(|event| event.event_id.clone());
+
+        Ok(ListOpsItemEventsOutput {
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }
