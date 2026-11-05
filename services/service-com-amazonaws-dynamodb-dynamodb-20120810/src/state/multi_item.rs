@@ -13,33 +13,6 @@
 
 use super::*;
 
-// ===========================================================================
-// The two read modules beside this one
-// ===========================================================================
-
-/// What a READ of a table — or of one of its secondary indexes — asks for and reports:
-/// the `ProjectionExpression` member and what its paths report of an item
-/// ([`projection`]), and what being pointed at an index means for the read
-/// ([`indexed_read`]). Both are files beside this one, for the reason this module is one:
-/// they are about what a REQUEST asks for, while [`super`] is the table and item store
-/// itself.
-///
-/// They are declared here rather than in [`super`] so that they sit INSIDE that module's
-/// subtree, which is what lets the projection reader be built on the expression lexer and
-/// parser [`super`] keeps private, while that file — already far past the size a single
-/// file should carry, and due to be split into modules of its own — takes no change.
-/// Everything they export is re-exported below and again by [`super`], so every caller
-/// still names them `crate::state::…`.
-#[path = "projection.rs"]
-pub mod projection;
-
-pub use projection::*;
-
-#[path = "indexed_read.rs"]
-pub mod indexed_read;
-
-pub use indexed_read::*;
-
 /// How many put-or-delete operations one `BatchWriteItem` may carry: "up to 25 item
 /// put or delete operations" (the `BatchWriteItem` doc), which is also the length the
 /// model gives `BatchWriteItemRequestMap`. The ceiling is on the OPERATIONS, counted

@@ -20,8 +20,8 @@
 //! re-exported up to `crate::state`, so every caller names it `crate::state::…`.
 
 use crate::state::{
-    merge_reported, path_skeleton, tokenize_expression, DocumentPath, ExprParser, ExprToken, Item,
-    PathStep, RequestError, Substitutions, MAX_EXPRESSION_TOKENS,
+    check_paths_disjoint, merge_reported, path_skeleton, tokenize_expression, DocumentPath,
+    ExprParser, ExprToken, Item, PathStep, RequestError, Substitutions, MAX_EXPRESSION_TOKENS,
 };
 
 /// The most document paths one projection may name, whichever member states it.
@@ -36,12 +36,16 @@ use crate::state::{
 /// `ValidationException`.
 pub const MAX_PROJECTED_PATHS: usize = MAX_EXPRESSION_TOKENS / 2;
 
-/// The paths one projection reports by: held to [`MAX_PROJECTED_PATHS`], put in the order
-/// a report applies them, and with the duplicates a request may repeat folded together.
+/// The paths one projection reports by: held to [`MAX_PROJECTED_PATHS`], refused when
+/// two of them address the same location or one inside the other, and put in the order a
+/// report applies them.
 ///
 /// Settled ONCE, before anything is read, so what [`project_paths`] does per reported item
 /// is a function of this service's constants rather than of the request body.
-pub fn projected_paths(mut paths: Vec<DocumentPath>) -> Result<Vec<DocumentPath>, RequestError> {
+pub fn projected_paths(
+    member: &'static str,
+    mut paths: Vec<DocumentPath>,
+) -> Result<Vec<DocumentPath>, RequestError> {
     if paths.len() > MAX_PROJECTED_PATHS {
         return Err(RequestError::Validation(format!(
             "One or more parameter values were invalid: a projection may name at most \
@@ -49,11 +53,15 @@ pub fn projected_paths(mut paths: Vec<DocumentPath>) -> Result<Vec<DocumentPath>
             paths.len()
         )));
     }
+    // Two paths that address one location, or one that addresses a location inside
+    // another, cannot both be reported: the request is wrong rather than one of them
+    // winning silently, which is the rule an UPDATE's actions are held to as well
+    // ([`crate::state::check_paths_disjoint`]).
+    check_paths_disjoint(member, &paths.iter().collect::<Vec<&DocumentPath>>())?;
     // DOCUMENT-PATH order, so what a report carries does not depend on the order the
     // request happened to list the paths in: two indexes of one list are reported in index
-    // order. A path the request names twice contributes once.
+    // order.
     paths.sort_by(|one, two| one.0.cmp(&two.0));
-    paths.dedup();
     Ok(paths)
 }
 
@@ -62,8 +70,7 @@ pub fn projected_paths(mut paths: Vec<DocumentPath>) -> Result<Vec<DocumentPath>
 /// Every name is resolved before anything is read: a `#alias` the request never defined,
 /// a bare reserved word, a path deeper than a stored value may nest and a list that does
 /// not read as `path (, path)*` are all refusals of the REQUEST, whichever operation
-/// carried it. A reader that serves whole attributes only wants the top-level names of
-/// these paths, which is what [`crate::state::projection_expression_attributes`] answers.
+/// carried it.
 pub fn projection_expression_paths(
     member: &'static str,
     expression: &str,

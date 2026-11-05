@@ -37,11 +37,10 @@
 //! the size of the table — a search whose results would pass that budget answers the ones
 //! that fit, as a shorter `SearchResults` list.
 //!
-//! Two residual gaps answer the scaffold's 501 rather than a refusal the real service
-//! does not make, and are the only parts of this operation still unwritten: a
-//! `ProjectionExpression` path that reaches INSIDE an attribute (`a.b`, `a[0]`), which no
-//! reader in this crate serves yet, and an index whose stored `DistanceFunction` is
-//! outside the model's `VectorDistanceFunction` enum, which no create or update can store.
+//! One residual gap answers the scaffold's 501 rather than a refusal the real service
+//! does not make, and is the only part of this operation still unwritten: an index whose
+//! stored `DistanceFunction` is outside the model's `VectorDistanceFunction` enum, which
+//! no create or update can store.
 //!
 //! ## Shape of an operation
 //!
@@ -152,7 +151,6 @@
 //!   resource, find the ThrottlingReason field in the returned exception.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -322,7 +320,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let (Some(requested), Some(stored)) =
             (requested_attributes.as_ref(), stored_attributes.as_ref())
         {
-            if requested.iter().any(|name| !stored.contains(name)) {
+            if requested
+                .iter()
+                .map(|path| path.attribute())
+                .any(|name| !stored.contains(name))
+            {
                 return Err(lift(crate::state::RequestError::Validation(
                     UNPROJECTED_ATTRIBUTE_MESSAGE.to_string(),
                 )));
@@ -430,7 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let entry = index.index_entry(item, &table.key_schema);
             let projected = match requested_attributes.as_ref() {
-                Some(requested) => crate::state::project_attributes(&entry, requested),
+                Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,
             };
             reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&projected));
@@ -580,30 +582,24 @@ fn indexed_vector(
         .collect()
 }
 
-/// The attributes a `ProjectionExpression` asks for, or `None` when the request names
+/// The projection a `SearchVectors` reports through, or `None` when the request names
 /// none — in which case "the operation returns all attributes projected into the vector
 /// index" (`SearchVectors$ProjectionExpression`).
 ///
-/// The name list is read by the shared reader
-/// ([`crate::state::projection_expression_attributes`]). A path that reaches INSIDE an
-/// attribute, which that reader answers `None` for, is not served here yet and says so
-/// with the scaffold's 501 rather than a refusal the real service does not answer.
+/// Read by the one reader every read of this service reads a projection with
+/// ([`crate::state::requested_projection`]), so a path that reaches INSIDE an attribute
+/// reports the value it addresses here exactly as it does on the item reads. This
+/// operation carries no legacy `AttributesToGet`.
 fn projected_attributes(
     input: &SearchVectorsInput,
-) -> Result<Option<BTreeSet<String>>, SearchVectorsError> {
-    let Some(expression) = input.projection_expression.as_deref() else {
-        return Ok(None);
-    };
-    let substitutions =
-        crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None);
-    crate::state::projection_expression_attributes(PROJECTION_EXPRESSION, expression, substitutions)
-        .map_err(lift)?
-        .map(Some)
-        .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::not_implemented(
-                "SearchVectors with a ProjectionExpression path into an attribute",
-            )
-        })
+) -> Result<Option<Vec<crate::state::DocumentPath>>, SearchVectorsError> {
+    crate::state::requested_projection(
+        PROJECTION_EXPRESSION,
+        input.projection_expression.as_deref(),
+        None,
+        input.expression_attribute_names.as_ref(),
+    )
+    .map_err(lift)
 }
 
 /// What a search consumed, as this operation reports it, or `None` when the request asked

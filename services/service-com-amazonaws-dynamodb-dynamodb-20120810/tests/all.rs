@@ -61,6 +61,8 @@ mod expression_rules_and_write_admission;
 mod global_secondary_indexes;
 #[path = "all/global_tables.rs"]
 mod global_tables;
+#[path = "all/index_and_projection_reads.rs"]
+mod index_and_projection_reads;
 #[path = "all/index_capacity_and_item_collections.rs"]
 mod index_capacity_and_item_collections;
 #[path = "all/index_key_types_and_range_refusals.rs"]

@@ -19,8 +19,11 @@
 //! consistent `GetItem` costs ([`crate::state::TRANSACTIONAL_CAPACITY_FACTOR`]), reported
 //! per table by [`crate::state::ReadLedger`] when `ReturnConsumedCapacity` asks for it.
 //!
-//! `ProjectionExpression` is NOT served yet: a `Get` that carries one is answered 501
-//! rather than silently served the whole item, exactly as `GetItem` answers it.
+//! What each element reports of the item it addresses is that element's own
+//! `ProjectionExpression`, with its `ExpressionAttributeNames` aliases, read into the one
+//! path list every read of this service reports through
+//! ([`crate::state::requested_projection`]); an element that names none reports the whole
+//! item, exactly as `GetItem` answers it.
 //!
 //! ## Shape of an operation
 //!
@@ -206,20 +209,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
+        // What each element REPORTS of the item it addresses, settled before the store is
+        // reached: a projection the service would refuse is refused whatever the tables
+        // hold. `Get` carries no legacy `AttributesToGet`, so the expression is the only
+        // way one element states its projection, and it is read by the one reader every
+        // read of this service reads it with
+        // ([`crate::state::requested_projection`]).
+        let mut projections: Vec<Option<Vec<crate::state::DocumentPath>>> =
+            Vec::with_capacity(input.transact_items.len());
         for item in &input.transact_items {
             // Every token this element DEFINES must be one its projection uses, and the
             // refusal is the ELEMENT's, so it is stated on its own.
             crate::state::Substitutions::new(item.get.expression_attribute_names.as_ref(), None)
                 .check_all_referenced_in_element(&[(
-                    "ProjectionExpression",
+                    PROJECTION_EXPRESSION,
                     item.get.projection_expression.as_deref(),
                 )])
                 .map_err(lift)?;
-            if item.get.projection_expression.is_some() {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "TransactGetItems with ProjectionExpression",
-                ));
-            }
+            projections.push(
+                crate::state::requested_projection(
+                    PROJECTION_EXPRESSION,
+                    item.get.projection_expression.as_deref(),
+                    None,
+                    item.get.expression_attribute_names.as_ref(),
+                )
+                .map_err(lift)?,
+            );
         }
 
         // WHO this request speaks for, resolved before this service's store is locked
@@ -237,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transaction that is refused consumed nothing anywhere.
         let mut per_table: std::collections::BTreeMap<String, f64> =
             std::collections::BTreeMap::new();
-        for requested in &input.transact_items {
+        for (requested, projected) in input.transact_items.iter().zip(&projections) {
             let name = crate::state::resolve_table_name(&requested.get.table_name).map_err(lift)?;
             for (attribute, value) in &requested.get.key {
                 crate::state::check_attribute_value(attribute, value).map_err(lift)?;
@@ -270,7 +285,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
             *per_table.entry(name.clone()).or_default() += units;
             ledger.record(&name, units);
-            responses.push(ItemResponse { item });
+            // "ProjectionExpression - One or more attributes of the specified item to
+            // retrieve from the table. [...] If no attribute names are specified, then
+            // all attributes of the specified item are returned" (`Get`): what this
+            // element asked for of the item it found.
+            responses.push(ItemResponse {
+                item: crate::state::reported_item(item, projected.as_deref()),
+            });
         }
 
         // "The entire transaction is rejected" when any part of it cannot be served, so
@@ -308,6 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The input member a projection travels in, which is what its refusals name.
+const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> TransactGetItemsError {

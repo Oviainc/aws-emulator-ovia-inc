@@ -503,29 +503,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let condition = KeyCondition::resolve(table, schema, comparisons).map_err(lift)?;
         // "A FilterExpression does not allow key attributes. You cannot define a
         // filter expression based on a partition key or a sort key": which attributes
-        // the expression reads comes from the parsed tree, judged against the table's
-        // own key schema.
-        if let Some(filter) = &filter {
-            if let Some(key) = filter
-                .attribute_reads()
-                .keys()
-                .find(|attribute| table.is_table_key(attribute))
-            {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Filter Expression can only contain non-primary key attributes: \
-                     Primary key attribute: {key}"
-                )));
-            }
-        }
-
-        // "If any of the requested attributes are not projected into the local
-        // secondary index, DynamoDB fetches each of these attributes from the parent
-        // table" (`Query$Select`) — which is what makes that read cost what the whole
-        // item costs. What a read needs is what it reports plus what its filter reads.
+        // the expression reads comes from the parsed tree, judged against EVERY key
+        // schema the read is addressed through — the table's own, and the index's when
+        // the request named one. An index query reads items of the table, so the
+        // table's key attributes are primary key attributes there too.
         let filter_attributes: ::std::collections::BTreeSet<String> = filter
             .as_ref()
             .map(|filter| filter.attribute_reads().into_keys().collect())
             .unwrap_or_default();
+        if let Some(key) = filter_attributes
+            .iter()
+            .find(|attribute| table.is_table_key(attribute) || condition.is_key(attribute))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Filter Expression can only contain non-primary key attributes: \
+                 Primary key attribute: {key}"
+            )));
+        }
+        // "If any of the requested attributes are not projected into the local
+        // secondary index, DynamoDB fetches each of these attributes from the parent
+        // table" (`Query$Select`) — which is what makes that read cost what the whole
+        // item costs. What a read needs is what it reports plus what its filter reads.
         let fetches_from_table = index.as_ref().is_some_and(|index| {
             !index.global
                 && crate::state::needs_unprojected(
@@ -666,7 +664,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The read is ADMITTED against the read capacity the table is provisioned for:
         // the units it consumes are the ones this response bills — every item the page
         // read, filtered or not — and a read past that capacity is refused rather than
-        // served.
+        // served. A read served from an index spends the TABLE's provisioned capacity
+        // here, because an index of a provisioned table has no capacity of its own in
+        // this store.
         if let Err(throttle) = store
             .active_table_mut(&region, &name, now)
             .map_err(lift)?
@@ -775,6 +775,10 @@ struct KeyCondition {
     /// The attribute the partition key value below belongs to, which is how a STORED
     /// item's own value for it is found when the query reads an index.
     partition_name: String,
+    /// The sort key that schema declares, when it declares one. Kept whether or not the
+    /// condition constrains it, because it is a key attribute of the schema being read
+    /// either way — which is what a `FilterExpression` may not name ([`Self::is_key`]).
+    sort_name: Option<String>,
     partition: crate::state::AttributeValueKey,
     sort: Option<SortCondition>,
 }
@@ -895,6 +899,7 @@ impl KeyCondition {
         let partition = partition.ok_or_else(|| missed_key_schema_element(&partition_name))?;
         Ok(Self {
             partition_name,
+            sort_name,
             partition,
             sort,
         })
@@ -913,15 +918,21 @@ impl KeyCondition {
         let Some(actual) = actual else {
             return Ok(false);
         };
-        let first = &sort.operands[0];
+        // The operand count was held to the one the comparison takes when the condition
+        // was resolved, so a comparison that reaches here has the operands it needs.
+        let Some(first) = sort.operands.first() else {
+            return Ok(false);
+        };
         Ok(match sort.operator {
             Operator::Equal => actual == first,
             Operator::LessThan => actual < first,
             Operator::LessOrEqual => actual <= first,
             Operator::GreaterThan => actual > first,
             Operator::GreaterOrEqual => actual >= first,
-            Operator::Between => actual >= first && actual <= &sort.operands[1],
-            Operator::BeginsWith => begins_with(actual, first)?,
+            Operator::Between => {
+                actual >= first && sort.operands.get(1).is_some_and(|high| actual <= high)
+            }
+            Operator::BeginsWith => begins_with(actual, first),
         })
     }
 
@@ -954,6 +965,13 @@ impl KeyCondition {
     fn starts_within(&self, table: &crate::state::Table, start: &crate::state::Item) -> bool {
         stored_key_value(table, start, &self.partition_name).as_ref() == Some(&self.partition)
     }
+
+    /// Whether `attribute` is a key attribute of the schema this query reads, which is
+    /// what a `FilterExpression` may not name — whether or not the condition constrains
+    /// it.
+    fn is_key(&self, attribute: &str) -> bool {
+        attribute == self.partition_name || Some(attribute) == self.sort_name.as_deref()
+    }
 }
 
 /// One key attribute of a stored item or of a key map, encoded the way the order
@@ -977,15 +995,19 @@ fn stored_key_value(
 fn begins_with(
     actual: &crate::state::AttributeValueKey,
     prefix: &crate::state::AttributeValueKey,
-) -> Result<bool, crate::state::RequestError> {
+) -> bool {
     match (actual, prefix) {
         (crate::state::AttributeValueKey::S(value), crate::state::AttributeValueKey::S(prefix)) => {
-            Ok(value.starts_with(prefix.as_str()))
+            value.starts_with(prefix.as_str())
         }
         (crate::state::AttributeValueKey::B(value), crate::state::AttributeValueKey::B(prefix)) => {
-            Ok(value.starts_with(prefix.as_slice()))
+            value.starts_with(prefix.as_slice())
         }
-        _ => Err(begins_with_operand_type(actual)),
+        // Both values were held to the type the schema declares for the key they
+        // compare — the operand when the condition was resolved
+        // ([`begins_with_operand_type`]), the stored value when it was written — so two
+        // of different types cannot reach here.
+        _ => false,
     }
 }
 

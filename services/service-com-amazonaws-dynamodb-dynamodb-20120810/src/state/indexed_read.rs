@@ -168,7 +168,7 @@ pub fn resolve_selection(
 ///
 /// Either way the list is the one [`projected_paths`] settles: held to the ceiling that
 /// module names — which is what bounds the legacy member, since it carries no modelled
-/// length — de-duplicated, and in the order a report applies it. So what
+/// length — refused when two paths overlap, and in the order a report applies it. So what
 /// [`reported_items`] does per item it answers is a function of this service's constants
 /// rather than of the request body.
 pub fn requested_projection(
@@ -178,19 +178,32 @@ pub fn requested_projection(
     names: Option<&HashMap<String, String>>,
 ) -> Result<Option<Vec<DocumentPath>>, RequestError> {
     let legacy = attributes_to_get.filter(|names| !names.is_empty());
-    let paths = match (projection_expression, legacy) {
-        (Some(_), Some(_)) => return Err(expression_conflict("AttributesToGet", member)),
-        (Some(expression), None) => {
-            projection_expression_paths(member, expression, Substitutions::new(names, None))?
-        }
-        (None, Some(names)) => names
-            .iter()
-            .map(|name| DocumentPath::attribute_named(name))
-            .collect(),
+    // Whichever member the request stated its projection through is the member its
+    // refusals name: a caller that sent no `ProjectionExpression` at all is told about
+    // the list it did send.
+    let (stated, paths) = match (projection_expression, legacy) {
+        (Some(_), Some(_)) => return Err(expression_conflict(LEGACY_PROJECTION_MEMBER, member)),
+        (Some(expression), None) => (
+            member,
+            projection_expression_paths(member, expression, Substitutions::new(names, None))?,
+        ),
+        (None, Some(names)) => (
+            LEGACY_PROJECTION_MEMBER,
+            names
+                .iter()
+                .map(|name| DocumentPath::attribute_named(name))
+                .collect(),
+        ),
         (None, None) => return Ok(None),
     };
-    projected_paths(paths).map(Some)
+    projected_paths(stated, paths).map(Some)
 }
+
+/// The member a request states its projection through one generation back:
+/// "AttributesToGet - This is a legacy parameter. Use ProjectionExpression instead"
+/// (that member's doc). Named here because it is what the refusals of a request that
+/// used it have to say.
+const LEGACY_PROJECTION_MEMBER: &str = "AttributesToGet";
 
 /// Whether a read needs an attribute its index does not project, which is what sends it
 /// on to the parent table.

@@ -23,9 +23,12 @@
 //! [`crate::state::ReadLedger`]. Every key this emulator accepted is read, so
 //! `UnprocessedKeys` is the empty map AWS answers with rather than an absent member.
 //!
-//! `ProjectionExpression` and the legacy `AttributesToGet` are NOT served yet: a request
-//! that carries either is answered 501 rather than silently served the whole item, exactly
-//! as `GetItem` answers them.
+//! What each table's entry reports of the items it addresses is that entry's own
+//! projection — a `ProjectionExpression` with its `ExpressionAttributeNames` aliases, or
+//! the legacy `AttributesToGet` list, read into the one path list every read of this
+//! service reports through ([`crate::state::requested_projection`]) — and the whole item
+//! for an entry that names no projection, exactly as `GetItem` answers them. An entry
+//! that states the projection both ways is a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -254,28 +257,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested > crate::state::MAX_BATCH_GET_KEYS {
             return Err(lift(crate::state::too_many_batch_items("BatchGetItem")));
         }
-        for keys in input.request_items.values() {
+        // The tables are walked in name order, so which refusal a bad batch earns does
+        // not depend on the request map's iteration order.
+        let mut addressed: Vec<(&String, &KeysAndAttributes)> =
+            input.request_items.iter().collect();
+        addressed.sort_by(|left, right| left.0.cmp(right.0));
+        // What each table's entry REPORTS of the items it addresses, settled before the
+        // store is reached: a projection the service would refuse is refused whatever
+        // the tables hold. Read by the one reader every read of this service reads it
+        // with, which also refuses an entry that states the projection through both
+        // members ([`crate::state::requested_projection`]).
+        let mut projections: std::collections::HashMap<&String, Vec<crate::state::DocumentPath>> =
+            std::collections::HashMap::new();
+        for (table_name, keys) in &addressed {
             // Every token one table's entry DEFINES must be one its projection uses, and
             // the refusal is that ENTRY's, so it is stated on its own.
             crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
                 .check_all_referenced_in_element(&[(
-                    "ProjectionExpression",
+                    PROJECTION_EXPRESSION,
                     keys.projection_expression.as_deref(),
                 )])
                 .map_err(lift)?;
-            if keys.projection_expression.is_some() {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "BatchGetItem with ProjectionExpression",
-                ));
-            }
-            if keys
-                .attributes_to_get
-                .as_ref()
-                .is_some_and(|names| !names.is_empty())
+            if let Some(projected) = crate::state::requested_projection(
+                PROJECTION_EXPRESSION,
+                keys.projection_expression.as_deref(),
+                keys.attributes_to_get.as_deref(),
+                keys.expression_attribute_names.as_ref(),
+            )
+            .map_err(lift)?
             {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "BatchGetItem with AttributesToGet",
-                ));
+                projections.insert(table_name, projected);
             }
         }
 
@@ -284,12 +295,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
-
-        // The tables are walked in name order, so which refusal a bad batch earns does
-        // not depend on the request map's iteration order.
-        let mut addressed: Vec<(&String, &KeysAndAttributes)> =
-            input.request_items.iter().collect();
-        addressed.sort_by(|left, right| left.0.cmp(right.0));
 
         let mut responses: std::collections::HashMap<String, Vec<crate::state::Item>> =
             std::collections::HashMap::new();
@@ -307,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
         let mut tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (table_name, requested_keys) in addressed {
+        for &(table_name, requested_keys) in &addressed {
             let name = crate::state::resolve_table_name(table_name).map_err(lift)?;
             if !tables.insert(name.clone()) {
                 return Err(crate::scaffolded::Scaffolded::validation(
@@ -361,7 +366,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ledger.record(&name, units);
                 processed += 1;
                 if let Some(item) = item {
-                    found.push(item);
+                    // "ProjectionExpression - One or more attributes to be retrieved from
+                    // the table or index. By default, all attributes are returned"
+                    // (`BatchGetItem$UnprocessedKeys`, which describes the same entry the
+                    // request sent): what this table's entry asked for of the item it
+                    // found, and the whole item when it asked for no projection.
+                    found.extend(crate::state::reported_item(
+                        Some(item),
+                        projections.get(table_name).map(Vec::as_slice),
+                    ));
                 }
             }
             // "Each element in the response consists of a table name, along with a map
@@ -433,3 +446,6 @@ fn lift(error: crate::state::RequestError) -> BatchGetItemError {
         }
     }
 }
+
+/// The input member a projection travels in, which is what its refusals name.
+const PROJECTION_EXPRESSION: &str = "ProjectionExpression";

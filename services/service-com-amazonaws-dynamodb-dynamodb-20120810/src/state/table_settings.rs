@@ -1,0 +1,705 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The per-table settings that each carry a status of their own.
+//!
+//! Continuous backups and point-in-time recovery, contributor insights, time to live,
+//! and the Kinesis destinations a table streams to: each one a record with its own
+//! status vocabulary, its own transitions and its own refusals. They live beside
+//! [`super`] rather than inside it because each is a SETTING of a table with a
+//! lifecycle of its own, while the parent module is the table and item store itself;
+//! `super` re-exports them, so every caller still names them `crate::state::…`.
+
+use super::*;
+
+/// The `ContinuousBackupsStatus` a table reports: "Continuous backups are ENABLED on
+/// all tables at table creation" (the `UpdateContinuousBackups` doc), and nothing in
+/// this API turns them off — `PointInTimeRecoverySpecification` carries only the
+/// point-in-time recovery flag — so every table reports the same one of the two values
+/// the model declares for that member
+/// ([`crate::ops::types::CONTINUOUS_BACKUPS_STATUS_VALUES`]).
+pub const CONTINUOUS_BACKUPS_STATUS: &str = "ENABLED";
+
+/// The two values `PointInTimeRecoveryStatus` takes: "ENABLED - Point in time recovery
+/// is enabled. DISABLED - Point in time recovery is disabled"
+/// (`PointInTimeRecoveryDescription$PointInTimeRecoveryStatus`), which are the model's
+/// own value table ([`crate::ops::types::POINT_IN_TIME_RECOVERY_STATUS_VALUES`]) named
+/// here one per meaning, so a reader of this store sees which one a setting reports.
+pub const POINT_IN_TIME_RECOVERY_ENABLED: &str = "ENABLED";
+pub const POINT_IN_TIME_RECOVERY_DISABLED: &str = "DISABLED";
+
+/// The recovery period an enable that names none settles on: "This parameter is
+/// optional. If no value is provided, the value will default to 35"
+/// (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`).
+pub const DEFAULT_RECOVERY_PERIOD_IN_DAYS: i32 = 35;
+
+/// How far behind the present the newest restorable point sits:
+/// "`LatestRestorableDateTime` is typically 5 minutes before the current time" (the
+/// `UpdateContinuousBackups` doc and
+/// `PointInTimeRecoveryDescription$LatestRestorableDateTime`).
+pub const RESTORE_WINDOW_LAG: Duration = Duration::from_secs(5 * 60);
+
+/// One day, the unit `RecoveryPeriodInDays` counts the recovery window in.
+pub(super) const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A table's point-in-time recovery settings: what `UpdateContinuousBackups` writes and
+/// what both it and `DescribeContinuousBackups` report.
+///
+/// Only the SETTINGS are stored. The restorable window is DERIVED from them at every
+/// read, because it moves with the clock rather than with any call: its newest point is
+/// one [`RESTORE_WINDOW_LAG`] behind now and its oldest the configured period behind
+/// that, bounded below by the instant recovery started — before which there is nothing
+/// to restore from.
+#[derive(Debug, Clone, Default)]
+pub struct PointInTimeRecovery {
+    /// When point-in-time recovery was last turned on, or `None` while it is off (which
+    /// is how every table starts: this API is the only way to turn it on, and
+    /// `CreateTable` carries no `PointInTimeRecoverySpecification`).
+    pub(super) enabled_at: Option<SystemTime>,
+    /// The recovery period in force while recovery is on, in days.
+    pub(super) recovery_period_in_days: i32,
+}
+
+impl PointInTimeRecovery {
+    /// Apply one `PointInTimeRecoverySpecification`.
+    ///
+    /// Turning recovery on while it is ALREADY on does not restart the window — the
+    /// recoverable period is as old as the recovery that has been running — so only the
+    /// period is re-stated; turning it off forgets where the window started, so a later
+    /// enable starts a new one.
+    pub fn apply(&mut self, enabled: bool, recovery_period_in_days: Option<i32>, now: SystemTime) {
+        if enabled {
+            self.enabled_at = Some(self.enabled_at.unwrap_or(now));
+            self.recovery_period_in_days =
+                recovery_period_in_days.unwrap_or(DEFAULT_RECOVERY_PERIOD_IN_DAYS);
+        } else {
+            self.enabled_at = None;
+            self.recovery_period_in_days = 0;
+        }
+    }
+
+    /// Whether point-in-time recovery is on, which is what a restore from a point in
+    /// time is served against ([`Self::restorable_window`] derives the window such a
+    /// restore is held to, and answers `None` for exactly the tables this answers
+    /// `false` for).
+    pub fn enabled(&self) -> bool {
+        self.enabled_at.is_some()
+    }
+
+    /// The restorable window at `now` — `(earliest, latest)` — while recovery is on,
+    /// and `None` while it is off, because a table with recovery off has no point in
+    /// time to restore to.
+    ///
+    /// DERIVED at every read rather than stored, because it moves with the clock: the
+    /// newest point is one [`RESTORE_WINDOW_LAG`] behind now ("LatestRestorableDateTime
+    /// is typically 5 minutes before the current time") and the oldest the configured
+    /// period behind now, each held at or after the instant recovery started — before
+    /// which there is nothing to restore from. The bounds are ordered by construction,
+    /// so the window is never empty.
+    pub fn restorable_window(&self, now: SystemTime) -> Option<(SystemTime, SystemTime)> {
+        let enabled_at = self.enabled_at?;
+        let latest = now
+            .checked_sub(RESTORE_WINDOW_LAG)
+            .unwrap_or(now)
+            .max(enabled_at);
+        let period = u32::try_from(self.recovery_period_in_days).unwrap_or_default();
+        let earliest = now
+            .checked_sub(DAY * period)
+            .unwrap_or(now)
+            .clamp(enabled_at, latest);
+        // Reported at the precision a timestamp carries on the wire, so each bound a
+        // client reads back is exactly the instant it can send in again.
+        Some((
+            at_timestamp_precision(earliest),
+            at_timestamp_precision(latest),
+        ))
+    }
+
+    /// The continuous-backups settings as the two continuous-backups operations report
+    /// them: the table's continuous-backups status, and the point-in-time recovery
+    /// description — the window only while recovery is on, since a table with recovery
+    /// off has no point in time to restore to.
+    pub fn describe(&self, now: SystemTime) -> ContinuousBackupsDescription {
+        let recovery = match self.restorable_window(now) {
+            Some((earliest, latest)) => PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_ENABLED.to_string()),
+                recovery_period_in_days: Some(self.recovery_period_in_days),
+                earliest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(earliest)),
+                latest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(latest)),
+            },
+            None => PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_DISABLED.to_string()),
+                ..PointInTimeRecoveryDescription::default()
+            },
+        };
+        ContinuousBackupsDescription {
+            continuous_backups_status: CONTINUOUS_BACKUPS_STATUS.to_string(),
+            point_in_time_recovery_description: Some(recovery),
+        }
+    }
+}
+
+// =============================================================================
+// CONTRIBUTOR INSIGHTS
+//
+// A table and each of its global secondary indexes carry their own setting: what
+// `UpdateContributorInsights` writes, and what `DescribeContributorInsights` and
+// `ListContributorInsights` report back.
+// =============================================================================
+
+/// The statuses a contributor insights setting is reported in, named one per meaning out
+/// of the model's own value table
+/// ([`crate::ops::types::CONTRIBUTOR_INSIGHTS_STATUS_VALUES`]).
+///
+/// `FAILED` is not among them: that status stands for a failure of the CloudWatch rules
+/// behind the feature ("the most common exceptions for a FAILED status are:
+/// LimitExceededException ... AccessDeniedException ..." — the `FailureException` doc),
+/// and this store runs none, so no setting is ever reported in it.
+pub const CONTRIBUTOR_INSIGHTS_ENABLING: &str = "ENABLING";
+pub const CONTRIBUTOR_INSIGHTS_ENABLED: &str = "ENABLED";
+pub const CONTRIBUTOR_INSIGHTS_DISABLING: &str = "DISABLING";
+pub const CONTRIBUTOR_INSIGHTS_DISABLED: &str = "DISABLED";
+
+/// The two values `ContributorInsightsAction` declares
+/// ([`crate::ops::types::CONTRIBUTOR_INSIGHTS_ACTION_VALUES`]), named one per meaning.
+pub const CONTRIBUTOR_INSIGHTS_ENABLE: &str = "ENABLE";
+pub const CONTRIBUTOR_INSIGHTS_DISABLE: &str = "DISABLE";
+
+/// The mode an enable that names none settles on: the wider of the two the model
+/// declares, which tracks "all access and throttled events" rather than "throttled
+/// events only" (`UpdateContributorInsights$ContributorInsightsMode`) — an enable that
+/// asked for no narrowing asked for neither half to be dropped.
+pub const DEFAULT_CONTRIBUTOR_INSIGHTS_MODE: &str = "ACCESSED_AND_THROTTLED_KEYS";
+
+/// The separator between the table name and the index name in the key one contributor
+/// insights summary pages by ([`contributor_insights_key`]).
+///
+/// A table name and an index name are `[a-zA-Z0-9_.-]` only (the `TableName` and
+/// `IndexName` patterns), so this character can occur in neither: it cannot be mistaken
+/// for part of a name, and it sorts below every character one can carry, which keeps a
+/// table's own summary immediately ahead of its indexes' in the one ascending order
+/// [`page_by_name`] walks.
+pub(super) const CONTRIBUTOR_INSIGHTS_KEY_SEPARATOR: char = '!';
+
+/// The name one contributor insights summary is ordered and resumed by: the table it
+/// belongs to, and the index after it where the summary is an index's.
+pub fn contributor_insights_key(table: &str, index: Option<&str>) -> String {
+    match index {
+        Some(index) => format!("{table}{CONTRIBUTOR_INSIGHTS_KEY_SEPARATOR}{index}"),
+        None => table.to_string(),
+    }
+}
+
+/// The contributor insights setting of ONE table or index: what the last accepted
+/// `UpdateContributorInsights` asked for, and when.
+///
+/// Only the REQUEST is stored; the status is derived at every read, because turning
+/// insights on or off is asynchronous — the call leaves the setting `ENABLING` /
+/// `DISABLING` and the clock owes it the move to `ENABLED` / `DISABLED` one
+/// [`STATUS_TRANSITION`] later. A resource no request has ever named is `DISABLED` with
+/// no timestamp at all: this API is the only way to turn insights on, and `CreateTable`
+/// carries no contributor insights member.
+#[derive(Debug, Clone, Default)]
+pub struct ContributorInsights {
+    /// Whether the last accepted action was `ENABLE`.
+    pub(super) enabled: bool,
+    /// When that action was accepted, or `None` while no request has named this
+    /// resource.
+    pub(super) requested_at: Option<SystemTime>,
+    /// When the clock owes the move out of the transient status.
+    pub(super) settles_at: Option<SystemTime>,
+    /// The mode in force while insights are on, as the request named it (or
+    /// [`DEFAULT_CONTRIBUTOR_INSIGHTS_MODE`] where it named none). A `DISABLE` clears
+    /// it: a setting that tracks nothing is tracking neither kind of event.
+    pub(super) mode: Option<String>,
+}
+
+impl ContributorInsights {
+    /// Apply one `ContributorInsightsAction`, with the mode an enable names.
+    ///
+    /// The action is accepted whether or not it changes anything — re-stating `ENABLE`
+    /// re-states the mode and starts the span again — so what a later read reports is
+    /// always the last request's.
+    pub fn apply(&mut self, enable: bool, mode: Option<&str>, now: SystemTime) {
+        self.enabled = enable;
+        self.requested_at = Some(now);
+        self.settles_at = Some(now + STATUS_TRANSITION);
+        self.mode = enable.then(|| {
+            mode.unwrap_or(DEFAULT_CONTRIBUTOR_INSIGHTS_MODE)
+                .to_string()
+        });
+    }
+
+    /// The status at `now`: the transient one until the clock has made the move due,
+    /// then the settled one.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        let settled = self.settles_at.is_none_or(|due| now >= due);
+        match (self.enabled, settled) {
+            (true, true) => CONTRIBUTOR_INSIGHTS_ENABLED,
+            (true, false) => CONTRIBUTOR_INSIGHTS_ENABLING,
+            (false, true) => CONTRIBUTOR_INSIGHTS_DISABLED,
+            (false, false) => CONTRIBUTOR_INSIGHTS_DISABLING,
+        }
+    }
+
+    /// "Timestamp of the last time the status was changed"
+    /// (`DescribeContributorInsightsOutput$LastUpdateDateTime`): the instant the status
+    /// this read reports was reached — the call's own instant while the move is still
+    /// owed, and the instant it fell due once it has. `None` for a resource no request
+    /// has named, whose status has never changed.
+    pub fn last_update(&self, now: SystemTime) -> Option<SystemTime> {
+        match self.settles_at {
+            Some(due) if now >= due => Some(due),
+            _ => self.requested_at,
+        }
+    }
+
+    /// The mode in force, which a setting that is off carries none of.
+    pub fn mode(&self) -> Option<String> {
+        self.mode.clone()
+    }
+
+    /// Whether this setting is one `ListContributorInsights` reports a summary for.
+    ///
+    /// The listing enumerates the contributor insights CONFIGURATIONS that exist — the
+    /// resources insights are being turned on for, are on for, or are still being turned
+    /// off for. A resource whose status has settled `DISABLED` has no configuration, so
+    /// it carries no summary: it drops out of the listing once a `DISABLE` settles, and a
+    /// resource no update has ever named was never in it. `DescribeContributorInsights`
+    /// is what answers for a named resource either way, and reports `DISABLED` for it.
+    pub fn listed(&self, now: SystemTime) -> bool {
+        self.status(now) != CONTRIBUTOR_INSIGHTS_DISABLED
+    }
+}
+
+// =============================================================================
+// TIME TO LIVE
+//
+// One setting per table: whether items expire, and the attribute whose epoch-seconds
+// value says when. `UpdateTimeToLive` writes it, `DescribeTimeToLive` reports it, and
+// the store's own sweep ([`Table::apply_due_expirations`]) removes the items whose
+// deletion the clock has already made due.
+// =============================================================================
+
+/// The four values `TimeToLiveStatus` declares
+/// ([`crate::ops::types::TIME_TO_LIVE_STATUS_VALUES`]), named one per meaning: turning
+/// a table's TTL on or off is asynchronous ("It can take up to one hour for the change
+/// to fully process" — the `UpdateTimeToLive` doc), so the setting is reported in a
+/// transient status until the clock has settled it.
+pub const TIME_TO_LIVE_ENABLING: &str = "ENABLING";
+pub const TIME_TO_LIVE_ENABLED: &str = "ENABLED";
+pub const TIME_TO_LIVE_DISABLING: &str = "DISABLING";
+pub const TIME_TO_LIVE_DISABLED: &str = "DISABLED";
+
+/// How long after an item has expired its deletion falls due, and the shortest span
+/// between two sweeps of one table.
+///
+/// DynamoDB states no fixed figure for this one: "DynamoDB deletes expired items on a
+/// best-effort basis ... DynamoDB typically deletes expired items within two days of
+/// expiration. The exact duration within which an item gets deleted after expiration is
+/// specific to the nature of the workload" (the `UpdateTimeToLive` doc), which is an
+/// upper bound on a best-effort sweep rather than a duration to keep. This emulator
+/// therefore CHOOSES 500 ms: non-zero, so an item that has just expired is still served
+/// to a reader ("Items that have expired and not been deleted will still show up in
+/// reads, queries, and scans" — the same doc), and short enough that a client that waits
+/// sees the deletion. It doubles as the sweep interval, so the walk one request can
+/// trigger over a table's items runs at most once per span however many requests arrive.
+pub const TTL_DELETION_DELAY: Duration = Duration::from_millis(500);
+
+/// How a call that turns TTL on while it is already on is refused: AWS's FIXED sentence
+/// for that case, which names neither the table nor the attribute.
+///
+/// This is the refusal for a call that asks for the setting the table ALREADY has — the
+/// same attribute, enabled again. A call naming another attribute is a different
+/// refusal, which reports the attribute in force
+/// ([`time_to_live_attribute_mismatch`]).
+pub const TIME_TO_LIVE_ALREADY_ENABLED_MESSAGE: &str = "TimeToLive is already enabled";
+
+/// The same for a call that turns TTL off while it is already off.
+pub const TIME_TO_LIVE_ALREADY_DISABLED_MESSAGE: &str = "TimeToLive is already disabled";
+
+/// How a specification that names an attribute OTHER than the one TTL is in force for is
+/// refused: AWS's sentence for that case, whose variable part is the attribute this
+/// table's items are currently expired by, read from the table's stored setting.
+///
+/// The TTL attribute of a table whose TTL is on is not something this API moves: a
+/// specification naming another attribute asks for a TTL over an attribute that is not
+/// the one in force, so it is refused and the stored one is reported back — whether the
+/// specification was enabling TTL or disabling it, because either way the attribute it
+/// names is not this table's.
+pub fn time_to_live_attribute_mismatch(attribute_in_force: &str) -> String {
+    format!(
+        "TimeToLive is active on a different AttributeName: current AttributeName is \
+         {attribute_in_force}"
+    )
+}
+
+/// How a call that arrives while the last TTL change is still processing is refused:
+/// "Any additional UpdateTimeToLive calls for the same table during this one hour
+/// duration result in a ValidationException" (the `UpdateTimeToLive` doc). The span this
+/// emulator processes a change over is [`STATUS_TRANSITION`], the one every other
+/// transient status here is reported for.
+pub const TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE: &str =
+    "Time to live has been modified multiple times within a fixed interval";
+
+/// One table's Time to Live setting: what the last accepted `UpdateTimeToLive` asked
+/// for, when it was accepted, and when this table's items were last swept.
+///
+/// Only the REQUEST is stored; the status is derived at every read, for the reason
+/// [`ContributorInsights`]'s is — the change is asynchronous, so the call leaves the
+/// setting `ENABLING` / `DISABLING` and the clock owes it the move to `ENABLED` /
+/// `DISABLED` one [`STATUS_TRANSITION`] later. A table no `UpdateTimeToLive` has named
+/// is `DISABLED` with no attribute at all: this API is the only way to turn TTL on, and
+/// `CreateTable` carries no TTL member.
+#[derive(Debug, Clone, Default)]
+pub struct TimeToLive {
+    /// Whether the last accepted specification turned TTL on.
+    pub(super) enabled: bool,
+    /// The attribute that specification named — the one whose value items expire by
+    /// while TTL is on, and the one being withdrawn while it is going off. `None` until
+    /// a request has named one.
+    pub(super) attribute_name: Option<String>,
+    /// When the clock owes the move out of the transient status.
+    pub(super) settles_at: Option<SystemTime>,
+    /// When this table's items were last swept for expiries, or `None` while they never
+    /// have been.
+    pub(super) swept_at: Option<SystemTime>,
+}
+
+impl TimeToLive {
+    /// Apply one `TimeToLiveSpecification`: the attribute it names comes into force (or
+    /// starts being withdrawn) and the transient span starts again.
+    pub fn apply(&mut self, enabled: bool, attribute_name: &str, now: SystemTime) {
+        self.enabled = enabled;
+        self.attribute_name = Some(attribute_name.to_string());
+        self.settles_at = Some(now + STATUS_TRANSITION);
+    }
+
+    /// Whether the clock has already settled the last change this setting was given.
+    pub fn settled(&self, now: SystemTime) -> bool {
+        self.settles_at.is_none_or(|due| now >= due)
+    }
+
+    /// The status at `now`: the transient one until the clock has made the move due,
+    /// then the settled one.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match (self.enabled, self.settled(now)) {
+            (true, true) => TIME_TO_LIVE_ENABLED,
+            (true, false) => TIME_TO_LIVE_ENABLING,
+            (false, true) => TIME_TO_LIVE_DISABLED,
+            (false, false) => TIME_TO_LIVE_DISABLING,
+        }
+    }
+
+    /// The attribute this table's items are expired by RIGHT NOW: the one the settled
+    /// enable named, and `None` for a table whose TTL is off or still settling.
+    pub fn attribute_in_force(&self, now: SystemTime) -> Option<&str> {
+        match self.status(now) {
+            TIME_TO_LIVE_ENABLED => self.attribute_name.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Project this setting into the `TimeToLiveDescription` the TTL reader reports:
+    /// the status, and the attribute it is in force for.
+    ///
+    /// A setting that has settled OFF reports no attribute: nothing expires items on
+    /// that table, so there is no TTL attribute for it to name — which is also what a
+    /// table that has never had TTL reports.
+    pub fn describe(&self, now: SystemTime) -> TimeToLiveDescription {
+        let status = self.status(now);
+        TimeToLiveDescription {
+            time_to_live_status: Some(status.to_string()),
+            attribute_name: match status {
+                TIME_TO_LIVE_DISABLED => None,
+                _ => self.attribute_name.clone(),
+            },
+        }
+    }
+
+    /// The attribute a sweep that is DUE at `now` expires items by, or `None` when this
+    /// table has nothing to sweep yet.
+    ///
+    /// A sweep is due only while TTL is in force — a change that is still settling
+    /// expires nothing, because the attribute it names is not the one items are being
+    /// deleted by yet — and at most once per [`TTL_DELETION_DELAY`].
+    pub(super) fn due_sweep_attribute(&self, now: SystemTime) -> Option<String> {
+        let in_force = self.status(now) == TIME_TO_LIVE_ENABLED;
+        let due = self
+            .swept_at
+            .is_none_or(|last| now >= last + TTL_DELETION_DELAY);
+        (in_force && due)
+            .then(|| self.attribute_name.clone())
+            .flatten()
+    }
+
+    /// Record that this table's items have just been swept.
+    pub(super) fn mark_swept(&mut self, now: SystemTime) {
+        self.swept_at = Some(now);
+    }
+}
+
+/// The epoch-seconds instant an item's TTL attribute must not be LATER than for its
+/// deletion to be due at `now`: one [`TTL_DELETION_DELAY`] back, as an `N` value's text,
+/// so the comparison runs through the same number parser a stored `N` was canonicalized
+/// by ([`NumberKey`]).
+pub(super) fn expiry_cutoff(now: SystemTime) -> Option<NumberKey> {
+    let delay = i128::try_from(TTL_DELETION_DELAY.as_millis()).unwrap_or(i128::MAX);
+    let millis = epoch_millis(now).saturating_sub(delay);
+    let sign = if millis < 0 { "-" } else { "" };
+    let magnitude = millis.unsigned_abs();
+    NumberKey::parse(&format!(
+        "{sign}{}.{:03}",
+        magnitude / 1_000,
+        magnitude % 1_000
+    ))
+}
+
+/// Whether one item's TTL attribute value has already made the item's deletion due.
+///
+/// "TTL compares the current time in epoch time format to the time stored in the TTL
+/// attribute of an item. If the epoch time value stored in the attribute is less than
+/// the current time, the item is marked as expired" (the `UpdateTimeToLive` doc): the
+/// value is a NUMBER of seconds since the epoch, so an attribute of any other type
+/// expires nothing — a string, a set or a boolean states no epoch time to compare.
+pub(super) fn expiry_due(value: &AttributeValue, cutoff: &NumberKey) -> bool {
+    match value {
+        AttributeValue::N(text) => {
+            NumberKey::parse(text).is_some_and(|expires_at| expires_at <= *cutoff)
+        }
+        _ => false,
+    }
+}
+
+// =============================================================================
+// KINESIS DATA STREAM DESTINATIONS
+//
+// A table replicates its item changes to a Kinesis data stream through a
+// DESTINATION record it carries: the enable command registers one, the update
+// command changes the timestamp precision of a registered one, the disable
+// command stops it, and the describing operation reports every one the table
+// holds. Each record below is what those operations read and report; no value
+// they answer with is canned.
+// =============================================================================
+
+/// The `DestinationStatus` values a destination record moves between
+/// ([`crate::ops::types::DESTINATION_STATUS_VALUES`]), named one per meaning.
+///
+/// Registering, updating and stopping replication are all asynchronous, so a
+/// destination is reported in a transient status (`ENABLING`, `UPDATING`,
+/// `DISABLING`) for a span and in the settled one (`ACTIVE`, `DISABLED`) after it —
+/// the same clock-owed move every other status in this store makes
+/// ([`STATUS_TRANSITION`]).
+pub const DESTINATION_STATUS_ENABLING: &str = "ENABLING";
+pub const DESTINATION_STATUS_ACTIVE: &str = "ACTIVE";
+pub const DESTINATION_STATUS_UPDATING: &str = "UPDATING";
+pub const DESTINATION_STATUS_DISABLING: &str = "DISABLING";
+pub const DESTINATION_STATUS_DISABLED: &str = "DISABLED";
+
+/// How DynamoDB opens its refusal of a command against a table's Kinesis streaming
+/// destination that the table's state cannot serve; the reason follows the colon.
+pub(super) const KINESIS_DESTINATION_INVALID_STATE: &str =
+    "Table is not in a valid state to enable Kinesis Streaming Destination";
+
+/// How a command that addresses ONE of a table's Kinesis streaming destinations is
+/// refused when the table holds NO destination record for that stream at all: the stream
+/// ARN the request named and the table it named it against, under the invalid-state
+/// sentence above.
+///
+/// This is the lookup miss proper — the table has no record of ever replicating to that
+/// stream. A record that EXISTS but is not `ACTIVE` is a state refusal instead
+/// ([`kinesis_destination_not_active_to_update`]), because the two are different causes
+/// for the caller: one is terminal, the other is waited out or re-enabled.
+pub fn kinesis_destination_not_found(table: &str, stream_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: No streaming destination with streamArn: \
+         {stream_arn} found for table with tableName: {table}"
+    ))
+}
+
+/// How the command that STOPS replication is refused when the destination it addresses is
+/// not `ACTIVE`: replication can only be stopped once it is running, and the refusal is
+/// stated over that required status alone — it names neither the table nor the stream.
+///
+/// The same sentence answers every status that is not `ACTIVE`, a table that holds no
+/// record for the stream included: in each case there is no running replication to stop.
+pub fn kinesis_destination_not_active_to_disable() -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: KinesisStreamingDestination must be ACTIVE to \
+         perform DISABLE operation."
+    ))
+}
+
+/// How the command that CHANGES a destination's configuration is refused when the
+/// destination it addresses exists but is not `ACTIVE`: the status the change requires,
+/// over the table name and the Kinesis stream ARN the request addressed the destination
+/// by (`kdsArn`).
+pub fn kinesis_destination_not_active_to_update(table: &str, stream_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: Kinesis streaming is not in ACTIVE state. Updates \
+         are only allowed in ACTIVE state. TableName: {table}, kdsArn: {stream_arn}"
+    ))
+}
+
+/// How the command that STARTS replication is refused when the table already replicates
+/// to that stream: the same invalid-state sentence, over the stream and table the
+/// request named. Replication that is already on cannot be started again.
+pub fn kinesis_destination_already_enabled(table: &str, stream_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: Streaming destination with streamArn: \
+         {stream_arn} is already enabled for table with tableName: {table}"
+    ))
+}
+
+/// How many Kinesis data stream destination records ONE table keeps.
+///
+/// The list grows by one per DISTINCT stream a command registers — a stream the table
+/// already holds a record for is re-registered in place — and the stopped records are
+/// the replication history the describing operation reports. AWS publishes no figure for
+/// that history, so this store CHOOSES 64: room for a table's replication history to be
+/// reported in full, and a bound, so no sequence of commands grows one table's record
+/// list without end.
+pub const MAX_KINESIS_DESTINATIONS_PER_TABLE: usize = 64;
+
+/// The form a Kinesis data stream's ARN takes
+/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`), answering the stream it
+/// names.
+///
+/// The `StreamArn` member is modelled as a length-bounded string only, so this is the
+/// check the service itself makes: a value that names no Kinesis data stream addresses
+/// no destination at all, which is an INPUT failure rather than a lookup miss, worded
+/// the way this service words an ARN member it cannot read ([`check_table_arn`]).
+pub fn check_stream_arn(stream_arn: &str) -> Result<String, RequestError> {
+    let invalid = || {
+        RequestError::Validation(format!(
+            "Invalid StreamArn: Invalid StreamArn provided as input {stream_arn}"
+        ))
+    };
+    // `arn`, partition, service, region, account, resource — the resource field is the
+    // last one and may itself carry `/`, so the split stops at six.
+    let fields: Vec<&str> = stream_arn.splitn(6, ':').collect();
+    let (partition, service, region, resource) = match fields.as_slice() {
+        ["arn", partition, service, region, _account, resource] => {
+            (*partition, *service, *region, *resource)
+        }
+        _ => return Err(invalid()),
+    };
+    if partition.is_empty() || service != "kinesis" || region.is_empty() {
+        return Err(invalid());
+    }
+    let name = resource.strip_prefix("stream/").ok_or_else(invalid)?;
+    if name.is_empty() || name.contains('/') {
+        return Err(invalid());
+    }
+    Ok(name.to_string())
+}
+
+/// One Kinesis data stream destination of a table: the stream it replicates to, where
+/// that replication is in its lifecycle, and the timestamp precision in force.
+///
+/// Only the last accepted command is stored; the status is derived at every read from
+/// the clock, exactly as [`ContributorInsights`] derives its own.
+#[derive(Debug, Clone)]
+pub struct KinesisDestination {
+    /// "The ARN for a specific Kinesis data stream"
+    /// (`KinesisDataStreamDestination$StreamArn`) — the identity a command addresses
+    /// this record by.
+    pub stream_arn: String,
+    /// The status this record settles on once the span has elapsed.
+    pub(super) settled_status: &'static str,
+    /// The status it reports until then.
+    pub(super) transient_status: &'static str,
+    /// When the clock owes the move from the transient status to the settled one.
+    pub(super) settles_at: SystemTime,
+    /// "The precision of the Kinesis data stream timestamp"
+    /// (`KinesisDataStreamDestination$ApproximateCreationDateTimePrecision`), or `None`
+    /// while no command has named one: the member is absent until one does.
+    pub(super) precision: Option<String>,
+}
+
+impl KinesisDestination {
+    /// Register one destination, as the command that starts replication leaves it:
+    /// `ENABLING` for the span, then `ACTIVE`.
+    pub fn enabling(stream_arn: &str, precision: Option<&str>, now: SystemTime) -> Self {
+        Self {
+            stream_arn: stream_arn.to_string(),
+            settled_status: DESTINATION_STATUS_ACTIVE,
+            transient_status: DESTINATION_STATUS_ENABLING,
+            settles_at: now + STATUS_TRANSITION,
+            precision: precision.map(str::to_string),
+        }
+    }
+
+    /// The status at `now`: the transient one until the clock has made the move due,
+    /// then the settled one.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.settles_at {
+            self.transient_status
+        } else {
+            self.settled_status
+        }
+    }
+
+    /// Whether this record still REPLICATES — the destination a command that addresses
+    /// a table's live replication to this stream acts on. A record whose replication has
+    /// stopped, or is stopping, is history: it is still reported, and no longer
+    /// addressable.
+    pub fn replicating(&self, now: SystemTime) -> bool {
+        let status = self.status(now);
+        status != DESTINATION_STATUS_DISABLED && status != DESTINATION_STATUS_DISABLING
+    }
+
+    /// Whether this record is `ACTIVE` at `now` — replication running, with no
+    /// asynchronous change of its own still owed.
+    ///
+    /// This is the status a command that CHANGES the destination requires: while a
+    /// registration, a configuration change or a stop is still in flight the destination
+    /// is in a transient status, and the change is refused on that status.
+    pub fn active(&self, now: SystemTime) -> bool {
+        self.status(now) == DESTINATION_STATUS_ACTIVE
+    }
+
+    /// Apply one update of this destination's configuration: the record is `UPDATING`
+    /// for the span and `ACTIVE` after it, carrying the precision the command named.
+    ///
+    /// A command that names no precision changes none — it asks for no configuration
+    /// change — and still restarts the span, because the service accepted the command.
+    pub fn apply_update(&mut self, precision: Option<&str>, now: SystemTime) {
+        if let Some(precision) = precision {
+            self.precision = Some(precision.to_string());
+        }
+        self.settled_status = DESTINATION_STATUS_ACTIVE;
+        self.transient_status = DESTINATION_STATUS_UPDATING;
+        self.settles_at = now + STATUS_TRANSITION;
+    }
+
+    /// The timestamp precision in force, which a destination no command has named one
+    /// for carries none of.
+    pub fn precision(&self) -> Option<String> {
+        self.precision.clone()
+    }
+
+    /// Apply the command that STOPS replication: the record is `DISABLING` for the span
+    /// and `DISABLED` after it, keeping the stream it replicated to and the precision it
+    /// replicated under — a stopped destination is still reported, as this table's
+    /// replication history.
+    pub fn apply_disable(&mut self, now: SystemTime) {
+        self.settled_status = DESTINATION_STATUS_DISABLED;
+        self.transient_status = DESTINATION_STATUS_DISABLING;
+        self.settles_at = now + STATUS_TRANSITION;
+    }
+
+    /// Project this record into the `KinesisDataStreamDestination` the describing
+    /// operation reports.
+    ///
+    /// `DestinationStatusDescription` is "the human-readable string that corresponds to
+    /// the replica status" — a description of a FAILURE, which a record that replicates
+    /// has none of, so the member stays absent.
+    pub fn describe(&self, now: SystemTime) -> KinesisDataStreamDestination {
+        KinesisDataStreamDestination {
+            stream_arn: Some(self.stream_arn.clone()),
+            destination_status: Some(self.status(now).to_string()),
+            destination_status_description: None,
+            approximate_creation_date_time_precision: self.precision(),
+        }
+    }
+}

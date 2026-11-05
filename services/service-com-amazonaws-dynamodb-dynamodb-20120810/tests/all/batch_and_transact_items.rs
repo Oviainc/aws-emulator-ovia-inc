@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // One harness for the whole target: the router, the request and the error-code reader
 // come from `tests/all/emulator.rs`; the table factory from `tests/all/table_items.rs`.
-use crate::emulator::{call, call_in, emulator, error_code, ok};
+use crate::emulator::{call, call_in, emulator, error_code, message, ok};
 use crate::table_items::create_active_table;
 
 /// Send one operation in `region` that must succeed, for the cases that are ABOUT the
@@ -919,47 +919,52 @@ async fn a_refused_multi_item_request_is_refused_and_writes_nothing() {
     }
 }
 
-/// `ProjectionExpression` and the legacy `AttributesToGet` are not served on the
-/// multi-item read paths yet, so a request that carries one is answered 501 rather than
-/// silently served the whole item — the same answer `GetItem` gives them.
+/// A multi-item read reports what its entry's projection names, and an entry that states
+/// that projection BOTH ways — through `ProjectionExpression` and through the legacy
+/// `AttributesToGet` it replaced — is refused as the contradiction it is, the same way
+/// `GetItem` refuses it. What a served projection REPORTS is the subject of
+/// `tests/all/index_and_projection_reads.rs`.
 #[tokio::test]
-async fn an_unserved_projection_is_answered_not_implemented() {
+async fn a_projection_stated_twice_is_refused() {
     let router = emulator();
     let table = "multi-projection";
     create_active_table(&router, table, &[("pk", "HASH", "S")]).await;
 
     let cases: Vec<(&str, &str, Value)> = vec![
         (
-            "BatchGetItem with ProjectionExpression",
+            "BatchGetItem stating one table's projection both ways",
             "BatchGetItem",
             json!({"RequestItems": {table: {
                 "Keys": [{"pk": {"S": "a"}}],
                 "ProjectionExpression": "ver",
-            }}}),
-        ),
-        (
-            "BatchGetItem with AttributesToGet",
-            "BatchGetItem",
-            json!({"RequestItems": {table: {
-                "Keys": [{"pk": {"S": "a"}}],
                 "AttributesToGet": ["ver"],
             }}}),
         ),
         (
-            "TransactGetItems with ProjectionExpression",
-            "TransactGetItems",
-            json!({"TransactItems": [{"Get": {
-                "TableName": table,
-                "Key": {"pk": {"S": "a"}},
-                "ProjectionExpression": "ver",
-            }}]}),
+            "GetItem stating its projection both ways",
+            "GetItem",
+            json!({"TableName": table, "Key": {"pk": {"S": "a"}},
+                   "ProjectionExpression": "ver", "AttributesToGet": ["ver"]}),
         ),
     ];
     for (case, operation, body) in cases {
         let (status, refused) = call(&router, operation, body).await;
         assert_eq!(
-            status, 501,
-            "case {case}: an unserved member is answered 501, got {status} with {refused}"
+            status, 400,
+            "case {case}: a request that states one thing twice is refused, got {status} \
+             with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case}: expected ValidationException, got {refused}"
+        );
+        assert_eq!(
+            message(&refused),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet} Expression parameters: \
+             {ProjectionExpression}",
+            "case {case}: expected the two-members sentence, got {refused}"
         );
     }
 }

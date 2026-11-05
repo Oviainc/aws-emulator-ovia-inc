@@ -6,10 +6,13 @@
 //! with no item is a 200 with `Item` absent, not an error; an unknown — or not yet
 //! `ACTIVE` — table is `ResourceNotFoundException`.
 //!
-//! Projections (`ProjectionExpression`, the legacy `AttributesToGet`) are refused
-//! with the scaffold's 501 and filed as their own gap issue. `ConsistentRead` needs
-//! no handling beyond its effect on `ConsumedCapacity`: this store has one copy of
-//! each item, so every read of it is strongly consistent.
+//! What the response carries of the item is the request's projection — a
+//! `ProjectionExpression` with its `ExpressionAttributeNames` aliases, or the legacy
+//! `AttributesToGet` list, read into the one path list every read of this service
+//! reports through ([`crate::state::requested_projection`]) — and the whole item when
+//! the request names no projection. `ConsistentRead` needs no handling beyond its effect
+//! on `ConsumedCapacity`: this store has one copy of each item, so every read of it is
+//! strongly consistent.
 //!
 //! The `Key` is held to the same documented key-value limits the write path applies
 //! ([`crate::state::Table::check_key_limits`]): a key that could never be stored is
@@ -223,36 +226,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request invalid.
         crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None)
             .check_all_referenced(&[(
-                "ProjectionExpression",
+                PROJECTION_EXPRESSION,
                 input.projection_expression.as_deref(),
             )])
             .map_err(lift)?;
-        if let Some(expression) = input.projection_expression.as_deref() {
-            // The member is VALIDATED whether or not projecting is served: whether the
-            // expression is one this service's language accepts — a bare reserved
-            // word, an undefined `#name`, a syntax error — is a fact of the request,
-            // and refusing it as unwritten would answer "nobody implemented this" for
-            // a request no implementation could serve. The names it resolves to are
-            // this reader's to use once it serves the member.
-            crate::state::projection_expression_attributes(
-                "ProjectionExpression",
-                expression,
-                crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
-            )
-            .map_err(lift)?;
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "GetItem with ProjectionExpression",
-            ));
-        }
-        if input
-            .attributes_to_get
-            .as_ref()
-            .is_some_and(|names| !names.is_empty())
-        {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "GetItem with AttributesToGet",
-            ));
-        }
+        // What this read REPORTS of the item it finds, settled before the store is
+        // reached: the member is VALIDATED whether or not the key holds an item, because
+        // whether the projection is one this service's language accepts — a bare
+        // reserved word, an undefined `#name`, a syntax error, two paths that overlap —
+        // is a fact of the request. Read by the one reader every read of this service
+        // reads it with, which also refuses a request that states the projection through
+        // both members ([`crate::state::requested_projection`]).
+        let projected = crate::state::requested_projection(
+            PROJECTION_EXPRESSION,
+            input.projection_expression.as_deref(),
+            input.attributes_to_get.as_deref(),
+            input.expression_attribute_names.as_ref(),
+        )
+        .map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked:
         // the table's resource policy and the caller's own identity-based policies decide
@@ -282,7 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let units =
             crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false));
         // The read is ADMITTED against the read capacity the table is provisioned for:
-        // the units it consumes are the ones this response bills, and a read past that
+        // the units it consumes are the ones this response bills — read off the WHOLE
+        // item, because "the number of capacity units consumed will be the same whether
+        // you request all of the attributes (the default behavior) or just some of them
+        // (using a projection expression)" (the `GetItem` doc) — and a read past that
         // capacity is refused rather than served.
         if let Err(throttle) = store
             .active_table_mut(&region, &name, now)
@@ -298,7 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         Ok(GetItemOutput {
-            item,
+            // "Item - A map of attribute names to AttributeValue objects, as specified
+            // by ProjectionExpression": what the request asked for of the item it found,
+            // and the whole item when it asked for no projection at all.
+            item: crate::state::reported_item(item, projected.as_deref()),
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,
@@ -330,3 +327,6 @@ fn lift(error: crate::state::RequestError) -> GetItemError {
         }
     }
 }
+
+/// The input member a projection travels in, which is what its refusals name.
+const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
