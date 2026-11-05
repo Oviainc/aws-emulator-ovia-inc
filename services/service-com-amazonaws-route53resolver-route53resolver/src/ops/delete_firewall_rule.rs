@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFirewallRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFirewallRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFirewallRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +122,23 @@ impl From<DeleteFirewallRuleErrorModeled> for DeleteFirewallRuleError {
     }
 }
 
+/// How this operation reports a refusal the store decided: as the modelled
+/// exception that states it, which is the one the model declares for this
+/// operation for that class of fault — the same refusal the batch delete
+/// reports as an entry's `Code` and `Message`.
+impl From<crate::state::FirewallRuleDeleteRefusal> for DeleteFirewallRuleErrorModeled {
+    fn from(refusal: crate::state::FirewallRuleDeleteRefusal) -> Self {
+        match refusal {
+            crate::state::FirewallRuleDeleteRefusal::Validation(error) => {
+                Self::ValidationException(error)
+            }
+            crate::state::FirewallRuleDeleteRefusal::ResourceNotFound(error) => {
+                Self::ResourceNotFoundException(error)
+            }
+        }
+    }
+}
+
 /// The `DeleteFirewallRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +175,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFirewallRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFirewallRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFirewallRule"))
+        // The engine is reachable from `&self` (constructor-injected); a rule is
+        // not an ARN-bearing resource of its own, so this operation takes
+        // nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFirewallRuleErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The rule this request names, as the store takes one: the group that
+        // holds it, the source it matches on, and the query type that tells
+        // apart the rules of one group matching the same source. Every decision
+        // about the deletion — which rule the request names, the rule leaving
+        // the group so the group's `RuleCount` and every later read of its rules
+        // follow from the one removal, the lifecycle states a delete succeeds in
+        // — is made there, so this rule and the same rule deleted as one entry
+        // of a batch delete are the same deletion.
+        let named = crate::state::FirewallRuleMatchSource {
+            firewall_rule_group_id: &input.firewall_rule_group_id,
+            firewall_domain_list_id: input.firewall_domain_list_id.as_deref(),
+            firewall_threat_protection_id: input.firewall_threat_protection_id.as_deref(),
+            qtype: input.qtype.as_deref(),
+            action: crate::state::FIREWALL_RULE_ACTION_WORD_DELETE,
+        };
+
+        let now = ::std::time::Instant::now();
+        let deleted = state
+            .lock()
+            .delete_firewall_rule(named, now)
+            .map_err(DeleteFirewallRuleErrorModeled::from)?;
+
+        // "The specification for the firewall rule that you just deleted": the
+        // rule as the group held it the moment it was removed.
+        Ok(DeleteFirewallRuleOutput {
+            firewall_rule: Some(deleted),
+        })
     }
 }

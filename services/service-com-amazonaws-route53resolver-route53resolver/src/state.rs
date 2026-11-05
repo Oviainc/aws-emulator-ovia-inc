@@ -459,6 +459,18 @@ pub const RSLVR_CODE_ASSOCIATION_MUTATION_PROTECTED: &str = "RSLVR-02307";
 /// [`firewall_rule_update_batch_too_large`].
 pub const RSLVR_CODE_FIREWALL_RULE_BATCH_TOO_LARGE: &str = "RSLVR-02052";
 
+/// The Route 53 Resolver service error code reported when no rule of the DNS
+/// Firewall rule group the request named matches the source it named the rule
+/// by.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`]:
+/// `ResourceNotFoundException` states every resource of the service a caller
+/// cannot address, so the HTTP status and the shape name alone do not say which
+/// one was missing — and a rule inside a group is reported with its own code,
+/// and not the one a resource named by its id carries
+/// ([`RSLVR_CODE_RESOURCE_NOT_FOUND`]). See [`firewall_rule_not_found`].
+pub const RSLVR_CODE_FIREWALL_RULE_NOT_FOUND: &str = "RSLVR-02004";
+
 /// The Route 53 Resolver service error code reported when a DNS Firewall rule
 /// write states a block setting for an action that blocks nothing.
 ///

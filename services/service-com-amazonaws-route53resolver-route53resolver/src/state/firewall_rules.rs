@@ -161,17 +161,29 @@ pub fn firewall_rule_update_batch_too_large(cap: usize) -> LimitExceededExceptio
     }
 }
 
-/// The `ResourceNotFoundException` the rule operations answer for a rule of a
-/// group the caller cannot address, built here so every operation that resolves
-/// a rule inside a group reports the same body.
+/// The `ResourceNotFoundException` the rule operations answer when no rule of
+/// the group the request named matches the source it named the rule by, built
+/// here so every operation that resolves a rule inside a group reports the same
+/// body.
 ///
-/// It carries the same coded sentence as every other resource of this service a
-/// caller names but cannot address ([`resource_not_found_message`]), with the
-/// rule's modelled shape name as the resource type and the id the request named
-/// the rule by — its match source — inside it.
-pub fn firewall_rule_not_found(match_source_id: &str) -> ResourceNotFoundException {
+/// A rule is not addressed by an id of its own: it is addressed INSIDE a group,
+/// by the source it matches on, so the service reports its own coded sentence
+/// for it ([`RSLVR_CODE_FIREWALL_RULE_NOT_FOUND`]) and names both halves of
+/// what the request named — the rule group, and the member it named the rule by
+/// with the id it carried there. `ResourceType` is the rule's modelled shape
+/// name, which is the resource that doesn't exist.
+pub fn firewall_rule_not_found(
+    firewall_rule_group_id: &str,
+    match_source_member: &str,
+    match_source_id: &str,
+) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(match_source_id)),
+        message: Some(rslvr_message(
+            RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
+            &format!(
+                r#"Can’t locate the rule for the Firewall rule group ID: "{firewall_rule_group_id}" and {match_source_member} "{match_source_id}""#
+            ),
+        )),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE.to_string()),
     }
 }
@@ -591,18 +603,37 @@ pub struct FirewallRuleMatchSource<'a> {
 }
 
 impl<'a> FirewallRuleMatchSource<'a> {
-    /// The one id this request names its rule by, or `None` when it carries
-    /// both ids or neither — in both of which it names no single rule.
-    pub fn match_source_id(&self) -> Option<&'a str> {
+    /// The member this request names its rule by, as the service words it, and
+    /// the id it carried there — or `None` when it carries both ids or neither,
+    /// in both of which it names no single rule.
+    ///
+    /// The member is part of what the service says when no rule of the group
+    /// answers to what was named ([`firewall_rule_not_found`]), so which member
+    /// that is and which id it carries are read out in ONE place.
+    pub fn match_source(&self) -> Option<(&'static str, &'a str)> {
         match (
             self.firewall_domain_list_id,
             self.firewall_threat_protection_id,
         ) {
-            (Some(id), None) | (None, Some(id)) => Some(id),
+            (Some(id), None) => Some((FIREWALL_RULE_DOMAIN_LIST_MEMBER, id)),
+            (None, Some(id)) => Some((FIREWALL_RULE_THREAT_PROTECTION_MEMBER, id)),
             _ => None,
         }
     }
+
+    /// The one id this request names its rule by, or `None` when it carries
+    /// both ids or neither — in both of which it names no single rule.
+    pub fn match_source_id(&self) -> Option<&'a str> {
+        self.match_source().map(|(_, id)| id)
+    }
 }
+
+/// How the service words the member a request named its rule by, inside the
+/// sentence it reports when no rule of the group answers to it: the modelled
+/// member read as words, `FirewallDomainListId` for a domain-list rule and
+/// `FirewallThreatProtectionId` for a DNS Firewall Advanced one.
+pub const FIREWALL_RULE_DOMAIN_LIST_MEMBER: &str = "Firewall domain list ID";
+pub const FIREWALL_RULE_THREAT_PROTECTION_MEMBER: &str = "Firewall threat protection ID";
 
 /// Why no single stored rule answers to what a request named.
 ///
@@ -629,7 +660,7 @@ pub fn locate_firewall_rule(
     group: &FirewallRuleGroupRecord,
     named: &FirewallRuleMatchSource<'_>,
 ) -> Result<usize, FirewallRuleLookupFault> {
-    let Some(match_source_id) = named.match_source_id() else {
+    let Some((match_source_member, match_source_id)) = named.match_source() else {
         return Err(FirewallRuleLookupFault::Validation(ValidationException {
             message: Some(format!(
                 "Exactly one of FirewallDomainListId and FirewallThreatProtectionId \
@@ -656,7 +687,11 @@ pub fn locate_firewall_rule(
 
     match candidates.as_slice() {
         [] => Err(FirewallRuleLookupFault::ResourceNotFound(
-            firewall_rule_not_found(match_source_id),
+            firewall_rule_not_found(
+                named.firewall_rule_group_id,
+                match_source_member,
+                match_source_id,
+            ),
         )),
         [only] => Ok(*only),
         // Among rules of one group that match the same source, the `Qtype` the
@@ -983,12 +1018,16 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         };
         let index = locate_firewall_rule(group, &named)?;
         // A request that named no single rule was refused above, so the rule
-        // this update is about always has the id it was named by.
-        let match_source_id = named.match_source_id().unwrap_or_default();
+        // this update is about always has the member and the id it was named by.
+        let (match_source_member, match_source_id) = named.match_source().unwrap_or_default();
 
         let Some(stored) = group.rules.get(index).map(|record| record.to_rule(now)) else {
             return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
-                firewall_rule_not_found(match_source_id),
+                firewall_rule_not_found(
+                    request.firewall_rule_group_id,
+                    match_source_member,
+                    match_source_id,
+                ),
             ));
         };
 
@@ -1112,7 +1151,11 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         };
         let Some(record) = group.rules.get_mut(index) else {
             return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
-                firewall_rule_not_found(match_source_id),
+                firewall_rule_not_found(
+                    request.firewall_rule_group_id,
+                    match_source_member,
+                    match_source_id,
+                ),
             ));
         };
 
