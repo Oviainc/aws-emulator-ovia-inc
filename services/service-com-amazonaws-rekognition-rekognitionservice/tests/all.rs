@@ -21,6 +21,8 @@ mod face_comparison;
 mod face_detection;
 #[path = "all/image_content_refusal.rs"]
 mod image_content_refusal;
+#[path = "all/photographic_enrolment.rs"]
+mod photographic_enrolment;
 #[path = "all/projects.rs"]
 mod projects;
 #[path = "all/resource_tags.rs"]

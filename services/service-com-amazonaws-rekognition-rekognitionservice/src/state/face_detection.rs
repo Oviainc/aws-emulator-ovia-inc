@@ -52,17 +52,30 @@
 //!    with that contrast ([`MAX_SKIN_TEXTURE_RATIO`]) — skin is a smooth region, while a
 //!    region whose intensity swings as much as the features do is texture or noise — the
 //!    box stands out from the ring around it by [`MIN_REGION_CONTRAST`] (figure against
-//!    ground, where there is a ring to measure), and there is a wide dark feature where a
-//!    mouth belongs. A pair with no mouth, no smooth skin between the eyes or no
+//!    ground, where there is a ring to measure), [`MIN_FACE_SKIN_FRACTION`] of the box is
+//!    that same skin, so the box is mostly the face rather than mostly whatever surrounds
+//!    it, the skin just OUTSIDE one of the two eyes stands above them too
+//!    ([`MIN_TEMPLE_CONTRAST_RATIO`]) — the eyes of a face have face on both sides of them,
+//!    while two dark blobs with only background outside them flank something that is not a
+//!    face — and there is a wide dark feature where a mouth belongs. A pair with no mouth,
+//!    no smooth skin between the eyes, no skin across its box or beside it, or no
 //!    separation from its surroundings is reported as nothing at all.
 //! 7. **Score** — the `Confidence` reported is the detector's own measured agreement: how
 //!    alike the two eyes are, how level, how far the bridge stands above them in intensity
 //!    and how near the mouth sits to where the proportions put it, averaged. It is the only
 //!    confidence anything here measured, and a face below [`MIN_CONFIDENCE`] is not
-//!    reported. Boxes overlapping an already accepted one by more than [`MAX_OVERLAP`] are
-//!    suppressed, so one face is reported once, and what is left is sorted largest first
-//!    and cut to [`MAX_FACES`] — "DetectFaces detects the 100 largest faces in the image".
-//! 8. **Measure** — each reported face carries only members this pipeline measured:
+//!    reported.
+//! 8. **Suppress** — ONE face is reported ONCE. The readings are walked best first (the one
+//!    whose box the image holds whole before one it clips, then the stronger-scoring one),
+//!    and a reading of a region already accounted for is dropped: either it shares more
+//!    than [`MAX_OVERLAP`] of what the two cover together, or it lies more than
+//!    [`MAX_SHARED_FRACTION`] inside the region already kept — a face read at a second
+//!    window width, or a wider pair of its own features, is the same face and not a second
+//!    one around it. Both measures are taken on the regions as REPORTED, the part of each
+//!    box the image holds, since that is what an answer claims. What is left is sorted by
+//!    that region, largest first, and cut to [`MAX_FACES`] — "DetectFaces detects the 100
+//!    largest faces in the image".
+//! 9. **Measure** — each reported face carries only members this pipeline measured:
 //!    `BoundingBox` (the derived box, as the fractions of the image a `BoundingBox` is
 //!    expressed in), `Confidence` (step 7), `Landmarks` (the eye centroids and the mouth's
 //!    own extent), `Pose.Roll` (the angle of the eye line) and `Quality` (the mean
@@ -179,9 +192,20 @@ pub const EYE_LINE_FROM_TOP: f32 = 0.45;
 /// scale as the `Confidence` it carries.
 pub const MIN_CONFIDENCE: f32 = 50.0;
 
-/// How much of an already accepted face's box a later candidate may share, as the
+/// How much of an already accepted face's region a later reading may share, as the
 /// intersection over the union of the two, before it is taken for the same face.
 pub const MAX_OVERLAP: f32 = 0.3;
+
+/// How much of the SMALLER of two readings' regions may lie inside the larger before the
+/// two are ONE face read twice. A pair of features read at another window width, or a
+/// wider pair taken off the same face, derives a box of another size around the same
+/// pixels, and a box nested in another box is not a second face beside it — which the
+/// intersection over the UNION misses exactly when the two differ most in size.
+pub const MAX_SHARED_FRACTION: f32 = 0.6;
+
+/// How much of a reading's own box the image must hold for the reading to have measured
+/// the whole of that box, rather than only the part of it the frame carries.
+const MIN_WHOLE_BOX_FRACTION: f32 = 0.98;
 
 /// How many cells on a side the appearance of a face is measured on: fine enough to carry
 /// where that face's own features sit inside its box, coarse enough that one cell still
@@ -201,6 +225,33 @@ pub const APPEARANCE_GRID: usize = 8;
 pub const QUALITY_BAR_LOW: f32 = 1.0;
 pub const QUALITY_BAR_MEDIUM: f32 = 3.0;
 pub const QUALITY_BAR_HIGH: f32 = 6.0;
+
+/// How much of a face's box must be the face's own SKIN — the tone measured between and
+/// below its eyes — for the box to be a face at all: a box that is in the majority
+/// something else (the background, a garment, hair, the side of a neck) is a region of the
+/// picture a pair of dark specks lined up in, not a face.
+pub const MIN_FACE_SKIN_FRACTION: f32 = 0.5;
+
+/// How far from that skin's own tone a pixel may sit and still BE that skin, as a fraction
+/// of how far the skin stands above the face's dark features: the features set into a face
+/// are what that contrast measures, so half of it is the span of tone the skin itself
+/// covers as the light falls across it.
+const MAX_SKIN_DEVIATION: f32 = 0.5;
+
+/// How many points, on a side, the skin coverage of a face box samples. NOT an AWS limit:
+/// it bounds the measurement's cost by a constant whatever the box's size.
+const SKIN_SAMPLES: usize = 32;
+
+/// How far OUTSIDE each eye, along the eye line and in multiples of the eye span, the skin
+/// at the side of the face is measured, and the half-size of that measurement: inside the
+/// box the proportions derive, and far enough out that it is the face beside the eye rather
+/// than the eye itself.
+const TEMPLE_OUTSIDE_EYE_IN_SPANS: f32 = 0.25;
+const TEMPLE_HALF_SIZE_IN_SPANS: f32 = 0.1;
+
+/// How far above the eyes the brighter of those two sides must stand, as a fraction of the
+/// contrast measured between this face's own skin and its own eyes.
+const MIN_TEMPLE_CONTRAST_RATIO: f32 = 0.5;
 
 /// The radius of the averaging window the feature mask and every region mean read through.
 const SMOOTH_RADIUS: usize = 1;
@@ -560,6 +611,12 @@ impl Pixels {
     fn decoded_at(&self, x: usize, y: usize) -> f32 {
         f32::from(self.decoded[y * self.width + x])
     }
+
+    /// The averaged plane at one pixel: what every measurement of a region's TONE reads, so
+    /// one noisy pixel is not a measurement.
+    fn smoothed_at(&self, x: usize, y: usize) -> f32 {
+        f32::from(self.smoothed[y * self.width + x])
+    }
 }
 
 /// One connected run of feature pixels: a candidate eye, nostril, brow or mouth.
@@ -640,19 +697,36 @@ fn faces(pixels: &Pixels) -> Vec<MeasuredFace> {
             }
         }
     }
-    // Strongest first, so the box kept for a face is the best-scoring reading of it and a
-    // weaker reading of the same pixels is suppressed rather than reported beside it.
-    found.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    // The best reading first, so the box kept for a face is that reading of it and every
+    // other reading of the same pixels is suppressed rather than reported beside it. A
+    // reading whose box the image holds WHOLE measured all of that face; one whose box runs
+    // off the frame measured only the part of it the pixels show, so the complete reading is
+    // the better measurement of the same face, and between two readings measured alike the
+    // stronger-scoring one is.
+    found.sort_by(|left, right| {
+        measured_whole(pixels, &right.rect)
+            .cmp(&measured_whole(pixels, &left.rect))
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+    });
     let mut kept: Vec<Candidate> = Vec::new();
     for candidate in found {
+        // What a reading REPORTS is the part of its box the image holds, so that region is
+        // what decides whether two readings stand for one face.
+        let region = reported_region(pixels, &candidate.rect);
         if kept
             .iter()
-            .all(|other| overlap(&candidate.rect, &other.rect) <= MAX_OVERLAP)
+            .all(|other| !same_face(&region, &reported_region(pixels, &other.rect)))
         {
             kept.push(candidate);
         }
     }
-    kept.sort_by(|left, right| right.rect.area().total_cmp(&left.rect.area()));
+    // "The faces that are returned by IndexFaces are sorted by the largest face bounding box
+    // size to the smallest": the box each face reports, which is the region above.
+    kept.sort_by(|left, right| {
+        reported_region(pixels, &right.rect)
+            .area()
+            .total_cmp(&reported_region(pixels, &left.rect).area())
+    });
     kept.truncate(MAX_FACES);
     kept.iter()
         .map(|face| MeasuredFace {
@@ -949,6 +1023,37 @@ fn candidate(pixels: &Pixels, blobs: &[Blob], first: usize, second: usize) -> Op
     if !stands_out(pixels, &rect, span) {
         return None;
     }
+    // A face's box is mostly the FACE: the skin measured between and below its eyes covers
+    // it, with the features set into that skin. A box that is in the majority something
+    // else was not read off a face.
+    let skin = (bridge + cheeks) / 2.0;
+    if skin_coverage(pixels, pixels.rect(rect.bounds()), skin, contrast) < MIN_FACE_SKIN_FRACTION
+    {
+        return None;
+    }
+    // The eyes are set INTO a face: outside each of them the face carries on toward the side
+    // of the head, so the skin just beyond an eye stands well above that eye in intensity.
+    // A pair of dark blobs with nothing but background outside them flanks something that is
+    // not a face at all — the side of a neck, a gap between two objects, the shoulders of a
+    // figure — and reads as a face only if nothing outside the pair is ever measured. The
+    // measurement follows the eye line, so a tilted face is read along its own axis, and
+    // only the BRIGHTER of the two sides has to stand out, because a face can be lit from
+    // one side or carry hair across the other.
+    let outward = TEMPLE_OUTSIDE_EYE_IN_SPANS * span;
+    let (along_x, along_y) = (dx / span, dy / span);
+    let temples = [
+        (left.cx - along_x * outward, left.cy - along_y * outward),
+        (right.cx + along_x * outward, right.cy + along_y * outward),
+    ]
+    .into_iter()
+    .filter_map(|(x, y)| {
+        let half = TEMPLE_HALF_SIZE_IN_SPANS * span;
+        pixels.integral.mean(pixels.around(x, y, half, half))
+    })
+    .fold(f32::NEG_INFINITY, f32::max);
+    if temples < eyes + MIN_TEMPLE_CONTRAST_RATIO * contrast {
+        return None;
+    }
     let mouth = mouth_of(blobs, mid_x, mid_y, span)?;
 
     // The score is what was measured about this reading of the pixels: how alike the two
@@ -973,6 +1078,38 @@ fn candidate(pixels: &Pixels, blobs: &[Blob], first: usize, second: usize) -> Op
         mouth,
         roll: dy.atan2(dx).to_degrees().clamp(-180.0, 180.0),
     })
+}
+
+/// What fraction of a face box's own pixels are that face's SKIN: those within
+/// [`MAX_SKIN_DEVIATION`] of `contrast` of the `skin` tone measured on the face.
+///
+/// Sampled on a bounded grid — at most [`SKIN_SAMPLES`] points on a side — so the cost is a
+/// constant whatever the size of the box.
+fn skin_coverage(pixels: &Pixels, rect: PixelRect, skin: f32, contrast: f32) -> f32 {
+    if rect.is_empty() {
+        return 0.0;
+    }
+    let band = MAX_SKIN_DEVIATION * contrast;
+    let step_x = ((rect.x1 - rect.x0) / SKIN_SAMPLES.max(1)).max(1);
+    let step_y = ((rect.y1 - rect.y0) / SKIN_SAMPLES.max(1)).max(1);
+    let mut skin_like = 0_u32;
+    let mut count = 0_u32;
+    let mut y = rect.y0;
+    while y < rect.y1 {
+        let mut x = rect.x0;
+        while x < rect.x1 {
+            if (pixels.smoothed_at(x, y) - skin).abs() <= band {
+                skin_like += 1;
+            }
+            count += 1;
+            x += step_x;
+        }
+        y += step_y;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    skin_like as f32 / count as f32
 }
 
 /// Whether a face box differs in mean intensity from the ring around it — figure against
@@ -1031,17 +1168,45 @@ fn mouth_of(blobs: &[Blob], mid_x: f32, mid_y: f32, span: f32) -> Option<Mouth> 
         })
 }
 
-/// How much two face boxes share, as the intersection over their union.
-fn overlap(left: &FaceRect, right: &FaceRect) -> f32 {
+/// The region a reading REPORTS: its box as far as the image holds it. A box partly outside
+/// the frame was measured only where there are pixels to measure, and the part of it the
+/// image carries is both what is answered and what stands for the face here.
+fn reported_region(pixels: &Pixels, rect: &FaceRect) -> FaceRect {
+    let left = rect.left.clamp(0.0, pixels.width_f32());
+    let top = rect.top.clamp(0.0, pixels.height_f32());
+    let right = rect.right().clamp(0.0, pixels.width_f32());
+    let bottom = rect.bottom().clamp(0.0, pixels.height_f32());
+    FaceRect {
+        left,
+        top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
+}
+
+/// Whether the image holds the whole of a reading's box, so that reading measured all of
+/// the face it stands for rather than the part of it the frame carries.
+fn measured_whole(pixels: &Pixels, rect: &FaceRect) -> bool {
+    rect.area() > 0.0
+        && reported_region(pixels, rect).area() >= MIN_WHOLE_BOX_FRACTION * rect.area()
+}
+
+/// Whether two reported regions stand for ONE face: they either share more than
+/// [`MAX_OVERLAP`] of what they cover together, or the smaller of them lies more than
+/// [`MAX_SHARED_FRACTION`] inside the larger — one face read at two scales, not two faces.
+fn same_face(left: &FaceRect, right: &FaceRect) -> bool {
+    let shared = shared_area(left, right);
+    let union = left.area() + right.area() - shared;
+    let smaller = left.area().min(right.area());
+    (union > 0.0 && shared / union > MAX_OVERLAP)
+        || (smaller > 0.0 && shared / smaller > MAX_SHARED_FRACTION)
+}
+
+/// How much two face boxes share, in the units their sides are in.
+fn shared_area(left: &FaceRect, right: &FaceRect) -> f32 {
     let shared_width = (left.right().min(right.right()) - left.left.max(right.left)).max(0.0);
     let shared_height = (left.bottom().min(right.bottom()) - left.top.max(right.top)).max(0.0);
-    let intersection = shared_width * shared_height;
-    let union = left.area() + right.area() - intersection;
-    if union <= 0.0 {
-        0.0
-    } else {
-        intersection / union
-    }
+    shared_width * shared_height
 }
 
 /// The `FaceDetail` of one detected face: the members this detector measured, and no other.
