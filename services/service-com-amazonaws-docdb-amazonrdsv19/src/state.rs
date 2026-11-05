@@ -126,6 +126,27 @@ pub const DEFAULT_DOCDB_ANALYTICS_ENABLED: bool = false;
 /// no input member in this model supplies one.
 pub const DEFAULT_CUSTOM_DATA_GROUP_PRESENT: bool = false;
 
+/// `DBCluster$VPCNetworkingEnabled` for every cluster this service can create: an Amazon
+/// DocumentDB cluster is reachable only from inside a virtual private cloud, whose
+/// protocols its subnet group fixes (`DBCluster$NetworkType`: "The network type is
+/// determined by the `DBSubnetGroup` specified for the cluster"), so VPC networking is on
+/// for every one of them and no input member turns it off.
+pub const DEFAULT_VPC_NETWORKING_ENABLED: bool = true;
+
+/// `DBCluster$InternetAccessGatewayEnabled` for a cluster created without an internet
+/// access gateway: no input member in this model attaches one.
+pub const DEFAULT_INTERNET_ACCESS_GATEWAY_ENABLED: bool = false;
+
+/// Seconds in the day `BackupRetentionPeriod` is counted in
+/// (`CreateDBClusterMessage$BackupRetentionPeriod`: "The number of days for which
+/// automated backups are retained"), so the retained window can be measured back from
+/// now.
+const SECONDS_PER_DAY: f64 = 24.0 * 60.0 * 60.0;
+
+/// How many characters follow the leading `Z` of a Route 53 hosted zone id, matching the
+/// fourteen-character ids AWS publishes for its endpoint hosted zones.
+const HOSTED_ZONE_ID_LEN: usize = 13;
+
 /// `VpcSecurityGroupMembership$Status` for a security group attached to a live resource.
 pub const SECURITY_GROUP_ACTIVE: &str = "active";
 
@@ -440,6 +461,13 @@ pub struct DbClusterRecord {
     pub docdb_analytics_enabled: bool,
     /// `CustomDataGroupPresent`; see [`DEFAULT_CUSTOM_DATA_GROUP_PRESENT`].
     pub custom_data_group_present: bool,
+    /// `VPCNetworkingEnabled`; see [`DEFAULT_VPC_NETWORKING_ENABLED`].
+    pub vpc_networking_enabled: bool,
+    /// `InternetAccessGatewayEnabled`; see [`DEFAULT_INTERNET_ACCESS_GATEWAY_ENABLED`].
+    pub internet_access_gateway_enabled: bool,
+    /// `HostedZoneId`: the Route 53 hosted zone this cluster's endpoints live in, minted
+    /// once from the cluster's Region; see [`hosted_zone_id`].
+    pub hosted_zone_id: String,
     /// `DBClusterMembers`, in the order the instances joined.
     pub members: Vec<ClusterMember>,
     /// The cluster's tags, as (key, value).
@@ -1443,10 +1471,61 @@ pub fn tag_pairs(tags: Option<Vec<Tag>>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The Route 53 hosted zone the Region's Amazon DocumentDB endpoints live in. One zone per
+/// Region, so every cluster in a Region reports the same id — as AWS does.
+///
+/// The id is DERIVED from the Region rather than looked up: AWS's per-Region zone ids are
+/// published in its endpoint documentation but are in no part of this service's Smithy
+/// model, and what the member promises (`DBCluster$HostedZoneId`, `Endpoint$HostedZoneId`:
+/// "the ID that Amazon Route 53 assigns when you create a hosted zone") is a stable,
+/// `Z`-prefixed id that does not change between reads. The mixing is the tree's one
+/// derived-id mixer ([`::service_common::stable_hex_id`]), uppercased and cut to a leading
+/// `Z` plus [`HOSTED_ZONE_ID_LEN`] characters — uppercase hexadecimal, a subset of the
+/// uppercase alphanumerics AWS's own zone ids use. A client that compares the id against
+/// AWS's published one for a Region sees a different label; it keeps the format, the
+/// per-Region invariance and the stability the member promises.
+pub fn hosted_zone_id(region: &str) -> String {
+    let mixed: String = ::service_common::stable_hex_id(&["docdb-hosted-zone", region])
+        .to_uppercase()
+        .chars()
+        .take(HOSTED_ZONE_ID_LEN)
+        .collect();
+    format!("Z{mixed}")
+}
+
+/// A cluster's point-in-time-restore window as (`EarliestRestorableTime`,
+/// `LatestRestorableTime`), or `None` for a cluster that has no window yet.
+///
+/// The window is what `RestoreDBClusterToPointInTime` can restore inside:
+/// `RestoreDBClusterToPointInTimeMessage$RestoreToTime` "must be before the latest
+/// restorable time", and `UseLatestRestorableTime` restores to its upper end. Continuous
+/// backup of a cluster only begins once the cluster has finished provisioning, so a
+/// cluster still [`STATUS_CREATING`] reports no window at all, and a cluster whose
+/// automated backups are off (a zero `BackupRetentionPeriod`) retains nothing to restore
+/// from. Otherwise the window runs from the start of the retained backups —
+/// `BackupRetentionPeriod` days back, and never before the cluster itself existed — up to
+/// the instant it is read at, continuous backup covering everything up to now.
+///
+/// `now` is passed in so one call reports one consistent window on both ends.
+pub fn cluster_restore_window(
+    record: &DbClusterRecord,
+    now: ::aws_smithy_types::DateTime,
+) -> Option<(::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime)> {
+    if record.status == STATUS_CREATING || record.backup_retention_period <= 0 {
+        return None;
+    }
+    let retained_from =
+        now.as_secs_f64() - f64::from(record.backup_retention_period) * SECONDS_PER_DAY;
+    let earliest = retained_from.max(record.cluster_create_time.as_secs_f64());
+    Some((::aws_smithy_types::DateTime::from_secs_f64(earliest), now))
+}
+
 /// A cluster record as the modeled `DBCluster`.
 ///
 /// `MultiAZ` is computed from the member instances' Availability Zones, and the endpoints
-/// and ARN from the identifier, so nothing here is a value the handler was handed.
+/// and ARN from the identifier, so nothing here is a value the handler was handed. The
+/// point-in-time-restore window is computed the same way, from the record's creation
+/// instant and retention period; see [`cluster_restore_window`].
 pub fn cluster_to_shape(
     record: &DbClusterRecord,
     instances: &BTreeMap<String, DbInstanceRecord>,
@@ -1457,6 +1536,7 @@ pub fn cluster_to_shape(
         .filter_map(|member| instances.get(&member.db_instance_identifier))
         .map(|instance| instance.availability_zone.as_str())
         .collect();
+    let restore_window = cluster_restore_window(record, now());
     DBCluster {
         // The members AWS's cluster envelope always carries, each read from the record so
         // one projection reports what every path stored; see
@@ -1468,6 +1548,8 @@ pub fn cluster_to_shape(
         db_activity_stream_status: Some(record.activity_stream_status.clone()),
         docdb_analytics_enabled: Some(record.docdb_analytics_enabled),
         custom_data_group_present: Some(record.custom_data_group_present),
+        vpc_networking_enabled: Some(record.vpc_networking_enabled),
+        internet_access_gateway_enabled: Some(record.internet_access_gateway_enabled),
         availability_zones: Some(record.availability_zones.clone()),
         backup_retention_period: Some(record.backup_retention_period),
         db_cluster_identifier: Some(record.identifier.clone()),
@@ -1475,13 +1557,13 @@ pub fn cluster_to_shape(
         db_subnet_group: record.db_subnet_group.clone(),
         status: Some(record.status.clone()),
         percent_progress: None,
-        earliest_restorable_time: None,
+        earliest_restorable_time: restore_window.map(|(earliest, _)| earliest),
         endpoint: Some(record.endpoint()),
         reader_endpoint: Some(record.reader_endpoint()),
         multi_az: Some(zones_in_use.len() > 1),
         engine: Some(record.engine.clone()),
         engine_version: Some(record.engine_version.clone()),
-        latest_restorable_time: None,
+        latest_restorable_time: restore_window.map(|(_, latest)| latest),
         port: Some(record.port),
         master_username: record.master_username.clone(),
         preferred_backup_window: Some(record.preferred_backup_window.clone()),
@@ -1510,7 +1592,7 @@ pub fn cluster_to_shape(
                 })
                 .collect(),
         ),
-        hosted_zone_id: None,
+        hosted_zone_id: Some(record.hosted_zone_id.clone()),
         storage_encrypted: Some(record.storage_encrypted),
         kms_key_id: record.kms_key_id.clone(),
         db_cluster_resource_id: Some(record.resource_id.clone()),
@@ -1538,9 +1620,10 @@ pub fn cluster_to_shape(
 /// An instance record as the modeled `DBInstance`.
 ///
 /// `cluster` is the instance's cluster, when it is still in state: the members that a
-/// cluster owns (port, backup settings, encryption, security groups, engine version) are
-/// read from it rather than copied at create time, so a later `ModifyDBCluster` shows up
-/// on its instances too.
+/// cluster owns (port, backup settings, encryption, security groups, engine version, the
+/// Route 53 hosted zone its endpoints live in, and the point-in-time-restore window its
+/// continuous backup covers) are read from it rather than copied at create time, so a
+/// later `ModifyDBCluster` shows up on its instances too.
 pub fn instance_to_shape(
     record: &DbInstanceRecord,
     cluster: Option<&DbClusterRecord>,
@@ -1553,7 +1636,7 @@ pub fn instance_to_shape(
         endpoint: Some(Endpoint {
             address: Some(record.endpoint_address.clone()),
             port: Some(cluster.map_or(DEFAULT_PORT, |owner| owner.port)),
-            hosted_zone_id: None,
+            hosted_zone_id: cluster.map(|owner| owner.hosted_zone_id.clone()),
         }),
         instance_create_time: Some(record.instance_create_time),
         preferred_backup_window: cluster.map(|owner| owner.preferred_backup_window.clone()),
@@ -1572,7 +1655,9 @@ pub fn instance_to_shape(
         db_subnet_group: None,
         preferred_maintenance_window: Some(record.preferred_maintenance_window.clone()),
         pending_modified_values: None,
-        latest_restorable_time: None,
+        latest_restorable_time: cluster
+            .and_then(|owner| cluster_restore_window(owner, now()))
+            .map(|(_, latest)| latest),
         engine_version: cluster.map(|owner| owner.engine_version.clone()),
         auto_minor_version_upgrade: Some(record.auto_minor_version_upgrade),
         publicly_accessible: Some(false),

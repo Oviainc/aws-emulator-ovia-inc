@@ -212,6 +212,14 @@ pub struct DBCluster {
     /// Whether this cluster carries a custom data group; added to the on-disk model from
     /// the recorded AWS responses, like [`DBCluster::auto_minor_version_upgrade`].
     pub custom_data_group_present: Option<bool>,
+    /// Whether this cluster runs inside a virtual private cloud; added to the on-disk
+    /// model from the recorded AWS responses, like
+    /// [`DBCluster::auto_minor_version_upgrade`].
+    pub vpc_networking_enabled: Option<bool>,
+    /// Whether an internet access gateway is attached to this cluster; added to the
+    /// on-disk model from the recorded AWS responses, like
+    /// [`DBCluster::auto_minor_version_upgrade`].
+    pub internet_access_gateway_enabled: Option<bool>,
     pub availability_zones: Option<Vec<String>>,
     pub backup_retention_period: Option<i32>,
     pub db_cluster_identifier: Option<String>,

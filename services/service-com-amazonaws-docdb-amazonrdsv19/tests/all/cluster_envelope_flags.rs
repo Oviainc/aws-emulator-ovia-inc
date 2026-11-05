@@ -2,18 +2,19 @@
 
 //! End-to-end tests for the members Amazon DocumentDB's cluster envelope ALWAYS carries
 //! beyond what the shipped model shape declares: `AutoMinorVersionUpgrade`,
-//! `ActivityStreamStatus`, `DBActivityStreamStatus`, `DocdbAnalyticsEnabled` and
-//! `CustomDataGroupPresent`.
+//! `ActivityStreamStatus`, `DBActivityStreamStatus`, `DocdbAnalyticsEnabled`,
+//! `CustomDataGroupPresent`, `VPCNetworkingEnabled` and `InternetAccessGatewayEnabled`.
 //!
 //! The rule: every member the cluster envelope always carries is projected
 //! unconditionally, out of the cluster record, by the one projection every path shares
 //! (`crate::state::cluster_to_shape`) — and where no input member of this service can set
 //! one, the record is born at the value the service reports for a cluster created without
-//! it: automatic minor version upgrade on, the DocumentDB-only capability flags off, and
-//! the database activity stream in its stopped steady state. The constants in
-//! `src/state.rs` cite each one.
+//! it: automatic minor version upgrade on, the DocumentDB-only capability flags off, VPC
+//! networking on (a cluster is reachable only from inside a virtual private cloud) with no
+//! internet access gateway, and the database activity stream in its stopped steady state.
+//! The constants in `src/state.rs` cite each one.
 //!
-//! The rule generalises over the cluster's inputs (none of them touches these five
+//! The rule generalises over the cluster's inputs (none of them touches these seven
 //! members) and over the operation whose envelope carries the cluster, so the table below
 //! spans BOTH: each row is a differently shaped `CreateDBCluster`, and every row is read
 //! through the create, describe, modify and delete envelopes in turn.
@@ -29,14 +30,17 @@ use crate::cluster_lifecycle::{count, let_the_clock_catch_up, opt_text, text, te
 /// could change it. Source: the `DBCluster` members of this service's on-disk model (added
 /// there from the recorded AWS responses) and the defaults cited on
 /// `state::DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE`, `state::ACTIVITY_STREAM_STOPPED`,
-/// `state::DEFAULT_DOCDB_ANALYTICS_ENABLED` and
-/// `state::DEFAULT_CUSTOM_DATA_GROUP_PRESENT`.
-const ENVELOPE_FLAGS: [(&str, &str); 5] = [
+/// `state::DEFAULT_DOCDB_ANALYTICS_ENABLED`, `state::DEFAULT_CUSTOM_DATA_GROUP_PRESENT`,
+/// `state::DEFAULT_VPC_NETWORKING_ENABLED` and
+/// `state::DEFAULT_INTERNET_ACCESS_GATEWAY_ENABLED`.
+const ENVELOPE_FLAGS: [(&str, &str); 7] = [
     ("AutoMinorVersionUpgrade", "true"),
     ("ActivityStreamStatus", "stopped"),
     ("DBActivityStreamStatus", "stopped"),
     ("DocdbAnalyticsEnabled", "false"),
     ("CustomDataGroupPresent", "false"),
+    ("VPCNetworkingEnabled", "true"),
+    ("InternetAccessGatewayEnabled", "false"),
 ];
 
 /// Assert that `xml` carries every element of [`ENVELOPE_FLAGS`] with its value — asserted
@@ -63,8 +67,8 @@ struct CreateCase {
 
 /// The table: clusters differing in the inputs `CreateDBCluster` takes — credentials,
 /// port, retention, encryption, protection, logs exports, storage type, scaling, network
-/// type, tags and availability zones. None of them is an input to the four members under
-/// test, which is exactly the rule.
+/// type, tags and availability zones. None of them is an input to the members under test,
+/// which is exactly the rule.
 fn create_cases() -> Vec<CreateCase> {
     vec![
         CreateCase {
@@ -144,8 +148,8 @@ async fn every_cluster_envelope_carries_the_added_members_whatever_the_create_as
             .await;
         assert_envelope_flags(&format!("{} / describe", case.label), &described);
 
-        // 3. The modify envelope — and a modify that changes something else must leave the
-        //    four alone.
+        // 3. The modify envelope — and a modify that changes something else must leave
+        //    every one of them alone.
         let modified = docdb
             .ok(
                 case.label,

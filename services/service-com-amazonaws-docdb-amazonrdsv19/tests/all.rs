@@ -17,6 +17,8 @@ mod ca_certificate_material;
 mod cluster_envelope_flags;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_networking_and_restore_window.rs"]
+mod cluster_networking_and_restore_window;
 #[path = "all/cluster_parameter_groups.rs"]
 mod cluster_parameter_groups;
 #[path = "all/cluster_snapshot_lifecycle.rs"]
