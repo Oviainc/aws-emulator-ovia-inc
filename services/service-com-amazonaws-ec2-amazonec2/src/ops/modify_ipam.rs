@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIpam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIpam`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the stored IPAM it names — its
+//! description, its tier, its metered account, its private-GUA setting and the operating
+//! Regions it adds and removes — leaving every member the request does not carry as it was,
+//! and answers the IPAM in the transient `modify-in-progress` state with the instant the
+//! clock owes it `modify-complete` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::modify_ipam`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIpam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIpam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIpamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIpam"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — "the Amazon
+        // Web Services Region of the IPAM" (`Ipam$IpamRegion`) was settled when the IPAM was
+        // created, and a modification cannot move an IPAM to another Region. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun
+        // arm below: "not an IPAM id at all" is a malformed request rather than an IPAM that
+        // does not exist, which is the order every resource of this crate asks the two
+        // questions in (`crate::state::require_well_formed_id`).
+        let ipam_id = input.ipam_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+
+        // "Choose the operating Regions for the IPAM … IPAM only discovers and monitors
+        // resources in the Amazon Web Services Regions you select as operating Regions"
+        // (`AddOperatingRegions`) and "the operating Regions to remove"
+        // (`RemoveOperatingRegions`). Both lists are read HERE, before anything is looked up
+        // or written, and a Region a request names is held to the same catalog `CreateIpam`
+        // holds one to, so the two cannot disagree about which Region names an IPAM may
+        // operate in. The model's `len 0..50` has already bounded how many may be named.
+        let add_operating_regions = requested_regions(
+            input
+                .add_operating_regions
+                .iter()
+                .flatten()
+                .map(|added| added.region_name.as_deref()),
+            "addOperatingRegion",
+        )?;
+        let remove_operating_regions = requested_regions(
+            input
+                .remove_operating_regions
+                .iter()
+                .flatten()
+                .map(|removed| removed.region_name.as_deref()),
+            "removeOperatingRegion",
+        )?;
+
+        // One Region both added and removed asks for two incompatible things of the same
+        // Region, so the request is refused rather than one of the two silently winning.
+        if let Some(conflicting) = add_operating_regions
+            .iter()
+            .find(|added| remove_operating_regions.contains(added))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                format!(
+                    "The operating Region {conflicting} cannot be added and removed by the \
+                     same request"
+                ),
+            ));
+        }
+
+        let modification = state::IpamModification {
+            ipam_id: ipam_id.to_string(),
+            description: input.description.clone(),
+            add_operating_regions,
+            remove_operating_regions,
+            tier: input.tier.clone(),
+            metered_account: input.metered_account.clone(),
+            enable_private_gua: input.enable_private_gua,
+        };
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first, the way every other state-touching handler in this crate starts:
+        // what this modification is applied to is the IPAM as it ACTUALLY stands rather than
+        // as the call before it left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM you want to modify" (`IpamId`): an id this account holds no
+        // IPAM for has nothing to modify, which is the IPAM's own `NotFound` refusal every
+        // reader of an `IpamId` in this crate answers.
+        let Some(current) = store.ipams.get(ipam_id).cloned() else {
+            return Err(state::invalid_ipam_id_not_found(ipam_id));
+        };
+
+        // An IPAM always operates in its own home Region — it is one of its operating
+        // Regions from the moment it is created, and an IPAM that did not operate there
+        // could manage nothing in the Region it lives in — so the request to drop that one
+        // is refused rather than served.
+        if let Some(home_region) = current.ipam_region.as_deref().filter(|home| {
+            modification
+                .remove_operating_regions
+                .iter()
+                .any(|removed| removed == home)
+        }) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({home_region}) for parameter removeOperatingRegion is invalid. \
+                 The home Region of an IPAM is always one of its operating Regions."
+            )));
+        }
+
+        // What this call would leave behind, computed by the ONE definition of what a
+        // modification does to an IPAM, so the figure checked here is exactly the one the
+        // write charges. The budget is asked about the NET change: this call stores no
+        // further IPAM, so the IPAM ceiling cannot bound it, while the description and the
+        // Region names it sets are caller-chosen text.
+        let applied = modification.applied_to(&current);
+        let refund = state::ipam_modifiable_bytes(&current);
+        let charge = state::ipam_modifiable_bytes(&applied);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // Every parameter has been read and the IPAM resolved, and nothing has been written
+        // yet: "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`), so a request that WOULD have worked stops here, and one that would
+        // have been refused was refused above with its own reason.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Written through the store's ONE writer of a modification, so what this answers is
+        // the stored record a later `DescribeIpams` of the same IPAM reports.
+        let Some(ipam) = store.modify_ipam(&modification) else {
+            // Unreachable: the IPAM was resolved above and the store is locked throughout.
+            return Err(state::internal_error(format!(
+                "the IPAM '{ipam_id}' could not be read back after its modification"
+            )));
+        };
+        Ok(ModifyIpamOutput { ipam: Some(ipam) })
     }
+}
+
+/// The Region names one operating-Region list of the request carries, as a set.
+///
+/// "The name of the operating Region" (`AddIpamOperatingRegion$RegionName` /
+/// `RemoveIpamOperatingRegion$RegionName`) is the only member either shape has, so an entry
+/// without one names no Region at all and is refused with the same `MissingParameter`
+/// `CreateIpam` answers for it. A name that IS given is held to the catalog of Regions of the
+/// partition this emulator's ARNs name ([`crate::state::commercial_regions`]), exactly as
+/// `CreateIpam` holds the operating Regions of a create — a Region AWS does not publish can
+/// neither be added to an IPAM nor removed from one. Operating Regions are a SET
+/// (`Ipam$OperatingRegions`), so a name repeated within one list says nothing the first
+/// mention does not and is kept once.
+fn requested_regions<'a>(
+    requested: impl Iterator<Item = Option<&'a str>>,
+    member: &str,
+) -> Result<Vec<String>, ModifyIpamError> {
+    let catalog = crate::state::commercial_regions();
+    let mut regions: Vec<String> = Vec::new();
+    for region_name in requested {
+        let Some(region_name) = region_name.filter(|name| !name.is_empty()) else {
+            return Err(crate::state::missing_parameter(
+                "An operating region must have a region name",
+            ));
+        };
+        if !catalog.contains(&region_name) {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "Value ({region_name}) for parameter {member} is invalid. \
+                 This is not a valid Region name."
+            )));
+        }
+        if !regions.iter().any(|held| held == region_name) {
+            regions.push(region_name.to_string());
+        }
+    }
+    Ok(regions)
 }

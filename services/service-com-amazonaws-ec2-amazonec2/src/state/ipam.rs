@@ -564,6 +564,13 @@ pub const IPAM_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
 /// The state those three enums reach once the creation is done: `create-complete`.
 pub const IPAM_STATE_CREATE_COMPLETE: &str = "create-complete";
 
+/// An IPAM whose configuration a `ModifyIpam` is still applying: the `IpamState` enum's
+/// `modify-in-progress` member.
+pub const IPAM_STATE_MODIFY_IN_PROGRESS: &str = "modify-in-progress";
+
+/// The state an IPAM reaches once that modification is applied: `modify-complete`.
+pub const IPAM_STATE_MODIFY_COMPLETE: &str = "modify-complete";
+
 /// A resource discovery association AWS is still making: the
 /// `IpamResourceDiscoveryAssociationState` enum's `associate-in-progress` member.
 pub const IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS: &str = "associate-in-progress";
@@ -702,6 +709,116 @@ pub fn ipam_payload_bytes(spec: &IpamSpec) -> usize {
         .saturating_add(2 * (regions + description))
         .saturating_add(spec.client_token.as_deref().unwrap_or_default().len())
         .saturating_add(3 * STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// What one `ModifyIpam` asks to be changed about a stored IPAM.
+///
+/// A member left `None` here is one the REQUEST did not carry, which leaves the stored value
+/// exactly as it was rather than returning it to the default a create would have given it —
+/// the same contract [`TransitGatewayModification`] has for a gateway. The operating Regions
+/// are two SETS rather than one value, because the request names the ones to add and the ones
+/// to remove instead of the list it wants to end up with.
+#[derive(Debug, Clone)]
+pub struct IpamModification {
+    /// "The ID of the IPAM you want to modify" (`ModifyIpamRequest$IpamId`).
+    pub ipam_id: String,
+    /// "The description of the IPAM you want to modify" (`ModifyIpamRequest$Description`), or
+    /// `None` when the request named none.
+    pub description: Option<String>,
+    /// The Region names of `ModifyIpamRequest$AddOperatingRegions`, already validated and
+    /// deduplicated by the caller.
+    pub add_operating_regions: Vec<String>,
+    /// The Region names of `ModifyIpamRequest$RemoveOperatingRegions`, likewise.
+    pub remove_operating_regions: Vec<String>,
+    /// The `IpamTier` the IPAM is moved to, or `None` to leave it in the one it is in.
+    pub tier: Option<String>,
+    /// The `IpamMeteredAccount` the IPAM meters to, or `None` to leave it as it is.
+    pub metered_account: Option<String>,
+    /// "Enable this option to use your own GUA ranges as private IPv6 addresses"
+    /// (`ModifyIpamRequest$EnablePrivateGua`), or `None` to leave the setting as it is.
+    pub enable_private_gua: Option<bool>,
+}
+
+impl IpamModification {
+    /// The IPAM this modification leaves behind, from the one it is applied to.
+    ///
+    /// The ONE definition of what a modification DOES to an IPAM, so the figure a handler
+    /// charges to the store's byte budget is exactly the one the write stores. Every member
+    /// the request did not carry is copied across unchanged, and every member the IPAM's own
+    /// creation derived — its ids, its ARN, its owner, its home Region, its counts — is
+    /// carried over untouched, since none of them follows from this request. The state is
+    /// left as it stands here; [`ComAmazonawsEc2Amazonec2State::modify_ipam`] is what moves
+    /// it, so no path can store a state the clock knows nothing about.
+    pub fn applied_to(&self, ipam: &Ipam) -> Ipam {
+        let mut applied = ipam.clone();
+        if self.description.is_some() {
+            applied.description = self.description.clone();
+        }
+        if self.tier.is_some() {
+            applied.tier = self.tier.clone();
+        }
+        if self.metered_account.is_some() {
+            applied.metered_account = self.metered_account.clone();
+        }
+        if self.enable_private_gua.is_some() {
+            applied.enable_private_gua = self.enable_private_gua;
+        }
+        applied.operating_regions = Some(
+            self.operating_regions_after(ipam)
+                .into_iter()
+                .map(|region_name| IpamOperatingRegion {
+                    region_name: Some(region_name),
+                })
+                .collect(),
+        );
+        applied
+    }
+
+    /// The Region names the IPAM operates in once this modification is applied: the ones it
+    /// holds now, less the ones to remove, plus the ones to add.
+    ///
+    /// "Operating Regions are Amazon Web Services Regions where the IPAM is allowed to manage
+    /// IP address CIDRs" (`Ipam$OperatingRegions`) — a SET, so a Region already held is added
+    /// no second time and one the IPAM does not hold is removed without effect, and the Region
+    /// names the IPAM already reports keep the order they were stored in so an addition is
+    /// reported after them.
+    pub fn operating_regions_after(&self, ipam: &Ipam) -> Vec<String> {
+        let mut regions: Vec<String> = ipam
+            .operating_regions
+            .iter()
+            .flatten()
+            .filter_map(|operating| operating.region_name.clone())
+            .filter(|held| !self.remove_operating_regions.contains(held))
+            .collect();
+        for added in &self.add_operating_regions {
+            if !regions.iter().any(|held| held == added) {
+                regions.push(added.clone());
+            }
+        }
+        regions
+    }
+}
+
+/// The caller-chosen bytes of a stored IPAM that a `ModifyIpam` can change: its description
+/// and the names of the Regions it operates in, each counted twice because the IPAM's default
+/// resource discovery keeps a copy of both — exactly the share [`ipam_payload_bytes`] charges
+/// a create for them.
+///
+/// The ONE definition of that charge, so what [`ComAmazonawsEc2Amazonec2State::modify_ipam`]
+/// gives back for the record it replaces is the same number a later modification of the
+/// replacement gives back for it. The tags, the client token and the fixed per-record
+/// overhead are deliberately NOT counted: no modification changes them, so counting them
+/// would charge and refund the same figure twice.
+pub fn ipam_modifiable_bytes(ipam: &Ipam) -> usize {
+    let regions: usize = ipam
+        .operating_regions
+        .iter()
+        .flatten()
+        .filter_map(|operating| operating.region_name.as_deref())
+        .map(str::len)
+        .sum();
+    let description = ipam.description.as_deref().unwrap_or_default().len();
+    2 * (regions + description)
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -923,6 +1040,53 @@ impl ComAmazonawsEc2Amazonec2State {
                     Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_COMPLETE.to_string());
             }
         }
+    }
+
+    /// Apply one `ModifyIpam` to the IPAM it names and answer the record it leaves behind —
+    /// or `None` when this store holds no IPAM of that id and nothing was written.
+    ///
+    /// The ONE writer of a modification, so what `ModifyIpam` answers is the stored record a
+    /// later `DescribeIpams` of the same IPAM reports. What the modification CHANGES is
+    /// [`IpamModification::applied_to`]; what this adds is everything the store owns:
+    ///
+    /// * the IPAM is left in the NON-TERMINAL [`IPAM_STATE_MODIFY_IN_PROGRESS`] with the move
+    ///   to [`IPAM_STATE_MODIFY_COMPLETE`] recorded in [`Self::ipam_modify_complete_at`] one
+    ///   [`TRANSITION_DELAY`] out and applied by [`Self::materialize_due_transitions`], so a
+    ///   caller acting straight after the call still sees the transient state and nothing is
+    ///   slept for;
+    /// * the IPAM's default resource discovery follows it — "IPAM only discovers and monitors
+    ///   resources in the Amazon Web Services Regions you select as operating Regions"
+    ///   (`Ipam$OperatingRegions`), so the discovery that does that monitoring for this IPAM
+    ///   operates in the same Regions it does, which is also the invariant
+    ///   [`Self::insert_ipam`] establishes and [`ipam_payload_bytes`] charges for;
+    /// * the store's byte budget gives back what the replaced record held and is charged what
+    ///   the new one holds ([`ipam_modifiable_bytes`]), so the budget tracks exactly the
+    ///   caller-chosen text that is stored.
+    ///
+    /// A caller must have asked [`Self::would_exceed_stored_bytes_after_refund`] first: this
+    /// method is the single write path, and it is not where a request is refused.
+    pub fn modify_ipam(&mut self, modification: &IpamModification) -> Option<Ipam> {
+        let current = self.ipams.get(&modification.ipam_id)?.clone();
+        let mut applied = modification.applied_to(&current);
+        applied.state = Some(IPAM_STATE_MODIFY_IN_PROGRESS.to_string());
+
+        self.release_stored_bytes(ipam_modifiable_bytes(&current));
+        self.add_stored_bytes(ipam_modifiable_bytes(&applied));
+
+        if let Some(discovery) = current
+            .default_resource_discovery_id
+            .as_deref()
+            .and_then(|discovery_id| self.ipam_resource_discoveries.get_mut(discovery_id))
+        {
+            discovery.description = applied.description.clone();
+            discovery.operating_regions = applied.operating_regions.clone();
+        }
+
+        self.ipams
+            .insert(modification.ipam_id.clone(), applied.clone());
+        self.ipam_modify_complete_at
+            .insert(modification.ipam_id.clone(), Instant::now() + TRANSITION_DELAY);
+        Some(applied)
     }
 
     /// Whether another resource discovery association fits inside the store's ceiling

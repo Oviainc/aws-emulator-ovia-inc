@@ -2166,6 +2166,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// resource discovery and that discovery's association too, since all four were created
     /// by the same call and are owed their completed state at the same instant.
     pub ipam_create_complete_at: BTreeMap<String, Instant>,
+    /// When each IPAM's `modify-in-progress` -> `modify-complete` transition falls due, for
+    /// the IPAMs a `ModifyIpam` has changed.
+    ///
+    /// The counterpart of [`Self::ipam_create_complete_at`] for a modification, on the same
+    /// clock and for the same reason: `ModifyIpam` answers the IPAM in the non-terminal
+    /// `modify-in-progress` state, so the clock owes it `modify-complete`
+    /// [`TRANSITION_DELAY`] later whether or not anybody calls again. Written by
+    /// [`Self::modify_ipam`] and applied by [`Self::materialize_due_transitions`]; an IPAM
+    /// nobody has modified has no entry.
+    pub ipam_modify_complete_at: BTreeMap<String, Instant>,
     /// Every IPAM resource discovery the account holds, by `IpamResourceDiscoveryId`, as the
     /// modelled [`IpamResourceDiscovery`] shape itself. Starts with the default resource
     /// discovery of each IPAM ([`Self::insert_ipam`]).
@@ -3042,6 +3052,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_connections: BTreeMap::new(),
             ipams: BTreeMap::new(),
             ipam_create_complete_at: BTreeMap::new(),
+            ipam_modify_complete_at: BTreeMap::new(),
             ipam_resource_discoveries: BTreeMap::new(),
             ipam_resource_discovery_associations: BTreeMap::new(),
             ipam_resource_discovery_association_complete_at: BTreeMap::new(),

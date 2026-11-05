@@ -1364,3 +1364,9 @@ mod describe_vpcs_ipv6_associations;
 // gives.
 #[path = "all/security_group_rule_prefix_lists.rs"]
 mod security_group_rule_prefix_lists;
+// What `ModifyIpam` applies to the IPAM it names — its description, tier, metered account,
+// private-GUA setting and the operating Regions it adds and removes — what it leaves as it
+// was, the transient state it answers, and what it refuses without changing anything.
+// Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/modify_ipam.rs"]
+mod modify_ipam;

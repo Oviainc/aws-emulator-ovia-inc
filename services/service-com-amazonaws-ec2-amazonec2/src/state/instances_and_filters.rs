@@ -1119,6 +1119,23 @@ impl ComAmazonawsEc2Amazonec2State {
             self.ipam_create_complete_at.remove(&ipam_id);
             self.complete_ipam_creation(&ipam_id);
         }
+        // An IPAM `ModifyIpam` answered as `modify-in-progress` reaches `modify-complete`
+        // once its due instant has passed, whether or not anybody called — the same contract
+        // as the IPAM scope above. Only an IPAM still in the state the modification left it
+        // in is moved, so one something else has since moved on is left alone.
+        let ipams = &mut self.ipams;
+        self.ipam_modify_complete_at.retain(|ipam_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(ipam) = ipams.get_mut(ipam_id) {
+                if ipam.state.as_deref() == Some(IPAM_STATE_MODIFY_IN_PROGRESS) {
+                    ipam.state = Some(IPAM_STATE_MODIFY_COMPLETE.to_string());
+                }
+            }
+            // The transition is applied once; nothing is owed on this IPAM any more.
+            false
+        });
         // The resources whose own record carries the move the clock owes it
         // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
         // left transient, one subnet association of a multicast domain, a route table
