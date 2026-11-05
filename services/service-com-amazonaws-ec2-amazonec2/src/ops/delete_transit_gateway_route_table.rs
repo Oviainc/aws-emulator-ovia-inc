@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTransitGatewayRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTransitGatewayRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the transit gateway route table the request names from the store,
+//! along with everything stored as a PART of that table (the route propagations into it and
+//! the prefix list references it held), and answers the removed table in the `deleting`
+//! state its own state catalog names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTransitGatewayRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A table one of its transit gateway's default roles names, and one an attachment is still
+//! associated with, are refused instead.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +138,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTransitGatewayRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTransitGatewayRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTransitGatewayRouteTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — a route
+        // table is named by id and carries no Region of its own. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first: something that is not a transit gateway route table
+        // id at all is refused as malformed BEFORE any lookup, so "not an id of this kind"
+        // never reads as "no such route table" and is never answered by the DryRun arm
+        // below either.
+        let route_table_id = input.transit_gateway_route_table_id.as_str();
+        state::require_well_formed_transit_gateway_route_table_id(route_table_id)?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: whether this delete is admissible is asked of the state the store
+        // is ACTUALLY in, so a table whose `available` move had fallen due — and an
+        // association whose own move had — is seen in the state it was owed.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified transit gateway route table": an id this account holds no
+        // route table for is a refusal, not a no-op — a caller that deletes twice has to be
+        // able to tell the deletion it performed from one it did not.
+        let Some(route_table) = store
+            .transit_gateway_route_tables
+            .get(route_table_id)
+            .cloned()
+        else {
+            return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                route_table_id,
+            ));
+        };
+
+        // A DEFAULT route table is the transit gateway's own rather than the caller's: the
+        // gateway's create is what made it ("we create a default transit gateway route table
+        // and use it as the default association route table", `CreateTransitGateway`) and the
+        // gateway's options keep naming it, so it exists for as long as its gateway does.
+        // Removing it on its own would leave the gateway reporting a route table id nothing
+        // resolves, which is why the role is refused here rather than cleaned up after.
+        if route_table
+            .default_association_route_table
+            .unwrap_or_default()
+            || route_table
+                .default_propagation_route_table
+                .unwrap_or_default()
+        {
+            return Err(default_route_table_of_its_gateway(&route_table));
+        }
+
+        // "If there are any route tables associated with the transit gateway route table, you
+        // must first run DisassociateRouteTable before you can delete the transit gateway
+        // route table": an association is a dependency the CALLER clears, so a table that
+        // still holds one is refused with EC2's own code for a delete the resource's
+        // dependencies forbid, and nothing is removed.
+        let associated: Vec<String> = store
+            .transit_gateway_route_table_associations(route_table_id)
+            .map(|association| association.transit_gateway_attachment_id.clone())
+            .collect();
+        if !associated.is_empty() {
+            return Err(state::dependency_violation(format!(
+                "The transit gateway route table '{route_table_id}' is associated with the \
+                 transit gateway attachments {holders}, which must be disassociated from it \
+                 before it can be deleted",
+                holders = associated.join(", "),
+            )));
+        }
+
+        // Every refusal this request could meet has been asked, so it is one that WOULD have
+        // succeeded and a dry run stops here: "If you have the required permissions, the
+        // error response is DryRunOperation" (`$DryRun`). Nothing has been removed yet, and
+        // nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(mut deleted) = remove_transit_gateway_route_table(&mut store, route_table_id)
+        else {
+            // Unreachable: the table was resolved above and the store is locked throughout.
+            // Kept so a removal that found nothing can never read as a 200 over a table the
+            // store still holds.
+            return Err(state::internal_error(
+                "the transit gateway route table checked a moment ago could not be removed",
+            ));
+        };
+        // "Information about the deleted transit gateway route table"
+        // (`DeleteTransitGatewayRouteTableResult$TransitGatewayRouteTable`) as this call
+        // leaves it: the `TransitGatewayRouteTableState` member a deletion puts a table into
+        // is `deleting`, so that is the state the answer carries rather than the one the
+        // table held before the call.
+        deleted.state = Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_DELETING.to_string());
+        Ok(DeleteTransitGatewayRouteTableOutput {
+            transit_gateway_route_table: Some(deleted),
+        })
     }
+}
+
+/// A transit gateway route table a delete has been asked for: the
+/// `TransitGatewayRouteTableState` enum's `deleting` member
+/// (`smithy_query(query="shape",shape="TransitGatewayRouteTableState")`), which is the state
+/// this operation answers the table it removed with.
+const TRANSIT_GATEWAY_ROUTE_TABLE_STATE_DELETING: &str = "deleting";
+
+/// The refusal a route table one of its gateway's default roles names answers: HTTP 400
+/// `IncorrectState`, naming the table, the role it holds and the gateway that owns it.
+fn default_route_table_of_its_gateway(
+    route_table: &TransitGatewayRouteTable,
+) -> DeleteTransitGatewayRouteTableError {
+    let role = if route_table
+        .default_association_route_table
+        .unwrap_or_default()
+    {
+        "association"
+    } else {
+        "propagation"
+    };
+    crate::state::incorrect_state(format!(
+        "The transit gateway route table '{route_table_id}' is the default {role} route \
+         table of the transit gateway '{transit_gateway_id}' and cannot be deleted",
+        route_table_id = route_table
+            .transit_gateway_route_table_id
+            .as_deref()
+            .unwrap_or_default(),
+        transit_gateway_id = route_table.transit_gateway_id.as_deref().unwrap_or_default(),
+    ))
+}
+
+/// Take the route table `route_table_id` out of the store, with everything stored as a PART
+/// of that table, and answer the record as it was held — or `None` when the store holds no
+/// such table.
+///
+/// What goes with the table, and why:
+///
+/// * the `available` move the clock may still have owed it, so nothing can move a table the
+///   store no longer holds into a state;
+/// * the route propagations into it and the prefix list references it held, which are entries
+///   IN that table and name no other — a table the store does not hold holds no entries, and
+///   leaving them would keep their bytes charged against the store's budget for ever.
+///
+/// Each removal gives back exactly the bytes its own writer charged
+/// ([`crate::state::transit_gateway_route_table_payload_bytes`],
+/// [`crate::state::STORED_RECORD_OVERHEAD_BYTES`] and
+/// [`crate::state::transit_gateway_prefix_list_reference_payload_bytes`]), so the charge and
+/// the release cannot drift apart.
+fn remove_transit_gateway_route_table(
+    store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
+    route_table_id: &str,
+) -> Option<TransitGatewayRouteTable> {
+    use crate::state;
+
+    let route_table = store.transit_gateway_route_tables.remove(route_table_id)?;
+    store.release_stored_bytes(state::transit_gateway_route_table_payload_bytes(
+        &route_table,
+    ));
+    store
+        .transit_gateway_route_table_available_at
+        .remove(route_table_id);
+
+    let propagations: Vec<(String, String)> = store
+        .transit_gateway_propagations
+        .keys()
+        .filter(|(table, _)| table == route_table_id)
+        .cloned()
+        .collect();
+    for key in propagations {
+        if store.transit_gateway_propagations.remove(&key).is_some() {
+            store.release_stored_bytes(state::STORED_RECORD_OVERHEAD_BYTES);
+        }
+    }
+
+    let references: Vec<(String, String)> = store
+        .transit_gateway_prefix_list_references
+        .keys()
+        .filter(|(table, _)| table == route_table_id)
+        .cloned()
+        .collect();
+    for (table, prefix_list_id) in references {
+        if store
+            .transit_gateway_prefix_list_references
+            .remove(&(table.clone(), prefix_list_id.clone()))
+            .is_some()
+        {
+            store.release_stored_bytes(
+                state::transit_gateway_prefix_list_reference_payload_bytes(
+                    &table,
+                    &prefix_list_id,
+                ),
+            );
+        }
+    }
+
+    Some(route_table)
 }

@@ -21,8 +21,7 @@
 //! bounds of `TransitGatewayMaxResults` and one past each). The seeded tables are written
 //! through the store's own writer (`insert_transit_gateway_route_table`) and then put into
 //! the state and default roles each row names, because the only writers that mint a route
-//! table in another state — `DeleteTransitGatewayRouteTable` among them — are still scaffold
-//! stubs.
+//! table in another state are still scaffold stubs.
 //!
 //! The round trip is asserted separately, over the creates that ARE implemented:
 //! `CreateTransitGateway`'s default route table and `CreateTransitGatewayRouteTable`'s

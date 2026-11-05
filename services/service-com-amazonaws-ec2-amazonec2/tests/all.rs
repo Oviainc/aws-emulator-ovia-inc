@@ -1304,6 +1304,12 @@ mod unmonitor_instances;
 // it refuses, and the minting outcome the clock owes an AFI it is read through. Declared beside
 #[path = "all/describe_fpga_images.rs"]
 mod describe_fpga_images;
+// file is where every new ec2 suite inserts its lines. What `DeleteTransitGatewayRouteTable`
+// removes — the transit gateway route table the request names with the propagations and prefix
+// list references stored in it — the state it answers that table with, and the ids, default
+// roles, standing associations and dry run it refuses without removing anything.
+#[path = "all/delete_transit_gateway_route_table.rs"]
+mod delete_transit_gateway_route_table;
 // What `ModifyManagedPrefixList` revises on one managed prefix list of the account: the entry
 // set it computes from the one the list holds, the version a revision of that set mints while a
 // rename leaves it alone, the entries the superseded version keeps, the state the clock settles
