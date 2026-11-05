@@ -593,7 +593,8 @@ async fn a_token_belongs_to_the_listing_that_issued_it() {
     }
 
     // Each published `maxResults` bound is served, and one past either bound is refused by
-    // the modelled range before the handler runs.
+    // the modelled range before the handler runs — as the parameter value it is, which is
+    // the class this service refuses every value its model does not admit with.
     for page_size in [MIN_PACKAGES_PER_PAGE, MAX_PACKAGES_PER_PAGE] {
         let (status, page) = list_packages_page(&router, REGION, &first, Some(page_size), None).await;
         assert_eq!(
@@ -612,7 +613,7 @@ async fn a_token_belongs_to_the_listing_that_issued_it() {
             status,
             &refused,
             400,
-            "ValidationException",
+            "InvalidParameterValueException",
         );
     }
 

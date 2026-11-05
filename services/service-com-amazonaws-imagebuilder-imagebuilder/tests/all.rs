@@ -27,6 +27,8 @@ mod image_packages;
 mod image_pipeline_execution;
 #[path = "all/infrastructure_configuration.rs"]
 mod infrastructure_configuration;
+#[path = "all/parameter_value_refusals.rs"]
+mod parameter_value_refusals;
 #[path = "all/resource_not_found.rs"]
 mod resource_not_found;
 #[path = "all/resource_tags.rs"]

@@ -8,7 +8,8 @@
 //! The rules it follows, each from the modelled documentation quoted beside it:
 //!
 //! * the document is named by "exactly one of the following methods": `data` or `uri`,
-//!   so naming both or neither is `InvalidParameterCombinationException`;
+//!   so naming both or neither is the parameter-value refusal this service states for a
+//!   request it cannot accept a parameter of, naming both members;
 //! * `semanticVersion`'s three assignable nodes each take an integer up to 2^30-1, so a
 //!   version past that bound is `InvalidVersionNumberException`;
 //! * the component TYPE is read from the document, never submitted: "If the document
@@ -191,7 +192,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `CreateComponentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#CreateComponent")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE models
+// that shape (a client error, `@httpError` 400, "The value that you provided for the
+// specified parameter is invalid.") and other operations declare it, while this operation's
+// own error list does not — and it is the class Image Builder refuses a parameter of this
+// request with, including the one requirement that holds over `data` and `uri` TOGETHER.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#CreateComponent",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum CreateComponentErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -200,6 +210,7 @@ pub enum CreateComponentErrorModeled {
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidParameterCombinationException(InvalidParameterCombinationException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     InvalidVersionNumberException(InvalidVersionNumberException),
     ResourceInUseException(ResourceInUseException),
@@ -272,14 +283,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // "The component is based on a YAML document that you specify using exactly one
-        // of the following methods" — inline `data`, or a `uri` pointing at one.
+        // of the following methods" — inline `data`, or a `uri` pointing at one. A
+        // requirement over the two members together, so it is refused as this service
+        // refuses every parameter whose value it cannot accept: the parameter-value class,
+        // naming both members ([`crate::state::component_data_or_uri_message`]).
         let document_source = match (input.data.as_deref(), input.uri.as_deref()) {
             (Some(data), None) => DocumentSource::Inline(data),
             (None, Some(uri)) => DocumentSource::Uri(uri),
             _ => {
                 return Err(
-                    CreateComponentErrorModeled::InvalidParameterCombinationException(
-                        InvalidParameterCombinationException {
+                    CreateComponentErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
                             message: Some(crate::state::component_data_or_uri_message()),
                         },
                     )

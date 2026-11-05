@@ -788,7 +788,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 json!({"uri": "s3://bucket/key.yaml"}),
             ),
             400,
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
         ),
         (
             "a component naming neither data nor uri",
@@ -799,7 +799,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 "clientToken": "rtok-0002",
             }),
             400,
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
         ),
         (
             "a component version one past the documented bound",
@@ -812,7 +812,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
              pattern before the handler",
             component_body("not-numbers", "one.two.three", "rtok-0004", json!({})),
             400,
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             "a component uri that is not an S3 URL",

@@ -25,7 +25,9 @@
 //! * [`RequestIdEnvelopeOperation`], the operation wrapper a service hands back from
 //!   `Service::override_operation`, covers a handler-returned modelled error and a
 //!   framework refusal raised while a matched operation was being served (an absent
-//!   required member, a value outside a declared bound);
+//!   required member, a value outside a declared bound) — or
+//!   [`RequestIdReportingOperation`], for a service that holds its operations already
+//!   wrapped and composes the report around them;
 //! * [`RequestIdEnvelopeDefinition`], the definition wrapper a service hands back from
 //!   `Service::definition`, covers a routing failure (an `Action` naming no modelled
 //!   operation), a transport failure detected before any operation was named, and a
@@ -50,6 +52,11 @@
 //!   envelope element for the id (`restJson1`, `restXml`, `awsJson`, `rpcv2Cbor`) answers
 //!   with. Reached through [`RequestIdHeaderOperation`] and
 //!   [`RequestIdEnvelopeDefinition::header_only`].
+//! * [`with_request_id_error_member`], the JSON-error-body report: the `requestId` MEMBER
+//!   beside the `__type` and the `message`, which is what a service whose recorded failures
+//!   carry the id in the body itself answers with. Reached through
+//!   [`RequestIdReportingOperation::error_member`] and
+//!   [`RequestIdEnvelopeDefinition::error_member`].
 //!
 //! Only the request id is this module's business: the HTTP status, the `<Type>`, the
 //! `<Code>`, the `<Message>`, the body of a success and every other header stay with the
@@ -254,6 +261,78 @@ pub fn with_request_id_header(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
+/// The body member a JSON error envelope reports the request id in, for the services whose
+/// error bodies carry it beside `message` rather than in a header alone.
+const REQUEST_ID_MEMBER: &str = "requestId";
+
+/// The lowest HTTP status that is a failure, and so the lowest one answered by an error
+/// body at all.
+const FIRST_FAILURE_STATUS: u16 = 400;
+
+/// Add `"requestId"` to a JSON error body, as its last member.
+///
+/// `None` means the document needs nothing: it is not a JSON OBJECT, or it already carries
+/// the member — so this is idempotent, and a renderer that starts writing the member itself
+/// cannot end up with two. The insertion is TEXTUAL, at the object's closing brace, so every
+/// other byte of the body — the member order a renderer chose, its escaping, its spacing —
+/// survives exactly as it was written.
+fn add_error_request_id(body: &str, request_id: &str) -> Option<String> {
+    let document: serde_json::Value = serde_json::from_str(body).ok()?;
+    let members = document.as_object()?;
+    if members.contains_key(REQUEST_ID_MEMBER) {
+        return None;
+    }
+    let close = body.rfind('}')?;
+    let separator = if members.is_empty() { "" } else { "," };
+    Some(format!(
+        "{}{separator}\"{REQUEST_ID_MEMBER}\":\"{request_id}\"{}",
+        &body[..close],
+        &body[close..]
+    ))
+}
+
+/// The response with the request it answers named in the `requestId` MEMBER of its JSON
+/// error body — the report for a service whose own error envelope carries the id there.
+///
+/// Several AWS REST services answer a failure as
+/// `{"__type":"<shape>","message":"<why>","requestId":"<id>"}`, where the id belongs to the
+/// ENVELOPE and not to any modelled error shape: no error shape declares it, so no handler
+/// can set it, and the framework's JSON error renderers write the `__type` and the `message`
+/// alone. It is the id such a service's SDK surfaces for the failed call, and the same id a
+/// successful call reads out of the modelled `requestId` of its own output.
+///
+/// A SUCCESS is left untouched: its body is the modelled output, which states the id through
+/// whatever member the model gives it, and adding one here would write a member the model
+/// does not declare. A failure whose body is not a JSON object (an XML envelope, a streamed
+/// body) is left untouched too, and one that already names its request keeps the id it has,
+/// so two layers of one service cannot report two ids for one call.
+pub fn with_request_id_error_member(mut resp: RtResponse) -> RtResponse {
+    if resp.status().as_u16() < FIRST_FAILURE_STATUS {
+        return resp;
+    }
+    let rewritten = {
+        // An error body is built in memory by its renderer, so the bytes are readable
+        // here; a streamed body is not an error body and is left alone.
+        let Some(bytes) = resp.body().bytes() else {
+            return resp;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return resp;
+        };
+        add_error_request_id(text, &new_request_id())
+    };
+    if let Some(rewritten) = rewritten {
+        // Only a renderer that advertised a length needs it corrected; the framework's
+        // error renderers set `content-type` alone and leave framing to the transport.
+        if resp.headers().get("content-length").is_some() {
+            let length = rewritten.len().to_string();
+            let _ = resp.headers_mut().try_insert("content-length", length);
+        }
+        *resp.body_mut() = SdkBody::from(rewritten);
+    }
+    resp
+}
+
 /// The text of the FIRST `<name>` element of `text`, or `None` when it holds none.
 fn first_element_text<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let open = format!("<{name}>");
@@ -417,6 +496,57 @@ impl ErasedOperation for RequestIdHeaderOperation {
     }
 }
 
+/// Serves an operation a service already WRAPPED — behind its front door, say — and reports
+/// the request id on whatever that wrapper answered.
+///
+/// The two wrappers above resolve the modelled operation out of the service's own generated
+/// routing table, which is the whole wiring for a service that serves that table unchanged.
+/// A service that serves its operations wrapped holds the wrapped operation itself, so it
+/// composes this around that one instead: the report is applied to the response the wrapped
+/// operation produced, whatever layer inside it answered — a success, a modelled error, a
+/// refusal its front door worded, or a constraint refusal raised while it was being served.
+pub struct RequestIdReportingOperation<O> {
+    operation: O,
+    report: Report,
+}
+
+impl<O: ErasedOperation> RequestIdReportingOperation<O> {
+    /// Serve `operation` and report the id in the `requestId` member of its JSON error body
+    /// ([`with_request_id_error_member`]).
+    pub fn error_member(operation: O) -> Self {
+        Self {
+            operation,
+            report: with_request_id_error_member,
+        }
+    }
+
+    /// Serve `operation` and report the id in the response header alone
+    /// ([`with_request_id_header`]).
+    pub fn header(operation: O) -> Self {
+        Self {
+            operation,
+            report: with_request_id_header,
+        }
+    }
+}
+
+impl<O: ErasedOperation> ErasedOperation for RequestIdReportingOperation<O> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move { (self.report)(self.operation.run(svc, req, ctx).await) })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // The wrapped operation's own schemes: wrapping must not change which schemes
+        // sign it.
+        self.operation.auth_schemes()
+    }
+}
+
 /// A service's model-derived half with the framework-level error renderers wrapped, so a
 /// routing failure, a transport failure and a pre-dispatch refusal answer in the same
 /// envelope every other error of that service does.
@@ -449,6 +579,16 @@ impl<D: ErasedServiceDefinition> RequestIdEnvelopeDefinition<D> {
         Self {
             inner,
             report: with_request_id_header,
+        }
+    }
+
+    /// Wrap a service's generated definition, reporting the id in the `requestId` member of
+    /// the JSON error body ([`with_request_id_error_member`]) — the report for a service
+    /// whose own error envelope carries it there.
+    pub fn error_member(inner: D) -> Self {
+        Self {
+            inner,
+            report: with_request_id_error_member,
         }
     }
 
@@ -806,6 +946,89 @@ mod tests {
                 "case {case:?}: expected the same id on a second report, got {second:?}"
             );
             let _ = again;
+        }
+    }
+
+    /// RULE: a FAILURE whose body is a JSON object names the request it answers in that
+    /// object's `requestId` member, and nothing else about the response changes.
+    ///
+    /// The rows span what the report generalises over: which shape the body names, whether
+    /// the object carries members at all, a body that is not a JSON object, a body that
+    /// already names its request, and a success.
+    #[test]
+    fn a_json_failure_names_the_request_in_its_body() {
+        // (case, status, the rendered body, whether the member is added)
+        let rows = [
+            (
+                "a refusal",
+                400u16,
+                r#"{"__type":"InvalidParameterValueException","message":"no"}"#,
+                true,
+            ),
+            ("a modelled error", 404, r#"{"message":"gone"}"#, true),
+            ("an empty object", 400, "{}", true),
+            ("a server fault", 500, r#"{"__type":"ServiceException"}"#, true),
+            ("an XML envelope", 400, "<Error><Code>x</Code></Error>", false),
+            (
+                "a body that already names it",
+                400,
+                r#"{"message":"no","requestId":"11112222-3333-4444-5555-666677778888"}"#,
+                false,
+            ),
+            ("a success", 200, r#"{"requestId":null}"#, false),
+        ];
+
+        for (case, status, body, adds) in rows {
+            let answered = with_request_id_error_member(RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                SdkBody::from(body),
+            ));
+            assert_eq!(
+                answered.status().as_u16(),
+                status,
+                "case {case:?}: the status must not move"
+            );
+            let answered_body = std::str::from_utf8(answered.body().bytes().expect("bytes"))
+                .expect("utf-8")
+                .to_string();
+            if !adds {
+                assert_eq!(
+                    answered_body, body,
+                    "case {case:?}: expected the body to survive byte for byte, got \
+                     {answered_body:?}"
+                );
+                continue;
+            }
+            let document: serde_json::Value =
+                serde_json::from_str(&answered_body).expect("a JSON object");
+            let reported = document
+                .get(REQUEST_ID_MEMBER)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                is_request_id(reported),
+                "case {case:?}: expected a well-formed id in {REQUEST_ID_MEMBER}, got \
+                 {answered_body:?}"
+            );
+            // Every member the renderer wrote is still there, and reporting again adds no
+            // second id.
+            let original: serde_json::Value = serde_json::from_str(body).expect("a JSON object");
+            for (member, value) in original.as_object().expect("an object") {
+                assert_eq!(
+                    document.get(member),
+                    Some(value),
+                    "case {case:?}: expected the member {member:?} to survive"
+                );
+            }
+            let again = with_request_id_error_member(RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                SdkBody::from(answered_body.clone()),
+            ));
+            assert_eq!(
+                std::str::from_utf8(again.body().bytes().expect("bytes")).expect("utf-8"),
+                answered_body,
+                "case {case:?}: expected a second report to change nothing"
+            );
         }
     }
 }

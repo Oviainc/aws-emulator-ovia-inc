@@ -10,8 +10,10 @@
 //! The rule under test: a value a modelled ARN pattern does not admit is refused as the
 //! parameter value it is — HTTP 400 `InvalidParameterValueException`, naming the parameter
 //! and the pattern its value had to match, with the partition and Region fields of that
-//! pattern spelled in the forms those fields take rather than as the model bounds a field.
-//! A violation of any other constraint keeps the framework's own wording.
+//! pattern spelled in the form of the layer that READ the value: the Region-code form for a
+//! value read out of the request BODY, the character-class form for one read out of the
+//! REQUEST LINE. A constraint class this service states no requirement for keeps the
+//! framework's own wording.
 //!
 //! The rows span what the rule generalises over: which operation carries the member, where
 //! the member rides (a JSON body member, a query parameter), which resource kind the ARN
@@ -32,22 +34,23 @@ const ACCOUNT: &str = "000000000000";
 /// The pattern `ListImagePackages` states for `imageBuildVersionArn`: the modelled
 /// `ImageBuildVersionArn` pattern
 /// (`smithy_query(query="shape",shape="ImageBuildVersionArn")`) with its partition and
-/// Region fields spelled as the service states them.
+/// Region fields spelled as the layer that reads a BODY member states them.
 const IMAGE_BUILD_VERSION_ARN_PATTERN: &str = "^arn:aws(?:-[a-z]+)*:imagebuilder:[a-z]{2,}(?:-[a-z]+)+-[0-9]+:(?:[0-9]{12}|aws(?:-[a-z-]+)?):image/[a-z0-9-_]+/[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$";
 
 /// The pattern `GetImageRecipe` states for `imageRecipeArn`, from the modelled
-/// `ImageRecipeArn`. See [`IMAGE_BUILD_VERSION_ARN_PATTERN`].
-const IMAGE_RECIPE_ARN_PATTERN: &str = "^arn:aws(?:-[a-z]+)*:imagebuilder:[a-z]{2,}(?:-[a-z]+)+-[0-9]+:(?:[0-9]{12}|aws):image-recipe/[a-z0-9-_]+/(?:[0-9]+|x)\\.(?:[0-9]+|x)\\.(?:[0-9]+|x)$";
+/// `ImageRecipeArn`, with the two fields spelled as the layer that reads a REQUEST-LINE
+/// parameter states them. See [`IMAGE_BUILD_VERSION_ARN_PATTERN`].
+const IMAGE_RECIPE_ARN_PATTERN: &str = "^arn:aws(?:-[a-z0-9]+)*:imagebuilder:[a-z0-9-]*[a-z0-9]:(?:[0-9]{12}|aws):image-recipe/[a-z0-9-_]+/(?:[0-9]+|x)\\.(?:[0-9]+|x)\\.(?:[0-9]+|x)$";
 
 /// The pattern `GetComponent` states for `componentBuildVersionArn`, from the modelled
-/// `ComponentVersionArnOrBuildVersionArn`. See [`IMAGE_BUILD_VERSION_ARN_PATTERN`].
-const COMPONENT_ARN_PATTERN: &str = "^arn:aws(?:-[a-z]+)*:imagebuilder:[a-z]{2,}(?:-[a-z]+)+-[0-9]+:(?:[0-9]{12}|aws(?:-[a-z-]+)?|third-party):component/[a-z0-9-_]+/(?:(?:([0-9]+|x)\\.([0-9]+|x)\\.([0-9]+|x))|(?:[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+))$";
+/// `ComponentVersionArnOrBuildVersionArn`. See [`IMAGE_RECIPE_ARN_PATTERN`].
+const COMPONENT_ARN_PATTERN: &str = "^arn:aws(?:-[a-z0-9]+)*:imagebuilder:[a-z0-9-]*[a-z0-9]:(?:[0-9]{12}|aws(?:-[a-z-]+)?|third-party):component/[a-z0-9-_]+/(?:(?:([0-9]+|x)\\.([0-9]+|x)\\.([0-9]+|x))|(?:[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+))$";
 
 /// The pattern `GetInfrastructureConfiguration` states for
 /// `infrastructureConfigurationArn`, from the modelled `InfrastructureConfigurationArn`.
-/// See [`IMAGE_BUILD_VERSION_ARN_PATTERN`].
+/// See [`IMAGE_RECIPE_ARN_PATTERN`].
 const INFRASTRUCTURE_CONFIGURATION_ARN_PATTERN: &str =
-    "^arn:aws(?:-[a-z]+)*:imagebuilder:[a-z]{2,}(?:-[a-z]+)+-[0-9]+:(?:[0-9]{12}|aws):infrastructure-configuration/[a-z0-9-_]+$";
+    "^arn:aws(?:-[a-z0-9]+)*:imagebuilder:[a-z0-9-]*[a-z0-9]:(?:[0-9]{12}|aws):infrastructure-configuration/[a-z0-9-_]+$";
 
 /// One row of the refusal table: the case, the member whose value is refused, the pattern
 /// the refusal states, and the request that carries the refused value (method, URI, body).
@@ -230,32 +233,36 @@ async fn a_value_a_modelled_arn_pattern_refuses_is_an_invalid_parameter_value() 
 }
 
 #[tokio::test]
-async fn a_violation_that_is_not_an_arn_pattern_keeps_the_framework_wording() {
+async fn a_constraint_class_this_service_states_no_requirement_for_keeps_the_framework_wording() {
     let router = emulator();
 
-    // The control: this service rewords what an ARN member admits, nothing else. A value
-    // outside a NUMERIC range and a value outside a pattern that is not an ARN's are both
-    // left to the framework's own refusal.
+    // The control: this service states a requirement for the constraint classes its
+    // recorded refusals establish one for (a pattern, a numeric bound, an enumerated value
+    // set). A class they do not — a string past a `@length` maximum, a member the shape
+    // requires and the request omits — is left to the framework's own refusal rather than
+    // being given a clause this service has never been seen to state.
     let rows: Vec<ControlRow> = vec![
         (
-            "a page size past the modelled maximum",
-            "POST",
-            "/ListImagePackages".to_string(),
-            Some(json!({
-                "imageBuildVersionArn":
-                    format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:image/my-image/1.0.0/1"),
-                "maxResults": 26,
-            })),
-        ),
-        (
-            "a semantic version whose nodes are not numbers",
+            "a description past its modelled length maximum",
             "PUT",
             "/CreateComponent".to_string(),
             Some(json!({
                 "name": "control-component",
-                "semanticVersion": "one.two.three",
+                "semanticVersion": "1.0.0",
                 "platform": "Linux",
                 "clientToken": "ctrl-0001",
+                "description": "d".repeat(1025),
+                "data": "name: Control\nschemaVersion: 1.0\n",
+            })),
+        ),
+        (
+            "a member the shape requires and the request omits",
+            "PUT",
+            "/CreateComponent".to_string(),
+            Some(json!({
+                "name": "control-component",
+                "platform": "Linux",
+                "clientToken": "ctrl-0002",
                 "data": "name: Control\nschemaVersion: 1.0\n",
             })),
         ),

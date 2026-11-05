@@ -3177,43 +3177,6 @@ fn group(parts: &[String]) -> String {
 // Each wording lives here once, so two operations state the same failure the same way.
 // ---------------------------------------------------------------------------
 
-/// The ARN partition field as the model spells it: `aws` followed by anything up to the
-/// next colon, which is all a pattern needs in order to bound ONE field.
-const MODELLED_PARTITION_FIELD: &str = "arn:aws[^:]*:";
-
-/// The ARN partition field as a refusal states it: `aws` followed by the hyphenated words a
-/// partition name is made of (`aws-cn`, `aws-us-gov`).
-const STATED_PARTITION_FIELD: &str = "arn:aws(?:-[a-z]+)*:";
-
-/// The ARN Region field of this service as the model spells it: anything up to the next
-/// colon, for the same reason as [`MODELLED_PARTITION_FIELD`].
-const MODELLED_REGION_FIELD: &str = ":imagebuilder:[^:]+:";
-
-/// The ARN Region field as a refusal states it: the form a Region code takes — an area, one
-/// or more hyphenated words, and a number (`us-east-1`, `ap-southeast-3`).
-const STATED_REGION_FIELD: &str = ":imagebuilder:[a-z]{2,}(?:-[a-z]+)+-[0-9]+:";
-
-/// How a refusal of this service quotes the pattern an ARN member's value had to match: the
-/// member's own modelled pattern, with the two fields above spelled the way this service
-/// states them rather than the way a model bounds a field — anchors included, since this
-/// service states the whole-value expression as the model writes it.
-///
-/// The two fields are the ones EVERY `*Arn` shape of this model spells identically
-/// (`^arn:aws[^:]*:imagebuilder:[^:]+:…`), so one rendering serves every ARN member of every
-/// operation. Every other field — the account, the resource kind, the name, the version —
-/// is quoted exactly as the model carries it, which is also what a pattern spelling the two
-/// fields some other way gets, since there is then nothing to restate.
-///
-/// This is the one rendering this service chooses; the sentence and the envelope it is
-/// quoted in belong to the shared refusal seam
-/// (`service_common::validation_message::parameter_pattern_refusal`).
-#[must_use]
-pub fn stated_arn_pattern(pattern: &str) -> String {
-    pattern
-        .replace(MODELLED_PARTITION_FIELD, STATED_PARTITION_FIELD)
-        .replace(MODELLED_REGION_FIELD, STATED_REGION_FIELD)
-}
-
 /// Why a request naming a subnet but no security group is refused.
 ///
 /// The rule is the `subnetId` member's own: "If you specify `subnetId`, you must also
@@ -3317,10 +3280,24 @@ pub fn invalid_version_number_message(semantic_version: &str) -> String {
 /// the request body. A URL that points to a YAML document file stored in Amazon S3, using
 /// the uri property in the request body", and `data` adds "you cannot specify both
 /// properties".
+///
+/// A requirement over the two members TOGETHER rather than a constraint on either value, so
+/// it is stated in the sentence this service states every refused parameter in
+/// (`service_common::validation_message::parameters_value_mismatch`), naming both members:
+/// neither one's value is wrong on its own.
 #[must_use]
 pub fn component_data_or_uri_message() -> String {
-    "The request must specify exactly one of data and uri.".to_string()
+    ::service_common::validation_message::parameters_value_mismatch(
+        &[COMPONENT_DATA_MEMBER, COMPONENT_URI_MEMBER],
+        "You must specify either data or a uri.",
+    )
 }
+
+/// The member a component document rides in inline, as the API spells it.
+const COMPONENT_DATA_MEMBER: &str = "data";
+
+/// The member a component document's location rides in, as the API spells it.
+const COMPONENT_URI_MEMBER: &str = "uri";
 
 /// Why a `CreateComponent` naming a URI that is not an S3 URL is refused.
 ///

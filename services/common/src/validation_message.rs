@@ -26,6 +26,16 @@
 //! had to match. There too the service chooses only its error code, which of its patterns it
 //! states that way, and the rendering of the expression — the sentence stays here.
 //!
+//! A service that refuses a parameter value that way for EVERY constraint class, and not for
+//! `@pattern` alone, states the same sentence over the requirement the value broke:
+//! [`parameter_value_mismatch`] (or [`parameters_value_mismatch`], for a requirement that
+//! holds over several members together) over one of the requirement clauses
+//! [`must_match_pattern`], [`pattern_requirement_unstated`], [`must_be_at_most`],
+//! [`must_be_at_least`] and [`must_be_one_of`], with the parameter named as the API spells it
+//! ([`api_parameter_path`]) rather than as the framework's walk does. Which clause a class
+//! takes, and which refusals are stated this way at all, is the service's; the sentences and
+//! the spelling stay here.
+//!
 //! The rendering rule is framework-level — it belongs in
 //! `vendor/smithy-schema-server/src/constraints.rs`'s `Violation::requirement`, which a fix
 //! may not change from here; once it learns this, delete this module and every
@@ -939,10 +949,140 @@ pub fn parameter_pattern_refusal(
 /// missed it — so the sentence is the same whatever a caller submitted.
 #[must_use]
 pub fn parameter_pattern_mismatch(member: &str, pattern: &str) -> String {
+    parameter_value_mismatch(member, &must_match_pattern(member, pattern))
+}
+
+/// The sentence a service states for a parameter whose value it refused: the parameter, and
+/// the requirement that value had to satisfy.
+///
+/// The one sentence [`parameter_pattern_mismatch`] and every other requirement clause below
+/// are stated inside, so a service that refuses a value outside a `@pattern` and one that
+/// refuses a value outside a `@range` word the two halves of the sentence identically. The
+/// value itself is WITHHELD: the requirement is what the parameter admits, not the one value
+/// that missed it.
+#[must_use]
+pub fn parameter_value_mismatch(member: &str, requirement: &str) -> String {
+    parameters_value_mismatch(&[member], requirement)
+}
+
+/// [`parameter_value_mismatch`] about a COMBINATION of parameters: the requirement holds
+/// over several members together, so the sentence names each of them
+/// (`The value supplied for parameter 'data' and 'uri' is not valid. …`) and the requirement
+/// states what the combination has to satisfy.
+///
+/// For the refusal a service states where no ONE member's value is wrong — two mutually
+/// exclusive members, a member without the companion it requires — which is a requirement of
+/// the request rather than of a value, and so cannot be stated as a constraint clause.
+#[must_use]
+pub fn parameters_value_mismatch(members: &[&str], requirement: &str) -> String {
     format!(
-        "The value supplied for parameter '{member}' is not valid. {member} must match \
-         pattern {pattern}"
+        "The value supplied for parameter {} is not valid. {requirement}",
+        quoted_parameters(members)
     )
+}
+
+/// The members a refusal names, each quoted, as a sentence lists them: one on its own, two
+/// joined by `and`, more than two as a comma-separated list closed by `and`.
+fn quoted_parameters(members: &[&str]) -> String {
+    let quoted: Vec<String> = members.iter().map(|member| format!("'{member}'")).collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, leading)) => format!("{} and {last}", leading.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// The requirement clause for a value outside its member's `@pattern`: the expression the
+/// value had to match, quoted as the service that states it quotes an expression.
+#[must_use]
+pub fn must_match_pattern(member: &str, pattern: &str) -> String {
+    format!("{member} must match pattern {pattern}")
+}
+
+/// The requirement clause for a value outside its member's `@pattern` where the service
+/// states the requirement WITHOUT quoting the expression — the pattern is named as the one
+/// the member requires and nothing of it is echoed.
+#[must_use]
+pub fn pattern_requirement_unstated(member: &str) -> String {
+    format!("{member} does not match the required pattern")
+}
+
+/// The requirement clause for a value above its member's `@range` maximum: the bound the
+/// value had to stay at or below.
+#[must_use]
+pub fn must_be_at_most(member: &str, bound: &str) -> String {
+    format!("{member} must be smaller than or equal to {bound}")
+}
+
+/// The requirement clause for a value below its member's `@range` minimum: the bound the
+/// value had to reach.
+#[must_use]
+pub fn must_be_at_least(member: &str, bound: &str) -> String {
+    format!("{member} must be greater than or equal to {bound}")
+}
+
+/// The requirement clause for a value outside an enumerated type's value set: the set the
+/// value had to come from, each value quoted, in the order the model declares them.
+///
+/// A service whose recordings state that set in another order hands the violation through
+/// [`in_sorted_enum_order`] first, which is where an order of its own is chosen; this states
+/// the set it is given.
+#[must_use]
+pub fn must_be_one_of(member: &str, values: &[String]) -> String {
+    let quoted: Vec<String> = values.iter().map(|value| format!("'{value}'")).collect();
+    format!("{member} must be one of [{}]", quoted.join(", "))
+}
+
+/// The segment the framework's member paths mark a step from a collection into its element
+/// with (`aws_smithy_schema_server::constraints::path::element`), which the API spells as an
+/// INDEX on the collection instead.
+const COLLECTION_STEP: &str = "member";
+
+/// `path` as the API spells the parameter it names: the step the framework's walk takes from
+/// a COLLECTION into one of its elements is not a parameter of the API, so a list element is
+/// addressed by its zero-based index on the member that holds it
+/// (`distributions.1.member.amiDistributionConfiguration.name` becomes
+/// `distributions[0].amiDistributionConfiguration.name`) and a map entry by its key alone
+/// (`amiTags.owner.member` becomes `amiTags.owner`).
+///
+/// The framework reports a violation at the path its validating walk builds, which spells an
+/// element the way the walk steps into it — a one-based position (or the entry's key) and the
+/// collection step — and no API has such a member: a caller fixing the request addresses the
+/// element by its index on the member that holds it. Every other segment is left exactly as
+/// the walk spelled it.
+///
+/// The collection step is recognised by its spelling, which is the only thing a dotted path
+/// carries: a STRUCTURE member of that name, nested under another member, is indistinguishable
+/// from it and is folded the same way. The framework's own paths have that ambiguity, and the
+/// first segment is never read as a step, so a top-level member of that name is untouched.
+#[must_use]
+pub fn api_parameter_path(path: &str) -> String {
+    let mut steps: Vec<String> = Vec::new();
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        // The walk steps into an element as `<position-or-key>.member`, and only from a
+        // collection it already named, so the first segment of a path is never such a step.
+        if steps.is_empty() || segments.peek() != Some(&COLLECTION_STEP) {
+            steps.push(segment.to_string());
+            continue;
+        }
+        segments.next();
+        match segment
+            .parse::<usize>()
+            .ok()
+            .filter(|position| *position >= 1)
+        {
+            // A list element: its index on the member that holds it, counted from zero.
+            Some(position) => {
+                if let Some(holder) = steps.last_mut() {
+                    holder.push_str(&format!("[{}]", position - 1));
+                }
+            }
+            // A map entry: the key the caller chose, as the request carried it.
+            None => steps.push(segment.to_string()),
+        }
+    }
+    steps.join(".")
 }
 
 /// The ONE body behind every entry point above: the framework's envelope over the
@@ -1446,13 +1586,16 @@ pub fn envelope_over(clauses: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
-        aws_validation_refusal_withholding, aws_validation_refusal_withholding_violations,
-        aws_validation_refusal_withholding_with, enum_value_not_found, envelope_over,
-        float_value_text, in_float_value_rendering, in_pattern_first_order, map_key_refusal,
-        map_key_refusal_quoting, parameter_pattern_refusal, pattern_mismatch,
-        property_count_refusal, quoting_the_submitted_collection,
-        quoting_the_whole_submitted_value, string_too_long, string_too_short,
+        api_parameter_path, aws_validation_refusal, aws_validation_refusal_over_elements,
+        aws_validation_refusal_with, aws_validation_refusal_withholding,
+        aws_validation_refusal_withholding_violations, aws_validation_refusal_withholding_with,
+        enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
+        in_pattern_first_order, map_key_refusal, map_key_refusal_quoting, must_be_at_least,
+        must_be_at_most, must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
+        parameter_pattern_refusal, parameter_value_mismatch, parameters_value_mismatch,
+        pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
+        quoting_the_submitted_collection, quoting_the_whole_submitted_value, string_too_long,
+        string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -2977,5 +3120,147 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// RULE: a member path is spelled the way the API addresses the parameter — a
+    /// collection element as a zero-based bracket index on the member that holds it, every
+    /// other segment as the walk spelled it.
+    ///
+    /// The rows span what the spelling generalises over: depth, how many collections one
+    /// path steps through, where in the path the element sits, and a position that is not an
+    /// element step at all.
+    #[test]
+    fn a_member_path_is_spelled_the_way_the_api_addresses_it() {
+        // (case, the walk's path, the parameter the API names)
+        let rows = [
+            ("a top-level member", "semanticVersion", "semanticVersion"),
+            (
+                "a member of a structure member",
+                "imageTestsConfiguration.timeoutMinutes",
+                "imageTestsConfiguration.timeoutMinutes",
+            ),
+            (
+                "a member inside a list element",
+                "distributions.1.member.amiDistributionConfiguration.name",
+                "distributions[0].amiDistributionConfiguration.name",
+            ),
+            (
+                "a later element of a list",
+                "blockDeviceMappings.4.member.ebs.volumeSize",
+                "blockDeviceMappings[3].ebs.volumeSize",
+            ),
+            (
+                "a scalar element of a list",
+                "supportedOsVersions.2.member",
+                "supportedOsVersions[1]",
+            ),
+            (
+                "an element inside an element",
+                "distributions.1.member.launchTemplateConfigurations.2.member.accountId",
+                "distributions[0].launchTemplateConfigurations[1].accountId",
+            ),
+            ("a map entry's value", "amiTags.owner.member", "amiTags.owner"),
+            (
+                "a member whose name is a number but no element step",
+                "filters.1",
+                "filters.1",
+            ),
+        ];
+
+        for (case, path, expected) in rows {
+            let actual = api_parameter_path(path);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the parameter {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: one sentence states every parameter refusal — the parameter (or the
+    /// combination), then the requirement its value had to satisfy — and the requirement
+    /// clause names the member and what the model admits.
+    ///
+    /// The rows span the constraint classes a requirement is stated for and the two forms of
+    /// the sentence.
+    #[test]
+    fn a_parameter_refusal_states_the_parameter_and_its_requirement() {
+        // (case, the sentence, what it must read)
+        let enum_values = [
+            "Self".to_owned(),
+            "Shared".to_owned(),
+            "Amazon".to_owned(),
+        ];
+        let rows = [
+            (
+                "a pattern",
+                parameter_value_mismatch(
+                    "semanticVersion",
+                    &must_match_pattern("semanticVersion", r"^[0-9]+\.[0-9]+\.[0-9]+$"),
+                ),
+                "The value supplied for parameter 'semanticVersion' is not valid. \
+                 semanticVersion must match pattern ^[0-9]+\\.[0-9]+\\.[0-9]+$",
+            ),
+            (
+                "a pattern whose expression is not stated",
+                parameter_value_mismatch(
+                    "distributionConfigurationArn",
+                    &pattern_requirement_unstated("distributionConfigurationArn"),
+                ),
+                "The value supplied for parameter 'distributionConfigurationArn' is not \
+                 valid. distributionConfigurationArn does not match the required pattern",
+            ),
+            (
+                "an upper bound",
+                parameter_value_mismatch(
+                    "imageTestsConfiguration.timeoutMinutes",
+                    &must_be_at_most("imageTestsConfiguration.timeoutMinutes", "1440"),
+                ),
+                "The value supplied for parameter 'imageTestsConfiguration.timeoutMinutes' \
+                 is not valid. imageTestsConfiguration.timeoutMinutes must be smaller than \
+                 or equal to 1440",
+            ),
+            (
+                "a lower bound",
+                parameter_value_mismatch("maxResults", &must_be_at_least("maxResults", "1")),
+                "The value supplied for parameter 'maxResults' is not valid. maxResults \
+                 must be greater than or equal to 1",
+            ),
+            (
+                "an enumerated value set",
+                parameter_value_mismatch("owner", &must_be_one_of("owner", &enum_values)),
+                "The value supplied for parameter 'owner' is not valid. owner must be one \
+                 of ['Self', 'Shared', 'Amazon']",
+            ),
+            (
+                "a requirement over two members together",
+                parameters_value_mismatch(
+                    &["data", "uri"],
+                    "You must specify either data or a uri.",
+                ),
+                "The value supplied for parameter 'data' and 'uri' is not valid. You must \
+                 specify either data or a uri.",
+            ),
+            (
+                "a requirement over three members together",
+                parameters_value_mismatch(&["a", "b", "c"], "Pick one."),
+                "The value supplied for parameter 'a', 'b' and 'c' is not valid. Pick one.",
+            ),
+        ];
+
+        for (case, stated, expected) in &rows {
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+
+        // The pattern sentence a service states through the whole-refusal entry point and
+        // the one built from the clauses are the SAME sentence.
+        let composed = parameter_value_mismatch("arn", &must_match_pattern("arn", "^arn:"));
+        let stated = parameter_pattern_mismatch("arn", "^arn:");
+        assert_eq!(
+            stated, composed,
+            "case \"one sentence for one requirement\": expected {composed:?}, got {stated:?}"
+        );
     }
 }
