@@ -40,6 +40,12 @@ const KUBERNETES_VERSION: &str = "1.33";
 
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AddonRole";
 const OTHER_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/OtherAddonRole";
+/// A SECOND role of this account, for the association another owner holds: the
+/// role a request hands Amazon EKS must be one of the caller's own account
+/// ([`crate::pass_role_authorization`]), which `OTHER_ROLE_ARN` above — a role of
+/// another account, carried only on members this service stores rather than
+/// passes — is not.
+const CONTESTING_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ContestingRole";
 
 /// A configuration document every published add-on's schema accepts:
 /// `priorityClassName` is one of the keys EVERY add-on's configuration schema
@@ -1098,7 +1104,7 @@ async fn an_update_whose_change_can_no_longer_be_made_fails() {
         &serde_json::json!({
             "namespace": "kube-system",
             "serviceAccount": "contested-sa",
-            "roleArn": OTHER_ROLE_ARN,
+            "roleArn": CONTESTING_ROLE_ARN,
         })
         .to_string(),
     )
@@ -1139,6 +1145,18 @@ async fn an_update_whose_change_can_no_longer_be_made_fails() {
         after.addon()["health"]["issues"][0]["resourceIds"],
         serde_json::json!(["contested-sa"]),
         "the issue names the service account at fault, got {:?}",
+        after.addon()["health"]
+    );
+    // The conflict names the IAM role the service account is ALREADY bound to —
+    // the role of the association another owner holds, not the one this update
+    // asked for — which is what a reconciliation loop reads it for.
+    assert_eq!(
+        after.addon()["health"]["issues"][0]["message"],
+        serde_json::json!(format!(
+            "The service account is already associated with a different IAM role: \
+             {CONTESTING_ROLE_ARN}"
+        )),
+        "the issue names the role already bound, got {:?}",
         after.addon()["health"]
     );
     // Nothing of the add-on changed: a failed update writes none of what it asked

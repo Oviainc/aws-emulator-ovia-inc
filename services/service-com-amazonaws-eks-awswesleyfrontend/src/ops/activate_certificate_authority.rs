@@ -101,22 +101,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// Two classes are widened in through `extra_errors`, as `CreateCertificateAuthority`
-// widens `ClientException`: this SERVICE models both shapes and many of its
-// operations declare them, but this one lists neither. `ClientException` is the class
+// Three classes are widened in through `extra_errors`, as `CreateCertificateAuthority`
+// widens `ClientException`: this SERVICE models all three shapes and many of its
+// operations declare them, but this one lists none. `ClientException` is the class
 // every operation of the Amazon EKS-managed plane refuses a cluster this service does
-// not manage with ([`crate::state::connected_cluster_refusal`]), and
+// not manage with ([`crate::state::connected_cluster_refusal`]),
 // `ResourceInUseException` — "the specified resource is in use" — is the class a
 // rotation step is refused with while the cluster or the certificate authority it
-// names is busy, which is what the recorded service answers for it.
+// names is busy, and `InvalidRequestException` — "the request is invalid given the
+// state of the cluster" — is the class a promotion that asks for the state the
+// cluster is already in is refused with; both are what the recorded service answers
+// for those cases.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#ActivateCertificateAuthority",
-    extra_errors = ["ClientException", "ResourceInUseException"]
+    extra_errors = ["ClientException", "InvalidRequestException", "ResourceInUseException"]
 )]
 #[derive(Debug)]
 pub enum ActivateCertificateAuthorityErrorModeled {
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
+    InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
@@ -320,9 +324,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already the signer — are facts about the CA.
         //
         // "Activates a SUCCESSOR certificate authority": the CA this promotes is one
-        // that is not signing. The CA that already signs for the cluster — or that a
-        // promotion already took to `ACTIVATING` — is in use, so promoting it again
-        // is nothing this can do.
+        // that is not signing.
+        //
+        // The CA that ALREADY signs for the cluster is the state this call asks for,
+        // so there is nothing for it to do: the request is invalid given the state
+        // the cluster is in, which is the class — and the sentence — the recorded
+        // service answers it with. It names both resources the request addressed,
+        // the certificate authority and the cluster, and the refusal leaves the
+        // signer, its `activatedBy`/`activatedAt` and the cluster untouched: no
+        // update is started below.
+        if signing_status == CA_SIGNING_IN_USE {
+            return Err(
+                ActivateCertificateAuthorityErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        cluster_name: Some(cluster_name.clone()),
+                        message: Some(format!(
+                            "Certificate authority {authority_id} is already active for \
+                             cluster {cluster_name}"
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A CA a promotion already took to `ACTIVATING` is not the signer yet but is
+        // being worked on, so promoting it again is nothing this can do either: that
+        // one is IN USE.
         if signing_status != CA_SIGNING_NOT_USED {
             return Err(in_use(
                 &cluster_name,

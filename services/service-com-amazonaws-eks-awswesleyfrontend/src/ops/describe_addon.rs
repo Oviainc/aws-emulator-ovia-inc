@@ -174,9 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = (region, input.cluster_name.clone(), input.addon_name.clone());
         match guard.addons.get(&key) {
-            Some(record) => Ok(DescribeAddonOutput {
-                addon: Some(record.to_addon()),
-            }),
+            // "An array of EKS Pod Identity associations owned by the add-on": the
+            // associations live in the store's own map, so what this add-on still
+            // owns is read from there rather than from the list it was created
+            // with — a caller may have deleted one directly.
+            Some(record) => {
+                let live = guard.association_arns_owned_by(&record.arn);
+                Ok(DescribeAddonOutput {
+                    addon: Some(record.to_addon(&live)),
+                })
+            }
             None => Err(DescribeAddonErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )

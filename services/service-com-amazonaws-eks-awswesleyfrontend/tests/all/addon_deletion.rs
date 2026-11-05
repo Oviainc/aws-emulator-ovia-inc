@@ -67,7 +67,7 @@ async fn delete_addon_in(
     call(router, region, "DELETE", &uri, "").await
 }
 
-async fn delete_addon(
+pub(crate) async fn delete_addon(
     router: &MultiServiceRouter,
     cluster: &str,
     addon: &str,

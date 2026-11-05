@@ -25,12 +25,12 @@ use smithy_server_runtime::MultiServiceRouter;
 // crate — see `tests/all/wire.rs`.
 use crate::wire::{call, emulator, encode_label, Answer};
 
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 const OTHER_REGION: &str = "eu-west-1";
-const CLUSTER: &str = "pod-identity-cluster";
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/pod-identity";
-const OTHER_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/pod-identity-other";
-const TARGET_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/target";
+pub(crate) const CLUSTER: &str = "pod-identity-cluster";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/pod-identity";
+pub(crate) const OTHER_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/pod-identity-other";
+pub(crate) const TARGET_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/target";
 
 /// A well-formed association id this emulator never minted: the right prefix and
 /// exactly [`ASSOCIATION_ID_BODY_LEN`] lowercase alphanumerics.
@@ -62,7 +62,7 @@ async fn delete_cluster(router: &MultiServiceRouter, region: &str, name: &str) -
 }
 
 /// A cluster that exists, so an association call reaches the association itself.
-async fn cluster_fixture(region: &str, name: &str) -> MultiServiceRouter {
+pub(crate) async fn cluster_fixture(region: &str, name: &str) -> MultiServiceRouter {
     let router = emulator();
     let created = create_cluster(&router, region, name).await;
     assert_eq!(
@@ -73,7 +73,7 @@ async fn cluster_fixture(region: &str, name: &str) -> MultiServiceRouter {
     router
 }
 
-async fn create_association(
+pub(crate) async fn create_association(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -92,7 +92,7 @@ async fn create_association(
     .await
 }
 
-async fn describe_association(
+pub(crate) async fn describe_association(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -112,7 +112,7 @@ async fn describe_association(
     .await
 }
 
-async fn update_association(
+pub(crate) async fn update_association(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -133,7 +133,7 @@ async fn update_association(
     .await
 }
 
-async fn delete_association(
+pub(crate) async fn delete_association(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -155,7 +155,7 @@ async fn delete_association(
 
 /// The smallest request `CreatePodIdentityAssociation` accepts: the three
 /// required body members (`clusterName` travels in the URI).
-fn minimal_create(namespace: &str, service_account: &str) -> serde_json::Value {
+pub(crate) fn minimal_create(namespace: &str, service_account: &str) -> serde_json::Value {
     serde_json::json!({
         "namespace": namespace,
         "serviceAccount": service_account,
@@ -163,7 +163,7 @@ fn minimal_create(namespace: &str, service_account: &str) -> serde_json::Value {
     })
 }
 
-fn association_id_of(answer: &Answer) -> String {
+pub(crate) fn association_id_of(answer: &Answer) -> String {
     answer.association()["associationId"]
         .as_str()
         .unwrap_or_default()
@@ -557,9 +557,14 @@ async fn a_malformed_cluster_name_is_an_invalid_parameter() {
 
 /// The Kubernetes-name and IAM-role-ARN legs of the same rule, on the create.
 /// The accepted rows are the forms the catalogue admits that the issue never
-/// cited (another partition, a role path, a dotted service account name, a
+/// cited (a role path, a target role in another account and partition — which
+/// `targetRoleArn` is documented to allow — a dotted service account name, a
 /// namespace at the published length bound); the refused rows are each way a
 /// value leaves the form.
+///
+/// `roleArn` is NOT a row here: it is the role the request asks Amazon EKS to
+/// pass, so a value outside this account is a permission failure rather than a
+/// parameter one, and `crate::pass_role_authorization` is the suite that pins it.
 #[tokio::test]
 async fn create_checks_the_form_of_every_identifier_it_carries() {
     let router = cluster_fixture(REGION, CLUSTER).await;
@@ -570,19 +575,21 @@ async fn create_checks_the_form_of_every_identifier_it_carries() {
     // DNS-1123 names Kubernetes admits.
     let accepted: Vec<(&str, serde_json::Value)> = vec![
         (
-            "a role in another partition",
+            "a target role in another partition",
             serde_json::json!({
                 "namespace": "cn-namespace",
                 "serviceAccount": "sa-1",
-                "roleArn": "arn:aws-cn:iam::000000000000:role/china",
+                "roleArn": ROLE_ARN,
+                "targetRoleArn": "arn:aws-cn:iam::111122223333:role/china",
             }),
         ),
         (
-            "a role in the GovCloud partition, with a path",
+            "a role of this account under a path, and a target role under one too",
             serde_json::json!({
                 "namespace": "gov-namespace",
                 "serviceAccount": "sa-2",
-                "roleArn": "arn:aws-us-gov:iam::000000000000:role/team/dept/role-name",
+                "roleArn": "arn:aws:iam::000000000000:role/team/dept/role-name",
+                "targetRoleArn": "arn:aws-us-gov:iam::000000000000:role/team/dept/target",
             }),
         ),
         (
@@ -614,38 +621,42 @@ async fn create_checks_the_form_of_every_identifier_it_carries() {
     // REFUSED: each way a value leaves its form.
     let refused: Vec<(&str, serde_json::Value)> = vec![
         (
-            "a roleArn that is not an ARN at all",
+            "a targetRoleArn that is not an ARN at all",
             serde_json::json!({
                 "namespace": "default", "serviceAccount": "bad-1",
-                "roleArn": "not-an-arn",
+                "roleArn": ROLE_ARN, "targetRoleArn": "not-an-arn",
             }),
         ),
         (
-            "an ARN for an IAM user rather than a role",
+            "a target ARN for an IAM user rather than a role",
             serde_json::json!({
                 "namespace": "default", "serviceAccount": "bad-2",
-                "roleArn": "arn:aws:iam::000000000000:user/someone",
+                "roleArn": ROLE_ARN,
+                "targetRoleArn": "arn:aws:iam::111122223333:user/someone",
             }),
         ),
         (
-            "an IAM ARN carrying a Region, which IAM never does",
+            "a target IAM ARN carrying a Region, which IAM never does",
             serde_json::json!({
                 "namespace": "default", "serviceAccount": "bad-3",
-                "roleArn": "arn:aws:iam:us-west-2:000000000000:role/regional",
+                "roleArn": ROLE_ARN,
+                "targetRoleArn": "arn:aws:iam:us-west-2:111122223333:role/regional",
             }),
         ),
         (
-            "an ARN of another service",
+            "a target ARN of another service",
             serde_json::json!({
                 "namespace": "default", "serviceAccount": "bad-4",
-                "roleArn": "arn:aws:eks:us-west-2:000000000000:cluster/other",
+                "roleArn": ROLE_ARN,
+                "targetRoleArn": "arn:aws:eks:us-west-2:111122223333:cluster/other",
             }),
         ),
         (
-            "an account that is not 12 digits",
+            "a target account that is not 12 digits",
             serde_json::json!({
                 "namespace": "default", "serviceAccount": "bad-5",
-                "roleArn": "arn:aws:iam::12345:role/short-account",
+                "roleArn": ROLE_ARN,
+                "targetRoleArn": "arn:aws:iam::12345:role/short-account",
             }),
         ),
         (

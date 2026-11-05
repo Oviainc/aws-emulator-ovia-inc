@@ -544,8 +544,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|token| !token.trim().is_empty());
             if let Some(token) = replayed_token {
                 if existing.client_request_token.as_deref() == Some(token) {
+                    let live = guard.association_arns_owned_by(&existing.arn);
                     return Ok(CreateAddonOutput {
-                        addon: Some(existing.to_addon()),
+                        addon: Some(existing.to_addon(&live)),
                     });
                 }
             }
@@ -612,24 +613,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The cluster's pairs are collected in ONE walk and each requested entry is
         // looked up in that set, rather than re-walking the store per entry: the work
-        // is the sum of the two bounded sides, not their product.
-        let taken_service_accounts: ::std::collections::BTreeSet<&str> = guard
+        // is the sum of the two bounded sides, not their product. Each taken service
+        // account is kept with the IAM role it is already bound to, because that role
+        // is what the conflict is reported as
+        // ([`crate::state::service_account_already_associated`]).
+        let taken_service_accounts: ::std::collections::BTreeMap<&str, &str> = guard
             .pod_identity_associations_in(&region, &input.cluster_name)
             .filter(|record| record.namespace == namespace)
-            .map(|record| record.service_account.as_str())
+            .map(|record| (record.service_account.as_str(), record.role_arn.as_str()))
             .collect();
-        if let Some(association) = requested_associations
-            .iter()
-            .find(|association| taken_service_accounts.contains(association.service_account.as_str()))
-        {
+        if let Some(bound_role_arn) = requested_associations.iter().find_map(|association| {
+            taken_service_accounts
+                .get(association.service_account.as_str())
+                .copied()
+        }) {
             return Err(CreateAddonErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     cluster_name: Some(input.cluster_name.clone()),
                     addon_name: Some(input.addon_name.clone()),
-                    message: Some(state::association_already_exists(
-                        &namespace,
-                        &association.service_account,
-                    )),
+                    message: Some(state::service_account_already_associated(bound_role_arn)),
                     ..Default::default()
                 },
             )
@@ -724,7 +726,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // service's own wording (`crate::service::resolve_conflicts_contract`).
         };
 
-        let addon = record.to_addon();
+        // The associations this install created are already in the store, so the
+        // answer reports the ones it actually holds for this add-on.
+        let live = guard.association_arns_owned_by(&record.arn);
+        let addon = record.to_addon(&live);
         guard.addons.insert(addon_key, record);
 
         Ok(CreateAddonOutput {

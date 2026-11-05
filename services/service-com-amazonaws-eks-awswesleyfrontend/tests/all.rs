@@ -115,6 +115,8 @@ mod not_found_payload;
 mod pass_role_authorization;
 #[path = "all/peer_resolution_is_grounded.rs"]
 mod peer_resolution_is_grounded;
+#[path = "all/pod_identity_and_rotation_refusals.rs"]
+mod pod_identity_and_rotation_refusals;
 #[path = "all/pod_identity_associations.rs"]
 mod pod_identity_associations;
 #[path = "all/refusal_message_wording.rs"]

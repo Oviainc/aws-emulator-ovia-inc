@@ -10,7 +10,9 @@
 //!
 //! The identifiers the request carries are checked for their documented FORM
 //! before any resource is resolved, so a value that names nothing earns an
-//! `InvalidParameterException` (400) rather than a not-found.
+//! `InvalidParameterException` (400) rather than a not-found — a role ARN outside
+//! its form in this operation's own wording
+//! ([`crate::state::role_arn_refusal`]).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -219,15 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         for (member, value) in [
-            ("roleArn", input.role_arn.as_ref()),
-            ("targetRoleArn", input.target_role_arn.as_ref()),
+            ("roleArn", input.role_arn.as_deref()),
+            ("targetRoleArn", input.target_role_arn.as_deref()),
         ] {
             if let Some(value) = value {
                 if !state::is_iam_role_arn(value) {
-                    return Err(invalid_parameter(format!(
-                        "Value '{value}' at '{member}' failed to satisfy constraint: Member \
-                         must be an IAM role ARN"
-                    )));
+                    return Err(invalid_parameter(state::role_arn_refusal(member, value)));
                 }
             }
         }
@@ -287,10 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.association_id.clone(),
         );
         let Some(record) = guard.pod_identity_associations.get_mut(&key) else {
-            return Err(not_found(crate::state::child_resource_not_found(format!(
-                "No pod identity association found for ID: {}.",
-                input.association_id
-            ))));
+            return Err(not_found(crate::state::pod_identity_association_not_found(
+                &input.association_id,
+            )));
         };
 
         // "When using this policy, disableSessionTags must be set to true" — the
@@ -300,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let disable_session_tags = input.disable_session_tags.or(record.disable_session_tags);
         if policy.is_some() && disable_session_tags != Some(true) {
             return Err(invalid_parameter(
-                "Value at 'policy' requires 'disableSessionTags' to be true".to_string(),
+                state::POLICY_REQUIRES_DISABLED_SESSION_TAGS.to_string(),
             ));
         }
 

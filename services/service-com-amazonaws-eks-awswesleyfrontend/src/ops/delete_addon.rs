@@ -186,12 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let key = (region, input.cluster_name.clone(), input.addon_name.clone());
+        // The associations this add-on owns are read BEFORE the removal: the answer
+        // is "the full description of the add-on that was deleted", so it reports
+        // the set the add-on owned as it left, not the empty set the removal leaves
+        // behind.
+        let live = guard
+            .addons
+            .get(&key)
+            .map(|record| guard.association_arns_owned_by(&record.arn))
+            .unwrap_or_default();
         let Some(record) = guard.remove_addon(&key, input.preserve, now) else {
             return Err(not_found());
         };
 
         Ok(DeleteAddonOutput {
-            addon: Some(record.to_addon()),
+            addon: Some(record.to_addon(&live)),
         })
     }
 }

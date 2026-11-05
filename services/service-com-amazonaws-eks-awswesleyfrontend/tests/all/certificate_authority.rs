@@ -633,7 +633,8 @@ async fn an_appended_authority_distributes_once_the_clock_owes_it() {
 // ---------------------------------------------------------------------------
 // RULE: a cluster holds at most the documented number of certificate authorities
 // at a time (the signer plus one successor); appending past that ceiling is
-// refused with the service-limit error and writes nothing.
+// refused as a request that is invalid given the state the cluster is in, and
+// writes nothing.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -691,8 +692,8 @@ async fn a_cluster_holds_at_most_the_documented_number_of_authorities() {
         );
         assert_eq!(
             past.error_type.as_deref(),
-            Some("ResourceLimitExceededException"),
-            "case {case:?}: expected ResourceLimitExceededException, got {past:?}"
+            Some("InvalidRequestException"),
+            "case {case:?}: expected InvalidRequestException, got {past:?}"
         );
 
         // The refused call wrote nothing: every CA appended before it is still
@@ -832,7 +833,7 @@ async fn a_retry_with_the_same_idempotency_token_is_absorbed() {
             // holding the signer and this successor, has no room for.
             assert_eq!(
                 second.error_type.as_deref(),
-                Some("ResourceLimitExceededException"),
+                Some("InvalidRequestException"),
                 "case {case:?}: a call that is not a retry is held to the ceiling, \
                  got {second:?}"
             );

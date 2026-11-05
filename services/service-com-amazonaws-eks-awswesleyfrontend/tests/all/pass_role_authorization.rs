@@ -17,6 +17,7 @@
 //! ARNs — and, across the suites, every member of this service that carries such a role
 //! (`CreateCluster$roleArn`, `CreateCluster$computeConfig.nodeRoleArn`,
 //! `CreateNodegroup$nodeRole`, `CreateCapability$roleArn`,
+//! `CreatePodIdentityAssociation$roleArn`,
 //! `RegisterCluster$connectorConfig.roleArn` — the last of which the recording shows
 //! reporting the SAME question as its own 400 `InvalidParameterException`, so its suite
 //! asserts that shape instead).

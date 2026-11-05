@@ -13,9 +13,10 @@
 //! A call whose cluster or certificate authority is in any other state changes
 //! nothing and is refused with the class that names what is wrong: a cluster or an
 //! id the region does not hold is 404 `ResourceNotFoundException`; a cluster busy
-//! with its own lifecycle or another update, or a CA that is already signing, is 409
-//! `ResourceInUseException`; and a CA that is not fully distributed is the
-//! argument-level 400 `InvalidParameterException`.
+//! with its own lifecycle or another update is 409 `ResourceInUseException`; a CA
+//! that already signs for the cluster asks for the state the cluster is already in,
+//! so it is 400 `InvalidRequestException`; and a CA that is not fully distributed is
+//! the argument-level 400 `InvalidParameterException`.
 //!
 //! Each suite asserts that rule over a TABLE whose rows differ along what the rule
 //! generalises over (whether an idempotency token is supplied and how two calls'
@@ -87,7 +88,7 @@ async fn signer_of(router: &MultiServiceRouter, region: &str, cluster: &str) -> 
 /// distributed — the precondition the model states for an activation ("must already
 /// exist on the cluster and have a distributionStatus of COMPLETE") — returning
 /// `(the signer's id, the successor's id)`.
-async fn cluster_with_a_distributed_successor(
+pub(crate) async fn cluster_with_a_distributed_successor(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,
@@ -512,11 +513,11 @@ async fn a_retry_with_the_same_idempotency_token_is_absorbed() {
                 after.body["update"]["status"]
             );
         } else {
-            // The CA the first call promoted now signs, so activating it again is
-            // not something this operation can do.
+            // The CA the first call promoted now signs, so activating it again asks
+            // for the state the cluster is already in.
             assert_eq!(
                 (after.status, error_code(&after).as_str()),
-                (409, "ResourceInUseException"),
+                (400, "InvalidRequestException"),
                 "case {case:?}: the promoted CA already signs, got {after:?}"
             );
         }
@@ -660,8 +661,8 @@ async fn activation_is_refused_unless_the_cluster_and_the_authority_are_ready() 
             region: REGION,
             cluster: "act-ready".to_string(),
             authority_id: ready_signer.clone(),
-            status: 409,
-            code: "ResourceInUseException",
+            status: 400,
+            code: "InvalidRequestException",
         },
     ];
     for (case, cluster, authority_id) in parked {

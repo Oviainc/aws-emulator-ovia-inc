@@ -371,11 +371,19 @@ fn addressed(
             req,
             |input: &CreateAccessEntryInput| addresses_cluster(&input.cluster_name),
         ),
+        // `roleArn` is the role the EKS Pod Identity agent has Amazon EKS assume for
+        // the Pods of the service account, so the handler authorizes passing it
+        // before it judges the body or resolves the cluster.
         "CreatePodIdentityAssociation" => addressed_with(
             protocol,
             CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA,
             req,
-            |input: &CreatePodIdentityAssociationInput| addresses_cluster(&input.cluster_name),
+            |input: &CreatePodIdentityAssociationInput| {
+                passes_roles_and_addresses_cluster(
+                    vec![input.role_arn.clone()],
+                    &input.cluster_name,
+                )
+            },
         ),
         "AssociateIdentityProviderConfig" => addressed_with(
             protocol,

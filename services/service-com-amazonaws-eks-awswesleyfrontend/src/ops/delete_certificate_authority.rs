@@ -74,9 +74,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, PendingClusterConfig, UpdateRecord, UpdateScope, CA_BY_EKS, CA_DISTRIBUTION_DELETING,
-    CA_SIGNING_NOT_USED, STATUS_ACTIVE, STATUS_UPDATING, UPDATE_COMPLETION_DELAY,
-    UPDATE_IN_PROGRESS, UPDATE_PARAM_CERTIFICATE_AUTHORITY_ID, UPDATE_TYPE_CERTIFICATE_AUTHORITY,
+    self, PendingClusterConfig, UpdateRecord, UpdateScope, ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE,
+    CA_BY_EKS, CA_DISTRIBUTION_DELETING, CA_SIGNING_NOT_USED, STATUS_ACTIVE, STATUS_UPDATING,
+    UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_CERTIFICATE_AUTHORITY_ID,
+    UPDATE_TYPE_CERTIFICATE_AUTHORITY,
 };
 use std::time::SystemTime;
 
@@ -295,15 +296,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can't delete the certificate authority that's currently signing
         // certificates for the cluster (its signingStatus is IN_USE) — to remove the
         // outgoing CA, first activate the successor CA": a CA that signs, or that an
-        // activation is on its way to making the signer, is in use.
+        // activation is on its way to making the signer, is in use. The refusal is
+        // the one fixed sentence the recorded service answers it with, remediation
+        // included; the request named the CA, so nothing varies in it.
         if signing_status != CA_SIGNING_NOT_USED {
             return Err(in_use(
                 &cluster_name,
-                format!(
-                    "Certificate authority {authority_id} is in {signing_status} signing status; \
-                     the certificate authority that signs for cluster {cluster_name} cannot be \
-                     deleted."
-                ),
+                ACTIVE_CERTIFICATE_AUTHORITY_UNDELETABLE.to_string(),
             ));
         }
 

@@ -510,10 +510,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // cannot collide with the request: only an association another owner holds
             // can. Each side of both comparisons is bounded by that ceiling, so the work
             // is the sum of the two sides rather than their product.
-            let held_by_others: Vec<(&str, &str)> = guard
+            let held_by_others: Vec<(&str, &str, &str)> = guard
                 .pod_identity_associations_in(&region, &input.cluster_name)
                 .filter(|record| record.owner_arn.as_deref() != Some(addon_arn.as_str()))
-                .map(|record| (record.namespace.as_str(), record.service_account.as_str()))
+                .map(|record| {
+                    (
+                        record.namespace.as_str(),
+                        record.service_account.as_str(),
+                        record.role_arn.as_str(),
+                    )
+                })
                 .collect();
             if held_by_others.len() + requested.len() > MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER {
                 return Err(too_many(requested.len(), Some(held_by_others.len())));
@@ -522,24 +528,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // holds one would make the credential lookup that pair resolves ambiguous,
             // which is why the pod identity slice refuses a second association for it;
             // the same refusal belongs here, BEFORE anything is written, so a request
-            // that cannot be carried out in full writes nothing.
-            let taken: ::std::collections::BTreeSet<&str> = held_by_others
+            // that cannot be carried out in full writes nothing. Each taken service
+            // account is kept with the IAM role it is already bound to, because that
+            // role is what the conflict is reported as
+            // ([`crate::state::service_account_already_associated`]).
+            let taken: ::std::collections::BTreeMap<&str, &str> = held_by_others
                 .iter()
-                .filter(|(namespace, _)| *namespace == addon_namespace)
-                .map(|(_, service_account)| *service_account)
+                .filter(|(namespace, _, _)| *namespace == addon_namespace)
+                .map(|(_, service_account, role_arn)| (*service_account, *role_arn))
                 .collect();
-            if let Some(association) = requested
-                .iter()
-                .find(|association| taken.contains(association.service_account.as_str()))
-            {
+            if let Some(bound_role_arn) = requested.iter().find_map(|association| {
+                taken.get(association.service_account.as_str()).copied()
+            }) {
                 return Err(UpdateAddonErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         cluster_name: Some(input.cluster_name.clone()),
                         addon_name: Some(input.addon_name.clone()),
-                        message: Some(state::association_already_exists(
-                            &addon_namespace,
-                            &association.service_account,
-                        )),
+                        message: Some(state::service_account_already_associated(bound_role_arn)),
                         ..Default::default()
                     },
                 )

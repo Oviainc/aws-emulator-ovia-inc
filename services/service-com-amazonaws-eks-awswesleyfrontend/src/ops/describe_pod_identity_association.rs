@@ -226,10 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(record) => Ok(DescribePodIdentityAssociationOutput {
                 association: Some(record.to_association()),
             }),
-            None => Err(not_found(crate::state::child_resource_not_found(format!(
-                "No pod identity association found for ID: {}.",
-                input.association_id
-            )))),
+            None => Err(not_found(crate::state::pod_identity_association_not_found(
+                &input.association_id,
+            ))),
         }
     }
 }

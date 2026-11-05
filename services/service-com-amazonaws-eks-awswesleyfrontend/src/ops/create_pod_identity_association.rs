@@ -7,10 +7,12 @@
 //! `associationId`, `associationArn`, `externalId`, `createdAt` and `modifiedAt`
 //! it answers with are minted once here and stored, never recomputed on a read.
 //!
-//! Every identifier the request carries is checked for its documented FORM before
-//! any resource is resolved — the cluster name, the IAM role ARNs and the
-//! Kubernetes names — so a request that cannot name anything is an
-//! `InvalidParameterException` rather than a not-found.
+//! The `roleArn` the request asks Amazon EKS to pass is authorized FIRST — before
+//! the body's forms and before the cluster is resolved — and then every identifier
+//! the request carries is checked for its documented FORM before any resource is
+//! resolved: the cluster name, the target IAM role ARN and the Kubernetes names, so
+//! a request that cannot name anything is an `InvalidParameterException` rather than
+//! a not-found.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -110,6 +112,8 @@
 //!
 //! ## Errors
 //!
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   the class the pass-role authorization of `roleArn` answers with.
 //! * `InvalidParameterException` (HTTP 400) — The specified parameter is invalid. Review the
 //!   available parameters for the API request.
 //! * `InvalidRequestException` (HTTP 400) — The request is invalid given the state of the
@@ -143,16 +147,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `ClientException` is widened in through `extra_errors`: this SERVICE models that
-// shape and many of its operations declare it, but this one does not list it — and it
-// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
-// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+// Two classes are widened in through `extra_errors`: this SERVICE models both shapes
+// and many of its operations declare them, but this one lists neither.
+// `ClientException` is the class every operation of the Amazon EKS-managed plane
+// refuses a cluster this service does not manage with
+// ([`crate::state::connected_cluster_refusal`]), and `AccessDeniedException` — 403 —
+// is the class the pass-role authorization of `roleArn` answers with, the same one
+// `CreateCluster`, `CreateNodegroup`, `CreateFargateProfile` and `CreateCapability`
+// widen in for the same question ([`crate::state::pass_role_refusal`]).
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#CreatePodIdentityAssociation",
-    extra_errors = ["ClientException"]
+    extra_errors = ["ClientException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum CreatePodIdentityAssociationErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
@@ -223,9 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // Every refusal below names the member, the value and the constraint it
-        // failed, the way the boundary validator does: the caller has to fix the
-        // request from this text alone.
+        // The argument-level refusal: it names the member at fault and the value the
+        // request carried, so the caller has to fix the request from this text alone
+        // — in the operation's own wording where it has one
+        // ([`crate::state::role_arn_refusal`]), and the way the boundary validator
+        // words it for the members it would have refused itself.
         let invalid_parameter = |message: String| {
             CreatePodIdentityAssociationError::from(
                 CreatePodIdentityAssociationErrorModeled::InvalidParameterException(
@@ -238,7 +249,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // FORM FIRST: an identifier outside its documented form names nothing, in
+        // AUTHORIZATION FIRST. `roleArn` is the role the EKS Pod Identity agent has
+        // Amazon EKS assume for the Pods of this service account, so the caller is
+        // passing it to the service: Amazon EKS authorizes that `iam:PassRole`
+        // BEFORE it reports on anything else the request carries, and a value that
+        // names no role of this account is a PERMISSION failure whatever else is
+        // wrong with the request — including a value that is not an ARN at all,
+        // which is evaluated as the role of an account that is not this one
+        // ([`crate::state::pass_role_refusal`]). The question needs no state, which
+        // is why it is answered before the body's forms and before the cluster is
+        // resolved: a caller fixing its policy must not be told about a missing
+        // cluster or a malformed name instead.
+        //
+        // `targetRoleArn` is NOT passed here: "you can set a target IAM role in the
+        // same or a different account", and EKS Pod Identity assumes it with the
+        // association's own role rather than with the caller's `iam:PassRole`, so a
+        // target role of another account is ordinary use and only its FORM is
+        // judged below.
+        if let Some(why) = state::pass_role_refusal(&input.role_arn) {
+            return Err(CreatePodIdentityAssociationErrorModeled::AccessDeniedException(
+                AccessDeniedException { message: Some(why) },
+            )
+            .into());
+        }
+
+        // FORM NEXT: an identifier outside its documented form names nothing, in
         // any account or Region, so it is an invalid parameter and never a
         // not-found. None of these members carries a modelled constraint, so
         // nothing refused them before this handler ran.
@@ -259,24 +294,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        for (member, value) in [
-            ("roleArn", Some(&input.role_arn)),
-            ("targetRoleArn", input.target_role_arn.as_ref()),
-        ] {
-            if let Some(value) = value {
-                if !state::is_iam_role_arn(value) {
-                    return Err(invalid_parameter(format!(
-                        "Value '{value}' at '{member}' failed to satisfy constraint: Member \
-                         must be an IAM role ARN"
-                    )));
-                }
+        // `roleArn` is not re-judged here: the authorization above accepts only an
+        // IAM role ARN of this account and partition, so every value outside the
+        // form has already been answered as the permission failure it is.
+        if let Some(target_role_arn) = input.target_role_arn.as_deref() {
+            if !state::is_iam_role_arn(target_role_arn) {
+                return Err(invalid_parameter(state::role_arn_refusal(
+                    "targetRoleArn",
+                    target_role_arn,
+                )));
             }
         }
         // `policy`'s own documentation: "Session tags: When using this policy,
         // disableSessionTags must be set to true."
         if input.policy.is_some() && input.disable_session_tags != Some(true) {
             return Err(invalid_parameter(
-                "Value at 'policy' requires 'disableSessionTags' to be true".to_string(),
+                state::POLICY_REQUIRES_DISABLED_SESSION_TAGS.to_string(),
             ));
         }
 
@@ -338,13 +371,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
             }
+            // What the caller could not know is which IAM role the pair is
+            // already bound to, so that is what the refusal names — read off the
+            // STORED association, never off this request.
             return Err(
                 CreatePodIdentityAssociationErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(crate::state::association_already_exists(
-                            &input.namespace,
-                            &input.service_account,
+                        message: Some(crate::state::service_account_already_associated(
+                            &existing.role_arn,
                         )),
                         ..Default::default()
                     },

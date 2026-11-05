@@ -17,8 +17,8 @@
 //!
 //! The cluster must exist in the region the request is signed for, run no other
 //! update, and be `ACTIVE`; a cluster already holding
-//! [`crate::state::MAX_CERTIFICATE_AUTHORITIES_PER_CLUSTER`] CAs is refused with the
-//! service-limit error.
+//! [`crate::state::MAX_CERTIFICATE_AUTHORITIES_PER_CLUSTER`] CAs is refused as a
+//! request that is invalid given the state that cluster is in.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -102,18 +102,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `ClientException` is widened in through `extra_errors`: this SERVICE models that
-// shape and many of its operations declare it, but this one does not list it — and it
-// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
-// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+// Two classes are widened in through `extra_errors`: this SERVICE models both shapes
+// and many of its operations declare them, but this one lists neither.
+// `ClientException` is the class every operation of the Amazon EKS-managed plane
+// refuses a cluster this service does not manage with
+// ([`crate::state::connected_cluster_refusal`]), and `InvalidRequestException` — "the
+// request is invalid given the state of the cluster" — is the class a cluster that
+// already holds every certificate authority it may hold refuses a further append
+// with, which is what the recorded service answers for it.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#CreateCertificateAuthority",
-    extra_errors = ["ClientException"]
+    extra_errors = ["ClientException", "InvalidRequestException"]
 )]
 #[derive(Debug)]
 pub enum CreateCertificateAuthorityErrorModeled {
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
+    InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
     ResourceLimitExceededException(ResourceLimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -293,16 +298,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Each cluster can have at most two certificate authorities at a time: the
         // outgoing CA that's currently signing ... and one successor CA ... that you
         // can later activate to complete the rotation." A cluster already holding the
-        // ceiling has a rotation in flight, and appending past a ceiling is what the
-        // service-limit error reports.
+        // ceiling has a rotation in flight, so what this reports is not a quota the
+        // account can have raised but a fact about the cluster's own state: the
+        // request is invalid given that state, and the remediation is to delete one
+        // of the certificate authorities the cluster holds. That is the class — and
+        // the sentence, carrying the ceiling it names — the recorded service answers
+        // it with; nothing but the ceiling varies, so nothing else is interpolated.
         if cluster.certificate_authorities.len() >= MAX_CERTIFICATE_AUTHORITIES_PER_CLUSTER {
             return Err(
-                CreateCertificateAuthorityErrorModeled::ResourceLimitExceededException(
-                    ResourceLimitExceededException {
+                CreateCertificateAuthorityErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
                         cluster_name: Some(cluster_name.clone()),
                         message: Some(format!(
-                            "Cluster {cluster_name} already has the maximum of \
-                             {MAX_CERTIFICATE_AUTHORITIES_PER_CLUSTER} certificate authorities"
+                            "Cluster already has the maximum number of certificate \
+                             authorities ({MAX_CERTIFICATE_AUTHORITIES_PER_CLUSTER}). Delete \
+                             an existing CA before creating a new one."
                         )),
                         ..Default::default()
                     },
