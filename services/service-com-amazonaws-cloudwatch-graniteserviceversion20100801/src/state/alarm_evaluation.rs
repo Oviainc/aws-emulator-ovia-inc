@@ -707,6 +707,17 @@ fn newest_graded_period(now_secs: f64, period: f64) -> f64 {
     ((now_secs - evaluation_lag_secs(period)) / period).floor()
 }
 
+/// The instant the range an evaluation running at `now_secs` grades ENDS at, for windows
+/// `period` seconds wide: the end of the newest period that evaluation grades
+/// ([`newest_graded_period`]), the range being half-open on it.
+///
+/// One definition of that end, so the range the query array of an alarm is resolved over
+/// ([`State::resolved_query_array`]) and the watermark a datapoint is measured against to say
+/// whether an evaluation has REACHED it ([`State::metric_alarm_evaluation`]) cannot drift.
+fn graded_range_end(now_secs: f64, period: f64) -> f64 {
+    (newest_graded_period(now_secs, period) + 1.0) * period
+}
+
 /// The names of `alarms` in the order their evaluations came DUE: oldest first, and by name
 /// between two owed one at the same instant.
 ///
@@ -757,6 +768,21 @@ fn alarm_grades_unit(alarm: &MetricAlarm, unit: &str) -> bool {
 /// whether the unit is the alarm's own or the one its query names.
 pub(super) fn grades_unit(selector: Option<&str>, unit: &str) -> bool {
     selector.is_none_or(|wanted| unit == wanted)
+}
+
+/// What the series ONE alarm READS hold, as a single pass over them found it.
+///
+/// Both halves come out of that one pass, over the same series ([`watched_series_set`]), so an
+/// evaluation that has to know how far back its range must reach AND whether those series have
+/// moved on past the end of it does not walk them twice.
+#[derive(Debug, Clone, Copy, Default)]
+struct WatchedData {
+    /// The COARSEST granularity any datapoint of those series is stored at, in seconds, and
+    /// `0.0` for an alarm over series this store holds no datapoint of.
+    storage_span: f64,
+    /// The newest instant a datapoint this alarm GRADES has been aggregated into, among the
+    /// ones already in the past; `None` where those series hold no such datapoint.
+    newest_instant: Option<f64>,
 }
 
 /// One window of the series an alarm GRADES: the value it took, and how many observations it
@@ -1123,11 +1149,12 @@ impl State {
         // reaches further back than the look-back ([`evaluation_range_periods`]) — how much
         // further depends on how wide this alarm's windows are and on the granularity the
         // series it grades is STORED at, so both are resolved from the same places the grading
-        // itself reads them from ([`graded_window_secs`], [`Self::graded_storage_span`]).
+        // itself reads them from ([`graded_window_secs`], [`Self::watched_data`]).
+        let watched = self.watched_data(alarm, now_secs, budget);
         let range_periods = evaluation_range_periods(
             evaluation_periods,
             graded_window_secs(alarm),
-            self.graded_storage_span(alarm, budget),
+            watched.storage_span,
         );
         // The series this alarm GRADES, as the value each of those windows took, and what it
         // compares each of them against: the one number the alarm is configured with, or the
@@ -1219,6 +1246,24 @@ impl State {
         if withheld > 0 && evaluated.is_empty() {
             return None;
         }
+        // An evaluation that graded NO datapoint at all, while the series this alarm reads hold
+        // one its range has not reached yet, has not graded this alarm's series: the periods it
+        // covered are not periods the series has no datapoint for — the datapoint belongs to a
+        // period NEWER than the end of this evaluation's rolling range
+        // ([`newest_graded_period`]) — so no arm of the missing-data treatment stands in for
+        // anything, and the alarm keeps the state it has until the evaluation whose range
+        // reaches that datapoint grades it. Without this an alarm would reach a decided state
+        // from the treatment alone, over an EMPTY window, while a client was publishing into
+        // the very series it watches.
+        //
+        // The wait is at most ONE evaluation cadence, so a period the series really holds no
+        // datapoint for is still decided by the treatment: the datapoint is already in the
+        // past, and the period it belongs to enters the range a cadence after that period
+        // opened ([`evaluation_lag_secs`]).
+        let range_end = graded_range_end(now_secs, graded.period);
+        if evaluated.is_empty() && watched.newest_instant.is_some_and(|at| at >= range_end) {
+            return None;
+        }
         self.graded_evaluation(
             alarm,
             &graded,
@@ -1238,32 +1283,53 @@ impl State {
         )
     }
 
-    /// The COARSEST granularity any datapoint of the series this alarm reads is stored at, in
-    /// seconds, or `0.0` for an alarm over series this store holds no datapoint of. The
+    /// What the series this alarm READS hold, in ONE pass over them ([`WatchedData`]). The
     /// datapoints it visits are charged to `budget`, as every fold over a series is.
+    ///
+    /// The series are every one the alarm reads — the one its own members name, or each metric a
+    /// `Metrics` array's queries read ([`watched_series_set`]) — because the value an expression
+    /// yields is only as dense, and only as fresh, as the series it is computed from.
     ///
     /// What a datapoint's granularity is, is the datapoint's own: "Setting this to 1 specifies
     /// this metric as a high-resolution metric […] Setting this to 60 specifies this metric as
     /// regular resolution" (`MetricDatum$StorageResolution`), which is the span it is aggregated
     /// into ([`super::StoredDatum::aggregated_span`]) and so the shortest interval two of its
     /// datapoints can be apart. The coarsest of them is what the evaluation range has to reach
-    /// back over ([`evaluation_range_periods`]), and it is read over every series the alarm
-    /// reads — the one its own members name, or each metric a `Metrics` array's queries read
-    /// ([`watched_series_set`]) — because the value an expression yields is only as dense as the
-    /// coarsest series it is computed from.
-    fn graded_storage_span(&self, alarm: &MetricAlarm, budget: &mut EvaluationBudget) -> f64 {
-        let mut coarsest = 0.0_f64;
-        for (key, _) in watched_series_set(alarm) {
+    /// back over ([`evaluation_range_periods`]).
+    ///
+    /// The newest instant is read over the datapoints this alarm GRADES — a datapoint carrying
+    /// another unit than the one the alarm or its query selects is not one it reads at all
+    /// ([`grades_unit`]) — and only over the ones already in the past, since a datapoint stamped
+    /// ahead of this instant ("as much as 2 hours after the current day and time",
+    /// `PutMetricData`) belongs to a period the clock has not reached and no evaluation running
+    /// now is behind it.
+    fn watched_data(
+        &self,
+        alarm: &MetricAlarm,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> WatchedData {
+        let mut found = WatchedData::default();
+        for (key, unit) in watched_series_set(alarm) {
             let Some(series) = self.metrics.get(&key) else {
                 continue;
             };
             budget.charge_datapoints(series.len());
-            coarsest = series
-                .iter()
-                .map(StoredDatum::aggregated_span)
-                .fold(coarsest, f64::max);
+            for datum in series {
+                found.storage_span = found.storage_span.max(datum.aggregated_span());
+                if !grades_unit(unit.as_deref(), datum.unit()) {
+                    continue;
+                }
+                let at = datum.aggregated_instant();
+                if at > now_secs {
+                    continue;
+                }
+                if found.newest_instant.is_none_or(|newest| at > newest) {
+                    found.newest_instant = Some(at);
+                }
+            }
         }
-        coarsest
+        found
     }
 
     /// The series ONE alarm grades, as the value each window of its evaluation range took.
@@ -1481,7 +1547,7 @@ impl State {
         let newest_window = newest_graded_period(now_secs, period);
         #[allow(clippy::cast_precision_loss)]
         let start = (newest_window - (range_periods.saturating_sub(1) as f64)) * period;
-        let end = (newest_window + 1.0) * period;
+        let end = graded_range_end(now_secs, period);
 
         // How much work this array asks for is bounded BEFORE anything is parsed or folded:
         // the queries of the array and the windows of the range are the factors of every walk

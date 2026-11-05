@@ -97,6 +97,8 @@ mod forced_state_reclaim;
 mod get_dashboard_reader;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/held_verdict_until_graded.rs"]
+mod held_verdict_until_graded;
 #[path = "all/insight_rule_batch_failures.rs"]
 mod insight_rule_batch_failures;
 #[path = "all/insight_rule_body_refusal_message.rs"]
