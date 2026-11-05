@@ -188,9 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // A proxy that is still coming up, or on its way out, cannot take a modification:
-        // the state the clock has yet to settle is real.
-        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
+        // The group is created WITH the proxy and has no provisioning of its own, so it is
+        // there to be modified as soon as the proxy record is — a proxy that is still
+        // coming up already has its group. Only a proxy on its way out has a target group
+        // this service has nothing left to apply a change to.
+        if proxy.is_deleting() {
             return Err(
                 ModifyDBProxyTargetGroupErrorModeled::InvalidDBProxyStateFault(
                     InvalidDBProxyStateFault {

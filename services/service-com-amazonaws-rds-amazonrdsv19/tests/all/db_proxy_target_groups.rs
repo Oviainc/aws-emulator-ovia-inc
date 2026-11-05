@@ -10,7 +10,8 @@
 //! The rule under test, asserted over a TABLE spanning the class it generalises over
 //! rather than over one request: a report of a proxy's target groups computes the one
 //! group that proxy was created with from the proxy's own stored record — its name, its
-//! own ARN, that it is the proxy's default group, the proxy's readiness, and the
+//! own ARN, that it is the proxy's default group, its readiness (which the group has as
+//! soon as the proxy record exists, the group having no provisioning of its own), and the
 //! connection pool settings documented as the defaults for the proxy's engine family —
 //! while a proxy name that resolves to nothing, and any group name that is not the one
 //! group a proxy has, are the two not-found faults the operation models; and the report
@@ -118,8 +119,9 @@ async fn each_proxy_reports_the_one_target_group_it_was_created_with() {
         create_proxy(&router, row.proxy, row.engine_family).await;
     }
 
-    // The group comes up with the proxy, so while the proxy is still coming up the group
-    // reports that it is not ready either.
+    // The group is created WITH the proxy and has no provisioning of its own, so it is
+    // ready — `available` — as soon as the proxy record exists, even while the proxy
+    // itself is still coming up.
     let creating = describe_target_groups(
         &router,
         "the target group of a proxy that is still coming up",
@@ -129,10 +131,25 @@ async fn each_proxy_reports_the_one_target_group_it_was_created_with() {
     .await;
     assert_eq!(
         text(&creating, "Status"),
-        DB_PROXY_STATUS_CREATING,
+        DB_PROXY_STATUS_AVAILABLE,
         "case \"a proxy that is still coming up\": expected the target group to report \
-         {DB_PROXY_STATUS_CREATING}, got {:?} in {creating}",
+         {DB_PROXY_STATUS_AVAILABLE}, got {:?} in {creating}",
         text(&creating, "Status")
+    );
+    let proxy_coming_up = expect_ok(
+        "the proxy that is still coming up",
+        call(
+            &router,
+            "DescribeDBProxies",
+            &[("DBProxyName", ENGINE_FAMILY_CASES[0].proxy)],
+        )
+        .await,
+    );
+    assert_eq!(
+        text(&proxy_coming_up, "Status"),
+        DB_PROXY_STATUS_CREATING,
+        "case \"a proxy that is still coming up\": the PROXY is the one that is still \
+         coming up, got {proxy_coming_up}"
     );
     wait_for_settle();
 

@@ -67,6 +67,8 @@ mod db_parameter_metadata;
 mod db_parameters;
 #[path = "all/db_proxy_lifecycle.rs"]
 mod db_proxy_lifecycle;
+#[path = "all/db_proxy_target_group_readiness.rs"]
+mod db_proxy_target_group_readiness;
 #[path = "all/db_proxy_target_groups.rs"]
 mod db_proxy_target_groups;
 #[path = "all/db_security_group_deletion.rs"]

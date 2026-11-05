@@ -12,11 +12,12 @@
 //!
 //! * a modification of a proxy's target group carries the settings a caller wants CHANGED,
 //!   so each one it states is applied to the group and each one it leaves out keeps the
-//!   value the group already holds, a value outside the constraints
+//!   value the group already holds — except `MaxIdleConnectionsPercent`, documented as a
+//!   default derived from the pool size, which follows the `MaxConnectionsPercent` the call
+//!   puts in force — a value outside the constraints
 //!   `ConnectionPoolConfiguration` publishes is refused and leaves the group exactly as it
 //!   was, and a group the request does not resolve — an unknown proxy, any name but the one
-//!   group a proxy has, a proxy that is not ready — is the fault the operation models for
-//!   it;
+//!   group a proxy has — is the fault the operation models for it;
 //! * a delete is ACCEPTED rather than instantaneous: the proxy reports `deleting` from the
 //!   answer onwards and this service takes it away a moment later, after which every read
 //!   of the name is the proxy's own not-found fault, while a proxy no delete resolves and a
@@ -147,7 +148,9 @@ async fn a_target_group_modification_applies_what_it_states_and_keeps_the_rest()
             ],
             reported: &[
                 ("MaxConnectionsPercent", "100"),
-                ("MaxIdleConnectionsPercent", "20"),
+                // The row states no idle percentage, so it takes its documented default
+                // for the pool size this row puts in force: half of it.
+                ("MaxIdleConnectionsPercent", "50"),
                 ("ConnectionBorrowTimeout", "300"),
             ],
         },
@@ -229,9 +232,6 @@ async fn a_target_group_modification_applies_what_it_states_and_keeps_the_rest()
         }
     }
 
-    // A proxy that is still coming up has a target group no modification acts on, which is
-    // one of the refusals below, so it is stood up here and left `creating`.
-    create_proxy(&router, "emu-mod-creating", "MYSQL").await;
     let refusals: &[RefusalCase] = &[
         RefusalCase {
             case: "a MaxConnectionsPercent one below the lowest bound",
@@ -310,15 +310,6 @@ async fn a_target_group_modification_applies_what_it_states_and_keeps_the_rest()
             ],
             status: 404,
             code: "DBProxyTargetGroupNotFoundFault",
-        },
-        RefusalCase {
-            case: "the target group of a proxy that is still coming up",
-            params: &[
-                ("DBProxyName", "emu-mod-creating"),
-                ("TargetGroupName", "default"),
-            ],
-            status: 400,
-            code: "InvalidDBProxyStateFault",
         },
     ];
     for row in refusals {

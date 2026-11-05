@@ -117,6 +117,16 @@ pub const DEFAULT_TARGET_GROUP_RENAME_MESSAGE: &str =
 /// `MaxIdleConnectionsPercent` "must be between 0 and the value of
 /// `MaxConnectionsPercent`" — the value in force after this call, not the one the group
 /// held before it.
+///
+/// `MaxIdleConnectionsPercent` is the one member whose value is DERIVED rather than held:
+/// its own doc states it as a default computed from the pool size — "The default value is
+/// half of the value of `MaxConnectionsPercent`. For example, if `MaxConnectionsPercent` is
+/// 80, then the default value of `MaxIdleConnectionsPercent` is 40" — so whenever a call
+/// puts a new pool size in force without stating an idle percentage, that percentage is the
+/// default for the size now in force, on every such change and not only at creation. Where
+/// the call states both, the stated percentage is what stands. No other member is derived
+/// from another: `ConnectionBorrowTimeout`, `SessionPinningFilters` and `InitQuery` each
+/// publish a default of their own, so a call that does not state one leaves it as it is.
 pub fn merged_connection_pool_config(
     held: &ConnectionPoolConfigurationInfo,
     requested: &ConnectionPoolConfiguration,
@@ -129,6 +139,7 @@ pub fn merged_connection_pool_config(
             &MAX_CONNECTIONS_PERCENT_RANGE,
         )?;
         merged.max_connections_percent = Some(percent);
+        merged.max_idle_connections_percent = Some(percent / 2);
     }
     if let Some(timeout) = requested.connection_borrow_timeout {
         check_range(
@@ -356,6 +367,14 @@ impl DbProxyRecord {
         false
     }
 
+    /// Whether a delete has been accepted for the proxy, so it is on its way out of this
+    /// service: the clock owes its removal and there is nothing left for a modification of
+    /// it, or of the target group it takes with it, to act on. Named as the crate's other
+    /// records name the same predicate.
+    pub fn is_deleting(&self) -> bool {
+        self.status == DB_PROXY_STATUS_DELETING
+    }
+
     /// Accept a delete: the proxy reports `deleting` from now on, and the clock owes its
     /// removal from the store [`crate::state::STATUS_TRANSITION_DELAY`] from now, after
     /// which every read of the name is a `DBProxyNotFoundFault`. Nothing sleeps: the due
@@ -383,19 +402,34 @@ impl DbProxyRecord {
         )
     }
 
+    /// `DBProxyTargetGroup$Status` for the proxy's one target group.
+    ///
+    /// "A status of `available` means the target group is correctly associated with a
+    /// database. Other values indicate that you must wait for the target group to be
+    /// ready": the group is created WITH the proxy and has no provisioning of its own, so
+    /// it is ready exactly when the proxy record exists — a proxy that is still coming up
+    /// already has its group, and there is nothing for a caller to wait for. A proxy on
+    /// its way out takes its group with it, so the group then reports the status the proxy
+    /// is leaving in.
+    pub fn target_group_status(&self) -> &str {
+        if self.is_deleting() {
+            DB_PROXY_STATUS_DELETING
+        } else {
+            DB_PROXY_STATUS_AVAILABLE
+        }
+    }
+
     /// Project the proxy's one target group onto the modelled `DBProxyTargetGroup`.
     ///
     /// `IsDefault` is `true` because "each proxy is currently associated with a single
-    /// target group", and the group reports the PROXY's status: it is created with the
-    /// proxy and has no provisioning of its own, so it is ready exactly when the proxy is
-    /// ("Other values indicate that you must wait for the target group to be ready").
+    /// target group", and the group's readiness is [`Self::target_group_status`].
     pub fn target_group_to_wire(&self) -> DBProxyTargetGroup {
         DBProxyTargetGroup {
             db_proxy_name: Some(self.name.clone()),
             target_group_name: Some(DEFAULT_DB_PROXY_TARGET_GROUP.to_string()),
             target_group_arn: Some(self.target_group_arn()),
             is_default: Some(true),
-            status: Some(self.status.clone()),
+            status: Some(self.target_group_status().to_string()),
             connection_pool_config: Some(self.target_group.connection_pool_config.clone()),
             created_date: Some(self.target_group.created_date),
             updated_date: Some(self.target_group.updated_date),
