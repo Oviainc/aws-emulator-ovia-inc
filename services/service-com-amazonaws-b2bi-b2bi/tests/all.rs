@@ -43,6 +43,8 @@ mod tag_type_discriminator;
 mod tagging;
 #[path = "all/tagging_and_test_harness.rs"]
 mod tagging_and_test_harness;
+#[path = "all/test_conversion.rs"]
+mod test_conversion;
 #[path = "all/test_mapping.rs"]
 mod test_mapping;
 #[path = "all/test_parsing.rs"]

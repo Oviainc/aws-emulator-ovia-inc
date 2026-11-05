@@ -236,7 +236,7 @@ const ISA_SCAN_CHARS: usize = 212;
 const FIRST_REPETITION_SEPARATOR_RELEASE: u32 = 4020;
 
 /// The number of elements the ASC X12 interchange control header (ISA) carries.
-const ISA_ELEMENT_COUNT: usize = 16;
+pub(crate) const ISA_ELEMENT_COUNT: usize = 16;
 
 /// How many characters of an unparsable file a refusal quotes back: the three an
 /// interchange identifier occupies (`ISA`), which is what the check for a supported EDI
@@ -377,12 +377,16 @@ pub(crate) const ST_ELEMENTS: &[&str] = &[
 pub(crate) const SE_ELEMENTS: &[&str] = &["NumberOfIncludedSegments", "TransactionSetControlNumber"];
 
 /// The X12 segment ids the three envelopes are opened and closed with.
-const ISA: &str = "ISA";
-const IEA: &str = "IEA";
-const GS: &str = "GS";
-const GE: &str = "GE";
-const ST: &str = "ST";
-const SE: &str = "SE";
+///
+/// Visible to the crate because this service's X12 WRITER (`super::test_conversion`) opens
+/// and closes the same three envelopes, so the reader and the writer cannot disagree about
+/// the id of one.
+pub(crate) const ISA: &str = "ISA";
+pub(crate) const IEA: &str = "IEA";
+pub(crate) const GS: &str = "GS";
+pub(crate) const GE: &str = "GE";
+pub(crate) const ST: &str = "ST";
+pub(crate) const SE: &str = "SE";
 
 /// The key the interchanges of a document sit under, and the element name each repetition
 /// takes in the XML rendering.
@@ -455,7 +459,7 @@ const DETAIL_LOOPS: &[(&str, &str)] = &[
 /// each of them, after the heading table. The recorded purchase order is where this
 /// emulator takes it from.
 const DETAIL_LOOP_POSITION: u32 = 8000;
-const LOOP_KEY_SUFFIX: &str = "_loop";
+pub(crate) const LOOP_KEY_SUFFIX: &str = "_loop";
 
 /// The segment [`DETAIL_LOOPS`] names for the transaction set `transaction_set` opens its
 /// detail table with, if this emulator carries one for it.
@@ -477,6 +481,21 @@ fn detail_loop_key(segment: &str) -> String {
 /// set as a whole and not to the detail loop it follows, so it is reported beside that
 /// loop rather than inside its last occurrence.
 const SUMMARY_SEGMENTS: &[&str] = &["CTT", "TDS", "AK9"];
+
+/// Whether `value` is shaped like an X12 segment identifier: alphanumeric and STARTING
+/// WITH A LETTER, as every id in the X12 segment directory is.
+///
+/// That is also what keeps the document keys built from it legal XML element names, so an
+/// `XML` rendering cannot answer a success a conforming parser would reject — which is why
+/// this service's X12 WRITER (`super::test_conversion`) asks the same question of the
+/// `segment_id` a document hands it.
+pub(crate) fn is_segment_id(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && value.chars().all(|character| character.is_ascii_alphanumeric())
+}
 
 /// [`ISA_ELEMENTS`] with position 11 named for `release`.
 pub(crate) fn isa_element_names(release: u32) -> Vec<&'static str> {
@@ -742,12 +761,7 @@ fn split_segments(content: &str, delimiters: &Delimiters) -> Result<Vec<Segment>
         }
         let mut fields = piece.split(delimiters.element);
         let id = fields.next().unwrap_or_default().trim().to_string();
-        let shaped = id
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic())
-            && id.chars().all(|character| character.is_ascii_alphanumeric());
-        if !shaped {
+        if !is_segment_id(&id) {
             return Err(unparsable(format!(
                 "{id:?} is not an X12 segment identifier."
             )));
@@ -1464,16 +1478,9 @@ impl DocumentFormat {
 /// (`X12ElementRequirementValidationRule$elementPosition`).
 fn decode_element_position(value: &str) -> Option<(String, usize)> {
     let (segment, position) = value.split_once('-')?;
-    // The same shape a real segment id has (see `split_segments`): alphanumeric, starting
+    // The same shape a real segment id has (see `is_segment_id`): alphanumeric, starting
     // with a letter.
-    let shaped = segment
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
-        && segment
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric());
-    if !shaped {
+    if !is_segment_id(segment) {
         return None;
     }
     let position: usize = position.parse().ok()?;
@@ -1548,6 +1555,88 @@ fn requirement_messages(
         ));
     }
     messages
+}
+
+/// The element requirement rules `configured` holds — the validation rules this emulator
+/// can apply — or the reason one of them cannot be applied.
+///
+/// The two kinds of rule keyed by a four-digit X12 DATA ELEMENT id need the data element
+/// dictionary this emulator does not carry, and answering 200 with no message for one
+/// would report a validation that never ran, so each of them is refused; the positional
+/// kind is what [`requirement_messages`] evaluates. `member` is the request member the
+/// rules arrived in, which differs between the operations that take them (`TestParsing`
+/// takes them beside the input file, `TestConversion` on its conversion target).
+///
+/// Like [`parse_x12`] this is a SEAM: the error is the reason the rule cannot be applied,
+/// so a caller reads the same sentence whichever operation it reached, and each operation
+/// puts it in the error ITS model declares.
+pub(crate) fn element_requirement_rules<'a>(
+    configured: &'a [X12ValidationRule],
+    member: &str,
+) -> Result<Vec<&'a X12ElementRequirementValidationRule>, String> {
+    if configured.len() > MAX_VALIDATION_RULES {
+        return Err(format!(
+            "{member} carries {} rules, more than the {MAX_VALIDATION_RULES} rules this \
+             emulator evaluates over one input file.",
+            configured.len()
+        ));
+    }
+    let mut rules: Vec<&X12ElementRequirementValidationRule> = Vec::new();
+    for rule in configured {
+        match rule {
+            X12ValidationRule::elementRequirementValidationRule(rule) => {
+                if decode_element_position(&rule.element_position).is_none() {
+                    return Err(format!(
+                        "{member} elementRequirementValidationRule.elementPosition value \
+                         '{}' is not a segment identifier followed by an element position, \
+                         as in 'ST-01'.",
+                        rule.element_position
+                    ));
+                }
+                rules.push(rule);
+            }
+            X12ValidationRule::codeListValidationRule(rule) => {
+                return Err(format!(
+                    "{member} carries a codeListValidationRule for element id '{}': a rule \
+                     keyed by an X12 data element id cannot be applied by this emulator, \
+                     which carries no X12 data element dictionary, so no code list \
+                     validation was performed. Configure elementRequirementValidationRule \
+                     rules, which are keyed by element position.",
+                    rule.element_id
+                ))
+            }
+            X12ValidationRule::elementLengthValidationRule(rule) => {
+                return Err(format!(
+                    "{member} carries an elementLengthValidationRule for element id '{}': a \
+                     rule keyed by an X12 data element id cannot be applied by this \
+                     emulator, which carries no X12 data element dictionary, so no element \
+                     length validation was performed. Configure \
+                     elementRequirementValidationRule rules, which are keyed by element \
+                     position.",
+                    rule.element_id
+                ))
+            }
+        }
+    }
+    Ok(rules)
+}
+
+/// The validation messages `rules` produce over the X12 interchange `content` holds.
+///
+/// The seam this service's X12 WRITER (`super::test_conversion`) evaluates the configured
+/// rules through, so a rule reports the same finding in the same words whether it was
+/// applied to a file that was READ or to an interchange that was WRITTEN. The error is the
+/// reason `content` is not an interchange, worded as [`unsupported_standard`] and
+/// [`unparsable`] word it.
+pub(crate) fn requirement_messages_for(
+    content: &str,
+    rules: &[&X12ElementRequirementValidationRule],
+) -> Result<Vec<String>, String> {
+    let content = content.trim_start();
+    let delimiters = detect_delimiters(content)?;
+    let segments = split_segments(content, &delimiters)?;
+    let interchanges = parse_interchanges(segments)?;
+    Ok(requirement_messages(rules, &interchanges))
 }
 
 /// The S3 error codes that mean the object `inputFile` names is not there — which is the
@@ -1727,11 +1816,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The validation rules this emulator can apply are the positional ones; the two
-        // kinds keyed by a four-digit X12 DATA ELEMENT id need the data element dictionary
-        // this emulator does not carry, and answering 200 with no message for one would
-        // report a validation that never ran.
-        let mut requirement_rules: Vec<&X12ElementRequirementValidationRule> = Vec::new();
         let configured = input
             .advanced_options
             .as_ref()
@@ -1739,53 +1823,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|x12| x12.validation_options.as_ref())
             .and_then(|options| options.validation_rules.as_deref())
             .unwrap_or_default();
-        if configured.len() > MAX_VALIDATION_RULES {
-            return Err(validation(format!(
-                "advancedOptions.x12.validationOptions.validationRules carries {} rules, \
-                 more than the {MAX_VALIDATION_RULES} rules this emulator evaluates over \
-                 one input file.",
-                configured.len()
-            )));
-        }
-        for rule in configured {
-            match rule {
-                X12ValidationRule::elementRequirementValidationRule(rule) => {
-                    if decode_element_position(&rule.element_position).is_none() {
-                        return Err(validation(format!(
-                            "advancedOptions.x12.validationOptions.validationRules \
-                             elementRequirementValidationRule.elementPosition value '{}' is \
-                             not a segment identifier followed by an element position, as \
-                             in 'ST-01'.",
-                            rule.element_position
-                        )));
-                    }
-                    requirement_rules.push(rule);
-                }
-                X12ValidationRule::codeListValidationRule(rule) => {
-                    return Err(validation(format!(
-                        "advancedOptions.x12.validationOptions.validationRules carries a \
-                         codeListValidationRule for element id '{}': a rule keyed by an X12 \
-                         data element id cannot be applied by this emulator, which carries \
-                         no X12 data element dictionary, so no code list validation was \
-                         performed. Configure elementRequirementValidationRule rules, which \
-                         are keyed by element position.",
-                        rule.element_id
-                    )))
-                }
-                X12ValidationRule::elementLengthValidationRule(rule) => {
-                    return Err(validation(format!(
-                        "advancedOptions.x12.validationOptions.validationRules carries an \
-                         elementLengthValidationRule for element id '{}': a rule keyed by an \
-                         X12 data element id cannot be applied by this emulator, which \
-                         carries no X12 data element dictionary, so no element length \
-                         validation was performed. Configure \
-                         elementRequirementValidationRule rules, which are keyed by element \
-                         position.",
-                        rule.element_id
-                    )))
-                }
-            }
-        }
+        let requirement_rules =
+            element_requirement_rules(configured, "advancedOptions.x12.validationOptions.validationRules")
+                .map_err(validation)?;
 
         let region = crate::state::request_region(ctx.parts());
         let content = read_input_file(ctx, &region, &input.input_file).await?;

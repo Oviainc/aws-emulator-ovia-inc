@@ -283,22 +283,16 @@ async fn the_synthetic_error_shapes_carry_no_shape_id_of_this_service() {
             "ValidationException",
         ),
         (
-            // The one operation of this service still carrying the scaffold marker: the
-            // X12 interchange it would have to serialise needs segment dictionaries this
-            // emulator does not hold, so a well-formed request reaches the 501.
+            // No operation of this service carries the scaffold marker any more, and the
+            // synthetic 501 is still what a request this emulator has no ENGINE for is
+            // answered with: an XML input document needs an XSLT engine `TestMapping` does
+            // not have (see `tests/all/test_mapping.rs`, which asserts that refusal itself).
             "an operation nobody has implemented",
-            "TestConversion",
+            "TestMapping",
             json!({
-                "source": {
-                    "fileFormat": "JSON",
-                    "inputFile": { "fileContent": "{\"transactionSets\":[]}" }
-                },
-                "target": {
-                    "fileFormat": "X12",
-                    "formatDetails": {
-                        "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
-                    }
-                }
+                "inputFileContent": "<transactionSets><set/></transactionSets>",
+                "mappingTemplate": "$",
+                "fileFormat": "XML"
             }),
             501,
             "NotImplemented",

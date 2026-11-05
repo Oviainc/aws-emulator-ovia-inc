@@ -1634,45 +1634,73 @@ async fn the_idempotency_map_is_bounded_and_released() {
     );
 }
 
-/// The operations this slice deliberately leaves unimplemented still answer HTTP 501
-/// `NotImplemented` — never an empty success — so the stub census stays honest.
+/// Every operation of this service is implemented: the stub census is EMPTY, so a request
+/// that satisfies an operation's modelled constraints is answered by that operation's
+/// handler — with its own success or its own modelled refusal — and never by the scaffold's
+/// HTTP 501 `NotImplemented`, which would be an operation nobody wrote.
+///
+/// The rows are the operations whose scaffolds were the last to be closed, each with the
+/// modelled error its own handler answers this request with, so a handler reverted to the
+/// scaffold channel is caught here. (The 501 this service still answers a request it has no
+/// ENGINE for — `TestMapping` over an XML document, which needs an XSLT engine — names the
+/// missing capability rather than a missing handler, and `tests/all/test_mapping.rs` asserts
+/// that one.)
 #[tokio::test]
-async fn operations_outside_this_slice_still_answer_501() {
+async fn no_operation_of_this_service_answers_the_scaffolds_501() {
     let router = b2bi_router();
 
-    // (case, operation, a request that satisfies the modelled input constraints)
+    // (case, operation, a request that satisfies the modelled input constraints, the
+    //  modelled error its own handler answers that request with)
     //
-    // `TestConversion` is the one operation of this service still carrying the scaffold
-    // marker: serialising the X12 interchange it answers with needs segment dictionaries
-    // this emulator does not hold, so a request that satisfies every modelled constraint
-    // reaches the 501 rather than a fabricated interchange.
-    let cases: &[(&str, &str, Value)] = &[(
-        "test conversion",
-        "TestConversion",
-        json!({
-            "source": {
-                "fileFormat": "JSON",
-                "inputFile": { "fileContent": "{\"transactionSets\":[]}" }
-            },
-            "target": {
-                "fileFormat": "X12",
-                "formatDetails": {
-                    "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
+    // The error CODE is what tells the operation's own refusal from the scaffold's: the
+    // status each of these refusals carries is a separate question, tracked by the open
+    // issues on this service's client-error statuses, so only the scaffold's 501 is ruled
+    // out here.
+    let cases: &[(&str, &str, Value, &str)] = &[
+        (
+            // A well-formed JSON document that carries no interchange: the conversion's own
+            // refusal, not the scaffold's.
+            "test conversion",
+            "TestConversion",
+            json!({
+                "source": {
+                    "fileFormat": "JSON",
+                    "inputFile": { "fileContent": "{\"transactionSets\":[]}" }
+                },
+                "target": {
+                    "fileFormat": "X12",
+                    "formatDetails": {
+                        "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
+                    }
                 }
-            }
-        }),
-    )];
+            }),
+            "ValidationException",
+        ),
+        (
+            "update capability",
+            "UpdateCapability",
+            json!({ "capabilityId": "c-0123456789abcdef0" }),
+            "ResourceNotFoundException",
+        ),
+        (
+            "update partnership",
+            "UpdatePartnership",
+            json!({ "partnershipId": "ps-0123456789abcdef0" }),
+            "ResourceNotFoundException",
+        ),
+    ];
 
-    for (case, operation, request) in cases {
+    for (case, operation, request, expected_code) in cases {
         let (status, body) = call(&router, operation, request.clone()).await;
-        assert_eq!(
+        assert_ne!(
             status, 501,
-            "case {case:?}: expected 501 from the scaffold, got {status} {body}"
+            "case {case:?}: no operation of this service may answer the scaffold's 501, got \
+             {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "NotImplemented",
-            "case {case:?}: expected NotImplemented, got {body}"
+            *expected_code,
+            "case {case:?}: expected the operation's own {expected_code}, got {status} {body}"
         );
     }
 }

@@ -134,14 +134,18 @@ fn message(body: &Value) -> String {
 /// terminator, which an X12 interchange declares in its own control header (the element
 /// separator follows `ISA`, the component separator is ISA16 and the terminator follows
 /// it).
-type Delimiters = (char, char, char);
+///
+/// The X12 fixture builder below ([`segment`], [`interchange`] and the transaction sets
+/// they assemble) is `pub(crate)` so the `test_conversion` suite drives the X12 WRITER
+/// over the very interchanges this suite drives the reader over.
+pub(crate) type Delimiters = (char, char, char);
 
 /// The delimiter set almost every X12 sender uses.
-const STANDARD: Delimiters = ('*', '>', '~');
+pub(crate) const STANDARD: Delimiters = ('*', '>', '~');
 
 /// One X12 segment with `fields` as its segment id and elements, rendered with
 /// `delimiters`.
-fn segment(delimiters: Delimiters, fields: &[&str]) -> String {
+pub(crate) fn segment(delimiters: Delimiters, fields: &[&str]) -> String {
     let (element, _, terminator) = delimiters;
     let separator = element.to_string();
     format!("{}{terminator}", fields.join(&separator))
@@ -149,15 +153,15 @@ fn segment(delimiters: Delimiters, fields: &[&str]) -> String {
 
 /// One transaction set of the table below: the transaction set code, its control number,
 /// and the body segments between ST and SE.
-struct TransactionSet<'a> {
-    code: &'a str,
-    control: &'a str,
-    body: Vec<Vec<&'a str>>,
+pub(crate) struct TransactionSet<'a> {
+    pub(crate) code: &'a str,
+    pub(crate) control: &'a str,
+    pub(crate) body: Vec<Vec<&'a str>>,
 }
 
 /// The purchase-order transaction set an 850 carries: BEG with the purchase order number
 /// in BEG03, a name segment and a line item.
-fn purchase_order<'a>(control: &'a str, order: &'a str) -> TransactionSet<'a> {
+pub(crate) fn purchase_order<'a>(control: &'a str, order: &'a str) -> TransactionSet<'a> {
     TransactionSet {
         code: "850",
         control,
@@ -172,7 +176,7 @@ fn purchase_order<'a>(control: &'a str, order: &'a str) -> TransactionSet<'a> {
 
 /// A health-care-claim transaction set, whose HI segments carry COMPOSITE elements —
 /// `BK>8901` is one element with two components.
-fn health_care_claim<'a>(control: &'a str) -> TransactionSet<'a> {
+pub(crate) fn health_care_claim<'a>(control: &'a str) -> TransactionSet<'a> {
     TransactionSet {
         code: "837",
         control,
@@ -189,7 +193,7 @@ type GroupRow<'a> = (&'a str, Vec<TransactionSet<'a>>);
 
 /// A whole X12 interchange: ISA, then one functional group per entry in `groups`, then
 /// IEA, rendered with `delimiters`.
-fn interchange(
+pub(crate) fn interchange(
     delimiters: Delimiters,
     sender: &str,
     receiver: &str,

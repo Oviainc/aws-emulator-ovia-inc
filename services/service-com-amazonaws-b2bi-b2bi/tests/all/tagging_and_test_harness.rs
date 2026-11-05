@@ -669,14 +669,17 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
 }
 
 /// RULE: a test-harness operation refuses, with the modelled `ValidationException`
-/// (HTTP 400), a document that is not the `fileFormat` it was declared as; a document
-/// that IS that format gets the operation's real answer, which for `TestConversion` is
-/// the scaffold's 501, because this emulator carries no X12 segment dictionaries to
-/// serialise an interchange from and will not invent one.
+/// (HTTP 400), a document that is not the `fileFormat` it was declared as — and says which
+/// of the two refusals it gave: content that is not that format at all is refused for the
+/// format it was declared as, while content that IS that format but is not the B2Bi EDI
+/// document shape reaches `TestConversion`'s conversion and is refused for the document it
+/// is not.
 ///
 /// The rows span both source formats, and for each one several ways a document fails to
 /// be it (truncated, empty, not a document of that kind at all, unclosed, more than one
-/// XML root) beside documents that are it.
+/// XML root) beside documents that are it but carry no interchange to convert. The
+/// conversion itself — the interchange a real EDI document is written back as — is
+/// asserted by `test_conversion.rs`.
 #[tokio::test]
 async fn test_conversion_refuses_source_content_that_is_not_its_declared_format() {
     let router = b2bi_router();
@@ -715,19 +718,26 @@ async fn test_conversion_refuses_source_content_that_is_not_its_declared_format(
         )
         .await;
 
-        let (expected_status, expected_code) = if *is_that_format {
-            (501, "NotImplemented")
-        } else {
-            (400, "ValidationException")
-        };
         assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected {expected_status}, got {status} {body}"
+            status, 400,
+            "case {case:?}: expected 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            expected_code,
-            "case {case:?}: expected {expected_code}, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        // A document that IS its declared format got past the format check and was refused
+        // by the conversion; one that is not never reached it.
+        let message = text(&body, "Message");
+        let expected = if *is_that_format {
+            "could not be converted to X12"
+        } else {
+            "is declared as"
+        };
+        assert!(
+            message.contains(expected),
+            "case {case:?}: expected a refusal saying {expected:?}, got {message:?}"
         );
     }
 }
