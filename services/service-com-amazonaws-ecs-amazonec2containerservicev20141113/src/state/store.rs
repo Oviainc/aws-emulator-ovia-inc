@@ -45,6 +45,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     for container in &mut task.containers {
                         container.advance_to(STATUS_RUNNING);
                     }
+                    // A task does not run before the interface it was allocated is in
+                    // place, so by this instant Amazon ECS has created and attached it:
+                    // the attachment reports `ATTACHED` and the interface's own id, MAC
+                    // address and private IPv4 address
+                    // ([`AttachmentRecord::attach_allocated_interface`]).
+                    for attachment in &mut task.attachments {
+                        attachment.attach_allocated_interface();
+                    }
                     task.version += 1;
                 }
             }
@@ -323,8 +331,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// `RegisterTaskDefinition$networkMode`: "If the network mode is `awsvpc`, the task is
     /// allocated an elastic network interface" — that interface is the attachment, and a
     /// task in any other network mode shares its host's networking and is allocated none.
-    /// The attachment starts [`ATTACHMENT_STATUS_PRECREATED`]: Amazon ECS creates it, and
-    /// it is the AGENT that attaches it and says so through `SubmitAttachmentStateChanges`.
+    /// The attachment starts [`ATTACHMENT_STATUS_PRECREATED`] — Amazon ECS has CREATED the
+    /// interface, so it already carries the id, the MAC address and the private IPv4 address
+    /// it was given beside the subnet the launch named — and reaches
+    /// [`ATTACHMENT_STATUS_ATTACHED`] when the task it belongs to runs
+    /// ([`AttachmentRecord::attach_allocated_interface`]).
     pub fn mint_task_attachments(
         &mut self,
         network_mode: &str,
@@ -344,12 +355,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }]
             })
             .unwrap_or_default();
-        vec![AttachmentRecord {
+        let mut attachment = AttachmentRecord {
             id: self.next_attachment_id(),
+            sequence: self.next_attachment_seq,
             attachment_type: ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE.to_string(),
             status: ATTACHMENT_STATUS_PRECREATED.to_string(),
             details,
-        }]
+        };
+        attachment.report_allocated_interface();
+        vec![attachment]
     }
 
     /// The ARN of the task of `cluster_name` that holds the attachment `attachment_id`, or

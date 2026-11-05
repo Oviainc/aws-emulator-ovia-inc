@@ -242,6 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The clock pass above may have started tasks of a service whose registries name a
+        // Cloud Map service: that registration was owed at the instant those tasks started,
+        // whether or not anybody called, so it is materialised here like any other
+        // clock-owed change — with OUR guard dropped first, since the write takes the Cloud
+        // Map store's lock ([`crate::state::reconcile_cloud_map_instances`]).
+        let registrations = guard.cloud_map_registrations();
+        drop(guard);
+        crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
+
         Ok(DescribeTasksOutput {
             tasks: Some(tasks),
             failures: Some(failures),

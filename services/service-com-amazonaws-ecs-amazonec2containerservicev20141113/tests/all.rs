@@ -125,6 +125,10 @@ mod service_load_balancer_cross_field;
 mod service_not_active_refusals;
 #[path = "all/service_projection.rs"]
 mod service_projection;
+#[path = "all/service_registry_cloud_map_instances.rs"]
+mod service_registry_cloud_map_instances;
+#[path = "all/service_registry_dns_record_rules.rs"]
+mod service_registry_dns_record_rules;
 #[path = "all/service_revisions.rs"]
 mod service_revisions;
 #[path = "all/service_run_state.rs"]
@@ -157,6 +161,8 @@ mod task_definition_reference_refusals;
 mod task_definition_rendering;
 #[path = "all/task_definition_revision_requirement.rs"]
 mod task_definition_revision_requirement;
+#[path = "all/task_interface_allocation.rs"]
+mod task_interface_allocation;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
 #[path = "all/task_override_and_size_validation.rs"]

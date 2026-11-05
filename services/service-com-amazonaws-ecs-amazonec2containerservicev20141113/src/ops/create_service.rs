@@ -602,16 +602,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The details of the service discovery registry to associate with this service":
         // the registry is a CLOUD MAP service, so whether this one can be registered into is
         // READ from that service's store here — before ours is locked, for the same reason
-        // the target-group reads are ([`crate::state::cloud_map_services`]). What the read
-        // says is not acted on until the cluster has been resolved, so a create that names
-        // no cluster of this account is still refused for the cluster first.
+        // the target-group reads are ([`crate::state::cloud_map_service_dns_records`]). What
+        // the read says is not acted on until the cluster has been resolved, so a create
+        // that names no cluster of this account is still refused for the cluster first.
         let requested_registries = input.service_registries.clone().unwrap_or_default();
-        let known_registries = if requested_registries.is_empty() {
+        // "Each service may be associated with one service registry. Multiple service
+        // registries for each service are not supported": the list is bounded HERE, before
+        // any per-entry work and before either store is locked, so the work one request can
+        // ask for is finite ([`crate::state::service_registry_count_violation`]).
+        if let Some(message) = crate::state::service_registry_count_violation(&requested_registries)
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+        let registry_dns_records = if requested_registries.is_empty() {
             // A create that names no registry resolves none, so neither store is read for
             // it and an engine that holds no Cloud Map store cannot refuse it.
-            ::std::collections::HashSet::new()
+            ::std::collections::HashMap::new()
         } else {
-            crate::state::cloud_map_services(
+            crate::state::cloud_map_service_dns_records(
                 &*self.engine,
                 &crate::state::requested_registry_ids(&requested_registries),
             )
@@ -662,7 +675,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved: a `serviceRegistries` entry naming a Cloud Map service that service
         // holds no record of registers nothing, so nothing is stored for it.
         if let Some(message) =
-            crate::state::service_registry_refusal(&requested_registries, &known_registries)
+            crate::state::service_registry_refusal(&requested_registries, &registry_dns_records)
         {
             return Err(CreateServiceErrorModeled::ClientException(ClientException {
                 message: Some(message.to_string()),
@@ -744,12 +757,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // A registry registers the task's own published port, so what each entry has to
-            // name is decided by the revision's `networkMode`
+            // A registry registers the task at the port and the address the Cloud Map
+            // service's own DNS record type publishes, so what each entry has to name is
+            // decided by that record type together with the revision's `networkMode`
             // ([`crate::state::service_registry_binding_violation`]).
             if let Some(message) = crate::state::service_registry_binding_violation(
                 Some(definition),
                 &requested_registries,
+                &registry_dns_records,
             ) {
                 return Err(CreateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
@@ -1049,6 +1064,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateService` has no `include` member to narrow the response with, so the
         // service it just created is reported with the tags it was created with.
         let view = guard.service_view(stored, crate::state::ServiceFields::all());
+        // "New tasks are registered ... to the updated service registry configuration":
+        // the tasks this create placed belong in the Cloud Map services their registries
+        // name, so Cloud Map is brought in line with what this store now holds — with
+        // OUR guard dropped first, since that write takes the Cloud Map store's lock
+        // ([`crate::state::reconcile_cloud_map_instances`]).
+        let registrations = guard.cloud_map_registrations();
+        drop(guard);
+        crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
         Ok(CreateServiceOutput {
             service: Some(view),
         })

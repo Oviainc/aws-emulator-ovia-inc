@@ -108,6 +108,28 @@ pub use cluster_refusal::{
 /// How an ARN a REQUEST supplies is read, and what it is refused for: the Region and the
 /// account segments checked before the identifier is resolved.
 mod request_arn;
+
+/// The records a TASK is made of — its containers and the managed agents each of them
+/// runs — and the projections they are reported through.
+mod records;
+pub use records::*;
+
+/// What a `serviceRegistries` entry has to name: the rules the registry's own Cloud Map
+/// DNS record type and the revision's network mode put on it, and the Cloud Map read each
+/// one is decided against.
+mod validation;
+pub use validation::*;
+
+/// The elastic network interface an `awsvpc` task is allocated: what it carries, and when
+/// it is reported as attached.
+mod task_interfaces;
+pub use task_interfaces::*;
+
+/// The Cloud Map instances Amazon ECS registers for the tasks of a service that names a
+/// `serviceRegistries` entry.
+mod service_discovery;
+pub use service_discovery::*;
+
 pub use request_arn::{
     foreign_arn_segment, is_cluster_arn, names_another_account, names_another_region,
     request_arn_resource_violation, request_arn_violation, ForeignArnSegment,
@@ -2753,120 +2775,6 @@ impl ContainerInstanceFields {
     }
 }
 
-/// One container of a task, derived from the container definition the task's
-/// task-definition revision stored, and from what the ECS agent has reported about it
-/// since (`SubmitContainerStateChange`).
-#[derive(Debug, Clone)]
-pub struct ContainerRecord {
-    pub container_arn: String,
-    pub task_arn: String,
-    pub name: Option<String>,
-    pub image: Option<String>,
-    pub last_status: String,
-    pub cpu: Option<String>,
-    pub memory: Option<String>,
-    pub memory_reservation: Option<String>,
-    /// `Container$runtimeId`: "The ID of the Docker container" — the agent's, reported
-    /// through `SubmitContainerStateChange$runtimeId`, so it is absent until the agent
-    /// reports one.
-    pub runtime_id: Option<String>,
-    /// `Container$exitCode`: "The exit code returned from the container", as the agent
-    /// reported it with the state change.
-    pub exit_code: Option<i32>,
-    /// `Container$reason`: "A short (255 max characters) human-readable string to provide
-    /// additional details about a running or stopped container", as the agent reported it.
-    pub reason: Option<String>,
-    /// `Container$networkBindings`: the host/container port pairs the agent reported for
-    /// this container.
-    pub network_bindings: Vec<NetworkBinding>,
-    /// `Container$imageDigest`: "The container image manifest digest" — known only once
-    /// the agent has pulled the image and reported it
-    /// (`ContainerStateChange$imageDigest`), so absent until then.
-    pub image_digest: Option<String>,
-    /// `Container$managedAgents`: "The details of any Amazon ECS managed agents associated
-    /// with the container", each in the state the agent last reported for it
-    /// (`SubmitTaskStateChange$managedAgents`). Empty until the agent reports one.
-    pub managed_agents: Vec<ManagedAgentRecord>,
-}
-
-/// One Amazon ECS managed agent of a container, in the state the ECS agent last reported
-/// for it through `SubmitTaskStateChange$managedAgents` ("The details for the managed
-/// agent that's associated with the task").
-#[derive(Debug, Clone)]
-pub struct ManagedAgentRecord {
-    /// `ManagedAgent$name`: "The name of the managed agent", as the report named it.
-    pub name: String,
-    /// `ManagedAgent$lastStatus`: "The last known status of the managed agent" — the
-    /// agent's own word on it, stored as given.
-    pub last_status: String,
-    /// `ManagedAgent$reason`: "The reason for why the managed agent is in the state it is
-    /// in", and absent when the report carried none.
-    pub reason: Option<String>,
-    /// `ManagedAgent$lastStartedAt`: "The Unix timestamp for the time when the managed
-    /// agent was last started" — the instant a report first put it at
-    /// [`STATUS_RUNNING`], and `None` for an agent no report has started.
-    pub last_started_at: Option<DateTime>,
-}
-
-impl ManagedAgentRecord {
-    /// The `ManagedAgent` a container reports for this record.
-    pub fn view(&self) -> ManagedAgent {
-        ManagedAgent {
-            name: Some(self.name.clone()),
-            last_status: Some(self.last_status.clone()),
-            reason: self.reason.clone(),
-            last_started_at: self.last_started_at,
-        }
-    }
-}
-
-impl ContainerRecord {
-    /// The `Container` every task-returning operation reports, built from what is
-    /// stored.
-    pub fn view(&self) -> Container {
-        Container {
-            container_arn: Some(self.container_arn.clone()),
-            task_arn: Some(self.task_arn.clone()),
-            name: self.name.clone(),
-            image: self.image.clone(),
-            last_status: Some(self.last_status.clone()),
-            cpu: self.cpu.clone(),
-            memory: self.memory.clone(),
-            memory_reservation: self.memory_reservation.clone(),
-            runtime_id: self.runtime_id.clone(),
-            exit_code: self.exit_code,
-            reason: self.reason.clone(),
-            network_bindings: Some(self.network_bindings.clone()),
-            health_status: Some(HEALTH_UNKNOWN.to_string()),
-            image_digest: self.image_digest.clone(),
-            managed_agents: Some(
-                self.managed_agents
-                    .iter()
-                    .map(ManagedAgentRecord::view)
-                    .collect(),
-            ),
-            ..Container::default()
-        }
-    }
-
-    /// Move this container ON to `status`, if that is a LATER stage of
-    /// [`CONTAINER_LIFECYCLE`] than the one it is already reported at.
-    ///
-    /// The agent's report and the task's own clock-owed transitions both move a
-    /// container, and they can arrive in either order: a container the agent has already
-    /// reported STOPPED is not put back to RUNNING by the task reaching RUNNING. A stage
-    /// the lifecycle does not name is taken as reported, since it cannot be ranked.
-    pub fn advance_to(&mut self, status: &str) {
-        let onward = match (container_stage_rank(status), container_stage_rank(&self.last_status)) {
-            (Some(next), Some(current)) => next > current,
-            _ => true,
-        };
-        if onward {
-            self.last_status = status.to_string();
-        }
-    }
-}
-
 /// A task-definition revision, as `RegisterTaskDefinition` stored it.
 #[derive(Debug, Clone)]
 pub struct TaskDefinitionRecord {
@@ -3463,7 +3371,12 @@ impl TaskRecord {
             attachments: Some(self.attachments.iter().map(AttachmentRecord::view).collect()),
             cluster_arn: Some(self.cluster_arn.clone()),
             container_instance_arn: self.container_instance_arn.clone(),
-            containers: Some(self.containers.iter().map(ContainerRecord::view).collect()),
+            containers: Some(
+                self.containers
+                    .iter()
+                    .map(|container| container.view(&self.attachments))
+                    .collect(),
+            ),
             cpu: self.cpu.clone(),
             created_at: Some(self.created_at),
             desired_status: Some(self.desired_status.clone()),

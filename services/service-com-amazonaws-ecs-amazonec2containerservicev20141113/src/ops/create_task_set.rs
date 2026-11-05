@@ -319,6 +319,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // "The details of the service discovery registries to assign to this task set": a
+        // registry is a CLOUD MAP service, and what each entry has to name is decided by that
+        // service's own DNS record type — READ from that service's store here, before ours is
+        // locked, so the cross-service read holds no guard of ours
+        // ([`crate::state::cloud_map_service_dns_records`]).
+        let requested_registries = input.service_registries.clone().unwrap_or_default();
+        // The same bound the service-level create is held to: "Multiple service registries
+        // for each service are not supported"
+        // ([`crate::state::service_registry_count_violation`]).
+        if let Some(message) = crate::state::service_registry_count_violation(&requested_registries)
+        {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+        let registry_dns_records = if requested_registries.is_empty() {
+            ::std::collections::HashMap::new()
+        } else {
+            crate::state::cloud_map_service_dns_records(
+                &*self.engine,
+                &crate::state::requested_registry_ids(&requested_registries),
+            )
+            .ok_or_else(|| {
+                CreateTaskSetErrorModeled::ServerException(ServerException {
+                    message: Some("the Cloud Map store is unavailable".to_string()),
+                })
+            })?
+        };
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -418,6 +450,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::state::network_configuration_violation(
             &definition.network_mode,
             input.network_configuration.as_ref(),
+        ) {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // The registries this task set attaches are held to the same rule `CreateService`
+        // and `UpdateService` hold theirs to, against the same revision
+        // ([`crate::state::service_registry_binding_violation`]).
+        if let Some(message) = crate::state::service_registry_binding_violation(
+            Some(&definition),
+            &requested_registries,
+            &registry_dns_records,
         ) {
             return Err(CreateTaskSetErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -560,7 +607,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.network_configuration.as_ref(),
             ),
             load_balancers: input.load_balancers.clone().unwrap_or_default(),
-            service_registries: input.service_registries.clone().unwrap_or_default(),
+            service_registries: requested_registries.clone(),
             scale: crate::state::stored_scale(input.scale.as_ref()),
             tags: input.tags.clone().unwrap_or_default(),
             client_token: input.client_token.clone(),

@@ -25,14 +25,12 @@
 //! service-discovery service beside this one on ONE engine, the way the production router
 //! mounts them, and creates its namespace through that service's own API.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    answered, awsvpc_network_configuration, cluster_with_capacity, list, ok, refusal, service,
-    string, ACCOUNT, SIGNED_REGION,
+    answered, awsvpc_network_configuration, cloud_map, cluster_with_capacity,
+    emulator_with_cloud_map, list, ok, refusal, service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// The modelled error every bad-parameter refusal below carries.
@@ -933,70 +931,6 @@ async fn listing_tasks_answers_the_arns_the_desired_status_filter_selects() {
 // ---------------------------------------------------------------------------
 // A Cloud Map namespace with no ECS service in it
 // ---------------------------------------------------------------------------
-
-/// A router carrying this service AND the Cloud Map (service discovery) service over ONE
-/// shared engine — the two stores the namespace rule reads across, mounted the way the
-/// production router mounts them.
-fn emulator_with_cloud_map() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_servicediscovery_route53autonaming_v20170314::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// One `awsJson1_1` call to the Cloud Map service, returning its parsed body.
-async fn cloud_map(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    case: &str,
-) -> Value {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header(
-            "x-amz-target",
-            format!("Route53AutoNaming_v20170314.{operation}"),
-        )
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
-                 /servicediscovery/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let parsed: Value = if payload.is_empty() {
-        json!({})
-    } else {
-        serde_json::from_slice(&payload).unwrap_or_else(|_| {
-            json!({ "__unparsed": String::from_utf8_lossy(&payload) })
-        })
-    };
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected Cloud Map {operation} to answer 200, got {status} with \
-         {parsed}"
-    );
-    parsed
-}
 
 #[tokio::test]
 async fn a_cloud_map_namespace_with_no_ecs_service_in_it_lists_an_empty_set() {

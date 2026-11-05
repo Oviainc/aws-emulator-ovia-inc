@@ -277,6 +277,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteService` has no `include` member to narrow the response with, so "the
         // full description of the deleted service" carries its tags.
         let view = guard.service_view(stored, crate::state::ServiceFields::all());
+        // A service being drained away registers nothing: its tasks are stopping, so the
+        // instances Amazon ECS held for them in the Cloud Map services its registries name
+        // go with them ([`crate::state::reconcile_cloud_map_instances`]), with OUR guard
+        // dropped first since that write takes the Cloud Map store's lock.
+        let registrations = guard.cloud_map_registrations();
+        drop(guard);
+        crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
         Ok(DeleteServiceOutput {
             service: Some(view),
         })

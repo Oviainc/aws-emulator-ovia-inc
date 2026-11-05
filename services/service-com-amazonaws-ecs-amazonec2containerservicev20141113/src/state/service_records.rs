@@ -828,9 +828,9 @@ pub const ATTACHMENT_STATUS_PRECREATED: &str = "PRECREATED";
 /// The `KeyValuePair` key an elastic-network-interface attachment reports its subnet
 /// under. `Attachment$details` "for elastic network interfaces ... includes the network
 /// interface ID, the MAC address, the subnet ID, and the private IPv4 address"; the subnet
-/// is the one detail this emulator KNOWS, because the launch supplied it
-/// (`AwsVpcConfiguration$subnets`), and nothing here creates an interface to report an id,
-/// a MAC or an address of.
+/// is the one detail that is known the instant the attachment is created, because the
+/// launch supplied it (`AwsVpcConfiguration$subnets`) — the other three belong to the
+/// interface itself ([`AttachmentRecord::report_allocated_interface`]).
 pub const ATTACHMENT_DETAIL_SUBNET_ID: &str = "subnetId";
 
 /// One attachment of a task: the resource Amazon ECS allocated for it, in the state the
@@ -843,6 +843,11 @@ pub const ATTACHMENT_DETAIL_SUBNET_ID: &str = "subnetId";
 #[derive(Debug, Clone)]
 pub struct AttachmentRecord {
     pub id: String,
+    /// Which attachment of this store's whole history this is, from the counter the id was
+    /// minted out of (`next_attachment_id`). Everything the interface itself carries is
+    /// derived from it, so one interface's id, MAC and address are its own and read the
+    /// same every time ([`AttachmentRecord::report_allocated_interface`]).
+    pub sequence: u64,
     pub attachment_type: String,
     pub status: String,
     pub details: Vec<KeyValuePair>,
