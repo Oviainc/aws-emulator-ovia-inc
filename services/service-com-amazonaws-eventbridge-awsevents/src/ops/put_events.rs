@@ -41,10 +41,11 @@
 //! principal, so that document alone decides the delivery and a target which has
 //! granted it nothing, or which denies it, receives nothing
 //! ([`crate::state::target_policy_admits`], read on a queue target and on a
-//! dead-letter queue by [`queue_delivery_refusal`] and on a topic target by
-//! [`topic_delivery_refusal`]; what such a refusal REPORTS is the answer that
-//! target's own service gives it, so a queue's names the resource and a topic's
-//! the permission). What
+//! dead-letter queue by [`queue_delivery_refusal`], on a topic target by
+//! [`topic_delivery_refusal`] and on a function target by
+//! [`function_delivery_refusal`]; what such a refusal REPORTS is the answer that
+//! target's own service gives it, so a queue's names the resource while a topic's
+//! and a function's name the permission). What
 //! came of every handover is recorded in
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
@@ -1697,8 +1698,9 @@ pub(crate) async fn deliver(
     // never across the invocation. For a kind whose invocation is governed by the
     // target's own resource policy instead, the `RoleArn` is not what decides it
     // and this gate refuses nothing: that target's own document is what decides
-    // the delivery, where the invocation reads it (a queue's `Policy`, see
-    // [`queue_delivery_refusal`]).
+    // the delivery, where the invocation reads it (a queue's `Policy`, a topic's
+    // and a function's, see [`queue_delivery_refusal`],
+    // [`topic_delivery_refusal`] and [`function_delivery_refusal`]).
     let role_arn = target
         .role_arn
         .as_deref()
@@ -2395,19 +2397,30 @@ impl TargetKind {
                 }
                 outcome(request.send().await)
             }
-            Self::Function => outcome(
-                clients
-                    .lambda(ctx, region)
-                    // "Event: invoke the function asynchronously" — which is how
-                    // EventBridge invokes a function target: the rule does not
-                    // wait for the function's answer.
-                    .invoke()
-                    .function_name(arn)
-                    .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
-                    .payload(::aws_sdk_lambda::primitives::Blob::new(body.as_bytes()))
-                    .send()
-                    .await,
-            ),
+            Self::Function => {
+                // One client for both calls this delivery makes on the function,
+                // for the reason the queue branch above gives.
+                let client = clients.lambda(ctx, region).clone();
+                // The FUNCTION's own resource-based policy decides this delivery
+                // before anything is invoked ([`function_delivery_refusal`]).
+                if let Some(refusal) =
+                    function_delivery_refusal(&client, arn, self.action(), handover).await
+                {
+                    return refusal;
+                }
+                outcome(
+                    client
+                        // "Event: invoke the function asynchronously" — which is
+                        // how EventBridge invokes a function target: the rule
+                        // does not wait for the function's answer.
+                        .invoke()
+                        .function_name(arn)
+                        .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
+                        .payload(::aws_sdk_lambda::primitives::Blob::new(body.as_bytes()))
+                        .send()
+                        .await,
+                )
+            }
             Self::Topic => {
                 // One client for both calls this delivery makes on the topic,
                 // for the reason the queue branch above gives.
@@ -3145,6 +3158,153 @@ fn topic_publish_refusal(topic_arn: &str) -> (String, String) {
                 crate::state::SERVICE_PRINCIPAL,
                 SNS_PUBLISH_ACTION_NAME,
                 topic_arn,
+            )
+        ),
+    )
+}
+
+/// Why the function `function_arn` names does not accept this delivery, as the
+/// invocation outcome that records it — or `None` when its own resource-based
+/// policy permits it.
+///
+/// The SAME rule the queue and the topic branches follow
+/// ([`queue_delivery_refusal`]): "for Lambda functions, Amazon SNS topics and
+/// Amazon SQS queues, EventBridge relies on resource-based policies", and the
+/// call it makes on a function is `lambda:InvokeFunction` as the service
+/// principal [`crate::state::SERVICE_PRINCIPAL`] — so the FUNCTION's own policy
+/// is the only document in force over this delivery and what it states decides it
+/// ([`crate::state::target_policy_admits`]): nothing is invoked without a grant
+/// for that principal, an explicit deny refuses whatever else is granted, and a
+/// grant scoped by `aws:SourceArn` authorizes the deliveries of the rule it names
+/// and no other. A function carrying no policy at all has granted this service
+/// nothing, so the invocation is withheld until a statement grants it — and a
+/// target that is no longer there is in exactly that position, since the document
+/// that would have admitted the invocation is as absent in one case as in the
+/// other, which is why both are this one refusal and neither reaches the
+/// function's API.
+///
+/// A refusal is the delivery FAILING rather than one nobody attempted, so it is
+/// dead-lettered and counted on `FailedInvocations` like any other failed
+/// invocation (see [`deliver`]) — under the condition and the sentence AWS
+/// Lambda's own refusal of an invocation its resource policy does not permit
+/// gives it ([`function_invoke_refusal`]), which names the PERMISSION
+/// ([`crate::state::NO_PERMISSIONS`]) as that service's answer does.
+///
+/// The policy is read through the function's own `GetPolicy`, so what decides a
+/// delivery is the document a client's last `AddPermission` or `RemovePermission`
+/// left on it: a grant just added admits the next delivery and one just removed
+/// stops admitting it. A function that answers that read with anything other than
+/// the absence of a policy decides nothing here: the `Invoke` that follows
+/// reports what such a function answers, which is that service's own answer
+/// rather than a verdict read off a policy this never saw.
+async fn function_delivery_refusal(
+    client: &::aws_sdk_lambda::Client,
+    function_arn: &str,
+    action: &str,
+    handover: &Handover<'_>,
+) -> Option<crate::state::InvocationOutcome> {
+    let policy = function_policy(client, function_arn).await?;
+    let attempt = crate::state::DeliveryAttempt {
+        rule: handover.rule,
+        target_id: &handover.target.id,
+        action,
+        resource: function_arn,
+    };
+    if crate::state::target_policy_admits(policy.as_deref(), &attempt, handover.rule_arn) {
+        return None;
+    }
+    ::tracing::warn!(
+        function = %function_arn,
+        rule = %handover.rule,
+        "an EventBridge delivery was withheld: the function's own resource-based policy does \
+         not allow this service to invoke it"
+    );
+    let (code, message) = function_invoke_refusal(function_arn, action);
+    Some(crate::state::InvocationOutcome::Failed { code, message })
+}
+
+/// What the function `function_arn` names answered when its resource-based policy
+/// was read: `Some(Some(document))` for a function carrying one, `Some(None)` for
+/// one that carries none, and `None` for a function that did not answer the read
+/// at all — the three told apart for the reason [`queue_policy`] gives.
+///
+/// `GetPolicy` answers [`FUNCTION_POLICY_ABSENT_CODE`] both for a function that
+/// carries no policy and for a name that resolves to no function, and for a
+/// delivery those are the same thing: there is no document granting this service
+/// the invocation. So that answer is read as the absence of a policy, and every
+/// other failure of the read is one nothing can be concluded from.
+async fn function_policy(
+    client: &::aws_sdk_lambda::Client,
+    function_arn: &str,
+) -> Option<Option<String>> {
+    let answered = client.get_policy().function_name(function_arn).send().await;
+    let error = match answered {
+        Ok(answer) => return Some(answer.policy().map(ToString::to_string)),
+        Err(error) => error,
+    };
+    let code = ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(&error);
+    if code == Some(FUNCTION_POLICY_ABSENT_CODE) {
+        return Some(None);
+    }
+    ::tracing::warn!(
+        function = %function_arn,
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "an EventBridge target function's resource-based policy could not be read"
+    );
+    None
+}
+
+/// The error code AWS Lambda's `GetPolicy` answers when there is no policy to
+/// report — "a function, version or alias that has no policy at all is a
+/// `ResourceNotFoundException`", the same answer a name no function resolves to
+/// earns.
+const FUNCTION_POLICY_ABSENT_CODE: &str = "ResourceNotFoundException";
+
+/// The service name AWS Lambda's own error metadata carries.
+const LAMBDA_SERVICE_NAME: &str = "Lambda";
+
+/// The error code AWS Lambda answers a caller its resource-based policy does not
+/// permit, and the status that answer carries.
+///
+/// Not from that service's model: `Invoke` declares no such error — the Lambda
+/// model carries none by this name
+/// (`smithy_query(query="shape",shape="AccessDeniedException",
+/// model_path="services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/com-amazonaws-lambda-awsgirapiservice.json")`
+/// finds nothing) — because an authorization refusal is answered ahead of the
+/// operation, under the code and status AWS answers every unauthorized call with.
+/// That is what a caller of the invocation reads, and so what a delivery this
+/// service could not make reports.
+const LAMBDA_ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+const LAMBDA_ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The condition and the sentence EventBridge reports for a function target it
+/// could not invoke, because the function granted this service nothing.
+///
+/// The function's own policy is what governs the delivery
+/// ([`crate::state::target_policy_admits`]), and what the delivery SEES when that
+/// document grants nothing is AWS Lambda's own refusal of the invocation: the
+/// authorization sentence naming the principal the call was made as, the action
+/// and the function, followed by the metadata block an AWS error carries — the
+/// service, the status, the error code and the id of the refused request. The
+/// condition names the PERMISSION rather than the resource, because that is what
+/// Lambda's answer is about.
+///
+/// The request id is MINTED here, for the reason
+/// [`crate::state::queue_access_refusal`] gives: it identifies the ONE refused
+/// call, so it is drawn fresh from the tree's one mint of an AWS request id
+/// rather than derived from the event or the target.
+fn function_invoke_refusal(function_arn: &str, action: &str) -> (String, String) {
+    let request_id = ::service_common::query_error_envelope::new_request_id();
+    (
+        crate::state::NO_PERMISSIONS.to_string(),
+        format!(
+            "{} (Service: {LAMBDA_SERVICE_NAME}; Status Code: \
+             {LAMBDA_ACCESS_DENIED_STATUS}; Error Code: {LAMBDA_ACCESS_DENIED_CODE}; \
+             Request ID: {request_id}; Proxy: null)",
+            ::service_common::iam_authorization::not_authorized_by_resource_policy(
+                crate::state::SERVICE_PRINCIPAL,
+                action,
+                function_arn,
             )
         ),
     )

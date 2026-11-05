@@ -38,6 +38,21 @@ Issue-Commit: b1cd28f1ca277d6a032df605f83af5017e934043
 
 # events/lambda/sqs: EventBridge Lambda targets and SQS event source mappings never fire, ESM role validation is absent, and DLQ redrive counts wrong (7 causes)
 
+> _STATUS when this report was moved: cause 5 is fixed, and so is the AUTHORIZATION and
+> DEAD-LETTER half of cause 3 — an EventBridge rule now decides a Lambda function target's
+> delivery against that function's own resource-based policy (`ops::put_events::function_delivery_refusal`,
+> deciding through `state::target_policy_admits` as the queue and topic targets already did),
+> never invokes a function whose policy does not admit it, and dead-letters the refusal under
+> the no-permissions condition. Cause 5 needed no change: the gate was already there and its
+> wording is the recording's ("The function execution role does not have permissions to call
+> ReceiveMessage on SQS"), which is the opposite of what this report asked for — see the three
+> later reports of the same three checks named in the split report below.
+> The REMAINING causes — 2, 4, 6, 7, the positive half of 3 and 8 — are re-filed with their
+> failing replay keys as
+> `issues/things-that-do-not-work/20261029T182228Z-events-lambda-sqs-6-of-the-7-causes-remain-open.md`,
+> so they are not recorded as working. Five of them wait on one capability: a Lambda function
+> RUNNING its deployment package._
+>
 > _These are the seven still-open causes of
 > `20261029T182228Z-events-lambda-sqs-eventbridge-sqs-targets-ignore-the.md`, re-filed under
 > their own name when the eighth (cause 1 of that bundle — an EventBridge SQS target ignoring
