@@ -119,7 +119,7 @@ fn refused_rows() -> Vec<Refused> {
             given: Given::Nothing,
             refused: "Db",
             // Amazon RDS's own wording for an instance its deletion protection holds.
-            diagnosis: "deletion protection is enabled",
+            diagnosis: "Cannot delete protected DB Instance",
             // The walk runs newest first, and nothing here depends on the database: both
             // topics are deleted and the database alone is reported as the failure.
             expected: &[
@@ -153,7 +153,7 @@ fn refused_rows() -> Vec<Refused> {
             .to_string(),
             given: Given::Nothing,
             refused: "Db",
-            diagnosis: "deletion protection is enabled",
+            diagnosis: "Cannot delete protected DB Instance",
             // The topic the database DEPENDS ON cannot be deleted while the database is
             // still there, so the walk leaves it exactly as its create left it; the topic
             // the database has nothing to do with is deleted.

@@ -372,7 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if let Some(period) = input.backup_retention_period {
             if !crate::state::BACKUP_RETENTION_RANGE.contains(&period) {
-                return Err(ModifyDBInstanceError::validation(format!(
+                return Err(ModifyDBInstanceError::invalid_parameter_value(format!(
                     "invalid value {period} for BackupRetentionPeriod: must be a value from {} to {}",
                     crate::state::BACKUP_RETENTION_RANGE.start(),
                     crate::state::BACKUP_RETENTION_RANGE.end()
@@ -381,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(port) = input.db_port_number {
             if !crate::state::PORT_RANGE.contains(&port) {
-                return Err(ModifyDBInstanceError::validation(format!(
+                return Err(ModifyDBInstanceError::invalid_parameter_value(format!(
                     "invalid value {port} for DBPortNumber: must be a value from {} to {}",
                     crate::state::PORT_RANGE.start(),
                     crate::state::PORT_RANGE.end()
@@ -458,14 +458,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An instance that is still coming up, or is on its way out, cannot take a
         // modification — the state the clock has yet to settle is real. One that is
         // already `modifying` can: RDS accepts a further change while it applies the
-        // last one.
+        // last one. The sentence is the one the service words for the status the instance
+        // is in: a status it will LEAVE states the state a modification needs, and one it
+        // cannot leave names that status and that it is terminal, so a caller polling on
+        // the first reads that the second is futile
+        // ([`crate::state::modify_db_instance_invalid_state_message`]).
         let current_status = store.db_instances[&key].status.clone();
         if current_status != "available" && current_status != "modifying" {
             return Err(ModifyDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(
-                        crate::state::MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE.to_string(),
-                    ),
+                    message: Some(crate::state::modify_db_instance_invalid_state_message(
+                        &current_status,
+                    )),
                 },
             )
             .into());

@@ -167,20 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // "The global database can't be deleted when deletion protection is enabled"
-        // (`CreateGlobalCluster$DeletionProtection`) — a state the global cluster is in,
-        // which is the modelled `InvalidGlobalClusterStateFault` rather than a not-found.
+        // (`CreateGlobalCluster$DeletionProtection`) — a setting of the global cluster the
+        // request CONFLICTS with rather than a state it is passing through, so the refusal
+        // is the Query API's `InvalidParameterCombination` a client treats as terminal, the
+        // same answer the DB cluster and DB instance deletes give their own protection.
         if record.deletion_protection {
-            return Err(
-                DeleteGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
-                    InvalidGlobalClusterStateFault {
-                        message: Some(format!(
-                            "Global cluster {identifier} can't be deleted because deletion \
-                             protection is enabled"
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(DeleteGlobalClusterError::invalid_parameter_combination(
+                crate::state::deletion_protection_refusal_message(
+                    crate::state::DELETION_PROTECTED_GLOBAL_CLUSTER,
+                ),
+            ));
         }
         // A global database still holding member clusters is not deletable either: its
         // primary and secondary clusters have to be detached first

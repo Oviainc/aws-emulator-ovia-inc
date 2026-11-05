@@ -344,7 +344,9 @@ async fn the_only_refusals_are_deletion_protection_and_a_delete_already_running(
     wait_for_settle();
 
     // Deletion protection holds the instance whichever final-snapshot form is asked
-    // for, and leaves it exactly as it was.
+    // for, and leaves it exactly as it was. It is a setting the request conflicts with
+    // rather than a state the instance is passing through, so the refusal carries the
+    // Query API's parameter-combination code and the fixed sentence of that class.
     for (case, extra) in [
         ("protected, skipping the final snapshot", ("SkipFinalSnapshot", "true")),
         (
@@ -361,11 +363,14 @@ async fn the_only_refusals_are_deletion_protection_and_a_delete_already_running(
             )
             .await,
             400,
-            "InvalidDBInstanceState",
+            "InvalidParameterCombination",
         );
-        assert!(
-            text(&body, "Message").contains("emu-dd-protected"),
-            "case {case:?}: the refusal must name the instance, got {:?}",
+        assert_eq!(
+            text(&body, "Message"),
+            "Cannot delete protected DB Instance, please disable deletion protection and try \
+             again.",
+            "case {case:?}: the refusal must carry the sentence this class is worded with, \
+             got {:?}",
             text(&body, "Message")
         );
         let still_there = reported_status(&router, "emu-dd-protected").await;

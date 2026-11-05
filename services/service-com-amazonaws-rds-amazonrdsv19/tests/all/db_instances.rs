@@ -1254,7 +1254,7 @@ async fn documented_constraints_are_refused_at_their_bounds() {
             case: "an AvailabilityZone with Multi-AZ",
             identifier: "emu-bad-multi-az",
             extra: params!["MultiAZ" => true, "AvailabilityZone" => "us-west-2a"].to_vec(),
-            code: "ValidationException",
+            code: "InvalidParameterCombination",
             says: "AvailabilityZone",
         },
         RefusedCase {
@@ -2220,8 +2220,9 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
     .await;
 
     // The documented parameter combinations this operation models no error for, and the
-    // one row that is a VALUE outside what `FinalDBSnapshotIdentifier` accepts, which the
-    // Query API's `InvalidParameterValue` reports.
+    // one row that is a VALUE outside what `FinalDBSnapshotIdentifier` accepts: the
+    // combinations carry the Query API's `InvalidParameterCombination` and the value its
+    // `InvalidParameterValue`.
     let refusals: &[(&str, Params, &str)] = &[
         (
             "both skip and a final snapshot identifier",
@@ -2231,12 +2232,12 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
                 "FinalDBSnapshotIdentifier" => "emu-del-skip-final",
             ]
             .to_vec(),
-            "ValidationException",
+            "InvalidParameterCombination",
         ),
         (
             "neither skip nor a final snapshot identifier",
             params!["DBInstanceIdentifier" => "emu-del-skip"].to_vec(),
-            "ValidationException",
+            "InvalidParameterCombination",
         ),
         (
             "a final snapshot identifier the constraints rule out",
@@ -2257,7 +2258,8 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
         );
     }
 
-    // Deletion protection holds the instance.
+    // Deletion protection holds the instance: a setting the request conflicts with, which
+    // is a parameter refusal rather than a state fault.
     expect_error(
         "a protected instance",
         call(
@@ -2267,7 +2269,7 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
         )
         .await,
         400,
-        "InvalidDBInstanceState",
+        "InvalidParameterCombination",
     );
     // A status the clock has yet to settle does NOT refuse a delete: nothing has to
     // be up for RDS to tear an instance down. `db_instance_deletion` spans the

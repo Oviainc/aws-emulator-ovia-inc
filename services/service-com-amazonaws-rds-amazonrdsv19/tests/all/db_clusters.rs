@@ -1170,7 +1170,7 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
                 ("EngineMode", "serverless".to_string()),
             ],
             400,
-            "InvalidParameterCombination",
+            "InvalidParameterValue",
         ),
         (
             "an engine mode the member does not publish",

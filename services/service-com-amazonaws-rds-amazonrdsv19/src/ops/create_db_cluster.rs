@@ -690,76 +690,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(&engine_mode))
             {
-                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                    "engine version {} of {} does not support the {engine_mode} engine \
-                     mode: it supports {}",
-                    entry.engine_version,
-                    input.engine,
-                    entry.profile.engine_modes.join(" | ")
-                )));
+                // Which modes a version runs is the DOMAIN of this member for that
+                // version, so a mode outside it is a value this parameter does not accept
+                // — the `InvalidParameterValue` the member's own value list is refused
+                // with above, not a combination that failed. It is how RDS refuses
+                // `serverless` (Aurora Serverless v1) on a current engine version, which
+                // publishes `provisioned` alone.
+                return Err(CreateDBClusterError::invalid_parameter_value(
+                    crate::state::unavailable_engine_mode_message(&engine_mode),
+                ));
             }
         }
         // `ServerlessV2ScalingConfiguration`: the Aurora Serverless v2 capacity range,
         // which only a version the catalogue publishes a Serverless v2 capacity range for
         // can be created with — and only inside that range, in the half-step increments the
-        // member documents ("You can specify ACU values in half-step increments, such as 8,
-        // 8.5, 9, and so on").
+        // member documents. The rule is the one `ModifyDBCluster` rescales a cluster by.
         let serverless_v2_scaling = match &input.serverless_v2_scaling_configuration {
             None => None,
             Some(asked) => {
-                let Some((min_acu, max_acu)) =
-                    resolved_version.and_then(|entry| entry.profile.serverless_v2_capacity)
-                else {
-                    return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                        "ServerlessV2ScalingConfiguration is not supported by engine {} \
-                         version {}: that version runs no Aurora Serverless v2 capacity",
-                        input.engine,
-                        input.engine_version.as_deref().unwrap_or("(default)")
-                    )));
-                };
-                for (member, value) in [
-                    ("MinCapacity", asked.min_capacity),
-                    ("MaxCapacity", asked.max_capacity),
-                ] {
-                    let Some(value) = value else { continue };
-                    if !(min_acu..=max_acu).contains(&value) {
-                        return Err(CreateDBClusterError::invalid_parameter_value(format!(
-                            "invalid value {value} for \
-                             ServerlessV2ScalingConfiguration.{member}: engine {} version \
-                             {} serves {min_acu} to {max_acu} Aurora capacity units",
-                            input.engine,
-                            input.engine_version.as_deref().unwrap_or("(default)")
-                        )));
+                crate::state::check_serverless_v2_scaling(
+                    &input.engine,
+                    input.engine_version.as_deref().unwrap_or("(default)"),
+                    resolved_version.and_then(|entry| entry.profile.serverless_v2_capacity),
+                    asked.min_capacity,
+                    asked.max_capacity,
+                    asked.seconds_until_auto_pause,
+                )
+                .map_err(|rejection| match rejection {
+                    crate::state::ServerlessV2Rejection::Value(message) => {
+                        CreateDBClusterError::invalid_parameter_value(message)
                     }
-                    if (value * 2.0).fract() != 0.0 {
-                        return Err(CreateDBClusterError::invalid_parameter_value(format!(
-                            "invalid value {value} for \
-                             ServerlessV2ScalingConfiguration.{member}: Aurora capacity \
-                             units are specified in half-step increments"
-                        )));
+                    crate::state::ServerlessV2Rejection::Combination(message) => {
+                        CreateDBClusterError::invalid_parameter_combination(message)
                     }
-                }
-                if let (Some(min), Some(max)) = (asked.min_capacity, asked.max_capacity) {
-                    if min > max {
-                        return Err(CreateDBClusterError::invalid_parameter_combination(
-                            format!(
-                                "ServerlessV2ScalingConfiguration.MinCapacity ({min}) must \
-                                 not exceed MaxCapacity ({max})"
-                            ),
-                        ));
-                    }
-                }
-                if let Some(seconds) = asked.seconds_until_auto_pause {
-                    if !crate::state::SECONDS_UNTIL_AUTO_PAUSE_RANGE.contains(&seconds) {
-                        return Err(CreateDBClusterError::invalid_parameter_value(format!(
-                            "invalid value {seconds} for \
-                             ServerlessV2ScalingConfiguration.SecondsUntilAutoPause: must \
-                             be a value from {} to {} seconds",
-                            crate::state::SECONDS_UNTIL_AUTO_PAUSE_RANGE.start(),
-                            crate::state::SECONDS_UNTIL_AUTO_PAUSE_RANGE.end()
-                        )));
-                    }
-                }
+                })?;
                 Some(ServerlessV2ScalingConfigurationInfo {
                     min_capacity: asked.min_capacity,
                     max_capacity: asked.max_capacity,

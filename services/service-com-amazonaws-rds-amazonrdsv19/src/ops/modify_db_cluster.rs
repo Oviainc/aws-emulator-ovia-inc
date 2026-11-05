@@ -524,6 +524,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let engine = current.engine.clone();
+        let current_engine_version = current.engine_version.clone();
         let status = current.status.clone();
 
         // A cluster takes one modification at a time: one that is still coming up, on its
@@ -629,6 +630,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => None,
         };
+        // `ServerlessV2ScalingConfiguration`: the capacity a rescale asks for is held to
+        // the SAME rule the create provisions a cluster by
+        // ([`crate::state::check_serverless_v2_scaling`]) — the capacity range the engine
+        // version the cluster will be running publishes, the half-step increments the
+        // member documents, and the floor that cannot exceed the ceiling. Checked before
+        // the record is taken out of the store, so a capacity this service cannot run
+        // leaves the cluster exactly as it was rather than being stored unexamined.
+        if let Some(asked) = &input.serverless_v2_scaling_configuration {
+            let effective_version = resolved_engine_version
+                .clone()
+                .or_else(|| current_engine_version.clone());
+            let capacity = crate::ops::describe_db_engine_versions::resolve_version(
+                &engine,
+                effective_version.as_deref(),
+            )
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.profile.serverless_v2_capacity);
+            let version_label =
+                effective_version.unwrap_or_else(|| "(default)".to_string());
+            crate::state::check_serverless_v2_scaling(
+                &engine,
+                &version_label,
+                capacity,
+                asked.min_capacity,
+                asked.max_capacity,
+                asked.seconds_until_auto_pause,
+            )
+            .map_err(|rejection| match rejection {
+                crate::state::ServerlessV2Rejection::Value(message) => {
+                    ModifyDBClusterError::invalid_parameter_value(message)
+                }
+                crate::state::ServerlessV2Rejection::Combination(message) => {
+                    ModifyDBClusterError::invalid_parameter_combination(message)
+                }
+            })?;
+        }
 
         let mut record = store
             .db_clusters

@@ -244,17 +244,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SkipFinalSnapshot`: "By default, skip isn't enabled, and the DB snapshot is
         // created" — and "If you don't enable this parameter, you must specify the
         // FinalDBSnapshotIdentifier parameter", while enabling both "results in an
-        // error". Neither combination has a modelled error, so both are refused as a
-        // 400 `ValidationException` naming the members.
+        // error". Neither combination has a modelled error, so both are refused with the
+        // `InvalidParameterCombination` code RDS answers members that cannot hold together
+        // with, naming them — the same answer `DeleteDBCluster` and `DeleteTenantDatabase`
+        // give the same pair.
         let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
         match (skip_final_snapshot, &input.final_db_snapshot_identifier) {
             (true, Some(_)) => {
-                return Err(DeleteDBInstanceError::validation(
-                    "FinalDBSnapshotIdentifier can't be specified when SkipFinalSnapshot is enabled",
+                return Err(DeleteDBInstanceError::invalid_parameter_combination(
+                    crate::state::ONLY_ONE_FINAL_SNAPSHOT_MEMBER,
                 ));
             }
             (false, None) => {
-                return Err(DeleteDBInstanceError::validation(
+                return Err(DeleteDBInstanceError::invalid_parameter_combination(
                     crate::state::FINAL_SNAPSHOT_MEMBER_REQUIRED,
                 ));
             }
@@ -269,16 +271,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DeleteDBInstanceError::invalid_parameter_value)?;
         }
 
-        // "The database can't be deleted when deletion protection is enabled."
+        // "The database can't be deleted when deletion protection is enabled." That is a
+        // setting of the instance the request CONFLICTS with rather than a state the
+        // instance is passing through: the caller clears it with `ModifyDBInstance` and
+        // calls again, so the refusal carries the Query API's
+        // `InvalidParameterCombination`, which a client treats as terminal, instead of the
+        // modelled state fault it would wait on.
         if store.db_instances[&key].deletion_protection {
-            return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(
-                InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {identifier} can't be deleted because deletion protection is enabled"
-                    )),
-                },
-            )
-            .into());
+            return Err(DeleteDBInstanceError::invalid_parameter_combination(
+                crate::state::deletion_protection_refusal_message(
+                    crate::state::DELETION_PROTECTED_DB_INSTANCE,
+                ),
+            ));
         }
         // Nor can one whose delete is already running: "This operation can't be
         // canceled or reverted after it begins", so a second delete of an instance

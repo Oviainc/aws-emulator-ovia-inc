@@ -187,13 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `ForceFailover`: "Constraint: You can't enable force failover if the instance
-        // isn't configured for Multi-AZ." The model cannot express a constraint between
-        // two members, so it is refused here.
+        // isn't configured for Multi-AZ." The model cannot express a constraint between a
+        // member and the addressed instance's own configuration, so it is refused here —
+        // with the Query API's `InvalidParameterValue` and the fixed sentence Amazon RDS
+        // words that refusal with, never the unmodelled `ValidationException`, which is no
+        // Amazon RDS error code.
         if input.force_failover.unwrap_or(false) && !instance.multi_az {
-            return Err(RebootDBInstanceError::validation(format!(
-                "ForceFailover can't be enabled for DB instance {identifier}: it isn't \
-                 configured for Multi-AZ"
-            )));
+            return Err(RebootDBInstanceError::invalid_parameter_value(
+                crate::state::FORCE_FAILOVER_REQUIRES_MULTI_AZ_MESSAGE,
+            ));
         }
 
         // "Rebooting a DB instance restarts the database engine service", so there has to

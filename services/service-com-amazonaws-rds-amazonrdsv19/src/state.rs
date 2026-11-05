@@ -202,6 +202,11 @@ mod published_values;
 mod minted_values;
 mod engine_defaults;
 mod ca_certificates;
+// The refusal wording and the shared request checks this service's handlers classify a
+// refused call by: the sentences AWS words a refusal with, and the rules more than one
+// operation holds a request to.
+mod refusal_wording;
+pub use refusal_wording::*;
 pub use ca_certificates::*;
 pub use engine_defaults::*;
 pub use minted_values::*;
@@ -2041,7 +2046,8 @@ pub fn check_subnet_id(subnet_id: &str) -> Result<(), String> {
 pub enum SubnetListRejection {
     /// More subnets than one group holds — `DBSubnetQuotaExceededFault`.
     TooManySubnets(String),
-    /// A value that is not an EC2 subnet id at all — `InvalidSubnet`.
+    /// A list that names no subnet at all, or a value that is not an EC2 subnet id —
+    /// `InvalidSubnet`.
     NotASubnet(String),
     /// The named subnets cover fewer Availability Zones than a group must —
     /// `DBSubnetGroupDoesNotCoverEnoughAZs`.
@@ -2049,11 +2055,17 @@ pub enum SubnetListRejection {
 }
 
 /// Refuse a `SubnetIds` list a DB subnet group cannot be made of, whichever operation
-/// carries it: the published allowance for ONE group
-/// ([`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]), the EC2 subnet id form
-/// ([`check_subnet_id`]), and the documented coverage requirement ("DB subnet groups
+/// carries it: a list that names no subnet at all ([`EMPTY_SUBNET_LIST_MESSAGE`]), the
+/// published allowance for ONE group ([`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]), the EC2 subnet
+/// id form ([`check_subnet_id`]), and the documented coverage requirement ("DB subnet groups
 /// must contain at least one subnet in at least two AZs in the Amazon Web Services
 /// Region").
+///
+/// The order is the order the rules DEPEND on each other. A list with no entries is
+/// unusable as a list — there is no subnet to be of the wrong form and none to resolve a
+/// zone for — so it is refused as the list it is; the per-entry form comes next, and the
+/// Availability Zone coverage last, since coverage is a statement about subnets that are
+/// there.
 ///
 /// A subnet lies in exactly ONE Availability Zone, so a list naming fewer than two DISTINCT
 /// subnets cannot cover two zones whatever those subnets are — which is what the request
@@ -2063,6 +2075,11 @@ pub fn check_db_subnet_group_subnets(
     region: &str,
     subnet_ids: &[String],
 ) -> Result<(), SubnetListRejection> {
+    if subnet_ids.is_empty() {
+        return Err(SubnetListRejection::NotASubnet(
+            EMPTY_SUBNET_LIST_MESSAGE.to_string(),
+        ));
+    }
     if subnet_ids.len() > MAX_SUBNETS_PER_DB_SUBNET_GROUP {
         return Err(SubnetListRejection::TooManySubnets(format!(
             "the request names {} subnets: a DB subnet group holds at most {}",
@@ -2089,6 +2106,12 @@ pub fn check_db_subnet_group_subnets(
 /// The Availability Zones a DB subnet group must cover: "DB subnet groups must contain at
 /// least one subnet in at least two AZs in the Amazon Web Services Region."
 pub const MIN_DB_SUBNET_GROUP_AVAILABILITY_ZONES: usize = 2;
+
+/// What a `SubnetIds` list with no entries is refused with: the list itself is the thing
+/// that cannot be used, so Amazon RDS states that the ids are required and says nothing
+/// about the Availability Zone coverage the named subnets add up to — a statement about
+/// subnets, which this request carries none of.
+pub const EMPTY_SUBNET_LIST_MESSAGE: &str = "Subnet IDs are required.";
 
 /// The message the `DBSubnetGroupDoesNotCoverEnoughAZs` fault carries: RDS states the
 /// requirement, then the coverage the request's own subnets add up to, then what to do

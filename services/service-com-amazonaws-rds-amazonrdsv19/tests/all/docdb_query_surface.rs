@@ -321,7 +321,7 @@ async fn the_instance_a_delete_addresses_is_resolved_before_its_parameter_combin
             )
             .await,
             400,
-            "ValidationException",
+            "InvalidParameterCombination",
         );
         let message = text(&body, "Message");
         assert!(

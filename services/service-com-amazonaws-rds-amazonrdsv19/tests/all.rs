@@ -167,6 +167,8 @@ mod query_catalog_reads;
 mod query_error_envelope;
 #[path = "all/reboot_db_shard_group.rs"]
 mod reboot_db_shard_group;
+#[path = "all/refusal_class_by_cause.rs"]
+mod refusal_class_by_cause;
 #[path = "all/refusal_wording_and_input_guards.rs"]
 mod refusal_wording_and_input_guards;
 #[path = "all/resource_member_projection.rs"]

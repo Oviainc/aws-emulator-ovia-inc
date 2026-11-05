@@ -12,11 +12,9 @@
 //! resolves. The same operation WITHOUT a name reports a (possibly empty) page instead:
 //! "nothing named" and "nothing stored" are different answers.
 //!
-//! `ApplyPendingMaintenanceAction` is here for what it still shares with that rule — a
-//! resource is addressable only in its own region — and not for the answer: its
-//! `ResourceIdentifier` is a parameter Amazon RDS validates, so an identifier naming no
-//! resource is refused as that parameter's value, which the sibling suite
-//! `all/maintenance_action_resource_guard.rs` asserts.
+//! `ApplyPendingMaintenanceAction` is here for one part of that rule — a resource is
+//! addressable only in its own region — while the shapes its `ResourceIdentifier` can take
+//! are covered by the sibling suite `all/maintenance_action_resource_guard.rs`.
 //!
 //! the certificate catalog `DescribeCertificates` publishes is covered by the sibling
 //! suite `all/query_catalog_reads.rs`; what this one adds for that operation is the row
@@ -350,11 +348,11 @@ async fn a_name_that_resolves_to_nothing_answers_that_resources_not_found_fault(
             404,
             "DBClusterNotFoundFault",
         ),
-        // `ApplyPendingMaintenanceAction` is NOT in this table: its `ResourceIdentifier` is
-        // a parameter whose value Amazon RDS validates, so an identifier that names no
-        // resource is refused as that parameter's value rather than reported as a resource
-        // that is not found. The sibling suite `all/maintenance_action_resource_guard.rs`
-        // asserts that rule over the shapes such an identifier can take.
+        // `ApplyPendingMaintenanceAction` is NOT in this table only because its
+        // `ResourceIdentifier` is an ARN rather than a bare name: it answers the same class
+        // of not-found fault, which the sibling suite
+        // `all/maintenance_action_resource_guard.rs` asserts over the shapes such an
+        // identifier can take.
         (
             "DescribeGlobalClusters for a global cluster that was never created",
             "DescribeGlobalClusters",
@@ -481,7 +479,7 @@ async fn a_resource_is_addressable_only_in_the_region_it_was_created_in() {
     }
 
     // And the instance's own ARN resolves to no resource in the other region either: the
-    // maintenance-action front door refuses the identifier as a parameter value there (see
+    // maintenance-action front door answers its modelled not-found fault there (see
     // `all/maintenance_action_resource_guard.rs` for the rule), which is still a statement
     // about the REGION and not about the name.
     expect_error(
@@ -500,8 +498,8 @@ async fn a_resource_is_addressable_only_in_the_region_it_was_created_in() {
             ],
         )
         .await,
-        400,
-        "InvalidParameterValue",
+        404,
+        "ResourceNotFoundFault",
     );
 
     // In its own region the same name resolves, which is what makes the rows above a

@@ -232,8 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match (skip_final_snapshot, &input.final_db_snapshot_identifier) {
             (true, Some(_)) => {
                 return Err(DeleteTenantDatabaseError::invalid_parameter_combination(
-                    "FinalDBSnapshotIdentifier can't be specified when SkipFinalSnapshot is \
-                     enabled",
+                    crate::state::ONLY_ONE_FINAL_SNAPSHOT_MEMBER,
                 ));
             }
             (false, None) => {

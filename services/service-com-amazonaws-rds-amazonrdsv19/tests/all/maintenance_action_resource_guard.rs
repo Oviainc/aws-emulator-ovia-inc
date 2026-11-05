@@ -7,10 +7,10 @@
 //! request:
 //!
 //! * `ApplyPendingMaintenanceAction` acts on the resource its `ResourceIdentifier` names,
-//!   so that member is a PARAMETER whose value Amazon RDS validates: a value that resolves
-//!   to no resource of this account is refused with HTTP 400 and the Query API's
-//!   `InvalidParameterValue`, carrying the sentence `Unknown resource: <the value the
-//!   request sent>` — never a 404 for a resource that is "not found". The identifier
+//!   and the operation MODELS `ResourceNotFoundFault` for an identifier that names none: a
+//!   value that resolves to no resource of this account is answered with that fault, HTTP
+//!   404, carrying the sentence `Resource not found: <the resource the identifier names>`
+//!   — never a parameter refusal for a resource that is simply not there. The identifier
 //!   resolves when it is the ARN a DB cluster or a DB instance of the request's region
 //!   reports for itself, which is what the rows below vary: the resource kind, the ARN's
 //!   account, region and resource type, and a value that is no ARN at all.
@@ -40,10 +40,9 @@ use crate::db_instances::{
 /// ARN this service mints belongs to.
 const ACCOUNT: &str = "000000000000";
 
-/// The Query API error code a parameter-value refusal carries. No operation's model
-/// declares it — it is one of the common errors Amazon RDS answers a bad parameter with —
-/// so it is the `<Code>` the envelope carries rather than an `awsQueryError` of a fault.
-const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+/// The modelled fault an identifier that names no resource is answered with, as its
+/// `awsQueryError` code spells it.
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundFault";
 
 /// The ARN a stored DB instance of [`REGION`] reports for itself (`db` is the resource type
 /// RDS gives a DB instance in its ARN format).
@@ -99,7 +98,7 @@ async fn apply(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value() {
+async fn an_unknown_maintenance_action_resource_is_refused_as_not_found() {
     let router = emulator();
 
     // One cluster and one instance that DO resolve, so every row below fails for the
@@ -107,80 +106,92 @@ async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value(
     create_available_cluster(&router, "emu-maint-guard-cluster", "aurora-postgresql", &[]).await;
     create_available_instance(&router, "emu-maint-guard-instance").await;
 
-    // The shapes an identifier that names no resource of this account can take. The
-    // `ApplyAction` / `OptInType` pairings rotate through the values those two members
-    // publish, so no row can pass on one pairing being special — and the last row carries
-    // an action AWS does not publish, which pins that the identifier is decided FIRST.
-    let rows: &[(&str, String, &str, &str)] = &[
+    // The shapes an identifier that names no resource of this account can take, each with
+    // the sentence its refusal must carry, spelled out rather than derived from the code
+    // under test. The `ApplyAction` / `OptInType` pairings rotate through the values those
+    // two members publish, so no row can pass on one pairing being special — and the last
+    // row carries an action AWS does not publish, which pins that the identifier is
+    // decided FIRST.
+    let rows: &[(&str, String, &str, &str, &str)] = &[
         (
             "a DB instance ARN for an instance that was never created",
             instance_arn("emu-maint-guard-absent"),
             "system-update",
             "immediate",
+            "Resource not found: emu-maint-guard-absent",
         ),
         (
             "a DB cluster ARN for a cluster that was never created",
             cluster_arn("emu-maint-guard-absent-cluster"),
             "db-upgrade",
             "next-maintenance",
+            "Resource not found: emu-maint-guard-absent-cluster",
         ),
         (
             "a value that is no ARN at all",
             "emu-maint-guard-instance".to_string(),
             "os-upgrade",
             "undo-opt-in",
+            "Resource not found: emu-maint-guard-instance",
         ),
         (
             "the stored instance's name under the cluster resource type",
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-guard-instance"),
             "hardware-maintenance",
             "immediate",
+            "Resource not found: emu-maint-guard-instance",
         ),
         (
             "a DB snapshot ARN, which carries no maintenance action",
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:snapshot:emu-maint-guard-snap"),
             "ca-certificate-rotation",
             "next-maintenance",
+            "Resource not found: emu-maint-guard-snap",
         ),
         (
             "the stored instance's ARN in another account",
             format!("arn:aws:rds:{REGION}:210987654321:db:emu-maint-guard-instance"),
             "system-update",
             "immediate",
+            "Resource not found: emu-maint-guard-instance",
         ),
         (
             "the stored instance's ARN in another region",
             "arn:aws:rds:eu-west-1:000000000000:db:emu-maint-guard-instance".to_string(),
             "db-upgrade",
             "immediate",
+            "Resource not found: emu-maint-guard-instance",
         ),
         (
             "another service's ARN",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance:i-0a1b2c3d4e5f60718"),
             "os-upgrade",
             "next-maintenance",
+            "Resource not found: arn:aws:ec2:us-west-2:000000000000:instance:i-0a1b2c3d4e5f60718",
         ),
         (
             "an absent resource named with an unpublished action",
             instance_arn("emu-maint-guard-absent-too"),
             "reboot-now",
             "immediate",
+            "Resource not found: emu-maint-guard-absent-too",
         ),
     ];
 
-    for (case, resource, action, opt_in) in rows {
+    for (case, resource, action, opt_in, expected_message) in rows {
         let body = expect_error(
             case,
             apply(&router, resource, action, opt_in).await,
-            400,
-            INVALID_PARAMETER_VALUE,
+            404,
+            RESOURCE_NOT_FOUND,
         );
         let message = text(&body, "Message");
+        // The refusal names the RESOURCE the identifier names — the identifier segment of
+        // an RDS ARN, and the value itself when it is no such ARN.
         assert_eq!(
-            message,
-            format!("Unknown resource: {resource}"),
-            "case {case:?}: expected the refusal to name the identifier the request sent, \
-             got {message:?}"
+            &message, expected_message,
+            "case {case:?}: expected the refusal to read {expected_message:?}, got \
+             {message:?}"
         );
         // The awsQuery envelope types a client error `Sender`, and a client that branches
         // on that must not read `Receiver` for a value it can correct itself.

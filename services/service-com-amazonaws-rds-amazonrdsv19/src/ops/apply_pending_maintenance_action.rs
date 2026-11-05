@@ -75,10 +75,9 @@
 //! * `InvalidDBInstanceStateFault` (HTTP 400) — The DB instance isn't in a valid state.
 //! * `ResourceNotFoundFault` (HTTP 404) — The specified resource ID was not found.
 //!
-//! Of those, `ResourceNotFoundFault` is deliberately never produced: Amazon RDS validates
-//! this operation's `ResourceIdentifier` as a PARAMETER VALUE, so an identifier that
-//! resolves to no resource of the account is refused with HTTP 400 and the Query API's
-//! `InvalidParameterValue` (see the handler). The two state faults need a maintenance
+//! `ResourceIdentifier` names the resource this call ACTS ON, and `ResourceNotFoundFault`
+//! is what the operation models for an identifier that names none — so that is the answer
+//! (see the handler), not a parameter error. The two state faults need a maintenance
 //! action to be pending, and nothing in this service schedules one.
 
 #[allow(unused_imports)]
@@ -148,15 +147,17 @@ fn check_value(member: &str, value: &str, allowed: &[&str]) -> Result<(), String
 }
 
 /// The message Amazon RDS refuses a `ResourceIdentifier` that names no resource with: the
-/// fixed text, then the identifier the REQUEST carried, so the caller recognises the value
-/// it sent whatever shape that value had.
+/// fixed text, then the RESOURCE the identifier names.
 ///
-/// The refusal is about the PARAMETER rather than about a resource that went missing: the
-/// member takes "the RDS Amazon Resource Name (ARN) of the resource that the pending
-/// maintenance action applies to", and a value this account has no resource for is a value
-/// this parameter does not accept.
-fn unknown_resource_message(resource_identifier: &str) -> String {
-    format!("Unknown resource: {resource_identifier}")
+/// The resource is the identifier segment of an RDS ARN
+/// ([`crate::state::parse_rds_resource_arn`]) — the recorded answers of this front door
+/// name the resource that way rather than echoing the whole ARN back — and the value the
+/// request carried as it stands for anything that is no such ARN, so the caller recognises
+/// what it sent either way.
+fn resource_not_found_message(resource_identifier: &str) -> String {
+    let named = crate::state::parse_rds_resource_arn(resource_identifier)
+        .map_or(resource_identifier, |arn| arn.identifier);
+    format!("Resource not found: {named}")
 }
 
 /// The `ApplyPendingMaintenanceAction` operation.
@@ -226,25 +227,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|record| record.arn()),
             )
             .find(|arn| *arn == resource);
-        // A value that resolves to no resource of this account is refused as the PARAMETER
-        // VALUE it is — HTTP 400 with the Query API's `InvalidParameterValue` — and not as a
-        // resource that went missing: this call acts on the resource its ARN names, so an
-        // ARN naming nothing (an identifier that is no ARN at all, an ARN of another region
-        // or of a resource that was never created) is a request the caller has to correct,
-        // never one to retry or to branch on as a 404.
+        // An identifier that resolves to no resource of this account is answered with the
+        // fault this operation MODELS for it — `ResourceNotFoundFault`, "the specified
+        // resource ID was not found", HTTP 404: `ResourceIdentifier` names the resource the
+        // call acts on, so a value naming nothing (an identifier that is no ARN at all, an
+        // ARN of another region or of a resource that was never created) is a resource that
+        // is not there, which is the answer a client branches on, rather than a complaint
+        // about the parameter's form.
         let Some(resource_arn) = resolved else {
-            return Err(ApplyPendingMaintenanceActionError::invalid_parameter_value(
-                unknown_resource_message(&resource),
-            ));
+            return Err(ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    message: Some(resource_not_found_message(&resource)),
+                },
+            )
+            .into());
         };
 
         // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do
         // WITH it, so a request that names a resource this service does not hold is
         // answered with the refusal above rather than with a complaint about those members.
+        // A value outside the list either member publishes is one the parameter does not
+        // accept, which is the Query API's `InvalidParameterValue`.
         check_value("ApplyAction", &input.apply_action, &APPLY_ACTION_VALUES)
-            .map_err(ApplyPendingMaintenanceActionError::validation)?;
+            .map_err(ApplyPendingMaintenanceActionError::invalid_parameter_value)?;
         check_value("OptInType", &input.opt_in_type, &OPT_IN_TYPE_VALUES)
-            .map_err(ApplyPendingMaintenanceActionError::validation)?;
+            .map_err(ApplyPendingMaintenanceActionError::invalid_parameter_value)?;
 
         // What the resource has pending. This service schedules no maintenance action —
         // nothing in it ever writes one — so a resolved resource has none, and the honest

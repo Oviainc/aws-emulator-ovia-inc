@@ -340,16 +340,21 @@ async fn the_documented_refusals_leave_the_cluster_exactly_as_it_was() {
     );
     wait_for_settle();
 
-    // "The database can't be deleted when deletion protection is enabled."
+    // "The database can't be deleted when deletion protection is enabled." Deletion
+    // protection is a setting the request conflicts with, not a state the cluster is
+    // passing through, so the refusal is the Query API's parameter-combination code and the
+    // sentence the service words that class with — spelled out here, and naming the
+    // resource KIND rather than the identifier the request sent.
     let refused = expect_error(
         "deletion protection",
         delete_cluster(&router, "emu-dc-protected").await,
         400,
-        "InvalidDBClusterStateFault",
+        "InvalidParameterCombination",
     );
-    assert!(
-        text(&refused, "Message").contains("emu-dc-protected"),
-        "the refusal must name the cluster, got {:?}",
+    assert_eq!(
+        text(&refused, "Message"),
+        "Cannot delete protected Cluster, please disable deletion protection and try again.",
+        "the refusal must carry the sentence this class is worded with, got {:?}",
         text(&refused, "Message")
     );
     let untouched = reported_status(&router, "emu-dc-protected").await;

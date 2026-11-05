@@ -374,7 +374,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // members that cannot hold together keep the channel this crate already words
         // them through.
         if input.multi_az == Some(true) && input.availability_zone.is_some() {
-            return Err(CreateDBInstanceError::validation(
+            return Err(CreateDBInstanceError::invalid_parameter_combination(
                 "AvailabilityZone can't be specified when MultiAZ is enabled",
             ));
         }

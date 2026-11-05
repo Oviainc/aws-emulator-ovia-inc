@@ -186,6 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 }
                 crate::state::SubnetListRejection::NotASubnet(message) => {
+                    // A list that names no subnet at all is refused here too: the list is
+                    // what cannot be used, and `InvalidSubnet` is the fault for exactly
+                    // that — "the requested subnet is invalid". The AZ-coverage fault below
+                    // is reached only once there ARE subnets to resolve zones for.
                     CreateDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
                         message: Some(message),
                     })

@@ -578,7 +578,9 @@ async fn deleting_a_persisted_global_cluster_is_accepted_and_only_then_is_it_not
         );
         if deletion_protection {
             // "The global database can't be deleted when deletion protection is
-            // enabled": a state fault, not a not-found — the cluster is still there.
+            // enabled": a setting the request conflicts with — the caller clears it and
+            // calls again — so a parameter refusal, not a state fault, and the cluster
+            // is still there.
             expect_error(
                 case,
                 call(
@@ -588,7 +590,7 @@ async fn deleting_a_persisted_global_cluster_is_accepted_and_only_then_is_it_not
                 )
                 .await,
                 400,
-                "InvalidGlobalClusterStateFault",
+                "InvalidParameterCombination",
             );
             let still_there = expect_ok(
                 case,
