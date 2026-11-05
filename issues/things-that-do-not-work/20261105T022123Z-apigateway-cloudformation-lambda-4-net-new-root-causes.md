@@ -1,0 +1,83 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-create-positive apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-delete-positive apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-update-positive apigateway__cloudformation__lambda.cfn-custom-resource-signals-success-updates-stack-status-positive apigateway__cloudformation__lambda.cfn-nested-stack-lambda-provider-reuse-positive apigateway__cloudformation__lambda.cfn-stack-rollback-on-custom-resource-failure apigateway__cloudformation__lambda.cfn-custom-resource-lambda-missing-servicetoken-permission-rejected apigateway__cloudformation__lambda.sam-invalid-document-error-taxonomy-rejected
+Issue-Key: apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-create-positive|_deploy_cfn#3|KeyError|outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+Issue-Key: apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-delete-positive|_deploy_cfn#3|KeyError|outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+Issue-Key: apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-update-positive|_deploy_cfn#3|KeyError|outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+Issue-Key: apigateway__cloudformation__lambda.cfn-custom-resource-signals-success-updates-stack-status-positive|run#9|KeyError|marker_matches = [o["OutputValue"] for o in outputs if o["OutputKey"] == "MarkerOutput"]
+Issue-Key: apigateway__cloudformation__lambda.cfn-nested-stack-lambda-provider-reuse-positive|_deploy_cfn#8|KeyError|outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+Issue-Key: apigateway__cloudformation__lambda.cfn-stack-rollback-on-custom-resource-failure|run#8|AssertionError|raise AssertionError(f"expected ROLLBACK_COMPLETE, got {status}. {detail}")
+Issue-Key: apigateway__cloudformation__lambda.cfn-custom-resource-lambda-missing-servicetoken-permission-rejected|run#11|AssertionError|assert status == "ROLLBACK_COMPLETE"
+Issue-Key: apigateway__cloudformation__lambda.sam-invalid-document-error-taxonomy-rejected|run#4|AssertionError|assert described["Status"] == "FAILED", (
+Issue-Commit: b7ef27c459f4b9552530df460b80da7c4b39527f
+
+# apigateway__cloudformation__lambda: 4 net-new root causes — stack Outputs carry no OutputValue, a failed custom resource never rolls the stack back, the stack service role is not enforced, and the SAM transform validates nothing
+
+> _Note: this issue was identified against the code base at commit `b7ef27c459f4b9552530df460b80da7c4b39527f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+Four distinct root causes in the CloudFormation provisioning path, each grounded in the failing checks named under it. None of these eight checks carried an 'ALREADY FILED' or an 'OWNED by' marker in this replay, so none of them is bound to an open issue's replay keys from this run.
+
+Related already-filed issue, named here so this is not read as an independent discovery: 20261023T114649Z-cloudformation-outputs-carry-no-outputvalue-failed-resources-never.md (service token `cloudformation`) describes the same families as its Causes 1, 2 and 5 and lists these check ids, but its own disposition block DECLINES Causes 1, 2 and 5 as platform blockers, and the replay did not report any of the checks below as owned by it. Also related and not covering these: 20261102T101202Z-cloudformation-dynamodb-lambda-3-net-new-root-causes.md, 20261102T093047Z-cloudformation-sns-sqs-6-net-new-root-causes.md, 20261103T061702Z-cloudformation-lambda-ssm-3-net-new-root-causes.md and 20261104T232822Z-cloudformation-iam-lambda-s3-4-net-new-root.md — all carry other service tokens and other replay keys.
+
+Cause 1 of 4 — DescribeStacks Output entries omit OutputValue entirely.
+AWS: Smithy (cloudformation#Output) models the Output structure with members OutputKey, OutputValue ('The value associated with the output'), Description and ExportName. A stack that has reached CREATE_COMPLETE reports every declared Output with its resolved OutputValue, including Outputs whose Value is an Fn::GetAtt into a Custom:: resource's response Data or an Output exported by a nested stack. An Output whose Value cannot be resolved is not emitted valueless — the resource, and with it the stack, fails first.
+Emulator: DescribeStacks returns Stacks[0].Outputs entries that contain OutputKey but no OutputValue member at all, so the ordinary consumer pattern `{o['OutputKey']: o['OutputValue'] for o in stack.get('Outputs', [])}` raises `KeyError: 'OutputValue'`.
+Why: Outputs are the documented way a stack hands resource identifiers (function names, table and stream ARNs, queue URLs, provider response data) to its caller. With the value member absent, no caller can read any stack output, and every deploy-then-use flow dies on the handoff rather than on a real defect in the resource.
+Fix: the Outputs resolution and serialization in the stack-describe path of the cloudformation crate (resolve each Output's Value expression — Ref, Fn::GetAtt including custom-resource Data, and nested-stack Outputs — and emit the resolved OutputValue; where an Output's expression cannot be resolved, fail the resource and the stack instead of emitting a keyless Output).
+Traces: apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-create-positive, apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-delete-positive, apigateway__cloudformation__lambda.cfn-custom-resource-invokes-lambda-update-positive, apigateway__cloudformation__lambda.cfn-custom-resource-signals-success-updates-stack-status-positive, apigateway__cloudformation__lambda.cfn-nested-stack-lambda-provider-reuse-positive.
+
+Cause 2 of 4 — a custom resource whose provider answers Status=FAILED leaves the stack at CREATE_COMPLETE instead of rolling it back.
+AWS: recorded behavior only (the response protocol is not in the Smithy model; cloudformation#StackStatus does model ROLLBACK_IN_PROGRESS and ROLLBACK_COMPLETE, and StackEvent models ResourceStatus plus ResourceStatusReason). A Custom:: resource whose provider PUTs a response document with Status FAILED makes that resource CREATE_FAILED with the provider's Reason in ResourceStatusReason; the stack then goes ROLLBACK_IN_PROGRESS and settles at ROLLBACK_COMPLETE, and the already-created sibling resources of the same stack are deleted.
+Emulator: the stack settles at CREATE_COMPLETE and the custom resource reports CREATE_COMPLETE with an empty status reason, so the FAILED verdict is discarded and the sibling topic stays alive.
+Why: a deployment that did not work is reported as successful. A client that waits for a terminal stack status and then uses the stack proceeds against resources that were never created, and no negative-deployment test can ever fail.
+Fix: the custom-resource response handling and the per-resource failure propagation in the stack provisioning state machine — parse the provider's response document, map Status=FAILED to a CREATE_FAILED resource carrying the provider's Reason, and run the rollback transition.
+Traces: apigateway__cloudformation__lambda.cfn-stack-rollback-on-custom-resource-failure.
+
+Cause 3 of 4 — the stack service role passed as RoleARN is never used to authorize the custom-resource invoke, so a role without lambda:InvokeFunction still deploys.
+AWS: recorded behavior only. CreateStack with RoleARN uses that role for every action the stack takes. When the role's policy does not allow lambda:InvokeFunction on the Custom:: resource's ServiceToken, CloudFormation cannot invoke the provider: the resource reaches CREATE_FAILED with a ResourceStatusReason naming lambda:InvokeFunction, the stack settles at ROLLBACK_COMPLETE, and the provider is never invoked (no Create event is delivered). The same template deployed with a role that does allow the invoke reaches CREATE_COMPLETE.
+Emulator: the denied-role stack settles at CREATE_COMPLETE, so the permission boundary is not evaluated at all and the negative and positive legs are indistinguishable.
+Why: a client cannot rely on the stack service role to bound what a template may do — a template deployed with a deliberately minimal role behaves as if it had been deployed with an unrestricted one, and the failure signal AWS gives (CREATE_FAILED naming the missing action) never appears.
+Fix: authorization of stack actions against the RoleARN in the stack provisioner (evaluate the role's identity policy before invoking a custom resource's ServiceToken) plus the CREATE_FAILED/ResourceStatusReason and rollback path of Cause 2.
+Traces: apigateway__cloudformation__lambda.cfn-custom-resource-lambda-missing-servicetoken-permission-rejected.
+
+Cause 4 of 4 — the AWS::Serverless-2016-10-31 transform performs no SAM validation: an invalid SAM document produces a successful change set.
+AWS: recorded behavior only (the transform is not described by the cloudformation Smithy model; DescribeChangeSet reports Status, StatusReason and Changes). CreateChangeSet on a shell stack whose template declares the Serverless transform and contains a faulty resource fails the change set: Status FAILED, Changes empty, the shell stack stays at REVIEW_IN_PROGRESS, and nothing is materialised (the function the template would have created is still absent, so lambda GetFunction answers ResourceNotFoundException 'Function not found: arn:aws:lambda:<region>:<account>:function:<name>'). The StatusReason is the SAM validator's own aggregated diagnostic, wrapped by CloudFormation: the fixed text 'Transform AWS::Serverless-2016-10-31 failed with: Invalid Serverless Application Specification document. Number of errors found: <n>. ' followed by one cause per fault naming the offending logical id and property, e.g. 'Resource with id [Fn] is invalid. Policy at index 0 in the \'Policies\' property is not valid' for an unknown managed-policy name, 'Resource with id [Fn] is invalid. Runtime and Handler needs to be present when PackageType is of type `Zip`' for a missing Handler, 'Resource with id [Fn] is invalid. Event with id [Ev] is invalid. Resource dict has missing or invalid value for key Type. Event Type is: <type>.' for an unknown event type, and 'Resource with id [Fn] is invalid. Property \'PrimaryKey.Type\' is required.' for a SimpleTable without a key type; <n> is the count of faults in the document and the logical ids, property names and type names are taken from the submitted template. An unrecognised AWS::Serverless::* type is CloudFormation's own error instead, not the validator's: 'Template format error: Unrecognized resource types: [AWS::Serverless::<Type>]'. Each distinct fault therefore yields a distinct StatusReason.
+Emulator: the change set for an invalid document reaches Status CREATE_COMPLETE, so every faulty SAM template is accepted and no per-cause diagnostic is produced.
+Why: SAM is the normal authoring path for serverless stacks. A client that validates a template by creating a change set is told a broken document is deployable, and the per-fault diagnostics that tell an author which resource and which property is wrong are unavailable — a tool that funnels everything through one message, or through none, cannot report the fault.
+Fix: the AWS::Serverless-2016-10-31 transform in the change-set/template-processing path — validate the expanded Serverless resources, fail the change set with the wrapped SAM diagnostic (and CloudFormation's 'Template format error: Unrecognized resource types: [...]' for an unknown AWS::Serverless::* type), emit no Changes, and leave the shell stack at REVIEW_IN_PROGRESS with nothing materialised. 20261023T114649Z-cloudformation-outputs-carry-no-outputvalue-failed-resources-never.md lists this check under its rollback cause, which is not the divergence the check reports: the change set itself must fail, before any stack ever rolls back.
+Traces: apigateway__cloudformation__lambda.sam-invalid-document-error-taxonomy-rejected.
+
+## Evidence
+Cause 1 — expected each DescribeStacks Outputs entry to carry OutputValue; actual the entry has no such member:
+  File "check_apigateway__cloudformation__lambda_cfn_custom_resource_invokes_lambda_create_positive.py", line 250, in _deploy_cfn
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+  KeyError: 'OutputValue'
+The identical KeyError is raised by cfn-custom-resource-invokes-lambda-delete-positive (line 278), -update-positive (line 263), cfn-nested-stack-lambda-provider-reuse-positive (line 317) and, on the per-output form, by cfn-custom-resource-signals-success-updates-stack-status-positive (line 71: `marker_matches = [o["OutputValue"] for o in outputs if o["OutputKey"] == "MarkerOutput"]`).
+
+Cause 2 — expected DescribeStacks StackStatus == ROLLBACK_COMPLETE after the provider answered FAILED; actual CREATE_COMPLETE with every resource successful:
+  AssertionError: expected ROLLBACK_COMPLETE, got CREATE_COMPLETE. <stack>=CREATE_COMPLETE: | MyResource=CREATE_COMPLETE: | MyResource=CREATE_IN_PROGRESS:Resource creation Initiated | MyResource=CREATE_IN_PROGRESS: | ProviderFunction=CREATE_COMPLETE: | ProviderFunction=CREATE_IN_PROGRESS:Resource creation Initiated | AlwaysTopic=CREATE_COMPLETE: | ProviderFunction=CREATE_IN_PROGRESS:
+(the stack name in that line is a per-run generated value, not part of the requirement; the MyResource=CREATE_COMPLETE with an empty reason is).
+
+Cause 3 — expected, for a stack created with RoleARN whose policy omits lambda:InvokeFunction on the ServiceToken, StackStatus ROLLBACK_COMPLETE plus a CREATE_FAILED event for logical id MyResource whose ResourceStatusReason contains 'lambda:InvokeFunction', and no provider invocation; actual the stack settles at CREATE_COMPLETE:
+  File "check_apigateway__cloudformation__lambda_cfn_custom_resource_lambda_missing_servicetoken_permission_rejected.py", line 50, in run
+    assert status == "ROLLBACK_COMPLETE"
+  AssertionError
+
+Cause 4 — expected DescribeChangeSet Status == FAILED with the SAM validator's per-cause StatusReason, Changes == [] and the shell stack at REVIEW_IN_PROGRESS; actual the change set reports CREATE_COMPLETE:
+  File "check_apigateway__cloudformation__lambda_sam_invalid_document_error_taxonomy_rejected.py", line 74, in run
+    assert described["Status"] == "FAILED", (
+  AssertionError: leg bad_policy_name: an invalid SAM document must fail the change set, not reach 'CREATE_COMPLETE'
+For that leg AWS's StatusReason is 'Transform AWS::Serverless-2016-10-31 failed with: Invalid Serverless Application Specification document. Number of errors found: 1. Resource with id [Fn] is invalid. Policy at index 0 in the \'Policies\' property is not valid' — fixed text apart from the fault count and the logical id, which come from the submitted template.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and replay the suite.
+2. Cause 1: CreateStack with a template that declares an AWS::Lambda::Function provider and an AWS::CloudFormation::CustomResource, and an Outputs section whose Values are Fn::GetAtt into the custom resource's Data; wait for CREATE_COMPLETE and call DescribeStacks — each Outputs entry has OutputKey but no OutputValue. Repeat with a nested stack whose child Outputs are re-exported.
+3. Cause 2: CreateStack with a template whose custom-resource provider returns Status=FAILED alongside a sibling AWS::SNS::Topic; poll DescribeStacks — CREATE_COMPLETE instead of ROLLBACK_COMPLETE, and the sibling topic still exists.
+4. Cause 3: create two IAM roles for CloudFormation, one with and one without lambda:InvokeFunction on the provider function; CreateStack with RoleARN set to the role without it; poll DescribeStacks — CREATE_COMPLETE instead of ROLLBACK_COMPLETE, and DescribeStackEvents has no CREATE_FAILED event naming lambda:InvokeFunction.
+5. Cause 4: CreateChangeSet on a shell stack with a template declaring Transform: AWS::Serverless-2016-10-31 and an AWS::Serverless::Function with an unknown name in Policies (then, separately, without Handler, with an unknown event Type, with a SimpleTable lacking PrimaryKey.Type, with two faults, and with an unrecognised AWS::Serverless::NotAThing); DescribeChangeSet — Status CREATE_COMPLETE instead of FAILED with the per-cause StatusReason.
+6. Re-replay the check ids in trace_ids to confirm.
