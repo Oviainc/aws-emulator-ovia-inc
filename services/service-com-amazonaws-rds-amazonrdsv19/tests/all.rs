@@ -103,6 +103,8 @@ mod docdb_query_surface;
 mod engine_default_cluster_parameters;
 #[path = "all/engine_default_parameters.rs"]
 mod engine_default_parameters;
+#[path = "all/engine_statement_classes.rs"]
+mod engine_statement_classes;
 #[path = "all/engine_version_families.rs"]
 mod engine_version_families;
 #[path = "all/engine_version_page_tokens.rs"]

@@ -85,12 +85,16 @@ impl ::emulator_server::NativeHandler for PostgresWire {
 /// teardown can be guaranteed to happen at all.
 struct Session {
     database: Arc<InstanceDatabase>,
+    /// The database this session is connected to, which is the one its row and its
+    /// uncommitted work are in.
+    name: String,
     pid: u32,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.database.execute(
+            &self.name,
             "DELETE FROM pg_stat_ssl WHERE pid = ?",
             &[Some(self.pid.to_string())],
         );
@@ -232,10 +236,12 @@ async fn serve_session(
         requires_secure_transport: facts.requires_secure_transport,
         settings: std::collections::BTreeMap::new(),
         databases: facts.databases.clone(),
+        endpoint_host: facts.endpoint_host.clone(),
     };
     let database_handle = Arc::clone(&context.database);
     let _session = Session {
         database: Arc::clone(&database_handle),
+        name: session_facts.database.clone(),
         pid: session_facts.connection_id,
     };
     register_session(&database_handle, &session_facts).await;
@@ -264,7 +270,7 @@ async fn serve_session(
     // by, since it cancels nothing (see the cancel request above).
     key_data.extend_from_slice(&session_pid.to_be_bytes());
     send(&mut conn, b'K', &key_data).await?;
-    ready(&mut conn, &database_handle, false).await?;
+    ready(&mut conn, &database_handle, &session_facts.database, false).await?;
 
     // 5. The query protocols.
     let mut generation = context.generation.clone();
@@ -309,7 +315,13 @@ async fn serve_session(
                     &sql,
                 )
                 .await?;
-                ready(&mut conn, &database_handle, failed_in_transaction).await?;
+                ready(
+                    &mut conn,
+                    &database_handle,
+                    &session_facts.database,
+                    failed_in_transaction,
+                )
+                .await?;
             }
             // Parse.
             b'P' => {
@@ -454,10 +466,16 @@ async fn serve_session(
             }
             // Sync.
             b'S' => {
-                if !database_handle.in_transaction() {
+                if !database_handle.in_transaction(&session_facts.database) {
                     failed_in_transaction = false;
                 }
-                ready(&mut conn, &database_handle, failed_in_transaction).await?;
+                ready(
+                    &mut conn,
+                    &database_handle,
+                    &session_facts.database,
+                    failed_in_transaction,
+                )
+                .await?;
             }
             // Flush: everything this server writes is already flushed.
             b'H' => {
@@ -622,10 +640,10 @@ async fn run_statement(
     sql: String,
     params: Vec<Option<String>>,
 ) -> Result<wire_session::StatementAnswer, EngineError> {
-    let database = Arc::clone(database);
+    let engine = Arc::clone(database);
     let session = facts.clone();
     let answer = tokio::task::spawn_blocking(move || {
-        wire_session::run_statement(&database, &session, &sql, &params)
+        wire_session::run_statement(&engine, &session, &sql, &params)
     })
     .await
     .map_err(|error| EngineError::new(EngineErrorKind::Internal, error.to_string()))??;
@@ -634,6 +652,10 @@ async fn run_statement(
     }
     if let Some(database) = answer.database_changed.clone() {
         facts.database = database;
+    }
+    // A statement that created or dropped a database changed what this session may name.
+    if answer.databases_changed {
+        facts.databases = database.database_names();
     }
     Ok(answer)
 }
@@ -647,6 +669,11 @@ async fn write_answer(
     answer: &wire_session::StatementAnswer,
     describe_rows: bool,
 ) -> std::io::Result<()> {
+    // What the server has to say about the statement comes before its answer, which is
+    // the order a client reads them in.
+    for notice in &answer.notices {
+        notice_response(conn, notice).await?;
+    }
     if answer.verb.is_empty() {
         send(conn, b'I', &[]).await?;
         return Ok(());
@@ -821,6 +848,7 @@ fn render_cell(column: Option<&ColumnInfo>, cell: &Cell) -> Option<String> {
 /// handshake could be observed, what it negotiated.
 async fn register_session(database: &Arc<InstanceDatabase>, facts: &SessionFacts) {
     let database = Arc::clone(database);
+    let name = facts.database.clone();
     let pid = facts.connection_id.to_string();
     let encrypted = i64::from(facts.encrypted());
     let version = facts
@@ -829,8 +857,9 @@ async fn register_session(database: &Arc<InstanceDatabase>, facts: &SessionFacts
         .and_then(|tls| tls.protocol.clone());
     let cipher = facts.tls.as_ref().and_then(|tls| tls.cipher.clone());
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = database.execute(PG_STAT_SSL_SCHEMA, &[]);
+        let _ = database.execute(&name, PG_STAT_SSL_SCHEMA, &[]);
         let _ = database.execute(
+            &name,
             "INSERT OR REPLACE INTO pg_stat_ssl (pid, ssl, version, cipher) \
              VALUES (?, ?, ?, ?)",
             &[
@@ -915,6 +944,12 @@ fn sqlstate(kind: EngineErrorKind) -> &'static str {
         // serves.
         EngineErrorKind::LimitExceeded => "54000",
         EngineErrorKind::InsufficientPrivilege => "42501",
+        // `duplicate_object` and `object_in_use`: the general class of each, which a
+        // statement whose own condition names a narrower one overrides
+        // ([`EngineError::with_sqlstate`]).
+        EngineErrorKind::DuplicateObject => "42710",
+        EngineErrorKind::ObjectInUse => "55006",
+        EngineErrorKind::FeatureNotSupported => "0A000",
         EngineErrorKind::Internal => "58000",
     }
 }
@@ -924,12 +959,32 @@ async fn engine_error_response(
     conn: &mut ::emulator_server::ListenerConn,
     error: &EngineError,
 ) -> std::io::Result<()> {
-    error_response(conn, "ERROR", sqlstate(error.kind), &error.message).await
+    let code = error.sqlstate.unwrap_or_else(|| sqlstate(error.kind));
+    error_response(conn, "ERROR", code, &error.message).await
+}
+
+/// One `NoticeResponse`: what the server has to say about a statement it did not refuse.
+async fn notice_response(
+    conn: &mut ::emulator_server::ListenerConn,
+    notice: &wire_session::WireNotice,
+) -> std::io::Result<()> {
+    message_response(conn, b'N', notice.severity, notice.code, &notice.message).await
 }
 
 /// One `ErrorResponse`.
 async fn error_response(
     conn: &mut ::emulator_server::ListenerConn,
+    severity: &str,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    message_response(conn, b'E', severity, code, message).await
+}
+
+/// One `ErrorResponse` or `NoticeResponse`, which carry the same fields.
+async fn message_response(
+    conn: &mut ::emulator_server::ListenerConn,
+    kind: u8,
     severity: &str,
     code: &str,
     message: &str,
@@ -944,7 +999,7 @@ async fn error_response(
     body.push(b'M');
     put_cstring(&mut body, message);
     body.push(0);
-    send(conn, b'E', &body).await?;
+    send(conn, kind, &body).await?;
     conn.flush().await
 }
 
@@ -961,9 +1016,10 @@ async fn fatal(
 async fn ready(
     conn: &mut ::emulator_server::ListenerConn,
     database: &Arc<InstanceDatabase>,
+    name: &str,
     failed: bool,
 ) -> std::io::Result<()> {
-    let status = match (database.in_transaction(), failed) {
+    let status = match (database.in_transaction(name), failed) {
         (true, true) => b'E',
         (true, false) => b'T',
         (false, _) => b'I',

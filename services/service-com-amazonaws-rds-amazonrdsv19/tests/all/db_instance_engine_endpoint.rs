@@ -33,13 +33,17 @@ use tokio::net::TcpStream;
 use crate::db_instances::{call, emulator, expect_ok, subtrees, text, wait_for_settle};
 
 /// The master user every instance below is created with.
-const MASTER_USER: &str = "emuadmin";
+///
+/// `pub(crate)` here and below so the sibling suite that drives the statement classes this
+/// endpoint serves ([`crate::engine_statement_classes`]) opens its sessions with the same
+/// client rather than standing up a second one.
+pub(crate) const MASTER_USER: &str = "emuadmin";
 
 /// Its password. A test credential, and the only place in this suite it appears.
-const MASTER_PASSWORD: &str = "emu-Secret-99";
+pub(crate) const MASTER_PASSWORD: &str = "emu-Secret-99";
 
 /// The `DBName` every instance below is created with.
-const DATABASE: &str = "appdb";
+pub(crate) const DATABASE: &str = "appdb";
 
 /// `[(name, value.to_string()), ..]` — the query parameters of one call.
 macro_rules! params {
@@ -50,7 +54,7 @@ macro_rules! params {
 
 /// Create a DB instance, wait for it to settle, and answer with the endpoint it
 /// publishes.
-async fn available_instance(
+pub(crate) async fn available_instance(
     router: &smithy_server_runtime::MultiServiceRouter,
     identifier: &str,
     engine: &str,
@@ -158,28 +162,31 @@ type Client = Box<dyn Connection>;
 
 /// How a session is opened: in the clear, or with the wire's own in-band TLS upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transport {
+pub(crate) enum Transport {
     Plaintext,
     Tls,
 }
 
 /// A refusal a server sent: the code a client branches on and the sentence it reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Refusal {
-    code: String,
-    message: String,
+pub(crate) struct Refusal {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 /// One result set a client read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Rows {
-    columns: Vec<String>,
-    rows: Vec<Vec<Option<String>>>,
+pub(crate) struct Rows {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Option<String>>>,
+    /// What the server said about the statement without refusing it: the PostgreSQL
+    /// `NoticeResponse` messages it sent before the `CommandComplete`.
+    pub(crate) notices: Vec<Refusal>,
 }
 
 impl Rows {
     /// The one value a single-row, single-column answer carries.
-    fn only(&self) -> Option<&str> {
+    pub(crate) fn only(&self) -> Option<&str> {
         self.rows
             .first()
             .and_then(|row| row.first())
@@ -282,13 +289,13 @@ impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificat
 }
 
 /// A PostgreSQL session a client has opened.
-struct PostgresSession {
+pub(crate) struct PostgresSession {
     conn: Client,
 }
 
 /// Open a PostgreSQL session on `address:port`, as libpq does: the optional `SSLRequest`
 /// first, then the startup message, the password, and the parameters the server reports.
-async fn postgres_login(
+pub(crate) async fn postgres_login(
     address: &str,
     port: u16,
     transport: Transport,
@@ -365,7 +372,7 @@ async fn postgres_login(
 
 impl PostgresSession {
     /// Run one simple query and read everything the server answers for it.
-    async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
+    pub(crate) async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
         let mut message = Vec::new();
         put_cstring(&mut message, sql);
         postgres_send(&mut self.conn, b'Q', &message).await;
@@ -465,9 +472,11 @@ impl PostgresSession {
                     answer.rows.push(row);
                 }
                 b'E' => refusal = Some(postgres_refusal(&body)),
+                // NoticeResponse: what the server has to say about the statement.
+                b'N' => answer.notices.push(postgres_refusal(&body)),
                 // ReadyForQuery ends the exchange.
                 b'Z' => break,
-                // CommandComplete, EmptyQueryResponse, NoticeResponse.
+                // CommandComplete, EmptyQueryResponse.
                 _ => {}
             }
         }
@@ -557,15 +566,15 @@ const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
 
 /// A MySQL session a client has opened, and the version the greeting named.
-struct MySqlSession {
+pub(crate) struct MySqlSession {
     conn: Client,
-    server_version: String,
+    pub(crate) server_version: String,
 }
 
 /// Open a MySQL session on `address:port`, as libmysqlclient does: read the greeting,
 /// answer it (with the TLS upgrade in the middle when asked for), and read the server's
 /// verdict.
-async fn mysql_login(
+pub(crate) async fn mysql_login(
     address: &str,
     port: u16,
     transport: Transport,
@@ -645,7 +654,7 @@ async fn mysql_login(
 
 impl MySqlSession {
     /// Run one statement through `COM_QUERY` and read everything the server answers.
-    async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
+    pub(crate) async fn query(&mut self, sql: &str) -> Result<Rows, Refusal> {
         let mut command = vec![0x03u8];
         command.extend_from_slice(sql.as_bytes());
         mysql_write(&mut self.conn, 0, &command).await;

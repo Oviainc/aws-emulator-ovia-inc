@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The SQL engine behind a DB instance's engine endpoint: one in-process SQLite
-//! database per DB instance.
+//! database per DATABASE of a DB instance.
 //!
 //! A statement a client sends over the engine's native wire is RUN here and the rows
 //! this module returns are the rows the wire reports — nothing is synthesised from the
@@ -10,19 +10,28 @@
 //! with its own error, which the wire renders as that engine's error response, rather
 //! than answering a fabricated success.
 //!
-//! One connection per DB instance, taken under a mutex for the duration of a single
+//! A DATABASE (a MySQL schema, a PostgreSQL database) is a namespace of its own on both
+//! engines, so each one this instance holds is its own SQLite database — the same shape
+//! the RDS Data API's engine keeps (`service-com-amazonaws-rdsdata-rdsdataservice`), one
+//! database per name. A name is created when the client's DDL creates it
+//! ([`InstanceDatabase::create_database`]) and opened on first use for a name the instance
+//! already has (the one `DBName` named, the engine's own default, a MySQL system schema),
+//! up to [`MAX_DATABASES_PER_INSTANCE`].
+//!
+//! One connection per database, taken under a mutex for the duration of a single
 //! statement:
 //!
-//! * the database is in memory and private to the instance, so one instance's rows never
+//! * every database is in memory and private to the instance, so one instance's rows never
 //!   reach another's session and nothing is written to the host's disk;
-//! * sessions of one instance share the connection, which is why a transaction one
-//!   session opens is the instance's transaction — a limit of this engine, documented on
+//! * sessions on one database share its connection, which is why a transaction one
+//!   session opens is that database's transaction — a limit of this engine, documented on
 //!   [`InstanceDatabase::rollback_open_transaction`], which the wire calls when a session
 //!   ends so uncommitted work never outlives the session that wrote it;
 //! * every statement runs with the connection's own bounds in force (below) and under a
 //!   DEFAULT-DENY authorizer ([`confine_to_the_instance`]), and the result set a session
 //!   can draw out of one statement is capped in rows and in bytes.
 
+use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -75,6 +84,13 @@ const MAX_PAGE_CACHE_KIB: i64 = -256;
 /// temporary database a sort or a materialised CTE spills into.
 const CAPPED_SCHEMAS: [&str; 2] = ["main", "temp"];
 
+/// How many databases one DB instance's engine holds at once.
+///
+/// Each one is a connection of its own with its own page ceiling, and naming a database is
+/// what opens it, so a session that keeps naming fresh ones is bounded here rather than
+/// growing the process: past the cap a statement that would open another is refused.
+pub const MAX_DATABASES_PER_INSTANCE: usize = 64;
+
 /// What went wrong with a statement, in terms both wires can render: each one maps a kind
 /// to its own engine's code (a PostgreSQL SQLSTATE, a MySQL error number) and sends the
 /// engine's real message with it.
@@ -103,6 +119,13 @@ pub enum EngineErrorKind {
     LimitExceeded,
     /// The caller is not allowed to do this.
     InsufficientPrivilege,
+    /// An object the statement would create is already there.
+    DuplicateObject,
+    /// The object the statement would remove is still in use, or something still depends
+    /// on it.
+    ObjectInUse,
+    /// The engine does not serve this capability at all.
+    FeatureNotSupported,
     /// The engine cannot serve this at all.
     Internal,
 }
@@ -112,6 +135,15 @@ pub enum EngineErrorKind {
 pub struct EngineError {
     pub kind: EngineErrorKind,
     pub message: String,
+    /// Where in the statement the engine stopped reading it, for the wire that reports a
+    /// position in its own parse error.
+    pub offset: Option<usize>,
+    /// The SQLSTATE the PostgreSQL wire reports this refusal under, where the CONDITION
+    /// names one of its own rather than the kind's ([`EngineError::with_sqlstate`]).
+    pub sqlstate: Option<&'static str>,
+    /// The error number and SQLSTATE the MySQL wire reports this refusal under, where the
+    /// CONDITION names one of its own ([`EngineError::with_mysql_error`]).
+    pub mysql_error: Option<(u16, &'static str)>,
 }
 
 impl EngineError {
@@ -120,7 +152,36 @@ impl EngineError {
         Self {
             kind,
             message: message.into(),
+            offset: None,
+            sqlstate: None,
+            mysql_error: None,
         }
+    }
+
+    /// The same failure, reported on the PostgreSQL wire under `sqlstate`.
+    ///
+    /// A statement class has its own SQLSTATE where the kind alone does not name it — a
+    /// duplicate DATABASE (`42P04`) is not a duplicate object in general (`42710`) — and
+    /// what a client branches on is the one the condition carries.
+    #[must_use]
+    pub fn with_sqlstate(mut self, sqlstate: &'static str) -> Self {
+        self.sqlstate = Some(sqlstate);
+        self
+    }
+
+    /// The same failure, reported on the MySQL wire under `number` and `state`: the
+    /// server error number the statement class defines for this condition.
+    #[must_use]
+    pub fn with_mysql_error(mut self, number: u16, state: &'static str) -> Self {
+        self.mysql_error = Some((number, state));
+        self
+    }
+
+    /// The same failure, carrying where in the statement the engine stopped.
+    #[must_use]
+    pub fn at_offset(mut self, offset: Option<usize>) -> Self {
+        self.offset = offset;
+        self
     }
 }
 
@@ -189,92 +250,118 @@ impl ResultSet {
     }
 }
 
-/// One DB instance's database.
+/// One DB instance's engine: its databases, each with its own connection.
 pub struct InstanceDatabase {
-    conn: Mutex<Connection>,
+    databases: Mutex<Databases>,
+}
+
+/// The databases one instance holds.
+#[derive(Default)]
+struct Databases {
+    /// One connection per database name, keyed by the name as it was created.
+    open: BTreeMap<String, Connection>,
+    /// Whether the databases the INSTANCE comes with ([`InstanceDatabase::seed`]) have
+    /// been created yet. They are created once, on the first login, after which this
+    /// engine is the only thing that says which databases the instance has — so a
+    /// database a client created is there for every later session, and one a client
+    /// dropped stays gone.
+    seeded: bool,
 }
 
 /// Written by hand rather than derived: a connection is not `Debug`, and what a reader
-/// needs here is that the instance has one.
+/// needs here is which databases the instance holds.
 impl std::fmt::Debug for InstanceDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InstanceDatabase").finish()
+        f.debug_struct("InstanceDatabase")
+            .field("databases", &self.database_names())
+            .finish()
     }
 }
 
 impl InstanceDatabase {
-    /// Open the one empty in-memory database a DB instance's engine serves, with every
-    /// bound above in force before any client statement can reach it.
+    /// Bring the engine up for a DB instance that has no database open yet.
+    ///
+    /// The engine itself is started once here — on a host where it cannot start at all,
+    /// the caller answers the create with a failure rather than publishing an endpoint
+    /// nothing serves — and each database is opened empty when it is first named.
     pub fn open() -> Result<Self, EngineError> {
-        let conn = Connection::open_in_memory().map_err(unavailable)?;
-        // Temp database in memory FIRST, so naming `temp` below opens it in memory and
-        // not as a host file; then the page ceiling on both schemas.
-        conn.pragma_update(None, "temp_store", TEMP_STORE_MEMORY)
-            .map_err(unavailable)?;
-        conn.pragma_update(None, "cache_size", MAX_PAGE_CACHE_KIB)
-            .map_err(unavailable)?;
-        for schema in CAPPED_SCHEMAS {
-            conn.pragma_update(Some(schema), "max_page_count", MAX_DATABASE_PAGES)
-                .map_err(unavailable)?;
-        }
-        for (limit, value) in [
-            // No second database, ever: this also takes `VACUUM INTO` away, which the
-            // engine implements by attaching its output file.
-            (Limit::SQLITE_LIMIT_ATTACHED, 0),
-            (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES),
-            (Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES),
-            (Limit::SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPRESSION_DEPTH),
-            (Limit::SQLITE_LIMIT_COMPOUND_SELECT, MAX_COMPOUND_SELECT),
-            (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, MAX_BOUND_PARAMETERS),
-        ] {
-            conn.set_limit(limit, value).map_err(unavailable)?;
-        }
-        for (config, enabled) in [
-            (rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
-            (rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
-        ] {
-            conn.set_db_config(config, enabled).map_err(unavailable)?;
-        }
-        // Installed LAST, so the settings above — themselves pragmas — are not refused
-        // by it.
-        conn.authorizer(Some(confine_to_the_instance));
+        drop(open_confined_database()?);
         Ok(Self {
-            conn: Mutex::new(conn),
+            databases: Mutex::new(Databases::default()),
         })
     }
 
-    /// The connection, recovering a lock a panicking session poisoned: a long-lived
-    /// emulator has to keep serving every later session.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The instance's databases, recovering a lock a panicking session poisoned: a
+    /// long-lived emulator has to keep serving every later session.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Databases> {
+        self.databases.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Run `sql` with `params` bound to its placeholders in order, and answer with what
-    /// the engine produced.
+    /// Create the databases the INSTANCE itself comes with — the one `DBName` named, the
+    /// engine's own default, a MySQL server's system schemas — once.
+    ///
+    /// Called as a session is admitted, because that is the first moment this emulator
+    /// knows what the instance's record says they are. After it, the engine is the only
+    /// thing that says which databases the instance has: a later call adds nothing, so a
+    /// database a client dropped is not quietly created again.
+    pub fn seed(&self, names: &[String]) {
+        let mut databases = self.lock();
+        if databases.seeded {
+            return;
+        }
+        databases.seeded = true;
+        for name in names {
+            if name.is_empty() || resolve(&databases.open, name).is_some() {
+                continue;
+            }
+            if admit_another_database(&databases).is_err() {
+                return;
+            }
+            match open_confined_database() {
+                Ok(conn) => {
+                    databases.open.insert(name.clone(), conn);
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Run `sql` with `params` bound to its placeholders in order against the database
+    /// `database`, and answer with what the engine produced.
     ///
     /// Blocking, CPU-bound work: a wire handler calls it on a blocking task so a long
     /// statement cannot starve the async runtime, and the statement itself is bounded by
     /// [`STATEMENT_DEADLINE`] and by the result caps.
-    pub fn execute(&self, sql: &str, params: &[Option<String>]) -> Result<ResultSet, EngineError> {
-        let conn = self.lock();
+    pub fn execute(
+        &self,
+        database: &str,
+        sql: &str,
+        params: &[Option<String>],
+    ) -> Result<ResultSet, EngineError> {
+        let mut databases = self.lock();
+        let conn = connection(&mut databases, database)?;
         let deadline = Instant::now() + STATEMENT_DEADLINE;
         conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline));
-        let answer = run_statement(&conn, sql, params);
+        let answer = run_statement(conn, sql, params);
         conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
         answer
     }
 
-    /// Whether the engine is inside a transaction a session opened, which is what a
-    /// PostgreSQL `ReadyForQuery` and a MySQL status flag report.
+    /// Whether the database `database` is inside a transaction a session opened, which is
+    /// what a PostgreSQL `ReadyForQuery` and a MySQL status flag report.
     #[must_use]
-    pub fn in_transaction(&self) -> bool {
-        !self.lock().is_autocommit()
+    pub fn in_transaction(&self, database: &str) -> bool {
+        let databases = self.lock();
+        resolve(&databases.open, database)
+            .and_then(|name| databases.open.get(&name))
+            .is_some_and(|conn| !conn.is_autocommit())
     }
 
-    /// The columns `sql` would produce, without running it: what the extended query
-    /// protocol's `Describe` answers.
-    pub fn describe(&self, sql: &str) -> Result<Vec<ColumnInfo>, EngineError> {
-        let conn = self.lock();
+    /// The columns `sql` would produce against `database`, without running it: what the
+    /// extended query protocol's `Describe` answers.
+    pub fn describe(&self, database: &str, sql: &str) -> Result<Vec<ColumnInfo>, EngineError> {
+        let mut databases = self.lock();
+        let conn = connection(&mut databases, database)?;
         let statement = conn.prepare(sql).map_err(from_engine)?;
         Ok(statement
             .columns()
@@ -286,19 +373,150 @@ impl InstanceDatabase {
             .collect())
     }
 
-    /// Roll back the transaction a session left open, if it left one.
+    /// The databases this instance has, in name order — what a login may name and what
+    /// `SHOW DATABASES` lists.
     ///
-    /// The sessions of one instance share the connection, so a `BEGIN` that is never
-    /// committed would otherwise hold the instance's uncommitted rows for whoever
+    /// A database with no name is not one of them: a MySQL session opened without naming
+    /// one runs its unqualified statements against a database of its own, which no client
+    /// can name and no listing shows.
+    #[must_use]
+    pub fn database_names(&self) -> Vec<String> {
+        self.lock()
+            .open
+            .keys()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this instance holds the database `name`.
+    #[must_use]
+    pub fn has_database(&self, name: &str) -> bool {
+        !name.is_empty() && resolve(&self.lock().open, name).is_some()
+    }
+
+    /// Create the database `name` empty, and answer whether it was created — `false`
+    /// where the instance already held it, which is what makes an `IF NOT EXISTS` create a
+    /// no-op rather than a second database.
+    pub fn create_database(&self, name: &str) -> Result<bool, EngineError> {
+        let mut databases = self.lock();
+        if resolve(&databases.open, name).is_some() {
+            return Ok(false);
+        }
+        admit_another_database(&databases)?;
+        databases
+            .open
+            .insert(name.to_string(), open_confined_database()?);
+        Ok(true)
+    }
+
+    /// Drop the database `name` with every table in it, and answer whether it was there.
+    pub fn drop_database(&self, name: &str) -> bool {
+        let mut databases = self.lock();
+        match resolve(&databases.open, name) {
+            Some(name) => databases.open.remove(&name).is_some(),
+            None => false,
+        }
+    }
+
+    /// Roll back the transactions the sessions of this instance left open, if any.
+    ///
+    /// The sessions on one database share its connection, so a `BEGIN` that is never
+    /// committed would otherwise hold that database's uncommitted rows for whoever
     /// connects next. A wire handler calls this when a session ends — including when the
     /// session is severed by a reboot or a stop — which is the engine behaviour a client
     /// sees: work it never committed is gone, work it committed stays.
     pub fn rollback_open_transaction(&self) {
-        let conn = self.lock();
-        if !conn.is_autocommit() {
-            let _ = conn.execute_batch("ROLLBACK");
+        for conn in self.lock().open.values() {
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
         }
     }
+}
+
+/// The name `name` names among `databases`, which is the one it matches ignoring case:
+/// the engines resolve a database name case-insensitively on the platforms RDS runs them
+/// on, so `USE APPDB` reaches the database `appdb` rather than opening a second one.
+fn resolve(databases: &BTreeMap<String, Connection>, name: &str) -> Option<String> {
+    databases
+        .keys()
+        .find(|known| known.eq_ignore_ascii_case(name))
+        .cloned()
+}
+
+/// Whether one more database may be opened on this instance; see
+/// [`MAX_DATABASES_PER_INSTANCE`].
+fn admit_another_database(databases: &Databases) -> Result<(), EngineError> {
+    if databases.open.len() >= MAX_DATABASES_PER_INSTANCE {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!(
+                "this endpoint serves at most {MAX_DATABASES_PER_INSTANCE} databases per DB \
+                 instance"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The connection the database `name` runs on, opened empty on first use.
+///
+/// A name reaches this only after the wire layer has admitted it (a login, a `USE`, the
+/// DDL that created it), so opening on first use is what gives the instance's own
+/// databases — the one `DBName` named, the engine's default, a MySQL system schema — a
+/// database each without the engine having to be told their names when it starts.
+fn connection<'a>(
+    databases: &'a mut Databases,
+    name: &str,
+) -> Result<&'a mut Connection, EngineError> {
+    let key = resolve(&databases.open, name).unwrap_or_else(|| name.to_string());
+    if !databases.open.contains_key(&key) {
+        admit_another_database(databases)?;
+        databases.open.insert(key.clone(), open_confined_database()?);
+    }
+    databases
+        .open
+        .get_mut(&key)
+        .ok_or_else(|| EngineError::new(EngineErrorKind::Internal, "the database is not open"))
+}
+
+/// One empty in-memory database, with every bound above in force before any client
+/// statement can reach it.
+fn open_confined_database() -> Result<Connection, EngineError> {
+    let conn = Connection::open_in_memory().map_err(unavailable)?;
+    // Temp database in memory FIRST, so naming `temp` below opens it in memory and
+    // not as a host file; then the page ceiling on both schemas.
+    conn.pragma_update(None, "temp_store", TEMP_STORE_MEMORY)
+        .map_err(unavailable)?;
+    conn.pragma_update(None, "cache_size", MAX_PAGE_CACHE_KIB)
+        .map_err(unavailable)?;
+    for schema in CAPPED_SCHEMAS {
+        conn.pragma_update(Some(schema), "max_page_count", MAX_DATABASE_PAGES)
+            .map_err(unavailable)?;
+    }
+    for (limit, value) in [
+        // No second database, ever: this also takes `VACUUM INTO` away, which the
+        // engine implements by attaching its output file.
+        (Limit::SQLITE_LIMIT_ATTACHED, 0),
+        (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES),
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES),
+        (Limit::SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPRESSION_DEPTH),
+        (Limit::SQLITE_LIMIT_COMPOUND_SELECT, MAX_COMPOUND_SELECT),
+        (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, MAX_BOUND_PARAMETERS),
+    ] {
+        conn.set_limit(limit, value).map_err(unavailable)?;
+    }
+    for (config, enabled) in [
+        (rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
+        (rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
+    ] {
+        conn.set_db_config(config, enabled).map_err(unavailable)?;
+    }
+    // Installed LAST, so the settings above — themselves pragmas — are not refused
+    // by it.
+    conn.authorizer(Some(confine_to_the_instance));
+    Ok(conn)
 }
 
 /// An engine that could not be brought up or configured at all.
@@ -391,18 +609,23 @@ fn run_statement(
 
 /// Classify what the engine refused, keeping ITS message.
 fn from_engine(error: rusqlite::Error) -> EngineError {
+    // A statement the engine could not READ at all arrives as its own variant, carrying
+    // the engine's bare message and where in the statement it stopped — which is what a
+    // wire needs to word its own parse error. Classified by the failure inside it, so it
+    // is not reported as an engine that broke.
+    if let rusqlite::Error::SqlInputError {
+        error: failure,
+        msg,
+        offset,
+        ..
+    } = &error
+    {
+        return EngineError::new(failure_kind(failure), msg.clone())
+            .at_offset(usize::try_from(*offset).ok());
+    }
     let message = engine_message(&error);
     let kind = match &error {
-        rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
-            rusqlite::ErrorCode::ConstraintViolation => constraint_kind(failure.extended_code),
-            rusqlite::ErrorCode::OperationInterrupted => EngineErrorKind::Cancelled,
-            rusqlite::ErrorCode::AuthorizationForStatementDenied => {
-                EngineErrorKind::InsufficientPrivilege
-            }
-            rusqlite::ErrorCode::TypeMismatch => EngineErrorKind::DataError,
-            rusqlite::ErrorCode::Unknown => EngineErrorKind::Syntax,
-            _ => EngineErrorKind::Internal,
-        },
+        rusqlite::Error::SqliteFailure(failure, _) => failure_kind(failure),
         rusqlite::Error::InvalidParameterCount(..) | rusqlite::Error::InvalidQuery => {
             EngineErrorKind::Syntax
         }
@@ -421,6 +644,20 @@ fn from_engine(error: rusqlite::Error) -> EngineError {
         kind
     };
     EngineError::new(kind, message)
+}
+
+/// What one engine failure code means, in terms both wires can render.
+fn failure_kind(failure: &rusqlite::ffi::Error) -> EngineErrorKind {
+    match failure.code {
+        rusqlite::ErrorCode::ConstraintViolation => constraint_kind(failure.extended_code),
+        rusqlite::ErrorCode::OperationInterrupted => EngineErrorKind::Cancelled,
+        rusqlite::ErrorCode::AuthorizationForStatementDenied => {
+            EngineErrorKind::InsufficientPrivilege
+        }
+        rusqlite::ErrorCode::TypeMismatch => EngineErrorKind::DataError,
+        rusqlite::ErrorCode::Unknown => EngineErrorKind::Syntax,
+        _ => EngineErrorKind::Internal,
+    }
 }
 
 /// Which constraint the engine refused the row for, from its extended result code.

@@ -35,7 +35,7 @@ use super::tls_probe::{HandshakeRecord, HandshakeTap};
 use super::wire_session::{
     self, LoginRefusal, PasswordProof, SessionContext, SessionFacts, TlsFacts,
 };
-use super::EngineWire;
+use super::{server_statements, EngineWire};
 
 /// How many bytes one packet may carry. The protocol allows 16 MiB per packet; this is
 /// what this endpoint serves, so a length prefix cannot make it allocate without bound.
@@ -215,13 +215,22 @@ async fn serve_session(
         requires_secure_transport: facts.requires_secure_transport,
         settings: std::collections::BTreeMap::new(),
         databases: facts.databases.clone(),
+        endpoint_host: facts.endpoint_host.clone(),
     };
     let database_handle = Arc::clone(&context.database);
     let _session = Session {
         database: Arc::clone(&database_handle),
     };
     let deprecate_eof = client_capabilities & CLIENT_DEPRECATE_EOF != 0;
-    write_ok(&mut conn, sequence.wrapping_add(1), &database_handle, 0, 0).await?;
+    write_ok(
+        &mut conn,
+        sequence.wrapping_add(1),
+        &database_handle,
+        &session_facts.database,
+        0,
+        0,
+    )
+    .await?;
 
     // 5. The command phase.
     let mut generation = context.generation.clone();
@@ -258,10 +267,17 @@ async fn serve_session(
             // COM_INIT_DB.
             0x02 => {
                 let named = String::from_utf8_lossy(argument).into_owned();
-                if facts.databases.contains(&named) {
+                if server_statements::database_exists(&database_handle, &session_facts, &named) {
                     session_facts.database = named;
-                    write_ok(&mut conn, sequence.wrapping_add(1), &database_handle, 0, 0)
-                        .await?;
+                    write_ok(
+                        &mut conn,
+                        sequence.wrapping_add(1),
+                        &database_handle,
+                        &session_facts.database,
+                        0,
+                        0,
+                    )
+                    .await?;
                 } else {
                     write_error(
                         &mut conn,
@@ -288,7 +304,15 @@ async fn serve_session(
             }
             // COM_PING.
             0x0e => {
-                write_ok(&mut conn, sequence.wrapping_add(1), &database_handle, 0, 0).await?;
+                write_ok(
+                    &mut conn,
+                    sequence.wrapping_add(1),
+                    &database_handle,
+                    &session_facts.database,
+                    0,
+                    0,
+                )
+                .await?;
             }
             // Every other command — the prepared-statement protocol, the replication
             // commands, `COM_CHANGE_USER` — is one this endpoint does not serve, and the
@@ -440,17 +464,30 @@ async fn serve_query(
     if let Some(database) = answer.database_changed.clone() {
         facts.database = database;
     }
+    // A statement that created or dropped a schema changed what this session may name.
+    if answer.databases_changed {
+        facts.databases = database.database_names();
+    }
     if answer.result.columns.is_empty() {
         return write_ok(
             conn,
             sequence,
             database,
+            &facts.database,
             answer.result.affected,
             answer.result.last_insert_id,
         )
         .await;
     }
-    write_result_set(conn, sequence, database, &answer.result, deprecate_eof).await
+    write_result_set(
+        conn,
+        sequence,
+        database,
+        &facts.database,
+        &answer.result,
+        deprecate_eof,
+    )
+    .await
 }
 
 /// A result set in the text protocol: the column count, one definition per column, the
@@ -459,6 +496,7 @@ async fn write_result_set(
     conn: &mut ::emulator_server::ListenerConn,
     sequence: u8,
     database: &Arc<InstanceDatabase>,
+    name: &str,
     result: &super::sql_engine::ResultSet,
     deprecate_eof: bool,
 ) -> std::io::Result<()> {
@@ -476,7 +514,7 @@ async fn write_result_set(
     }
     if !deprecate_eof {
         sequence = sequence.wrapping_add(1);
-        write_packet(conn, sequence, &eof_packet(database)).await?;
+        write_packet(conn, sequence, &eof_packet(database, name)).await?;
     }
     for row in &result.rows {
         let mut payload = Vec::new();
@@ -491,10 +529,10 @@ async fn write_result_set(
     }
     sequence = sequence.wrapping_add(1);
     if deprecate_eof {
-        let payload = ok_payload(database, 0, 0, true);
+        let payload = ok_payload(database, name, 0, 0, true);
         write_packet(conn, sequence, &payload).await?;
     } else {
-        write_packet(conn, sequence, &eof_packet(database)).await?;
+        write_packet(conn, sequence, &eof_packet(database, name)).await?;
     }
     conn.flush().await
 }
@@ -670,6 +708,13 @@ fn statement_error(kind: EngineErrorKind) -> (u16, &'static str) {
         // which is not one of the server's own numbered conditions.
         EngineErrorKind::LimitExceeded => (1105, "HY000"),
         EngineErrorKind::InsufficientPrivilege => (1227, "42000"),
+        // `ER_TABLE_EXISTS_ERROR` and `ER_ROW_IS_REFERENCED`: the general number of each
+        // class, which a statement whose own condition names a narrower one overrides
+        // ([`EngineError::with_mysql_error`]).
+        EngineErrorKind::DuplicateObject => (1050, "42S01"),
+        EngineErrorKind::ObjectInUse => (1217, "23000"),
+        // `ER_NOT_SUPPORTED_YET`.
+        EngineErrorKind::FeatureNotSupported => (1235, "42000"),
         EngineErrorKind::Internal => (1105, "HY000"),
     }
 }
@@ -680,7 +725,9 @@ async fn write_engine_error(
     sequence: u8,
     error: &EngineError,
 ) -> std::io::Result<()> {
-    let (number, state) = statement_error(error.kind);
+    let (number, state) = error
+        .mysql_error
+        .unwrap_or_else(|| statement_error(error.kind));
     write_error(conn, sequence, number, state, &error.message).await
 }
 
@@ -706,10 +753,11 @@ async fn write_ok(
     conn: &mut ::emulator_server::ListenerConn,
     sequence: u8,
     database: &Arc<InstanceDatabase>,
+    name: &str,
     affected: u64,
     last_insert_id: i64,
 ) -> std::io::Result<()> {
-    let payload = ok_payload(database, affected, last_insert_id, false);
+    let payload = ok_payload(database, name, affected, last_insert_id, false);
     write_packet(conn, sequence, &payload).await?;
     conn.flush().await
 }
@@ -718,6 +766,7 @@ async fn write_ok(
 /// `CLIENT_DEPRECATE_EOF`.
 fn ok_payload(
     database: &Arc<InstanceDatabase>,
+    name: &str,
     affected: u64,
     last_insert_id: i64,
     ends_result_set: bool,
@@ -725,22 +774,23 @@ fn ok_payload(
     let mut payload = vec![if ends_result_set { 0xfe } else { 0x00 }];
     put_length_encoded(&mut payload, affected);
     put_length_encoded(&mut payload, last_insert_id.max(0).unsigned_abs());
-    payload.extend_from_slice(&status_flags(database).to_le_bytes());
+    payload.extend_from_slice(&status_flags(database, name).to_le_bytes());
     payload.extend_from_slice(&0u16.to_le_bytes());
     payload
 }
 
 /// One `EOF` packet, for a client that did not ask for `CLIENT_DEPRECATE_EOF`.
-fn eof_packet(database: &Arc<InstanceDatabase>) -> Vec<u8> {
+fn eof_packet(database: &Arc<InstanceDatabase>, name: &str) -> Vec<u8> {
     let mut payload = vec![0xfeu8];
     payload.extend_from_slice(&0u16.to_le_bytes());
-    payload.extend_from_slice(&status_flags(database).to_le_bytes());
+    payload.extend_from_slice(&status_flags(database, name).to_le_bytes());
     payload
 }
 
-/// The session's status flags: autocommit, and whether a transaction is open.
-fn status_flags(database: &Arc<InstanceDatabase>) -> u16 {
-    if database.in_transaction() {
+/// The session's status flags: autocommit, and whether a transaction is open on the
+/// database it is connected to.
+fn status_flags(database: &Arc<InstanceDatabase>, name: &str) -> u16 {
+    if database.in_transaction(name) {
         SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
     } else {
         SERVER_STATUS_AUTOCOMMIT

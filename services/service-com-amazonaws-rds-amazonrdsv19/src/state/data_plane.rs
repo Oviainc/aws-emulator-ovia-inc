@@ -22,10 +22,13 @@
 //!
 //! * this module — the endpoint record the store holds per instance, which engine speaks
 //!   which wire, and the facts a session is admitted against ([`InstanceFacts`]);
-//! * [`sql_engine`] — the in-process SQLite database each instance's statements run
-//!   against;
+//! * [`sql_engine`] — the in-process SQLite database each of an instance's databases runs
+//!   its statements against;
 //! * [`wire_session`] — what is shared by the two wires: the admission decision, the
 //!   server commands (`SHOW`, `SET`) and the session values a statement can read;
+//! * [`server_statements`] — the statements the server answers out of the instance's own
+//!   catalog: installing an extension, creating a database, opening and ending a
+//!   transaction;
 //! * [`pg_wire`] and [`mysql_wire`] — the server half of each protocol.
 //!
 //! The endpoint is the RESOURCE: dropping the stored [`DbEngineEndpoint`] closes the port
@@ -42,6 +45,7 @@ use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 
 pub mod mysql_wire;
 pub mod pg_wire;
+pub mod server_statements;
 pub mod sql_engine;
 pub mod tls_probe;
 pub mod wire_session;
@@ -115,7 +119,7 @@ pub struct DbEngineEndpoint {
     pub endpoint: ServedEndpoint,
     /// Which protocol the listener speaks.
     pub wire: EngineWire,
-    /// The instance's database, shared with every session on the listener.
+    /// The instance's databases, shared with every session on the listener.
     database: Arc<sql_engine::InstanceDatabase>,
     /// The engine's run: a session serves only while the value it started under is
     /// current, so bumping it severs every live session (a reboot, a stop).

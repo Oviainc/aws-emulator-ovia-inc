@@ -21,7 +21,7 @@ use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use tokio::sync::watch;
 
 use super::sql_engine::{Cell, ColumnInfo, EngineError, EngineErrorKind, InstanceDatabase, ResultSet};
-use super::EngineWire;
+use super::{server_statements, EngineWire};
 use crate::state::ComAmazonawsRdsAmazonrdsv19State;
 
 /// How many bytes of SQL one statement may carry, matching the engine's own statement
@@ -193,6 +193,12 @@ impl SessionContext {
                 databases.extend(MYSQL_SYSTEM_DATABASES.iter().map(|name| (*name).to_string()));
             }
         }
+        // The databases the INSTANCE comes with are created in its engine once, here,
+        // because this is where the record that names them is read. After that the engine
+        // is what says which databases the instance has, so one a client created with
+        // `CREATE DATABASE` is there for this session too and one it dropped stays gone.
+        self.database.seed(&databases);
+        let databases = self.database.database_names();
         let default_database = match wire {
             EngineWire::Postgres => record
                 .db_name
@@ -406,6 +412,8 @@ pub struct SessionFacts {
     pub settings: BTreeMap<String, String>,
     /// The databases this instance has, which is what a `USE` is resolved against.
     pub databases: Vec<String>,
+    /// The host the instance's listener is bound to, which is the host a refusal names.
+    pub endpoint_host: String,
 }
 
 impl SessionFacts {
@@ -501,16 +509,66 @@ pub struct StatementAnswer {
     /// The database this statement moved the session to (`USE`), which the caller writes
     /// back the same way.
     pub database_changed: Option<String>,
+    /// Whether this statement changed WHICH DATABASES the instance has, so the caller
+    /// reads the list again onto its [`SessionFacts`].
+    pub databases_changed: bool,
+    /// What the server has to say about the statement beside its answer: the notices and
+    /// warnings PostgreSQL sends before a `CommandComplete`.
+    pub notices: Vec<WireNotice>,
+}
+
+/// One thing the server says about a statement without refusing it: a PostgreSQL
+/// `NoticeResponse`, which carries the same severity, code and sentence an error does.
+#[derive(Debug, Clone)]
+pub struct WireNotice {
+    /// `NOTICE` or `WARNING`.
+    pub severity: &'static str,
+    /// The SQLSTATE the condition carries (`00000` where it is merely successful).
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl WireNotice {
+    /// A `NOTICE`: the server did something the client did not ask about.
+    #[must_use]
+    pub fn notice(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: "NOTICE",
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A `WARNING`: the statement succeeded but not as the client assumed.
+    #[must_use]
+    pub fn warning(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: "WARNING",
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl StatementAnswer {
-    fn new(verb: impl Into<String>, result: ResultSet) -> Self {
+    /// What one statement answers with.
+    #[must_use]
+    pub fn new(verb: impl Into<String>, result: ResultSet) -> Self {
         Self {
             verb: verb.into(),
             result,
             setting_changed: None,
             database_changed: None,
+            databases_changed: false,
+            notices: Vec::new(),
         }
+    }
+
+    /// The same answer, with one more thing the server says about it.
+    #[must_use]
+    pub fn with_notice(mut self, notice: WireNotice) -> Self {
+        self.notices.push(notice);
+        self
     }
 }
 
@@ -547,13 +605,83 @@ pub fn run_statement(
         return Ok(StatementAnswer::new(String::new(), ResultSet::default()));
     }
     let words = leading_words(&tokens, 3);
-    if let Some(answer) = server_command(facts, &words, &tokens)? {
+    if let Some(answer) = server_command(database, facts, &words, &tokens)? {
         return Ok(answer);
     }
     let verb = statement_verb(&words);
+    // Where the statement's own names put it, and the statement as the engine reads it.
+    let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
     let prepared = render_for_engine(facts, &stream);
-    let result = database.execute(&prepared, params)?;
+    let result = database
+        .execute(&target, &prepared, params)
+        .map_err(|error| {
+            server_statements::as_the_engine_words_it(facts.wire, &prepared, error)
+        })?;
     Ok(StatementAnswer::new(verb, result))
+}
+
+/// Which DATABASE a statement runs against, and the statement with the qualifiers that
+/// said so removed.
+///
+/// A database is a namespace on both engines, and a client names a table in another one by
+/// qualifying it: `<database>.<table>`. So the qualifier is what SELECTS the database the
+/// statement runs against — this server resolves it the way the engines do, and the
+/// statement the engine is then handed names the table inside that database. A statement
+/// with no qualifier runs against the database the session is on (its login, its `USE`).
+///
+/// A statement whose qualifiers name SEVERAL databases is one this endpoint does not
+/// serve: the databases are separate, so it is refused as the endpoint's own limit rather
+/// than answered over one of them.
+fn resolve_qualifiers(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    stream: &[Token],
+) -> Result<(String, Vec<Token>), EngineError> {
+    let names = database.database_names();
+    let mut rendered = Vec::with_capacity(stream.len());
+    let mut target: Option<String> = None;
+    // A word that FOLLOWS a period is the thing being qualified (`widgets.id`), never a
+    // qualifier itself.
+    let mut after_period = false;
+    let mut index = 0usize;
+    while index < stream.len() {
+        let token = &stream[index];
+        if let (false, Token::Word(word)) = (after_period, token) {
+            let qualifier = names
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(&word.value));
+            if let Some(qualifier) = qualifier {
+                let period = next_significant(stream, index + 1)
+                    .filter(|at| matches!(stream.get(*at), Some(Token::Period)));
+                let qualified = period
+                    .and_then(|at| next_significant(stream, at + 1))
+                    .is_some_and(|at| matches!(stream.get(at), Some(Token::Word(_))));
+                if let (Some(period), true) = (period, qualified) {
+                    if target
+                        .as_deref()
+                        .is_some_and(|chosen| !chosen.eq_ignore_ascii_case(qualifier))
+                    {
+                        return Err(EngineError::new(
+                            EngineErrorKind::LimitExceeded,
+                            "this endpoint serves a statement over one database at a time",
+                        ));
+                    }
+                    target = Some(qualifier.clone());
+                    // The qualifier and the period are what selected the database; what
+                    // the engine is handed is the name inside it.
+                    index = period + 1;
+                    after_period = true;
+                    continue;
+                }
+            }
+        }
+        if !matches!(token, Token::Whitespace(_)) {
+            after_period = matches!(token, Token::Period);
+        }
+        rendered.push(token.clone());
+        index += 1;
+    }
+    Ok((target.unwrap_or_else(|| facts.database.clone()), rendered))
 }
 
 /// The columns a statement would produce, as the engine reports them for it.
@@ -576,11 +704,17 @@ pub fn describe_statement(
         .cloned()
         .collect();
     let words = leading_words(&tokens, 3);
-    if matches!(server_command(facts, &words, &tokens), Ok(Some(_)) | Err(_)) {
+    if matches!(
+        server_command(database, facts, &words, &tokens),
+        Ok(Some(_)) | Err(_)
+    ) {
         return Vec::new();
     }
+    let Ok((target, stream)) = resolve_qualifiers(database, facts, &stream) else {
+        return Vec::new();
+    };
     database
-        .describe(&render_for_engine(facts, &stream))
+        .describe(&target, &render_for_engine(facts, &stream))
         .unwrap_or_default()
 }
 
@@ -588,12 +722,19 @@ pub fn describe_statement(
 ///
 /// `None` means the statement is the engine's to run.
 fn server_command(
+    database: &InstanceDatabase,
     facts: &SessionFacts,
     words: &[String],
     tokens: &[Token],
 ) -> Result<Option<StatementAnswer>, EngineError> {
     let first = words.first().map(String::as_str).unwrap_or_default();
     let second = words.get(1).map(String::as_str).unwrap_or_default();
+    // Opening and ending a transaction: what the server decides is whether the ENGINE is
+    // asked to open or end one, which is not the same question on a session that has none
+    // open.
+    if let Some(answer) = server_statements::transaction_control(database, facts, words)? {
+        return Ok(Some(answer));
+    }
     match (facts.wire, first, second) {
         // "ALTER SYSTEM is used for changing server configuration parameters across the
         // entire database cluster ... only superusers can change configuration
@@ -602,6 +743,20 @@ fn server_command(
             EngineErrorKind::InsufficientPrivilege,
             "must be superuser to execute ALTER SYSTEM command".to_string(),
         )),
+        // The server objects a statement class of the engine's own creates: an extension
+        // of a PostgreSQL database, and a database of the instance.
+        (EngineWire::Postgres, "CREATE", "EXTENSION") => {
+            server_statements::create_extension(database, facts, tokens).map(Some)
+        }
+        (EngineWire::Postgres, "DROP", "EXTENSION") => {
+            server_statements::drop_extension(database, facts, tokens).map(Some)
+        }
+        (_, "CREATE", "DATABASE") | (EngineWire::MySql, "CREATE", "SCHEMA") => {
+            server_statements::create_database(database, facts, words, tokens).map(Some)
+        }
+        (_, "DROP", "DATABASE") | (EngineWire::MySql, "DROP", "SCHEMA") => {
+            server_statements::drop_database(database, facts, words, tokens).map(Some)
+        }
         (EngineWire::Postgres, "SHOW", _) => Ok(Some(postgres_show(facts, tokens)?)),
         (EngineWire::Postgres, "SET", _) => Ok(Some(postgres_set(facts, tokens)?)),
         (EngineWire::MySql, "SHOW", _) => mysql_show(facts, words, tokens).map(Some),
@@ -622,11 +777,7 @@ fn server_command(
                 .skip(1)
                 .map(|token| token.to_string().replace(['`', '"'], ""))
                 .collect();
-            if facts
-                .databases
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&named))
-            {
+            if server_statements::database_exists(database, facts, &named) {
                 let mut answer = StatementAnswer::new("USE", ResultSet::default());
                 answer.database_changed = Some(named);
                 Ok(Some(answer))
