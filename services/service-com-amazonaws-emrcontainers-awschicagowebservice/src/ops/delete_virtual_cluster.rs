@@ -179,9 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if current_state != crate::state::CLUSTER_RUNNING {
             return Err(DeleteVirtualClusterErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Virtual cluster {} is in state {current_state} and cannot be deleted",
-                        input.id
+                    // The same state-refusal wording every call this service refuses for a
+                    // cluster's state carries
+                    // ([`crate::state::virtual_cluster_state_refusal_message`]).
+                    message: Some(crate::state::virtual_cluster_state_refusal_message(
+                        &current_state,
+                        Self::NAME,
                     )),
                 },
             )

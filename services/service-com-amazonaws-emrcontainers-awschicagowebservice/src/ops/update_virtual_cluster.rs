@@ -192,9 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if current_state != crate::state::CLUSTER_RUNNING {
             return Err(UpdateVirtualClusterErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Virtual cluster {} is in state {current_state} and cannot be updated",
-                        input.id
+                    // This service's wording for a cluster whose state forbids the call
+                    // ([`crate::state::virtual_cluster_state_refusal_message`]): the state
+                    // that blocked it and the operation it blocked, and no cluster id.
+                    message: Some(crate::state::virtual_cluster_state_refusal_message(
+                        &current_state,
+                        Self::NAME,
                     )),
                 },
             )

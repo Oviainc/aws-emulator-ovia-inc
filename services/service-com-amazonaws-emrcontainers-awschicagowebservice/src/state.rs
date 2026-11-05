@@ -865,6 +865,41 @@ impl ResourceKind {
     }
 }
 
+/// The `message` a refusal carries when the request names a virtual cluster that IS
+/// stored but whose `VirtualClusterState` (RUNNING, TERMINATING, TERMINATED, ARRESTED —
+/// smithy_query: shape `VirtualClusterState`) forbids the call:
+/// `Virtual cluster state <state> is not valid to create resource <Operation>.`
+///
+/// The variable parts are the cluster's CURRENT state and the name of the operation being
+/// refused; the cluster's own id is not part of this wording, which is what separates it
+/// from a not-found refusal ([`ResourceKind::not_found_message`]) — a state refusal says
+/// which state blocked the call, not which resource was asked for.
+///
+/// Every operation of this service that refuses a call because the cluster's state leaves
+/// it nothing to do takes its wording from here, so the two cannot drift apart.
+pub fn virtual_cluster_state_refusal_message(state: &str, operation: &str) -> String {
+    bounded_message(format!(
+        "Virtual cluster state {state} is not valid to create resource {operation}."
+    ))
+}
+
+/// The `message` `CancelJobRun` carries for a run whose `JobRunState` is one a
+/// cancellation can no longer reach ([`job_state_is_terminal`]): `Job run <id> is not in a
+/// cancellable state`.
+///
+/// The only variable part is the job run id the request named, held to what the member
+/// carrying the message can hold ([`message_about`]); the run's current state is NOT
+/// interpolated — a state refusal of a job run reports that the run is past cancelling,
+/// not which terminal state it reached (a reader that wants the state calls
+/// `DescribeJobRun`).
+pub fn job_run_not_cancellable_message(identifier: &str) -> String {
+    message_about(
+        "Job run ",
+        identifier,
+        " is not in a cancellable state",
+    )
+}
+
 /// The resource a tagging call's `resourceArn` (an `RsiArn`) names.
 ///
 /// `RsiArn`'s pattern (`^arn:(aws[a-zA-Z0-9-]*):emr-containers:.+:(\d{12}):/virtualclusters/.+$`)

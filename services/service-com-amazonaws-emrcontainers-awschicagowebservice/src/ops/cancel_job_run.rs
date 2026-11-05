@@ -173,10 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::job_state_is_terminal(&current_state) {
             return Err(CancelJobRunErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Job run {} is in state {current_state} and cannot be cancelled",
-                        input.id
-                    )),
+                    // This service's wording for a job run a cancellation can no longer
+                    // reach ([`crate::state::job_run_not_cancellable_message`]): the
+                    // request's id is the only part of it that varies.
+                    message: Some(crate::state::job_run_not_cancellable_message(&input.id)),
                 },
             )
             .into());

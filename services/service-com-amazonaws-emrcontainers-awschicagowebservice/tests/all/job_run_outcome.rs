@@ -172,7 +172,16 @@ fn attempts_made(job_run: &Value, case: &str) -> Option<i64> {
 /// The deadline is the span the service owes a run's outcome plus margin for a loaded
 /// machine: a run that is still non-terminal past it is the defect this suite is about —
 /// a poll-until-terminal loop that never ends.
-async fn poll_until_terminal(emr: &Emr, case: &str, cluster: &str, run: &str) -> Value {
+///
+/// `pub(crate)` because [`crate::state_transition_refusal_wording`] waits for the same
+/// outcome before it asks what the refusal of a finished run says, so the test binary
+/// carries ONE definition of "wait until the run has settled".
+pub(crate) async fn poll_until_terminal(
+    emr: &Emr,
+    case: &str,
+    cluster: &str,
+    run: &str,
+) -> Value {
     let deadline = Instant::now() + state::JOB_OUTCOME_SPAN + Duration::from_secs(20);
     loop {
         let job_run = described_run(emr, case, cluster, run).await;

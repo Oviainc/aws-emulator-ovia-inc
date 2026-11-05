@@ -75,6 +75,8 @@ mod start_job_run_job_template;
 mod start_job_run_required_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/state_transition_refusal_wording.rs"]
+mod state_transition_refusal_wording;
 #[path = "all/virtual_cluster_job_run_loop.rs"]
 mod virtual_cluster_job_run_loop;
 #[path = "all/virtual_cluster_listing.rs"]
