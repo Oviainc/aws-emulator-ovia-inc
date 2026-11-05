@@ -59,6 +59,7 @@ fn launch(name: &str, fleets: Value) -> Value {
     json!({
         "Name": name,
         "ReleaseLabel": "emr-6.15.0",
+        "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
         "Instances": { "KeepJobFlowAliveWhenNoSteps": true, "InstanceFleets": fleets },
     })
 }

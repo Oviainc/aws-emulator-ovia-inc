@@ -37,6 +37,21 @@ const ACTION_ON_FAILURE: [&str; 4] = [
 
 static NULL: Value = Value::Null;
 
+/// The EC2 instance profile every `RunJobFlow` below names as its `JobFlowRole`.
+///
+/// `RunJobFlow` requires one — "also called instance profile and Amazon EC2 role. An IAM
+/// role for an Amazon EMR cluster. The Amazon EC2 instances of the cluster assume this
+/// role" (`RunJobFlow$JobFlowRole` doc) — so a launch that is meant to SUCCEED names it.
+/// This suite carries only EMR, so there is no IAM here to resolve it against; the
+/// IAM-grounded half of that rule lives in
+/// `core/router/tests/all/emr_job_flow_role_instance_profile.rs`.
+pub(crate) const INSTANCE_PROFILE: &str = "EMR_EC2_DefaultRole";
+
+/// The service role every `RunJobFlow` below names, which the launch requires too — "the
+/// IAM role that Amazon EMR assumes in order to access Amazon Web Services resources on
+/// your behalf" (`RunJobFlow$ServiceRole` doc).
+pub(crate) const SERVICE_ROLE: &str = "EMR_DefaultRole";
+
 /// The access key id the harness's requests PRESENT by default, so a suite that reads
 /// this service's audit stream can attribute a call to it. Request authentication is off
 /// in these tests; this is the identity a request carries, not a verified one.
@@ -198,6 +213,7 @@ pub(crate) fn step_config(name: &str, jar: &str, args: Value, extra: Value) -> V
 pub(crate) fn minimal_request(name: &str) -> Value {
     json!({
         "Name": name,
+        "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
         "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge" },
     })
 }
@@ -206,6 +222,7 @@ pub(crate) fn minimal_request(name: &str) -> Value {
 pub(crate) fn kept_alive_request(name: &str) -> Value {
     json!({
         "Name": name,
+        "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
         "Instances": {
             "InstanceCount": 2,
             "MasterInstanceType": "m5.xlarge",
@@ -279,6 +296,7 @@ async fn run_job_flow_persists_each_cluster_and_describe_cluster_reads_it_back()
                 "Name": "fleet cluster",
                 "ReleaseLabel": "emr-7.1.0",
                 "AutoScalingRole": "EMR_AutoScaling_DefaultRole",
+                "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
                 "ScaleDownBehavior": "TERMINATE_AT_TASK_COMPLETION",
                 "CustomAmiId": "ami-0123456789abcdef0",
                 "StepConcurrencyLevel": 256,
@@ -312,6 +330,7 @@ async fn run_job_flow_persists_each_cluster_and_describe_cluster_reads_it_back()
                 "Name": "legacy",
                 "AmiVersion": "2.4.2",
                 "VisibleToAllUsers": false,
+                "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
                 "Instances": {
                     "InstanceCount": 2,
                     "MasterInstanceType": "m1.small",
@@ -589,6 +608,7 @@ async fn submitted_steps_are_read_back_as_submitted_newest_first() {
     let second_cluster = emr
         .run_job_flow(json!({
             "Name": "stepped at launch",
+            "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
             "Steps": with_cluster,
@@ -768,6 +788,7 @@ async fn list_steps_honours_its_filters_and_paginates_on_marker() {
     let cluster_id = emr
         .run_job_flow(json!({
             "Name": "paged",
+            "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
             "Steps": steps,
@@ -1097,6 +1118,7 @@ async fn terminate_job_flows_shuts_each_named_cluster_down() {
     let protected = emr
         .run_job_flow(json!({
             "Name": "protected",
+            "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
             "Instances": {
                 "InstanceCount": 1,
                 "MasterInstanceType": "m5.xlarge",
@@ -1302,6 +1324,7 @@ async fn documented_limits_are_enforced_at_their_bounds() {
             "RunJobFlow",
             json!({
                 "Name": "both",
+                "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
                 "Instances": {
                     "InstanceGroups": [{
                         "InstanceRole": "MASTER",
@@ -1338,7 +1361,14 @@ async fn documented_limits_are_enforced_at_their_bounds() {
         ),
     ] {
         let (status, payload) = emr
-            .call("RunJobFlow", json!({ "Name": label, "Instances": instances }))
+            .call(
+                "RunJobFlow",
+                json!({
+                    "Name": label,
+                    "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
+                    "Instances": instances,
+                }),
+            )
             .await;
         assert_eq!(
             status, 200,
@@ -1389,6 +1419,7 @@ async fn documented_limits_are_enforced_at_their_bounds() {
     let cluster_id = emr
         .run_job_flow(json!({
             "Name": "nearly full",
+            "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
             "Steps": (0..255).map(|index| step_config(

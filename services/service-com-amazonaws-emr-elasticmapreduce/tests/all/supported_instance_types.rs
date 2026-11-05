@@ -634,6 +634,7 @@ async fn reading_the_catalog_changes_nothing() {
         json!({
             "Name": "catalog-is-not-account-state",
             "ReleaseLabel": release,
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
             "Instances": { "MasterInstanceType": "m5.xlarge", "InstanceCount": 1 },
         }),
     )

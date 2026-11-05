@@ -240,6 +240,13 @@ pub mod error_code {
     /// The code for a `ReleaseLabel` that names no release of the service's catalog
     /// ([`super::invalid_release_label_message`]).
     pub const INVALID_RELEASE_LABEL: &str = "INVALID_RELEASE_LABEL";
+
+    /// The code for a creation-date window whose beginning is after its end
+    /// ([`super::inverted_created_window_message`]). The code names the two members and
+    /// the order they were given in, so a client learns which pair of filters to swap
+    /// rather than only that the request was invalid.
+    pub const INVALID_DATES_CREATED_AFTER_AFTER_CREATED_BEFORE: &str =
+        "INVALID_DATES_CREATED_AFTER_AFTER_CREATED_BEFORE";
 }
 
 /// How a sentence that quotes an input member's value renders a value the request did
@@ -397,6 +404,47 @@ pub fn invalid_release_label(release_label: &str) -> InvalidRequestException {
     InvalidRequestException {
         error_code: Some(error_code::INVALID_RELEASE_LABEL.to_string()),
         message: Some(invalid_release_label_message(release_label)),
+    }
+}
+
+/// How a listing bounded by a CREATION-DATE window refuses a window whose beginning is
+/// after its end.
+///
+/// Recorded behavior for the text, which is entirely FIXED: Amazon EMR names the two
+/// members in the casing the wire uses for them and interpolates neither instant, so a
+/// caller matching the sentence recognises every inverted window the same way.
+pub fn inverted_created_window_message() -> String {
+    "createdAfter date cannot be after createdBefore date.".to_string()
+}
+
+/// The refusal a listing answers an inverted creation-date window with: that sentence
+/// under the inverted-window discriminator
+/// ([`error_code::INVALID_DATES_CREATED_AFTER_AFTER_CREATED_BEFORE`]).
+///
+/// The code is paired with the wording HERE, in the one place the wording is built, so
+/// no listing can answer the inverted-window sentence without its code.
+pub fn inverted_created_window() -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(
+            error_code::INVALID_DATES_CREATED_AFTER_AFTER_CREATED_BEFORE.to_string(),
+        ),
+        message: Some(inverted_created_window_message()),
+    }
+}
+
+/// Whether a creation-date window is one no cluster can fall inside: its beginning is
+/// strictly after its end.
+///
+/// A window is inverted only when the request bounds it at BOTH ends — one bound alone
+/// is open on the other side — and an instant equal at both ends is the single-instant
+/// window, which is satisfiable and therefore filtered rather than refused.
+pub fn is_inverted_window(
+    after: Option<&::aws_smithy_types::DateTime>,
+    before: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    match (after, before) {
+        (Some(after), Some(before)) => after.as_secs_f64() > before.as_secs_f64(),
+        _ => false,
     }
 }
 
@@ -1507,10 +1555,92 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The IAM roles every cluster launch has to name, as AWS names each in the sentence
+/// that refuses a launch carrying none of it.
+///
+/// Recorded behavior for each name: the EC2 role is named by the thing it IS ("also
+/// called instance profile and Amazon EC2 role", `RunJobFlow$JobFlowRole` doc), the
+/// service role by its member name. They are checked in the order a launch NEEDS them:
+/// the instance profile is required and then resolved against IAM, and the service role
+/// is required after that — the order Amazon EMR is recorded answering for a launch that
+/// names neither.
+pub mod required_cluster_role {
+    /// `RunJobFlow$JobFlowRole`, the profile the cluster's Amazon EC2 instances assume.
+    pub const INSTANCE_PROFILE: &str = "InstanceProfile";
+    /// `RunJobFlow$ServiceRole`, the role "Amazon EMR assumes in order to access Amazon
+    /// Web Services resources on your behalf" (`RunJobFlow$ServiceRole` doc).
+    pub const SERVICE_ROLE: &str = "ServiceRole";
+}
+
+/// What AWS answers when a cluster launch names none of an IAM role it requires: the
+/// role, named as AWS names it ([`required_cluster_role`]), then the fixed tail.
+///
+/// Recorded behavior for the text. Its one variable part is WHICH role is missing, taken
+/// from the request — nothing of the request's own values is interpolated, because a
+/// request that carried none of the role carried no value to state.
+pub fn required_cluster_role_message(role: &str) -> String {
+    format!("{role} is required for creating cluster.")
+}
+
+/// Whether a role member of a cluster launch names a role AT ALL.
+///
+/// A member the request omitted and the empty value its `@length(0..10280)` admits name
+/// no role alike: "The default role is EMR_EC2_DefaultRole. In order to use the default
+/// role, you must have already created it" (`RunJobFlow$JobFlowRole` doc) — naming no
+/// role does not select that default.
+pub fn names_a_cluster_role(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
 /// What AWS answers when a cluster launch names an EC2 instance profile that does
-/// not resolve: `Invalid InstanceProfile: <name>.`, built from the request.
+/// not resolve: `Invalid InstanceProfile: <name>.`, built from the request — the value
+/// the caller sent, so it is told which of its names resolved to nothing.
 pub fn invalid_instance_profile_message(job_flow_role: &str) -> String {
     format!("Invalid InstanceProfile: {job_flow_role}.")
+}
+
+/// What AWS answers when a cluster launch names an EC2 instance profile that EXISTS and
+/// that it cannot authorize: the fixed sentence and, as its one variable part, the ARN
+/// IAM holds that profile under.
+///
+/// Recorded behavior for the text. It carries no trailing stop: the ARN ends the
+/// sentence as AWS writes it.
+pub fn unauthorized_instance_profile_message(instance_profile_arn: &str) -> String {
+    format!("Failed to authorize instance profile {instance_profile_arn}")
+}
+
+/// The service principal the role an EC2 instance profile carries has to trust for the
+/// cluster's instances to assume it.
+///
+/// "The Amazon EC2 instances of the cluster assume this role"
+/// (`RunJobFlow$JobFlowRole` doc), and an instance assumes a role through its instance
+/// profile, so the role's trust policy has to admit Amazon EC2.
+const INSTANCE_PROFILE_PRINCIPAL: &str = "ec2.amazonaws.com";
+
+/// Why a cluster launch's `JobFlowRole` is one Amazon EMR will not launch with, and
+/// therefore WHICH refusal the launch is answered with.
+///
+/// The two are different error classes, so a client branching on the code learns which
+/// of the two it has to fix: a value that names no instance profile of this account is a
+/// malformed REQUEST, while a profile that EXISTS and cannot be authorized is an
+/// authorization failure for a request that was otherwise well formed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobFlowRoleRefusal {
+    /// The value names no instance profile this account holds
+    /// ([`invalid_instance_profile_message`]).
+    Invalid(String),
+    /// The instance profile exists and could not be authorized, with the sentence that
+    /// states it ([`unauthorized_instance_profile_message`]).
+    Unauthorized(String),
+}
+
+impl JobFlowRoleRefusal {
+    /// The sentence this refusal is stated in.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Invalid(message) | Self::Unauthorized(message) => message.clone(),
+        }
+    }
 }
 
 /// The instance profile NAME a `JobFlowRole` value denotes, or `None` when the
@@ -1531,11 +1661,19 @@ fn instance_profile_name(job_flow_role: &str) -> Option<&str> {
 }
 
 /// Amazon EMR resolves a cluster's `JobFlowRole` to a real EC2 instance profile
-/// when the cluster is LAUNCHED, and refuses the launch — writing no cluster —
-/// when that profile does not exist in this account.
+/// when the cluster is LAUNCHED, and refuses the launch — writing no cluster — when the
+/// value names no instance profile of this account, or when the profile it names cannot
+/// be authorized.
 ///
-/// `Some(message)` is that refusal, worded as AWS words it
-/// ([`invalid_instance_profile_message`]). `None` means the launch may proceed.
+/// `Some(refusal)` is that refusal, classed and worded as AWS words it
+/// ([`JobFlowRoleRefusal`]). `None` means the launch may proceed.
+///
+/// A profile is AUTHORIZED when it carries a role whose trust policy admits
+/// [`INSTANCE_PROFILE_PRINCIPAL`] — the one reading of a trust policy this tree has
+/// ([`service_common::iam_trust_policy::admits_service_principal`]) — because that is
+/// what lets the cluster's Amazon EC2 instances assume it. A profile carrying none, or
+/// one whose role trusts another principal, exists and cannot be authorized, which is a
+/// different refusal from a profile that does not exist at all.
 ///
 /// IAM is reached the way any emulated service reaches another: through the ONE
 /// in-process IAM client every service that resolves a caller-supplied IAM entity
@@ -1543,14 +1681,20 @@ fn instance_profile_name(job_flow_role: &str) -> Option<&str> {
 /// service crate. `None` therefore also covers the case where this emulator has no
 /// IAM to ask (a router with only this service mounted, say): nothing is then known
 /// about the profile, and a refusal has to be grounded in what IAM answered, never
-/// assumed.
+/// assumed — which is also why a trust document IAM holds and this cannot read refuses
+/// nothing.
 pub async fn instance_profile_violation(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     job_flow_role: &str,
-) -> Option<String> {
+) -> Option<JobFlowRoleRefusal> {
+    let invalid = || {
+        Some(JobFlowRoleRefusal::Invalid(
+            invalid_instance_profile_message(job_flow_role),
+        ))
+    };
     let Some(name) = instance_profile_name(job_flow_role) else {
-        return Some(invalid_instance_profile_message(job_flow_role));
+        return invalid();
     };
     let answer = ::service_common::iam_client::iam_client(ctx, region)
         .get_instance_profile()
@@ -1558,12 +1702,33 @@ pub async fn instance_profile_violation(
         .send()
         .await;
     match answer {
-        Ok(_) => None,
+        Ok(held) => {
+            let profile = held.instance_profile()?;
+            // A role whose trust document is absent or unreadable is no evidence either
+            // way, so it withholds the refusal rather than inventing one; a profile
+            // carrying NO role has nothing for an instance to assume, which is the
+            // refusal itself.
+            let trusts_instances = |role: &::aws_sdk_iam::types::Role| -> Option<bool> {
+                ::service_common::iam_trust_policy::admits_service_principal(
+                    role.assume_role_policy_document()?,
+                    INSTANCE_PROFILE_PRINCIPAL,
+                )
+            };
+            if profile
+                .roles()
+                .iter()
+                .map(trusts_instances)
+                .any(|verdict| verdict != Some(false))
+            {
+                return None;
+            }
+            Some(JobFlowRoleRefusal::Unauthorized(
+                unauthorized_instance_profile_message(profile.arn()),
+            ))
+        }
         // IAM says this account holds no such instance profile: the refusal is
         // grounded in what IAM answered.
-        Err(error) if instance_profile_is_absent(&error) => {
-            Some(invalid_instance_profile_message(job_flow_role))
-        }
+        Err(error) if instance_profile_is_absent(&error) => invalid(),
         // Any other answer is this emulator failing to ask, not IAM reporting an
         // unresolvable profile, so it refuses nothing — and it is worth a warning,
         // because a deployment with no IAM to ask is one where this gate does not

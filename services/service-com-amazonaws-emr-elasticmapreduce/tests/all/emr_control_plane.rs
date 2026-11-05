@@ -100,6 +100,7 @@ fn fleet_request(name: &str) -> Value {
     json!({
         "Name": name,
         "ReleaseLabel": "emr-7.1.0",
+        "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
         "Instances": {
             "KeepJobFlowAliveWhenNoSteps": true,
             "InstanceFleets": [{
@@ -279,6 +280,7 @@ async fn cancel_steps_reports_one_status_per_requested_step() {
     let cluster_id = emr
         .run_job_flow(json!({
             "Name": "cancelled",
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
             "Steps": steps,
@@ -552,6 +554,7 @@ async fn set_unhealthy_node_replacement_writes_what_describe_cluster_reports() {
     let launched_on = emr
         .run_job_flow(json!({
             "Name": "on",
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
             "Instances": {
                 "InstanceCount": 1,
                 "MasterInstanceType": "m5.xlarge",
@@ -835,6 +838,7 @@ async fn the_new_stores_refuse_a_create_past_their_maximum() {
             "RunJobFlow",
             json!({
                 "Name": "too many fleets",
+                "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
                 "Instances": { "KeepJobFlowAliveWhenNoSteps": true, "InstanceFleets": fleets },
             }),
         )
@@ -858,6 +862,7 @@ async fn get_session_refuses_a_session_the_cluster_does_not_carry() {
             "Name": "session enabled",
             "ReleaseLabel": "emr-7.1.0",
             "SessionEnabled": true,
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
         }))

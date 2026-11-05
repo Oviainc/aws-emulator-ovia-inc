@@ -186,6 +186,7 @@ async fn a_cluster_reports_the_one_subnet_and_zone_its_instances_were_launched_i
             .run_job_flow(json!({
                 "Name": label,
                 "ReleaseLabel": "emr-6.15.0",
+                "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
                 "Instances": case.instances.clone(),
             }))
             .await;

@@ -2,20 +2,31 @@
 
 //! Amazon EMR resolves a cluster's `JobFlowRole` against IAM before launching it.
 //!
-//! The rule under test: `RunJobFlow` resolves `JobFlowRole` — "also called
-//! instance profile and Amazon EC2 role" — to an EC2 instance profile IAM holds in
-//! this account, and refuses the launch with HTTP 400 `ValidationException`
-//! carrying `Invalid InstanceProfile: <value>.`, writing NO cluster, when that
-//! profile does not exist. A name IAM holds a profile under is accepted and
-//! round-trips as the cluster's `Ec2InstanceAttributes.IamInstanceProfile`.
+//! The rule under test: every Amazon EC2 instance of a cluster assumes the instance
+//! profile the launch names — "also called instance profile and Amazon EC2 role" — and
+//! Amazon EMR itself acts as the launch's `ServiceRole`, so `RunJobFlow` requires both
+//! members and then resolves the instance profile against IAM, writing NO cluster when
+//! any of those fails. Three error classes follow:
+//!
+//! 1. a launch naming none of a role it requires is HTTP 400 `ValidationException`
+//!    carrying `<role> is required for creating cluster.`;
+//! 2. a `JobFlowRole` naming no instance profile this account holds is HTTP 400
+//!    `ValidationException` carrying `Invalid InstanceProfile: <value>.`;
+//! 3. a profile that EXISTS and carries no role Amazon EC2 may assume is HTTP 400
+//!    `AccessDeniedException` carrying `Failed to authorize instance profile <arn>`,
+//!    whose variable part is the ARN IAM holds that profile under.
+//!
+//! A name IAM holds an EC2-assumable profile under is accepted and round-trips as the
+//! cluster's `Ec2InstanceAttributes.IamInstanceProfile`.
 //!
 //! This suite needs TWO services on one engine — EMR reaches IAM through the
 //! in-process callback, so a single-service router has no IAM to ask — which is why
 //! it lives here rather than in either service's own crate. The rows span what the
 //! rule generalises over: how the profile is named (friendly name, a different
 //! casing of it, its ARN, the ARN of a profile under a path), whether anything of
-//! that name exists (a profile, only a role of the same name, nothing at all), and
-//! the request that names no profile at all.
+//! that name exists (a profile EC2 may assume, a profile carrying no role, a profile
+//! whose role trusts another principal, only a role of the same name, nothing at all),
+//! and the requests that name no role at all.
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built —
 //! and the requests driven — on a sized thread.
@@ -43,6 +54,17 @@ const PROFILE_PATH: &str = "/service-role/";
 /// resolves the profile, not the role, so a cluster naming it is refused.
 const ROLE_ONLY: &str = "EMR_EC2_RoleWithoutProfile";
 
+/// An instance profile this account holds that carries NO role: it exists, and there is
+/// nothing in it for an Amazon EC2 instance to assume.
+const ROLELESS_PROFILE: &str = "EMR_EC2_RolelessProfile";
+
+/// An instance profile this account holds whose role trusts ANOTHER service principal:
+/// it exists, and Amazon EC2 may not assume what it carries.
+const FOREIGN_TRUST_PROFILE: &str = "EMR_EC2_LambdaTrustedProfile";
+
+/// The service role every launch below names, which `RunJobFlow` requires too.
+const SERVICE_ROLE: &str = "EMR_DefaultRole";
+
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`.
 /// The signature is never checked: this router runs with authentication off.
 fn authorization(signing_name: &str) -> String {
@@ -57,9 +79,15 @@ fn authorization(signing_name: &str) -> String {
 /// Written compactly and with no `&`, `=`, `+` or `%`, so it travels in an
 /// `awsQuery` form body as written.
 fn ec2_trust_policy() -> String {
-    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
-     \"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
-        .to_string()
+    trust_policy("ec2.amazonaws.com")
+}
+
+/// A trust policy admitting `principal` and nothing else, in the same compact form.
+fn trust_policy(principal: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Principal\":{{\"Service\":\"{principal}\"}},\"Action\":\"sts:AssumeRole\"}}]}}"
+    )
 }
 
 /// The ARN of an instance profile this account holds under `path`.
@@ -168,7 +196,7 @@ fn run_job_flow_body(name: &str, job_flow_role: Option<&str>) -> serde_json::Val
     let mut body = serde_json::json!({
         "Name": name,
         "ReleaseLabel": "emr-6.15.0",
-        "ServiceRole": "EMR_DefaultRole",
+        "ServiceRole": SERVICE_ROLE,
         "Instances": {
             "InstanceCount": 1,
             "MasterInstanceType": "m5.xlarge",
@@ -181,15 +209,35 @@ fn run_job_flow_body(name: &str, job_flow_role: Option<&str>) -> serde_json::Val
     body
 }
 
-/// One row: the `JobFlowRole` a `RunJobFlow` names, and whether the launch stands.
+/// One row: the `JobFlowRole` a `RunJobFlow` names, and what the launch is answered
+/// with.
+#[derive(Debug, PartialEq, Eq)]
+enum Expected {
+    /// The profile IAM holds and Amazon EC2 may assume, so the cluster is launched.
+    Launched,
+    /// The request named no instance profile at all.
+    Required,
+    /// The value names no instance profile this account holds; the value the sentence
+    /// echoes.
+    Invalid(String),
+    /// The named profile could not be authorized; the ARN the refusal must report.
+    Unauthorized(String),
+}
+
+/// One row of the table.
 struct ProfileCase {
     case: &'static str,
     /// The cluster's name, so each row writes (or fails to write) its own cluster.
     cluster: &'static str,
     /// The `JobFlowRole` the request carries, if any.
     job_flow_role: Option<String>,
-    /// Whether the cluster must be launched (`true`) or the launch refused.
-    launched: bool,
+    expected: Expected,
+}
+
+/// This account's instance-profile ARN for the profile NAME `name` — what EMR reports
+/// for a `JobFlowRole` that is a name rather than an ARN.
+fn named_profile_arn(name: &str) -> String {
+    instance_profile_arn("/", name)
 }
 
 fn profile_cases() -> Vec<ProfileCase> {
@@ -198,50 +246,57 @@ fn profile_cases() -> Vec<ProfileCase> {
             case: "an instance profile IAM holds, by name",
             cluster: "held-by-name",
             job_flow_role: Some(HELD_PROFILE.to_string()),
-            launched: true,
+            expected: Expected::Launched,
         },
         ProfileCase {
             // IAM entity names "are not distinguished by case".
             case: "the same instance profile in a different case",
             cluster: "held-other-case",
             job_flow_role: Some(HELD_PROFILE.to_lowercase()),
-            launched: true,
+            expected: Expected::Launched,
         },
         ProfileCase {
             case: "an instance profile IAM holds, by ARN",
             cluster: "held-by-arn",
             job_flow_role: Some(instance_profile_arn("/", HELD_PROFILE)),
-            launched: true,
+            expected: Expected::Launched,
         },
         ProfileCase {
             case: "an instance profile under a path, by ARN",
             cluster: "pathed-by-arn",
             job_flow_role: Some(instance_profile_arn(PROFILE_PATH, PATHED_PROFILE)),
-            launched: true,
+            expected: Expected::Launched,
         },
         ProfileCase {
-            case: "no JobFlowRole at all, so there is nothing to resolve",
+            case: "no JobFlowRole at all, which every cluster needs one of",
             cluster: "no-role",
             job_flow_role: None,
-            launched: true,
+            expected: Expected::Required,
+        },
+        ProfileCase {
+            // `@length(0..10280)` admits the empty string, which names nothing.
+            case: "an empty JobFlowRole",
+            cluster: "empty-role",
+            job_flow_role: Some(String::new()),
+            expected: Expected::Required,
         },
         ProfileCase {
             case: "a name IAM holds a role under but no instance profile",
             cluster: "role-only",
             job_flow_role: Some(ROLE_ONLY.to_string()),
-            launched: false,
+            expected: Expected::Invalid(ROLE_ONLY.to_string()),
         },
         ProfileCase {
             case: "an instance profile that was never created",
             cluster: "absent-profile",
             job_flow_role: Some("no-such-profile".to_string()),
-            launched: false,
+            expected: Expected::Invalid("no-such-profile".to_string()),
         },
         ProfileCase {
             case: "an instance profile ARN naming a profile that was never created",
             cluster: "absent-profile-arn",
             job_flow_role: Some(instance_profile_arn("/", "also-no-such-profile")),
-            launched: false,
+            expected: Expected::Invalid(instance_profile_arn("/", "also-no-such-profile")),
         },
         ProfileCase {
             // An ARN of another vendor names no IAM instance profile, whatever its
@@ -249,7 +304,7 @@ fn profile_cases() -> Vec<ProfileCase> {
             case: "an ARN of another service whose last segment is a held profile name",
             cluster: "foreign-vendor-arn",
             job_flow_role: Some(format!("arn:aws:s3:::bucket/{HELD_PROFILE}")),
-            launched: false,
+            expected: Expected::Invalid(format!("arn:aws:s3:::bucket/{HELD_PROFILE}")),
         },
         ProfileCase {
             // The IAM ROLE ARN of the role the held profile carries: an instance
@@ -260,14 +315,33 @@ fn profile_cases() -> Vec<ProfileCase> {
                 "arn:aws:iam::{}:role/{HELD_PROFILE}",
                 engine::emulator_account_id()
             )),
-            launched: false,
+            expected: Expected::Invalid(format!(
+                "arn:aws:iam::{}:role/{HELD_PROFILE}",
+                engine::emulator_account_id()
+            )),
         },
         ProfileCase {
-            // `@length(0..10280)` admits the empty string, which names nothing.
-            case: "an empty JobFlowRole",
-            cluster: "empty-role",
-            job_flow_role: Some(String::new()),
-            launched: false,
+            // The profile EXISTS and carries nothing an instance could assume, which is
+            // the authorization failure rather than an unresolvable name.
+            case: "an instance profile carrying no role at all",
+            cluster: "roleless-profile",
+            job_flow_role: Some(ROLELESS_PROFILE.to_string()),
+            expected: Expected::Unauthorized(named_profile_arn(ROLELESS_PROFILE)),
+        },
+        ProfileCase {
+            // It exists and its role trusts another service principal, so Amazon EC2
+            // may not assume it.
+            case: "an instance profile whose role trusts another principal",
+            cluster: "foreign-trust-profile",
+            job_flow_role: Some(FOREIGN_TRUST_PROFILE.to_string()),
+            expected: Expected::Unauthorized(named_profile_arn(FOREIGN_TRUST_PROFILE)),
+        },
+        ProfileCase {
+            // Named by ARN, the refusal still reports the ARN IAM holds it under.
+            case: "the same unauthorizable profile named by ARN",
+            cluster: "foreign-trust-profile-arn",
+            job_flow_role: Some(instance_profile_arn("/", FOREIGN_TRUST_PROFILE)),
+            expected: Expected::Unauthorized(named_profile_arn(FOREIGN_TRUST_PROFILE)),
         },
     ]
 }
@@ -372,6 +446,49 @@ fn a_cluster_is_launched_only_for_an_instance_profile_iam_holds() {
             );
             assert_eq!(status, 200, "setup: CreateRole {ROLE_ONLY}: got {status} {body}");
 
+            // An instance profile carrying NO role: it exists, and there is nothing in
+            // it for an Amazon EC2 instance to assume.
+            let (status, body) = iam(
+                &router,
+                &runtime,
+                "CreateInstanceProfile",
+                &[("InstanceProfileName", ROLELESS_PROFILE), ("Path", "/")],
+            );
+            assert_eq!(
+                status, 200,
+                "setup: CreateInstanceProfile {ROLELESS_PROFILE}: got {status} {body}"
+            );
+
+            // An instance profile whose role trusts ANOTHER service principal, so
+            // Amazon EC2 may not assume it.
+            let foreign = trust_policy("lambda.amazonaws.com");
+            for (action, parameters) in [
+                (
+                    "CreateRole",
+                    vec![
+                        ("RoleName", FOREIGN_TRUST_PROFILE),
+                        ("AssumeRolePolicyDocument", foreign.as_str()),
+                    ],
+                ),
+                (
+                    "CreateInstanceProfile",
+                    vec![("InstanceProfileName", FOREIGN_TRUST_PROFILE), ("Path", "/")],
+                ),
+                (
+                    "AddRoleToInstanceProfile",
+                    vec![
+                        ("InstanceProfileName", FOREIGN_TRUST_PROFILE),
+                        ("RoleName", FOREIGN_TRUST_PROFILE),
+                    ],
+                ),
+            ] {
+                let (status, body) = iam(&router, &runtime, action, &parameters);
+                assert_eq!(
+                    status, 200,
+                    "setup: IAM {action} for {FOREIGN_TRUST_PROFILE}: got {status} {body}"
+                );
+            }
+
             for case in profile_cases() {
                 let (status, body) = emr(
                     &router,
@@ -380,59 +497,97 @@ fn a_cluster_is_launched_only_for_an_instance_profile_iam_holds() {
                     run_job_flow_body(case.cluster, case.job_flow_role.as_deref()),
                 );
                 let listed = cluster_names(&router, &runtime);
-                if case.launched {
-                    assert_eq!(
-                        status, 200,
-                        "case {:?}: RunJobFlow must succeed, got {status} {body}",
-                        case.case
-                    );
-                    let cluster_id = body["JobFlowId"].as_str().unwrap_or_default().to_string();
-                    assert!(
-                        !cluster_id.is_empty(),
-                        "case {:?}: RunJobFlow must answer a JobFlowId, got {body}",
-                        case.case
-                    );
-                    assert!(
-                        listed.iter().any(|name| name == case.cluster),
-                        "case {:?}: the cluster must be listed, got {listed:?}",
-                        case.case
-                    );
-                    let (status, described) = emr(
-                        &router,
-                        &runtime,
-                        "DescribeCluster",
-                        serde_json::json!({ "ClusterId": cluster_id }),
-                    );
-                    assert_eq!(
-                        status, 200,
-                        "case {:?}: DescribeCluster must answer 200, got {status} {described}",
-                        case.case
-                    );
-                    let reported = described["Cluster"]["Ec2InstanceAttributes"]
-                        ["IamInstanceProfile"]
-                        .as_str()
-                        .map(str::to_string);
-                    assert_eq!(
-                        reported, case.job_flow_role,
-                        "case {:?}: the cluster must report the JobFlowRole it was given, \
-                         got {described}",
-                        case.case
-                    );
-                } else {
-                    let role = case.job_flow_role.clone().unwrap_or_default();
-                    assert_eq!(
-                        (status, error_code(&body).as_str()),
-                        (400, "ValidationException"),
-                        "case {:?}: an unresolvable instance profile must be refused 400 \
-                         ValidationException, got {status} {body}",
-                        case.case
-                    );
-                    assert_eq!(
-                        error_message(&body),
-                        format!("Invalid InstanceProfile: {role}."),
-                        "case {:?}: expected the instance-profile refusal, got {body}",
-                        case.case
-                    );
+                match &case.expected {
+                    Expected::Launched => {
+                        assert_eq!(
+                            status, 200,
+                            "case {:?}: RunJobFlow must succeed, got {status} {body}",
+                            case.case
+                        );
+                        let cluster_id =
+                            body["JobFlowId"].as_str().unwrap_or_default().to_string();
+                        assert!(
+                            !cluster_id.is_empty(),
+                            "case {:?}: RunJobFlow must answer a JobFlowId, got {body}",
+                            case.case
+                        );
+                        assert!(
+                            listed.iter().any(|name| name == case.cluster),
+                            "case {:?}: the cluster must be listed, got {listed:?}",
+                            case.case
+                        );
+                        let (status, described) = emr(
+                            &router,
+                            &runtime,
+                            "DescribeCluster",
+                            serde_json::json!({ "ClusterId": cluster_id }),
+                        );
+                        assert_eq!(
+                            status, 200,
+                            "case {:?}: DescribeCluster must answer 200, got {status} \
+                             {described}",
+                            case.case
+                        );
+                        let reported = described["Cluster"]["Ec2InstanceAttributes"]
+                            ["IamInstanceProfile"]
+                            .as_str()
+                            .map(str::to_string);
+                        assert_eq!(
+                            reported, case.job_flow_role,
+                            "case {:?}: the cluster must report the JobFlowRole it was \
+                             given, got {described}",
+                            case.case
+                        );
+                    }
+                    Expected::Required => {
+                        assert_eq!(
+                            (status, error_code(&body).as_str()),
+                            (400, "ValidationException"),
+                            "case {:?}: a launch naming no instance profile must be \
+                             refused 400 ValidationException, got {status} {body}",
+                            case.case
+                        );
+                        assert_eq!(
+                            error_message(&body),
+                            "InstanceProfile is required for creating cluster.",
+                            "case {:?}: expected the required-profile refusal, got {body}",
+                            case.case
+                        );
+                    }
+                    Expected::Unauthorized(arn) => {
+                        assert_eq!(
+                            (status, error_code(&body).as_str()),
+                            (400, "AccessDeniedException"),
+                            "case {:?}: an unauthorizable instance profile must be \
+                             refused 400 AccessDeniedException, got {status} {body}",
+                            case.case
+                        );
+                        assert_eq!(
+                            error_message(&body),
+                            format!("Failed to authorize instance profile {arn}"),
+                            "case {:?}: expected the unauthorized-profile refusal \
+                             naming {arn:?}, got {body}",
+                            case.case
+                        );
+                    }
+                    Expected::Invalid(value) => {
+                        assert_eq!(
+                            (status, error_code(&body).as_str()),
+                            (400, "ValidationException"),
+                            "case {:?}: a value naming no instance profile must be \
+                             refused 400 ValidationException, got {status} {body}",
+                            case.case
+                        );
+                        assert_eq!(
+                            error_message(&body),
+                            format!("Invalid InstanceProfile: {value}."),
+                            "case {:?}: expected the unresolvable-profile refusal \
+                             echoing {value:?}, got {body}",
+                            case.case
+                        );
+                    }
+                }
+                if case.expected != Expected::Launched {
                     assert!(
                         !listed.iter().any(|name| name == case.cluster),
                         "case {:?}: a refused launch must write no cluster, got {listed:?}",

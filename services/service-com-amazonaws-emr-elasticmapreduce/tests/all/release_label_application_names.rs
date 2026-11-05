@@ -251,6 +251,7 @@ async fn the_reported_identifiers_are_what_run_job_flow_accepts() {
                 "Name": format!("catalog-{label}"),
                 "ReleaseLabel": label,
                 "Applications": requested,
+                "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
                 "Instances": {
                     "InstanceCount": 1,
                     "MasterInstanceType": "m5.xlarge",

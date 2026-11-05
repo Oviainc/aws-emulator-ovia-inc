@@ -19,6 +19,8 @@ mod block_public_access;
 mod cluster_id_refusal_code;
 #[path = "all/cluster_placement.rs"]
 mod cluster_placement;
+#[path = "all/created_window.rs"]
+mod created_window;
 #[path = "all/emr_control_plane.rs"]
 mod emr_control_plane;
 #[path = "all/enum_refusal_identity.rs"]
@@ -77,3 +79,5 @@ mod supported_instance_types;
 mod tag_character_class;
 #[path = "all/termination_protection.rs"]
 mod termination_protection;
+#[path = "all/unreadable_request_values.rs"]
+mod unreadable_request_values;

@@ -180,6 +180,8 @@ async fn session_credentials_name_the_missing_security_configuration_feature() {
             "Name": "with a security configuration",
             "ReleaseLabel": "emr-7.1.0",
             "SecurityConfiguration": "named-but-not-runtime-roles",
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE,
+            "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
         }))

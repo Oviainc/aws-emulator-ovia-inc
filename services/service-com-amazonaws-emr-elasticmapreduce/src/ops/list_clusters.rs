@@ -3,7 +3,8 @@
 //! @op ListClusters
 //! Answers with a `ClusterSummary` for every persisted cluster, newest first, filtered
 //! by `ClusterStates` and the `CreatedAfter`/`CreatedBefore` window and paginated with
-//! `Marker`. Each summary is a projection of a [`crate::state::ClusterRecord`].
+//! `Marker`. Each summary is a projection of a [`crate::state::ClusterRecord`]. A window
+//! whose beginning is after its end is refused before the filter is applied.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +152,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
+
+        // The creation-date window is settled BEFORE the filter is applied: a window
+        // whose beginning is after its end selects nothing any cluster could fall
+        // inside, so it is a bad REQUEST rather than a filter that matched nothing, and
+        // the caller is told which pair of bounds to swap instead of reading an empty
+        // success as "no clusters in this window".
+        if crate::state::is_inverted_window(
+            input.created_after.as_ref(),
+            input.created_before.as_ref(),
+        ) {
+            return Err(ListClustersErrorModeled::InvalidRequestException(
+                crate::state::inverted_created_window(),
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(

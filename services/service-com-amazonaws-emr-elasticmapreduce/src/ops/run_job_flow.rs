@@ -408,17 +408,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Also called instance profile and Amazon EC2 role. An IAM role for an Amazon
         // EMR cluster. The Amazon EC2 instances of the cluster assume this role."
-        // (`RunJobFlow$JobFlowRole`.) EMR resolves that profile in IAM at launch time
-        // and refuses the launch when it does not exist — before any cluster state is
-        // written, so a refused request leaves nothing for `ListClusters` to report. The
-        // refusal goes through `refuse`, so this branch leaves the same audit record
-        // every other returning branch of this handler does.
-        if let Some(job_flow_role) = input.job_flow_role.as_deref() {
-            if let Some(message) =
-                crate::state::instance_profile_violation(ctx, &region, job_flow_role).await
-            {
-                return Err(refuse(message));
-            }
+        // (`RunJobFlow$JobFlowRole`.) A cluster's instances cannot run without one, so a
+        // launch that names none is refused before anything is resolved.
+        let Some(job_flow_role) = input
+            .job_flow_role
+            .as_deref()
+            .filter(|role| !role.is_empty())
+        else {
+            return Err(refuse(crate::state::required_cluster_role_message(
+                crate::state::required_cluster_role::INSTANCE_PROFILE,
+            )));
+        };
+
+        // The instance profile the launch names is then resolved in IAM, and the launch
+        // refused when it does not exist or cannot be authorized — before any cluster
+        // state is written, so a refused request leaves nothing for `ListClusters` to
+        // report. Both refusals go through an audited branch, so this path leaves the
+        // same audit record every other returning branch of this handler does; they are
+        // different error CLASSES, so a value naming no profile of this account keeps the
+        // request-validation envelope while a profile that exists and could not be
+        // authorized is an authorization failure.
+        if let Some(refusal) =
+            crate::state::instance_profile_violation(ctx, &region, job_flow_role).await
+        {
+            return Err(match refusal {
+                crate::state::JobFlowRoleRefusal::Invalid(message) => refuse(message),
+                crate::state::JobFlowRoleRefusal::Unauthorized(message) => {
+                    crate::state::audit(
+                        Self::NAME,
+                        &requested_name,
+                        ctx,
+                        AuditOutcome::ValidationRefused,
+                    );
+                    crate::scaffolded::Scaffolded::access_denied(message)
+                }
+            });
+        }
+
+        // "The IAM role that Amazon EMR assumes in order to access Amazon Web Services
+        // resources on your behalf." (`RunJobFlow$ServiceRole`.) The launch needs one
+        // too, and it is required AFTER the instance profile is resolved: that is the
+        // order Amazon EMR answers a launch that names neither in.
+        if !crate::state::names_a_cluster_role(input.service_role.as_deref()) {
+            return Err(refuse(crate::state::required_cluster_role_message(
+                crate::state::required_cluster_role::SERVICE_ROLE,
+            )));
         }
 
         // "The specified managed scaling policy for an Amazon EMR cluster."

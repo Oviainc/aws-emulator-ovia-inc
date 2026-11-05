@@ -98,6 +98,7 @@ impl Emr {
 fn minimal_cluster(name: &str) -> Value {
     json!({
         "Name": name,
+        "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
         "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge" },
     })
 }

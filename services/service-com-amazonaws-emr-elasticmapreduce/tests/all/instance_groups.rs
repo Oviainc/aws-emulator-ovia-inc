@@ -234,7 +234,12 @@ fn assert_group(case: &str, expected: &Expected, got: &Value) {
 
 /// A `RunJobFlow` request whose `Instances` member is `instances`.
 fn launch(name: &str, instances: Value) -> Value {
-    json!({ "Name": name, "ReleaseLabel": "emr-6.15.0", "Instances": instances })
+    json!({
+        "Name": name,
+        "ReleaseLabel": "emr-6.15.0",
+        "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
+        "Instances": instances,
+    })
 }
 
 /// The three-role `InstanceGroups` list case 4 launches with, and case 2 of the clock

@@ -38,6 +38,7 @@ const NOT_SHUTTING_DOWN: [&str; 3] = ["STARTING", "WAITING", "RUNNING"];
 fn launched_with_protection(name: &str, protected: bool) -> serde_json::Value {
     json!({
         "Name": name,
+        "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
         "Instances": {
             "InstanceCount": 1,
             "MasterInstanceType": "m5.xlarge",

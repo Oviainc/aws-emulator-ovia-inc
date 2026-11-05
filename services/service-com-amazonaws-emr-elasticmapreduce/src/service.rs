@@ -92,6 +92,8 @@ use std::sync::Arc;
 
 use crate::ops::types::InvalidRequestException;
 
+pub mod request_layer;
+
 /// The wire error code of `com.amazonaws.emr#InvalidRequestException`, this
 /// service's modelled client-input error: "This exception occurs when there is
 /// something wrong with user input" (HTTP 400). Used by
@@ -196,6 +198,26 @@ fn resolves_cluster_id(operation: &str) -> bool {
 /// The `ClusterId` member as the wire spells it, which is how a request names it and how
 /// a validator member path spells it once lower-camelled.
 const CLUSTER_ID: &str = "ClusterId";
+
+/// The operation that resolves an EC2 instance profile from its own input.
+///
+/// Amazon EMR resolves that profile BEFORE it checks the request's other members: a
+/// recorded `RunJobFlow` carrying both a `JobFlowRole` naming no instance profile and no
+/// `Instances` member at all is refused for the PROFILE. The framework validates the
+/// whole input ahead of the handler, which would invert that order, so
+/// [`OperationScopedRefusal`] restores it — see `job_flow_role_first_response`.
+const RESOLVES_JOB_FLOW_ROLE: &str = "RunJobFlow";
+
+/// The `JobFlowRole` member as the wire spells it.
+const JOB_FLOW_ROLE: &str = "JobFlowRole";
+
+/// The wire error code of the authorization failure Amazon EMR answers a cluster launch
+/// whose instance profile it could not authorize with (HTTP 400).
+///
+/// RECORDED behavior: no operation of this service declares the shape, which is why it is
+/// built from this crate's own synthetic one
+/// ([`crate::scaffolded::AccessDeniedException`]).
+const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 
 /// The input member whose absence this service refuses as a cluster id it cannot
 /// resolve, as a validator member path spells it.
@@ -351,6 +373,23 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedRefusal<Eng>
             let Some((operation, op)) = routed else {
                 return svc.definition().routing_error_response(req);
             };
+            // Deserialization precedes every later layer: a value whose JSON type the
+            // modelled member it is bound to cannot be read from never becomes a value
+            // at all, so it is refused as the PROTOCOL's own failure before the
+            // operation's own walk reaches its constraints or its handler. The framework
+            // would otherwise render that codec failure in the constraint-violation
+            // envelope, which is a different error class and a different remediation for
+            // the caller ([`request_layer`]). The cost is deliberate: a request's body is
+            // read twice, once here and once by the dispatch that follows.
+            let unreadable = {
+                let protocol = svc.definition().wire_protocol(req);
+                request_layer::coercion_refusal::<Eng>(operation, protocol.protocol(), req)
+            };
+            if let Some(message) = unreadable {
+                if let Some(response) = serialization_refusal_response(svc, req, message) {
+                    return response;
+                }
+            }
             let served = ServedOperation::of(operation);
             let (response, refused) = SERVED_OPERATION
                 .scope(
@@ -373,6 +412,11 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedRefusal<Eng>
                 if let Some(first) = self.cluster_first_response(served, svc, req) {
                     return first;
                 }
+            }
+            // The EC2 instance profile a cluster launch names is resolved first too, for
+            // the same reason and in the same way.
+            if let Some(first) = job_flow_role_first_response(operation, svc, req, ctx).await {
+                return first;
             }
             // The framework rendered the chosen code and sentence already; what it
             // cannot render is the modelled shape's OTHER member. Re-serializing is
@@ -471,6 +515,48 @@ fn validation_refusal_response(
             &crate::scaffolded::ValidationException::new(message),
             &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
             VALIDATION_EXCEPTION,
+            REFUSED_STATUS,
+        )
+        .ok()
+}
+
+/// `message` as the PROTOCOL's own refusal of a body that could not be read answers it
+/// ([`request_layer`]), in the envelope of the protocol `req` is served in.
+///
+/// The shape is synthetic because no model declares it: the request never became an
+/// input, so no operation ran to answer with one of its own errors.
+fn serialization_refusal_response(
+    svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
+    message: String,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    svc.definition()
+        .wire_protocol(req)
+        .protocol()
+        .serialize_error(
+            &crate::scaffolded::SerializationException::new(message),
+            &crate::scaffolded::SERIALIZATION_EXCEPTION_SCHEMA,
+            request_layer::SERIALIZATION_EXCEPTION,
+            REFUSED_STATUS,
+        )
+        .ok()
+}
+
+/// `message` as the authorization-failure envelope answers it, in the envelope of the
+/// protocol `req` is served in — the same path a handler refusing a request through
+/// [`crate::scaffolded::Scaffolded::access_denied`] takes.
+fn access_denied_refusal_response(
+    svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
+    message: String,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    svc.definition()
+        .wire_protocol(req)
+        .protocol()
+        .serialize_error(
+            &crate::scaffolded::AccessDeniedException::new(message),
+            &crate::scaffolded::ACCESS_DENIED_EXCEPTION_SCHEMA,
+            ACCESS_DENIED_EXCEPTION,
             REFUSED_STATUS,
         )
         .ok()
@@ -656,6 +742,39 @@ fn rejected_enum_values_refusal(violations: &[Violation]) -> Option<InvalidReque
         error_code: Some(format!("{INVALID_VALUES_CODE}{}", opening(member))),
         message: Some(message),
     })
+}
+
+/// The refusal the served operation would have answered for the `JobFlowRole` the request
+/// carries, when that value is one it cannot launch a cluster with. `None` when the
+/// operation resolves no instance profile, when the request carries no `JobFlowRole` — the
+/// absent member is its own refusal, which the handler answers — or when the value names
+/// a profile this account holds and Amazon EC2 may assume.
+///
+/// Amazon EMR RESOLVES that profile before it checks the request's other members, while
+/// the framework checks every member before the handler runs — so this restores the order
+/// for a request that gets both wrong, exactly as `cluster_first_response` does for a
+/// cluster id. The classes and the sentences are the handler's own
+/// ([`crate::state::instance_profile_violation`]), so the two orders cannot word one
+/// refusal two ways; only the envelope is chosen here.
+async fn job_flow_role_first_response(
+    operation: &str,
+    svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
+    ctx: &OperationContext<'_>,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    if operation != RESOLVES_JOB_FLOW_ROLE {
+        return None;
+    }
+    let job_flow_role = request_member(req, JOB_FLOW_ROLE).filter(|role| !role.is_empty())?;
+    let region = crate::state::request_region(ctx.parts());
+    match crate::state::instance_profile_violation(ctx, &region, &job_flow_role).await? {
+        crate::state::JobFlowRoleRefusal::Invalid(message) => {
+            validation_refusal_response(svc, req, message)
+        }
+        crate::state::JobFlowRoleRefusal::Unauthorized(message) => {
+            access_denied_refusal_response(svc, req, message)
+        }
+    }
 }
 
 /// The `com-amazonaws-emr-elasticmapreduce` emulated service: the generated [`ServiceDefinition`] plus

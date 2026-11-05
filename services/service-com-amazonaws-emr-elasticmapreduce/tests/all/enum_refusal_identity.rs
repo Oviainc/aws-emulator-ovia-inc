@@ -593,6 +593,7 @@ async fn every_declared_comparison_operator_is_admitted_and_persisted() {
         .run_job_flow(json!({
             "Name": "nested enum round trip",
             "ReleaseLabel": "emr-6.15.0",
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
             "Instances": {
                 "KeepJobFlowAliveWhenNoSteps": true,
                 "InstanceGroups": [
