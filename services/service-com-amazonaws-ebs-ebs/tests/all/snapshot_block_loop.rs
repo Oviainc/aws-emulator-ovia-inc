@@ -814,7 +814,7 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
 
         // Round trip: the snapshot the create reported is the one a read observes. The
         // read path sees a snapshot only once its content is final, so the snapshot is
-        // sealed first — with a count of zero, which is what was written to it.
+        // sealed first; nothing was written to it, so the count it declares is zero.
         let sealed = complete_snapshot(&router, &snapshot_id, 0).await;
         assert_eq!(
             sealed.status, 202,
@@ -977,12 +977,6 @@ async fn refusals_carry_the_modelled_error_and_status() {
             // error. Asserted in full in `payload_checksum_integrity.rs`.
             403,
             "InvalidSignatureException",
-        ),
-        (
-            "CompleteSnapshot with a count that disagrees with the blocks written",
-            complete_snapshot(&router, &pending_id, 7).await,
-            400,
-            "ValidationException",
         ),
         (
             "GetSnapshotBlock with a BlockToken this service never issued",
@@ -1181,10 +1175,9 @@ async fn a_child_snapshot_starts_from_a_copy_of_the_parent_blocks() {
         child_reply.json()
     );
 
-    // `ChangedBlocksCount` is "The number of blocks that were written to the snapshot",
-    // and the blocks a child inherited were not written to it: one new block written to
-    // the child is a count of ONE, whatever the parent contributed. Sealing it is also
-    // what makes the child readable, so the inherited blocks are observed afterwards.
+    // A block written to the CHILD, at an index the parent never held. Sealing the child
+    // is what makes it readable, so the inherited blocks and this one are observed
+    // afterwards, through the listing below.
     let new_bytes = block_bytes(13);
     let new_checksum = checksum(&new_bytes);
     let written_reply =
@@ -1198,7 +1191,7 @@ async fn a_child_snapshot_starts_from_a_copy_of_the_parent_blocks() {
     let sealed = complete_snapshot(&router, &child, 1).await;
     assert_eq!(
         sealed.status, 202,
-        "case \"child\": CompleteSnapshot must count only the blocks written to the child, got {} with body {}",
+        "case \"child\": CompleteSnapshot must seal the child snapshot, got {} with body {}",
         sealed.status,
         String::from_utf8_lossy(&sealed.body)
     );
@@ -1343,8 +1336,8 @@ async fn rewriting_a_block_index_replaces_the_bytes_and_keeps_one_token() {
             );
         }
 
-        // One block was written, however many times it was rewritten, so the seal's count
-        // is one.
+        // Sealing is what makes the snapshot readable; the listing below is what proves
+        // one block was stored, however many times the index was rewritten.
         let sealed = complete_snapshot(&router, &snapshot_id, 1).await;
         assert_eq!(
             sealed.status, 202,

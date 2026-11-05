@@ -361,16 +361,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here rather than cloned a second time.
         for (block_index, entry) in parent_blocks.into_iter().flatten() {
             let block_token = store.mint_block_token(&snapshot_id, block_index);
-            // Inherited, not written: `CompleteSnapshot`'s `ChangedBlocksCount` counts
-            // only what a caller writes into THIS snapshot.
-            blocks.insert(
-                block_index,
-                BlockEntry {
-                    block_token,
-                    written: false,
-                    ..entry
-                },
-            );
+            // The child lists the inherited block under its OWN token, never the
+            // parent's.
+            blocks.insert(block_index, BlockEntry { block_token, ..entry });
         }
 
         let encrypted = input.encrypted == Some(true) || input.kms_key_arn.is_some();

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_required_members.rs"]
 mod absent_required_members;
+#[path = "all/declared_block_inputs.rs"]
+mod declared_block_inputs;
 #[path = "all/minted_query_tokens.rs"]
 mod minted_query_tokens;
 #[path = "all/payload_checksum_integrity.rs"]

@@ -156,15 +156,6 @@ pub struct BlockEntry {
     pub block_token: String,
     /// The write progress the caller reported, if any.
     pub progress: Option<i32>,
-    /// Whether this block was WRITTEN to this snapshot by `PutSnapshotBlock`, as opposed
-    /// to inherited from a `ParentSnapshotId`.
-    ///
-    /// `CompleteSnapshotRequest$ChangedBlocksCount` is "The number of blocks that were
-    /// written to the snapshot", and an incremental snapshot shares its parent's
-    /// unchanged blocks rather than writing them, so only the ones flagged here are
-    /// counted against it. Overwriting an inherited index is a write, so the entry that
-    /// replaces it carries the flag.
-    pub written: bool,
 }
 
 /// A snapshot and everything written into it.
@@ -195,13 +186,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The number of blocks WRITTEN to this snapshot, which is what
-    /// `CompleteSnapshotRequest$ChangedBlocksCount` counts. See
-    /// [`BlockEntry::written`].
-    pub fn written_block_count(&self) -> usize {
-        self.blocks.values().filter(|entry| entry.written).count()
-    }
-
     /// Whether this snapshot's content is final: `CompleteSnapshot` sealed it.
     ///
     /// "You cannot write new blocks to a snapshot after it has been completed", so this
@@ -512,6 +496,28 @@ pub fn invalid_volume_size_message(volume_size: i64) -> String {
 /// which is not the spelling the input member carries.
 pub const PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE: &str =
     "ParentSnapshotId and Encrypt cannot be specified together";
+
+/// The message `PutSnapshotBlock` answers with when `DataLength` is not the block size
+/// this service writes.
+///
+/// A request-derived template naming the rejected length and the one length the service
+/// accepts, which is [`SNAPSHOT_BLOCK_SIZE_BYTES`] —
+/// `PutSnapshotBlockRequest$DataLength` documents "Currently, the only supported size is
+/// 524288 bytes. Valid values: 524288". It states no other derived quantity.
+pub fn invalid_block_data_length_message(data_length: i32) -> String {
+    format!("Block data length {data_length} is not valid, expected {SNAPSHOT_BLOCK_SIZE_BYTES}")
+}
+
+/// The message `PutSnapshotBlock` answers with when `BlockIndex` names an offset outside
+/// the snapshot's volume.
+///
+/// A request-derived template naming only the rejected index: the extent that rejected it
+/// follows from the snapshot's own `VolumeSize` (`BlockIndex` is "a logical index in units
+/// of 512 KiB blocks", so an index at or past [`blocks_in_volume`] is outside it), and
+/// that derived bound is not part of this sentence.
+pub fn block_index_beyond_volume_message(block_index: i32) -> String {
+    format!("Block index {block_index} is beyond the volume size extent")
+}
 
 /// The message `PutSnapshotBlock` answers with when the block payload the request
 /// DECLARED cannot be read off it.

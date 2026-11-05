@@ -2,9 +2,8 @@
 
 //! @op CompleteSnapshot
 //!
-//! Implemented: checks the number of blocks actually written against
-//! `ChangedBlocksCount`, seals the stored snapshot and acknowledges with the status that
-//! record was in when the request was accepted.
+//! Implemented: seals the stored snapshot and acknowledges with the status that record
+//! was in when the request was accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -215,24 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Refusing on a guessed composition would reject requests a real client builds
         // correctly, which is worse than not checking; so the snapshot is sealed on the
         // evidence this service does have — the blocks it actually stored, checksum-
-        // verified one by one as `PutSnapshotBlock` persisted them, and counted against
-        // `ChangedBlocksCount` below.
+        // verified one by one as `PutSnapshotBlock` persisted them.
         let _ = (&input.checksum, &input.checksum_aggregation_method);
 
-        // "Seals and completes the snapshot after all of the required blocks of data
-        // have been written to it": the caller's count must agree with what was written
-        // to THIS snapshot. Blocks a `ParentSnapshotId` was inherited from were not
-        // written to it, so they are not counted (see `BlockEntry::written`).
-        let written = i32::try_from(snapshot.written_block_count()).unwrap_or(i32::MAX);
-        if written != input.changed_blocks_count {
-            return Err(validation(
-                "INVALID_PARAMETER_VALUE",
-                format!(
-                    "ChangedBlocksCount {} does not match the {written} blocks written to snapshot {}",
-                    input.changed_blocks_count, input.snapshot_id
-                ),
-            ));
-        }
+        // `ChangedBlocksCount` is the caller's own accounting of the writes it made ("The
+        // number of blocks that were written to the snapshot"), bounded only by the
+        // model's `range` min 0 and already checked against it at the boundary. It is NOT
+        // a precondition this call verifies against the blocks the snapshot holds: the
+        // request is accepted on any modelled value, so a count that disagrees with what
+        // was written still seals the snapshot rather than being refused.
+        let _ = input.changed_blocks_count;
 
         // The status the snapshot is in when this request is ACCEPTED, which is what the
         // 202 reports. `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — so

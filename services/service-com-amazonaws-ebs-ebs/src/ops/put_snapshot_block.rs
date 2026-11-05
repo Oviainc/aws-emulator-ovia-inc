@@ -116,10 +116,12 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::state::{
-    blocks_in_volume, checksum_base64_sha256, checksum_mismatch_message,
-    is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
+    block_index_beyond_volume_message, blocks_in_volume, checksum_base64_sha256,
+    checksum_mismatch_message, invalid_block_data_length_message, is_well_formed_snapshot_id,
+    malformed_snapshot_id_message, snapshot_not_found_message,
     unsupported_checksum_algorithm_message, BlockEntry, CHECKSUM_ALGORITHM_SHA256,
     FAILED_TO_READ_BLOCK_DATA_MESSAGE, MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
+    SNAPSHOT_BLOCK_SIZE_BYTES,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -238,21 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `BlockData` is the `@httpPayload` and `DataLength` declares how many bytes of
-        // it the request carries, so a payload that does not deliver exactly that many
-        // bytes leaves the service with no block to store: the declared block data could
-        // not be READ. That is a bad request parameter/payload, which the modelled
-        // `ValidationExceptionReason` calls `INVALID_PARAMETER_VALUE`, reported with the
-        // service's fixed sentence for a failed read. `INVALID_BLOCK` is reserved below
-        // for a block that WAS read and is then rejected on its content.
-        let actual_length = i64::try_from(input.block_data.len()).unwrap_or(i64::MAX);
-        if actual_length != i64::from(input.data_length) {
-            return Err(validation(
-                "INVALID_PARAMETER_VALUE",
-                FAILED_TO_READ_BLOCK_DATA_MESSAGE.to_string(),
-            ));
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
         let now = SystemTime::now();
         let mut store = state.lock();
@@ -269,7 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
         };
-        let block_size = snapshot.block_size;
         let volume_size = snapshot.volume_size;
         let stored_blocks = snapshot.blocks.len();
         let index_already_written = snapshot.blocks.contains_key(&input.block_index);
@@ -294,6 +280,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation("INVALID_SNAPSHOT_ID", message));
         }
 
+        // `DataLength`: "Currently, the only supported size is 524288 bytes. Valid
+        // values: 524288." The DECLARED length is judged on its own value, before the
+        // payload that arrived is measured against it: a length this service never writes
+        // is wrong whatever the request's body turned out to hold.
+        if input.data_length != SNAPSHOT_BLOCK_SIZE_BYTES {
+            return Err(validation(
+                "INVALID_PARAMETER_VALUE",
+                invalid_block_data_length_message(input.data_length),
+            ));
+        }
+
+        // `BlockData` is the `@httpPayload` and `DataLength` declares how many bytes of
+        // it the request carries, so a payload that does not deliver exactly that many
+        // bytes leaves the service with no block to store: the declared block data could
+        // not be READ. That is a bad request parameter/payload, which the modelled
+        // `ValidationExceptionReason` calls `INVALID_PARAMETER_VALUE`, reported with the
+        // service's fixed sentence for a failed read. `INVALID_BLOCK` is reserved below
+        // for a block that WAS read and is then rejected on its content.
+        let actual_length = i64::try_from(input.block_data.len()).unwrap_or(i64::MAX);
+        if actual_length != i64::from(input.data_length) {
+            return Err(validation(
+                "INVALID_PARAMETER_VALUE",
+                FAILED_TO_READ_BLOCK_DATA_MESSAGE.to_string(),
+            ));
+        }
+
         // `BlockIndex` is "a logical index in units of 512 KiB blocks … (logical offset
         // of data/524288)", so an index at or past the snapshot's own volume extent
         // names an offset outside the volume.
@@ -301,22 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if i64::from(input.block_index) >= index_limit {
             return Err(validation(
                 "INVALID_BLOCK",
-                format!(
-                    "BlockIndex {} is outside a {volume_size} GiB volume, which addresses block indexes 0..{index_limit}",
-                    input.block_index
-                ),
-            ));
-        }
-
-        // `DataLength`: "Currently, the only supported size is 524288 bytes. Valid
-        // values: 524288."
-        if input.data_length != block_size {
-            return Err(validation(
-                "INVALID_PARAMETER_VALUE",
-                format!(
-                    "DataLength {} is not supported; the only supported block size is {block_size} bytes",
-                    input.data_length
-                ),
+                block_index_beyond_volume_message(input.block_index),
             ));
         }
 
@@ -360,8 +357,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checksum_algorithm: CHECKSUM_ALGORITHM_SHA256.to_string(),
             block_token,
             progress: input.progress,
-            // Written to THIS snapshot, so it counts against `ChangedBlocksCount`.
-            written: true,
         };
         let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
             return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));

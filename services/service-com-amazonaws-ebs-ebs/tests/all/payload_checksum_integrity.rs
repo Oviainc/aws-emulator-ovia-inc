@@ -22,7 +22,8 @@
 //! The matching checksum is the positive control.
 
 use crate::snapshot_block_loop::{
-    block_bytes, checksum, put_block, router, start_snapshot, BLOCK_SIZE,
+    block_bytes, checksum, list_blocks, listed_blocks, put_block, router, start_snapshot,
+    BLOCK_SIZE,
 };
 
 /// How the refusal states the two checksums: the one computed over the received payload,
@@ -135,15 +136,32 @@ async fn a_payload_that_is_not_the_one_the_checksum_names_fails_the_requests_int
             reply.json()
         );
 
-        // Nothing was stored: the request never reached the snapshot. The snapshot is
-        // sealed with a count of zero, which only holds if no block was written.
+        // Nothing was stored: the request never reached the snapshot. Proven by reading
+        // the snapshot back once it is sealed (sealing is what makes it readable), where
+        // the listing reports no block at all.
         let sealed = crate::snapshot_block_loop::complete_snapshot(&router, &snapshot_id, 0).await;
         assert_eq!(
             sealed.status, 202,
-            "case {case:?}: a refused write must store nothing, so the seal's count is zero; \
-             got {} with body {}",
+            "case {case:?}: the snapshot the refused write targeted must still seal; got {} \
+             with body {}",
             sealed.status,
             String::from_utf8_lossy(&sealed.body)
+        );
+        let listing = list_blocks(&router, &snapshot_id, "").await;
+        assert_eq!(
+            listing.status, 200,
+            "case {case:?}: the sealed snapshot must be listable, got {} with body {}",
+            listing.status,
+            String::from_utf8_lossy(&listing.body)
+        );
+        let listed: Vec<i32> = listed_blocks(&listing)
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert!(
+            listed.is_empty(),
+            "case {case:?}: a refused write must store nothing, so the listing must hold no \
+             block; got {listed:?}"
         );
     }
 }
