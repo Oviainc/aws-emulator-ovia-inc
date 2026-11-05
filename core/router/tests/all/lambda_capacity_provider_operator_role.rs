@@ -18,19 +18,27 @@
 //! about it, while this operation is recorded refusing an operator role that does not
 //! exist. That is the reading
 //! `service_com_amazonaws_lambda_awsgirapiservice::state::capacity_provider::operator_role_is_unassumable`
-//! implements through the shared `service_common::iam_role::role_is_unassumable`. A role of
-//! ANOTHER account is served by both: that account's IAM is not this emulator's to ask, so
-//! there is no answer to ground a refusal in.
+//! implements through the shared `service_common::iam_role::role_is_unassumable`.
 //!
-//! The refusal's message is wholly fixed text: it names neither the role nor which half of
-//! the question failed.
+//! SECOND RULE, asked AHEAD of that one: a well-formed role ARN of ANOTHER account is
+//! refused `AccessDeniedException` (HTTP 403) with the fixed sentence `Cross-account pass
+//! role is not allowed.`, persisting nothing. Creating the provider HANDS the role to this
+//! service, which is an `iam:PassRole`, and a pass is granted by the account that HOLDS the
+//! role — so a principal of this account may pass a role of its own account and no role of
+//! another one, whatever that other role trusts. It is decided on the request's own account
+//! field and asks the IAM beside it nothing, which is why it also stands where no IAM is
+//! mounted; it too is the reading
+//! `…::state::capacity_provider::operator_role_is_of_another_account` implements.
+//!
+//! Both refusals' messages are wholly fixed text: neither names the role, the account, nor
+//! which half of the question failed.
 //!
 //! The role is resolved against the ACCOUNT's IAM records, which is why this suite lives
 //! here: each role is created through the real `CreateRole` on the same engine that serves
 //! Lambda, so what the check reads is the document IAM persisted and not a copy. The rows
 //! span what is particular to this surface: whether IAM holds the role at all, whether the
-//! trust policy admits this service, and a role of ANOTHER account — about which this
-//! emulator's IAM can answer nothing, so nothing is refused.
+//! trust policy admits this service, and whose account the ARN names — this one, or another
+//! one whose role no principal here may pass.
 
 use std::sync::Arc;
 
@@ -57,6 +65,9 @@ const CAPACITY_PROVIDERS_URI: &str = "/2025-11-30/capacity-providers";
 const OPERATOR_ROLE_INVALID: &str =
     "The operator role is invalid or doesn't have sufficient permissions. Verify the role \
      and permissions and try again.";
+
+/// AWS's refusal of a pass of another account's role, which only that account can grant.
+const CROSS_ACCOUNT_PASS_ROLE: &str = "Cross-account pass role is not allowed.";
 
 /// One emulator carrying both services over ONE shared engine, exactly as the production
 /// router builds them.
@@ -185,15 +196,55 @@ enum Role {
     Held(String),
     /// A well-formed role ARN of THIS account that IAM holds no role for.
     AbsentFromIam,
-    /// A well-formed role ARN of ANOTHER account.
-    AnotherAccount,
+    /// A well-formed role ARN of ANOTHER account, in the partition the row names.
+    AnotherAccount(&'static str),
 }
 
-/// One row: the operator role the create names, and whether the provider is stored.
+/// What the create answers for the role a row names.
+enum Outcome {
+    /// Served: 202, and the provider is read back.
+    Served,
+    /// Refused the modelled 400: IAM answered that this service cannot manage compute as
+    /// the role.
+    OperatorRoleInvalid,
+    /// Refused 403: the role belongs to another account, so this account cannot pass it.
+    CrossAccountPassRole,
+}
+
+impl Outcome {
+    /// The HTTP status and wire error code the answer carries (`""` on a success).
+    fn status_and_code(&self) -> (u16, &'static str) {
+        match self {
+            Self::Served => (202, ""),
+            Self::OperatorRoleInvalid => (400, "InvalidParameterValueException"),
+            Self::CrossAccountPassRole => (403, "AccessDeniedException"),
+        }
+    }
+
+    /// The refusal's fixed sentence, for a row that is refused.
+    fn message(&self) -> Option<&'static str> {
+        match self {
+            Self::Served => None,
+            Self::OperatorRoleInvalid => Some(OPERATOR_ROLE_INVALID),
+            Self::CrossAccountPassRole => Some(CROSS_ACCOUNT_PASS_ROLE),
+        }
+    }
+
+    /// The member the refusal's sentence arrives on: the modelled errors of this service
+    /// spell it `message`, and the synthetic 403 spells it `Message`.
+    fn message_member(&self) -> &'static str {
+        match self {
+            Self::Served | Self::OperatorRoleInvalid => "message",
+            Self::CrossAccountPassRole => "Message",
+        }
+    }
+}
+
+/// One row: the operator role the create names, and what the create answers for it.
 struct Row {
     case: &'static str,
     role: Role,
-    accepted: bool,
+    outcome: Outcome,
 }
 
 /// The table the rule is asserted over.
@@ -206,7 +257,7 @@ fn rows() -> Vec<Row> {
                 json!("sts:AssumeRole"),
                 json!({ "Service": LAMBDA_PRINCIPAL }),
             )),
-            accepted: true,
+            outcome: Outcome::Served,
         },
         Row {
             case: "a role trusting lambda among several services",
@@ -215,7 +266,7 @@ fn rows() -> Vec<Row> {
                 json!(["sts:TagSession", "sts:AssumeRole"]),
                 json!({ "Service": ["ec2.amazonaws.com", LAMBDA_PRINCIPAL] }),
             )),
-            accepted: true,
+            outcome: Outcome::Served,
         },
         Row {
             case: "a role trusting only another service",
@@ -224,7 +275,7 @@ fn rows() -> Vec<Row> {
                 json!("sts:AssumeRole"),
                 json!({ "Service": "ec2.amazonaws.com" }),
             )),
-            accepted: false,
+            outcome: Outcome::OperatorRoleInvalid,
         },
         Row {
             case: "a role whose statement DENIES lambda the assume",
@@ -233,7 +284,7 @@ fn rows() -> Vec<Row> {
                 json!("sts:AssumeRole"),
                 json!({ "Service": LAMBDA_PRINCIPAL }),
             )),
-            accepted: false,
+            outcome: Outcome::OperatorRoleInvalid,
         },
         Row {
             case: "a role trusting lambda for an action that is not assuming it",
@@ -242,7 +293,7 @@ fn rows() -> Vec<Row> {
                 json!("s3:GetObject"),
                 json!({ "Service": LAMBDA_PRINCIPAL }),
             )),
-            accepted: false,
+            outcome: Outcome::OperatorRoleInvalid,
         },
         Row {
             // "This account's IAM holds no role under that name" IS an answer about the
@@ -253,24 +304,35 @@ fn rows() -> Vec<Row> {
             // `crate::state::capacity_provider::operator_role_is_unassumable` implements
             // (the shared `service_common::iam_role::role_is_unassumable`), and what
             // separates it from a function's EXECUTION role, which is routinely provisioned
-            // out of band and so serves such a create. A fix for another issue must not
-            // flip it: if this row fails in a gate, the change under review is what to fix.
+            // out of band and so serves such a create. This answer is AWS's RECORDED one
+            // for this operation, so a fix for another issue must not flip it: if this row
+            // fails in a gate, the change under review is what to fix.
             case: "a role this account's IAM holds none of",
             role: Role::AbsentFromIam,
-            accepted: false,
+            outcome: Outcome::OperatorRoleInvalid,
         },
         Row {
-            // Nothing is KNOWN about another account's role — its IAM is not this
-            // emulator's to ask, and the shared reading resolves no role of THIS account
-            // from such an ARN — so a refusal would be grounded in nothing and this one is
-            // served. AWS refuses it too, but with its own answer (403
-            // `AccessDeniedException`, "Cross-account pass role is not allowed."), which
-            // `CreateCapacityProvider` does not model here yet: that half is tracked by
-            // `issues/things-that-do-not-work/human-lambda-createcapacityprovider-refuses-an-operator-role-absen.md`,
-            // and the code and this row have to change together when it lands.
+            // Creating the provider HANDS the role to this service, which is an
+            // `iam:PassRole`, and a pass is granted by the account that HOLDS the role —
+            // so no principal of this account may pass another account's role, whatever
+            // that role trusts, and this emulator's IAM is never asked about it. That is
+            // the reading
+            // `crate::state::capacity_provider::operator_role_is_of_another_account`
+            // implements. This answer too is AWS's RECORDED one for this operation (403
+            // `AccessDeniedException`, "Cross-account pass role is not allowed."), and it
+            // differs from the EXECUTION-role reading, which serves another account's role,
+            // on purpose. A fix for another issue must not flip it: if this row fails in a
+            // gate, the change under review is what to fix.
             case: "a well-formed role ARN of another account",
-            role: Role::AnotherAccount,
-            accepted: true,
+            role: Role::AnotherAccount("aws"),
+            outcome: Outcome::CrossAccountPassRole,
+        },
+        Row {
+            // The account field is what decides it, in any partition the member's pattern
+            // admits.
+            case: "another account's role in another partition",
+            role: Role::AnotherAccount("aws-us-gov"),
+            outcome: Outcome::CrossAccountPassRole,
         },
     ]
 }
@@ -293,7 +355,9 @@ async fn create_capacity_provider_refuses_an_operator_role_lambda_cannot_assume(
             Role::AbsentFromIam => {
                 "arn:aws:iam::000000000000:role/capacity-operator-never-created".to_string()
             }
-            Role::AnotherAccount => "arn:aws:iam::123456789012:role/capacity-operator".to_string(),
+            Role::AnotherAccount(partition) => {
+                format!("arn:{partition}:iam::123456789012:role/capacity-operator")
+            }
         };
         let name = format!("operator-probe-{index}");
 
@@ -305,15 +369,18 @@ async fn create_capacity_provider_refuses_an_operator_role_lambda_cannot_assume(
         )
         .await;
 
-        if row.accepted {
-            assert_eq!(
-                (status, code.as_str()),
-                (202, ""),
-                "case {:?}: a role nothing is known against must create the provider, got \
-                 {status} {code:?}: {created}",
-                row.case
-            );
-            assert_eq!(
+        let expected = row.outcome.status_and_code();
+        assert_eq!(
+            (status, code.as_str()),
+            expected,
+            "case {:?}: expected HTTP {} {:?} from the create, got {status} {code:?}: \
+             {created}",
+            row.case,
+            expected.0,
+            expected.1
+        );
+        match row.outcome.message() {
+            None => assert_eq!(
                 created["CapacityProvider"]["PermissionsConfig"]
                     ["CapacityProviderOperatorRoleArn"]
                     .as_str(),
@@ -321,26 +388,20 @@ async fn create_capacity_provider_refuses_an_operator_role_lambda_cannot_assume(
                 "case {:?}: the provider is managed with the role the request named, got \
                  {created}",
                 row.case
-            );
-        } else {
-            assert_eq!(
-                (status, code.as_str()),
-                (400, "InvalidParameterValueException"),
-                "case {:?}: a role this service cannot assume must be refused, got {status} \
-                 {code:?}: {created}",
-                row.case
-            );
-            assert_eq!(
-                created["message"].as_str(),
-                Some(OPERATOR_ROLE_INVALID),
-                "case {:?}: expected the modelled refusal message, got {created}",
-                row.case
-            );
-            assert!(
-                !created.to_string().contains(&role_arn),
-                "case {:?}: the refusal must name no role, got {created}",
-                row.case
-            );
+            ),
+            Some(message) => {
+                assert_eq!(
+                    created[row.outcome.message_member()].as_str(),
+                    Some(message),
+                    "case {:?}: expected the refusal's fixed sentence, got {created}",
+                    row.case
+                );
+                assert!(
+                    !created.to_string().contains(&role_arn),
+                    "case {:?}: the refusal must name no role, got {created}",
+                    row.case
+                );
+            }
         }
 
         // Accepted or refused, the store holds exactly what the answer claimed: a refused
@@ -353,7 +414,7 @@ async fn create_capacity_provider_refuses_an_operator_role_lambda_cannot_assume(
             None,
         )
         .await;
-        let expected = if row.accepted {
+        let expected = if row.outcome.message().is_none() {
             (200, "")
         } else {
             (404, "ResourceNotFoundException")

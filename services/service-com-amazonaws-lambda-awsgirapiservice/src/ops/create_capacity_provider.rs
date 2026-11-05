@@ -16,8 +16,10 @@
 //! account's IAM holds none of, and one it holds whose stored trust policy does not admit
 //! this service, are both refused `InvalidParameterValueException` with nothing persisted
 //! (see `crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE`), while a role
-//! nothing is KNOWN about — another account's, whose IAM this emulator cannot ask, an
-//! unreadable answer, or no IAM mounted to ask — is served.
+//! nothing is KNOWN about — an unreadable answer, or no IAM mounted to ask — is served.
+//! Ahead of that, a role ARN of ANOTHER account is refused `AccessDeniedException` (HTTP
+//! 403, `crate::state::capacity_provider::CROSS_ACCOUNT_PASS_ROLE_MESSAGE`): handing the
+//! role over is an `iam:PassRole`, which only the account HOLDING the role can grant.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +229,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation callback): nothing here opens a socket, resolves a host or reads an
         // ambient credential. An emulator with no IAM mounted to ask refuses nothing, so a
         // missing answer never becomes a refusal. It is awaited with no store guard held.
+        // Handing the role over is itself an `iam:PassRole`, and a pass is granted by the
+        // account that HOLDS the role — so a role ARN of ANOTHER account is one no principal
+        // of this account may pass, whatever that role trusts, and it is refused 403
+        // `AccessDeniedException`
+        // (`crate::state::capacity_provider::operator_role_is_of_another_account`, which is
+        // decided on the request's own account field and asks IAM nothing, since the IAM
+        // that could answer about that role is not this emulator's). It stands ahead of the
+        // question below, so a role of another account is never the subject of a question
+        // about THIS account's records.
+        if crate::state::capacity_provider::operator_role_is_of_another_account(
+            &input.permissions_config.capacity_provider_operator_role_arn,
+        ) {
+            return Err(crate::scaffolded::AccessDeniedException::new(
+                crate::state::capacity_provider::CROSS_ACCOUNT_PASS_ROLE_MESSAGE,
+            )
+            .into());
+        }
+
         if crate::state::capacity_provider::operator_role_is_unassumable(
             ctx,
             &region,

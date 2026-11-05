@@ -3,7 +3,8 @@
 //! How a capacity provider is ADDRESSED: the ARN this service mints for one, the ARN
 //! resource type that ARN carries, the reading of a client-sent `CapacityProviderName` in
 //! either documented form, and the refusals a value that names no provider — or an operator
-//! role this service cannot manage its compute with — is answered with.
+//! role this service cannot manage its compute with, or may not be handed at all — is
+//! answered with.
 //!
 //! It lives in its own module rather than in the already long [`crate::state`], which
 //! re-exports every item here, so a handler still names them as `crate::state::…` and the
@@ -19,6 +20,13 @@
 //! split on `:` and compared — nothing indexes, slices or does arithmetic on it.
 
 use super::ARN_NAMESPACE;
+
+/// The ARN vendor field an IAM role ARN carries, as the modelled pattern of the operator
+/// role member writes it
+/// (`smithy_query(query="shape",shape="CapacityProviderPermissionsConfig")`:
+/// `^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`) — the field the
+/// cross-account reading below parses the operator role over.
+const IAM_ARN_NAMESPACE: &str = "iam";
 
 /// The ARN resource type of a capacity provider, as the model's `CapacityProviderArn`
 /// pattern writes it (`…:lambda:<region>:<account>:capacity-provider:<name>`) — stated
@@ -133,10 +141,12 @@ pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
 /// of this account an ARN names, how IAM is asked, or how a trust document is read.
 ///
 /// `false` — do not refuse — for every other case, wherever nothing is KNOWN: a value that
-/// names no role of THIS account (another account's IAM is not this emulator's to ask), an
-/// emulator with no IAM mounted to ask at all, and an answer this emulator could not read.
-/// The principal that has to be admitted is the one a function's execution role admits
-/// ([`super::EXECUTION_ROLE_PRINCIPAL`]): this service is what assumes both.
+/// names no role of THIS account (another account's IAM is not this emulator's to ask, and
+/// such a value is already refused ahead of this question by
+/// [`operator_role_is_of_another_account`]), an emulator with no IAM mounted to ask at all,
+/// and an answer this emulator could not read. The principal that has to be admitted is the
+/// one a function's execution role admits ([`super::EXECUTION_ROLE_PRINCIPAL`]): this
+/// service is what assumes both.
 ///
 /// It therefore takes the STRONGER of the two shared readings
 /// (`service_common::iam_role::role_is_unassumable`, which refuses a role this account's IAM
@@ -159,4 +169,54 @@ pub async fn operator_role_is_unassumable(
         super::EXECUTION_ROLE_PRINCIPAL,
     )
     .await
+}
+
+/// Why a request that hands this service an operator role of ANOTHER account is refused.
+///
+/// Wholly fixed text: the denial is about the hand-off itself rather than about any role, so
+/// it names neither the role the request carried nor the account that holds it — the same
+/// sentence the rest of this tree records AWS refusing a pass of another account's role with.
+///
+/// The question it answers is [`operator_role_is_of_another_account`]; it is answered with
+/// the 403 `AccessDeniedException` channel ([`crate::scaffolded::AccessDeniedException`]),
+/// not with the modelled 400 of [`OPERATOR_ROLE_INVALID_MESSAGE`], because the caller is
+/// refused on the authorization to pass the role rather than on the role's own fitness.
+pub const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// Whether `operator_role_arn` names an IAM role of an account OTHER than the one whose
+/// resources this emulator holds — the create is then refused with
+/// [`CROSS_ACCOUNT_PASS_ROLE_MESSAGE`] and nothing is stored.
+///
+/// Creating a provider HANDS this service the operator role, which is an `iam:PassRole` the
+/// caller has to hold, and a pass of a role is granted by the account that HOLDS that role:
+/// a principal of this account can pass a role of its own account and no role of another
+/// one, whatever that other role trusts. So this is decided on the REQUEST alone — the
+/// account field of the ARN against [`::engine::emulator_account_id`] — and asks IAM
+/// nothing: the IAM that could answer about another account's role is not this emulator's,
+/// which is exactly why the pass cannot be authorized. Being grounded in the request and not
+/// in an IAM answer, it stands whether or not an IAM is mounted to ask, unlike
+/// [`operator_role_is_unassumable`], and it is asked FIRST, so a role of another account is
+/// never the subject of a question about this account's records.
+///
+/// `false` for a role ARN of THIS account, which the member's modelled pattern admits only
+/// with a 12-digit account, and for an EMPTY account field, which names no OTHER account —
+/// both are then judged by [`operator_role_is_unassumable`]. Also `false` for a value that
+/// is no IAM ARN at all: such a value violates the member's modelled pattern and is refused
+/// by the constraint walk ahead of any handler, so nothing here has to invent an answer for
+/// it. The ARN's fields come from the crate's ONE shared parse
+/// (`service_common::arn::parse_of`), so nothing indexes or slices the untrusted value.
+///
+/// These answers are AWS's RECORDED behaviour for this operation, and they differ from the
+/// reading a function's EXECUTION role takes — which serves a role of another account — on
+/// purpose: an execution role is stored for later invocations, while the operator role is
+/// handed over by this very call. The cross-service suite
+/// `core/router/tests/all/lambda_capacity_provider_operator_role.rs` and this crate's
+/// `tests/all/capacity_provider_operator_role.rs` pin both answers, so a fix for another
+/// issue must not flip them: if those suites fail in a gate, the change under review is what
+/// to fix.
+#[must_use]
+pub fn operator_role_is_of_another_account(operator_role_arn: &str) -> bool {
+    ::service_common::arn::parse_of(operator_role_arn, IAM_ARN_NAMESPACE).is_some_and(|arn| {
+        !arn.account.is_empty() && arn.account != ::engine::emulator_account_id()
+    })
 }
