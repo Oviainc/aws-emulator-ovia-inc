@@ -902,9 +902,16 @@ pub const MESSAGE_CONTENT_NOT_FOUND: &str = "Content does not exist.";
 ///
 /// It is a PER-ENTRY error inside a successful answer, not a refusal: the call reports
 /// which of the ids it was given it could not acknowledge, and names the id in the
-/// entry's own `recommendationId` member rather than in this sentence.
-pub const MESSAGE_RECOMMENDATION_NOT_AVAILABLE: &str =
-    "The recommendation is not an available recommendation of this session.";
+/// entry's own `recommendationId` member
+/// (`smithy_query(query="shape",shape="NotifyRecommendationsReceivedError")`:
+/// `recommendationId` is "The identifier of the recommendation that is in error") rather
+/// than in this sentence. The sentence itself is the ONE fixed service text for the
+/// class — it does not name a reason and does not vary per entry — so every entry of
+/// every answer carries exactly this string, and the Wisdom view of this same endpoint
+/// words it from its own copy of this constant
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a client
+/// cannot read a different sentence depending on which model it addressed.
+pub const MESSAGE_RECOMMENDATION_NOT_PROCESSED: &str = "Could not process recommendation";
 
 /// The fixed text of the modelled `ValidationException` a `CreateContent` naming an
 /// `uploadId` this service never issued (or one already consumed, or one whose URL has

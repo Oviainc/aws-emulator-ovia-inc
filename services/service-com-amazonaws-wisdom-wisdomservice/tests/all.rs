@@ -31,6 +31,8 @@ mod content_upload;
 mod idempotency_contents_and_refusal_fidelity;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
+#[path = "all/notify_recommendations_error_text.rs"]
+mod notify_recommendations_error_text;
 #[path = "all/quick_response.rs"]
 mod quick_response;
 #[path = "all/quick_response_mutations.rs"]

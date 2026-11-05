@@ -47,6 +47,8 @@ mod knowledge_base_lifecycle;
 mod knowledge_base_listing_and_queries;
 #[path = "all/modelled_refusals.rs"]
 mod modelled_refusals;
+#[path = "all/notify_recommendations_error_text.rs"]
+mod notify_recommendations_error_text;
 #[path = "all/quick_response.rs"]
 mod quick_response;
 #[path = "all/quick_response_delete_reach.rs"]

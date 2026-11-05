@@ -60,7 +60,7 @@ const ENDPOINT_HOST: &str = "wisdom.eu-west-1.amazonaws.com";
 const ROUTE_KEY: &str = "com-amazonaws-wisdom-wisdomservice";
 
 /// A UUID no create ever mints, for the not-found assertions.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+pub(crate) const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// One media type `StartContentUpload`'s modelled `ContentType` pattern admits
 /// (`smithy_query(query="operation",operation="StartContentUpload")`).
@@ -86,14 +86,14 @@ const UPLOAD_TYPE_PUBLISHED: &str = r"(text/(plain|html|csv))|(application/(pdf|
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn string(&self, pointer: &str) -> String {
+    pub(crate) fn string(&self, pointer: &str) -> String {
         self.body
             .pointer(pointer)
             .and_then(Value::as_str)
@@ -101,7 +101,7 @@ impl Reply {
             .to_string()
     }
 
-    fn array(&self, pointer: &str) -> Vec<Value> {
+    pub(crate) fn array(&self, pointer: &str) -> Vec<Value> {
         self.body
             .pointer(pointer)
             .and_then(Value::as_array)
@@ -111,7 +111,7 @@ impl Reply {
 
     /// The error code a client branches on: the `x-amzn-errortype` header, falling back
     /// to the body's `__type` for a protocol that carries it only there.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         if self.error_type.is_empty() {
             self.string("/__type")
         } else {
@@ -119,7 +119,7 @@ impl Reply {
         }
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.string("/message")
     }
 }
@@ -140,13 +140,13 @@ fn label(value: &str) -> String {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
@@ -156,7 +156,7 @@ impl Emulator {
         Self { router, engine }
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{ROUTE_KEY}/aws4_request, \
              SignedHeaders=host, Signature=not-verified-in-this-suite"
@@ -226,7 +226,7 @@ impl Emulator {
         }
     }
 
-    async fn assistant(&self, name: &str) -> (String, String) {
+    pub(crate) async fn assistant(&self, name: &str) -> (String, String) {
         let reply = self
             .send(
                 "POST",
@@ -245,7 +245,7 @@ impl Emulator {
         )
     }
 
-    async fn knowledge_base(&self, name: &str, kind: &str) -> (String, String) {
+    pub(crate) async fn knowledge_base(&self, name: &str, kind: &str) -> (String, String) {
         let reply = self
             .send(
                 "POST",
@@ -264,7 +264,7 @@ impl Emulator {
         )
     }
 
-    async fn session(&self, assistant_id: &str, name: &str) -> (String, String) {
+    pub(crate) async fn session(&self, assistant_id: &str, name: &str) -> (String, String) {
         let reply = self
             .send(
                 "POST",
@@ -345,7 +345,7 @@ impl Emulator {
     /// Put one recommendation on a session's feed through the state seam — real Wisdom
     /// makes a recommendation available out of band, and no implemented operation of this
     /// model publishes one.
-    fn publish(&self, assistant_id: &str, session_id: &str, recommendation_id: &str) {
+    pub(crate) fn publish(&self, assistant_id: &str, session_id: &str, recommendation_id: &str) {
         let store = state::service_state(&*self.engine).expect("the service state");
         let mut store = store.lock();
         let session = store

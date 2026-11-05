@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|recommendation_id| NotifyRecommendationsReceivedError2 {
                         recommendation_id: Some(recommendation_id),
                         message: Some(
-                            crate::state::MESSAGE_RECOMMENDATION_NOT_AVAILABLE.to_string(),
+                            crate::state::MESSAGE_RECOMMENDATION_NOT_PROCESSED.to_string(),
                         ),
                     })
                     .collect(),
