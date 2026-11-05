@@ -201,9 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing ran the benchmark, so there is no instant its run started at.
             start_time: None,
             end_time: job.end_time.map(crate::state::timestamp),
-            // `Tags` is optional in the modelled output, so a job created without any
-            // reports the member absent rather than an empty list.
-            tags: Some(job.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The tag set the job holds, reported whatever is in it: the EMPTY list for a
+            // job nothing tagged, because the member is how the job reports its tags
+            // rather than what the create mentioned.
+            tags: Some(job.tags.clone()),
         };
         let job_arn = job.arn.clone();
         drop(store);

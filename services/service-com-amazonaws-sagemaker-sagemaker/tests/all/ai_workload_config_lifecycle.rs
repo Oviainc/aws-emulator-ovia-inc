@@ -293,13 +293,16 @@ async fn describe_replays_every_member_the_create_stored() {
             "case {case:?}: expected the stored tags to round-trip, got {:?}",
             described.get("Tags")
         );
-        // `Tags` is optional in the modelled output, so a request that carried none —
-        // omitted or an explicitly empty list — reports the member absent rather than an
-        // empty list.
+        // The tag set is the configuration's own collection, so the member is present
+        // whatever is in it: a request that carried none — omitted or an explicitly empty
+        // list — reports the EMPTY list rather than going missing (the rule the
+        // `read_responses_report_what_a_resource_holds` suite pins).
         if sent_tags.is_empty() {
-            assert!(
-                described.get("Tags").is_none(),
-                "case {case:?}: expected Tags to be absent when none were given, got {:?}",
+            assert_eq!(
+                described.get("Tags"),
+                Some(&json!([])),
+                "case {case:?}: expected Tags to be the empty list when none were given, \
+                 got {:?}",
                 described.get("Tags")
             );
         }

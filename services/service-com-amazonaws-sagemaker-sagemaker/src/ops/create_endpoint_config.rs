@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpointConfig
-//! IMPLEMENTED: stores the configuration's variants verbatim in `crate::state`, refuses
-//! a name already in use and a variant naming a model that does not exist. This is the
-//! ONLY file to touch for this operation.
+//! IMPLEMENTED: stores the configuration's variants verbatim in `crate::state`, stamps the
+//! members the service itself resolves (the utilization-metrics flag a new configuration
+//! carries and whether its containers are isolated), and refuses a name already in use and
+//! a variant naming a model that does not exist. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +126,38 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// What `EnableNetworkIsolation` means for a configuration created without it.
+///
+/// The member "sets whether all model containers deployed to the endpoint are isolated"
+/// (this file's modelled contract above), so a configuration that asks for no isolation is
+/// not isolated — the same resolution `CreateModel` makes for a model's own flag.
+const NETWORK_ISOLATION_DEFAULT: bool = false;
+
+/// What `MetricsConfig$EnableDetailedObservability` means for a configuration created
+/// without it: "The default value for new endpoint configurations is True"
+/// (`smithy_query(query="doc",shape="MetricsConfig",member="EnableDetailedObservability")`).
+///
+/// The effective value is fixed when the configuration is CREATED — the same documentation
+/// adds that a configuration created before the feature reads `False` unless it was set
+/// explicitly — so it is stamped on the record here rather than resolved again by each
+/// reader.
+const DETAILED_OBSERVABILITY_DEFAULT: bool = true;
+
+/// Fill in what SageMaker itself resolves for an endpoint configuration's utilization
+/// metrics: the detailed-observability flag a new configuration carries when the request
+/// names none, inside the `MetricsConfig` the request carried or one of its own when it
+/// carried none.
+///
+/// Applied where the configuration is WRITTEN, so `DescribeEndpointConfig` and the
+/// endpoint that snapshots the configuration report one answer.
+fn materialise_metrics_config(requested: Option<MetricsConfig>) -> MetricsConfig {
+    let mut resolved = requested.unwrap_or_default();
+    if resolved.enable_detailed_observability.is_none() {
+        resolved.enable_detailed_observability = Some(DETAILED_OBSERVABILITY_DEFAULT);
+    }
+    resolved
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -247,11 +281,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 data_capture_config: input.data_capture_config,
                 async_inference_config: input.async_inference_config,
                 explainer_config: input.explainer_config,
-                metrics_config: input.metrics_config,
+                // What the endpoint would RUN under, not only what the request mentioned:
+                // the detailed-observability flag a new configuration carries, and no
+                // isolation unless the request asked for it.
+                metrics_config: Some(materialise_metrics_config(input.metrics_config)),
                 kms_key_id: input.kms_key_id,
                 execution_role_arn: input.execution_role_arn,
                 vpc_config: input.vpc_config,
-                enable_network_isolation: input.enable_network_isolation,
+                enable_network_isolation: Some(
+                    input
+                        .enable_network_isolation
+                        .unwrap_or(NETWORK_ISOLATION_DEFAULT),
+                ),
                 tags: input.tags.unwrap_or_default(),
                 creation_time: ::std::time::SystemTime::now(),
             },

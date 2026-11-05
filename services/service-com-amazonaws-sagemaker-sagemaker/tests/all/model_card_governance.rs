@@ -210,11 +210,15 @@ async fn created_model_cards_round_trip_through_describe() {
             Some(format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE").as_str()),
             "case {case}: CreatedBy.IamIdentity.Arn, got {created_by:?}"
         );
-        // Nothing has modified the card, so there is no identity for a modification.
+        // Nothing has modified the card, so there is no identity to report for a
+        // modification — and the member is how the card reports its last modifier, so it
+        // is present as the EMPTY `UserContext` rather than omitted (the rule the
+        // `read_responses_report_what_a_resource_holds` suite pins).
         assert_eq!(
             described.get("LastModifiedBy"),
-            None,
-            "case {case}: expected no LastModifiedBy on an unmodified card, got {described:?}"
+            Some(&json!({})),
+            "case {case}: expected an empty LastModifiedBy on an unmodified card, got \
+             {described:?}"
         );
         assert!(
             number_field(&described, "LastModifiedTime") > 0.0,

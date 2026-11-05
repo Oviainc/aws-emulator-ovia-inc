@@ -396,6 +396,101 @@ async fn model_reads_report_the_container_mode_and_isolation_the_service_default
     }
 }
 
+/// RULE: `DescribeEndpointConfig` reports the utilization-metrics configuration and the
+/// isolation flag the endpoint would RUN under — the value the request stated, or the
+/// documented default (`EnableDetailedObservability` true for a new configuration,
+/// `false` for isolation) when it stated none.
+#[tokio::test]
+async fn endpoint_config_reads_report_the_metrics_and_isolation_the_service_resolves() {
+    // Rows differ along what the request states: neither member, each on its own, and a
+    // `MetricsConfig` naming only one of its OTHER members
+    // (`smithy_query(query="shape",shape="MetricsConfig")` lists `EnableEnhancedMetrics`,
+    // `EnableDetailedObservability` and `MetricPublishFrequencyInSeconds`), which leaves
+    // the defaulted one to the service.
+    let rows: Vec<(&str, Option<bool>, Option<Value>)> = vec![
+        ("nothing-stated", None, None),
+        ("isolated", Some(true), None),
+        ("isolation-off", Some(false), None),
+        (
+            "observability-off",
+            None,
+            Some(json!({ "EnableDetailedObservability": false })),
+        ),
+        (
+            "observability-on",
+            Some(true),
+            Some(json!({ "EnableDetailedObservability": true })),
+        ),
+        (
+            "enhanced-only",
+            None,
+            Some(json!({ "EnableEnhancedMetrics": true })),
+        ),
+        (
+            // `MetricPublishFrequencyInSeconds` is an intEnum whose values are 10, 30, 60,
+            // 120, 180, 240 and 300 (the member's own documentation).
+            "frequency-only",
+            None,
+            Some(json!({ "MetricPublishFrequencyInSeconds": 30 })),
+        ),
+    ];
+
+    for (case, isolation, metrics) in rows {
+        let emulator = Emulator::new();
+        let mut body = json!({
+            "EndpointConfigName": case,
+            "ProductionVariants": [{
+                "VariantName": "AllTraffic",
+                "InitialInstanceCount": 1,
+                "InstanceType": "ml.m5.large",
+                "InitialVariantWeight": 1.0,
+            }],
+        });
+        if let Some(isolation) = isolation {
+            body["EnableNetworkIsolation"] = json!(isolation);
+        }
+        if let Some(metrics) = &metrics {
+            body["MetricsConfig"] = metrics.clone();
+        }
+        emulator.ok("CreateEndpointConfig", &body).await;
+
+        let described = emulator
+            .ok(
+                "DescribeEndpointConfig",
+                &json!({ "EndpointConfigName": case }),
+            )
+            .await;
+        assert_eq!(
+            described
+                .get("EnableNetworkIsolation")
+                .and_then(Value::as_bool),
+            Some(isolation.unwrap_or(false)),
+            "case {case}: EnableNetworkIsolation, got {described:?}"
+        );
+        let stated_observability = metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("EnableDetailedObservability"))
+            .and_then(Value::as_bool);
+        assert_eq!(
+            described
+                .pointer("/MetricsConfig/EnableDetailedObservability")
+                .and_then(Value::as_bool),
+            Some(stated_observability.unwrap_or(true)),
+            "case {case}: MetricsConfig.EnableDetailedObservability, got {described:?}"
+        );
+        // Every other metrics member is echoed exactly as stated beside the resolved one,
+        // and stays absent where the request stated none.
+        for member in ["EnableEnhancedMetrics", "MetricPublishFrequencyInSeconds"] {
+            assert_eq!(
+                described
+                    .pointer(&format!("/MetricsConfig/{member}")),
+                metrics.as_ref().and_then(|metrics| metrics.get(member)),
+                "case {case}: MetricsConfig.{member}, got {described:?}"
+            );
+        }
+    }
+}
+
 /// Register the model package group `group` so a versioned package can join it.
 async fn create_group(emulator: &Emulator, group: &str) {
     emulator

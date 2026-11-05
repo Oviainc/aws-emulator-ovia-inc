@@ -536,14 +536,24 @@ async fn describe_endpoint_config_replays_exactly_what_create_stored() {
             str_field(&created, "EndpointConfigArn"),
             "case {case}: DescribeEndpointConfig must replay the ARN create minted"
         );
-        for member in ["ProductionVariants", "KmsKeyId", "DataCaptureConfig",
-                       "EnableNetworkIsolation"] {
+        for member in ["ProductionVariants", "KmsKeyId", "DataCaptureConfig"] {
             assert_eq!(
                 described.get(member),
                 body.get(member),
                 "case {case}: {member} must round-trip, got {described:?}"
             );
         }
+        // `EnableNetworkIsolation` is resolved by the SERVICE: the submitted value where
+        // the request named one, and no isolation where it named none — so the read
+        // reports what the endpoint would run under rather than only what was sent
+        // (`service_resolved_members` and `read_responses_report_what_a_resource_holds`
+        // pin that rule).
+        assert_eq!(
+            described.get("EnableNetworkIsolation"),
+            Some(body.get("EnableNetworkIsolation").unwrap_or(&json!(false))),
+            "case {case}: EnableNetworkIsolation must report the effective value, got \
+             {described:?}"
+        );
         assert!(
             described.get("CreationTime").is_some_and(Value::is_number),
             "case {case}: CreationTime must be a stored timestamp, got {described:?}"

@@ -293,6 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or(crate::state::AI_RECOMMENDATION_OPTIMIZE_MODEL_DEFAULT),
                 role_arn: input.role_arn,
                 tags: input.tags.unwrap_or_default(),
+                // The job holds no recommendation yet: the list is what the read reports,
+                // and it starts EMPTY rather than absent.
+                recommendations: Vec::new(),
                 // AWS returns an accepted recommendation job in a non-terminal status, so
                 // the move out of it is owed by the clock rather than taken on this call.
                 status: crate::state::AI_RECOMMENDATION_STATUS_IN_PROGRESS.to_string(),

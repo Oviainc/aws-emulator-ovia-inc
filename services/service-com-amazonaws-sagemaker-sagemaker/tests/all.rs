@@ -189,6 +189,8 @@ mod processing_job_not_found_refusals;
 mod processing_job_stop;
 #[path = "all/processing_job_stop_absent_target.rs"]
 mod processing_job_stop_absent_target;
+#[path = "all/read_responses_report_what_a_resource_holds.rs"]
+mod read_responses_report_what_a_resource_holds;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
 #[path = "all/resource_tagging.rs"]

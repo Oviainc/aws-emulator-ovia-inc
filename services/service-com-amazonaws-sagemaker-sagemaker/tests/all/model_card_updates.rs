@@ -407,9 +407,9 @@ async fn naming_both_aspects_or_neither_is_refused_and_persists_nothing() {
         );
         assert_eq!(
             described.get("LastModifiedBy"),
-            None,
-            "case {case}: expected no modifier to be recorded for a refused update, got \
-             {described:?}"
+            Some(&json!({})),
+            "case {case}: expected no modifier to be recorded for a refused update, so the \
+             member stays the empty UserContext, got {described:?}"
         );
     }
 }

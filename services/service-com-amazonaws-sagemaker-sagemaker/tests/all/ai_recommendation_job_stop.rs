@@ -9,7 +9,7 @@
 //! The tests assert RULES over a TABLE of inputs rather than one recorded call: a stop of
 //! a running job answers the stored job's ARN and moves it into the transient `Stopping`
 //! status, whatever its name, Region or optional members; the clock — not the read — owes
-//! it `Stopped`, with no failure reason beside a status the caller asked for; a stop
+//! it `Stopped`, with the reason the stop recorded beside it; a stop
 //! already in flight is not restarted; a job whose run is over has nothing to stop; a name
 //! nothing created is refused with the modelled `ResourceNotFound`; and a stop moves the
 //! one job it names and no other.
@@ -37,6 +37,10 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/SageMakerRecommendationRo
 
 /// The workload configuration every job below is created against.
 const WORKLOAD_CONFIG: &str = "stop-workload-config";
+
+/// How SageMaker words the `FailureReason` of a job a caller stopped: a fixed sentence
+/// carrying nothing of the request (`state::AI_RECOMMENDATION_STOPPED_BY_USER_REASON`).
+const STOPPED_BY_USER: &str = "Job stopped by user request";
 
 /// One row of the stop table: a case name, the job's name and Region, and whatever the
 /// request carries beyond `CreateAIRecommendationJob`'s required members.
@@ -162,8 +166,8 @@ async fn describe(emulator: &Emulator, region: &str, name: &str) -> (u16, Value)
 
 /// RULE: a stop of a running AI recommendation job answers the ARN of the stored job and
 /// moves it into the transient `Stopping` status; the move to the terminal `Stopped` is
-/// owed by the CLOCK, carries no failure reason — stopping is what the caller asked for —
-/// and is stable across later reads.
+/// owed by the CLOCK, carries the reason the stop recorded — the run ended because the
+/// caller asked it to — and is stable across later reads.
 #[tokio::test]
 async fn stopping_a_running_job_moves_it_to_stopping_then_stopped() {
     for row in stop_rows() {
@@ -211,9 +215,16 @@ async fn stopping_a_running_job_moves_it_to_stopping_then_stopped() {
              got {stopping:?}"
         );
         assert!(
-            stopping.get("FailureReason").is_none() && stopping.get("EndTime").is_none(),
-            "case {case:?}: expected neither FailureReason nor EndTime while the job is \
-             Stopping, got {stopping:?}"
+            stopping.get("EndTime").is_none(),
+            "case {case:?}: expected no EndTime while the job is Stopping, got {stopping:?}"
+        );
+        // The stop records WHY the run ended without a result, and reports it from the
+        // moment the job is stopping: AWS's fixed sentence for a job a caller stopped.
+        assert_eq!(
+            str_field(&stopping, "FailureReason"),
+            STOPPED_BY_USER,
+            "case {case:?}: expected the stop's reason while the job is Stopping, \
+             got {stopping:?}"
         );
 
         tokio::time::sleep(PAST_STOP_DUE).await;
@@ -230,10 +241,11 @@ async fn stopping_a_running_job_moves_it_to_stopping_then_stopped() {
             "case {case:?}: expected the job the caller stopped to end in Stopped, \
              got {after:?}"
         );
-        assert!(
-            after.get("FailureReason").is_none(),
-            "case {case:?}: expected no FailureReason beside a status the caller asked \
-             for, got {after:?}"
+        assert_eq!(
+            str_field(&after, "FailureReason"),
+            STOPPED_BY_USER,
+            "case {case:?}: expected the stop's reason to stand beside the terminal \
+             status, got {after:?}"
         );
         let end_time = after
             .get("EndTime")
@@ -249,9 +261,16 @@ async fn stopping_a_running_job_moves_it_to_stopping_then_stopped() {
              {creation_time}, got {after:?}"
         );
         assert!(
-            after.get("StartTime").is_none() && after.get("Recommendations").is_none(),
-            "case {case:?}: expected neither StartTime nor Recommendations for a run that \
-             never started, got {after:?}"
+            after.get("StartTime").is_none(),
+            "case {case:?}: expected no StartTime for a run that never started, got {after:?}"
+        );
+        // Nothing analysed the model, so the list the job holds is reported EMPTY rather
+        // than omitted (the rule `read_responses_report_what_a_resource_holds` pins).
+        assert_eq!(
+            after.get("Recommendations"),
+            Some(&json!([])),
+            "case {case:?}: expected the empty Recommendations list for a run that never \
+             started, got {after:?}"
         );
 
         // The move happened once: a later read reports exactly the same job, so the

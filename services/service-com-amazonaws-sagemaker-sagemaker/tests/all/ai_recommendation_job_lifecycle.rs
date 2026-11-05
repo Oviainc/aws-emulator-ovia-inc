@@ -368,11 +368,14 @@ async fn describe_replays_every_member_the_create_stored() {
             described.get("StartTime").is_none() && described.get("EndTime").is_none(),
             "case {case:?}: expected no run timestamps before the job ends, got {described:?}"
         );
-        // Nothing analysed the model, so no recommendation is invented for it.
-        assert!(
-            described.get("Recommendations").is_none(),
-            "case {case:?}: expected no Recommendations for a run that never started, \
-             got {:?}",
+        // Nothing analysed the model, so no recommendation is invented for it — and the
+        // list the job holds is reported EMPTY rather than omitted (the rule the
+        // `read_responses_report_what_a_resource_holds` suite pins).
+        assert_eq!(
+            described.get("Recommendations"),
+            Some(&json!([])),
+            "case {case:?}: expected the empty Recommendations list for a run that never \
+             started, got {:?}",
             described.get("Recommendations")
         );
 
@@ -446,10 +449,15 @@ async fn describe_replays_every_member_the_create_stored() {
             "case {case:?}: expected the stored tags to round-trip, got {:?}",
             described.get("Tags")
         );
+        // The tag set is the job's own collection, so the member is present whatever is in
+        // it: a job created with no tags reports the EMPTY list rather than going missing
+        // (the rule the `read_responses_report_what_a_resource_holds` suite pins).
         if sent_tags.is_empty() {
-            assert!(
-                described.get("Tags").is_none(),
-                "case {case:?}: expected Tags to be absent when none were given, got {:?}",
+            assert_eq!(
+                described.get("Tags"),
+                Some(&json!([])),
+                "case {case:?}: expected Tags to be the empty list when none were given, \
+                 got {:?}",
                 described.get("Tags")
             );
         }
@@ -652,10 +660,11 @@ async fn a_job_leaves_in_progress_only_once_the_clock_owes_it() {
             after.get("StartTime").is_none(),
             "case {case:?}: expected no StartTime for a run that never started, got {after:?}"
         );
-        assert!(
-            after.get("Recommendations").is_none(),
-            "case {case:?}: expected no Recommendations for a run that never started, \
-             got {after:?}"
+        assert_eq!(
+            after.get("Recommendations"),
+            Some(&json!([])),
+            "case {case:?}: expected the empty Recommendations list for a run that never \
+             started, got {after:?}"
         );
 
         // The move happened once: a later read reports exactly the same job, so the

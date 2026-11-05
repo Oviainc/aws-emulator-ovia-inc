@@ -238,10 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reports the targets it was created with.
             performance_target: Some(job.performance_target.clone()),
             // Nothing analysed the model (see
-            // `crate::state::NO_RECOMMENDATION_RUNTIME_REASON`), so there is no
-            // recommendation to report: the member stays ABSENT rather than reporting an
-            // empty list a caller cannot tell from "no recommendations yet".
-            recommendations: None,
+            // `crate::state::NO_RECOMMENDATION_RUNTIME_REASON`), so the job holds no
+            // recommendation — which the list REPORTS as the empty list: the member is how
+            // the job reports what it holds, so it is present whatever is in it.
+            recommendations: Some(job.recommendations.clone()),
             role_arn: job.role_arn.clone(),
             compute_spec: job.compute_spec.clone(),
             adapter_source: job.adapter_source.clone(),
@@ -249,9 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing ran the analysis, so there is no instant its run started at.
             start_time: None,
             end_time: job.end_time.map(crate::state::timestamp),
-            // `Tags` is optional in the modelled output, so a job created without any
-            // reports the member absent rather than an empty list.
-            tags: (!job.tags.is_empty()).then(|| job.tags.clone()),
+            // The tag set the job holds, reported whatever is in it: the EMPTY list for a
+            // job nothing tagged, because the member is how the job reports its tags
+            // rather than what the create mentioned.
+            tags: Some(job.tags.clone()),
         };
         let job_arn = job.arn.clone();
         drop(store);

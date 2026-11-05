@@ -296,7 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the IAM identity the request signed with and none of the Studio members.
             created_by: held.created_by.clone(),
             last_modified_time: Some(crate::state::timestamp(held.last_modified_time)),
-            last_modified_by: held.last_modified_by.clone(),
+            // Who last modified this version: the identity `UpdateModelCard` recorded, or
+            // the EMPTY `UserContext` while nothing has modified it — the member is how
+            // the card reports its last modifier, so it is present either way, as the
+            // lineage readers report theirs.
+            last_modified_by: Some(held.last_modified_by.clone().unwrap_or_default()),
             // `ModelCardProcessingStatus` reports the progress of model card DELETION;
             // a card nobody has asked to delete is in none of those states, so the
             // optional member is absent.

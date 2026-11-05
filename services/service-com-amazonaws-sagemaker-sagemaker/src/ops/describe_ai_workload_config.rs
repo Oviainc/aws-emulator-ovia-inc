@@ -170,9 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ai_workload_config_arn: config.arn.clone(),
             dataset_config: config.dataset_config.clone(),
             ai_workload_configs: config.workload_configs.clone(),
-            // The modelled member is optional and the create accepts no tags at all, so an
-            // untagged configuration reports absent rather than an empty list.
-            tags: (!config.tags.is_empty()).then(|| config.tags.clone()),
+            // The tag set the configuration holds, reported whatever is in it: the EMPTY
+            // list for a configuration nothing tagged, because the member is how the
+            // configuration reports its tags rather than what the create mentioned.
+            tags: Some(config.tags.clone()),
             creation_time: crate::state::timestamp(config.creation_time),
         })
     }

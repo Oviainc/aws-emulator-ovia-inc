@@ -12,7 +12,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::Tag;
+use crate::ops::types::{AIRecommendation, Tag};
 
 use super::ComAmazonawsSagemakerSagemakerState;
 
@@ -97,6 +97,15 @@ pub const NO_RECOMMENDATION_RUNTIME_REASON: &str =
     "This emulator serves no inference data plane and runs no model optimization or \
      benchmarking tool, so the recommendation job's run was never started";
 
+/// `FailureReason` of a recommendation job the caller asked to stop.
+///
+/// The stop is not a fault of the job, but the service still records WHY the run ended
+/// without a result, and it is the same sentence for every job a caller stops, so it is
+/// fixed text with nothing of the request in it. Written where the stop is recorded
+/// ([`AIRecommendationJob::request_stop`]), so the reason is reported while the job is
+/// stopping and after it has stopped.
+pub const AI_RECOMMENDATION_STOPPED_BY_USER_REASON: &str = "Job stopped by user request";
+
 /// Why a reader or the stop could not resolve an AI recommendation job, named
 /// once here so `DescribeAIRecommendationJob` and `StopAIRecommendationJob` refuse an
 /// unknown name with the same sentence: the AI family's [`super::ai_entity_not_found`],
@@ -172,6 +181,12 @@ pub struct AIRecommendationJob {
     pub optimize_model: bool,
     pub role_arn: String,
     pub tags: Vec<Tag>,
+    /// The recommendations the job HOLDS, which is what
+    /// `DescribeAIRecommendationJob` reports — the empty list while nothing has analysed
+    /// the model (see [`NO_RECOMMENDATION_RUNTIME_REASON`]), held directly rather than as
+    /// an `Option` so the read reports the collection instead of deciding again whether to
+    /// mention it (see the note on an entity's own collections in [`super`]).
+    pub recommendations: Vec<AIRecommendation>,
     pub status: String,
     pub failure_reason: Option<String>,
     pub creation_time: SystemTime,
@@ -191,8 +206,8 @@ impl AIRecommendationJob {
     /// A job left to run ends in [`AI_RECOMMENDATION_STATUS_FAILED`] with
     /// [`NO_RECOMMENDATION_RUNTIME_REASON`]: nothing analysed the model, so no
     /// `Completed` status, no `StartTime` and no recommendation is invented for it. A job
-    /// the caller asked to stop ends in [`AI_RECOMMENDATION_STATUS_STOPPED`] with no
-    /// failure reason instead: stopping is what the caller asked for, not a failure.
+    /// the caller asked to stop ends in [`AI_RECOMMENDATION_STATUS_STOPPED`], keeping the
+    /// reason the stop recorded ([`AI_RECOMMENDATION_STOPPED_BY_USER_REASON`]).
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
@@ -255,9 +270,10 @@ impl AIRecommendationJob {
     /// status is observable.
     pub fn request_stop(&mut self, now: SystemTime) {
         self.status = AI_RECOMMENDATION_STATUS_STOPPING.to_string();
-        // The run is being abandoned on request, not failing, so any reason a previous
-        // status carried is cleared rather than reported beside `Stopped`.
-        self.failure_reason = None;
+        // The run is being abandoned on request, so the reason it ended without a result
+        // is the stop the caller asked for — replacing whatever reason a previous status
+        // carried.
+        self.failure_reason = Some(AI_RECOMMENDATION_STOPPED_BY_USER_REASON.to_string());
         self.end_time = None;
         self.ends_at = now + AI_RECOMMENDATION_JOB_STOPS_AFTER;
     }
