@@ -316,7 +316,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// Call `ReimportApi`: `PUT /v2/apis/{ApiId}` with the definition in the `Body` member.
-async fn reimport(
+pub(crate) async fn reimport(
     router: &MultiServiceRouter,
     api_id: &str,
     query: &str,

@@ -15,8 +15,10 @@
 //! * **`Basepath` decides what the routes' paths are prefixed with**: `ignore` (the
 //!   default) leaves the definition's base path out, `prepend` puts all of it in front,
 //!   and `split` drops its first segment — a stage name — and prepends the rest.
-//! * A definition this service cannot import is refused 400 and persists NOTHING, and
-//!   `FailOnWarnings` turns a warning into that same refusal.
+//! * A definition this service cannot read at all is refused 400 and persists NOTHING,
+//!   and `FailOnWarnings` turns a warning into that same refusal. A problem with ONE
+//!   path's integration is a warning, not a refusal — see
+//!   `api_import_integration_warnings`.
 //!
 //! The rows span what each rule generalises over: the document's version (OpenAPI 3 and
 //! Swagger 2.0), how many paths and operations it declares, which optional members and
@@ -722,79 +724,9 @@ async fn a_definition_this_service_cannot_import_is_refused_and_persists_nothing
             json!({ "openapi": "3.0.1", "info": { "title": "bad-paths" }, "paths": [] })
                 .to_string(),
         ),
-        (
-            "an integration extension with no type",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "typeless" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "uri": "https://example.com" } } } }
-            })
-            .to_string(),
-        ),
-        (
-            "an integration type outside the modelled catalog",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "bad-type" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "sidecar", "uri": "https://example.com" } } } }
-            })
-            .to_string(),
-        ),
-        (
-            "an integration type supported only for WebSocket APIs",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "mock-type" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "mock" } } } }
-            })
-            .to_string(),
-        ),
-        (
-            "an integration that names no endpoint",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "uriless" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "http_proxy" } } } }
-            })
-            .to_string(),
-        ),
-        (
-            "a VPC_LINK connection with no link",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "linkless" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "http_proxy", "uri": "https://example.com", "connectionType": "VPC_LINK" } } } }
-            })
-            .to_string(),
-        ),
-        (
-            // The same rule `CreateIntegration` applies: 2.0 is a Lambda proxy's
-            // payload format, and "for all other integrations, 1.0 is the only
-            // supported value".
-            "a payload format version the integration type does not support",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "bad-payload-format" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "http_proxy", "uri": "https://example.com", "payloadFormatVersion": "2.0" } } } }
-            })
-            .to_string(),
-        ),
-        (
-            "a service-action subtype on an integration that is not AWS_PROXY",
-            "",
-            json!({
-                "openapi": "3.0.1",
-                "info": { "title": "bad-subtype" },
-                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "http_proxy", "uri": "https://example.com", "integrationSubtype": "SQS-SendMessage" } } } }
-            })
-            .to_string(),
-        ),
+        // A problem with ONE path's integration is NOT a refusal — the api is created and
+        // the problem is warned about; those rows live in
+        // `api_import_integration_warnings`.
         (
             // And the CORS rule every writer of a configuration applies.
             "a CORS configuration allowing credentials and the wildcard origin",
@@ -900,16 +832,31 @@ async fn an_integration_timeout_is_held_to_the_modelled_range() {
              the extension named, got {integrations:?}"
         );
     }
+    // Outside that range the integration is not created: the problem belongs to one path,
+    // so the api is imported, the route is kept without a target and the response warns.
     for timeout in [49_i64, 30_001, 0] {
-        let (status, body) = import(&router, "", &timeout_definition(timeout)).await;
+        let (status, imported) = import(&router, "", &timeout_definition(timeout)).await;
         assert_eq!(
-            status, 400,
-            "case timeoutInMillis={timeout}: outside the modelled range, got {status} {body}"
+            status, 201,
+            "case timeoutInMillis={timeout}: outside the modelled range, got {status} {imported}"
+        );
+        let warnings = imported["warnings"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "case timeoutInMillis={timeout}: expected one warning for the integration the \
+             import could not create, got {imported}"
+        );
+        let api_id = as_str(&imported, "apiId");
+        assert_eq!(
+            stored_integrations(&router, &api_id).await.len(),
+            0,
+            "case timeoutInMillis={timeout}: the integration must not be created"
         );
         assert_eq!(
-            error_code(&body),
-            "BadRequestException",
-            "case timeoutInMillis={timeout}: expected BadRequestException, got {body}"
+            stored_routes(&router, &api_id).await,
+            BTreeMap::from([("GET /pets".to_string(), None)]),
+            "case timeoutInMillis={timeout}: the route must be imported without a target"
         );
     }
 }

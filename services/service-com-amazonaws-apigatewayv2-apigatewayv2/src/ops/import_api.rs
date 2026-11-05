@@ -12,6 +12,12 @@
 //! carries the `HTTP` protocol type and the route selection expression that protocol
 //! documents.
 //!
+//! A problem with ONE path's integration is not a problem with the definition: the api is
+//! created, that integration is skipped — its route is imported without a target — and
+//! the problem is reported in `Warnings`, which is what `FailOnWarnings` ("whether to
+//! rollback the API creation when a warning is encountered") turns into a refusal. Only a
+//! body that describes no api at all is refused outright.
+//!
 //! The definition reader ([`parse_definition`] and the shapes it answers with) is `pub`
 //! because `ReimportApi` takes the SAME `Body` and `Basepath` members and so has to read
 //! a definition exactly as this operation does: it reaches this reader as
@@ -399,6 +405,36 @@ const UNSUPPORTED_OPERATION_KEYS: &[&str] = &["trace", "connect"];
 /// The extension an OpenAPI operation carries its API Gateway integration in.
 const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
 
+/// Why an integration extension that names no `type` cannot be created, as API Gateway
+/// words it: `IntegrationType` is the modelled member the extension's `type` names, and
+/// the sentence is the reason the warning for such a path carries.
+const INTEGRATION_TYPE_REQUIRED: &str =
+    "IntegrationType is a required parameter for creating integration.";
+
+/// The keys of an `x-amazon-apigateway-integration` extension an HTTP api's integration is
+/// created from: the members [`read_integration`] reads onto [`ImportedIntegration`], which
+/// are the ones the modelled `Integration` of an HTTP api carries.
+///
+/// A key the extension declares that is NOT one of these configures something an HTTP
+/// api's integration has no member for (an integration template, a passthrough behaviour,
+/// a cache — all of them REST-api configuration), so the import carries it over as nothing
+/// and reports it in `ImportInfo` ("particular properties of your OpenAPI definition which
+/// are ignored during import", `ImportApi$ImportInfo`).
+const INTEGRATION_EXTENSION_KEYS: &[&str] = &[
+    "type",
+    "httpMethod",
+    "uri",
+    "integrationSubtype",
+    "connectionType",
+    "connectionId",
+    "credentials",
+    "payloadFormatVersion",
+    "timeoutInMillis",
+    "requestParameters",
+    "responseParameters",
+    "tlsConfig",
+];
+
 /// The document-level extension an OpenAPI definition carries an HTTP api's CORS
 /// configuration in — the `CorsConfiguration` member's counterpart in a definition.
 const CORS_EXTENSION: &str = "x-amazon-apigateway-cors";
@@ -615,10 +651,15 @@ pub enum BasePathMode {
     Split,
 }
 
+/// How API Gateway names a `Basepath` outside the documented three in the refusal it
+/// answers such a request with: the fixed text, which the value the request sent follows
+/// after a colon.
+const UNRECOGNIZED_BASE_PATH_OPTION: &str = "Unrecognized base path option";
+
 /// The base path mode a request asks for; `Ignore` when it names none.
 ///
-/// `Err` carries the message for a value outside the documented three, naming the member
-/// and the values it accepts.
+/// `Err` carries the message for a value outside the documented three, naming the value
+/// that was not recognized.
 /// The three values are matched EXACTLY, as the member documents them: a spelling the
 /// documented value set does not carry is refused rather than guessed at, so a definition
 /// that imports here imports at API Gateway too.
@@ -627,9 +668,7 @@ pub fn base_path_mode(basepath: Option<&str>) -> Result<BasePathMode, String> {
         None | Some("ignore") => Ok(BasePathMode::Ignore),
         Some("prepend") => Ok(BasePathMode::Prepend),
         Some("split") => Ok(BasePathMode::Split),
-        Some(other) => Err(format!(
-            "Invalid value for Basepath: '{other}'. Valid values are: ignore, prepend, split."
-        )),
+        Some(other) => Err(format!("{UNRECOGNIZED_BASE_PATH_OPTION}: {other}")),
     }
 }
 
@@ -951,20 +990,20 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
         // operation this import can read, so it imports nothing and says so rather than
         // reporting a success that silently holds fewer routes than the document.
         if item.entries().is_none() && !matches!(item, Node::Null) {
-            warn(
+            report(
                 &mut definition.warnings,
                 format!("Path '{path}' declares no operations and was not imported"),
             );
             continue;
         }
-        for (operation, declaration) in item.entries().unwrap_or_default() {
-            let operation = operation.to_ascii_lowercase();
+        for (declared, declaration) in item.entries().unwrap_or_default() {
+            let operation = declared.to_ascii_lowercase();
             let Some((_, method)) = OPERATION_KEYS
                 .iter()
                 .find(|(candidate, _)| *candidate == operation.as_str())
             else {
                 if UNSUPPORTED_OPERATION_KEYS.contains(&operation.as_str()) {
-                    warn(
+                    report(
                         &mut definition.warnings,
                         format!("Unsupported method '{operation}' for path '{path}'"),
                     );
@@ -984,19 +1023,46 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
             }
             let route_key = format!("{method} {route_path}");
             if !claimed.insert(route_key.clone()) {
-                warn(
+                report(
                     &mut definition.warnings,
                     format!("Duplicate route key '{route_key}': the later operation was ignored"),
                 );
                 continue;
             }
             let integration = match declaration.member(INTEGRATION_EXTENSION) {
-                Some(extension) => Some(read_integration(extension, &route_key)?),
+                Some(extension) => {
+                    // Every key the extension declares that an HTTP api's integration has
+                    // no member for is carried over as nothing, and reported as ignored
+                    // under the location the document wrote it at.
+                    for key in ignored_integration_keys(extension) {
+                        report(
+                            &mut definition.import_info,
+                            ignored_key_message(
+                                &format!("paths.{path}.{declared}.{INTEGRATION_EXTENSION}"),
+                                key,
+                            ),
+                        );
+                    }
+                    // A problem with THIS integration is not a problem with the
+                    // definition: the integration is skipped, the route is still imported
+                    // (with no `Target`, which `CreateIntegration`/`UpdateRoute` fills in
+                    // afterwards) and the problem is reported as a warning.
+                    match read_integration(extension) {
+                        Ok(integration) => Some(integration),
+                        Err(reason) => {
+                            report(
+                                &mut definition.warnings,
+                                integration_warning(method, path, &reason),
+                            );
+                            None
+                        }
+                    }
+                }
                 None => {
                     // The route is still imported: a route with no `Target` is a route an
                     // HTTP api may hold, and `CreateIntegration`/`UpdateRoute` is what
                     // wires one up afterwards.
-                    warn(
+                    report(
                         &mut definition.warnings,
                         format!("No integration defined for route '{route_key}'"),
                     );
@@ -1012,12 +1078,47 @@ fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedAp
     Ok(definition)
 }
 
-/// Record one warning, keeping what a response reports bounded by
-/// [`MAX_REPORTED_MESSAGES`] however many paths the definition declares.
-fn warn(warnings: &mut Vec<String>, message: String) {
-    if warnings.len() < MAX_REPORTED_MESSAGES {
-        warnings.push(message);
+/// Record one reported message — a `Warnings` or an `ImportInfo` entry — keeping what a
+/// response reports bounded by [`MAX_REPORTED_MESSAGES`] however many paths and keys the
+/// definition declares.
+fn report(messages: &mut Vec<String>, message: String) {
+    if messages.len() < MAX_REPORTED_MESSAGES {
+        messages.push(message);
     }
+}
+
+/// The warning an import reports for an integration it could not create, leaving the route
+/// the integration belonged to without a target.
+///
+/// A per-path integration problem does not fail the import: API Gateway reports it at the
+/// resource it belongs to and says what it did with it — the api, and every route the
+/// document declares, is created either way. The resource is named as the document names
+/// it: the operation's method and the path it is declared under, NOT the route key the
+/// base path mode went on to build, which is the import's own value rather than the
+/// document's.
+fn integration_warning(method: &str, path: &str, reason: &str) -> String {
+    format!(
+        "Unable to create integration for resource at path '{method} {path}': {reason}. Ignoring."
+    )
+}
+
+/// The `ImportInfo` entry reporting one key of the definition that the import carries over
+/// as nothing, naming the location the document wrote it at.
+fn ignored_key_message(location: &str, key: &str) -> String {
+    format!("{location}: key [{key}] will be ignored by API Gateway")
+}
+
+/// The keys an integration extension declares that an HTTP api's integration has no member
+/// for ([`INTEGRATION_EXTENSION_KEYS`] is the set it does), in the order the parsed
+/// document carries them.
+fn ignored_integration_keys(extension: &Node) -> Vec<&str> {
+    extension
+        .entries()
+        .unwrap_or_default()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !INTEGRATION_EXTENSION_KEYS.contains(key))
+        .collect()
 }
 
 /// Refuse a value longer than the member's modelled length, naming the member and the
@@ -1075,36 +1176,37 @@ fn read_cors(document: &Node) -> Result<Option<Cors>, String> {
 
 /// The integration an operation's [`INTEGRATION_EXTENSION`] declares.
 ///
-/// Every refusal here is the one `CreateIntegration` answers the same integration with:
+/// Every rule applied here is the one `CreateIntegration` holds the same integration to:
 /// an imported integration is held to the rules of the operation that would otherwise
 /// have created it, so no definition can write a record a caller could not.
-fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegration, String> {
-    let refusal = |message: &str| format!("Unable to import route '{route_key}': {message}");
+///
+/// `Err` carries the REASON this integration cannot be created, which the caller of this
+/// reader reports as the warning [`integration_warning`] words: a problem here belongs to
+/// one resource of the document, not to the document, so it is never the import's refusal.
+fn read_integration(extension: &Node) -> Result<ImportedIntegration, String> {
     if extension.entries().is_none() {
-        return Err(refusal(&format!("'{INTEGRATION_EXTENSION}' must be an object")));
+        return Err(format!("'{INTEGRATION_EXTENSION}' must be an object"));
     }
     // The extension spells the type in lower case (`http_proxy`), while the modelled
     // `IntegrationType` is upper case; they are the same catalog.
     let integration_type = extension
         .string_member("type")
         .map(|value| value.to_ascii_uppercase())
-        .ok_or_else(|| refusal(&format!("'{INTEGRATION_EXTENSION}.type' is required")))?;
+        .ok_or_else(|| INTEGRATION_TYPE_REQUIRED.to_string())?;
     if !INTEGRATION_TYPE_VALUES.contains(&integration_type.as_str()) {
-        return Err(refusal(&format!(
+        return Err(format!(
             "invalid integration type '{integration_type}'. Valid values are: {}.",
             INTEGRATION_TYPE_VALUES.join(", ")
-        )));
+        ));
     }
     // An imported api speaks HTTP, and three of the five integration types are
     // documented as supported only for WebSocket APIs, so an integration of one of
     // those types is refused here exactly as `CreateIntegration` refuses it, through the
     // gate they share.
-    if let Err(message) = crate::state::validate_integration_type_for_protocol(
+    crate::state::validate_integration_type_for_protocol(
         crate::state::HTTP_PROTOCOL_TYPE,
         &integration_type,
-    ) {
-        return Err(refusal(&message));
-    }
+    )?;
 
     // Everything else the extension declares, read before anything is refused beyond
     // the catalogs above, so the whole integration is checked at once.
@@ -1115,10 +1217,10 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
         .map(|value| value.to_ascii_uppercase());
     if let Some(connection_type) = &connection_type {
         if !CONNECTION_TYPE_VALUES.contains(&connection_type.as_str()) {
-            return Err(refusal(&format!(
+            return Err(format!(
                 "invalid connection type '{connection_type}'. Valid values are: {}.",
                 CONNECTION_TYPE_VALUES.join(", ")
-            )));
+            ));
         }
     }
     let connection_id = extension.string_member("connectionId");
@@ -1133,7 +1235,7 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
     // `UpdateIntegration` go through, so an imported integration cannot be a record a
     // caller could not have created. A template selection expression is not read here:
     // an imported api speaks HTTP and that member is supported only for WebSocket APIs.
-    if let Err(message) = crate::state::validate_integration(
+    crate::state::validate_integration(
         &integration_type,
         integration_subtype.as_deref(),
         integration_uri.as_deref(),
@@ -1143,19 +1245,17 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
             .unwrap_or(crate::state::DEFAULT_CONNECTION_TYPE),
         connection_id.as_deref(),
         ::std::option::Option::None,
-    ) {
-        return Err(refusal(&message));
-    }
+    )?;
 
     let timeout_in_millis = extension
         .integer_member("timeoutInMillis")
-        .map_err(|message| refusal(&message))?;
+        .map_err(|_| format!("'{INTEGRATION_EXTENSION}.timeoutInMillis' must be an integer"))?;
     if let Some(timeout) = timeout_in_millis {
         if !(MIN_TIMEOUT_MILLIS..=MAX_TIMEOUT_MILLIS).contains(&timeout) {
-            return Err(refusal(&format!(
+            return Err(format!(
                 "'{INTEGRATION_EXTENSION}.timeoutInMillis' must be between \
                  {MIN_TIMEOUT_MILLIS} and {MAX_TIMEOUT_MILLIS}, got {timeout}"
-            )));
+            ));
         }
     }
 
