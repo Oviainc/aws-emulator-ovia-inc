@@ -181,6 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        // The DATA a final snapshot holds: a copy of the instance's storage, taken BEFORE
+        // the store is locked and on a blocking task, because it is engine work (see
+        // `crate::state::capture_instance_storage`). Only a delete that asks for a final
+        // snapshot copies anything, and the copy is dropped unused when a refusal below
+        // answers the request.
+        let storage = match &input.final_db_snapshot_identifier {
+            Some(_) => crate::state::capture_instance_storage(
+                &state,
+                &(region.clone(), identifier.clone()),
+            )
+            .await
+            .map_err(DeleteTenantDatabaseError::internal_failure)?,
+            None => None,
+        };
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
@@ -301,6 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     source,
                     snapshot_identifier,
                     source.tags.clone(),
+                    storage,
                 );
                 let snapshot_arn = snapshot.arn();
                 store.db_snapshots.insert(snapshot_key, snapshot);

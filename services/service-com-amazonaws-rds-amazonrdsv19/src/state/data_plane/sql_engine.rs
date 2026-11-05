@@ -70,6 +70,21 @@ const MAX_BOUND_PARAMETERS: i32 = 1_000;
 /// cannot grow the process without limit (16,384 pages of 4 KiB, 64 MiB per schema).
 const MAX_DATABASE_PAGES: i64 = 16_384;
 
+/// How many pages one step of an online backup copies; see
+/// [`InstanceDatabase::load_from`]. The copy is driven a step at a time rather than in one
+/// call so its deadline is checked between steps, which is the cancellation point a
+/// bounded request needs.
+const BACKUP_PAGES_PER_STEP: std::os::raw::c_int = 256;
+
+/// The wall-clock budget ONE copy of a database gets: the same budget one statement gets,
+/// because a copy is engine work of the same kind. Checked while waiting for each end of
+/// the copy and between its steps, so a copy always gives up rather than holding either
+/// database or spinning on a step that does not progress.
+pub const COPY_DEADLINE: Duration = STATEMENT_DEADLINE;
+
+/// How long a copy waits before asking again for a database another thread is using.
+const COPY_LOCK_POLL: Duration = Duration::from_millis(10);
+
 /// `PRAGMA temp_store = MEMORY`, so the engine's temporary database is in memory rather
 /// than a file in the host's temp directory.
 const TEMP_STORE_MEMORY: i32 = 2;
@@ -297,6 +312,29 @@ impl InstanceDatabase {
         self.databases.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The instance's databases, waited for only until `deadline`: `None` where another
+    /// thread held them for that long.
+    ///
+    /// What [`Self::load_from`] takes each end of a copy with, so a copy can neither park
+    /// a request on an engine that is busy nor hold one it could not finish with. A lock
+    /// a panicking session poisoned is recovered exactly as [`Self::lock`] recovers it.
+    fn lock_until(&self, deadline: Instant) -> Option<std::sync::MutexGuard<'_, Databases>> {
+        loop {
+            match self.databases.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Some(poisoned.into_inner())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(COPY_LOCK_POLL);
+                }
+            }
+        }
+    }
+
     /// Create the databases the INSTANCE itself comes with — the one `DBName` named, the
     /// engine's own default, a MySQL server's system schemas — once.
     ///
@@ -371,6 +409,70 @@ impl InstanceDatabase {
                 declared_type: column.decl_type().map(str::to_string),
             })
             .collect())
+    }
+
+    /// Copy every database this instance holds into a NEW engine, which is what TAKING a
+    /// snapshot of a DB instance's storage is: the copy holds the databases, the schemas
+    /// and the rows as they stand at this instant, and nothing written to this instance
+    /// afterwards reaches it.
+    ///
+    /// Blocking, CPU-bound work, bounded exactly as [`Self::load_from`] is: a caller runs
+    /// it on a blocking task, as a wire handler runs a statement.
+    pub fn capture(&self) -> Result<Self, EngineError> {
+        let copy = Self::open()?;
+        copy.load_from(self)?;
+        Ok(copy)
+    }
+
+    /// Replace this engine's databases with `source`'s, which is what RESTORING a snapshot
+    /// into a new DB instance's storage is.
+    ///
+    /// This instance ends up holding exactly the databases the source holds, each with
+    /// exactly its contents: a restore REPLACES what the engine had rather than merging
+    /// into it. Each database is copied by the engine's own online backup
+    /// ([`copy_database`]), and the databases the instance comes with are the source's, so
+    /// a restored instance does not seed its own over them.
+    ///
+    /// Bounded and interruptible, so no request can wedge either engine: `source` must be
+    /// a DIFFERENT instance and is REFUSED when it is this one, each end is taken with
+    /// [`Self::lock_until`] under [`COPY_DEADLINE`] rather than waited on, and each copy is
+    /// driven one step at a time against the same deadline. The number of databases is
+    /// bounded by [`MAX_DATABASES_PER_INSTANCE`], which the source itself is held to.
+    ///
+    /// Blocking, CPU-bound work: a caller runs it on a blocking task.
+    pub fn load_from(&self, source: &Self) -> Result<(), EngineError> {
+        // One engine cannot be both ends of a copy: the second lock would be the one this
+        // thread already holds.
+        if std::ptr::eq(self, source) {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "an instance's databases cannot be copied over themselves",
+            ));
+        }
+        let deadline = Instant::now() + COPY_DEADLINE;
+        let busy = |end: &str| {
+            EngineError::new(
+                EngineErrorKind::Cancelled,
+                format!(
+                    "the {end} of a copy was in use for longer than {} seconds",
+                    COPY_DEADLINE.as_secs()
+                ),
+            )
+        };
+        // Both ends are taken under the one deadline, so two copies that each hold what
+        // the other needs both give up instead of deadlocking.
+        let source = source.lock_until(deadline).ok_or_else(|| busy("source"))?;
+        let mut destination = self.lock_until(deadline).ok_or_else(|| busy("destination"))?;
+        destination.open.clear();
+        // The databases the INSTANCE comes with are the ones the source had: a restored
+        // instance that has already been handed a database must not seed another over it.
+        destination.seeded = source.seeded;
+        for (name, held) in &source.open {
+            let mut copy = open_confined_database()?;
+            copy_database(held, &mut copy, deadline)?;
+            destination.open.insert(name.clone(), copy);
+        }
+        Ok(())
     }
 
     /// The databases this instance has, in name order — what a login may name and what
@@ -517,6 +619,50 @@ fn open_confined_database() -> Result<Connection, EngineError> {
     // by it.
     conn.authorizer(Some(confine_to_the_instance));
     Ok(conn)
+}
+
+/// Copy `source` over `destination` with the engine's own page-level copy.
+///
+/// `sqlite3_backup_*` between two OPEN connections, so no path is named and no file is
+/// opened — unlike `VACUUM INTO`, which the authorizer denies. It also runs beneath SQL,
+/// so it copies every table, index, view and trigger of the source exactly, with no
+/// dialect or quoting of its own to get wrong.
+///
+/// Driven one step at a time rather than through `run_to_completion`, so `deadline` is
+/// checked between steps: that is the cancellation point a bounded request needs. The
+/// page ceiling is a property of the destination CONNECTION and not of the pages copied
+/// into it, so the destination keeps the bound [`open_confined_database`] installed and the
+/// copy cannot exceed it — the engine answers `SQLITE_FULL` if a source ever did.
+fn copy_database(
+    source: &Connection,
+    destination: &mut Connection,
+    deadline: Instant,
+) -> Result<(), EngineError> {
+    let backup = ::rusqlite::backup::Backup::new(source, destination).map_err(unavailable)?;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(EngineError::new(
+                EngineErrorKind::Cancelled,
+                format!(
+                    "copying a database took longer than {} seconds",
+                    COPY_DEADLINE.as_secs()
+                ),
+            ));
+        }
+        match backup.step(BACKUP_PAGES_PER_STEP).map_err(unavailable)? {
+            ::rusqlite::backup::StepResult::Done => return Ok(()),
+            ::rusqlite::backup::StepResult::More => {}
+            // Neither end is shared with anything but this copy, which holds both ends'
+            // engines, so a busy or locked step is the engine reporting a state this copy
+            // cannot resolve by waiting.
+            unresolvable => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("the engine answered {unresolvable:?} while copying a database"),
+                ))
+            }
+        }
+    }
 }
 
 /// An engine that could not be brought up or configured at all.

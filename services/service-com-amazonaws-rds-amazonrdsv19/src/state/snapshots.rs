@@ -25,6 +25,12 @@ pub struct DbClusterSnapshotRecord {
     pub engine: String,
     pub engine_version: Option<String>,
     pub engine_mode: Option<String>,
+    /// `DBClusterInstanceClass` of the cluster the snapshot was taken from — the compute
+    /// and memory capacity of each DB instance in a Multi-AZ DB cluster — which is the
+    /// class a DB instance restored from this snapshot is provisioned with when the
+    /// request names none. `None` for a cluster that carries no instance class of its own
+    /// (an Aurora cluster, whose snapshots a DB instance cannot be restored from).
+    pub db_instance_class: Option<String>,
     /// `AllocatedStorage` of the cluster the snapshot was taken from, which the snapshot
     /// reports until its own size is known; see [`Self::to_wire`].
     pub allocated_storage: Option<i32>,
@@ -93,6 +99,7 @@ impl DbClusterSnapshotRecord {
             engine: cluster.engine.clone(),
             engine_version: cluster.engine_version.clone(),
             engine_mode: Some(cluster.engine_mode.clone()),
+            db_instance_class: cluster.db_cluster_instance_class.clone(),
             // "The allocated storage size of the DB cluster snapshot in gibibytes (GiB)":
             // the storage of the cluster the snapshot is being taken from, which is what
             // the API reports until the snapshot's own size is known ([`Self::to_wire`]).
@@ -226,11 +233,31 @@ pub struct DbSnapshotRecord {
     pub dbi_resource_id: String,
     pub engine: String,
     pub engine_version: Option<String>,
+    /// `DBInstanceClass` of the instance the snapshot was taken from, which is what a
+    /// restore of this snapshot provisions when the request names no class of its own
+    /// ("Default: The same DBInstanceClass as the original DB instance").
+    pub db_instance_class: String,
+    /// `DBName` of the instance the snapshot was taken from: the database the snapshot's
+    /// data lives in, so a restore of it serves the same database name.
+    pub db_name: Option<String>,
     pub allocated_storage: Option<i32>,
     pub master_username: Option<String>,
+    /// The master user's credential, as the DIGESTS a login is verified against — never
+    /// the password itself, exactly as [`DbInstanceRecord::master_user_password`] holds
+    /// it. A restore keeps the source's master credential, so the snapshot has to carry
+    /// it.
+    pub master_user_password: Option<data_plane::wire_session::MasterPasswordHash>,
     pub availability_zone: String,
     pub port: i32,
     pub storage_type: String,
+    /// The storage throughput the instance the snapshot was taken from was provisioned
+    /// with, in MiBps, which a restore provisions again.
+    pub storage_throughput: i32,
+    /// `BackupRetentionPeriod` as the source instance carried it, which is what a restore
+    /// uses when the request names none ("Default: Uses existing setting").
+    pub backup_retention_period: i32,
+    /// `PreferredBackupWindow` as the source instance carried it, for the same reason.
+    pub preferred_backup_window: Option<String>,
     pub encrypted: bool,
     pub kms_key_id: Option<String>,
     pub iops: Option<i32>,
@@ -240,6 +267,18 @@ pub struct DbSnapshotRecord {
     pub snapshot_type: String,
     pub instance_create_time: ::aws_smithy_types::DateTime,
     pub snapshot_create_time: ::aws_smithy_types::DateTime,
+    /// A COPY of the data the source instance's storage held when the snapshot was taken,
+    /// taken by the engine itself ([`data_plane::sql_engine::InstanceDatabase::capture`]):
+    /// this is what makes a snapshot restorable, because a restore loads it into the new
+    /// instance's own storage. `None` for a snapshot of an instance that has no engine
+    /// endpoint at all — an engine whose wire this emulator serves no data plane for.
+    ///
+    /// The copy is in memory and private to this snapshot, it is never written to the
+    /// host, and its size is bounded by the same per-database page ceiling every database
+    /// of this service's data plane carries; the number of copies is bounded by
+    /// [`DB_SNAPSHOT_QUOTA_PER_REGION`] and [`MAX_REGIONS`], like every other record here.
+    /// Deleting the snapshot drops it.
+    pub storage: Option<::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>>,
     pub tags: Vec<Tag>,
 }
 
@@ -264,13 +303,18 @@ impl DbSnapshotRecord {
         false
     }
 
-    /// Snapshot the source instance's settings. `snapshot_type` is `manual` for a
-    /// `CreateDBSnapshot` and for the final snapshot `DeleteDBInstance` takes —
-    /// `automated` is reserved for the backups RDS itself schedules.
+    /// Snapshot the source instance's settings and a copy of its data. `snapshot_type` is
+    /// `manual` for a `CreateDBSnapshot` and for the final snapshot `DeleteDBInstance`
+    /// takes — `automated` is reserved for the backups RDS itself schedules.
+    ///
+    /// `storage` is the copy of the instance's storage the caller took under the same
+    /// state lock ([`ComAmazonawsRdsAmazonrdsv19State::capture_instance_storage`]), so the
+    /// settings the snapshot reports and the data it holds are from one instant.
     pub fn from_instance(
         instance: &DbInstanceRecord,
         snapshot_identifier: &str,
         tags: Vec<Tag>,
+        storage: Option<::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>>,
     ) -> Self {
         Self {
             snapshot_identifier: snapshot_identifier.to_string(),
@@ -279,11 +323,17 @@ impl DbSnapshotRecord {
             dbi_resource_id: instance.dbi_resource_id.clone(),
             engine: instance.engine.clone(),
             engine_version: instance.engine_version.clone(),
+            db_instance_class: instance.db_instance_class.clone(),
+            db_name: instance.db_name.clone(),
             allocated_storage: instance.allocated_storage,
             master_username: instance.master_username.clone(),
+            master_user_password: instance.master_user_password.clone(),
             availability_zone: instance.availability_zone.clone(),
             port: instance.endpoint_port,
             storage_type: instance.storage_type.clone(),
+            storage_throughput: instance.storage_throughput,
+            backup_retention_period: instance.backup_retention_period,
+            preferred_backup_window: instance.preferred_backup_window.clone(),
             encrypted: instance.storage_encrypted,
             kms_key_id: instance.kms_key_id.clone(),
             iops: instance.iops,
@@ -293,6 +343,7 @@ impl DbSnapshotRecord {
             snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
             instance_create_time: instance.instance_create_time,
             snapshot_create_time: now_as_wire_timestamp(),
+            storage,
             tags,
         }
     }
@@ -327,6 +378,11 @@ impl DbSnapshotRecord {
             // the progress of the copy this record stands for, not a stored field.
             percent_progress: Some(if self.status == "available" { 100 } else { 0 }),
             storage_type: Some(self.storage_type.clone()),
+            storage_throughput: Some(self.storage_throughput),
+            // The automated-backup settings the source instance carried when the snapshot
+            // was taken, which is what a restore of it uses when the request names none.
+            backup_retention_period: Some(self.backup_retention_period),
+            preferred_backup_window: self.preferred_backup_window.clone(),
             encrypted: Some(self.encrypted),
             kms_key_id: self.kms_key_id.clone(),
             db_snapshot_arn: Some(self.arn()),
@@ -334,5 +390,33 @@ impl DbSnapshotRecord {
             tag_list: Some(self.tags.clone()),
             ..DBSnapshot::default()
         }
+    }
+}
+
+impl ComAmazonawsRdsAmazonrdsv19State {
+    /// The key of the DB snapshot `value` names IN `region`: either its identifier, as the
+    /// snapshot was taken under it, or its ARN — `RestoreDBInstanceFromDBSnapshot`
+    /// documents both ("If you are restoring from a shared manual DB snapshot, the
+    /// `DBSnapshotIdentifier` must be the ARN of the shared DB snapshot").
+    ///
+    /// A DB snapshot's identifier is stored as the caller spelled it — `DBSnapshotIdentifier`
+    /// documents no case folding, unlike the instance and group names — so the identifier
+    /// form matches exactly, the way `DescribeDBSnapshots` and `DeleteDBSnapshot` read it.
+    pub fn resolve_db_snapshot_key(&self, region: &str, value: &str) -> Option<String> {
+        if self
+            .db_snapshots
+            .contains_key(&(region.to_string(), value.to_string()))
+        {
+            return Some(value.to_string());
+        }
+        // Only an ARN can match the scan below, so a plain identifier that named nothing
+        // does not pay for rendering a region's stored ARNs.
+        if !value.starts_with("arn:") {
+            return None;
+        }
+        self.snapshots_in(region)
+            .into_iter()
+            .find(|record| record.arn() == value)
+            .map(|record| record.snapshot_identifier.clone())
     }
 }

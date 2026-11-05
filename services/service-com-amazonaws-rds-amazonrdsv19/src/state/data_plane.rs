@@ -251,6 +251,45 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     }
 }
 
+/// A COPY of the data the DB instance `key` names holds right now: what a DB snapshot of
+/// that instance holds, so restoring the snapshot brings those rows back.
+///
+/// `Ok(None)` for an instance with no engine endpoint — an engine whose wire this emulator
+/// serves no data plane for ([`engine_wire`]), which has no storage to copy, and an
+/// identifier this store holds no instance under. `Err` when the engine could not make the
+/// copy, which the caller answers as a failure of this emulator rather than storing a
+/// snapshot that holds nothing.
+///
+/// The store lock is taken only to read the instance's database HANDLE and is released
+/// before the copy starts, and the copy itself runs on a blocking task — it is engine
+/// work, like a statement a session runs, so it belongs off the runtime's worker threads
+/// and outside the lock every other request to this service needs. Its own bounds are
+/// [`sql_engine::COPY_DEADLINE`] and the page ceiling each database carries.
+///
+/// Called BEFORE the handler takes the store lock for the work the snapshot is part of, so
+/// no state guard is held across its await.
+pub async fn capture_instance_storage(
+    state: &::engine::ServiceState<ComAmazonawsRdsAmazonrdsv19State>,
+    key: &RegionalKey,
+) -> Result<Option<Arc<sql_engine::InstanceDatabase>>, String> {
+    let Some(database) = state
+        .lock()
+        .engine_endpoint(key)
+        .map(DbEngineEndpoint::database)
+    else {
+        return Ok(None);
+    };
+    let copied = ::tokio::task::spawn_blocking(move || database.capture())
+        .await
+        .map_err(|error| format!("the DB instance's storage could not be copied: {error}"))?;
+    copied.map(|copy| Some(Arc::new(copy))).map_err(|error| {
+        format!(
+            "the DB instance's storage could not be copied: {}",
+            error.message
+        )
+    })
+}
+
 /// Open the engine endpoint for the DB instance `region`/`resource_id` names, on the
 /// wire its engine speaks.
 ///

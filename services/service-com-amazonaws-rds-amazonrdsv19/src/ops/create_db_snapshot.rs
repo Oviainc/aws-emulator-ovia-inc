@@ -172,6 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        // The DATA the snapshot will hold: a copy of the source instance's storage, taken
+        // BEFORE the store is locked and on a blocking task, because it is engine work
+        // (see `crate::state::capture_instance_storage`). It is what makes the snapshot
+        // restorable; it is dropped unused when a refusal below answers the request.
+        let storage =
+            crate::state::capture_instance_storage(&state, &(region.clone(), source_identifier.clone()))
+                .await
+                .map_err(CreateDBSnapshotError::internal_failure)?;
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
@@ -219,11 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every setting the snapshot reports is COPIED from the source record, so a
-        // later change to the instance does not rewrite history.
+        // later change to the instance does not rewrite history, beside the copy of the
+        // instance's storage taken above.
         let snapshot = crate::state::DbSnapshotRecord::from_instance(
             source,
             &snapshot_identifier,
             input.tags.unwrap_or_default(),
+            storage,
         );
 
         // The region's manual DB snapshot quota, and the number of regions this store

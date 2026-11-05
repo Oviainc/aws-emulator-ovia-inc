@@ -89,6 +89,8 @@ fn stored_snapshot(region: &str, identifier: &str, cluster: &str) -> DbClusterSn
         engine: "aurora-postgresql".to_string(),
         engine_version: Some("15.4".to_string()),
         engine_mode: Some("provisioned".to_string()),
+        // An Aurora cluster carries no `DBClusterInstanceClass` of its own.
+        db_instance_class: None,
         allocated_storage: Some(1),
         holds_data: true,
         master_username: Some("postgres".to_string()),

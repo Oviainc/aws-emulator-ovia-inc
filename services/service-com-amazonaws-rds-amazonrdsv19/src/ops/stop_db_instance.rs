@@ -201,6 +201,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        // The DATA the snapshot this stop takes holds: a copy of the instance's storage,
+        // taken BEFORE the store is locked and on a blocking task, because it is engine
+        // work (see `crate::state::capture_instance_storage`). Only a stop that names a
+        // snapshot copies anything, and the copy is dropped unused when a refusal below
+        // answers the request.
+        let storage = match &input.db_snapshot_identifier {
+            Some(_) => crate::state::capture_instance_storage(
+                &state,
+                &(region.clone(), identifier.clone()),
+            )
+            .await
+            .map_err(StopDBInstanceError::internal_failure)?,
+            None => None,
+        };
         let mut store = state.lock();
         // The transitions the clock already made due — owed at this instant whether or not
         // anybody called — so the state this stop is judged against is the current one.
@@ -318,11 +332,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let source = &store.db_instances[&key];
             // Every setting the snapshot reports is COPIED from the instance record, the
             // same projection `CreateDBSnapshot` and `DeleteDBInstance`'s final snapshot
-            // use, so a later change to the instance does not rewrite history.
+            // use, so a later change to the instance does not rewrite history, beside the
+            // copy of the instance's storage taken above.
             let snapshot = crate::state::DbSnapshotRecord::from_instance(
                 source,
                 snapshot_identifier,
                 source.tags.clone(),
+                storage,
             );
             let snapshot_arn = snapshot.arn();
             store.db_snapshots.insert(snapshot_key, snapshot);

@@ -87,6 +87,8 @@ mod db_shard_group_primary_cluster;
 mod db_shard_groups;
 #[path = "all/db_snapshot_deletion.rs"]
 mod db_snapshot_deletion;
+#[path = "all/db_snapshot_restore.rs"]
+mod db_snapshot_restore;
 #[path = "all/db_subnet_group_deletion.rs"]
 mod db_subnet_group_deletion;
 #[path = "all/db_subnet_group_in_use_wording.rs"]

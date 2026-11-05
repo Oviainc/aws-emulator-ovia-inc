@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreDBInstanceFromDBSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreDBInstanceFromDBSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation creates a new DB instance from a stored DB snapshot — the
+//! source's settings, the members this request overrides, and the DATA the snapshot holds,
+//! loaded into the new instance's own storage. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreDBInstanceFromDBSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented operations; the copy of the source
+//! instance's storage a snapshot holds is
+//! [`crate::state::DbSnapshotRecord::storage`], taken by
+//! [`crate::state::data_plane::sql_engine::InstanceDatabase::capture`] when the snapshot
+//! was taken and loaded back by `load_from` here.
 //!
 //! ## Shape of an operation
 //!
@@ -362,18 +363,782 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreDBInstanceFromDBSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreDBInstanceFromDBSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx)
+            .map_err(RestoreDBInstanceFromDBSnapshotError::validation)?;
+
+        // The constraints are checked against the value the REQUEST carried, so the
+        // refusal quotes what the caller sent; "This parameter isn't case-sensitive", so
+        // the folded form is what is stored and echoed, exactly as `CreateDBInstance`
+        // stores it, and every later lookup folds the same way.
+        crate::state::check_identifier(
+            "DBInstanceIdentifier",
+            &input.db_instance_identifier,
+            63,
+        )
+        .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value)?;
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // Which snapshot the restore reads: exactly one of the two members names it —
+        // `DBSnapshotIdentifier` "Can't be specified when DBClusterSnapshotIdentifier is
+        // specified. Must be specified when DBClusterSnapshotIdentifier isn't specified."
+        // Neither combination has a modelled error, so both are refused with the Query
+        // API code for parameters that cannot hold together, naming the members.
+        let named_source = match (
+            &input.db_snapshot_identifier,
+            &input.db_cluster_snapshot_identifier,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_combination(
+                        "DBSnapshotIdentifier can't be specified when \
+                         DBClusterSnapshotIdentifier is specified",
+                    ),
+                )
+            }
+            (None, None) => {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_combination(
+                        "DBSnapshotIdentifier must be specified when \
+                         DBClusterSnapshotIdentifier isn't specified",
+                    ),
+                )
+            }
+            (Some(named), None) => NamedSource::Snapshot(named.clone()),
+            (None, Some(named)) => NamedSource::ClusterSnapshot(named.clone()),
+        };
+
+        // Documented constraints this operation models no error for: refused as a 400
+        // naming the member and its bound, never a 501 — the same guards, in the same
+        // words, as the create these settings would otherwise have gone to.
+        if input.multi_az == Some(true) && input.availability_zone.is_some() {
+            return Err(RestoreDBInstanceFromDBSnapshotError::validation(
+                "AvailabilityZone can't be specified when MultiAZ is enabled",
+            ));
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value(format!(
+                        "invalid value {port} for Port: must be a value from {} to {}",
+                        crate::state::PORT_RANGE.start(),
+                        crate::state::PORT_RANGE.end()
+                    )),
+                );
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            if !crate::state::BACKUP_RETENTION_RANGE.contains(&period) {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value(format!(
+                        "invalid value {period} for BackupRetentionPeriod: must be a value \
+                         from {} to {}",
+                        crate::state::BACKUP_RETENTION_RANGE.start(),
+                        crate::state::BACKUP_RETENTION_RANGE.end()
+                    )),
+                );
+            }
+        }
+        // `Engine` is resolved against the value list its member publishes and
+        // `DBInstanceClass` against the published DB instance class form, both before
+        // anything is read from the store: a request that is wrong in its parameters is
+        // refused for the parameter.
+        if let Some(engine) = &input.engine {
+            crate::state::check_engine(engine)
+                .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value)?;
+        }
+        if let Some(class) = &input.db_instance_class {
+            crate::state::check_db_instance_class(class)
+                .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated instance.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // The key the restored instance is stored under, in both the record map and the
+        // engine endpoint map, so the two always name the same instance.
+        let key = (region.clone(), identifier.clone());
+
+        // Everything this restore decides from the STORE is decided here, under the state
+        // lock, and the lock is released at the end of this block: the engine endpoint
+        // below is opened asynchronously, and a state guard cannot be held across an
+        // await. The copy of the snapshot's storage leaves the block as a handle, so the
+        // data loaded below is the data the snapshot held when it was taken.
+        let (mut record, snapshot_storage) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // The snapshot is resolved FIRST: a restore from a snapshot that does not
+            // exist is that snapshot type's modelled 404, not a conflict or a quota
+            // refusal the caller cannot act on.
+            let source = resolve_source(&store, &region, &named_source)?;
+
+            // "The database engine to use for the new instance. Default: The same as
+            // source." The version is the one the snapshot was taken at while the engine
+            // is unchanged; a request that names a DIFFERENT engine gets that engine's
+            // own default available version, because a version string of the source's
+            // engine names no version of another one.
+            let engine = input
+                .engine
+                .clone()
+                .unwrap_or_else(|| source.engine.clone());
+            let version_hint = if engine.eq_ignore_ascii_case(&source.engine) {
+                source.engine_version.clone()
+            } else {
+                None
+            };
+            let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+                &engine,
+                version_hint.as_deref(),
+            )
+            .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_combination)?;
+            let engine_version = match resolved_version {
+                Some(entry) => Some(entry.engine_version.to_string()),
+                // An engine the catalogue publishes no available version for: there is
+                // nothing to resolve against, so the source's version stands.
+                None => version_hint,
+            };
+
+            // Every resource this request REFERENCES by name is resolved in the store
+            // before the instance is inserted, and a name that resolves to nothing is
+            // that resource type's modelled not-found fault — the same resolution
+            // `CreateDBInstance` does, because the restored instance is a DB instance.
+            //
+            // `DBSubnetGroupName`: "If supplied, must match the name of an existing DB
+            // subnet group", and the name "is stored as a lowercase string".
+            let db_subnet_group_name = input
+                .db_subnet_group_name
+                .as_ref()
+                .map(|name| name.to_ascii_lowercase());
+            if let Some(name) = &db_subnet_group_name {
+                if store.resolve_db_subnet_group(&region, name).is_none() {
+                    return Err(
+                        RestoreDBInstanceFromDBSnapshotErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(crate::state::db_subnet_group_not_found_message(
+                                    name,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // `DBParameterGroupName`: "If supplied, must match the name of an existing DB
+            // parameter group." The groups RDS provides itself are there without any
+            // request having created them, so a name of that form resolves even though
+            // this store holds no record of it; a name that matches none is the modelled
+            // not-found fault.
+            if let Some(named) = &input.db_parameter_group_name {
+                if !store.db_parameter_group_exists(&region, named) {
+                    return Err(
+                        RestoreDBInstanceFromDBSnapshotErrorModeled::DBParameterGroupNotFoundFault(
+                            DBParameterGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_parameter_group_not_found_message(named),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // "RDS doesn't allow two DB instances with the same name": an identifier the
+            // region already holds is the modelled conflict, which is what the
+            // documentation tells a caller to rename the original instance to avoid.
+            if store.db_instances.contains_key(&key) {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::DBInstanceAlreadyExistsFault(
+                        DBInstanceAlreadyExistsFault {
+                            message: Some(
+                                crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The region's DB instance quota, and the number of regions this store keeps
+            // records for at all: a restore adds a DB instance, so it is bounded exactly
+            // as a create is, and the modelled fault says so.
+            if store.instances_in(&region).len() >= crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::InstanceQuotaExceededFault(
+                        InstanceQuotaExceededFault {
+                            message: Some(format!(
+                                "the request would exceed the allowed number of DB instances \
+                                 ({} per region, in at most {} regions)",
+                                crate::state::DB_INSTANCE_QUOTA_PER_REGION,
+                                crate::state::MAX_REGIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let mint = store.next_mint();
+            // "The compute and memory capacity of the Amazon RDS DB instance ... Default:
+            // The same DBInstanceClass as the original DB instance."
+            let db_instance_class = match input
+                .db_instance_class
+                .clone()
+                .or_else(|| source.db_instance_class.clone())
+            {
+                Some(class) => class,
+                // Only reachable for a snapshot of a resource that carries no instance
+                // class of its own, which is a Multi-AZ DB cluster snapshot taken from a
+                // cluster created without one: the member is what the caller has to
+                // supply, so the refusal names it.
+                None => {
+                    return Err(
+                        RestoreDBInstanceFromDBSnapshotError::invalid_parameter_combination(
+                            "DBInstanceClass must be specified when the snapshot names no \
+                             DB instance class of its own",
+                        ),
+                    )
+                }
+            };
+            // "Default: The same port as the original DB instance." A snapshot taken of a
+            // DB cluster that had no DB instance in it was taken on no port at all, so
+            // the restored instance listens on its engine's default port.
+            let endpoint_port = input.port.unwrap_or(if source.port > 0 {
+                source.port
+            } else {
+                crate::state::default_port(&engine)
+            });
+            let storage_type = input
+                .storage_type
+                .clone()
+                .or_else(|| source.storage_type.clone())
+                .unwrap_or_else(|| {
+                    crate::state::default_storage_type(input.iops.or(source.iops)).to_string()
+                });
+            let db_parameter_group_name = input.db_parameter_group_name.clone().or_else(|| {
+                resolved_version.map(|entry| {
+                    crate::state::default_db_parameter_group_name(entry.parameter_group_family)
+                })
+            });
+            let option_group_name = input.option_group_name.clone().or_else(|| {
+                resolved_version.map(|entry| {
+                    crate::state::default_option_group_name(&engine, entry.major_engine_version)
+                })
+            });
+            // "RDS checks whether you specify new tags. If yes, the new tags are added to
+            // the restored DB instance. If there are no new tags, RDS looks for the tags
+            // from the source DB instance for the DB snapshot, and then adds those tags
+            // to the restored DB instance" — which `resolve_source` read for this
+            // snapshot (see `inherited_tags`).
+            let tags = match input.tags.clone() {
+                Some(tags) if !tags.is_empty() => tags,
+                _ => source.tags.clone(),
+            };
+
+            let mut record = crate::state::DbInstanceRecord {
+                identifier: identifier.clone(),
+                region: region.clone(),
+                // The restored instance is a NEW resource: it gets its own resource id
+                // and its own endpoint host, never the source's.
+                dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
+                endpoint_host: crate::state::mint_endpoint_host(mint),
+                db_instance_class,
+                engine: engine.clone(),
+                engine_version,
+                // A restored DB instance is not usable the instant the call returns: RDS
+                // answers `creating` and the instance reaches `available` on its own.
+                status: "creating".to_string(),
+                pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                )),
+                // `DBName` "only applies to RDS for Oracle and RDS for SQL Server DB
+                // instances. It doesn't apply to the other engines" — whose restored
+                // instance carries the database the snapshot's data lives in.
+                db_name: if engine_takes_restored_db_name(&engine) {
+                    input.db_name.clone().or_else(|| source.db_name.clone())
+                } else {
+                    source.db_name.clone()
+                },
+                // "Be sure to allocate enough storage for your new DB instance so that
+                // the restore operation can succeed": the request may enlarge the
+                // source's storage, and names none to keep it.
+                allocated_storage: input.allocated_storage.or(source.allocated_storage),
+                // `MaxAllocatedStorage` is not a member of this operation, so the
+                // restored instance has no storage autoscaling configured.
+                max_allocated_storage: None,
+                // The restored instance keeps the SOURCE's master credential — the
+                // digests a login on its engine endpoint is verified against, never a
+                // password — because the restore mints no new one.
+                master_user_password: source.master_user_password.clone(),
+                master_username: source.master_username.clone(),
+                endpoint_port,
+                // Filled in below, once the core has assigned the engine listener its
+                // port.
+                served_endpoint: None,
+                // "By default, the new DB instance is created as a Single-AZ deployment."
+                multi_az: input.multi_az.unwrap_or(false),
+                storage_throughput: input
+                    .storage_throughput
+                    .or(source.storage_throughput)
+                    .unwrap_or_else(|| crate::state::default_storage_throughput(&storage_type)),
+                storage_type,
+                // Whether the restored instance's storage is encrypted follows the
+                // snapshot: this operation has no `StorageEncrypted` or `KmsKeyId` member,
+                // so a snapshot of encrypted storage restores encrypted under the same
+                // key.
+                storage_encrypted: source.storage_encrypted,
+                kms_key_id: source.kms_key_id.clone(),
+                iops: input.iops.or(source.iops),
+                license_model: input
+                    .license_model
+                    .clone()
+                    .or_else(|| source.license_model.clone()),
+                // "Default: A random, system-chosen Availability Zone"; this emulator
+                // picks the region's first zone, stores it, and reports it from the store.
+                availability_zone: input
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| format!("{region}a")),
+                // `BackupRetentionPeriod` and `PreferredBackupWindow`: "Default: Uses
+                // existing setting" — the setting the source carried when the snapshot
+                // was taken.
+                backup_retention_period: input
+                    .backup_retention_period
+                    .unwrap_or(source.backup_retention_period),
+                preferred_backup_window: input
+                    .preferred_backup_window
+                    .clone()
+                    .or_else(|| source.preferred_backup_window.clone()),
+                // `PreferredMaintenanceWindow` is not a member of this operation, so the
+                // restored instance gets the window a new instance gets.
+                preferred_maintenance_window: Some(
+                    crate::state::DEFAULT_PREFERRED_MAINTENANCE_WINDOW.to_string(),
+                ),
+                publicly_accessible: input.publicly_accessible.unwrap_or_else(|| {
+                    crate::state::default_publicly_accessible(
+                        &engine,
+                        db_subnet_group_name.as_deref(),
+                    )
+                }),
+                // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are
+                // applied automatically."
+                auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(true),
+                // `CopyTagsToSnapshot`: "In most cases, tags aren't copied by default."
+                copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+                // `DeletionProtection`: "By default, deletion protection isn't enabled."
+                deletion_protection: input.deletion_protection.unwrap_or(false),
+                db_subnet_group_name,
+                db_parameter_group_name,
+                option_group_name,
+                vpc_security_group_ids: input.vpc_security_group_ids.clone().unwrap_or_default(),
+                // This operation has no `DBSecurityGroups` member — the legacy
+                // EC2-Classic platform is not one a restore reaches — so the restored
+                // instance is in none.
+                db_security_group_names: Vec::new(),
+                // A restored DB instance is a standalone instance: it joins no DB
+                // cluster, which this operation has no member to name either.
+                db_cluster_identifier: None,
+                domain: input.domain.clone(),
+                ca_certificate_identifier: input
+                    .ca_certificate_identifier
+                    .clone()
+                    .unwrap_or_else(|| store.default_ca_certificate(&region).to_string()),
+                // `MonitoringInterval` and the Performance Insights members are not
+                // members of this operation, so Enhanced Monitoring is off and the
+                // insights mode is the one a new instance gets.
+                monitoring_interval: crate::state::DEFAULT_MONITORING_INTERVAL,
+                performance_insights_enabled: false,
+                iam_database_authentication_enabled: input
+                    .enable_iam_database_authentication
+                    .unwrap_or(false),
+                database_insights_mode: crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string(),
+                dedicated_log_volume: input.dedicated_log_volume.unwrap_or(false),
+                customer_owned_ip_enabled: input.enable_customer_owned_ip.unwrap_or(false),
+                network_type: input
+                    .network_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string()),
+                // `BackupTarget`: "The default is region."
+                backup_target: input
+                    .backup_target
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_BACKUP_TARGET.to_string()),
+                // `EngineLifecycleSupport`: "Default:
+                // open-source-rds-extended-support".
+                engine_lifecycle_support: input
+                    .engine_lifecycle_support
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
+                // The restored instance was created NOW; the source's own creation time
+                // stays on the snapshot, which is what `InstanceCreateTime` reports there.
+                instance_create_time: crate::state::now_as_wire_timestamp(),
+                tags,
+                engine_log: crate::state::InstanceLog::default(),
+            };
+            record.engine_log.record(format!(
+                "DB instance {} restored from {}; status {}",
+                record.identifier,
+                named_source.describe(),
+                record.status
+            ));
+            (record, source.storage.clone())
+        };
+
+        // The restored instance's own ENGINE ENDPOINT, opened with the state lock
+        // released, exactly as a create opens one: binding is asynchronous and the core
+        // owns the socket, the bind interface and the port. It is opened AFTER every
+        // refusal above has been answered, and before the record is admitted to the store.
+        let endpoint = match crate::state::engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    &region,
+                    &record.dbi_resource_id,
+                    wire,
+                )
+                .await
+                .map_err(RestoreDBInstanceFromDBSnapshotError::internal_failure)?,
+            ),
+            // An engine whose native wire this emulator does not speak: no listener is
+            // opened and the instance keeps the DNS-form endpoint this service has always
+            // reported for it, rather than publishing a port that would answer nothing.
+            None => None,
+        };
+        record.served_endpoint = endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.endpoint.clone());
+        // THE RESTORE ITSELF: the data the snapshot holds is loaded into the new
+        // instance's own storage, by the engine, before the endpoint is published — so the
+        // first session a client opens on it finds the snapshot's rows and not an empty
+        // database. A snapshot that holds no copy at all (one taken of an instance whose
+        // engine this emulator serves no data plane for) leaves the new storage empty,
+        // which is all it has to restore.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreDBInstanceFromDBSnapshot"))
+        // On a blocking task and with no state lock held: the copy is engine work, bounded
+        // by the engine's own copy deadline, exactly as the capture that took it was.
+        if let (Some(endpoint), Some(storage)) = (endpoint.as_ref(), snapshot_storage) {
+            let destination = endpoint.database();
+            ::tokio::task::spawn_blocking(move || destination.load_from(&storage))
+                .await
+                .map_err(|error| {
+                    RestoreDBInstanceFromDBSnapshotError::internal_failure(format!(
+                        "the DB snapshot's data could not be restored: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    RestoreDBInstanceFromDBSnapshotError::internal_failure(format!(
+                        "the DB snapshot's data could not be restored: {}",
+                        error.message
+                    ))
+                })?;
+        }
+
+        let mut store = state.lock();
+        // Another request may have created this identifier while this one was binding, so
+        // the conflict is answered again here rather than overwriting a stored instance.
+        if store.db_instances.contains_key(&key) {
+            return Err(
+                RestoreDBInstanceFromDBSnapshotErrorModeled::DBInstanceAlreadyExistsFault(
+                    DBInstanceAlreadyExistsFault {
+                        message: Some(
+                            crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let db_instance = record.to_wire();
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let instance_arn = record.arn();
+        let engine = record.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
+        store.db_instances.insert(key.clone(), record);
+        // The listener is the instance's: the store holds it, so it stays open for as
+        // long as the instance does and closes with it.
+        if let Some(endpoint) = endpoint {
+            store.db_engine_endpoints.insert(key, endpoint);
+        }
+        // A DB instance was created, so the region's event log records it: the restore is
+        // how this one came to exist, and `DescribeEvents` reports that entry for it from
+        // now on.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_CREATED,
+            &identifier,
+            instance_arn,
+        );
+        // The id just minted is recorded in the SHARED data-source directory, exactly as
+        // `CreateDBInstance` records one, so a service that monitors this instance can
+        // tell that THIS service owns the id. The RDS store is already locked here and the
+        // directory is taken second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            let mut directory = directory.lock();
+            directory.register(
+                &dbi_resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                &engine,
+            );
+            directory.record_monitoring(&dbi_resource_id, monitoring);
+        }
+
+        Ok(RestoreDBInstanceFromDBSnapshotOutput {
+            db_instance: Some(db_instance),
+        })
     }
+}
+
+/// Which snapshot a request named as the source to restore from: a DB snapshot
+/// (`DBSnapshotIdentifier`) or a Multi-AZ DB cluster snapshot
+/// (`DBClusterSnapshotIdentifier`). Exactly one of the two members may name one.
+enum NamedSource {
+    Snapshot(String),
+    ClusterSnapshot(String),
+}
+
+impl NamedSource {
+    /// The source as a sentence, for the restored instance's own log.
+    fn describe(&self) -> String {
+        match self {
+            Self::Snapshot(named) => format!("DB snapshot {named}"),
+            Self::ClusterSnapshot(named) => format!("DB cluster snapshot {named}"),
+        }
+    }
+}
+
+/// What the snapshot copied off the resource it was taken from: the settings the restored
+/// instance starts from — the request's own members then override them — and the data the
+/// restore loads into the new instance's storage.
+struct SourceSettings {
+    engine: String,
+    engine_version: Option<String>,
+    /// The class of the DB instance the snapshot was taken from, which is the restored
+    /// instance's default class. `None` only for a snapshot of a resource that carries no
+    /// instance class of its own.
+    db_instance_class: Option<String>,
+    db_name: Option<String>,
+    master_username: Option<String>,
+    master_user_password: Option<crate::state::data_plane::wire_session::MasterPasswordHash>,
+    allocated_storage: Option<i32>,
+    storage_type: Option<String>,
+    storage_throughput: Option<i32>,
+    iops: Option<i32>,
+    license_model: Option<String>,
+    storage_encrypted: bool,
+    kms_key_id: Option<String>,
+    /// The port the database engine was listening on at the time of the snapshot; zero
+    /// where nothing was listening at all.
+    port: i32,
+    backup_retention_period: i32,
+    preferred_backup_window: Option<String>,
+    tags: Vec<crate::ops::types::Tag>,
+    /// The copy of the source's storage the snapshot holds, if the source had any.
+    storage: Option<::std::sync::Arc<crate::state::data_plane::sql_engine::InstanceDatabase>>,
+}
+
+/// Resolve the snapshot `named` names in `region`, and read the settings a restore of it
+/// starts from.
+///
+/// A name that resolves to nothing is that snapshot type's own modelled 404
+/// (`DBSnapshotNotFoundFault`, `DBClusterSnapshotNotFoundFault`), and a snapshot that is
+/// still being taken is `InvalidDBSnapshotStateFault`: "The DB snapshot must be in the
+/// available state" to be restored from, the same state rule `DeleteDBSnapshot` holds to.
+/// Both forms of each identifier resolve — the identifier itself and the snapshot's ARN,
+/// which is what a shared manual snapshot is named by.
+fn resolve_source(
+    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    named: &NamedSource,
+) -> Result<SourceSettings, RestoreDBInstanceFromDBSnapshotError> {
+    match named {
+        NamedSource::Snapshot(requested) => {
+            let Some(stored_key) = store.resolve_db_snapshot_key(region, requested) else {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::DBSnapshotNotFoundFault(
+                        DBSnapshotNotFoundFault {
+                            message: Some(format!("DBSnapshot not found: {requested}")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let Some(snapshot) = store.db_snapshots.get(&(region.to_string(), stored_key)) else {
+                // A key this store resolved and a read under it can only disagree if the
+                // record is not where the lookup said it was, which answers the same
+                // modelled 404 as a snapshot that was never there.
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::DBSnapshotNotFoundFault(
+                        DBSnapshotNotFoundFault {
+                            message: Some(format!("DBSnapshot not found: {requested}")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if snapshot.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::InvalidDBSnapshotStateFault(
+                        InvalidDBSnapshotStateFault {
+                            message: Some(format!(
+                                "DB snapshot {requested} is in {} state but must be {} to be \
+                                 restored from",
+                                snapshot.status,
+                                crate::state::SNAPSHOT_STATUS_AVAILABLE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Ok(SourceSettings {
+                engine: snapshot.engine.clone(),
+                engine_version: snapshot.engine_version.clone(),
+                db_instance_class: Some(snapshot.db_instance_class.clone()),
+                db_name: snapshot.db_name.clone(),
+                master_username: snapshot.master_username.clone(),
+                master_user_password: snapshot.master_user_password.clone(),
+                allocated_storage: snapshot.allocated_storage,
+                storage_type: Some(snapshot.storage_type.clone()),
+                storage_throughput: Some(snapshot.storage_throughput),
+                iops: snapshot.iops,
+                license_model: snapshot.license_model.clone(),
+                storage_encrypted: snapshot.encrypted,
+                kms_key_id: snapshot.kms_key_id.clone(),
+                port: snapshot.port,
+                backup_retention_period: snapshot.backup_retention_period,
+                preferred_backup_window: snapshot.preferred_backup_window.clone(),
+                tags: inherited_tags(
+                    store
+                        .db_instances
+                        .get(&(region.to_string(), snapshot.db_instance_identifier.clone()))
+                        .map(|instance| instance.tags.clone()),
+                    &snapshot.tags,
+                ),
+                storage: snapshot.storage.clone(),
+            })
+        }
+        NamedSource::ClusterSnapshot(requested) => {
+            let Some(stored_key) = store.resolve_cluster_snapshot_key(region, requested) else {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::DBClusterSnapshotNotFoundFault(
+                        DBClusterSnapshotNotFoundFault {
+                            message: Some(format!("DBClusterSnapshot not found: {requested}")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let Some(snapshot) = store
+                .db_cluster_snapshots
+                .get(&(region.to_string(), stored_key))
+            else {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::DBClusterSnapshotNotFoundFault(
+                        DBClusterSnapshotNotFoundFault {
+                            message: Some(format!("DBClusterSnapshot not found: {requested}")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // "Can't be the identifier of an Aurora DB cluster snapshot": an Aurora
+            // cluster's data plane is its cluster endpoints, and `RestoreDBClusterFromSnapshot`
+            // is the operation that restores one, so the member refuses the value.
+            if crate::state::is_aurora(&snapshot.engine) {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value(format!(
+                        "invalid value {requested} for DBClusterSnapshotIdentifier: it can't be \
+                         the identifier of an Aurora DB cluster snapshot"
+                    )),
+                );
+            }
+            if snapshot.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+                return Err(
+                    RestoreDBInstanceFromDBSnapshotErrorModeled::InvalidDBSnapshotStateFault(
+                        InvalidDBSnapshotStateFault {
+                            message: Some(format!(
+                                "DB cluster snapshot {requested} is in {} state but must be {} \
+                                 to be restored from",
+                                snapshot.status,
+                                crate::state::SNAPSHOT_STATUS_AVAILABLE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Ok(SourceSettings {
+                engine: snapshot.engine.clone(),
+                engine_version: snapshot.engine_version.clone(),
+                db_instance_class: snapshot.db_instance_class.clone(),
+                // A DB cluster snapshot records no database name and no master
+                // credential of its own, and this emulator serves no data plane for a DB
+                // cluster, so there is no copy of its storage to restore either: the
+                // restored instance starts from the cluster's own settings and an empty
+                // database, which is all the snapshot holds.
+                db_name: None,
+                master_username: snapshot.master_username.clone(),
+                master_user_password: None,
+                allocated_storage: snapshot.allocated_storage,
+                storage_type: snapshot.storage_type.clone(),
+                storage_throughput: None,
+                iops: None,
+                license_model: snapshot.license_model.clone(),
+                storage_encrypted: snapshot.storage_encrypted,
+                kms_key_id: snapshot.kms_key_id.clone(),
+                port: snapshot.port,
+                backup_retention_period: snapshot.backup_retention_period.unwrap_or_default(),
+                preferred_backup_window: snapshot.preferred_backup_window.clone(),
+                tags: inherited_tags(
+                    store
+                        .db_clusters
+                        .get(&(region.to_string(), snapshot.db_cluster_identifier.clone()))
+                        .map(|cluster| cluster.tags.clone()),
+                    &snapshot.tags,
+                ),
+                storage: None,
+            })
+        }
+    }
+}
+
+/// The tags a restore that names none of its own gives the restored instance.
+///
+/// `CopyTagsToSnapshot` states the rule: "RDS checks whether you specify new tags. If yes,
+/// the new tags are added to the restored DB instance. If there are no new tags, RDS looks
+/// for the tags from the source DB instance for the DB snapshot, and then adds those tags
+/// to the restored DB instance." `source` is that resource's tags where this region still
+/// holds it; where it is gone — the final snapshot of a deleted instance — what is left of
+/// them is what the snapshot itself carries.
+fn inherited_tags(
+    source: Option<Vec<crate::ops::types::Tag>>,
+    snapshot: &[crate::ops::types::Tag],
+) -> Vec<crate::ops::types::Tag> {
+    match source {
+        Some(tags) if !tags.is_empty() => tags,
+        _ => snapshot.to_vec(),
+    }
+}
+
+/// Whether `engine` is one of the engines whose restored DB instance takes its database
+/// name from this request.
+///
+/// `DBName` on this operation "only applies to RDS for Oracle and RDS for SQL Server DB
+/// instances. It doesn't apply to the other engines or to RDS Custom DB instances" — those
+/// restore the databases the snapshot holds. The engines are matched by the prefix their
+/// published `Engine` values share (`oracle-*`, `sqlserver-*`, and the `custom-` forms of
+/// both).
+fn engine_takes_restored_db_name(engine: &str) -> bool {
+    let engine = engine.to_ascii_lowercase();
+    ["oracle-", "sqlserver-", "custom-oracle-", "custom-sqlserver-"]
+        .iter()
+        .any(|family| engine.starts_with(family))
 }

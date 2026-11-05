@@ -38,7 +38,9 @@
 //! bytes), [`MAX_REGIONS`] caps how many distinct regions hold records at all, and the
 //! per-region quotas cap the records in each. The store therefore holds at most
 //! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances,
-//! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots,
+//! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots — each holding a copy of the
+//! source instance's database, itself bounded by the page ceiling every database of this
+//! service's data plane carries ([`data_plane::sql_engine`]) —
 //! `MAX_REGIONS * DB_CLUSTER_QUOTA_PER_REGION` DB clusters — each carrying at most
 //! [`MAX_CLUSTER_LIST_VALUES`] values in each of its stored string lists —
 //! `MAX_REGIONS * DB_SHARD_GROUP_QUOTA_PER_REGION` DB shard groups,
@@ -214,7 +216,8 @@ pub use published_values::*;
 pub use clusters::*;
 pub use instances::*;
 pub use data_plane::{
-    engine_wire, open_engine_endpoint, DbEngineEndpoint, EngineWire, ServedEndpoint,
+    capture_instance_storage, engine_wire, open_engine_endpoint, DbEngineEndpoint, EngineWire,
+    ServedEndpoint,
 };
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].

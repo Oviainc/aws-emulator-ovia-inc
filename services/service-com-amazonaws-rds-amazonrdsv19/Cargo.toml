@@ -28,7 +28,17 @@ tracing = { workspace = true }
 # and the Athena, Redshift Data and RDS Data services build the same version and feature
 # set) is the SQL engine each instance's statements run against, in memory and per
 # instance.
-rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+#
+# The `backup` feature is SQLite's own online-backup API, which is what COPYING one
+# instance's database is: taking a DB snapshot of an instance and restoring that snapshot
+# into a new instance's storage are both a page-for-page copy made by the engine.
+rusqlite = { version = "0.37", features = [
+    "backup",
+    "bundled",
+    "column_decltype",
+    "hooks",
+    "limits",
+] }
 # `sqlparser` reads a statement as the TOKENS of its own dialect, which is how the wire
 # tells a server command (`SHOW`, `SET`) from a query and substitutes the session's values
 # into one without inspecting its text.

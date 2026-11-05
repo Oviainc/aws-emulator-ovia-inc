@@ -34,9 +34,10 @@ use crate::db_instances::{call, emulator, expect_ok, subtrees, text, wait_for_se
 
 /// The master user every instance below is created with.
 ///
-/// `pub(crate)` here and below so the sibling suite that drives the statement classes this
-/// endpoint serves ([`crate::engine_statement_classes`]) opens its sessions with the same
-/// client rather than standing up a second one.
+/// `pub(crate)` here and below so the sibling suites that drive this endpoint's own
+/// surface — the statement classes it serves ([`crate::engine_statement_classes`]) and the
+/// rows a snapshot restore brings back ([`crate::db_snapshot_restore`]) — open their
+/// sessions with the same client rather than standing up a second one.
 pub(crate) const MASTER_USER: &str = "emuadmin";
 
 /// Its password. A test credential, and the only place in this suite it appears.
@@ -99,7 +100,7 @@ pub(crate) async fn available_instance(
 }
 
 /// The `Endpoint` an envelope publishes, as a client reads it.
-fn endpoint_of(envelope: &str) -> (String, u16) {
+pub(crate) fn endpoint_of(envelope: &str) -> (String, u16) {
     let endpoint = subtrees(envelope, "Endpoint")
         .into_iter()
         .next()
@@ -154,11 +155,11 @@ async fn parameter_group(
 // ---------------------------------------------------------------------------
 
 /// A connection to an engine endpoint, in the clear or upgraded to TLS.
-trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub(crate) trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Connection for T {}
 
 /// What a client holds: the stream, whatever it is now.
-type Client = Box<dyn Connection>;
+pub(crate) type Client = Box<dyn Connection>;
 
 /// How a session is opened: in the clear, or with the wire's own in-band TLS upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
