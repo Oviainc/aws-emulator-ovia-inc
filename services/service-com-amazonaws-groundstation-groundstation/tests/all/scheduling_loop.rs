@@ -196,12 +196,15 @@ pub(crate) fn harness_serving(setting: &str) -> MultiServiceRouter {
     router
 }
 
-pub(crate) async fn send(
+/// The WHOLE answer of one call — status, headers and raw body bytes — for a suite that
+/// asserts on the FRAMING of an answer rather than on a parsed body (an answer that must
+/// carry no body at all, for one). [`send`] is this call reduced to a [`Reply`].
+pub(crate) async fn send_http(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
     body: Option<Value>,
-) -> Reply {
+) -> http::Response<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://groundstation.{REGION}.amazonaws.com{path}"))
@@ -214,9 +217,18 @@ pub(crate) async fn send(
         }
         None => bytes::Bytes::new(),
     };
-    let response = router
+    router
         .dispatch(builder.body(payload).expect("build the request"))
-        .await;
+        .await
+}
+
+pub(crate) async fn send(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Reply {
+    let response = send_http(router, method, path, body).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()

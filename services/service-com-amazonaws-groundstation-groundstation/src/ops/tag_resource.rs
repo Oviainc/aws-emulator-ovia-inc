@@ -17,6 +17,10 @@
 //! `ResourceNotFoundException` payload and status under the code that plane puts on the
 //! wire, shared with `UntagResource` and `ListTagsForResource`.
 //!
+//! A successful assignment hands nothing back: `TagResourceResponse` declares no member,
+//! so the answer is HTTP 204 No Content with an empty body rather than a 200 announcing a
+//! body that does not follow.
+//!
 //! The map itself is held to AWS's platform-wide tagging rules — the model constrains
 //! `TagsMap` not at all — through the gate every create of this service already applies
 //! ([`crate::state::validate_tags`]), plus the per-resource bound judged against the
@@ -150,7 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful assignment answers NO CONTENT: `TagResourceResponse` declares no member
+    // at all (`smithy_query(query="shape", shape="TagResourceResponse")`), so the answer
+    // leaves the caller nothing to parse and this service says so with the status that
+    // means it rather than with the 200 the protocol leaves defaulted — the model states no
+    // `@http` code here, so the success status is behaviour rather than model.
+    // `UntagResource`, the other mutation of the tagging plane, answers the same way; every
+    // operation of this service whose output carries members keeps its 200.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

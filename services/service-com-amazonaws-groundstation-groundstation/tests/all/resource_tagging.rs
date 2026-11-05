@@ -51,6 +51,7 @@ use crate::scheduling_loop::{
     harness_serving, harness_with_engine, provision_uplink_approval, send, Reply,
     ABSENT_CONFIG_ARN, ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID, REGION, STATION,
 };
+use crate::tag_mutation_no_content::TAG_MUTATION_SUCCESS_STATUS;
 use crate::tag_rules::{illegal_tag_maps, legal_tag_maps, tag_map};
 
 /// `arn` as the ONE `{resourceArn}` path segment of `/tags/{resourceArn}`.
@@ -462,8 +463,8 @@ async fn tag_resource_merges_its_entries_into_the_tags_of_the_resource_its_arn_n
             let case = format!("{label}: {}", write.label);
             let tagged = tag_resource(&router, &arn, &write.tags).await;
             assert_eq!(
-                tagged.status, 200,
-                "case {case}: expected TagResource 200, got {} {}",
+                tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {case}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
                 tagged.status, tagged.body
             );
 
@@ -531,8 +532,8 @@ async fn a_tag_write_touches_only_the_resource_its_arn_names() {
         let written = tags_of(&[("touched", "yes")]);
         let tagged = tag_resource(&router, target_arn, &written).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {target_label}: expected TagResource 200, got {} {}",
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {target_label}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             tagged.status, tagged.body
         );
 
@@ -589,8 +590,9 @@ async fn concurrent_tag_writes_all_persist() {
     for writer in writers {
         let (index, status) = writer.await.expect("a tag writer task");
         assert_eq!(
-            status, 200,
-            "case writer-{index:02}: expected TagResource 200, got {status}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case writer-{index:02}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got \
+             {status}"
         );
     }
 
@@ -806,8 +808,8 @@ async fn an_assignment_is_held_to_the_platform_tag_rules_every_create_enforces()
 
         let assigned = tag_resource_body(&router, &arn, Some(&tags)).await;
         assert_eq!(
-            assigned.status, 200,
-            "case {case:?}: expected TagResource 200, got {} {}",
+            assigned.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             assigned.status, assigned.body
         );
         let listed = list_tags(&router, &arn).await;
@@ -831,8 +833,8 @@ async fn the_per_resource_tag_ceiling_is_judged_against_the_merged_map() {
     let at_ceiling = tag_map(ceiling);
     let assigned = tag_resource_body(&router, &full, Some(&at_ceiling)).await;
     assert_eq!(
-        assigned.status, 200,
-        "case at the ceiling: expected TagResource 200, got {} {}",
+        assigned.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case at the ceiling: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         assigned.status, assigned.body
     );
     let listed = list_tags(&router, &full).await;
@@ -880,8 +882,9 @@ async fn the_per_resource_tag_ceiling_is_judged_against_the_merged_map() {
     let overwritten = tags_of(&[("tag-000", "rewritten")]);
     let accepted = tag_resource(&router, &full, &overwritten).await;
     assert_eq!(
-        accepted.status, 200,
-        "case overwrite at the ceiling: expected TagResource 200, got {} {}",
+        accepted.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case overwrite at the ceiling: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, \
+         got {} {}",
         accepted.status, accepted.body
     );
     let after = list_tags(&router, &full).await;
@@ -905,15 +908,16 @@ async fn the_per_resource_tag_ceiling_is_judged_against_the_merged_map() {
     let short_of = tag_map(ceiling - 1);
     let filled = tag_resource_body(&router, &nearly, Some(&short_of)).await;
     assert_eq!(
-        filled.status, 200,
-        "case one short of the ceiling: expected TagResource 200, got {} {}",
+        filled.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case one short of the ceiling: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, \
+         got {} {}",
         filled.status, filled.body
     );
     let mixed = tags_of(&[("tag-000", "rewritten"), ("the-last-slot", "v")]);
     let accepted = tag_resource(&router, &nearly, &mixed).await;
     assert_eq!(
-        accepted.status, 200,
-        "case the last slot: expected TagResource 200, got {} {}",
+        accepted.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case the last slot: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         accepted.status, accepted.body
     );
     let after = list_tags(&router, &nearly).await;

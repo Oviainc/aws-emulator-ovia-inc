@@ -2,6 +2,16 @@
 
 //! @op ListContactVersions
 //!
+//! Reports the version history the store holds for the contact `{contactId}` names, oldest
+//! first, one `maxResults`-bounded page at a time.
+//!
+//! A listing reports a SET, so a scope with nothing to report is an EMPTY PAGE: a
+//! `{contactId}` naming no contact of this account holds no version either, and the answer
+//! is HTTP 200 with `contactVersionsList` present and empty and no `nextToken`, which is
+//! what an SDK paginator over this listing is built on. Refusing an identifier that
+//! resolves to nothing belongs to the single-contact reads addressed at it,
+//! `DescribeContact` and `DescribeContactVersion`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -197,20 +207,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the status and the `lastUpdated` in force now.
         guard.settle_due_contacts();
 
-        let contact = guard.contacts.get(&input.contact_id).ok_or_else(|| {
-            ListContactVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                // The status (434) and the error code are the contract; nothing documents
-                // a text for this operation, so it answers what this service's other read
-                // of a contact by its `{contactId}` label answers — `DescribeContact`'s
-                // fixed literal, which discloses no id.
-                message: Some("Contact not found".to_string()),
-            })
-        })?;
-
         // Every version the store holds for this contact, oldest first
         // (`Contact::version_history`): a page boundary is only stable over a stable
         // order.
-        let versions = contact.version_history();
+        //
+        // A listing REPORTS A SET, so a scope holding no record is an empty page and not a
+        // refusal: a `{contactId}` naming no contact of this account holds no version
+        // either, which is the empty history every other scope with nothing to report
+        // answers with. That is what an SDK paginator over this listing is built on — it
+        // yields zero items rather than raising — and refusing an identifier that resolves
+        // to nothing is the job of the single-contact reads addressed at it,
+        // `DescribeContact` and `DescribeContactVersion`.
+        let versions = guard
+            .contacts
+            .get(&input.contact_id)
+            .map(crate::state::Contact::version_history)
+            .unwrap_or_default();
 
         // The boundary a token carries is the version the page ended on, by the
         // `versionId` the history is ordered on, so a page resumes after that version

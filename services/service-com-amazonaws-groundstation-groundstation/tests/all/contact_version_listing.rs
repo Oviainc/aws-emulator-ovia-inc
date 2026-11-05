@@ -5,9 +5,10 @@
 //! The RULE under test: `GET /contact/{contactId}/versions` reports the version history
 //! the store holds for the contact that label names — every version record and nothing
 //! else, oldest first (ascending `versionId`) — one page bounded by `maxResults` at a
-//! time, resumable with a `nextToken` scoped to this listing and that contact; a
-//! `contactId` naming no contact is answered `ResourceNotFoundException` (HTTP 434)
-//! rather than an empty list. Each record is the stored version as the service's other
+//! time, resumable with a `nextToken` scoped to this listing and that contact; a scope
+//! with nothing to report is an EMPTY PAGE rather than a refusal, so a `contactId` naming
+//! no contact is answered HTTP 200 with `contactVersionsList: []` and no `nextToken`. Each
+//! record is the stored version as the service's other
 //! readers report it, so the newest record is the `version` member `DescribeContact`
 //! answers, and the records a later change produces (an `UpdateContact` appending a
 //! version, the service applying it, every older version being superseded) show up on
@@ -24,7 +25,8 @@
 //!   listing span several pages;
 //! * a table of `nextToken`s this listing did not issue — forms other listings of this
 //!   service issue, and a token issued for ANOTHER contact's history — each refused;
-//! * a table of well-formed `Uuid`s naming no contact, each refused with 434;
+//! * a table of well-formed `Uuid`s naming no contact, each answered an empty page, against
+//!   the single-contact reads of the same ids, which are the operations that DO refuse;
 //! * the listing taken twice over an unchanged contact (a read changes nothing a later
 //!   caller sees) and across a pending update (the clock-owed `UPDATING` -> `ACTIVE`
 //!   move, which a read materialises but does not cause).
@@ -471,16 +473,16 @@ async fn a_token_this_listing_did_not_issue_for_this_contact_is_refused() {
 }
 
 #[tokio::test]
-async fn a_contact_that_does_not_exist_is_not_an_empty_history() {
+async fn a_contact_that_does_not_exist_is_an_empty_page() {
     let (router, engine) = harness_with_engine();
     let satellites = onboard_satellite_arns(&engine, 1);
     let profile_arn = create_mission_profile(&router, "version not found", 180, None, None).await;
-    // One contact exists, so a refusal below is about the id that was asked for rather
+    // One contact exists, so an empty page below is about the id that was asked for rather
     // than about an empty store.
     let existing = reserve_contact(&router, &profile_arn, &satellites[0]).await;
 
     // Well-formed `Uuid`s naming nothing: a run of zeros, a run of `f`s and a mixed one,
-    // so the refusal cannot be passing on one id's shape.
+    // so the answer cannot be passing on one id's shape.
     for absent in [
         ABSENT_UUID,
         "ffffffff-ffff-4fff-bfff-ffffffffffff",
@@ -490,21 +492,60 @@ async fn a_contact_that_does_not_exist_is_not_an_empty_history() {
             absent, existing,
             "case {absent}: this row must name no contact"
         );
-        let reply = send(&router, "GET", &format!("/contact/{absent}/versions"), None).await;
+        // The listing of a scope that holds nothing: 200 with the items member present and
+        // empty, and no token, so an SDK paginator yields zero items instead of raising.
+        let listed = list_versions(&router, absent, "", absent).await;
         assert_eq!(
-            reply.status, 434,
-            "case {absent}: expected 434 for a contact that does not exist, got {} {}",
-            reply.status, reply.body
+            versions_of(&listed, absent),
+            Vec::<Value>::new(),
+            "case {absent}: a contact with no version to report is an empty page, got {}",
+            listed.body
         );
         assert_eq!(
-            reply.error_code(),
-            "ResourceNotFoundException",
-            "case {absent}: wrong error shape, got {}",
-            reply.body
+            listed.field("nextToken"),
+            &Value::Null,
+            "case {absent}: an empty page closes the listing, got {}",
+            listed.field("nextToken")
         );
+        // Every page size answers the same way, the member never going missing.
+        for size in [1_i64, 100] {
+            let case = format!("{absent} maxResults={size}");
+            let page = list_versions(&router, absent, &format!("maxResults={size}"), &case).await;
+            assert_eq!(
+                versions_of(&page, &case),
+                Vec::<Value>::new(),
+                "case {case}: a bounded page of an empty history is still empty, got {}",
+                page.body
+            );
+        }
+
+        // The reads addressed at ONE contact are the operations that refuse: a listing
+        // reports a set, a read must answer a resource.
+        for (what, route) in [
+            ("DescribeContact", format!("/contact/{absent}")),
+            (
+                "DescribeContactVersion",
+                format!("/contact/{absent}/versions/{}", state::FIRST_VERSION_ID),
+            ),
+        ] {
+            let refused = send(&router, "GET", &route, None).await;
+            assert_eq!(
+                refused.status, 434,
+                "case {absent}/{what}: a single-contact read must refuse a contact that does \
+                 not exist, got {} {}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code(),
+                "ResourceNotFoundException",
+                "case {absent}/{what}: wrong error shape, got {}",
+                refused.body
+            );
+        }
     }
 
-    // The id that DOES name a contact answers its history instead.
+    // The id that DOES name a contact answers its history instead, so the empty page is
+    // about the scope holding nothing and not about the listing reporting nothing.
     let listed = list_versions(&router, &existing, "", "existing").await;
     assert_eq!(
         version_ids(&versions_of(&listed, "existing"), "existing"),

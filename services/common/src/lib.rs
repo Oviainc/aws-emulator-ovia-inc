@@ -373,6 +373,9 @@ pub mod management_events;
 /// template request with, and the mapping skeleton the other does.
 pub mod model_mapping_template;
 pub mod network;
+/// The framing of a response that carries no content: a success whose modelled output has
+/// no member answers 204 with no body, not the empty JSON object a serializer renders.
+pub mod no_content_responses;
 /// The ONE way a service tells a continuation token it ISSUED from one a caller built,
 /// for every paginated read whose `NextToken` carries the position inside it.
 pub mod page_tokens;

@@ -41,6 +41,7 @@ use crate::resource_tagging::{
     agent_arn, contact_arn, fresh_config, label, list_tags, reported_tags, tag_resource,
     taggable_resources, tags_of, Taggable,
 };
+use crate::tag_mutation_no_content::TAG_MUTATION_SUCCESS_STATUS;
 use crate::scheduling_loop::{
     create_config, harness, harness_serving, send, Reply, ABSENT_CONFIG_ARN,
     ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID, REGION, STATION,
@@ -58,7 +59,11 @@ const WIDE_CHAR: char = 'é';
 /// `value` as a query-string value: every byte outside the unreserved set is
 /// percent-encoded, which is what an SDK sends and what the server decodes — a bare `+`
 /// in a query string would arrive as a space.
-fn encode_query_value(value: &str) -> String {
+///
+/// `pub(crate)` so the suite that asserts the STATUS of a removal
+/// ([`crate::tag_mutation_no_content`]) sends the same encoding through the same front
+/// door rather than carrying a second copy of it.
+pub(crate) fn encode_query_value(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -170,8 +175,8 @@ fn removals() -> Vec<Removal> {
 async fn seed(router: &MultiServiceRouter, case: &str, arn: &str) -> BTreeMap<String, String> {
     let assigned = tag_resource(router, arn, &seeded()).await;
     assert_eq!(
-        assigned.status, 200,
-        "case {case}: expected the seeding TagResource 200, got {} {}",
+        assigned.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case}: expected the seeding TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         assigned.status, assigned.body
     );
     let listed = list_tags(router, arn).await;
@@ -213,8 +218,8 @@ async fn untag_resource_drops_the_named_keys_from_the_resource_its_arn_names() {
 
             let removed = untag_resource(&router, &arn, &borrowed).await;
             assert_eq!(
-                removed.status, 200,
-                "case {case}: expected UntagResource 200, got {} {}",
+                removed.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {case}: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
                 removed.status, removed.body
             );
 
@@ -274,8 +279,8 @@ async fn a_removal_touches_only_the_resource_its_arn_names() {
         let case = format!("{} (before)", resource.label);
         let assigned = tag_resource(&router, &resource.arn, &shared).await;
         assert_eq!(
-            assigned.status, 200,
-            "case {case}: expected TagResource 200, got {} {}",
+            assigned.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             assigned.status, assigned.body
         );
         let listed = list_tags(&router, &resource.arn).await;
@@ -290,8 +295,8 @@ async fn a_removal_touches_only_the_resource_its_arn_names() {
     for (index, (target_label, target_arn, _)) in before.iter().enumerate() {
         let removed = untag_resource(&router, target_arn, &["shared"]).await;
         assert_eq!(
-            removed.status, 200,
-            "case {target_label}: expected UntagResource 200, got {} {}",
+            removed.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {target_label}: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             removed.status, removed.body
         );
 
@@ -343,8 +348,8 @@ async fn an_arn_that_names_no_resource_is_refused_by_the_removal() {
     let live_arn = fresh_config(&router, "untouched by the refusals").await;
     let assigned = tag_resource(&router, &live_arn, &tags_of(&[("stage", "created")])).await;
     assert_eq!(
-        assigned.status, 200,
-        "case the live resource: expected TagResource 200, got {} {}",
+        assigned.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case the live resource: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         assigned.status, assigned.body
     );
 
@@ -528,15 +533,15 @@ async fn a_key_the_rules_allow_is_removed_at_every_published_bound() {
         assigned_map.insert("kept".to_string(), "yes".to_string());
         let assigned = tag_resource(&router, &arn, &assigned_map).await;
         assert_eq!(
-            assigned.status, 200,
-            "case {case:?}: expected TagResource 200, got {} {}",
+            assigned.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected TagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             assigned.status, assigned.body
         );
 
         let removed = untag_resource(&router, &arn, &[key.as_str()]).await;
         assert_eq!(
-            removed.status, 200,
-            "case {case:?}: expected UntagResource 200, got {} {}",
+            removed.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             removed.status, removed.body
         );
 
@@ -593,8 +598,9 @@ async fn the_modelled_shape_of_the_key_list_is_enforced_before_the_handler() {
     let borrowed: Vec<&str> = at_ceiling.iter().map(String::as_str).collect();
     let removed = untag_resource(&router, &target, &borrowed).await;
     assert_eq!(
-        removed.status, 200,
-        "case at the key-list ceiling: expected UntagResource 200, got {} {}",
+        removed.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case at the key-list ceiling: expected UntagResource {TAG_MUTATION_SUCCESS_STATUS}, \
+         got {} {}",
         removed.status, removed.body
     );
     let listed = list_tags(&router, &target).await;
