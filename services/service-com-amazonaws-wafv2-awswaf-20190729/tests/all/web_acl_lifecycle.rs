@@ -21,6 +21,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region the harness signs for unless a case asks for another one.
 pub(crate) const TEST_REGION: &str = "us-west-2";
 
+/// The ONE region endpoint the CLOUDFRONT scope is served at: "API and SDKs - For
+/// all calls, use the Region endpoint us-east-1" (`Scope`'s own doc). A conforming
+/// client has to make a CLOUDFRONT-scoped call there, so [`Waf::call`] signs one for
+/// this region and everything else for [`TEST_REGION`].
+pub(crate) const CLOUDFRONT_ENDPOINT_REGION: &str = "us-east-1";
+
 /// One emulator with the wafv2 service mounted on a single shared engine.
 ///
 /// Shared with the sibling suites in `tests/all/`, so every suite drives the
@@ -82,9 +88,27 @@ impl Waf {
         (status, parsed)
     }
 
-    /// [`Self::call_in`] for [`TEST_REGION`].
+    /// [`Self::call_in`] for the endpoint a conforming client would use: a request
+    /// naming the CLOUDFRONT scope goes to [`CLOUDFRONT_ENDPOINT_REGION`], every
+    /// other to [`TEST_REGION`].
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.call_in(TEST_REGION, operation, body).await
+        let region = match body.get("Scope").and_then(Value::as_str) {
+            Some("CLOUDFRONT") => CLOUDFRONT_ENDPOINT_REGION,
+            _ => TEST_REGION,
+        };
+        self.call_in(region, operation, body).await
+    }
+
+    /// [`Self::call_in`] for a region the case names, whatever scope the body
+    /// carries: how a suite drives a call from an endpoint that does not serve the
+    /// scope it names.
+    pub(crate) async fn call_from(
+        &self,
+        region: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.call_in(region, operation, body).await
     }
 
     /// The call must answer 200; answers its parsed body.

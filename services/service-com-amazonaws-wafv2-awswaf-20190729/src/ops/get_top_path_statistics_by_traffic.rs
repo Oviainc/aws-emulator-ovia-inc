@@ -6,7 +6,10 @@
 //! ([`crate::state::BotRequestRecord`]): the requests that fall inside the window
 //! and match the request's filters, grouped by path, ordered by request count, each
 //! entry carrying its share of the matching total and the busiest bots that asked
-//! for it, cut into pages of at most `Limit` entries.
+//! for it, cut into pages of at most `Limit` entries. A query that selects no
+//! recorded request — a quiet window, or an ARN no web ACL of this namespace
+//! carries — answers the empty result (`PathStatistics` `[]`,
+//! `TotalRequestCount` 0) rather than refusing.
 //!
 //! This emulator serves the WAFv2 control plane only — no HTTP request is ever
 //! evaluated against a stored web ACL here — so that log holds nothing and a window
@@ -218,23 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, which this operation does not
-        // need, and nothing here writes to the store.
-        let _ = ctx;
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
 
         // The request's own members first, so a bad one is refused whether or not
         // the ARN it carries names a stored web ACL.
-        if !crate::state::is_known_scope(&input.scope) {
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
             return Err(
-                GetTopPathStatisticsByTrafficErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_SCOPE_VALUE,
-                        &input.scope,
-                        "the scope names the namespace the web ACL lives in, and is one of \
-                         CLOUDFRONT or REGIONAL",
-                    ),
-                )
-                .into(),
+                GetTopPathStatisticsByTrafficErrorModeled::WAFInvalidParameterException(refusal)
+                    .into(),
             );
         }
         // `WebAclArn` names a web ACL, so an ARN of another shape — malformed, or
@@ -264,19 +259,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // The statistics belong to ONE web ACL, and WAFv2 namespaces every resource
-        // by scope: an ARN that resolves in the other scope names nothing here.
+        // by scope. This is a TRAFFIC query, not a resource read: what it reports is
+        // the requests recorded for the web ACL the ARN names in this namespace, and
+        // an ARN no such web ACL carries selects no recorded request — which is an
+        // empty, well-formed result ("the total number of requests that match the
+        // query criteria within the specified time window", with `TotalRequestCount`
+        // `@default 0` and `PathStatistics` required), not a refusal. A query over a
+        // window in which nothing was recorded answers the same way, so a caller
+        // doing analytics on quiet traffic is never handed an error for having no
+        // data yet.
         let web_acl_id = match state.arn_index.get(&input.web_acl_arn) {
             Some(crate::state::ResourceRef::WebAcl { scope, id }) if *scope == input.scope => {
                 id.clone()
             }
-            _ => {
-                return Err(
-                    GetTopPathStatisticsByTrafficErrorModeled::WAFNonexistentItemException(
-                        crate::state::nonexistent_item_exception(),
-                    )
-                    .into(),
-                );
-            }
+            _ => String::new(),
         };
 
         // The query criteria beside the window: which bots to count, and which part

@@ -153,18 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, which this operation does not
-        // need, and nothing here writes to the store.
-        let _ = ctx;
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(ListIPSetsErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the IP sets live in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(ListIPSetsErrorModeled::WAFInvalidParameterException(refusal).into());
         }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListIPSetsErrorModeled::WAFInternalErrorException(

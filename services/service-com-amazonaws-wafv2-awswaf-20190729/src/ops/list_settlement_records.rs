@@ -182,34 +182,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, which this operation does not
-        // need, and nothing here writes to the store.
-        let _ = ctx;
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
 
         // The request's own members first, so a bad one is refused whatever the
         // ledger holds.
         //
-        // An enum member's membership is refused at the request boundary, which
-        // words the member's own constraint; these are the handler's own guards, so
-        // a value that ever reaches one unchecked is reported as WAF's
-        // invalid-parameter refusal rather than silently selecting nothing.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(invalid_parameter(
-                crate::state::FIELD_SCOPE_VALUE,
-                &input.scope,
-                "the scope names the namespace the transactions were settled in, and is \
-                 one of CLOUDFRONT or REGIONAL",
-            ));
+        // `Scope` is judged from the request alone: an unknown value, and the global
+        // scope at an endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(
+                ListSettlementRecordsErrorModeled::WAFInvalidParameterException(refusal).into(),
+            );
         }
-        // "This operation is only available for CLOUDFRONT scope": the regional
-        // namespace settles no payment, so the scope it names is a value this
-        // operation does not accept, not an empty answer.
+        // "This operation is only available for CLOUDFRONT scope": monetization is a
+        // CloudFront-delivery feature, so under the regional namespace this
+        // operation does not exist rather than carrying a bad parameter value — the
+        // modelled `WAFInvalidOperationException`, whose message says what is
+        // unavailable and which scope to use
+        // (`crate::state::monetization_not_available_exception`).
         if input.scope != crate::state::SCOPE_CLOUDFRONT {
-            return Err(invalid_parameter(
-                crate::state::FIELD_SCOPE_VALUE,
-                &input.scope,
-                "settlement records are available only for the CLOUDFRONT scope",
-            ));
+            return Err(ListSettlementRecordsErrorModeled::WAFInvalidOperationException(
+                crate::state::monetization_not_available_exception(),
+            )
+            .into());
         }
         if !crate::state::is_known_currency(&input.currency) {
             return Err(invalid_parameter_without_field(
@@ -326,16 +323,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled `WAFInvalidParameterException` for a parameter the enum
-/// `ParameterExceptionField` names a settings group for, lifted into this
-/// operation's error channel.
-fn invalid_parameter(field: &str, parameter: &str, reason: &str) -> ListSettlementRecordsError {
-    ListSettlementRecordsErrorModeled::WAFInvalidParameterException(
-        crate::state::invalid_parameter_exception(field, parameter, reason),
-    )
-    .into()
-}
-
-/// [`invalid_parameter`] for a parameter that enum names no settings group for.
+/// `ParameterExceptionField` names no settings group for: the rejected value and
+/// why, lifted into this operation's error channel.
 fn invalid_parameter_without_field(parameter: &str, reason: &str) -> ListSettlementRecordsError {
     ListSettlementRecordsErrorModeled::WAFInvalidParameterException(
         crate::state::invalid_parameter_exception_without_field(parameter, reason),

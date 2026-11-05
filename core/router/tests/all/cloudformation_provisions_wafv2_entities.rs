@@ -46,7 +46,14 @@ use crate::query_wire::{elements, form_encode, opt_element};
 
 /// The region every request here is signed for, and so the region the stack's entities
 /// belong to.
-const REGION: &str = "us-west-2";
+///
+/// It is the region a CLOUDFRONT-scoped entity is reached through
+/// ([`CLOUDFRONT_REGION`]), because one case of this suite declares such an entity:
+/// WAF serves the global namespace at that endpoint ALONE ("API and SDKs - For all
+/// calls, use the Region endpoint us-east-1", `Scope`'s own doc), so a stack that
+/// declares a CLOUDFRONT-scoped web ACL has to run there — and a REGIONAL entity is
+/// served at every endpoint, so the regional cases are unaffected.
+const REGION: &str = CLOUDFRONT_REGION;
 
 /// The one Region a CLOUDFRONT-scoped entity is reached through, and so the Region segment
 /// of its ARN: "API and SDKs - For all calls, use the Region endpoint us-east-1" (`Scope`).

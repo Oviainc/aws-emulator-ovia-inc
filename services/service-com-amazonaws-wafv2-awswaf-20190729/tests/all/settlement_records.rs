@@ -788,8 +788,10 @@ async fn the_regional_namespace_is_refused_whatever_else_the_request_asks() {
         ledger_fixture("arn:aws:wafv2:us-west-2:123456789012:regional/webacl/x/0"),
     );
 
-    // "This operation is only available for CLOUDFRONT scope": the window, the
-    // filters and the page size make no difference to that.
+    // Monetization is a CloudFront-delivery feature, so under the regional namespace
+    // this operation does not exist: the modelled `WAFInvalidOperationException`,
+    // whose `Message` says what is unavailable and which scope to use. The window,
+    // the filters and the page size make no difference to that.
     for (case, extra) in [
         ("bare", json!({})),
         ("filtered", json!({ "Filters": [both_modes()] })),
@@ -800,24 +802,14 @@ async fn the_regional_namespace_is_refused_whatever_else_the_request_asks() {
             json!({}),
         );
         let refusal = waf
-            .refused(OPERATION, body, "WAFInvalidParameterException", case)
+            .refused(OPERATION, body, "WAFInvalidOperationException", case)
             .await;
         assert_eq!(
-            refusal["Field"],
-            json!("SCOPE_VALUE"),
-            "case {case:?}: the refusal must name the scope, got {refusal}"
-        );
-        assert_eq!(
-            refusal["Parameter"],
-            json!(SCOPE_REGIONAL),
-            "case {case:?}: the refusal must carry the rejected scope, got {refusal}"
-        );
-        let reason = refusal["Reason"].as_str().unwrap_or_default();
-        assert_eq!(
             error_message(&refusal),
-            format!("Error reason: {reason}, field: SCOPE_VALUE, parameter: {SCOPE_REGIONAL}"),
-            "case {case:?}: the message is composed from the answer's own three \
-             members, got {refusal}"
+            "Monetization is not available for regional resources. Use CloudFront \
+             scope to configure monetization.",
+            "case {case:?}: the refusal must carry WAF's monetization sentence, got \
+             {refusal}"
         );
         assert!(
             refusal["Settlements"].is_null(),

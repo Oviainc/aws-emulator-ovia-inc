@@ -157,17 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing in the answer comes from the request's own metadata either, so
         // neither is read here.
         let _ = (&self.engine, ctx);
-        if !crate::state::is_known_scope(&input.scope) {
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
             return Err(
-                DescribeAllManagedProductsErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_SCOPE_VALUE,
-                        &input.scope,
-                        "the scope names the namespace the managed products are offered \
-                         in, and is one of CLOUDFRONT or REGIONAL",
-                    ),
-                )
-                .into(),
+                DescribeAllManagedProductsErrorModeled::WAFInvalidParameterException(refusal)
+                    .into(),
             );
         }
 

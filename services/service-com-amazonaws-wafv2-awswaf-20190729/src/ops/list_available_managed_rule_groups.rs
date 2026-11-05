@@ -171,30 +171,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read of PUBLISHED data: `ctx` carries only request metadata, which this
-        // operation does not need, and a vendor's rule groups are not state this
+        // A read of PUBLISHED data: a vendor's rule groups are not state this
         // account owns — nothing creates, updates or deletes one — so the engine's
-        // store holds none of them and nothing here writes.
-        let _ = (ctx, &self.engine);
+        // store holds none of them and nothing here writes. `ctx` carries the
+        // endpoint region the scope is judged against.
+        let _ = &self.engine;
 
-        // `Scope` names the namespace the request is made in, and WAF recognises
-        // only the two values the enum declares. It narrows nothing below: a managed
+        // `Scope` names the namespace the request is made in, and it is judged from
+        // the request alone. It narrows nothing below: a managed
         // rule group is identified by its `(VendorName, Name)` pair alone ("you use
         // this, along with the vendor name, to identify the rule group", the pair's
         // own docs, which name no scope), so a vendor offers the same groups in
         // either namespace — unlike every resource this ACCOUNT owns, which a scope
         // does namespace.
-        if !crate::state::is_known_scope(&input.scope) {
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
             return Err(
-                ListAvailableManagedRuleGroupsErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_SCOPE_VALUE,
-                        &input.scope,
-                        "the scope names the namespace the request is made in, and is one of \
-                         CLOUDFRONT or REGIONAL",
-                    ),
-                )
-                .into(),
+                ListAvailableManagedRuleGroupsErrorModeled::WAFInvalidParameterException(refusal)
+                    .into(),
             );
         }
 

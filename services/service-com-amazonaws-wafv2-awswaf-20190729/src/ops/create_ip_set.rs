@@ -189,15 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the IP set lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
         // WAF's published quota is 10,000 addresses per IP set; past it the real
@@ -252,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::state::request_region(ctx.parts());
+        let region = crate::service::requests::request_region(ctx.parts());
         let mut state = state.lock();
 
         let name_key = (input.scope.clone(), input.name.clone());

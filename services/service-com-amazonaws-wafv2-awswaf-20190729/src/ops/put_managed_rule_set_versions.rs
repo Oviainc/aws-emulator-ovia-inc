@@ -203,9 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata, which this operation does not need: a
-        // put never mints the set's ARN, so it needs no region.
-        let _ = ctx;
+        // `ctx` carries the request's own metadata: the endpoint region the scope is
+        // judged against. A put never mints the set's ARN, so it needs no other.
+        //
+        // `Scope` is judged first: an unknown value, and the global scope at an
+        // endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(
+                PutManagedRuleSetVersionsErrorModeled::WAFInvalidParameterException(refusal).into(),
+            );
+        }
 
         // The version keys the request publishes under are `VersionKeyString`s, and a
         // map's KEYS do not reach the request boundary's walk (it visits a map's
@@ -224,18 +232,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(envelope));
         }
 
-        // WAF judges the ARNs the request carries first. Each entry of
+        // WAF RESOLVES the ARNs the request carries first, before it judges any other
+        // member and before it resolves the set the put targets. Each entry of
         // `VersionsToPublish` names "the Amazon Resource Name (ARN) of the vendor's
         // rule group that's used in the published managed rule group version"
-        // (`VersionToPublish$AssociatedRuleGroupArn`), and a value WAF will not
-        // accept there AT ALL — not an ARN, another service's ARN, or a wafv2 ARN of
-        // a kind that is not a rule group — is the modelled
-        // `WAFInvalidParameterException`: "Your request references an ARN that is
-        // malformed, or corresponds to a resource with which [it] can't be [used]",
-        // from that error's own doc, carrying `Field` RESOURCE_ARN, the rejected ARN
-        // as `Parameter` and why as `Reason`. Whether a well-formed rule-group ARN
-        // names a rule group that EXISTS is resolution, not syntax, and is judged
-        // below with the rest of the request's target resolution.
+        // (`VersionToPublish$AssociatedRuleGroupArn`), and a value WAF cannot USE
+        // there — not an ARN, another service's ARN, a wafv2 ARN of a kind that is
+        // not a rule group, or a well-formed rule-group ARN naming no rule group of
+        // this scope — is the modelled `WAFInvalidParameterException`: "Your request
+        // references an ARN that is malformed, or corresponds to a resource with
+        // which [it] can't be [used]", from that error's own doc, carrying `Field`
+        // RESOURCE_ARN, the rejected ARN as `Parameter` and
+        // `crate::state::ARN_NOT_VALID_REASON` as `Reason` — the one sentence that
+        // class carries for both halves of it, because the `Parameter` member already
+        // says which ARN. The syntax half needs no state and is judged here:
         if let Some(arn) = unacceptable_rule_group_reference(&input) {
             return Err(
                 PutManagedRuleSetVersionsErrorModeled::WAFInvalidParameterException(
@@ -243,19 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // Only then the optimistic-lock token's own modelled constraints, which this
-        // operation took over from the boundary so they run AFTER the reference
-        // above (`skip_validation` on `PutManagedRuleSetVersionsInput`).
-        let violations = crate::state::validate_members(&[(
-            &crate::state::M_LOCK_TOKEN,
-            crate::state::ConstrainedValue::Text(&input.lock_token),
-        )]);
-        if !violations.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::constraint_envelope(&violations),
-            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -268,8 +265,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // The TARGET of the put is the managed rule set `(Scope, Name, Id)` names, so
-        // it is resolved before anything else about the request is judged: an
+        // … and the resolution half against the store: every rule group a published
+        // version is defined by has to exist IN THIS SCOPE, because a version offered
+        // to customers runs the vendor's own rule group and a scope is a namespace.
+        // Priced here too, out of the entries read before the set is borrowed to write
+        // through: `ManagedRuleSetVersion$Capacity` is "the web ACL capacity units
+        // (WCUs) required for this rule group", which is the declared capacity of the
+        // rule group that defines the version.
+        let mut published_capacities: ::std::collections::HashMap<String, i64> =
+            ::std::collections::HashMap::new();
+        for arn in rule_group_references(&input) {
+            let Some(entry) = state
+                .rule_group_by_arn(&arn)
+                .filter(|entry| entry.scope == input.scope)
+            else {
+                crate::state::audit(
+                    "PutManagedRuleSetVersions",
+                    &input.scope,
+                    &input.name,
+                    &input.id,
+                    &format!(
+                        "WAFInvalidParameterException: no RuleGroup with the ARN {arn} exists"
+                    ),
+                );
+                return Err(
+                    PutManagedRuleSetVersionsErrorModeled::WAFInvalidParameterException(
+                        crate::state::invalid_arn_exception(&arn),
+                    )
+                    .into(),
+                );
+            };
+            published_capacities.insert(arn, entry.rule_group.capacity);
+        }
+
+        // Only then the optimistic-lock token's own modelled constraints, which this
+        // operation took over from the boundary so they run AFTER the references
+        // above (`skip_validation` on `PutManagedRuleSetVersionsInput`).
+        let violations = crate::state::validate_members(&[(
+            &crate::state::M_LOCK_TOKEN,
+            crate::state::ConstrainedValue::Text(&input.lock_token),
+        )]);
+        if !violations.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::constraint_envelope(&violations),
+            ));
+        }
+
+        // The TARGET of the put is the managed rule set `(Scope, Name, Id)` names: an
         // identity no managed rule set of this account carries names a resource that
         // doesn't exist, whatever else the request says, and nothing is published
         // under it.
@@ -290,38 +332,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // Every rule group a published version is defined by has to exist IN THIS
-        // SCOPE: a version offered to customers runs the vendor's own rule group, a
-        // scope is a namespace, and a reference to a rule group this account does
-        // not hold there references a resource that doesn't exist. Priced here too,
-        // out of the entries read before the set is borrowed to write through:
-        // `ManagedRuleSetVersion$Capacity` is "the web ACL capacity units (WCUs)
-        // required for this rule group", which is the declared capacity of the rule
-        // group that defines the version.
-        let mut published_capacities: ::std::collections::HashMap<String, i64> =
-            ::std::collections::HashMap::new();
-        for arn in rule_group_references(&input) {
-            let Some(entry) = state
-                .rule_group_by_arn(&arn)
-                .filter(|entry| entry.scope == input.scope)
-            else {
-                crate::state::audit(
-                    "PutManagedRuleSetVersions",
-                    &input.scope,
-                    &input.name,
-                    &input.id,
-                    &format!("WAFNonexistentItemException: no RuleGroup with the ARN {arn} exists"),
-                );
-                return Err(
-                    PutManagedRuleSetVersionsErrorModeled::WAFNonexistentItemException(
-                        crate::state::nonexistent_item_exception(),
-                    )
-                    .into(),
-                );
-            };
-            published_capacities.insert(arn, entry.rule_group.capacity);
         }
 
         let now = ::aws_smithy_types::DateTime::from_millis(crate::state::now_millis());

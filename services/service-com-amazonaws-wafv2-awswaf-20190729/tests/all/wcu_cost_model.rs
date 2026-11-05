@@ -63,10 +63,15 @@ const PER_CUSTOM_KEY: i64 = 30;
 /// The WCUs each text transformation a statement applies adds.
 const PER_TRANSFORMATION: i64 = 10;
 
-/// The WCUs inspecting all query arguments adds
-/// (`smithy_query(query="shape",shape="FieldToMatch",member="AllQueryArguments")` →
-/// "inspect all query arguments").
-const ALL_QUERY_ARGUMENTS: i64 = 10;
+/// The WCUs inspecting every value of a multi-valued request component adds — all
+/// query arguments, all headers, all cookies
+/// (`smithy_query(query="shape",shape="FieldToMatch")`: "inspect all query
+/// arguments", "inspect the request headers", "inspect the request cookies").
+const MULTI_VALUED_COMPONENT: i64 = 10;
+
+/// The WCUs inspecting all query arguments adds. See
+/// [`MULTI_VALUED_COMPONENT`].
+const ALL_QUERY_ARGUMENTS: i64 = MULTI_VALUED_COMPONENT;
 
 /// `[{ "Priority": i, "Type": t }, …]` for the transformation types named, in the
 /// order named.
@@ -386,6 +391,55 @@ fn modifier_rows() -> Vec<PricedRules> {
             })
         )]),
         expected: ATTRIBUTE + ALL_QUERY_ARGUMENTS,
+    });
+    rows.push(PricedRules {
+        case: "a byte match over every header".to_string(),
+        rules: json!([rule(
+            "a",
+            byte_match(
+                anchored,
+                json!({
+                    "Headers": {
+                        "MatchPattern": { "All": {} },
+                        "MatchScope": "ALL",
+                        "OversizeHandling": "CONTINUE",
+                    }
+                }),
+                &["NONE"]
+            )
+        )]),
+        expected: BYTE_MATCH_ANCHORED + MULTI_VALUED_COMPONENT,
+    });
+    rows.push(PricedRules {
+        case: "a scanning byte match over every cookie, with one transformation"
+            .to_string(),
+        rules: json!([rule(
+            "a",
+            byte_match(
+                "CONTAINS",
+                json!({
+                    "Cookies": {
+                        "MatchPattern": { "All": {} },
+                        "MatchScope": "KEY",
+                        "OversizeHandling": "MATCH",
+                    }
+                }),
+                &["LOWERCASE"]
+            )
+        )]),
+        expected: BYTE_MATCH_SCANNING + MULTI_VALUED_COMPONENT + PER_TRANSFORMATION,
+    });
+    rows.push(PricedRules {
+        case: "a byte match over ONE named header, which is not multi-valued".to_string(),
+        rules: json!([rule(
+            "a",
+            byte_match(
+                anchored,
+                json!({ "SingleHeader": { "Name": "user-agent" } }),
+                &["NONE"]
+            )
+        )]),
+        expected: BYTE_MATCH_ANCHORED,
     });
     rows.push(PricedRules {
         case: "a SQLi match at HIGH sensitivity with two transformations".to_string(),

@@ -2,7 +2,9 @@
 
 //! @op GetIPSet
 //! Answers the stored IPSet for `(Scope, Name, Id)`, with its current `LockToken`.
-//! An unknown triple is `WAFNonexistentItemException` (HTTP 400).
+//! A `Scope` this endpoint does not serve is `WAFInvalidParameterException` (HTTP
+//! 400), judged before the lookup; an unknown triple is
+//! `WAFNonexistentItemException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -164,9 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, which this operation does not
-        // need, and nothing here writes to the store.
-        let _ = ctx;
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
+        // `Scope` is judged before the set is looked up: an unknown value, and the
+        // global scope at an endpoint that does not serve it, are the same bad
+        // parameter (`crate::service::requests::validate_scope`) — and a caller at the wrong
+        // endpoint is told its scope is wrong rather than that its IP set does not
+        // exist.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(GetIPSetErrorModeled::WAFInvalidParameterException(refusal).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetIPSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {

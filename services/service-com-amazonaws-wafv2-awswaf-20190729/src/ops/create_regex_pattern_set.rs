@@ -178,15 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata (the region the ARN is minted in).
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(CreateRegexPatternSetErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the regex pattern set lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(CreateRegexPatternSetErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
         // Each submitted expression has to BE a regular expression: the modelled
@@ -232,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::state::request_region(ctx.parts());
+        let region = crate::service::requests::request_region(ctx.parts());
         let mut state = state.lock();
 
         // `Name` is the set's identity within its scope ("You cannot change the name

@@ -568,8 +568,9 @@ async fn an_expiry_update_stores_the_instant_it_names() {
 }
 
 /// A put whose `AssociatedRuleGroupArn` names no rule group of the account is
-/// refused once the set itself resolves: the version would run a rule group that
-/// does not exist.
+/// refused as the invalid PARAMETER the ARN is — the one refusal WAF answers for
+/// every ARN it cannot use for that member, malformed or merely unresolvable — and
+/// it is answered before the set the put targets is resolved at all.
 ///
 /// The rows differ in HOW the ARN fails to name one — a well-formed rule-group ARN
 /// nothing minted, and a rule group of the OTHER scope, since a scope is a
@@ -592,21 +593,39 @@ async fn a_put_whose_rule_group_does_not_exist_is_refused() {
             cloudfront_groups[0].clone(),
         ),
     ] {
-        waf.refused(
-            "PutManagedRuleSetVersions",
-            json!({
-                "Name": set_name,
-                "Scope": SCOPE_REGIONAL,
-                "Id": &set_id,
-                "LockToken": &set_lock,
-                "VersionsToPublish": {
-                    "Version_1.0": version_to_publish(&arn, 90),
-                },
-            }),
-            "WAFNonexistentItemException",
-            case,
-        )
-        .await;
+        let refusal = waf
+            .refused(
+                "PutManagedRuleSetVersions",
+                json!({
+                    "Name": set_name,
+                    "Scope": SCOPE_REGIONAL,
+                    "Id": &set_id,
+                    "LockToken": &set_lock,
+                    "VersionsToPublish": {
+                        "Version_1.0": version_to_publish(&arn, 90),
+                    },
+                }),
+                "WAFInvalidParameterException",
+                case,
+            )
+            .await;
+        assert_eq!(
+            (
+                refusal["Field"].as_str(),
+                refusal["Parameter"].as_str(),
+                refusal["Reason"].as_str()
+            ),
+            (
+                Some("RESOURCE_ARN"),
+                Some(arn.as_str()),
+                Some(
+                    "The ARN isn't valid. A valid ARN begins with arn: and includes \
+                     other information separated by colons or slashes."
+                )
+            ),
+            "case {case:?}: the refusal must name the ARN member, the rejected ARN and \
+             the reason, got {refusal}"
+        );
         let got = get_managed_rule_set(&waf, SCOPE_REGIONAL, set_name, &set_id).await;
         assert_eq!(
             got["ManagedRuleSet"]["PublishedVersions"],

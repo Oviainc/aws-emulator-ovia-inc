@@ -173,8 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata, which this operation does not need.
-        let _ = ctx;
+        // `ctx` carries the request's own metadata: the endpoint region the scope is
+        // judged against.
+        //
+        // `Scope` is judged before the lookup: an unknown value, and the global
+        // scope at an endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(DeleteIPSetErrorModeled::WAFInvalidParameterException(refusal).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteIPSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {

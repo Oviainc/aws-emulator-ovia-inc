@@ -87,6 +87,8 @@ mod rate_based_statement_managed_keys;
 mod rate_based_window_recovery;
 #[path = "all/referenced_resource_deletes.rs"]
 mod referenced_resource_deletes;
+#[path = "all/refusal_classes.rs"]
+mod refusal_classes;
 #[path = "all/regex_pattern_set_lifecycle.rs"]
 mod regex_pattern_set_lifecycle;
 #[path = "all/regex_pattern_set_listing.rs"]

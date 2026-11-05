@@ -240,22 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A report: it reads the stored web ACL and the clock, and writes nothing a
-        // later caller could see. `ctx` carries only request metadata, which this
-        // operation does not need.
-        let _ = ctx;
-
+        // later caller could see. `ctx` carries the request's own metadata: the
+        // endpoint region the scope is judged against.
+        //
         // `Scope` "specifies whether this is for a global resource type" and is the
-        // namespace the web ACL is resolved in, so it is judged first.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(GetSampledRequestsErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the web ACL is resolved in, \
-                     and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        // namespace the web ACL is resolved in, so it is judged first: an unknown
+        // value, and the global scope at an endpoint that does not serve it, are the
+        // same bad parameter (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(
+                GetSampledRequestsErrorModeled::WAFInvalidParameterException(refusal).into(),
+            );
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

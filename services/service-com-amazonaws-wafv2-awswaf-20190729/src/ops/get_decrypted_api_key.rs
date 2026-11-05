@@ -169,21 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, which this operation does not
-        // need, and nothing here writes to the store.
-        let _ = ctx;
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
+        //
         // `Scope`'s enum membership is refused at the request boundary, which words
         // the member's own constraint, so this is the handler's own guard: a scope
-        // that ever reaches it unchecked names no namespace to look the key up in.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(GetDecryptedAPIKeyErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the API key lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        // that ever reaches it unchecked, and the global scope at an endpoint that
+        // does not serve it, name no namespace to look the key up in.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(
+                GetDecryptedAPIKeyErrorModeled::WAFInvalidParameterException(refusal).into(),
+            );
         }
 
         // A value that does not decode to a key this service minted is not a key WAF

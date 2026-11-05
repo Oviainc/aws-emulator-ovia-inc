@@ -209,35 +209,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine's store holds none of it and nothing here writes. Nothing in the
         // answer comes from the request's own metadata either: every figure is the
         // vendor's, so `ctx` is read for nothing.
-        let _ = (&self.engine, ctx);
+        let _ = &self.engine;
 
-        // `Scope` names the namespace the request is made in, and WAF recognises
-        // only the two values the enum declares. It narrows nothing below: a
-        // managed rule group is identified by its `(VendorName, Name)` pair alone
-        // ("you use this, along with the vendor name, to identify the rule group",
-        // `Name`'s own doc), so a vendor publishes the same group in either
-        // namespace, and the same description of it.
-        if !crate::state::is_known_scope(&input.scope) {
+        // `Scope` names the namespace the request is made in, and it is judged
+        // before the catalogue is consulted: an unknown value, and the global scope
+        // at an endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`). It narrows nothing below: a managed rule
+        // group is identified by its `(VendorName, Name)` pair alone ("you use this,
+        // along with the vendor name, to identify the rule group", `Name`'s own
+        // doc), so a vendor publishes the same group in either namespace, and the
+        // same description of it.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
             return Err(
-                DescribeManagedRuleGroupErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_SCOPE_VALUE,
-                        &input.scope,
-                        "the scope names the namespace the request is made in, and is one of \
-                         CLOUDFRONT or REGIONAL",
-                    ),
-                )
-                .into(),
+                DescribeManagedRuleGroupErrorModeled::WAFInvalidParameterException(refusal).into(),
             );
         }
 
         // A `(VendorName, Name)` pair the catalogue does not list names nothing
         // that exists — the modelled `WAFNonexistentItemException`, exactly as a
-        // `ManagedRuleGroupStatement` naming an uncatalogued pair is refused.
+        // `ManagedRuleGroupStatement` naming an uncatalogued pair is refused. The
+        // pair is the only thing a caller can correct, so the refusal names it
+        // (`crate::state::managed_rules_not_found_exception`).
         let Some(group) = crate::state::managed_rule_group(&input.vendor_name, &input.name) else {
             return Err(
                 DescribeManagedRuleGroupErrorModeled::WAFNonexistentItemException(
-                    crate::state::nonexistent_item_exception(),
+                    crate::state::managed_rules_not_found_exception(
+                        &input.vendor_name,
+                        &input.name,
+                    ),
                 )
                 .into(),
             );

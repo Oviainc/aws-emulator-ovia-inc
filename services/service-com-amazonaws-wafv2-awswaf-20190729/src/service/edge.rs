@@ -2610,7 +2610,7 @@ fn compare_size(length: i64, size: i64, operator: &str) -> bool {
 fn compiled_regexes(patterns: &[String]) -> Vec<::regex::bytes::Regex> {
     patterns
         .iter()
-        .filter_map(|pattern| crate::state::compile_regex(pattern).ok())
+        .filter_map(|pattern| crate::state::compile_regex(pattern))
         .collect()
 }
 

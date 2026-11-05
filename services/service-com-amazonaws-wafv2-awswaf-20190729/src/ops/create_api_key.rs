@@ -174,8 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata, which minting a key does not need.
-        let _ = ctx;
+        // the request's own metadata: the endpoint region the scope is judged
+        // against.
 
         // `TokenDomains`' modelled constraints, which this operation took over from
         // the boundary so the refusal is worded the way WAF words a collection whose
@@ -199,15 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the member's own constraint, so this is the handler's own guard: a scope
         // that ever reaches it unchecked is reported as WAF's own invalid-parameter
         // refusal rather than minting a key into no namespace.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the API key lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
         // "You can use a single key for up to 5 domains" (this operation's own doc),

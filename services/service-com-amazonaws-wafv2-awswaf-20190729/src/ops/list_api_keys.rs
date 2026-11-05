@@ -177,22 +177,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, which this operation does not
-        // need, and nothing here writes to the store.
-        let _ = ctx;
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
         // `Scope`'s enum membership is refused at the request boundary, which words
         // the member's own constraint, so this is the handler's own guard: a scope
         // that ever reaches it unchecked is reported as WAF's own invalid-parameter
         // refusal rather than silently listing the keys of no namespace.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(ListAPIKeysErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the API keys live in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(ListAPIKeysErrorModeled::WAFInvalidParameterException(refusal).into());
         }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAPIKeysErrorModeled::WAFInternalErrorException(

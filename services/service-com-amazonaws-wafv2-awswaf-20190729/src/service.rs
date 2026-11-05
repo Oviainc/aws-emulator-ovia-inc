@@ -52,6 +52,9 @@
 //! inspect with.
 
 pub mod edge;
+/// The judgement every operation makes about the request itself, before it resolves
+/// anything the request names: the `Scope` against the endpoint it was signed for.
+pub mod requests;
 pub mod sqli;
 
 use smithy_server_runtime::{

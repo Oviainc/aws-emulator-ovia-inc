@@ -235,18 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata, which this operation does not need: an
-        // update never re-mints the ARN, so it needs no region.
-        let _ = ctx;
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the rule group lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        // `ctx` carries the request's own metadata: the endpoint region the scope is
+        // judged against. An update never re-mints the ARN, so it needs no other.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
         // The rule tree comes straight off the wire and nests, so its depth is

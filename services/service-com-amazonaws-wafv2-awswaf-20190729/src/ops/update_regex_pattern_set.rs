@@ -193,18 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata, which this operation does not need: an
-        // update never re-mints the ARN, so it needs no region.
-        let _ = ctx;
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(UpdateRegexPatternSetErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the regex pattern set lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        // `ctx` carries the request's own metadata: the endpoint region the scope is
+        // judged against. An update never re-mints the ARN, so it needs no other.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(
+                UpdateRegexPatternSetErrorModeled::WAFInvalidParameterException(refusal).into(),
+            );
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

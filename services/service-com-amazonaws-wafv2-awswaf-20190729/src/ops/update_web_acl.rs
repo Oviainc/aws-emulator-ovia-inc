@@ -294,9 +294,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata, which this operation does not need: an
-        // update never re-mints the ARN, so it needs no region.
-        let _ = ctx;
+        // `ctx` carries the request's own metadata: the endpoint region the scope is
+        // judged against. An update never re-mints the ARN, so it needs no other.
+        //
+        // `Scope` is judged first: an unknown value, and the global scope at an
+        // endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(refusal).into());
+        }
         // The rule tree comes straight off the wire and nests, so its depth is
         // bounded here, before anything walks, stores or measures it.
         if let Err(reason) =

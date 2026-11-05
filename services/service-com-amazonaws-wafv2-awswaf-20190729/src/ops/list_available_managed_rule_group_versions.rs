@@ -186,28 +186,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read of PUBLISHED data: `ctx` carries only request metadata, which this
-        // operation does not need, and the versions a vendor offers are not state
-        // this account owns — nothing creates, updates or deletes one — so the
-        // engine's store holds none of them and nothing here writes.
-        let _ = (ctx, &self.engine);
+        // A read of PUBLISHED data: the versions a vendor offers are not state this
+        // account owns — nothing creates, updates or deletes one — so the engine's
+        // store holds none of them and nothing here writes. `ctx` carries the
+        // endpoint region the scope is judged against.
+        let _ = &self.engine;
 
-        // `Scope` names the namespace the request is made in, and WAF recognises
-        // only the two values the enum declares. It narrows nothing below: a
-        // managed rule group is identified by its `(VendorName, Name)` pair alone
-        // ("you use this, along with the vendor name, to identify the rule group",
-        // `Name`'s own doc, which names no scope), so a vendor offers the same
-        // group, and the same versions of it, in either namespace — unlike every
-        // resource this ACCOUNT owns, which a scope does namespace.
-        if !crate::state::is_known_scope(&input.scope) {
+        // `Scope` names the namespace the request is made in, and it is judged
+        // before the catalogue is consulted: an unknown value, and the global scope
+        // at an endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`). It narrows nothing below: a managed rule
+        // group is identified by its `(VendorName, Name)` pair alone ("you use this,
+        // along with the vendor name, to identify the rule group", `Name`'s own doc,
+        // which names no scope), so a vendor offers the same group, and the same
+        // versions of it, in either namespace — unlike every resource this ACCOUNT
+        // owns, which a scope does namespace.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
             return Err(
                 ListAvailableManagedRuleGroupVersionsErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_SCOPE_VALUE,
-                        &input.scope,
-                        "the scope names the namespace the request is made in, and is one of \
-                         CLOUDFRONT or REGIONAL",
-                    ),
+                    refusal,
                 )
                 .into(),
             );
@@ -217,11 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`Name`'s own doc): the pair identifies a group the service publishes, and
         // a pair the catalogue does not list names nothing that exists — the
         // modelled `WAFNonexistentItemException`, exactly as a
-        // `ManagedRuleGroupStatement` naming an uncatalogued pair is refused.
+        // `ManagedRuleGroupStatement` naming an uncatalogued pair is refused, naming
+        // the pair that resolved to nothing
+        // (`crate::state::managed_rules_not_found_exception`).
         let Some(group) = crate::state::managed_rule_group(&input.vendor_name, &input.name) else {
             return Err(
                 ListAvailableManagedRuleGroupVersionsErrorModeled::WAFNonexistentItemException(
-                    crate::state::nonexistent_item_exception(),
+                    crate::state::managed_rules_not_found_exception(
+                        &input.vendor_name,
+                        &input.name,
+                    ),
                 )
                 .into(),
             );

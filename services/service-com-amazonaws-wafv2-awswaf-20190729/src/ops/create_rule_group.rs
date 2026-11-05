@@ -213,15 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the rule group lives in, and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
         // The rule tree comes straight off the wire and nests, so its depth is
@@ -313,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::state::request_region(ctx.parts());
+        let region = crate::service::requests::request_region(ctx.parts());
         let mut state = state.lock();
 
         // Every reference the rule tree carries must name an entity this service

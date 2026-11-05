@@ -479,9 +479,10 @@ async fn the_regional_namespace_is_refused_whatever_else_the_request_asks() {
         ledger("arn:aws:wafv2:us-west-2:123456789012:regional/webacl/regional-acl/0"),
     );
 
-    // "This operation is only available for CLOUDFRONT scope": the window and the
-    // filters make no difference to that, and a regional ledger is not summarised
-    // either.
+    // Monetization is a CloudFront-delivery feature, so under the regional namespace
+    // this operation does not exist: the modelled `WAFInvalidOperationException`. The
+    // window and the filters make no difference to that, and a regional ledger is not
+    // summarised either.
     for (case, time_window, extra) in [
         ("bare", window(0, 3_600), json!({})),
         (
@@ -496,13 +497,21 @@ async fn the_regional_namespace_is_refused_whatever_else_the_request_asks() {
             json!({}),
         ),
     ] {
-        waf.refused(
-            OPERATION,
-            with(request(SCOPE_REGIONAL, time_window), extra),
-            "WAFInvalidParameterException",
-            case,
-        )
-        .await;
+        let refusal = waf
+            .refused(
+                OPERATION,
+                with(request(SCOPE_REGIONAL, time_window), extra),
+                "WAFInvalidOperationException",
+                case,
+            )
+            .await;
+        assert_eq!(
+            refusal["Message"].as_str().unwrap_or_default(),
+            "Monetization is not available for regional resources. Use CloudFront \
+             scope to configure monetization.",
+            "case {case:?}: the refusal must carry WAF's monetization sentence, got \
+             {refusal}"
+        );
     }
 }
 

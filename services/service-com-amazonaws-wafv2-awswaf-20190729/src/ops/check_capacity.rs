@@ -180,21 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `Scope` "specifies whether this is for a global resource type" and is one of
-        // the two values the enum declares; it is also the namespace every reference in
-        // the rule list resolves in, so it is judged first.
-        if !crate::state::is_known_scope(&input.scope) {
-            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_SCOPE_VALUE,
-                    &input.scope,
-                    "the scope names the namespace the rules' references resolve in, \
-                     and is one of CLOUDFRONT or REGIONAL",
-                ),
-            )
-            .into());
+        // `Scope` "specifies whether this is for a global resource type" and is also
+        // the namespace every reference in the rule list resolves in, so it is judged
+        // first: an unknown value, and the global scope at an endpoint that does not
+        // serve it, are the same bad parameter (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
         // The rule tree comes straight off the wire and nests, so its depth is bounded

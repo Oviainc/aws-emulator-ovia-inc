@@ -226,27 +226,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A report: it reads the stored web ACL (and, when the rate-based rule lives
         // inside a referenced rule group, that rule group) and writes nothing a later
-        // caller could see. `ctx` carries only request metadata, which this operation
-        // does not need.
-        let _ = ctx;
+        // caller could see. `ctx` carries the request's own metadata: the endpoint
+        // region the scope is judged against.
 
         // `Scope` "specifies whether this is for a global resource type" and is the
-        // namespace the web ACL is resolved in, so it is judged first. `Scope` is a
-        // modelled enum, so the request boundary already refuses a value the model
-        // does not declare (a 400 `ValidationException`); this guard sits behind that
-        // one — like the guard in every sibling handler of this crate — so nothing
-        // that reaches the store is resolved in a namespace that does not exist.
-        if !crate::state::is_known_scope(&input.scope) {
+        // namespace the web ACL is resolved in, so it is judged first: an unknown
+        // value, and the global scope at an endpoint that does not serve it, are the
+        // same bad parameter (`crate::service::requests::validate_scope`). `Scope` is a modelled
+        // enum, so the request boundary already refuses a value the model does not
+        // declare (a 400 `ValidationException`); this guard sits behind that one —
+        // like the guard in every sibling handler of this crate — so nothing that
+        // reaches the store is resolved in a namespace that does not exist.
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
             return Err(
-                GetRateBasedStatementManagedKeysErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_SCOPE_VALUE,
-                        &input.scope,
-                        "the scope names the namespace the web ACL is resolved in, \
-                         and is one of CLOUDFRONT or REGIONAL",
-                    ),
-                )
-                .into(),
+                GetRateBasedStatementManagedKeysErrorModeled::WAFInvalidParameterException(refusal)
+                    .into(),
             );
         }
 

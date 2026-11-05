@@ -710,8 +710,16 @@ async fn a_bot_filtered_cloudfront_view_is_refused_as_a_pricing_plan_feature() {
     );
 }
 
+/// An ARN WAF will not accept as a web ACL ARN at all is refused; an ARN that is
+/// well formed but names no web ACL in the namespace asked about simply selects no
+/// recorded request, which is an empty result.
+///
+/// The second half is what separates a traffic QUERY from a resource read: "the
+/// total number of requests that match the query criteria within the specified time
+/// window" is 0 when nothing matches, and `TotalRequestCount` is `@default 0` with
+/// `PathStatistics` `@required`, so a well-formed query always has an answer.
 #[tokio::test]
-async fn an_arn_that_names_no_web_acl_in_the_scope_is_refused() {
+async fn an_arn_waf_cannot_read_as_a_web_acl_arn_is_refused_and_one_naming_nothing_is_empty() {
     let waf = Waf::new();
     let (_id, regional_arn, _lock) =
         create_web_acl(&waf, SCOPE_REGIONAL, "addressed-acl", json!([])).await;
@@ -720,42 +728,46 @@ async fn an_arn_that_names_no_web_acl_in_the_scope_is_refused() {
     // A well-formed web ACL ARN naming an id nothing was created under.
     let unknown_arn = format!("{regional_arn}-unknown");
 
-    // An ARN WAF will not accept as a web ACL ARN at all is the parameter failure;
-    // one that is well formed but resolves to nothing in the named scope is the
-    // missing-resource failure.
-    for (case, arn, scope, code) in [
+    for (case, arn, scope) in [
         (
             "a value that is no ARN",
             "arn:aws:wafv2:not-an-arn-at-all".to_string(),
             SCOPE_REGIONAL,
-            "WAFInvalidParameterException",
         ),
-        (
-            "an ARN of another resource kind",
-            ip_set_arn,
-            SCOPE_REGIONAL,
-            "WAFInvalidParameterException",
-        ),
-        (
-            "a web ACL ARN naming nothing",
-            unknown_arn,
-            SCOPE_REGIONAL,
-            "WAFNonexistentItemException",
-        ),
-        (
-            "a REGIONAL web ACL asked for in the CLOUDFRONT namespace",
-            regional_arn,
-            SCOPE_CLOUDFRONT,
-            "WAFNonexistentItemException",
-        ),
+        ("an ARN of another resource kind", ip_set_arn, SCOPE_REGIONAL),
     ] {
         waf.refused(
             OPERATION,
             request(&arn, scope, window(0, 3_600), 50, 10),
-            code,
+            "WAFInvalidParameterException",
             case,
         )
         .await;
+    }
+
+    // No traffic was recorded for either of these, so each answers the empty result
+    // rather than a refusal: one ARN names no web ACL at all, the other names one
+    // in the OTHER namespace.
+    for (case, arn, scope) in [
+        ("a web ACL ARN naming nothing", unknown_arn, SCOPE_REGIONAL),
+        (
+            "a REGIONAL web ACL asked for in the CLOUDFRONT namespace",
+            regional_arn,
+            SCOPE_CLOUDFRONT,
+        ),
+    ] {
+        let answer = waf
+            .ok(OPERATION, request(&arn, scope, window(0, 3_600), 50, 10))
+            .await;
+        assert_eq!(
+            (
+                answer["PathStatistics"].as_array().map(Vec::len),
+                answer["TotalRequestCount"].as_i64()
+            ),
+            (Some(0), Some(0)),
+            "case {case:?}: expected an empty PathStatistics list and TotalRequestCount \
+             0, got {answer}"
+        );
     }
 }
 
