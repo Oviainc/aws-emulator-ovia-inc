@@ -21,18 +21,41 @@ use crate::ops::types::{
     Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference, RecipeStep, Sample,
 };
 
+/// The resource kinds DataBrew states a refusal about in its SHORT form: the kind, the
+/// identifier the request carried and the bare predicate, with no terminating period
+/// (`Schedule nightly not found`, `Schedule nightly already exists`). Every other kind
+/// is stated in the service's sentence form (`Dataset orders wasn't found.`,
+/// `Dataset orders already exists.`).
+///
+/// The wording belongs to the RESOURCE the request addressed rather than to the
+/// operation that addressed it, so one kind reads the same from every lookup and every
+/// create that names it, and an operation added on a kind listed here states what the
+/// kind's existing operations state without a case of its own.
+const SHORT_FORM_RESOURCE_KINDS: [&str; 1] = ["Schedule"];
+
+/// Whether DataBrew states refusals about `kind` in its short, period-less form
+/// ([`SHORT_FORM_RESOURCE_KINDS`]).
+fn stated_in_short_form(kind: &str) -> bool {
+    SHORT_FORM_RESOURCE_KINDS.contains(&kind)
+}
+
 /// The message DataBrew answers a `ResourceNotFoundException` with: the kind of
 /// resource the lookup addressed, the identifier the request carried for it, and the
-/// fixed `wasn't found.` tail.
+/// predicate stating it was not found.
 ///
 /// The sentence the model documents on the error SHAPE ("One or more resources can't
 /// be found.") describes the error class, not the message a particular lookup
 /// answers with: DataBrew builds that message from the request, so a client can tell
 /// which resource was missing, and of which kind. `kind` is the resource kind as
 /// DataBrew names it in prose, capitalised (`Dataset`, `Job`, `Recipe`, `Schedule`);
-/// `identifier` is what the request looked the resource up by.
+/// `identifier` is what the request looked the resource up by. The predicate is the
+/// one DataBrew words that kind's refusals with ([`SHORT_FORM_RESOURCE_KINDS`]).
 pub fn not_found_message(kind: &str, identifier: &str) -> String {
-    format!("{kind} {identifier} wasn't found.")
+    if stated_in_short_form(kind) {
+        format!("{kind} {identifier} not found")
+    } else {
+        format!("{kind} {identifier} wasn't found.")
+    }
 }
 
 /// The message a lookup that addressed a (recipe, VERSION) pair answers its
@@ -60,9 +83,14 @@ pub fn job_not_found_message(name: &str) -> String {
 
 /// The message DataBrew answers a `ConflictException` with when a create names a
 /// resource that already exists: the resource kind, capitalised, and the name the
-/// request carried, so the message states which resource conflicted.
+/// request carried, so the message states which resource conflicted. The predicate is
+/// the one DataBrew words that kind's refusals with ([`SHORT_FORM_RESOURCE_KINDS`]).
 pub fn already_exists_message(kind: &str, name: &str) -> String {
-    format!("{kind} {name} already exists.")
+    if stated_in_short_form(kind) {
+        format!("{kind} {name} already exists")
+    } else {
+        format!("{kind} {name} already exists.")
+    }
 }
 
 /// The message DataBrew answers a `ConflictException` with when a write is refused

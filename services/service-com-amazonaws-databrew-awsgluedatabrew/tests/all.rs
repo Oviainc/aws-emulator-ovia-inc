@@ -19,6 +19,8 @@ mod databrew_harness;
 mod dataset_in_use_refusal;
 #[path = "all/dataset_update_lifecycle.rs"]
 mod dataset_update_lifecycle;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/project_delete.rs"]
 mod project_delete;
 #[path = "all/project_lifecycle.rs"]
@@ -33,6 +35,8 @@ mod recipe_version_resolution;
 mod resource_not_found_message;
 #[path = "all/schedule_lifecycle.rs"]
 mod schedule_lifecycle;
+#[path = "all/schedule_refusal_wording.rs"]
+mod schedule_refusal_wording;
 #[path = "all/schedule_update.rs"]
 mod schedule_update;
 #[path = "all/state_roundtrip.rs"]

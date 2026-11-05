@@ -5,7 +5,9 @@
 //! The rule pinned here: the message is built FROM THE REQUEST — it names the kind of
 //! resource the lookup addressed and the identifier the request carried for it
 //! (`<Kind> <identifier> wasn't found.`), so two misses of two different resources
-//! answer two different messages. The sentence the model documents on the error shape
+//! answer two different messages. The predicate belongs to the resource KIND: a
+//! schedule's miss is stated in DataBrew's short form (`Schedule <Name> not found`),
+//! which `tests/all/schedule_refusal_wording.rs` spans over the schedule operations. The sentence the model documents on the error shape
 //! ("One or more resources can't be found.", `smithy_query(query="shape",
 //! shape="ResourceNotFoundException")`) describes the error CLASS; it is not the
 //! message a particular lookup answers with.
@@ -159,7 +161,9 @@ fn not_found_cases() -> Vec<NotFoundCase> {
         NotFoundCase {
             case: "DescribeSchedule",
             request: |name| ("GET", format!("/schedules/{}", label(name)), None),
-            expected: |name| format!("Schedule {name} wasn't found."),
+            // A schedule's refusals are stated in DataBrew's short form, with no
+            // terminating period; see `tests/all/schedule_refusal_wording.rs`.
+            expected: |name| format!("Schedule {name} not found"),
             name_max: 255,
         },
     ]

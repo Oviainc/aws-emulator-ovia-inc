@@ -428,7 +428,9 @@ async fn an_update_of_a_schedule_nobody_created_is_refused() {
         );
         assert_eq!(
             refused.error_message(),
-            format!("Schedule {name} wasn't found."),
+            // A schedule miss is stated in DataBrew's short form, with no terminating
+            // period; `tests/all/schedule_refusal_wording.rs` spans that rule.
+            format!("Schedule {name} not found"),
             "case {name:?}: unexpected not-found message, got {:?}",
             refused.body
         );

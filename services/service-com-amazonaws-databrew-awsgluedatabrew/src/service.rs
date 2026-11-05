@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -98,15 +98,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. ONE thing is reworded here: the order an enumerated
+        // type's admissible set is stated in ([`stated_value_set`]). The envelope,
+        // the clause count, the echoed value, the member path and every
+        // requirement's wording stay the framework's — they are rendered by the
+        // same function the default wording uses — and the code stays the one the
+        // framework picks for a constraint refusal, so the chosen message travels
+        // with its matching code.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let stated: Vec<Violation> =
+                    violations.iter().map(in_stated_value_set_order).collect();
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: aws_smithy_schema_server::envelope(&stated)?,
+                })
+            }
+            // Authentication is the emulator's to answer, not this service's.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -136,4 +146,66 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The error code a constraint refusal carries on this service's wire (restJson1), which
+/// is also the code the framework's own default picks for one — kept so the message
+/// chosen above always travels with the code a client branches on.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// How wide the table an enumerated type's admissible values are held in is, and so the
+/// modulus a value's bucket is taken at.
+const VALUE_SET_BUCKETS: u32 = 32;
+
+/// `violation` with an enumerated type's admissible set stated in the order this service
+/// states that set in, and every other violation returned unchanged.
+///
+/// Only the ORDER of the values changes: the clause itself, the member path, the echoed
+/// value and the requirement's wording keep coming from the one place that writes them.
+fn in_stated_value_set_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(declared) = &violation.kind else {
+        return violation.clone();
+    };
+    let stated = stated_value_set(declared)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::EnumValue(stated),
+        value: violation.value.clone(),
+        sensitive: violation.sensitive,
+    }
+}
+
+/// The order an enumerated type's admissible set is STATED in: the order the set's own
+/// hash table is walked in, which is each value's bucket ascending and — where two values
+/// share a bucket — the reverse of the order the model declares them in, the
+/// later-declared value ahead of the earlier one.
+///
+/// The order belongs to the enumerated TYPE rather than to a member, an operation or a
+/// request carrying it, and it is computed from the values themselves: one type is stated
+/// the same way under every member that targets it, at any depth of the request, and a
+/// type the model gains is stated without anything being added here. It is NOT the order
+/// the model declares a type's values in, and not their sorted order either.
+fn stated_value_set(declared: &[String]) -> Vec<&str> {
+    // Declaration order reversed FIRST, so the stable sort below leaves two values of one
+    // bucket in that reverse order.
+    let mut stated: Vec<&str> = declared.iter().rev().map(String::as_str).collect();
+    stated.sort_by_key(|value| value_bucket(value));
+    stated
+}
+
+/// Which bucket of the table `value` sits in: its 31-based string hash — the hash so far
+/// multiplied by 31 plus the next UTF-16 code unit, wrapping at 32 bits — reduced to the
+/// table's width.
+///
+/// `services/service-com-amazonaws-acmpca-acmprivateca/src/service.rs` derives the same
+/// walk for its own value sets; the fold is four lines and decides only a listing order
+/// over model-declared values (it reads nothing a caller sent and is not a digest), so it
+/// is taken here rather than shared, as that crate's own note on the derivation explains.
+fn value_bucket(value: &str) -> u32 {
+    value.encode_utf16().fold(0u32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+    }) % VALUE_SET_BUCKETS
 }
