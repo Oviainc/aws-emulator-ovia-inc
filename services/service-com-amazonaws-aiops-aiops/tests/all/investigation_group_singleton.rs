@@ -11,9 +11,9 @@
 //!
 //! 1. An account holds at most [`MAX_INVESTIGATION_GROUPS_PER_REGION`] investigation
 //!    group in each Region; a create in a Region that already holds that many is
-//!    refused with `ServiceQuotaExceededException` (402) and stores nothing. The
-//!    check and the insert happen under one lock, so concurrent creates yield exactly
-//!    one winner.
+//!    refused with `ServiceQuotaExceededException` (402), worded as the service words
+//!    that error class, and stores nothing. The check and the insert happen under one
+//!    lock, so concurrent creates yield exactly one winner.
 //! 2. A group's encryption configuration is always reported: omitting it on the
 //!    create selects the Amazon Web Services owned key, and that is what a read
 //!    reports.
@@ -65,6 +65,26 @@ const TAGGING_NOT_FOUND: &str = "NotFoundException";
 /// Regions the per-region rows span: the recorded one, two other commercial regions
 /// and one whose name is longer and carries more fields.
 const REGIONS: &[&str] = &["us-west-2", "eu-central-1", "ap-southeast-4", "us-gov-west-1"];
+
+/// The sentence a create refused by the per-account/Region quota carries, as the
+/// service words that error class: fixed text that states no count, no Region and
+/// nothing the request sent.
+const QUOTA_EXCEEDED_MESSAGE: &str = "Cannot create another investigation group.";
+
+/// The sentence a `PutInvestigationGroupPolicy` carrying something that is not a policy
+/// document is refused with, as the service words that error class: fixed text that
+/// states no member path and no excerpt of the document.
+const INVALID_POLICY_DOCUMENT_MESSAGE: &str = "The specified resource policy document is invalid.";
+
+/// The sentence a cross-account source role that names no account other than the
+/// investigation account is refused with: fixed text around the investigation account
+/// and the ARN the request sent.
+fn source_role_sentence(source_role_arn: &str) -> String {
+    format!(
+        "Source role ARN cannot belong to the investigation account {ACCOUNT}. \
+         Found ARN: {source_role_arn}"
+    )
+}
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
 fn emulator() -> MultiServiceRouter {
@@ -420,6 +440,12 @@ async fn an_account_holds_one_investigation_group_per_region() {
                 error_code(&answer),
                 "ServiceQuotaExceededException",
                 "case {case:?}: expected ServiceQuotaExceededException, got {answer:?}"
+            );
+            assert_eq!(
+                message(&answer),
+                QUOTA_EXCEEDED_MESSAGE,
+                "case {case:?}: expected {QUOTA_EXCEEDED_MESSAGE:?}, got {:?}",
+                message(&answer)
             );
             assert!(
                 answer.get("arn").is_none(),
@@ -827,9 +853,10 @@ async fn a_resource_policy_must_be_a_json_document() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {answer:?}"
         );
-        assert!(
-            message(&answer).contains("policy"),
-            "case {case:?}: the refusal must name the member, got {answer:?}"
+        assert_eq!(
+            message(&answer),
+            INVALID_POLICY_DOCUMENT_MESSAGE,
+            "case {case:?}: expected {INVALID_POLICY_DOCUMENT_MESSAGE:?}, got {answer:?}"
         );
         assert!(
             !message(&answer).contains(document),
@@ -894,8 +921,9 @@ async fn a_resource_policy_must_be_a_json_document() {
 
 /// A cross-account configuration must name an account OTHER than the investigation
 /// account: a `sourceRoleArn` in the account that owns the group is refused with
-/// `ValidationException` (400), naming the refused ENTRY's own position, and the stored
-/// configuration is left untouched.
+/// `ValidationException` (400), worded as the service words that error class — the
+/// investigation account and the offending ARN — and the stored configuration is left
+/// untouched.
 ///
 /// Rows differ along the operation (create and update), the position of the offending
 /// entry in the list, and the list's size — with the foreign-account rows as the
@@ -913,39 +941,39 @@ async fn a_cross_account_source_role_must_name_another_account() {
         )
     };
 
-    // (case, the list, whether it must be accepted, the 1-based positions a refusal
-    // must name — the refused entries, which a refusal states as
-    // `crossAccountConfigurations.<n>.member.sourceRoleArn`)
-    let cases: Vec<(&str, Value, bool, Vec<usize>)> = vec![
-        ("an empty list", entries(&[]), true, vec![]),
-        ("one foreign account", entries(&[foreign(1)]), true, vec![]),
+    // (case, the list, the ARN a refusal must echo — `None` when the list must be
+    // accepted; a list with several offending entries is refused at the first of them)
+    let cases: Vec<(&str, Value, Option<String>)> = vec![
+        ("an empty list", entries(&[]), None),
+        ("one foreign account", entries(&[foreign(1)]), None),
         (
             "several foreign accounts",
             entries(&[foreign(1), foreign(2), foreign(3)]),
-            true,
-            vec![],
+            None,
         ),
         (
             "the investigation account alone",
             entries(&[own(1)]),
-            false,
-            vec![1],
+            Some(own(1)),
         ),
         (
             "the investigation account first",
             entries(&[own(1), foreign(1)]),
-            false,
-            vec![1],
+            Some(own(1)),
         ),
         (
             "the investigation account last",
             entries(&[foreign(1), foreign(2), own(1)]),
-            false,
-            vec![3],
+            Some(own(1)),
+        ),
+        (
+            "two entries in the investigation account",
+            entries(&[foreign(1), own(2), own(3)]),
+            Some(own(2)),
         ),
     ];
 
-    for (index, (case, list, accepted, positions)) in cases.iter().enumerate() {
+    for (index, (case, list, refused)) in cases.iter().enumerate() {
         // A create carrying the list.
         let region = REGIONS[index % REGIONS.len()];
         let body = json!({
@@ -954,7 +982,29 @@ async fn a_cross_account_source_role_must_name_another_account() {
             "crossAccountConfigurations": list,
         });
         let (status, answer) = create_in(&router, region, &body).await;
-        if *accepted {
+        if let Some(offending) = refused {
+            assert_eq!(
+                status, 400,
+                "case {case:?} on create: expected 400, got {status} / {answer:?}"
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {case:?} on create: expected ValidationException, got {answer:?}"
+            );
+            let expected = source_role_sentence(offending);
+            assert_eq!(
+                message(&answer),
+                expected,
+                "case {case:?} on create: expected {expected:?}, got {:?}",
+                message(&answer)
+            );
+            let left = listed(&router, region).await;
+            assert!(
+                left.is_empty(),
+                "case {case:?} on create: a refused create stores nothing, got {left:?}"
+            );
+        } else {
             assert_eq!(
                 status, 201,
                 "case {case:?} on create: expected 201, got {status} / {answer:?}"
@@ -967,7 +1017,9 @@ async fn a_cross_account_source_role_must_name_another_account() {
             let group = get_ok(&router, region, &arn, case).await;
             let want = list.as_array().filter(|list| !list.is_empty());
             assert_eq!(
-                group.get("crossAccountConfigurations").and_then(Value::as_array),
+                group
+                    .get("crossAccountConfigurations")
+                    .and_then(Value::as_array),
                 want,
                 "case {case:?} on create: expected the list stored as given, got {group:?}"
             );
@@ -980,29 +1032,6 @@ async fn a_cross_account_source_role_must_name_another_account() {
                 None,
             )
             .await;
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?} on create: expected 400, got {status} / {answer:?}"
-            );
-            assert_eq!(
-                error_code(&answer),
-                "ValidationException",
-                "case {case:?} on create: expected ValidationException, got {answer:?}"
-            );
-            for position in positions {
-                let member =
-                    format!("crossAccountConfigurations.{position}.member.sourceRoleArn");
-                assert!(
-                    message(&answer).contains(&member),
-                    "case {case:?} on create: the refusal must name {member}, got {answer:?}"
-                );
-            }
-            let left = listed(&router, region).await;
-            assert!(
-                left.is_empty(),
-                "case {case:?} on create: a refused create stores nothing, got {left:?}"
-            );
         }
     }
 
@@ -1021,7 +1050,7 @@ async fn a_cross_account_source_role_must_name_another_account() {
     .await;
     let stored = entries(&[foreign(9)]);
 
-    for (case, list, accepted, positions) in &cases {
+    for (case, list, refused) in &cases {
         let (status, answer) = update_in(
             &router,
             region,
@@ -1029,7 +1058,31 @@ async fn a_cross_account_source_role_must_name_another_account() {
             &json!({ "crossAccountConfigurations": list }),
         )
         .await;
-        if *accepted {
+        if let Some(offending) = refused {
+            assert_eq!(
+                status, 400,
+                "case {case:?} on update: expected 400, got {status} / {answer:?}"
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {case:?} on update: expected ValidationException, got {answer:?}"
+            );
+            let expected = source_role_sentence(offending);
+            assert_eq!(
+                message(&answer),
+                expected,
+                "case {case:?} on update: expected {expected:?}, got {:?}",
+                message(&answer)
+            );
+            let group = get_ok(&router, region, &arn, case).await;
+            assert_eq!(
+                group.get("crossAccountConfigurations"),
+                Some(&stored),
+                "case {case:?} on update: a refused update must leave the stored list, \
+                 got {group:?}"
+            );
+        } else {
             assert_eq!(
                 status, 200,
                 "case {case:?} on update: expected 200, got {status} / {answer:?}"
@@ -1042,31 +1095,6 @@ async fn a_cross_account_source_role_must_name_another_account() {
                 &json!({ "crossAccountConfigurations": stored }),
             )
             .await;
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?} on update: expected 400, got {status} / {answer:?}"
-            );
-            assert_eq!(
-                error_code(&answer),
-                "ValidationException",
-                "case {case:?} on update: expected ValidationException, got {answer:?}"
-            );
-            for position in positions {
-                let member =
-                    format!("crossAccountConfigurations.{position}.member.sourceRoleArn");
-                assert!(
-                    message(&answer).contains(&member),
-                    "case {case:?} on update: the refusal must name {member}, got {answer:?}"
-                );
-            }
-            let group = get_ok(&router, region, &arn, case).await;
-            assert_eq!(
-                group.get("crossAccountConfigurations"),
-                Some(&stored),
-                "case {case:?} on update: a refused update must leave the stored list, \
-                 got {group:?}"
-            );
         }
     }
 }

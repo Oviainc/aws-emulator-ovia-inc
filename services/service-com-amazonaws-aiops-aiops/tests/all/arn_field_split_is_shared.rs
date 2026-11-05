@@ -43,6 +43,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// by `tests/all/cross_account_configuration_names_an_account.rs`.
 const FOREIGN_ACCOUNT: &str = "111122223333";
 
+/// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`): the account an
+/// investigation group belongs to, which the cross-account refusal names.
+const ACCOUNT: &str = "000000000000";
+
 /// A role ARN for the group itself, satisfying the modelled `RoleArn`
 /// (`@length 20..2048`, `^arn:.*$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
@@ -60,8 +64,57 @@ const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// `state::TAGGING_RESOURCE_NOT_FOUND`.
 const TAGGING_NOT_FOUND: &str = "NotFoundException";
 
-/// The member a refused cross-account entry has to be named by.
+/// The member a refused cross-account entry is sent on.
 const SOURCE_ROLE_MEMBER: &str = "sourceRoleArn";
+
+/// The shortest `sourceRoleArn` the model admits, from the member's own `@length`
+/// (`smithy_query(query="shape",shape="CrossAccountConfiguration")`: it targets
+/// `RoleArn`, `@length` 20..2048). A shorter value is refused by the constraint walk at
+/// the request boundary, before the handlers' own cross-account rule sees it.
+const MIN_SOURCE_ROLE_ARN_LENGTH: usize = 20;
+
+/// The `@pattern` the model declares for the member, as this service reports it
+/// (unanchored): `smithy_query(query="shape",shape="RoleArn")` declares `^arn:.*$`.
+const SOURCE_ROLE_ARN_PATTERN: &str = "arn:.*";
+
+/// The sentence a source role that names no account other than the investigation
+/// account is refused with: fixed text around the investigation account and the ARN the
+/// request sent.
+fn source_role_sentence(source_role_arn: &str) -> String {
+    format!(
+        "Source role ARN cannot belong to the investigation account {ACCOUNT}. \
+         Found ARN: {source_role_arn}"
+    )
+}
+
+/// The whole message the write refusing `source_role_arn` must answer: the boundary
+/// walk's clauses when the value breaks the member's own modelled constraints, and the
+/// service's own sentence for every other value the cross-account rule refuses.
+fn expected_refusal(source_role_arn: &str) -> String {
+    let path = format!("crossAccountConfigurations.1.member.{SOURCE_ROLE_MEMBER}");
+    let mut clauses: Vec<String> = Vec::new();
+    if source_role_arn.len() < MIN_SOURCE_ROLE_ARN_LENGTH {
+        clauses.push(format!(
+            "Value at '{path}' failed to satisfy constraint: Member must have length \
+             greater than or equal to {MIN_SOURCE_ROLE_ARN_LENGTH}"
+        ));
+    }
+    if !source_role_arn.starts_with("arn:") {
+        clauses.push(format!(
+            "Value at '{path}' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: {SOURCE_ROLE_ARN_PATTERN}"
+        ));
+    }
+    match clauses.as_slice() {
+        [] => source_role_sentence(source_role_arn),
+        [clause] => format!("1 validation error detected: {clause}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
 
 /// The tag the target group is created with, so a tag read that resolved the group is
 /// distinguishable from one that answered an empty map.
@@ -520,10 +573,11 @@ async fn both_arn_readers_take_their_field_from_one_split() {
                     "case {case:?}: expected {operation} to report {VALIDATION}, got \
                      {body:?}"
                 );
-                assert!(
-                    message(body).contains(SOURCE_ROLE_MEMBER),
-                    "case {case:?}: expected {operation} to name {SOURCE_ROLE_MEMBER}, \
-                     got {:?}",
+                let expected = expected_refusal(&role);
+                assert_eq!(
+                    message(body),
+                    expected,
+                    "case {case:?}: expected {operation} to answer {expected:?}, got {:?}",
                     message(body)
                 );
             }

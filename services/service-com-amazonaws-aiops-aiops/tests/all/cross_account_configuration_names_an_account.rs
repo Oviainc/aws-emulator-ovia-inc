@@ -10,8 +10,12 @@
 //! The rule under test: an entry of `crossAccountConfigurations` is acceptable only
 //! when its `sourceRoleArn` is present and is a complete ARN whose account id field
 //! names an account other than the one the investigation group belongs to; anything
-//! else is refused with the modelled `ValidationException` (400) naming the offending
-//! ENTRY's own position, and is never stored. The model admits both ways an entry can
+//! else is refused with the modelled `ValidationException` (400) and is never stored.
+//! A source role that names no other account is refused with the service's own sentence
+//! for that error class, which names the investigation account and echoes the ARN the
+//! request sent, and names the first such entry; an entry carrying no source role at all
+//! is the condition the clause grammar states, one clause per offending position inside
+//! the envelope that counts them. The model admits both ways an entry can
 //! name no account at all — `sourceRoleArn` is not `@required`
 //! (`smithy_query(query="shape",shape="CrossAccountConfiguration")`), and its
 //! constraints (`@length 20..2048`, `^arn:.*$`) admit text with fewer fields than an
@@ -25,7 +29,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_aiops_aiops::state::{
-    absent_member_clause, constraint_clause, requirement_text, validation_envelope,
+    absent_member_clause, requirement_text, validation_envelope,
 };
 use smithy_server_runtime::{MultiServiceRouter, ViolationKind};
 
@@ -236,55 +240,68 @@ async fn listed(router: &MultiServiceRouter, region: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Why one entry of the list is refused.
-#[derive(Debug, Clone, Copy)]
-enum Why {
-    /// The entry carried no `sourceRoleArn`, so there was no value to judge.
-    NoValue,
-    /// The entry carried one, but it names no account other than this one.
-    NoOtherAccount,
+/// What a refused list must be refused with.
+#[derive(Debug, Clone)]
+enum Refusal {
+    /// Every entry that carried no `sourceRoleArn`, by 1-based position: the clause
+    /// grammar states one clause per position, and the envelope counts them.
+    AbsentMembers(Vec<usize>),
+    /// The FIRST entry whose source role names no account other than this one, by the
+    /// ARN the refusal echoes: the service's sentence names one source role.
+    NoOtherAccount(String),
 }
 
-/// One expected refusal: the 1-based position of the entry, and why.
-type Refusal = (usize, Why);
-
-/// A row: the `crossAccountConfigurations` list as sent, and the refusals it must draw
-/// — empty when both writes must accept and STORE it.
+/// A row: the `crossAccountConfigurations` list as sent, and the refusal it must draw
+/// — `None` when both writes must accept and STORE it.
 struct Row {
     case: &'static str,
     entries: Value,
-    refused: Vec<Refusal>,
+    refused: Option<Refusal>,
 }
 
-/// The clause the refusal of the entry at `position` must carry, as the service's own
-/// builders word it. `NoValue` is matched in full: its requirement is the framework's
+/// The whole message a refused list must carry.
+///
+/// `AbsentMembers` is the clause grammar, matched in full: the envelope over one
+/// absent-member clause per offending position, whose requirement is the framework's
 /// own absent-member wording, so the test states none of it itself. `NoOtherAccount` is
-/// matched on the clause SUBJECT, so the row pins which entry is refused without
-/// restating the requirement sentence.
-fn expected_clause((position, why): Refusal) -> String {
-    let path = format!("crossAccountConfigurations.{position}.member.sourceRoleArn");
-    match why {
-        Why::NoValue => absent_member_clause(
-            &path,
-            &requirement_text(ViolationKind::MissingRequiredMember),
+/// the service's own sentence for that error class: fixed text around the investigation
+/// account and the ARN the request sent.
+fn expected_message(refused: &Refusal) -> String {
+    match refused {
+        Refusal::AbsentMembers(positions) => {
+            let clauses: Vec<String> = positions
+                .iter()
+                .map(|position| {
+                    let path =
+                        format!("crossAccountConfigurations.{position}.member.sourceRoleArn");
+                    absent_member_clause(
+                        &path,
+                        &requirement_text(ViolationKind::MissingRequiredMember),
+                    )
+                })
+                .collect();
+            validation_envelope(&clauses)
+        }
+        Refusal::NoOtherAccount(arn) => format!(
+            "Source role ARN cannot belong to the investigation account {ACCOUNT}. \
+             Found ARN: {arn}"
         ),
-        Why::NoOtherAccount => constraint_clause(&path, ""),
     }
-}
-
-/// How the envelope over `clauses` many clauses opens — the service's own count
-/// wording, read off the builder every refusal is worded through.
-fn envelope_prefix(clauses: usize) -> String {
-    let rendered = validation_envelope(&vec![String::new(); clauses]);
-    let (prefix, _) = rendered
-        .split_once(':')
-        .expect("the envelope states a count, then its clauses");
-    format!("{prefix}:")
 }
 
 /// One entry naming `arn` as its source role.
 fn entry(arn: &str) -> Value {
     json!({ "sourceRoleArn": arn })
+}
+
+/// A refusal echoing the source role `arn` that names no other account.
+fn no_other_account(arn: &str) -> Option<Refusal> {
+    Some(Refusal::NoOtherAccount(arn.to_string()))
+}
+
+/// A refusal of every entry at the 1-based `positions` that carried no source role.
+fn absent_members(positions: &[usize]) -> Option<Refusal> {
+    Some(Refusal::AbsentMembers(positions.to_vec()))
 }
 
 /// The table. The rule generalises over the FORM a source role arrives in, so the rows
@@ -294,26 +311,33 @@ fn entry(arn: &str) -> Value {
 /// resource shape of a well-formed ARN; the number of entries; and the position of the
 /// offending entries inside the list.
 fn rows() -> Vec<Row> {
+    let good = format!("arn:aws:iam::{FOREIGN_ACCOUNT}:role/Good");
+    let own = format!("arn:aws:iam::{ACCOUNT}:role/Own");
+    let own_at_a_path = format!("arn:aws:iam::{ACCOUNT}:role/team/ops/Own");
+    let no_account_field = "arn:aws:iam::role/CrossAccountInvestigation";
+    let empty_account_field = "arn:aws:iam:::role/CrossAccountInvestigation";
+    let stops_at_the_account = format!("arn:aws:iam::{FOREIGN_ACCOUNT}");
+    let partition_and_service = "arn:aws:identitymanagement";
     vec![
         // --- accepted: a complete ARN naming another account, in several forms ---
         Row {
             case: "an empty list names no configuration at all",
             entries: json!([]),
-            refused: vec![],
+            refused: None,
         },
         Row {
             case: "one foreign-account role",
             entries: json!([entry(&format!(
                 "arn:aws:iam::{FOREIGN_ACCOUNT}:role/AIOpsCrossAccountRole"
             ))]),
-            refused: vec![],
+            refused: None,
         },
         Row {
             case: "a foreign-account role in another partition",
             entries: json!([entry(&format!(
                 "arn:aws-us-gov:iam::{FOREIGN_ACCOUNT}:role/AIOpsCrossAccountRole"
             ))]),
-            refused: vec![],
+            refused: None,
         },
         Row {
             case: "a foreign-account role at a path, and one whose resource holds colons",
@@ -323,81 +347,85 @@ fn rows() -> Vec<Row> {
                     "arn:aws:iam::{FOREIGN_ACCOUNT}:role:scoped:AIOpsCrossAccountRole"
                 )),
             ]),
-            refused: vec![],
+            refused: None,
         },
         Row {
             case: "an account that merely looks like the investigation account",
             entries: json!([entry(&format!("arn:aws:iam::{ACCOUNT}1:role/Lookalike"))]),
-            refused: vec![],
+            refused: None,
         },
         // --- refused: the entry names THIS account ---
         Row {
             case: "the investigation account itself",
-            entries: json!([entry(&format!("arn:aws:iam::{ACCOUNT}:role/Own"))]),
-            refused: vec![(1, Why::NoOtherAccount)],
+            entries: json!([entry(&own)]),
+            refused: no_other_account(&own),
         },
         Row {
             case: "the investigation account behind a resource path",
-            entries: json!([entry(&format!("arn:aws:iam::{ACCOUNT}:role/team/ops/Own"))]),
-            refused: vec![(1, Why::NoOtherAccount)],
+            entries: json!([entry(&own_at_a_path)]),
+            refused: no_other_account(&own_at_a_path),
         },
         // --- refused: the entry names NO account ---
         Row {
             case: "an ARN with no account field",
-            entries: json!([entry("arn:aws:iam::role/CrossAccountInvestigation")]),
-            refused: vec![(1, Why::NoOtherAccount)],
+            entries: json!([entry(no_account_field)]),
+            refused: no_other_account(no_account_field),
         },
         Row {
             case: "an ARN whose account field is empty",
-            entries: json!([entry("arn:aws:iam:::role/CrossAccountInvestigation")]),
-            refused: vec![(1, Why::NoOtherAccount)],
+            entries: json!([entry(empty_account_field)]),
+            refused: no_other_account(empty_account_field),
         },
         Row {
             case: "an ARN that stops at the account field, with no resource",
-            entries: json!([entry(&format!("arn:aws:iam::{FOREIGN_ACCOUNT}"))]),
-            refused: vec![(1, Why::NoOtherAccount)],
+            entries: json!([entry(&stops_at_the_account)]),
+            refused: no_other_account(&stops_at_the_account),
         },
         Row {
             case: "a value with nothing but a partition and a service",
-            entries: json!([entry("arn:aws:identitymanagement")]),
-            refused: vec![(1, Why::NoOtherAccount)],
+            entries: json!([entry(partition_and_service)]),
+            refused: no_other_account(partition_and_service),
         },
         // --- refused: the entry carries no source role at all ---
         Row {
             case: "an entry carrying no member whatsoever",
             entries: json!([{}]),
-            refused: vec![(1, Why::NoValue)],
+            refused: absent_members(&[1]),
         },
         // (An entry whose `sourceRoleArn` is an explicit JSON `null` never reaches this
         // rule: the restJson1 deserializer refuses a null where a string is modelled,
         // before any handler runs.)
-        // --- positions and counts: every offending entry reports, in list order ---
+        // --- positions and counts: every absent member reports, in list order, and the
+        // sentence that names ONE source role reports the first offending entry ---
         Row {
             case: "an empty entry after a good one",
-            entries: json!([
-                entry(&format!("arn:aws:iam::{FOREIGN_ACCOUNT}:role/Good")),
-                json!({}),
-            ]),
-            refused: vec![(2, Why::NoValue)],
+            entries: json!([entry(&good), json!({})]),
+            refused: absent_members(&[2]),
         },
         Row {
             case: "every way of naming no other account, in one list",
             entries: json!([
-                entry(&format!("arn:aws:iam::{FOREIGN_ACCOUNT}:role/Good")),
+                entry(&good),
                 json!({}),
-                entry("arn:aws:iam::role/CrossAccountInvestigation"),
-                entry(&format!("arn:aws:iam::{ACCOUNT}:role/Own")),
+                entry(no_account_field),
+                entry(&own),
             ]),
-            refused: vec![
-                (2, Why::NoValue),
-                (3, Why::NoOtherAccount),
-                (4, Why::NoOtherAccount),
-            ],
+            refused: absent_members(&[2]),
+        },
+        Row {
+            case: "a good entry, then two that name no other account",
+            entries: json!([entry(&good), entry(&own), entry(no_account_field)]),
+            refused: no_other_account(&own),
         },
         Row {
             case: "a list of nothing but empty entries",
             entries: json!([{}, {}, {}]),
-            refused: vec![(1, Why::NoValue), (2, Why::NoValue), (3, Why::NoValue)],
+            refused: absent_members(&[1, 2, 3]),
+        },
+        Row {
+            case: "empty entries around a good one",
+            entries: json!([json!({}), entry(&good), json!({})]),
+            refused: absent_members(&[1, 3]),
         },
     ]
 }
@@ -412,7 +440,7 @@ const CONFIGURATION_MEMBERS: &[&str] = &[
 ];
 
 /// Assert the answer to one refused write.
-fn assert_refused(operation: &str, case: &str, status: u16, body: &Value, refused: &[Refusal]) {
+fn assert_refused(operation: &str, case: &str, status: u16, body: &Value, refused: &Refusal) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected {operation} to refuse with 400, got {status} / {body:?}"
@@ -423,20 +451,11 @@ fn assert_refused(operation: &str, case: &str, status: u16, body: &Value, refuse
         "case {case:?}: expected {operation} to report {VALIDATION}, got {body:?}"
     );
     let reported = message(body);
-    let prefix = envelope_prefix(refused.len());
-    assert!(
-        reported.starts_with(&prefix),
-        "case {case:?}: expected {operation} to count {} violation(s) as {prefix:?}, \
-         got {reported:?}",
-        refused.len()
+    let expected = expected_message(refused);
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected {operation} to answer {expected:?}, got {reported:?}"
     );
-    for refusal in refused {
-        let clause = expected_clause(*refusal);
-        assert!(
-            reported.contains(&clause),
-            "case {case:?}: expected {operation} to state {clause:?}, got {reported:?}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -476,7 +495,7 @@ async fn a_stored_cross_account_configuration_names_another_account() {
         let patch = json!({ "crossAccountConfigurations": row.entries });
         let (update_status, updated) = update(&router, &update_region, &target, &patch).await;
 
-        if row.refused.is_empty() {
+        if row.refused.is_none() {
             assert_eq!(
                 create_status, 201,
                 "case {case:?}: expected the create to be accepted, \
@@ -534,20 +553,20 @@ async fn a_stored_cross_account_configuration_names_another_account() {
                 status, 200,
                 "case {case:?}: restoring the control must be accepted, got {answer:?}"
             );
-        } else {
+        } else if let Some(refused) = &row.refused {
             assert_refused(
                 "CreateInvestigationGroup",
                 case,
                 create_status,
                 &created,
-                &row.refused,
+                refused,
             );
             assert_refused(
                 "UpdateInvestigationGroup",
                 case,
                 update_status,
                 &updated,
-                &row.refused,
+                refused,
             );
 
             // The two writes refuse it IDENTICALLY, which is what one shared rule buys.

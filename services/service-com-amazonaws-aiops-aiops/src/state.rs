@@ -387,12 +387,22 @@ impl ComAmazonawsAiopsAiopsState {
 // `ResourceNotFoundException` message an absent resource is reported with
 // ([`investigation_group_not_found`], [`investigation_group_policy_not_found`]).
 //
-// Neither carries anything the request sent. A `ValidationException` names the
-// member and the requirement it violated and withholds the value that violated it;
-// a `ResourceNotFoundException` names the RESOURCE TYPE that is absent and withholds
+// A refusal the REQUEST BOUNDARY raises carries nothing the request sent: a
+// `ValidationException` for a modelled constraint names the member and the
+// requirement it violated and withholds the value that violated it, and a
+// `ResourceNotFoundException` names the RESOURCE TYPE that is absent and withholds
 // the identifier that named it. Recorded 4xx responses from this service are built
 // that way across every operation, and both messages are the whole machine-readable
 // detail a client gets, so a caller's own bytes must not be copied into them.
+//
+// A refusal the SERVICE ITSELF raises — a rule no modelled constraint expresses — is
+// worded as the service words that error class, which is NOT always the clause
+// grammar above and is not always value-free: what each sentence states, fixed text
+// and variable parts alike, is recorded per error class on the helper that owns it
+// ([`ROLE_NOT_ASSUMABLE`], [`INVALID_POLICY_DOCUMENT`],
+// [`source_role_arn_in_investigation_account`], [`region_quota_exceeded`]). Where
+// that sentence draws a value from the request, it is the value the request sent,
+// spelled as it sent it.
 //
 // The TAGGING operations are served by the tagging frontend and have their own two
 // wordings, single-homed below for the same reason: [`tag_capacity_rejection`] (400
@@ -1241,47 +1251,79 @@ pub fn stored_encryption_configuration(
 /// that stores the list applies this rule, each rendering the refusal as its own
 /// modelled `ValidationException`.
 ///
-/// Worded through [`constraint_clause`] — or [`absent_member_clause`], for an entry that
-/// carried no value at that path at all — inside [`validation_envelope`], the builders a
-/// boundary refusal is worded through: the member path and the requirement, with the
-/// offending ARN withheld. The path keeps the refused ENTRY's position
-/// ([`list_element_member_path`]), which is a fact about the request's shape rather than
-/// anything it sent, so a caller that sent many configurations is told WHICH one was
-/// refused exactly as a modelled constraint on the same member would tell it. A request
-/// whose entries break the rule more than once states one clause per entry, in list
-/// order, and the envelope counts them — again as the boundary walk does. The account
-/// named is the service's own, not anything the request carried.
+/// The two conditions are worded differently, because the service words them
+/// differently, and the ABSENT-member one is applied first — it is the condition the
+/// boundary walk itself would have refused the request with, had the model marked the
+/// member required, exactly as a modelled constraint is judged before an unmodelled
+/// rule everywhere else in this service:
+///
+/// * an entry carrying no source role AT ALL is a member missing from the request, which
+///   the clause grammar states: [`absent_member_clause`] inside [`validation_envelope`],
+///   at the entry's own position ([`list_element_member_path`]), with the framework's own
+///   absent-member requirement. Each such entry is a separate fact about the request's
+///   shape, so a list missing the member in several places states one clause per
+///   position, in list order, and the envelope counts them — again as the walk does;
+/// * an entry carrying a source role that names no OTHER account is refused with the
+///   service's own sentence for that error class
+///   ([`source_role_arn_in_investigation_account`]), which names the investigation
+///   account and ECHOES the ARN the request sent — a caller sending up to 25 entries
+///   identifies the refused one by that ARN, and the sentence states no member path and
+///   no clause grammar. That sentence names ONE source role, so the FIRST entry the rule
+///   refuses, in list order, is the one reported, and both operations that store the list
+///   report that same entry.
 pub fn cross_account_configurations_rejection(
     configurations: Option<&[CrossAccountConfiguration]>,
 ) -> Option<String> {
-    let own_account = ::engine::EMULATOR_ACCOUNT_ID;
-    let requirement =
-        format!("Member must name an account other than the investigation account {own_account}");
-    let clauses: Vec<String> = configurations?
+    let configurations = configurations?;
+    // Nothing at that path to judge: the entry names no account because it carries no
+    // source role.
+    let absent: Vec<String> = configurations
         .iter()
         .enumerate()
-        .filter_map(|(index, configuration)| {
-            let member_path = list_element_member_path(
-                CROSS_ACCOUNT_CONFIGURATIONS_MEMBER,
-                index,
-                SOURCE_ROLE_ARN_MEMBER,
-            );
-            match configuration.source_role_arn.as_deref() {
-                // Nothing at that path to judge: the entry names no account because it
-                // carries no source role.
-                None => Some(absent_member_clause(
-                    &member_path,
-                    &requirement_text(ViolationKind::MissingRequiredMember),
-                )),
-                // A source role names another account only when an account id can be
-                // read from it at all, and that id is not this account's.
-                Some(arn) => arn_account_id(arn)
-                    .is_none_or(|account| account == own_account)
-                    .then(|| constraint_clause(&member_path, &requirement)),
-            }
+        .filter(|(_, configuration)| configuration.source_role_arn.is_none())
+        .map(|(index, _)| {
+            absent_member_clause(
+                &list_element_member_path(
+                    CROSS_ACCOUNT_CONFIGURATIONS_MEMBER,
+                    index,
+                    SOURCE_ROLE_ARN_MEMBER,
+                ),
+                &requirement_text(ViolationKind::MissingRequiredMember),
+            )
         })
         .collect();
-    (!clauses.is_empty()).then(|| validation_envelope(&clauses))
+    if !absent.is_empty() {
+        return Some(validation_envelope(&absent));
+    }
+    // A source role names another account only when an account id can be read from it
+    // at all, and that id is not this account's.
+    let own_account = ::engine::EMULATOR_ACCOUNT_ID;
+    configurations
+        .iter()
+        .filter_map(|configuration| configuration.source_role_arn.as_deref())
+        .find(|arn| arn_account_id(arn).is_none_or(|account| account == own_account))
+        .map(|arn| source_role_arn_in_investigation_account(own_account, arn))
+}
+
+/// The sentence a write naming a cross-account source role that does not name an
+/// account other than the investigation account is refused with.
+///
+/// Recorded behavior: the refusal is the operation's modelled `ValidationException`
+/// (400) with `Source role ARN cannot belong to the investigation account <account>.
+/// Found ARN: <sourceRoleArn>`. The fixed text is the whole sentence around the two
+/// variable parts; `investigation_account` is the account the investigation group
+/// belongs to, read from this emulator's own state (every group's ARN carries it), and
+/// `source_role_arn` is the value the request sent, spelled exactly as it sent it. One
+/// function for every operation that stores the member — the create and the update — so
+/// the two cannot word this refusal differently.
+pub fn source_role_arn_in_investigation_account(
+    investigation_account: &str,
+    source_role_arn: &str,
+) -> String {
+    format!(
+        "Source role ARN cannot belong to the investigation account \
+         {investigation_account}. Found ARN: {source_role_arn}"
+    )
 }
 
 /// The list member a cross-account configuration arrives on, as a clause spells it.
@@ -1401,15 +1443,30 @@ pub async fn role_arn_rejection(
 ///
 /// A document that fails this is not stored at all, so a later
 /// `GetInvestigationGroupPolicy` cannot hand back something unparseable.
+///
+/// The refusal is the service's own sentence for that error class
+/// ([`INVALID_POLICY_DOCUMENT`]), not a clause about the member: the model expresses no
+/// JSON requirement, so nothing the boundary walk applies was violated.
 pub fn policy_document_rejection(policy: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(policy).ok();
-    parsed.filter(serde_json::Value::is_object).is_none().then(|| {
-        validation_message(
-            "policy",
-            "Member must be a resource policy document in JSON format",
-        )
-    })
+    parsed
+        .filter(serde_json::Value::is_object)
+        .is_none()
+        .then(|| INVALID_POLICY_DOCUMENT.to_string())
 }
+
+/// The sentence a `PutInvestigationGroupPolicy` carrying something that is not a policy
+/// document is refused with.
+///
+/// Recorded behavior: the refusal is the operation's modelled `ValidationException`
+/// (400) with this text. It is entirely FIXED — it draws nothing from the request: no
+/// member path, no excerpt of the document, no count — so the sentence is the whole
+/// requirement for the error class.
+///
+/// It is NOT worded through [`validation_message`]: that envelope states which MEMBER
+/// violated which modelled CONSTRAINT, and the document satisfies every constraint the
+/// model declares for it ([`policy_document_rejection`] states which).
+pub const INVALID_POLICY_DOCUMENT: &str = "The specified resource policy document is invalid.";
 
 /// The literal first field every ARN opens with.
 const ARN_FIRST_FIELD: &str = "arn";
@@ -1471,13 +1528,19 @@ fn quota_exceeded(message: String) -> ServiceQuotaExceededException {
 /// for already holds this account's one investigation group.
 ///
 /// The quota is published on the operation itself: "Currently, you can have one
-/// investigation group in each Region in your account."
+/// investigation group in each Region in your account." The MESSAGE, though, states
+/// none of that: recorded behavior is the fixed sentence
+/// [`CANNOT_CREATE_ANOTHER_GROUP`], which names no count, no Region and nothing the
+/// request carried — so the cap this emulator enforces
+/// ([`MAX_INVESTIGATION_GROUPS_PER_REGION`]) stays out of it and the wording cannot
+/// become a function of emulator configuration.
 pub fn region_quota_exceeded() -> ServiceQuotaExceededException {
-    quota_exceeded(format!(
-        "An account can have only {MAX_INVESTIGATION_GROUPS_PER_REGION} investigation group \
-         in each Region."
-    ))
+    quota_exceeded(CANNOT_CREATE_ANOTHER_GROUP.to_string())
 }
+
+/// The sentence a create refused by the per-account/Region investigation-group quota
+/// carries, as the service words that error class: entirely fixed text.
+pub const CANNOT_CREATE_ANOTHER_GROUP: &str = "Cannot create another investigation group.";
 
 /// The 402 a create is refused with when the store has reached its cross-region
 /// resource guard, [`MAX_INVESTIGATION_GROUPS`].

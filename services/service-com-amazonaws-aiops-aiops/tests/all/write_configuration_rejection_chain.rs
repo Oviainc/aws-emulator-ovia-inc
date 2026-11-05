@@ -264,15 +264,50 @@ fn chatbot_notification_channel(entries: usize) -> Value {
 
 /// One cross-account configuration naming `account`.
 fn cross_account_configurations(account: &str) -> Value {
-    json!([{ "sourceRoleArn": format!("arn:aws:iam::{account}:role/AIOpsCrossAccountRole") }])
+    json!([{ "sourceRoleArn": source_role_arn(account) }])
 }
 
-/// A row: a configuration both writes accept, and the member path the refusal must
-/// name — `None` when the whole chain accepts it.
+/// The refusal a row must draw, as the service words that rule.
+enum Refusal {
+    /// A rule the clause grammar states: the member path the clause names.
+    Clause(&'static str),
+    /// A rule the service words as its own sentence: the whole message.
+    Sentence(String),
+}
+
+impl Refusal {
+    /// How the message must OPEN — the whole message for a service sentence, and the
+    /// envelope plus the clause subject for a clause, whose requirement half each rule
+    /// states for itself.
+    fn prefix(&self) -> String {
+        match self {
+            Refusal::Clause(member) => validation_envelope(&[constraint_clause(member, "")]),
+            Refusal::Sentence(message) => message.clone(),
+        }
+    }
+}
+
+/// The sentence a source role that does not name another account is refused with: the
+/// service's own wording for that error class, which names the investigation account and
+/// echoes the ARN the request sent.
+fn source_role_sentence(source_role_arn: &str) -> String {
+    format!(
+        "Source role ARN cannot belong to the investigation account {ACCOUNT}. \
+         Found ARN: {source_role_arn}"
+    )
+}
+
+/// The `sourceRoleArn` [`cross_account_configurations`] builds for `account`.
+fn source_role_arn(account: &str) -> String {
+    format!("arn:aws:iam::{account}:role/AIOpsCrossAccountRole")
+}
+
+/// A row: a configuration both writes accept, and the refusal it must draw — `None`
+/// when the whole chain accepts it.
 struct Row {
     case: &'static str,
     configuration: Value,
-    refused_member: Option<&'static str>,
+    refused: Option<Refusal>,
 }
 
 /// The table. The rule is "one chain, one order, both writes", so the rows differ
@@ -286,21 +321,23 @@ fn rows() -> Vec<Row> {
         Row {
             case: "an encryption type outside the modelled value set",
             configuration: json!({ "encryptionConfiguration": { "type": UNMODELLED_KEY_TYPE } }),
-            refused_member: Some("encryptionConfiguration.type"),
+            refused: Some(Refusal::Clause("encryptionConfiguration.type")),
         },
         Row {
             case: "a source role naming the investigation account itself",
             configuration: json!({
                 "crossAccountConfigurations": cross_account_configurations(ACCOUNT),
             }),
-            refused_member: Some("crossAccountConfigurations.1.member.sourceRoleArn"),
+            refused: Some(Refusal::Sentence(source_role_sentence(&source_role_arn(
+                ACCOUNT,
+            )))),
         },
         Row {
             case: "tagKeyBoundaries one entry past the bound",
             configuration: json!({
                 "tagKeyBoundaries": tag_key_boundaries(MAX_COLLECTION_ENTRIES + 1),
             }),
-            refused_member: Some("tagKeyBoundaries"),
+            refused: Some(Refusal::Clause("tagKeyBoundaries")),
         },
         Row {
             case: "chatbotNotificationChannel far past the bound",
@@ -308,7 +345,7 @@ fn rows() -> Vec<Row> {
                 "chatbotNotificationChannel":
                     chatbot_notification_channel(MAX_COLLECTION_ENTRIES * 3),
             }),
-            refused_member: Some("chatbotNotificationChannel"),
+            refused: Some(Refusal::Clause("chatbotNotificationChannel")),
         },
         // Every rule of the chain violated at once: the FIRST one reports.
         Row {
@@ -320,7 +357,7 @@ fn rows() -> Vec<Row> {
                 "chatbotNotificationChannel":
                     chatbot_notification_channel(MAX_COLLECTION_ENTRIES + 1),
             }),
-            refused_member: Some("encryptionConfiguration.type"),
+            refused: Some(Refusal::Clause("encryptionConfiguration.type")),
         },
         // The encryption rule accepts, so the next one in the chain reports.
         Row {
@@ -330,7 +367,9 @@ fn rows() -> Vec<Row> {
                 "crossAccountConfigurations": cross_account_configurations(ACCOUNT),
                 "tagKeyBoundaries": tag_key_boundaries(MAX_COLLECTION_ENTRIES + 2),
             }),
-            refused_member: Some("crossAccountConfigurations.1.member.sourceRoleArn"),
+            refused: Some(Refusal::Sentence(source_role_sentence(&source_role_arn(
+                ACCOUNT,
+            )))),
         },
         // Both collections oversized: the one the bounds rule judges first reports.
         Row {
@@ -340,7 +379,7 @@ fn rows() -> Vec<Row> {
                 "chatbotNotificationChannel":
                     chatbot_notification_channel(MAX_COLLECTION_ENTRIES + 1),
             }),
-            refused_member: Some("tagKeyBoundaries"),
+            refused: Some(Refusal::Clause("tagKeyBoundaries")),
         },
         // Nothing violated, with both collections AT the bound: accepted by both
         // writes, and stored.
@@ -353,7 +392,7 @@ fn rows() -> Vec<Row> {
                 "chatbotNotificationChannel":
                     chatbot_notification_channel(MAX_COLLECTION_ENTRIES),
             }),
-            refused_member: None,
+            refused: None,
         },
     ]
 }
@@ -398,11 +437,11 @@ async fn both_writes_apply_one_configuration_rejection_chain() {
         let (update_status, updated) =
             update(&router, &update_region, &arn, &row.configuration).await;
 
-        match row.refused_member {
-            Some(member) => {
-                // The envelope and the clause subject are the service's own wording,
-                // read off the builders it words every refusal through.
-                let expected_prefix = validation_envelope(&[constraint_clause(member, "")]);
+        match &row.refused {
+            Some(refusal) => {
+                // A clause's envelope and subject are read off the builders the service
+                // words a clause through; a service sentence is stated in full.
+                let expected_prefix = refusal.prefix();
 
                 for (operation, status, body) in [
                     ("CreateInvestigationGroup", create_status, &created),
@@ -421,7 +460,7 @@ async fn both_writes_apply_one_configuration_rejection_chain() {
                     );
                     assert!(
                         message(body).starts_with(&expected_prefix),
-                        "case {case:?}: expected {operation} to name {member} as \
+                        "case {case:?}: expected {operation} to open its refusal with \
                          {expected_prefix:?}, got {:?}",
                         message(body)
                     );

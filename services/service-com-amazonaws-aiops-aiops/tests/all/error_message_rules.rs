@@ -9,18 +9,19 @@
 //!
 //! Two rules are under test, each over a SET of inputs rather than one recorded case:
 //!
-//! 1. A `ValidationException` message names the member and the requirement it
-//!    violated, in the AWS envelope (`N validation error(s) detected: …`), and carries
-//!    NOTHING of the value that violated it; a `@pattern` requirement is stated as the
-//!    expression the service applies, without the `^`/`$` a model spells it with. The
-//!    rows span the constraint classes (length minimum and maximum, range minimum and
-//!    maximum, pattern, value set, absence and a service rule the model does not
-//!    express), the members (`name`, `roleArn`, `retentionInDays`,
-//!    `encryptionConfiguration.type`, `identifier`, `maxResults`, `policy`) and the
-//!    four operations that can be refused this way. Two rows are rules the model does
-//!    NOT express — a resource policy that is not a JSON document, and a cross-account
-//!    source role in the investigation account — which a handler enforces itself and
-//!    words through the same builders.
+//! 1. A `ValidationException` message raised by the modelled-constraint walk names the
+//!    member and the requirement it violated, in the AWS envelope
+//!    (`N validation error(s) detected: …`), and carries NOTHING of the value that
+//!    violated it; a `@pattern` requirement is stated as the expression the service
+//!    applies, without the `^`/`$` a model spells it with. The rows span the constraint
+//!    classes (length minimum and maximum, range minimum and maximum, pattern, value
+//!    set, absence and a service rule the model does not express), the members (`name`,
+//!    `roleArn`, `retentionInDays`, `encryptionConfiguration.type`, `identifier`,
+//!    `maxResults`, `policy`) and the four operations that can be refused this way. The
+//!    rules the model does NOT express — a resource policy that is not a JSON document,
+//!    and a cross-account source role in the investigation account — are worded as the
+//!    service words those error classes instead, and are pinned by
+//!    `tests/all/service_worded_refusals.rs`.
 //! 2. A `ResourceNotFoundException` message names the modelled RESOURCE TYPE that is
 //!    absent — `<Resource> does not exist.` — and carries nothing of the identifier
 //!    that named it. The rows span the six operations that read or write a group by
@@ -429,42 +430,6 @@ async fn a_validation_refusal_names_the_member_and_its_constraint_and_echoes_no_
             Some(json!({})),
             "\u{0}".to_string(),
             envelope(&[absent_clause("policy")]),
-        ),
-        (
-            // A rule the model does not express: the document's modelled constraints
-            // bound only its length and character set, so the boundary walk admits
-            // any printable text and the operation checks the document itself.
-            "a policy document that is not JSON",
-            "POST",
-            "/investigationGroups/some-group/policy".to_string(),
-            Some(json!({ "policy": "{not-valid-json:::" })),
-            "{not-valid-json:::".to_string(),
-            envelope(&[clause(
-                "policy",
-                "Member must be a resource policy document in JSON format",
-            )]),
-        ),
-        (
-            // The same: a cross-account source role in the investigation account's own
-            // account satisfies `^arn:.*$` and is refused by the operation.
-            "a cross-account source role in the investigation account",
-            "POST",
-            "/investigationGroups".to_string(),
-            Some(json!({
-                "name": "own-account-source",
-                "roleArn": ROLE_ARN,
-                "crossAccountConfigurations": [
-                    { "sourceRoleArn": format!("arn:aws:iam::{}:role/Own", engine::EMULATOR_ACCOUNT_ID) }
-                ],
-            })),
-            format!("arn:aws:iam::{}:role/Own", engine::EMULATOR_ACCOUNT_ID),
-            envelope(&[clause(
-                "crossAccountConfigurations.1.member.sourceRoleArn",
-                &format!(
-                    "Member must name an account other than the investigation account {}",
-                    engine::EMULATOR_ACCOUNT_ID
-                ),
-            )]),
         ),
     ];
 

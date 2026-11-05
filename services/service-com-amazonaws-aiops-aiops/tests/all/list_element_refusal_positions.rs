@@ -7,16 +7,18 @@
 //! restJson1 deserialization, the modelled-constraint walk and this service's refusal
 //! renderer — so what is asserted is the message a signed AWS SDK request observes.
 //!
-//! The rule under test: a refusal of a member that lives inside a list element states
-//! that element's own 1-based position and the step into the collection
-//! (`<member>.<n>.member.<element member>`), and it states that path whether the
-//! requirement came from a modelled constraint the request boundary applied or from a
-//! rule the handler enforces itself — so the two cannot be told apart by their path
-//! grammar. A request whose elements break one rule in several positions states one
-//! clause per position, counted in the envelope, because each position is a separate
-//! fact about the request.
+//! The rule under test: a refusal the modelled-constraint walk raises for a member that
+//! lives inside a list element states that element's own 1-based position and the step
+//! into the collection (`<member>.<n>.member.<element member>`), and a request whose
+//! elements break one modelled rule in several positions states one clause per position,
+//! counted in the envelope, because each position is a separate fact about the request.
+//! A rule the HANDLER enforces itself is worded as the service words that error class
+//! instead: the same-account source-role refusal is one sentence naming the investigation
+//! account and the offending ARN, so it identifies the entry by the value the request
+//! sent rather than by a position, and a list with several offending entries is refused
+//! at the first of them.
 //!
-//! The rows differ along what the rule generalises over: the POSITION of the offending
+//! The rows differ along what the rules generalise over: the POSITION of the offending
 //! element (first, middle, last), the SIZE of the list (one entry, a few, and the
 //! modelled maximum of 25 — the member is a list of `@length` 0..25, per
 //! `smithy_query(query="shape",shape="CrossAccountConfigurations")`), the NUMBER of
@@ -280,19 +282,26 @@ impl Entry {
         }
     }
 
-    /// The requirement a clause states for an element of this kind, or `None` when the
-    /// kind is accepted.
+    /// The requirement a MODELLED clause states for an element of this kind, or `None`
+    /// when no modelled constraint refuses it.
     fn requirement(self) -> Option<String> {
         match self {
-            Entry::Foreign => None,
-            Entry::OwnAccount => Some(format!(
-                "Member must name an account other than the investigation account {ACCOUNT}"
-            )),
+            Entry::Foreign | Entry::OwnAccount => None,
             Entry::TooShort => Some(format!(
                 "Member must have length greater than or equal to {MIN_SOURCE_ROLE_ARN_LENGTH}"
             )),
         }
     }
+}
+
+/// The sentence the handlers' own same-account rule refuses a source role with: the
+/// service's wording for that error class, which names the investigation account and
+/// echoes the ARN the request sent.
+fn source_role_sentence(source_role_arn: &str) -> String {
+    format!(
+        "Source role ARN cannot belong to the investigation account {ACCOUNT}. \
+         Found ARN: {source_role_arn}"
+    )
 }
 
 /// The `crossAccountConfigurations` list `kinds` describes.
@@ -307,8 +316,12 @@ fn list(kinds: &[Entry]) -> Value {
 }
 
 /// The whole message `kinds` must be refused with, or `None` when every element is
-/// accepted: one clause per offending POSITION, in list order, inside the envelope that
-/// counts them.
+/// accepted.
+///
+/// A modelled violation is refused at the boundary, which states one clause per
+/// offending POSITION, in list order, inside the envelope that counts them. A
+/// same-account source role is refused by the handlers' own rule instead, with the
+/// service's sentence for the FIRST such element.
 fn expected_message(kinds: &[Entry]) -> Option<String> {
     let clauses: Vec<String> = kinds
         .iter()
@@ -327,7 +340,13 @@ fn expected_message(kinds: &[Entry]) -> Option<String> {
             })
         })
         .collect();
-    (!clauses.is_empty()).then(|| validation_envelope(&clauses))
+    if !clauses.is_empty() {
+        return Some(validation_envelope(&clauses));
+    }
+    kinds
+        .iter()
+        .position(|kind| *kind == Entry::OwnAccount)
+        .map(|index| source_role_sentence(&Entry::OwnAccount.source_role_arn(index + 1)))
 }
 
 /// A row: the case and the elements the list carries. Each row carries at most one KIND
@@ -500,14 +519,15 @@ fn clause_subjects(message: &str) -> Vec<String> {
         .collect()
 }
 
-/// The two kinds of rule refuse the SAME element at the SAME path: one grammar, so a
-/// client cannot tell a handler-enforced refusal from a boundary refusal by where it
-/// points.
+/// Each rule identifies the OFFENDING element the way the service words that rule: the
+/// boundary walk points at the element's own position, and the handlers' same-account
+/// rule echoes that element's own source role ARN — and no other element's — whatever
+/// position it sits at.
 ///
 /// The cases differ along the position of the offending element and the size of the list
-/// it sits in, which is exactly what the path has to carry.
+/// it sits in, which is what either way of identifying it has to carry.
 #[tokio::test]
-async fn both_rules_refuse_one_element_at_one_path() {
+async fn each_rule_identifies_the_offending_element() {
     let router = emulator();
 
     // (case, list size, 1-based position of the offending element)
@@ -528,25 +548,52 @@ async fn both_rules_refuse_one_element_at_one_path() {
         let region = region(index);
         let arn = create_ok(&router, &region, &format!("one-grammar-{index}")).await;
 
-        let mut subjects = Vec::new();
-        for offender in [Entry::OwnAccount, Entry::TooShort] {
-            let sent = list(&one_offender(*size, *at, offender));
-            let (status, body) = update(&router, &region, &arn, &sent).await;
-            assert_eq!(
-                status, 400,
-                "case {case:?} with {offender:?}: expected 400, got {status} / {body:?}"
-            );
-            subjects.push(clause_subjects(&message(&body)));
-        }
-
+        // The modelled constraint: one clause, at the offending element's position.
+        let sent = list(&one_offender(*size, *at, Entry::TooShort));
+        let (status, body) = update(&router, &region, &arn, &sent).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} with {:?}: expected 400, got {status} / {body:?}",
+            Entry::TooShort
+        );
+        let subjects = clause_subjects(&message(&body));
         let want = vec![format!(
             "crossAccountConfigurations.{at}.member.sourceRoleArn"
         )];
-        for (offender, got) in [Entry::OwnAccount, Entry::TooShort].iter().zip(&subjects) {
-            assert_eq!(
-                got, &want,
-                "case {case:?} with {offender:?}: expected the clause subjects {want:?}, \
-                 got {got:?}"
+        assert_eq!(
+            subjects, want,
+            "case {case:?} with {:?}: expected the clause subjects {want:?}, got {subjects:?}",
+            Entry::TooShort
+        );
+
+        // The handlers' own rule: the sentence echoes that element's ARN, and names
+        // no other element of the same list.
+        let kinds = one_offender(*size, *at, Entry::OwnAccount);
+        let sent = list(&kinds);
+        let (status, body) = update(&router, &region, &arn, &sent).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} with {:?}: expected 400, got {status} / {body:?}",
+            Entry::OwnAccount
+        );
+        let reported = message(&body);
+        let offending = Entry::OwnAccount.source_role_arn(*at);
+        assert_eq!(
+            reported,
+            source_role_sentence(&offending),
+            "case {case:?} with {:?}: expected {:?}, got {reported:?}",
+            Entry::OwnAccount,
+            source_role_sentence(&offending)
+        );
+        for (position, kind) in kinds.iter().enumerate() {
+            let other = kind.source_role_arn(position + 1);
+            if other == offending {
+                continue;
+            }
+            assert!(
+                !reported.contains(&other),
+                "case {case:?}: the refusal must name only the offending ARN, \
+                 got {other:?} in {reported:?}"
             );
         }
     }
