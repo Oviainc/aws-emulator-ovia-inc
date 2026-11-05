@@ -499,22 +499,43 @@ impl ClusterRecord {
 }
 
 /// A stored DAX parameter group: everything the modelled `ParameterGroup` reports, plus
-/// whether DAX provides it (a default group, which cannot be deleted).
+/// whether DAX provides it (a default group, which cannot be deleted) and the value this
+/// group carries for each parameter of the caching software.
 #[derive(Debug, Clone)]
 pub struct ParameterGroupRecord {
     pub name: String,
     pub description: Option<String>,
     /// True for a group AWS provides rather than one a caller created.
     pub default_group: bool,
+    /// This group's value for every parameter of the caching software, keyed by
+    /// `Parameter$ParameterName`. A group is created holding the system-defined value of
+    /// each parameter in [`DEFAULT_PARAMETERS`] (see [`default_parameter_values`]), so a
+    /// read of a group reports the group's OWN stored values rather than the catalog's;
+    /// a `BTreeMap` so those values page in one stable order.
+    pub parameter_values: BTreeMap<String, String>,
 }
 
 impl ParameterGroupRecord {
+    /// A group a caller created: it starts out carrying the system-defined value of
+    /// every parameter the caching software defines, which is what a group that has
+    /// never been updated reports.
+    pub fn new(name: String, description: Option<String>) -> Self {
+        Self {
+            name,
+            description,
+            default_group: false,
+            parameter_values: default_parameter_values(),
+        }
+    }
+
     /// The default group DAX provides in every account.
     pub fn default_group() -> Self {
         Self {
-            name: DEFAULT_PARAMETER_GROUP.to_string(),
-            description: Some(DEFAULT_PARAMETER_GROUP_DESCRIPTION.to_string()),
             default_group: true,
+            ..Self::new(
+                DEFAULT_PARAMETER_GROUP.to_string(),
+                Some(DEFAULT_PARAMETER_GROUP_DESCRIPTION.to_string()),
+            )
         }
     }
 
@@ -524,6 +545,26 @@ impl ParameterGroupRecord {
             parameter_group_name: Some(self.name.clone()),
             description: self.description.clone(),
         }
+    }
+
+    /// The names of the parameters this group holds a value for, in the one stable order
+    /// they page in (by name).
+    pub fn parameter_names(&self) -> Vec<&str> {
+        self.parameter_values.keys().map(String::as_str).collect()
+    }
+
+    /// The modelled `Parameter` this group reports for `name`: the catalog entry's
+    /// definition — its description, `Source`, data type, allowed values, modifiability
+    /// and change type — carrying the value THIS group stores for it. `None` when the
+    /// group holds no such parameter.
+    pub fn parameter_view(&self, name: &str) -> Option<Parameter> {
+        let definition = default_parameter(name)?;
+        let value = self
+            .parameter_values
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(definition.default_value);
+        Some(definition.view(value, definition.source))
     }
 }
 
@@ -720,6 +761,20 @@ pub fn default_parameter(name: &str) -> Option<&'static ParameterDefinition> {
     DEFAULT_PARAMETERS
         .iter()
         .find(|parameter| parameter.name == name)
+}
+
+/// The values a newly created parameter group carries: the system-defined value of every
+/// parameter in [`DEFAULT_PARAMETERS`], keyed by name.
+pub fn default_parameter_values() -> BTreeMap<String, String> {
+    DEFAULT_PARAMETERS
+        .iter()
+        .map(|parameter| {
+            (
+                parameter.name.to_string(),
+                parameter.default_value.to_string(),
+            )
+        })
+        .collect()
 }
 
 /// One recorded DAX event: what happened to which resource, and when.

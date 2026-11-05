@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the detailed parameter list of ONE stored parameter group: for every
+//! parameter that group holds a value for, the catalog entry behind it
+//! ([`crate::state::DEFAULT_PARAMETERS`]) rendered with the value THAT group stores, so
+//! a group that has never been updated reports the system-defined values, and the
+//! description, `Source`, data type, allowed values, modifiability and change type come
+//! from the one catalog every parameter view in this service renders from. The group is
+//! resolved out of the store, so a name this account holds no group for is refused with
+//! the modelled `ParameterGroupNotFoundFault` rather than answered with the catalog.
+//! This operation writes nothing, so a later caller sees exactly what this one saw.
+//!
+//! `Source` selects the parameters defined that way — the vocabulary `Parameter$Source`
+//! documents, [`crate::state::PARAMETER_SOURCES`] — and a value nothing is defined with
+//! selects none of them. The list is paged by `MaxResults`/`NextToken` through the
+//! shared [`crate::state::page`] helper, in the one stable order a group keeps its
+//! parameters in (by parameter name). A `MaxResults` outside the documented 20..=100
+//! window, and a `NextToken` this service did not issue, are refused with the modelled
+//! `InvalidParameterValueException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +162,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeParameters"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+
+        // "The value for MaxResults must be between 20 and 100" (`MaxResults`). DAX
+        // answers the request-independent template this fault has for this rejection.
+        if let Some(max_results) = input.max_results {
+            if !(crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
+                .contains(&max_results)
+            {
+                return Err(DescribeParametersErrorModeled::InvalidParameterValueException(
+                    crate::state::invalid_max_results(),
+                )
+                .into());
+            }
+        }
+
+        // A continuation token this service did not issue is refused, rather than
+        // answering an arbitrary page with a 200.
+        let start_from = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_token(token) {
+                Some(from) => Some(from),
+                None => {
+                    return Err(DescribeParametersErrorModeled::InvalidParameterValueException(
+                        crate::state::invalid_next_token(Self::NAME),
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+        // The parameters are those of the NAMED group, so a name this account holds no
+        // parameter group for resolves to nothing and is refused.
+        let Some(group) = store.parameter_groups.get(&input.parameter_group_name) else {
+            return Err(DescribeParametersErrorModeled::ParameterGroupNotFoundFault(
+                crate::state::parameter_group_not_found(),
+            )
+            .into());
+        };
+
+        // `Source` is "how the parameter is defined", a property of the catalog entry,
+        // so it selects the parameters defined that way and nothing when no parameter is.
+        let names: Vec<&str> = group
+            .parameter_names()
+            .into_iter()
+            .filter(|name| match input.source.as_deref() {
+                Some(source) => crate::state::default_parameter(name)
+                    .is_some_and(|definition| definition.source == source),
+                None => true,
+            })
+            .collect();
+
+        let (page, next_token) =
+            crate::state::page(&names, input.max_results, start_from.as_deref());
+        let parameters = page
+            .iter()
+            .filter_map(|name| group.parameter_view(name))
+            .collect();
+
+        Ok(DescribeParametersOutput {
+            next_token,
+            parameters: Some(parameters),
+        })
     }
 }

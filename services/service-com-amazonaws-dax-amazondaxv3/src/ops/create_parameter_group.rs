@@ -195,11 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let record = crate::state::ParameterGroupRecord {
-            name: input.parameter_group_name.clone(),
-            description: input.description,
-            default_group: false,
-        };
+        let record = crate::state::ParameterGroupRecord::new(
+            input.parameter_group_name.clone(),
+            input.description,
+        );
         let view = record.view();
         store
             .parameter_groups
