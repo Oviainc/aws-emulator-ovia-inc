@@ -582,6 +582,39 @@ fn api_burst_rate_description(api_name: &str) -> String {
     format!("The maximum burst rate of {api_name} API requests.")
 }
 
+/// One quota published as a COUNT of the resources of one plane in use: the plane's
+/// `AWS/Usage` `ResourceCount` meters it ([`usage_metric`]), so the row also carries the
+/// window those counts are published over, and its `Description` is the sentence AWS
+/// publishes for a counted plane with what the plane counts named in it.
+///
+/// `usage_service_name` is the service's `AWS/Usage` display name, never its
+/// `ServiceCode` (see [`aws_usage_metric`]); `resource` is the series CloudWatch
+/// publishes the count under and `counted` what the quota counts, as the quota's own
+/// published text names it. One constructor fills the class so two metered planes
+/// cannot drift apart, the way [`request_rate`] does for the rate class.
+fn resource_count_plane(
+    code: &str,
+    quota_name: &str,
+    value: f64,
+    usage_service_name: &str,
+    resource: &str,
+    counted: &str,
+) -> QuotaRow {
+    quota(quota_name, value)
+        .code(code)
+        .metric(usage_metric(
+            usage_service_name,
+            &[
+                ("Class", "None"),
+                ("Resource", resource),
+                ("Type", "Resource"),
+            ],
+        ))
+        .describe(&format!(
+            "The maximum number of {counted} in this account in the current Region."
+        ))
+}
+
 /// One per-API REQUEST-RATE quota of a service that publishes its API throttles under
 /// the name `Rate of <Api> requests`: a rate, so it carries the one-second window AWS
 /// publishes such a quota over and the `AWS/Usage` `CallCount` metric of the API it
@@ -2443,22 +2476,8 @@ const ELASTICACHE_USAGE_SERVICE: &str = "ElastiCache";
 /// for, so those rows carry that metric and the window those counts are published
 /// over, while a plane counted inside one cluster carries neither.
 pub(super) fn elasticache_quotas() -> Vec<QuotaRow> {
-    // A per-Region resource plane: metered by that plane's `AWS/Usage` resource count,
-    // and described by the sentence AWS publishes for the plane the row counts.
     let metered = |code: &str, name: &str, value: f64, resource: &str, counted: &str| {
-        quota(name, value)
-            .code(code)
-            .metric(usage_metric(
-                ELASTICACHE_USAGE_SERVICE,
-                &[
-                    ("Class", "None"),
-                    ("Resource", resource),
-                    ("Type", "Resource"),
-                ],
-            ))
-            .describe(&format!(
-                "The maximum number of {counted} in this account in the current Region."
-            ))
+        resource_count_plane(code, name, value, ELASTICACHE_USAGE_SERVICE, resource, counted)
     };
     vec![
         metered(
@@ -2666,23 +2685,10 @@ const ELB_USAGE_SERVICE: &str = "Elastic Load Balancing";
 /// planes of each type are the ones CloudWatch publishes an `AWS/Usage` resource count
 /// for.
 pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
-    // A per-Region resource plane of one load-balancer type: metered by that plane's
-    // `AWS/Usage` resource count, and described by the sentence AWS publishes for the
-    // plane the row counts.
+    // One per-Region plane of a load-balancer type, metered like every other counted
+    // plane ([`resource_count_plane`]).
     let metered = |code: &str, name: &str, value: f64, resource: &str, counted: &str| {
-        quota(name, value)
-            .code(code)
-            .metric(usage_metric(
-                ELB_USAGE_SERVICE,
-                &[
-                    ("Class", "None"),
-                    ("Resource", resource),
-                    ("Type", "Resource"),
-                ],
-            ))
-            .describe(&format!(
-                "The maximum number of {counted} in this account in the current Region."
-            ))
+        resource_count_plane(code, name, value, ELB_USAGE_SERVICE, resource, counted)
     };
     vec![
         metered(
