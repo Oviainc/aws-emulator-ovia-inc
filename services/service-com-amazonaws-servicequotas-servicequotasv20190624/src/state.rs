@@ -3454,43 +3454,12 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Instances per cluster", 16.0),
             ],
         ),
-        service(
-            "ds",
-            "AWS Directory Service",
-            vec![quota("Directories", 10.0)],
-        ),
-        service(
-            "dynamodb",
-            "Amazon DynamoDB",
-            vec![
-                quota("Maximum number of tables", 2500.0)
-                    .code("L-F98FE922")
-                    // DynamoDB publishes table count as a CloudWatch usage metric
-                    // (`AWS/Usage`, `ResourceCount`, `Resource=TableCount`), which is
-                    // what Service Quotas reports as this quota's `UsageMetric`.
-                    .metric(usage_metric(
-                        "DynamoDB",
-                        &[
-                            ("Class", "None"),
-                            ("Resource", "TableCount"),
-                            ("Type", "Resource"),
-                        ],
-                    ))
-                    .describe(
-                        "The maximum number of tables that can be created in this account in \
-                         the current Region.",
-                    ),
-                quota("Account-level write throughput limit", 80000.0),
-                quota("Global secondary indexes per table", 20.0).fixed(),
-            ],
-        ),
+        service("ds", "AWS Directory Service", ds_quotas()),
+        service("dynamodb", "Amazon DynamoDB", dynamodb_quotas()),
         service(
             "ebs",
             "Amazon Elastic Block Store (Amazon EBS)",
-            vec![
-                quota("Storage for General Purpose SSD (gp3) volumes, in TiB", 50.0).unit("TiB"),
-                quota("Snapshots per Region", 100000.0),
-            ],
+            ebs_quotas(),
         ),
         service(
             "ec2",
@@ -3500,10 +3469,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "ecr",
             "Amazon Elastic Container Registry (Amazon ECR)",
-            vec![
-                quota("Repositories", 10000.0),
-                quota("Images per repository", 10000.0),
-            ],
+            ecr_quotas(),
         ),
         service(
             "ecs",
@@ -3517,44 +3483,23 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "eks",
             "Amazon Elastic Kubernetes Service (Amazon EKS)",
-            vec![
-                quota("Clusters", 100.0),
-                quota("Managed node groups per cluster", 30.0),
-                quota("Nodes per managed node group", 450.0),
-            ],
+            eks_quotas(),
         ),
-        service(
-            "elasticache",
-            "Amazon ElastiCache",
-            vec![
-                quota("Nodes per Region", 300.0),
-                quota("Parameter groups per Region", 150.0),
-            ],
-        ),
+        service("elasticache", "Amazon ElastiCache", elasticache_quotas()),
         service(
             "elasticbeanstalk",
             "AWS Elastic Beanstalk",
-            vec![
-                quota("Applications", 75.0),
-                quota("Environments", 200.0),
-            ],
+            elasticbeanstalk_quotas(),
         ),
         service(
             "elasticfilesystem",
             "Amazon Elastic File System (Amazon EFS)",
-            vec![
-                quota("File systems per account", 1000.0),
-                quota("Access points per file system", 1000.0),
-            ],
+            elasticfilesystem_quotas(),
         ),
         service(
             "elasticloadbalancing",
             "Elastic Load Balancing (ELB)",
-            vec![
-                quota("Application Load Balancers per Region", 50.0),
-                quota("Classic Load Balancers per Region", 20.0),
-                quota("Target groups per Region", 3000.0),
-            ],
+            elasticloadbalancing_quotas(),
         ),
         service(
             "elasticmapreduce",

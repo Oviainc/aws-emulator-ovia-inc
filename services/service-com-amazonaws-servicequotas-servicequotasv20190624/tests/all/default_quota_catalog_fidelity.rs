@@ -265,7 +265,15 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("athena", "Athena"),
     ("autoscaling", "AutoScaling"),
     ("dynamodb", "DynamoDB"),
+    // Amazon EBS's API call counts and Amazon ECR's are published under each
+    // service's short display name, and the file-system and load-balancing counts
+    // under the names `AWS/Usage` publishes those services as.
+    ("ebs", "EBS"),
     ("ec2", "EC2"),
+    ("ecr", "ECR"),
+    ("elasticache", "ElastiCache"),
+    ("elasticfilesystem", "EFS"),
+    ("elasticloadbalancing", "Elastic Load Balancing"),
     ("events", "EventBridge"),
     // `AWS/Usage` publishes Amazon Data Firehose's API call counts under the service's
     // current display name, which the recorded default-quota listing of `firehose`

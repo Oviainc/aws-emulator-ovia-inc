@@ -1591,16 +1591,41 @@ pub(super) fn monitoring_quotas() -> Vec<QuotaRow> {
 
 /// Amazon OpenSearch Service's published quota catalog, under the `ServiceCode` its
 /// API endpoint uses.
+///
+/// SOURCE: AWS's published Service Quotas data for the `es` service code (the "Amazon
+/// OpenSearch Service quotas" page of its Developer Guide), and the recorded
+/// default-quota listing of that code for which `QuotaCode` names which quota. The
+/// service publishes the domain plane of the Region beside the planes counted inside
+/// one domain.
 pub(super) fn es_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Domains per Region", 100.0),
+        quota("Domains per Region", 100.0)
+            .code("L-076D529E")
+            .describe(
+                "The maximum number of OpenSearch Service domains in this account in the \
+                 current Region.",
+            ),
+        // The warm-tier instance plane of a domain, which AWS publishes as fixed.
+        quota("Warm instances per domain", 150.0)
+            .code("L-1F053E6F")
+            .fixed()
+            .describe("The maximum number of UltraWarm instances per domain."),
         // The quota `QuotaContextInfo`'s own documentation uses as its worked
         // example of a RESOURCE-level quota: the instance count is applied per
         // OpenSearch Service domain, and can also be set account-wide, so AWS
         // publishes it as adjustable at either level. The scope type names the
         // resource type the per-resource plane applies to, which for this service is
         // its domain resource.
-        quota("Instances per domain", 80.0).adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain"),
+        quota("Instances per domain", 80.0)
+            .code("L-6408ABDE")
+            .adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain")
+            .describe("The maximum number of instances per domain."),
+        quota("Cross-cluster search connections per domain", 20.0)
+            .code("L-AE676A72")
+            .describe("The maximum number of cross-cluster search connections per domain."),
+        quota("Packages per domain", 25.0)
+            .code("L-E9BC8C95")
+            .describe("The maximum number of packages that can be associated with one domain."),
     ]
 }
 
@@ -1957,6 +1982,864 @@ pub(super) fn secretsmanager_quotas() -> Vec<QuotaRow> {
         secrets_manager_request_rate("CreateSecret", 50.0)
             .code("L-CBA4CAC4")
             .fixed(),
+    ]
+}
+
+/// AWS Directory Service's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `ds` service code (the "AWS
+/// Directory Service quotas" page of its Administration Guide) for each quota's
+/// published name, default value and adjustability, and the recorded default-quota
+/// listing of that code for which `QuotaCode` names which quota. The service
+/// publishes one directory plane per directory TYPE, beside the manual-snapshot plane
+/// of each type it snapshots and the domain-controller plane of a managed directory.
+pub(super) fn ds_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("AD Connector directories", 10.0)
+            .code("L-092080C3")
+            .describe(
+                "The maximum number of AD Connector directories that you can create in this \
+                 account in the current Region.",
+            ),
+        quota("AWS Managed Microsoft AD directories", 20.0)
+            .code("L-25146888")
+            .describe(
+                "The maximum number of AWS Managed Microsoft AD directories that you can \
+                 create in this account in the current Region.",
+            ),
+        quota("Simple AD directories", 10.0)
+            .code("L-5B5620DE")
+            .describe(
+                "The maximum number of Simple AD directories that you can create in this \
+                 account in the current Region.",
+            ),
+        quota("Domain controllers per directory", 20.0)
+            .code("L-92A19B29")
+            // AWS publishes the domain-controller plane of a managed directory as fixed.
+            .fixed()
+            .describe(
+                "The maximum number of domain controllers that you can deploy for your AWS \
+                 Managed Microsoft AD directory.",
+            ),
+        // The two manual-snapshot planes, which AWS publishes as NOT adjustable: a
+        // directory's snapshot allowance is fixed, so no increase can be requested
+        // for it.
+        quota("Simple AD manual snapshots", 5.0)
+            .code("L-A18F1612")
+            .fixed()
+            .describe(
+                "The maximum number of manual snapshots that you can take for your Simple AD \
+                 directory.",
+            ),
+        quota("AWS Managed Microsoft AD manual snapshots", 5.0)
+            .code("L-EF86B739")
+            .fixed()
+            .describe(
+                "The maximum number of manual snapshots that you can take for your AWS \
+                 Managed Microsoft AD directory.",
+            ),
+    ]
+}
+
+/// The `AWS/Usage` display name Amazon DynamoDB publishes its usage counts under.
+const DYNAMODB_USAGE_SERVICE: &str = "DynamoDB";
+
+/// Amazon DynamoDB's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `dynamodb` service code (the
+/// "Service, account, and table quotas in Amazon DynamoDB" page of the Amazon
+/// DynamoDB Developer Guide), and the recorded default-quota listing of that code for
+/// which `QuotaCode` names which quota. DynamoDB publishes its throughput planes
+/// TWICE over — once for the account and once for a single table, and once for each of
+/// the two capacity modes — which is why the rows are named for the plane and the mode
+/// rather than for throughput as a whole.
+pub(super) fn dynamodb_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota(
+            "Account-level read throughput limit (Provisioned mode)",
+            80_000.0,
+        )
+        .code("L-1BB77E89")
+        .describe(
+            "The maximum number of read capacity units that can be provisioned across all \
+             tables in this account in the current Region.",
+        ),
+        quota(
+            "Account-level write throughput limit (Provisioned mode)",
+            80_000.0,
+        )
+        .code("L-2A593B99")
+        .describe(
+            "The maximum number of write capacity units that can be provisioned across all \
+             tables in this account in the current Region.",
+        ),
+        quota("Table-level read throughput limit", 40_000.0)
+            .code("L-34F6A552")
+            .describe(
+                "The maximum number of read capacity units that can be provisioned for a \
+                 single table.",
+            ),
+        // The secondary-index plane of a table, which AWS publishes as fixed.
+        quota("Global secondary indexes per table", 20.0)
+            .code("L-34F8CCC8")
+            .fixed()
+            .describe("The maximum number of global secondary indexes for a single table."),
+        quota("Concurrent control plane operations", 500.0)
+            .code("L-6F30DCE1")
+            .fixed()
+            .describe(
+                "The maximum number of concurrent control plane operations in this account in \
+                 the current Region.",
+            ),
+        quota(
+            "Account-level read throughput limit (On-demand mode)",
+            40_000.0,
+        )
+        .code("L-923BEB7A")
+        .describe(
+            "The maximum number of read request units that all on-demand tables in this \
+             account in the current Region can serve per second.",
+        ),
+        quota("Table-level write throughput limit", 40_000.0)
+            .code("L-AB614373")
+            .describe(
+                "The maximum number of write capacity units that can be provisioned for a \
+                 single table.",
+            ),
+        quota(
+            "Account-level write throughput limit (On-demand mode)",
+            40_000.0,
+        )
+        .code("L-C2098644")
+        .describe(
+            "The maximum number of write request units that all on-demand tables in this \
+             account in the current Region can serve per second.",
+        ),
+        quota(
+            "Table-level read throughput limit (On-demand mode)",
+            40_000.0,
+        )
+        .code("L-CF0CBE56")
+        .describe(
+            "The maximum number of read request units that a single on-demand table can \
+             serve per second.",
+        ),
+        quota(
+            "Table-level write throughput limit (On-demand mode)",
+            40_000.0,
+        )
+        .code("L-D98E8184")
+        .describe(
+            "The maximum number of write request units that a single on-demand table can \
+             serve per second.",
+        ),
+        quota("Concurrent import jobs", 50.0)
+            .code("L-F3CA5463")
+            .describe(
+                "The maximum number of concurrent import jobs in this account in the current \
+                 Region.",
+            ),
+        quota("Concurrent export jobs", 300.0)
+            .code("L-F7858A77")
+            .describe(
+                "The maximum number of concurrent export jobs in this account in the current \
+                 Region.",
+            ),
+        // The table plane of the account, the one DynamoDB publishes a CloudWatch
+        // usage metric for (`AWS/Usage`, `ResourceCount`, `Resource=TableCount`).
+        quota("Maximum number of tables", 2500.0)
+            .code("L-F98FE922")
+            .metric(usage_metric(
+                DYNAMODB_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", "TableCount"),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe(
+                "The maximum number of tables that can be created in this account in the \
+                 current Region.",
+            ),
+    ]
+}
+
+/// The `AWS/Usage` display name Amazon EBS publishes its API call counts under, which
+/// is the `Service` dimension of every metered EBS quota.
+const EBS_USAGE_SERVICE: &str = "EBS";
+
+/// Amazon Elastic Block Store's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `ebs` service code (the "Amazon
+/// EBS quotas" page of the Amazon EBS User Guide) for the storage, IOPS and snapshot
+/// planes it publishes, and the recorded default-quota listing of that code for which
+/// `QuotaCode` names which quota and for the per-API request rates it publishes beside
+/// them. EBS publishes a storage plane PER VOLUME TYPE — a volume type is what the
+/// capacity is bought under — so a storage row is named for the type and carries the
+/// `TiB` unit AWS publishes it in; a request-rate row carries the one-second window
+/// and the `AWS/Usage` `CallCount` of the operation it throttles ([`request_rate`]).
+pub(super) fn ebs_quotas() -> Vec<QuotaRow> {
+    let rate =
+        |code: &str, api: &str, per_second: f64| request_rate(code, EBS_USAGE_SERVICE, api, per_second);
+    // A storage plane of one volume type: the capacity, in TiB, of all volumes of that
+    // type in the Region.
+    let storage = |code: &str, volume_type: &str, tebibytes: f64| {
+        quota(format!("Storage for {volume_type} volumes, in TiB"), tebibytes)
+            .code(code)
+            .unit("TiB")
+            .describe(&format!(
+                "The maximum aggregated storage, in TiB, of all {volume_type} volumes in this \
+                 account in the current Region."
+            ))
+    };
+    // An IOPS plane of one volume type: the provisioned IOPS of all volumes of that
+    // type in the Region.
+    let iops = |code: &str, volume_type: &str, operations_per_second: f64| {
+        quota(
+            format!("IOPS for {volume_type} volumes"),
+            operations_per_second,
+        )
+        .code(code)
+        .describe(&format!(
+            "The maximum aggregated IOPS provisioned for all {volume_type} volumes in this \
+             account in the current Region."
+        ))
+    };
+    vec![
+        // The one volume-attachment rate AWS publishes as not adjustable.
+        rate("L-028ACFB9", "AttachVolume", 100.0).fixed(),
+        rate("L-07399329", "CompleteSnapshot", 100.0),
+        rate("L-09BD8365", "CopySnapshot", 10.0),
+        rate("L-1774F84A", "CreateSnapshot", 50.0),
+        rate("L-18E976AB", "CreateSnapshots", 50.0),
+        rate("L-1D4D9345", "CreateVolume", 100.0),
+        storage("L-17AF77E8", "Throughput Optimized HDD (st1)", 50.0),
+        rate("L-309BACF6", "DeleteSnapshot", 100.0),
+        rate("L-35B31D98", "DeleteVolume", 100.0),
+        rate("L-39BD5252", "DescribeFastSnapshotRestores", 100.0),
+        rate("L-3A0E616D", "DescribeSnapshots", 100.0),
+        rate("L-59C8FC87", "DescribeVolumeStatus", 100.0),
+        rate("L-5F80CA91", "DescribeVolumes", 100.0),
+        rate("L-631ECBD3", "DescribeVolumesModifications", 100.0),
+        rate("L-651D1834", "DetachVolume", 100.0),
+        rate("L-750405C3", "DisableFastSnapshotRestores", 10.0),
+        storage("L-7A658B76", "General Purpose SSD (gp3)", 50.0),
+        rate("L-82ACEF56", "EnableFastSnapshotRestores", 10.0),
+        // The EBS direct APIs: the block-level read and write rates of a snapshot,
+        // which AWS publishes far above its control-plane rates.
+        rate("L-835364B2", "GetSnapshotBlock", 1000.0),
+        iops("L-8656991D", "Provisioned IOPS SSD (io2)", 100_000.0),
+        rate("L-87C9DEA6", "ListChangedBlocks", 100.0),
+        storage("L-8D977E7E", "Provisioned IOPS SSD (io2)", 20.0),
+        rate("L-915A3DBB", "ListSnapshotBlocks", 100.0),
+        rate("L-94D7AB7D", "LockSnapshot", 10.0),
+        rate("L-98A0B26D", "ModifySnapshotAttribute", 100.0),
+        storage("L-9A0E0F82", "Magnetic (standard)", 20.0),
+        storage("L-9CF3C2EB", "Cold HDD (sc1)", 50.0),
+        rate("L-9F6E7C4E", "ModifySnapshotTier", 10.0),
+        rate("L-A37D9CF3", "ModifyVolume", 100.0),
+        rate("L-AFAE1BE8", "PutSnapshotBlock", 1000.0),
+        rate("L-AFEBDF7A", "ResetSnapshotAttribute", 100.0),
+        iops("L-B3A130E6", "Provisioned IOPS SSD (io1)", 300_000.0),
+        rate("L-B9F7C487", "RestoreSnapshotTier", 10.0),
+        // The attachment plane of a Multi-Attach enabled volume, which AWS publishes
+        // as fixed.
+        quota("Attachments per Multi-Attach enabled volume", 16.0)
+            .code("L-C125AE42")
+            .fixed()
+            .describe(
+                "The maximum number of instances that one Multi-Attach enabled volume can be \
+                 attached to.",
+            ),
+        quota("In-progress snapshot archives per account", 5.0)
+            .code("L-D0291BE3")
+            .fixed()
+            .describe(
+                "The maximum number of snapshot archives that can be in progress at once in \
+                 this account in the current Region.",
+            ),
+        storage("L-D18FCD1D", "General Purpose SSD (gp2)", 50.0),
+        rate("L-D8F37C68", "StartSnapshot", 10.0),
+        quota("Fast snapshot restores per Region", 5.0)
+            .code("L-DB2FBAA1")
+            .describe(
+                "The maximum number of snapshots that fast snapshot restore can be enabled \
+                 for in this account in the current Region.",
+            ),
+        quota("Concurrent snapshot copies per destination Region", 20.0)
+            .code("L-DB70D580")
+            .fixed()
+            .describe(
+                "The maximum number of snapshot copies that can be in progress at once to a \
+                 single destination Region.",
+            ),
+        rate("L-E137849C", "UnlockSnapshot", 10.0),
+        quota("Archived snapshots per volume", 25.0)
+            .code("L-E20676C1")
+            .describe(
+                "The maximum number of snapshots of one volume that can be in the archive \
+                 storage tier.",
+            ),
+        quota("Snapshots per Region", 100_000.0)
+            .code("L-F06E64A8")
+            .describe(
+                "The maximum number of snapshots in this account in the current Region.",
+            ),
+        storage("L-FD252861", "Provisioned IOPS SSD (io1)", 50.0),
+    ]
+}
+
+/// The `AWS/Usage` display name Amazon ECR publishes its API call counts under.
+const ECR_USAGE_SERVICE: &str = "ECR";
+
+/// Amazon Elastic Container Registry's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `ecr` service code (the "Amazon
+/// ECR service quotas" page of the Amazon ECR User Guide) for the registry, repository
+/// and image planes it publishes, and the recorded default-quota listing of that code
+/// for which `QuotaCode` names which quota and for the per-API request rates it
+/// publishes beside them. A size plane carries the unit AWS publishes it in rather
+/// than being a count, and a request-rate row carries the one-second window and the
+/// `AWS/Usage` `CallCount` of the operation it throttles ([`request_rate`]).
+pub(super) fn ecr_quotas() -> Vec<QuotaRow> {
+    let rate =
+        |code: &str, api: &str, per_second: f64| request_rate(code, ECR_USAGE_SERVICE, api, per_second);
+    vec![
+        quota("Registered repositories", 10_000.0)
+            .code("L-03A36CE1")
+            .describe(
+                "The maximum number of repositories that can be registered in this account in \
+                 the current Region.",
+            ),
+        quota("Images per repository", 10_000.0)
+            .code("L-0A556EFC")
+            .describe("The maximum number of images in one repository."),
+        quota("Lifecycle policy rules per repository", 50.0)
+            .code("L-1165B4AE")
+            .fixed()
+            .describe("The maximum number of rules in one repository's lifecycle policy."),
+        quota("Filters per lifecycle policy rule", 100.0)
+            .code("L-16E70933")
+            .fixed()
+            .describe("The maximum number of filters in one lifecycle policy rule."),
+        quota("Repository policy length", 10_240.0)
+            .code("L-241DEEBA")
+            .unit("Bytes")
+            .fixed()
+            .describe("The maximum length, in bytes, of one repository's policy document."),
+        quota("Layer parts per image layer", 10_000.0)
+            .code("L-24725E9A")
+            .fixed()
+            .describe("The maximum number of parts that one image layer can be uploaded in."),
+        quota("Maximum image layer size", 52.0)
+            .code("L-343F3D94")
+            .unit("Gigabytes")
+            .fixed()
+            .describe("The maximum size, in GiB, of one image layer."),
+        quota("Pull through cache rules per registry", 25.0)
+            .code("L-44194860")
+            .describe("The maximum number of pull through cache rules in one registry."),
+        quota("Replication destinations per registry", 25.0)
+            .code("L-55A41110")
+            .describe(
+                "The maximum number of destinations in one registry's replication \
+                 configuration.",
+            ),
+        rate("L-6EF7FC96", "BatchCheckLayerAvailability", 1000.0),
+        rate("L-8BE1781E", "BatchDeleteImage", 100.0),
+        rate("L-95B28F8D", "BatchGetImage", 10_000.0),
+        rate("L-9B60BFFB", "CompleteLayerUpload", 100.0),
+        rate("L-9C9D5A08", "CreateRepository", 10.0),
+        rate("L-A1670B10", "DeleteRepository", 10.0),
+        rate("L-A60A366D", "DescribeImages", 100.0),
+        rate("L-A71EAF5A", "DescribeRepositories", 100.0),
+        rate("L-AD52DFB2", "GetAuthorizationToken", 500.0),
+        rate("L-B9173138", "GetDownloadUrlForLayer", 3000.0),
+        rate("L-C0B33BA1", "InitiateLayerUpload", 100.0),
+        rate("L-CB63E564", "ListImages", 100.0),
+        rate("L-CFEB8E8D", "PutImage", 100.0),
+        rate("L-EF8F6F4E", "UploadLayerPart", 1000.0),
+    ]
+}
+
+/// Amazon Elastic Kubernetes Service's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `eks` service code (the "Amazon
+/// EKS service quotas" page of the Amazon EKS User Guide), and the recorded
+/// default-quota listing of that code for which `QuotaCode` names which quota and for
+/// each code's adjustability. EKS publishes its planes per CLUSTER as well as per
+/// Region — a cluster is the unit its node groups, Fargate profiles and access
+/// configuration are counted in — so a row names the plane it is counted on.
+pub(super) fn eks_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Clusters", 100.0)
+            .code("L-11427A54")
+            .describe(
+                "The maximum number of EKS clusters in this account in the current Region.",
+            ),
+        quota("Managed node groups per cluster", 30.0)
+            .code("L-1194D53C")
+            .describe("The maximum number of managed node groups per cluster."),
+        quota("Nodes per managed node group", 450.0)
+            .code("L-23414FF3")
+            .describe("The maximum number of nodes per managed node group."),
+        quota("Fargate profiles per cluster", 10.0)
+            .code("L-33415657")
+            .describe("The maximum number of Fargate profiles per cluster."),
+        quota("Selectors per Fargate profile", 5.0)
+            .code("L-5C12D558")
+            .fixed()
+            .describe("The maximum number of selectors per Fargate profile."),
+        quota("Label pairs per Fargate profile selector", 5.0)
+            .code("L-6AFFD1D8")
+            .fixed()
+            .describe("The maximum number of label pairs per Fargate profile selector."),
+        quota("Control plane security groups per cluster", 4.0)
+            .code("L-6D54EA21")
+            .fixed()
+            .describe("The maximum number of control plane security groups per cluster."),
+        quota("Public endpoint access CIDR ranges per cluster", 40.0)
+            .code("L-93A74D60")
+            .fixed()
+            .describe(
+                "The maximum number of CIDR ranges that public access to a cluster's endpoint \
+                 can be restricted to.",
+            ),
+        quota("Access entries per cluster", 100.0)
+            .code("L-BD136A63")
+            .describe("The maximum number of access entries per cluster."),
+        quota("Pod identity associations per cluster", 1000.0)
+            .code("L-C56B9FC3")
+            .describe("The maximum number of EKS Pod Identity associations per cluster."),
+        quota("Registered clusters", 10.0)
+            .code("L-D78D8AF8")
+            .describe(
+                "The maximum number of Kubernetes clusters that can be connected to EKS in \
+                 this account in the current Region.",
+            ),
+        quota("Add-ons per cluster", 20.0)
+            .code("L-EA277FDC")
+            .describe("The maximum number of EKS add-ons per cluster."),
+        quota("EKS Anywhere subscriptions", 10.0)
+            .code("L-FDFA5F81")
+            .describe(
+                "The maximum number of EKS Anywhere subscriptions in this account in the \
+                 current Region.",
+            ),
+    ]
+}
+
+/// The `AWS/Usage` display name Amazon ElastiCache publishes its resource counts
+/// under, which is the `Service` dimension of every metered ElastiCache quota.
+const ELASTICACHE_USAGE_SERVICE: &str = "ElastiCache";
+
+/// Amazon ElastiCache's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `elasticache` service code (the
+/// "Quotas for ElastiCache" page of the Amazon ElastiCache User Guide), and the
+/// recorded default-quota listing of that code for which `QuotaCode` names which
+/// quota and for the usage metric each metered row carries. The planes ElastiCache
+/// counts PER REGION are the ones CloudWatch publishes an `AWS/Usage` resource count
+/// for, so those rows carry that metric and the window those counts are published
+/// over, while a plane counted inside one cluster carries neither.
+pub(super) fn elasticache_quotas() -> Vec<QuotaRow> {
+    // A per-Region resource plane: metered by that plane's `AWS/Usage` resource count,
+    // and described by the sentence AWS publishes for the plane the row counts.
+    let metered = |code: &str, name: &str, value: f64, resource: &str, counted: &str| {
+        quota(name, value)
+            .code(code)
+            .metric(usage_metric(
+                ELASTICACHE_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", resource),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe(&format!(
+                "The maximum number of {counted} in this account in the current Region."
+            ))
+    };
+    vec![
+        metered(
+            "L-3E7F7726",
+            "Nodes per Region",
+            300.0,
+            "NodesPerRegion",
+            "nodes",
+        ),
+        quota("Nodes per cluster (Memcached)", 40.0)
+            .code("L-3F15A733")
+            .describe("The maximum number of nodes in one Memcached cluster."),
+        quota("Replicas per shard", 5.0)
+            .code("L-75A7B5A4")
+            .describe("The maximum number of read replicas per shard."),
+        metered(
+            "L-7D6587E6",
+            "Parameter groups per Region",
+            150.0,
+            "ParameterGroupsPerRegion",
+            "parameter groups",
+        ),
+        metered(
+            "L-80E085C7",
+            "Security groups per Region",
+            50.0,
+            "SecurityGroupsPerRegion",
+            "cache security groups",
+        ),
+        quota("Shards per cluster (cluster mode enabled)", 500.0)
+            .code("L-8C334AD1")
+            .describe("The maximum number of shards in one cluster with cluster mode enabled."),
+        metered(
+            "L-943F0F1C",
+            "Subnet groups per Region",
+            150.0,
+            "SubnetGroupsPerRegion",
+            "subnet groups",
+        ),
+        quota("Subnets per subnet group", 20.0)
+            .code("L-A87EE522")
+            .describe("The maximum number of subnets in one subnet group."),
+        quota("Users", 100.0)
+            .code("L-AD484FC5")
+            .describe(
+                "The maximum number of users in this account in the current Region.",
+            ),
+        quota("User groups", 100.0)
+            .code("L-AF354865")
+            .describe(
+                "The maximum number of user groups in this account in the current Region.",
+            ),
+        metered(
+            "L-BBCDAECC",
+            "Serverless caches per Region",
+            40.0,
+            "ServerlessCachesPerRegion",
+            "serverless caches",
+        ),
+        metered(
+            "L-DFE45DF3",
+            "Manual backups per Region",
+            1000.0,
+            "ManualBackupsPerRegion",
+            "manual backups",
+        ),
+    ]
+}
+
+/// AWS Elastic Beanstalk's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `elasticbeanstalk` service code
+/// (the "AWS Elastic Beanstalk service quotas" page of its Developer Guide), and the
+/// recorded default-quota listing of that code for which `QuotaCode` names which
+/// quota. Elastic Beanstalk publishes the planes of the deployment model it serves —
+/// the applications of an account, the versions and configuration templates those
+/// applications hold, the environments running them, and the custom platform versions
+/// they run on.
+pub(super) fn elasticbeanstalk_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Applications", 75.0)
+            .code("L-1CEABD17")
+            .describe(
+                "The maximum number of applications in this account in the current Region.",
+            ),
+        quota("Application versions", 1000.0)
+            .code("L-8EFC1C51")
+            .describe(
+                "The maximum number of application versions in this account in the current \
+                 Region.",
+            ),
+        quota("Configuration templates", 300.0)
+            .code("L-9838E43F")
+            .describe(
+                "The maximum number of configuration templates in this account in the current \
+                 Region.",
+            ),
+        quota("Environments", 200.0)
+            .code("L-D64F1F14")
+            .describe(
+                "The maximum number of environments in this account in the current Region.",
+            ),
+        quota("Custom platform versions", 50.0)
+            .code("L-E593A077")
+            .describe(
+                "The maximum number of custom platform versions in this account in the current \
+                 Region.",
+            ),
+    ]
+}
+
+/// The `AWS/Usage` display name Amazon EFS publishes its API call counts under.
+const EFS_USAGE_SERVICE: &str = "EFS";
+
+/// Amazon Elastic File System's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `elasticfilesystem` service
+/// code (the "Amazon EFS quotas that you can increase" and "Quotas for Amazon EFS file
+/// systems" tables of the Amazon EFS User Guide), and the recorded default-quota
+/// listing of that code for which `QuotaCode` names which quota, for each code's
+/// adjustability and for the per-API request rates it publishes beside the resource
+/// planes. A throughput row carries the unit AWS publishes it in rather than being a
+/// count, and a request-rate row carries the one-second window and the `AWS/Usage`
+/// `CallCount` of the operation it throttles ([`request_rate`]).
+pub(super) fn elasticfilesystem_quotas() -> Vec<QuotaRow> {
+    let rate =
+        |code: &str, api: &str, per_second: f64| request_rate(code, EFS_USAGE_SERVICE, api, per_second);
+    vec![
+        quota("File systems per account", 1000.0)
+            .code("L-03A6A61D")
+            .describe(
+                "The maximum number of file systems in this account in the current Region.",
+            ),
+        quota("Access points per file system", 1000.0)
+            .code("L-06519EB8")
+            .describe("The maximum number of access points per file system."),
+        quota("Mount targets per file system per Availability Zone", 1.0)
+            .code("L-1E30FF38")
+            .fixed()
+            .describe(
+                "The maximum number of mount targets that one file system can have in one \
+                 Availability Zone.",
+            ),
+        quota("VPCs per file system", 1.0)
+            .code("L-207AE8E0")
+            .fixed()
+            .describe("The maximum number of VPCs that one file system can be mounted from."),
+        quota("Security groups per mount target", 5.0)
+            .code("L-29770CF9")
+            .fixed()
+            .describe("The maximum number of security groups per mount target."),
+        quota("Tags per file system", 50.0)
+            .code("L-336A920F")
+            .fixed()
+            .describe("The maximum number of tags per file system."),
+        quota("Replication configurations per file system", 1.0)
+            .code("L-3D348029")
+            .fixed()
+            .describe("The maximum number of replication configurations per file system."),
+        quota("Provisioned throughput per file system", 1024.0)
+            .code("L-48B15094")
+            .unit("Megabytes/Second")
+            .describe(
+                "The maximum throughput, in MiB/s, that can be provisioned for one file \
+                 system.",
+            ),
+        quota("Total provisioned throughput per Region", 3072.0)
+            .code("L-4CCB99B3")
+            .unit("Megabytes/Second")
+            .describe(
+                "The maximum throughput, in MiB/s, that can be provisioned across all file \
+                 systems in this account in the current Region.",
+            ),
+        rate("L-509A1582", "CreateAccessPoint", 5.0),
+        rate("L-6D380DD0", "CreateFileSystem", 5.0),
+        rate("L-7391004C", "CreateMountTarget", 5.0),
+        rate("L-7FEABCD7", "CreateReplicationConfiguration", 5.0),
+        rate("L-848C634D", "DeleteAccessPoint", 5.0),
+        rate("L-A139E5A7", "DeleteFileSystem", 5.0),
+        rate("L-B34D07B4", "DeleteMountTarget", 5.0),
+        rate("L-B8B14E21", "DescribeAccessPoints", 100.0),
+        rate("L-BFB6FB19", "DescribeFileSystems", 100.0),
+        rate("L-C8C0D2A0", "DescribeMountTargets", 100.0),
+        rate("L-CDCE244F", "DescribeReplicationConfigurations", 100.0),
+        rate("L-D6548EE7", "PutBackupPolicy", 10.0),
+        rate("L-F3C5D9EF", "PutLifecycleConfiguration", 10.0),
+        rate("L-FA0AAA42", "UpdateFileSystem", 10.0),
+    ]
+}
+
+/// The `AWS/Usage` display name Elastic Load Balancing publishes its resource counts
+/// under, which is the `Service` dimension of every metered load-balancing quota.
+const ELB_USAGE_SERVICE: &str = "Elastic Load Balancing";
+
+/// Elastic Load Balancing's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `elasticloadbalancing` service
+/// code (the "Quotas for your Application Load Balancers", "…Network Load Balancers",
+/// "…Gateway Load Balancers" and "…Classic Load Balancers" pages of the Elastic Load
+/// Balancing User Guide), and the recorded default-quota listing of that code for
+/// which `QuotaCode` names which quota, for each code's adjustability and for the
+/// usage metric each metered row carries. Elastic Load Balancing publishes its planes
+/// PER LOAD BALANCER TYPE — a type is what a listener, rule or target allowance is
+/// bought under — so a row is named for the type it is counted on, and the per-Region
+/// planes of each type are the ones CloudWatch publishes an `AWS/Usage` resource count
+/// for.
+pub(super) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
+    // A per-Region resource plane of one load-balancer type: metered by that plane's
+    // `AWS/Usage` resource count, and described by the sentence AWS publishes for the
+    // plane the row counts.
+    let metered = |code: &str, name: &str, value: f64, resource: &str, counted: &str| {
+        quota(name, value)
+            .code(code)
+            .metric(usage_metric(
+                ELB_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", resource),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe(&format!(
+                "The maximum number of {counted} in this account in the current Region."
+            ))
+    };
+    vec![
+        metered(
+            "L-057ECE54",
+            "Application Load Balancers per Region",
+            50.0,
+            "ApplicationLoadBalancersPerRegion",
+            "Application Load Balancers",
+        ),
+        metered(
+            "L-0BB7B635",
+            "Classic Load Balancers per Region",
+            20.0,
+            "ClassicLoadBalancersPerRegion",
+            "Classic Load Balancers",
+        ),
+        metered(
+            "L-1A491844",
+            "Network Load Balancers per Region",
+            50.0,
+            "NetworkLoadBalancersPerRegion",
+            "Network Load Balancers",
+        ),
+        metered(
+            "L-23568085",
+            "Gateway Load Balancers per Region",
+            100.0,
+            "GatewayLoadBalancersPerRegion",
+            "Gateway Load Balancers",
+        ),
+        metered(
+            "L-332EE142",
+            "Target groups per Region",
+            3000.0,
+            "TargetGroupsPerRegion",
+            "target groups",
+        ),
+        quota("Listeners per Application Load Balancer", 50.0)
+            .code("L-37E1617B")
+            .describe("The maximum number of listeners per Application Load Balancer."),
+        quota("Listeners per Network Load Balancer", 50.0)
+            .code("L-43FE5A42")
+            .describe("The maximum number of listeners per Network Load Balancer."),
+        quota("Listeners per Gateway Load Balancer", 1.0)
+            .code("L-52964454")
+            .fixed()
+            .describe("The maximum number of listeners per Gateway Load Balancer."),
+        quota("Listeners per Classic Load Balancer", 100.0)
+            .code("L-53DA6B97")
+            .describe("The maximum number of listeners per Classic Load Balancer."),
+        quota("Rules per Application Load Balancer", 100.0)
+            .code("L-57A373D6")
+            .describe(
+                "The maximum number of rules per Application Load Balancer, not counting \
+                 default rules.",
+            ),
+        quota("Certificates per Application Load Balancer", 25.0)
+            .code("L-69A177A2")
+            .describe(
+                "The maximum number of certificates per Application Load Balancer, not \
+                 counting default certificates.",
+            ),
+        quota("Certificates per Network Load Balancer", 25.0)
+            .code("L-723DCCB6")
+            .describe(
+                "The maximum number of certificates per Network Load Balancer, not counting \
+                 default certificates.",
+            ),
+        quota("Target groups per Application Load Balancer", 100.0)
+            .code("L-7A15E3C5")
+            .fixed()
+            .describe("The maximum number of target groups per Application Load Balancer."),
+        quota("Target groups per action per Application Load Balancer", 5.0)
+            .code("L-7C45F98A")
+            .fixed()
+            .describe(
+                "The maximum number of target groups per action for one Application Load \
+                 Balancer.",
+            ),
+        quota("Targets per Application Load Balancer", 1000.0)
+            .code("L-7E6692B2")
+            .describe("The maximum number of targets per Application Load Balancer."),
+        quota("Targets per Network Load Balancer", 3000.0)
+            .code("L-7EED9B64")
+            .describe("The maximum number of targets per Network Load Balancer."),
+        quota("Targets per Gateway Load Balancer", 300.0)
+            .code("L-822D1B1B")
+            .describe("The maximum number of targets per Gateway Load Balancer."),
+        quota(
+            "Targets per Availability Zone per Network Load Balancer",
+            500.0,
+        )
+        .code("L-8A66D0E6")
+        .describe(
+            "The maximum number of targets per Availability Zone per Network Load Balancer.",
+        ),
+        quota(
+            "Targets per Availability Zone per Gateway Load Balancer",
+            300.0,
+        )
+        .code("L-9365A611")
+        .describe(
+            "The maximum number of targets per Availability Zone per Gateway Load Balancer.",
+        ),
+        quota(
+            "Targets per target group per Application Load Balancer",
+            1000.0,
+        )
+        .code("L-9E6F9012")
+        .describe("The maximum number of targets per target group per Application Load Balancer."),
+        quota("Targets per target group per Network Load Balancer", 1000.0)
+            .code("L-A012D4E8")
+            .describe(
+                "The maximum number of targets per target group per Network Load Balancer.",
+            ),
+        quota("Registered instances per Classic Load Balancer", 1000.0)
+            .code("L-A0D0B863")
+            .describe("The maximum number of instances registered with one Classic Load Balancer."),
+        quota("Condition values per rule", 5.0)
+            .code("L-A8F7060B")
+            .fixed()
+            .describe("The maximum number of condition values per rule."),
+        quota("Condition wildcards per rule", 5.0)
+            .code("L-B211E961")
+            .fixed()
+            .describe("The maximum number of condition wildcards per rule."),
+        quota("Load balancers per target group", 1.0)
+            .code("L-B22855CB")
+            .fixed()
+            .describe("The maximum number of load balancers one target group can be used by."),
+        quota("Subnets per Availability Zone per load balancer", 1.0)
+            .code("L-B6DF7632")
+            .fixed()
+            .describe(
+                "The maximum number of subnets per Availability Zone for one load balancer.",
+            ),
+        quota("Trust stores per Region", 10.0)
+            .code("L-CE3125E5")
+            .describe(
+                "The maximum number of trust stores in this account in the current Region.",
+            ),
+        quota("Certificate authority certificates per trust store", 25.0)
+            .code("L-E9E9831D")
+            .describe(
+                "The maximum number of certificate authority certificates per trust store.",
+            ),
+        quota("Revocation lists per trust store", 10.0)
+            .code("L-EBC0C08B")
+            .describe("The maximum number of certificate revocation lists per trust store."),
+        quota("Security groups per load balancer", 5.0)
+            .code("L-EEF1AD04")
+            .fixed()
+            .describe("The maximum number of security groups per load balancer."),
+        quota("Tags per load balancer", 50.0)
+            .code("L-F31E307C")
+            .fixed()
+            .describe("The maximum number of tags per load balancer."),
     ]
 }
 
