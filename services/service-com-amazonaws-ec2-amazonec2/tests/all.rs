@@ -39,6 +39,14 @@ mod vpc_encryption_controls;
 // suite inserts its lines.
 #[path = "all/vpc_internet_path.rs"]
 mod vpc_internet_path;
+// The create side of the route table slice: the one table `CreateRouteTable` stores for the
+// VPC a request names, with the local route it comes with for each block that VPC has
+// associated, the tags it asked for, the client token that makes the create idempotent, and
+// the refusals and dry run that store nothing — each read back through `DescribeRouteTables`.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/create_route_table.rs"]
+mod create_route_table;
 // An account's internet gateways: what `CreateInternetGateway` stores and
 // `DescribeInternetGateways` reports back out of that store — the id, the owning account, the
 // empty attachment set, the tags, and how the id list, the documented filters and the page
