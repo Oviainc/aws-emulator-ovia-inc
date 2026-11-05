@@ -748,38 +748,23 @@ fn selected_response(
         .or_else(|| default_integration_response(integration))
 }
 
-/// The compiled-program budget one stored `selectionPattern` may take, so a pattern inside
-/// the stored length still cannot compile into an arbitrarily large automaton — the bound is
-/// stated here rather than left to the engine's own default, as the other services that
-/// evaluate a caller-stored pattern state theirs. The subject is three characters and the
-/// pattern selects one of at most 500 responses ([`selected_response`]), so neither factor
-/// of the matching cost is caller-unbounded.
-const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
-
-/// See [`COMPILED_PATTERN_LIMIT`]: the budget for the lazy DFA the match runs through, so a
-/// pattern cannot thrash that cache either.
-const PATTERN_DFA_LIMIT: usize = 64 * 1024;
-
 /// Whether the `selectionPattern` `pattern` matches `value`, which is the backend status
 /// for an AWS integration.
 ///
 /// The pattern is a regular expression a CONTROL-PLANE call stored, not one a request
 /// carries, and the subject is the three characters of a status code: it is matched WHOLE,
 /// so a pattern for a class of statuses (`4\d{2}`) selects exactly that class rather than
-/// every status one of its digits appears in. It is evaluated by the maintained engine,
-/// whose matching is linear in the subject with no backtracking blowup, under the EXPLICIT
-/// compiled-size and DFA budgets above — so a stored pattern cannot make a request to this
-/// stage expensive. A pattern that is not a regular expression this engine builds within
-/// those budgets matches nothing, and is said so.
+/// every status one of its digits appears in. It is built through
+/// [`super::stored_pattern`] — this data plane's one compile of a caller-stored expression,
+/// under its EXPLICIT compiled-size and DFA budgets, by the maintained engine whose matching
+/// is linear in the subject with no backtracking blowup — so a stored pattern cannot make a
+/// request to this stage expensive. A pattern that is not a regular expression this engine
+/// builds within those budgets matches nothing, and is said so.
 fn pattern_matches(pattern: &str, value: &str) -> bool {
     let anchored = format!("^(?:{pattern})$");
-    match ::regex::RegexBuilder::new(&anchored)
-        .size_limit(COMPILED_PATTERN_LIMIT)
-        .dfa_size_limit(PATTERN_DFA_LIMIT)
-        .build()
-    {
-        Ok(regex) => regex.is_match(value),
-        Err(_) => {
+    match super::stored_pattern(&anchored) {
+        Some(regex) => regex.is_match(value),
+        None => {
             ::tracing::warn!(
                 "an integration response's selectionPattern is not a regular expression \
                  this emulator evaluates within its compiled-size budget, so it selects \

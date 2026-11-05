@@ -216,9 +216,12 @@
 //! cluster holds — it reports what the integration answers for the records as they stand.
 
 pub mod aws_integration;
+pub mod cognito_user_pools;
+pub mod execute_api_authorization;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -304,7 +307,13 @@ const AUTHORIZATION_AWS_IAM: &str = "AWS_IAM";
 /// The `authorizationType`s served by an `Authorizer` of the API: "`CUSTOM` for using a
 /// custom authorizer, or `COGNITO_USER_POOLS` for using a Cognito user pool"
 /// (`Method$authorizationType`).
-const AUTHORIZATION_BY_AUTHORIZER: &[&str] = &["CUSTOM", "COGNITO_USER_POOLS"];
+const AUTHORIZATION_BY_AUTHORIZER: &[&str] = &["CUSTOM", AUTHORIZATION_COGNITO_USER_POOLS];
+
+/// The one `authorizationType` whose authorizer's decision is a function of the request and
+/// of the api's own records rather than of code this emulator cannot run: "`COGNITO_USER_POOLS`
+/// for using a Cognito user pool" (`Method$authorizationType`), evaluated in full by
+/// [`cognito_user_pools`].
+const AUTHORIZATION_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
 
 /// The header an API key travels in when the API's `apiKeySource` is `HEADER`, which is
 /// what that member documents: "`HEADER` to read the API key from the `X-API-Key` header of
@@ -1211,9 +1220,11 @@ async fn serving<Eng: Send + Sync + 'static>(
             .find(|resource| resource.path == matched_path)
             .and_then(|resource| resource.methods.get(verb));
 
-        if let Some(refusal) = authorization_refusal(api, live_method, authorization_type, req) {
-            return refusal_response(Some(api), refusal);
-        }
+        let authorizer_claims =
+            match authorization_refusal(engine, api, live_method, authorization_type, req) {
+                Ok(claims) => claims,
+                Err(refusal) => return refusal_response(Some(api), refusal),
+            };
         // The api's own RESOURCE POLICY, which "applies to this RestApi regardless of the
         // caller and Method configuration" (`RestApi$policy`): a document the developer
         // attached decides every request this endpoint answers, so it is applied here —
@@ -1224,14 +1235,33 @@ async fn serving<Eng: Send + Sync + 'static>(
         // Who the request speaks for is the METHOD's authorization, not what the request
         // carries: API Gateway authenticates nobody for a method whose `authorizationType`
         // is `NONE`, so such a call speaks for nobody however it is signed, while an
-        // `AWS_IAM` method is reached with a credential the emulator has already verified.
-        // `service_common` owns the one definition of the identity this emulator's
-        // published credential speaks for, so the principal a refusal here blames is the
-        // one STS reports for it.
-        let signed_as = (authorization_type == AUTHORIZATION_AWS_IAM)
-            .then(::service_common::caller_principal::ambient_user_arn);
-        // Built once, because TWO decisions are taken about this call: whether the document
-        // lets it invoke the method, and whether it lets the caller ask for the stage's
+        // `AWS_IAM` method speaks for the principal the credential it signed with was
+        // minted for — the session STS holds for it, which is what makes a credential an
+        // identity pool VENDED a principal this api's policies can be written about
+        // ([`execute_api_authorization`]).
+        let signing = (authorization_type == AUTHORIZATION_AWS_IAM).then(|| {
+            execute_api_authorization::signing_caller(
+                engine,
+                sigv4_access_key_id(req).unwrap_or_default().as_str(),
+                ctx.credential_store(),
+                SystemTime::now(),
+            )
+        });
+        let signed_as = signing.as_ref().map(|caller| caller.arn.clone());
+        // A credential the clock has already run out on speaks for nobody, so nothing below has
+        // a principal to decide about: it is refused here, BEFORE the api's own document is
+        // asked, rather than letting a wildcard `Principal` match a credential that names no
+        // one. (In the assembled emulator the layer that authenticates a request refuses such a
+        // credential before this plane is reached at all.)
+        if let Some(message) = signing
+            .as_ref()
+            .and_then(execute_api_authorization::expired_refusal)
+        {
+            return refusal_response(Some(api), access_denied(message));
+        }
+        // Built once, because THREE decisions are taken about this call: whether the
+        // caller's own policies let it invoke the method, whether the document the api
+        // carries does, and whether that document lets the caller ask for the stage's
         // cached response to be reloaded.
         let call_of = resource_policy::Call {
             // The api's own Region, from the record: an api lives in exactly one
@@ -1266,6 +1296,26 @@ async fn serving<Eng: Send + Sync + 'static>(
                 return refusal_response(Some(api), access_denied(message));
             }
         }
+        // An `AWS_IAM` method is authorized by IAM, and that is a decision about the
+        // PRINCIPAL the verified credential speaks for: `execute-api:Invoke` on this
+        // method's own ARN, allowed by the caller's identity-based policies or by the
+        // document the api carries. Taken after the resource policy's own deny, so an
+        // explicit deny there keeps answering first.
+        if let Some(signing) = signing.as_ref() {
+            let allowed_by_policy = resource_policy::allows_invoke(attached_policy, &call_of);
+            if let Some(message) =
+                execute_api_authorization::refusal(signing, &call_of, allowed_by_policy)
+            {
+                tracing::warn!(
+                    api_id = %api.id,
+                    stage = %stage.stage_name,
+                    path = %matched_path,
+                    verb = %verb,
+                    "the caller is not authorized to invoke this method"
+                );
+                return refusal_response(Some(api), access_denied(message));
+            }
+        }
         // A key-required method is admitted by the key the records associate with this
         // stage, and the association is also what says which usage plans METER the call.
         let admission = if snapshot.api_key_required {
@@ -1291,7 +1341,14 @@ async fn serving<Eng: Send + Sync + 'static>(
                 querystring: sent_query_parameters(query_of(req.uri())),
                 header: sent_headers(req),
                 stage_variables: stage.variables.clone(),
-                context: call_context(&api.id, &stage.stage_name, verb, matched_path, req.uri()),
+                context: call_context(
+                    &api.id,
+                    &stage.stage_name,
+                    verb,
+                    matched_path,
+                    req.uri(),
+                    &authorizer_claims,
+                ),
             },
         );
         // The method's own request validator, before the integration is reached: a
@@ -2077,40 +2134,49 @@ fn warned(mut response: RtResponse, warn: bool) -> RtResponse {
     response
 }
 
-/// The refusal the method's `authorizationType` earns this request, or `None` when the
-/// request may proceed.
+/// What the method's `authorizationType` makes of this request: the claims the authorizer
+/// publishes to the integration, or the refusal the request earns.
 ///
-/// `NONE` admits every request. `AWS_IAM` needs a SigV4 credential, whose SIGNATURE the
-/// emulator itself verifies (a service never checks signatures), so only its presence is
-/// read here. An `Authorizer`-backed type is a decision this emulator cannot obtain — the
-/// authorizer runs code — except for the one part of it that is settled before the
-/// authorizer is called: an identity source the request does not carry is `401` without
-/// the authorizer running at all (`Authorizer$identitySource`).
+/// `NONE` admits every request and publishes nothing. `AWS_IAM` needs a SigV4 credential,
+/// whose SIGNATURE the emulator itself verifies (a service never checks signatures), so only
+/// its presence is read here — WHETHER that credential may invoke the method is the decision
+/// [`execute_api_authorization`] takes, applied by [`serving`] once the method ARN is known.
 ///
-/// What `AWS_IAM` here does NOT do, stated so a passing test is not read as more than it
-/// is: no IDENTITY-based decision is made. AWS both authenticates the signature and
-/// evaluates `execute-api:Invoke` for the resolved principal against the caller's identity
-/// policies as well as the api's resource policy, refusing an authenticated but
-/// unprivileged caller. This emulator models no identity-policy evaluation for an invoke,
-/// so the decision an under-privileged principal would get from AWS is not one it can
-/// produce; a verified credential gets past THIS gate. The api's own RESOURCE policy is a
-/// decision it does make, on every request whatever the authorization type —
-/// [`super::resource_policy`], applied by [`serve_resolved`] straight after this.
-fn authorization_refusal(
+/// An `Authorizer`-backed type is read in two steps. The part settled before the authorizer
+/// is called at all is the identity source: a source the request does not carry is `401`
+/// without the authorizer running (`Authorizer$identitySource`). Then the DECISION:
+///
+/// * `COGNITO_USER_POOLS` is decided in full, because it is a function of the token, of the
+///   pools the authorizer's `providerARNs` name and of the method's own
+///   `authorizationScopes` — all of which are records this emulator holds
+///   ([`cognito_user_pools`]) — and the claims of an accepted token are what the
+///   integration sees as `$context.authorizer.claims`;
+/// * `CUSTOM` is a Lambda function's return value, which no deployment package produces here,
+///   so it is answered through `AUTHORIZER_CONFIGURATION_ERROR` rather than guessed at.
+///
+/// The api's own RESOURCE policy is a separate decision, taken on every request whatever the
+/// authorization type — [`super::resource_policy`], applied by [`serving`] straight after
+/// this.
+fn authorization_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     api: &RestApiEntry,
     method: Option<&MethodEntry>,
     authorization_type: &str,
     req: &RtRequest,
-) -> Option<GatewayRefusal> {
+) -> Result<BTreeMap<String, String>, GatewayRefusal> {
     if authorization_type == AUTHORIZATION_NONE {
-        return None;
+        return Ok(BTreeMap::new());
     }
     if authorization_type == AUTHORIZATION_AWS_IAM {
-        return (!carries_sigv4_credential(req)).then_some(MISSING_AUTHENTICATION_TOKEN);
+        return if carries_sigv4_credential(req) {
+            Ok(BTreeMap::new())
+        } else {
+            Err(MISSING_AUTHENTICATION_TOKEN)
+        };
     }
     if !AUTHORIZATION_BY_AUTHORIZER.contains(&authorization_type) {
         // A value outside the documented set is a method this emulator cannot authorize.
-        return Some(API_CONFIGURATION_ERROR);
+        return Err(API_CONFIGURATION_ERROR);
     }
     // A method whose `authorizerId` names no authorizer of this API cannot authorize the
     // call at all, which is a configuration the stage cannot serve.
@@ -2118,8 +2184,12 @@ fn authorization_refusal(
         .and_then(|method| method.authorizer_id.as_deref())
         .and_then(|id| api.authorizers.get(id))
     else {
-        return Some(API_CONFIGURATION_ERROR);
+        return Err(API_CONFIGURATION_ERROR);
     };
+    // The value the authorizer EXTRACTS from the request, which is what it then evaluates:
+    // the first identity source that names a part of the request, in the order the authorizer
+    // declares them.
+    let mut presented: Option<String> = None;
     for source in authorizer
         .identity_source
         .as_deref()
@@ -2133,31 +2203,65 @@ fn authorization_refusal(
         // to something else (a stage variable, say) is not one this emulator can resolve,
         // and is left to the refusal below rather than treated as satisfied.
         if let Some(header) = source.strip_prefix(METHOD_REQUEST_HEADER_PREFIX) {
-            if req
+            let Some(value) = req
                 .headers()
                 .get(header.to_ascii_lowercase())
-                .is_none_or(str::is_empty)
-            {
-                return Some(UNAUTHORIZED);
-            }
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(UNAUTHORIZED);
+            };
+            presented.get_or_insert_with(|| value.to_string());
             continue;
         }
         if let Some(parameter) = source.strip_prefix(METHOD_REQUEST_QUERY_PREFIX) {
-            let present = query_of(req.uri()).split('&').any(|pair| {
+            let carried = query_of(req.uri()).split('&').find_map(|pair| {
                 pair.split_once('=')
-                    .is_some_and(|(key, value)| key == parameter && !value.is_empty())
+                    .filter(|(key, value)| *key == parameter && !value.is_empty())
+                    .map(|(_, value)| value.to_string())
             });
-            if !present {
-                return Some(UNAUTHORIZED);
-            }
+            let Some(value) = carried else {
+                return Err(UNAUTHORIZED);
+            };
+            presented.get_or_insert(value);
         }
+    }
+    if authorization_type == AUTHORIZATION_COGNITO_USER_POOLS
+        && authorizer.r#type == crate::ops::create_authorizer::AUTHORIZER_TYPE_COGNITO_USER_POOLS
+    {
+        // No value extracted at all is an authorizer that was not called: the identity source
+        // it declares is one this emulator could not read, or it declares none.
+        let Some(presented) = presented else {
+            return Err(UNAUTHORIZED);
+        };
+        return match cognito_user_pools::evaluate(
+            engine,
+            authorizer,
+            // The METHOD's own `authorizationScopes`, which "are used with a
+            // `COGNITO_USER_POOLS` authorizer to authorize the method invocation"
+            // (`Method$authorizationScopes`) — read off the live method, since
+            // `Deployment$apiSummary`'s `MethodSnapshot` models them not at all.
+            method.map_or(&[][..], |method| method.authorization_scopes.as_slice()),
+            &presented,
+            SystemTime::now(),
+        ) {
+            cognito_user_pools::Decision::Authorized(authorized) => Ok(authorized.claims),
+            cognito_user_pools::Decision::Unauthorized(reason) => {
+                tracing::warn!(
+                    authorizer = %authorizer.name,
+                    %reason,
+                    "refusing an invoke: the user-pool authorizer does not accept the presented \
+                     token"
+                );
+                Err(UNAUTHORIZED)
+            }
+        };
     }
     tracing::warn!(
         authorizer = %authorizer.name,
         kind = %authorizer.r#type,
         "the authorizer's decision cannot be obtained: this emulator runs no authorizer code"
     );
-    Some(AUTHORIZER_CONFIGURATION_ERROR)
+    Err(AUTHORIZER_CONFIGURATION_ERROR)
 }
 
 /// What the records say about the API key a request presented: which stored key admitted
@@ -3714,16 +3818,23 @@ fn sent_headers(req: &RtRequest) -> BTreeMap<String, String> {
 /// The `$context` values of this call, keyed by the member path a mapping template writes.
 ///
 /// Only what the api's own records and the request itself say about the call: which api and
-/// stage answered it, the method it reached and the path it arrived at. The per-request id
-/// is NOT among them — it is minted where the response reports it (`service_common` owns
-/// both the minting and the header), so it is not a value this call carries — and a member
-/// no value here names is a reference the template is not rendered from at all.
+/// stage answered it, the method it reached, the path it arrived at, and the CLAIMS the
+/// method's authorizer published for it. The per-request id is NOT among them — it is minted
+/// where the response reports it (`service_common` owns both the minting and the header), so
+/// it is not a value this call carries — and a member no value here names is a reference the
+/// template is not rendered from at all.
+///
+/// An authorizer's claims are published under `authorizer.claims.<name>`, the member path a
+/// template reads a signed-in user by (`$context.authorizer.claims.sub`); a method whose
+/// authorization publishes none adds no member, so such a reference stays unrendered exactly
+/// as it did before any authorizer published anything.
 fn call_context(
     api_id: &str,
     stage: &str,
     verb: &str,
     resource_path: &str,
     uri: &str,
+    authorizer_claims: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     [
         ("apiId", api_id.to_string()),
@@ -3734,7 +3845,48 @@ fn call_context(
     ]
     .into_iter()
     .map(|(member, value)| (member.to_string(), value))
+    .chain(
+        authorizer_claims
+            .iter()
+            .map(|(claim, value)| (format!("{AUTHORIZER_CLAIMS_MEMBER}.{claim}"), value.clone())),
+    )
     .collect()
+}
+
+/// The `$context` member path an authorizer's claims are published under.
+///
+/// `$context.authorizer.claims.<name>` is how a mapping template reads one claim of the token
+/// a `COGNITO_USER_POOLS` authorizer accepted, which is what makes the signed-in user
+/// available to the integration.
+const AUTHORIZER_CLAIMS_MEMBER: &str = "authorizer.claims";
+
+/// The compiled-program budget one caller-STORED regular expression may take, so an
+/// expression inside the stored length still cannot compile into an arbitrarily large
+/// automaton — the bound is stated here rather than left to the engine's own default, as the
+/// other services that evaluate a caller-stored pattern state theirs.
+const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
+
+/// See [`COMPILED_PATTERN_LIMIT`]: the budget for the lazy DFA a match runs through, so a
+/// stored expression cannot thrash that cache either.
+const PATTERN_DFA_LIMIT: usize = 64 * 1024;
+
+/// `expression` compiled under the two EXPLICIT budgets above, or `None` for a value this
+/// engine does not build a regular expression of within them.
+///
+/// The ONE compile of a caller-stored regular expression this data plane makes: an
+/// `IntegrationResponse$selectionPattern` ([`aws_integration`]) and an
+/// `Authorizer$identityValidationExpression` ([`cognito_user_pools`]) are both patterns a
+/// CONTROL-PLANE call stored and a REQUEST is then matched against, so both are built here —
+/// under budgets, by the maintained engine whose matching is linear in the subject with no
+/// backtracking blowup, so a stored pattern cannot make a request to a deployed stage
+/// expensive. A pattern the budgets refuse is reported as one this emulator does not
+/// evaluate, which is the caller's own decision to make.
+pub(crate) fn stored_pattern(expression: &str) -> Option<::regex::Regex> {
+    ::regex::RegexBuilder::new(expression)
+        .size_limit(COMPILED_PATTERN_LIMIT)
+        .dfa_size_limit(PATTERN_DFA_LIMIT)
+        .build()
+        .ok()
 }
 
 /// Whether the request presents a SigV4 credential at all — in the `Authorization` header a
@@ -3752,18 +3904,36 @@ fn call_context(
 /// a service's — and it is one the emulator cannot make for this plane: it verifies a
 /// request against the signing name of the service that claimed it, which for this service
 /// is its control plane's, while an invoke is signed under the data plane's own
-/// (`crate::service`'s module docs state the whole rule).
+/// (`crate::service`'s module docs state the whole rule). WHICH principal the credential
+/// speaks for, and whether that principal may invoke the method, is
+/// [`execute_api_authorization`]'s decision.
 pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
-    if req
+    sigv4_access_key_id(req).is_some()
+}
+
+/// The ACCESS KEY ID of the SigV4 credential the request presents, from either form
+/// [`carries_sigv4_credential`] reads: the `Credential=<akid>/<scope>` element of the
+/// `Authorization` header, or the `X-Amz-Credential` query parameter of a presigned URL.
+///
+/// One reader for the presence and the value, so a request that is admitted as signed is
+/// also one whose principal can be resolved.
+fn sigv4_access_key_id(req: &RtRequest) -> Option<String> {
+    let key_id_of = |credential: &str| {
+        let key_id = credential.split('/').next().unwrap_or(credential).trim();
+        (!key_id.is_empty()).then(|| key_id.to_string())
+    };
+    if let Some(credential) = req
         .headers()
         .get("authorization")
-        .is_some_and(|value| value.contains("Credential="))
+        .and_then(|value| value.split("Credential=").nth(1))
+        .and_then(|credential| credential.split([',', ' ']).next())
     {
-        return true;
+        return key_id_of(credential);
     }
     query_of(req.uri())
         .split('&')
-        .any(|pair| pair.starts_with("X-Amz-Credential="))
+        .find_map(|pair| pair.strip_prefix("X-Amz-Credential="))
+        .and_then(key_id_of)
 }
 
 /// One gateway-response refusal, rendered as the API serves it on the wire.

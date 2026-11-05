@@ -187,6 +187,21 @@ pub fn denial(policy: &str, call: &Call<'_>) -> Option<String> {
     refused.then(|| not_authorized(INVOKE_ACTION, call.principal_named(), &call.method_arn()))
 }
 
+/// Whether the document the api carries explicitly ALLOWS this call to invoke the method.
+///
+/// The one thing [`denial`] cannot report: it answers whether the document REFUSES the call,
+/// and for an IAM-authorized caller an unstated document is not a refusal (the module docs give
+/// the argument). Whether it is an ALLOW is a different question, and it is the one the
+/// identity-based gate beside this one needs — for a caller in the api's own account either
+/// grant suffices, so an allow here admits a caller whose own policies state nothing
+/// ([`super::invoke::execute_api_authorization`]).
+///
+/// `policy` is `None` for an api carrying no document, which allows nothing.
+#[must_use]
+pub fn allows_invoke(policy: Option<&str>, call: &Call<'_>) -> bool {
+    policy.is_some_and(|policy| decision(policy, call, INVOKE_ACTION) == Decision::Allowed)
+}
+
 /// Whether this call may ask for the stage's cached response to be reloaded, which is what
 /// a stage requiring authorization for a cache-control header asks about.
 ///
@@ -269,7 +284,11 @@ fn decision(policy: &str, call: &Call<'_>, action: &str) -> Decision {
 /// sentence ends in the clause OTHER services word their refusal with ("because no
 /// resource-based policy allows …"); the `execute-api` endpoint's own answer ends at the
 /// resource.
-fn not_authorized(action: &str, principal: &str, method_arn: &str) -> String {
+///
+/// `pub(crate)` because the IDENTITY-based gate beside this one refuses the same call about
+/// the same method in the same sentence ([`super::invoke::execute_api_authorization`]) — one
+/// wording, so the two gates cannot diverge while their docs say they do not.
+pub(crate) fn not_authorized(action: &str, principal: &str, method_arn: &str) -> String {
     format!("User: {principal} is not authorized to perform: {action} on resource: {method_arn}")
 }
 

@@ -304,18 +304,37 @@ fn reference_at(glyphs: &[char], at: usize, depth: usize) -> Option<(Reference, 
     let (variable, next) = identifier_at(glyphs, index)?;
     index = next;
     let mut steps = Vec::new();
-    while glyphs.get(index) == Some(&'.') {
-        let Some((name, after_name)) = identifier_at(glyphs, index + 1) else {
-            break;
-        };
-        if glyphs.get(after_name) == Some(&'(') {
-            let (arguments, after_call) = arguments_at(glyphs, after_name + 1, depth + 1)?;
-            steps.push(Step::Call(name, arguments));
-            index = after_call;
-        } else {
-            steps.push(Step::Member(name));
-            index = after_name;
+    loop {
+        if glyphs.get(index) == Some(&'.') {
+            let Some((name, after_name)) = identifier_at(glyphs, index + 1) else {
+                break;
+            };
+            if glyphs.get(after_name) == Some(&'(') {
+                let (arguments, after_call) = arguments_at(glyphs, after_name + 1, depth + 1)?;
+                steps.push(Step::Call(name, arguments));
+                index = after_call;
+            } else {
+                steps.push(Step::Member(name));
+                index = after_name;
+            }
+            continue;
         }
+        // The BRACKETED spelling of the same member, which is how a key that is not a bare
+        // name is reached: `$context.authorizer.claims['cognito:username']`. A Cognito
+        // authorizer publishes namespaced claims, whose `:` no identifier admits, so the
+        // bracketed form is the only way a template can read one.
+        if glyphs.get(index) == Some(&'[') {
+            let Some((key, after_key)) = quoted_key_at(glyphs, index + 1) else {
+                break;
+            };
+            if glyphs.get(after_key) != Some(&']') {
+                break;
+            }
+            steps.push(Step::Member(key));
+            index = after_key + 1;
+            continue;
+        }
+        break;
     }
     if braced {
         if glyphs.get(index) != Some(&'}') {
@@ -335,6 +354,12 @@ fn reference_at(glyphs: &[char], at: usize, depth: usize) -> Option<(Reference, 
     ))
 }
 
+/// The `$context` member whose value is a MAP an authorizer returned rather than a fixed set
+/// of members: `$context.authorizer`, whose `claims` a user-pool authorizer fills and whose
+/// other keys a custom authorizer chooses. A key it does not carry is an absent value, so a
+/// reference to one renders as nothing.
+const AUTHORIZER_MEMBER: &str = "authorizer";
+
 /// The identifier at `at` and the index just past it: a letter or `_`, then letters,
 /// digits, `_` and `-`, which is what the language admits in a name.
 fn identifier_at(glyphs: &[char], at: usize) -> Option<(String, usize)> {
@@ -353,6 +378,31 @@ fn identifier_at(glyphs: &[char], at: usize) -> Option<(String, usize)> {
         }
     }
     Some((name, index))
+}
+
+/// The quoted key at `at` and the index just past its closing quote: the subscript of a
+/// bracketed member access (`['cognito:username']`, `["cognito:username"]`).
+///
+/// Either quote, as the language admits both, and the key is taken verbatim — a member name is
+/// whatever the value it names is keyed by, which for a token's claim is the claim's own name.
+/// `None` for a subscript that is not a quoted string, which leaves the text unread rather
+/// than guessed at.
+fn quoted_key_at(glyphs: &[char], at: usize) -> Option<(String, usize)> {
+    let quote = *glyphs.get(at)?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut index = at + 1;
+    let mut key = String::new();
+    loop {
+        let glyph = *glyphs.get(index)?;
+        index += 1;
+        if glyph == quote {
+            break;
+        }
+        key.push(glyph);
+    }
+    (!key.is_empty()).then_some((key, index))
 }
 
 /// The arguments of a method call opened at `at` (just past its `(`), and the index just
@@ -493,12 +543,22 @@ impl Render<'_> {
                     .ok_or_else(unresolved)
             }
             // "$context" — "contains the contextual information of your request". Only the
-            // members this call has a value for resolve.
+            // members this call has a value for resolve, with the one exception the
+            // `authorizer` map below states.
             "context" => {
                 let mut named = Vec::with_capacity(reference.steps.len());
                 for step in &reference.steps {
                     match step {
                         Step::Member(name) => named.push(name.clone()),
+                        // `get('name')` is the method a MAP of the context is read by, which
+                        // is the other spelling of the bracketed member access above — the
+                        // same member, named by its key.
+                        Step::Call(method, arguments) if method == "get" => {
+                            match self.one_argument(arguments)? {
+                                Some(key) => named.push(key),
+                                None => return Err(unresolved()),
+                            }
+                        }
                         Step::Call(_, _) => return Err(unresolved()),
                     }
                 }
@@ -506,6 +566,19 @@ impl Render<'_> {
                     .context
                     .get(&named.join("."))
                     .cloned()
+                    .or_else(|| {
+                        // `$context.authorizer` is not a fixed set of members: it is the MAP
+                        // an authorizer returned as the context of its decision — its
+                        // `claims` for a user-pool authorizer, whatever a custom one put
+                        // there — so a key it does not carry is an ABSENT VALUE rather than a
+                        // reference naming something outside the language. It renders as
+                        // nothing, the way a lookup in every other map of the call does
+                        // (`$input.params` of a parameter the request did not send).
+                        named
+                            .first()
+                            .is_some_and(|first| first == AUTHORIZER_MEMBER)
+                            .then(String::new)
+                    })
                     .ok_or_else(unresolved)
             }
             _ => Err(unresolved()),
@@ -593,6 +666,14 @@ mod tests {
             context: [
                 ("httpMethod".to_string(), "POST".to_string()),
                 ("stage".to_string(), "test".to_string()),
+                (
+                    "authorizer.claims.sub".to_string(),
+                    "6b1d0f0e-user".to_string(),
+                ),
+                (
+                    "authorizer.claims.cognito:username".to_string(),
+                    "alice".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -623,6 +704,17 @@ mod tests {
             ("$stageVariables.backend", "beta"),
             ("$stageVariables.get('backend')", "beta"),
             ("$context.httpMethod/$context.stage", "POST/test"),
+            // An authorizer's claims, by the bare member path and by the two spellings a
+            // claim whose name is no bare identifier is reached by.
+            ("$context.authorizer.claims.sub", "6b1d0f0e-user"),
+            ("$context.authorizer.claims['cognito:username']", "alice"),
+            ("$context.authorizer.claims[\"cognito:username\"]", "alice"),
+            ("$context.authorizer.claims.get('cognito:username')", "alice"),
+            ("${context.authorizer.claims['cognito:username']}", "alice"),
+            // A key the authorizer's context map does not carry is an absent VALUE, so it
+            // renders as nothing — the same way a parameter the request did not send does.
+            ("$context.authorizer.claims.email", ""),
+            ("$context.authorizer.principalId", ""),
         ];
         let inputs = inputs();
         for (template, expected) in cases {

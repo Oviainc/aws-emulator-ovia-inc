@@ -20,6 +20,14 @@ mod greengrass_deployment_iot_job;
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `a…` span (where the other apigateway suites land) are both
+// regions concurrently landing suites add their line to.
+#[path = "all/apigateway_cognito_user_pools_authorizer.rs"]
+mod apigateway_cognito_user_pools_authorizer;
+// Declared here, in this same head region, for the reason the entry above records.
+#[path = "all/apigateway_iam_authorized_invoke.rs"]
+mod apigateway_iam_authorized_invoke;
+// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `e…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/ebs_start_snapshot_resolves_its_kms_key.rs"]

@@ -77,8 +77,23 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 # pattern used to choose an integration response based on the response from the back end" —
 # against the status a backend answered with. The maintained engine, whose matching is
 # linear in the subject, so a pattern a control-plane call stored cannot make a request to a
-# deployed stage expensive.
+# deployed stage expensive. Also matches an `Authorizer$identityValidationExpression`
+# against the audience of the token a `COGNITO_USER_POOLS` authorizer was presented.
 regex = "1"
+# A `COGNITO_USER_POOLS` authorizer's decision is a function of the token presented and of
+# the user pools its `providerARNs` name, and every pool this emulator serves publishes its
+# own key set in this same process: the data plane reads that PUBLIC key set from the pool
+# that owns it rather than fetching `<issuer>/.well-known/jwks.json` over a network this
+# emulator never leaves (`service::invoke::cognito_user_pools`).
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
+# An `AWS_IAM`-authorized method is authorized against the PRINCIPAL the request's credential
+# speaks for: STS holds the sessions an access key id resolves to — which is where a
+# credential an identity pool vended is recorded — and IAM holds the identity-based policies
+# and the permissions boundary in force on that principal
+# (`service::invoke::execute_api_authorization`). The decision itself is
+# `service_common::iam_authorization`, the tree's one evaluation of policy documents.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

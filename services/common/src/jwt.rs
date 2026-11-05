@@ -43,8 +43,15 @@
 //! same situation). Nothing new should read a token by hand.
 //!
 //! A presentation prefix is NOT this module's concern: a token travelling in an
-//! `Authorization` header carries the RFC 6750 `Bearer` scheme in front of it, which the
-//! service reading that header strips before calling [`read`].
+//! `Authorization` header carries the RFC 6750 `Bearer` scheme in front of it, which
+//! [`without_bearer_scheme`] strips before [`read`] sees it.
+//!
+//! What a token CLAIMS is the consuming service's rule, but three readings of the claim set are
+//! the same wherever they are made and live here beside the form: the AUDIENCES it names
+//! ([`CompactJws::audiences`], both `aud` forms and the `client_id` an access token writes
+//! instead), the SCOPES it claims ([`CompactJws::claimed_scopes`], both spellings), and its own
+//! validity WINDOW ([`CompactJws::outside_window`], RFC 7519 §4.1.4/§4.1.5). Which audience,
+//! which scope and what to do about a token carrying no expiry stay the caller's decision.
 //!
 //! # The JOSE primitives underneath
 //!
@@ -145,6 +152,172 @@ impl CompactJws {
     #[must_use]
     pub fn claim_str(&self, name: &str) -> Option<&str> {
         self.claims.get(name).and_then(::serde_json::Value::as_str)
+    }
+
+    /// The AUDIENCES the token names: who it was issued FOR.
+    ///
+    /// "The `aud` value is … either an array of case-sensitive strings or … a single
+    /// case-sensitive string" (RFC 7519 §4.1.3), so both forms are read. An OAuth 2.0 ACCESS
+    /// token names its client in [`CLIENT_ID_CLAIM`] where an identity token writes
+    /// [`AUDIENCE_CLAIM`], so both claims are read and the audiences of either are reported —
+    /// a consumer matching an expected audience matches against this whole list.
+    #[must_use]
+    pub fn audiences(&self) -> Vec<&str> {
+        let mut audiences = Vec::new();
+        for claim in [AUDIENCE_CLAIM, CLIENT_ID_CLAIM] {
+            match self.claims.get(claim) {
+                Some(::serde_json::Value::String(single)) => audiences.push(single.as_str()),
+                Some(::serde_json::Value::Array(entries)) => audiences.extend(
+                    entries
+                        .iter()
+                        .filter_map(::serde_json::Value::as_str),
+                ),
+                _ => {}
+            }
+        }
+        audiences
+    }
+
+    /// The SCOPES the token claims, from either spelling in [`SCOPE_CLAIMS`]: the
+    /// space-delimited string OAuth 2.0 defines ("a JSON string containing a space-separated
+    /// list of scopes", RFC 8693 §4.2) and the list form an issuer may write instead.
+    ///
+    /// A token carrying neither claims nothing, which is what an identity token does.
+    #[must_use]
+    pub fn claimed_scopes(&self) -> Vec<&str> {
+        let mut claimed = Vec::new();
+        for claim in SCOPE_CLAIMS {
+            match self.claims.get(*claim) {
+                Some(::serde_json::Value::String(text)) => {
+                    claimed.extend(text.split_whitespace());
+                }
+                Some(::serde_json::Value::Array(entries)) => claimed.extend(
+                    entries
+                        .iter()
+                        .filter_map(::serde_json::Value::as_str)
+                        .map(str::trim),
+                ),
+                _ => {}
+            }
+        }
+        claimed
+    }
+
+    /// A claim written as RFC 7519 §2's NumericDate, in whole seconds.
+    ///
+    /// "Non-integer values can be used" (§2), so a fractional instant is read and truncated to
+    /// the whole second; a claim that is not a JSON number is no NumericDate and reads as
+    /// absent.
+    #[must_use]
+    pub fn numeric_date(&self, claim: &str) -> Option<i64> {
+        let value = self.claims.get(claim)?;
+        if let Some(seconds) = value.as_i64() {
+            return Some(seconds);
+        }
+        let seconds = value.as_f64()?;
+        if !seconds.is_finite() {
+            return None;
+        }
+        // A float-to-integer cast saturates at the integer's bounds rather than wrapping, so
+        // an instant beyond them reads as the nearest representable one.
+        Some(seconds.trunc() as i64)
+    }
+
+    /// Why the token is outside its own validity window at `now`, or `None` while it is inside
+    /// it.
+    ///
+    /// The two claims RFC 7519 defines it by: `exp`, "the expiration time on or after which
+    /// the JWT MUST NOT be accepted for processing" (§4.1.4), and `nbf`, "the time before
+    /// which the JWT MUST NOT be accepted for processing" (§4.1.5). `nbf` is optional, so a
+    /// token carrying none is valid from its issuance; whether a token carrying no `exp` is
+    /// acceptable is the CONSUMER's rule, so that case is reported
+    /// ([`WindowDefect::NoExpiry`]) rather than decided here.
+    #[must_use]
+    pub fn outside_window(&self, now: ::std::time::SystemTime) -> Option<WindowDefect> {
+        let seconds = now
+            .duration_since(::std::time::UNIX_EPOCH)
+            .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or_default();
+        let Some(expiry) = self.numeric_date(EXPIRY_CLAIM) else {
+            return Some(WindowDefect::NoExpiry);
+        };
+        if seconds >= expiry {
+            return Some(WindowDefect::Expired);
+        }
+        if self
+            .numeric_date(NOT_BEFORE_CLAIM)
+            .is_some_and(|starts| seconds < starts)
+        {
+            return Some(WindowDefect::NotYetValid);
+        }
+        None
+    }
+}
+
+/// The claim naming a token's ISSUER — "the principal that issued the JWT" (RFC 7519 §4.1.1).
+pub const ISSUER_CLAIM: &str = "iss";
+
+/// The claim naming who a token was issued FOR (RFC 7519 §4.1.3); see
+/// [`CompactJws::audiences`].
+pub const AUDIENCE_CLAIM: &str = "aud";
+
+/// The claim an OAuth 2.0 ACCESS token names its client in, where an identity token writes
+/// [`AUDIENCE_CLAIM`]; see [`CompactJws::audiences`].
+pub const CLIENT_ID_CLAIM: &str = "client_id";
+
+/// The claim naming when a token stops being accepted (RFC 7519 §4.1.4).
+pub const EXPIRY_CLAIM: &str = "exp";
+
+/// The claim naming when a token starts being accepted (RFC 7519 §4.1.5).
+pub const NOT_BEFORE_CLAIM: &str = "nbf";
+
+/// The claims a token's SCOPES are read from; see [`CompactJws::claimed_scopes`].
+pub const SCOPE_CLAIMS: &[&str] = &["scope", "scp"];
+
+/// The RFC 6750 §2.1 authentication scheme a bearer token is presented under, lowercased —
+/// an HTTP auth scheme is case-insensitive (RFC 7235 §2.1), so the comparison is too.
+pub const BEARER_SCHEME: &str = "bearer";
+
+/// `presented` with the RFC 6750 `Bearer` credential prefix removed, and trimmed.
+///
+/// A presentation prefix is not part of the token: a token travelling in an `Authorization`
+/// header carries that scheme in front of it, and the service reading that header strips it
+/// before reading the token. A value carrying no scheme is the token itself.
+#[must_use]
+pub fn without_bearer_scheme(presented: &str) -> &str {
+    let trimmed = presented.trim();
+    let (scheme, rest) = match trimmed.split_once(' ') {
+        Some(split) => split,
+        None => return trimmed,
+    };
+    if scheme.eq_ignore_ascii_case(BEARER_SCHEME) {
+        rest.trim()
+    } else {
+        trimmed
+    }
+}
+
+/// Why a token is outside its own validity window; see [`CompactJws::outside_window`].
+///
+/// `Display` renders the reason as a clause about the token, the same way [`FormDefect`] does,
+/// so a service states its own refusal without holding a second copy of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowDefect {
+    /// The token names no expiry at all, so its window cannot be checked.
+    NoExpiry,
+    /// `now` is at or after the token's `exp`.
+    Expired,
+    /// `now` is before the token's `nbf`.
+    NotYetValid,
+}
+
+impl ::std::fmt::Display for WindowDefect {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::NoExpiry => f.write_str("it names no expiry"),
+            Self::Expired => f.write_str("it has expired"),
+            Self::NotYetValid => f.write_str("it is not yet valid"),
+        }
     }
 }
 
@@ -653,8 +826,8 @@ mod tests {
     //! services that call it.
 
     use super::{
-        read, read_unsecured, verify, CompactJws, FormDefect, SignatureDefect, MAX_TOKEN_BYTES,
-        P256_COORDINATE_BYTES,
+        read, read_unsecured, verify, without_bearer_scheme, CompactJws, FormDefect,
+        SignatureDefect, WindowDefect, MAX_TOKEN_BYTES, P256_COORDINATE_BYTES,
     };
 
     /// `bytes` as one base64url segment (unpadded, as a compact JWS carries it).
@@ -673,6 +846,106 @@ mod tests {
     /// A token whose header and claim set are `header` and `claims`.
     fn token(header: &str, claims: &str) -> String {
         format!("{}.{}.{}", segment(header), segment(claims), segment("sig"))
+    }
+
+    /// A token carrying `claims`, read.
+    fn claiming(claims: &str) -> CompactJws {
+        read(&token(r#"{"alg":"ES256"}"#, claims)).expect("the test builds a well-formed token")
+    }
+
+    /// RULE: the RFC 6750 credential prefix is stripped whatever case the scheme is written
+    /// in, and a value carrying no scheme is the token itself.
+    #[test]
+    fn the_bearer_presentation_scheme_is_stripped_in_any_case() {
+        // Rows differ along the case of the scheme, the spacing, and whether there is one.
+        let rows: &[(&str, &str, &str)] = &[
+            ("the documented spelling", "Bearer abc.def.ghi", "abc.def.ghi"),
+            ("all lower case", "bearer abc.def.ghi", "abc.def.ghi"),
+            ("all upper case", "BEARER abc.def.ghi", "abc.def.ghi"),
+            ("mixed case", "BeArEr abc.def.ghi", "abc.def.ghi"),
+            ("surrounding space", "  Bearer   abc.def.ghi  ", "abc.def.ghi"),
+            ("no scheme at all", "abc.def.ghi", "abc.def.ghi"),
+            ("another scheme", "Basic abc.def.ghi", "Basic abc.def.ghi"),
+            ("nothing", "", ""),
+        ];
+        for (case, presented, expected) in rows {
+            let actual = without_bearer_scheme(presented);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a token's audiences are both `aud` forms and the `client_id` an access token
+    /// writes instead; its scopes are both spellings; and its window is `exp` with the
+    /// optional `nbf`.
+    #[test]
+    fn a_tokens_audiences_scopes_and_window_are_read_from_either_spelling() {
+        let at = |seconds: u64| ::std::time::UNIX_EPOCH + ::std::time::Duration::from_secs(seconds);
+
+        // Audiences: the string form, the array form, the access-token spelling, none.
+        let audience_rows: &[(&str, &str, &[&str])] = &[
+            ("a single aud", r#"{"aud":"client-1"}"#, &["client-1"]),
+            (
+                "an aud array",
+                r#"{"aud":["client-1","client-2"]}"#,
+                &["client-1", "client-2"],
+            ),
+            ("an access token's client_id", r#"{"client_id":"client-1"}"#, &["client-1"]),
+            ("neither claim", r#"{"sub":"u"}"#, &[]),
+        ];
+        for (case, claims, expected) in audience_rows {
+            let read = claiming(claims);
+            let actual = read.audiences();
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // Scopes: the space-delimited string, the list, neither.
+        let scope_rows: &[(&str, &str, &[&str])] = &[
+            (
+                "the space-delimited scope string",
+                r#"{"scope":"things/read things/write"}"#,
+                &["things/read", "things/write"],
+            ),
+            ("an scp list", r#"{"scp":["things/read"]}"#, &["things/read"]),
+            ("neither claim", r#"{"sub":"u"}"#, &[]),
+        ];
+        for (case, claims, expected) in scope_rows {
+            let read = claiming(claims);
+            let actual = read.claimed_scopes();
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // The window: each published bound and one past it, plus the fractional NumericDate
+        // RFC 7519 §2 admits and a token carrying no expiry at all.
+        let window_rows: &[(&str, &str, u64, Option<WindowDefect>)] = &[
+            ("inside the window", r#"{"exp":2000}"#, 1_999, None),
+            ("at the expiry", r#"{"exp":2000}"#, 2_000, Some(WindowDefect::Expired)),
+            ("past the expiry", r#"{"exp":2000}"#, 2_001, Some(WindowDefect::Expired)),
+            ("a fractional expiry", r#"{"exp":2000.75}"#, 1_999, None),
+            ("no expiry at all", r#"{"sub":"u"}"#, 1, Some(WindowDefect::NoExpiry)),
+            (
+                "before its not-before",
+                r#"{"exp":2000,"nbf":1500}"#,
+                1_499,
+                Some(WindowDefect::NotYetValid),
+            ),
+            ("at its not-before", r#"{"exp":2000,"nbf":1500}"#, 1_500, None),
+        ];
+        for (case, claims, seconds, expected) in window_rows {
+            let actual = claiming(claims).outside_window(at(*seconds));
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     #[test]

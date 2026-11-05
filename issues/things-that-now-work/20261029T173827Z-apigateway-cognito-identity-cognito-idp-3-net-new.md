@@ -52,3 +52,33 @@ Cause 3: "expected Allow decision to reach the integration, got 404: b'{\"__type
 2. Re-replay exactly the checks in trace_ids; each cause's own checks are listed under its 'Traces:' line.
 3. By hand for Cause 1: create a REST API with a COGNITO_USER_POOLS authorizer over a confirmed user pool, deploy a stage, and GET the stage URL with Authorization=<valid ID token> — expect 200 and the integration body; repeat with a token from another pool — expect 401 {"message":"Unauthorized"}.
 4. By hand for Cause 2: vend credentials via GetCredentialsForIdentity for an authenticated role holding execute-api:Invoke on the method ARN, SigV4-sign a GET of the stage URL with them, and expect 200 (and a 403 execute-api authorization message when the grant is removed).
+
+## Resolution — what this report does and does NOT claim now works
+
+Read this before trusting the file's location: this report is filed as resolved for Causes 1
+and 2 only.
+
+* **Cause 1 — FIXED.** A `COGNITO_USER_POOLS` authorizer's decision is computed in full from
+  the token presented, the user pools its `providerARNs` name (each publishes its own key set
+  in this same process) and the method's `authorizationScopes`
+  (`services/service-com-amazonaws-apigateway-backplanecontrolservice/src/service/invoke/cognito_user_pools.rs`).
+  A token one of those pools signed, inside its window, matching the authorizer's
+  `identityValidationExpression` and claiming one of the method's scopes reaches the
+  integration with its claims published as `$context.authorizer.claims.<name>`; every other
+  token is `401 {"message":"Unauthorized"}`. No token question answers 500 any more. Three of
+  the four replay keys under this cause pass; the fourth
+  (`apigw-cognito-authorizer-claims-context-passthrough`) still answers 500 from the
+  INTEGRATION half rather than the authorizer, and is re-filed (below).
+* **Cause 2 — FIXED.** An `AWS_IAM` method is authorized by evaluating `execute-api:Invoke` on
+  the method's own ARN for the principal the request's credential was minted for — which is
+  how a session a Cognito identity pool vended becomes a principal the api's policies can be
+  written about — refusing a caller neither its identity-based policies nor the api's resource
+  policy allow with the sentence IAM words an authorization failure in
+  (`.../src/service/invoke/execute_api_authorization.rs`).
+* **Cause 3 — NOT FIXED.** The 404 `UnknownService` for a template-deployed stage URL is
+  unchanged by that work and is not declined as a non-defect: its root cause is that
+  CloudFormation reports an `AWS::ApiGateway::RestApi` created while performing no create
+  against API Gateway, so the id its `Ref` hands back names no api. It is carried forward,
+  with its replay key, in
+  `issues/things-that-do-not-work/20261103T000000Z-apigateway-cloudformation-a-template-deployed-rest-api-stage-url-answers-404-unknownservice.md`,
+  beside the one remaining Cause 1 key.
