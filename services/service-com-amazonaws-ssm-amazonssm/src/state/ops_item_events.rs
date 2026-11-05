@@ -133,7 +133,7 @@ pub struct OpsItemEventRecord {
     /// ([`DETAIL_TYPE_CREATE`], [`DETAIL_TYPE_UPDATE`]).
     pub detail_type: String,
     /// "Specific information about the OpsItem event": the JSON document the writer built
-    /// out of what it persisted ([`created_detail`]).
+    /// out of what it persisted ([`written_detail`]).
     pub detail: String,
     /// "The Amazon Resource Name (ARN) of the IAM entity that created the OpsItem event".
     pub created_by: String,
