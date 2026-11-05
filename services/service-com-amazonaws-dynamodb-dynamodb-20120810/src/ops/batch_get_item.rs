@@ -313,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             std::collections::BTreeSet::new();
         let mut tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for &(table_name, requested_keys) in &addressed {
-            let name = crate::state::resolve_table_name_in(table_name, &region).map_err(lift)?;
+            let name = crate::state::batch_table_key(table_name, &region).map_err(lift)?;
             if !tables.insert(name.clone()) {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     crate::state::DUPLICATE_BATCH_TABLE_MESSAGE,

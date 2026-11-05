@@ -691,11 +691,10 @@ async fn the_destination_lifecycle_is_driven_over_the_wire() {
     );
     assert_eq!(
         message(&body),
-        format!(
-            "Table is not in a valid state to enable Kinesis Streaming Destination: Streaming \
-             destination with streamArn: {arn} is already enabled for table with tableName: Wired"
-        ),
-        "case \"registered twice\": expected DynamoDB's already-enabled sentence, got {}",
+        "Table is not in a valid state to enable Kinesis Streaming Destination: \
+         EnableKinesisStreamingDestination must be DISABLED or ENABLE_FAILED to perform ENABLE \
+         operation.",
+        "case \"registered twice\": expected DynamoDB's enable-state sentence, got {}",
         message(&body)
     );
 

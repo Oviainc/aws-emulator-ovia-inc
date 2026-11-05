@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The catalogues a table's COPIES live in: backups, imports and exports.
+//! On-demand backups: the catalogue a table's COPIES live in.
 //!
 //! Their status vocabularies, the ARNs they are addressed by, the snapshot a backup
-//! keeps of its source table, and the windows a listing reports them within. They live
-//! beside [`super`] rather than inside it because they are about a COPY of a table
-//! taken at one instant, while the parent module is the live store; `super` re-exports
-//! them, so every caller still names them `crate::state::…`.
+//! keeps of its source table, and the window a listing reports them within. They live
+//! beside [`super`] rather than inside it because they are about a COPY of a table taken
+//! at one instant, while the parent module is the live store; `super` re-exports them, so
+//! every caller still names them `crate::state::…`. The import and export catalogues
+//! stay in `state.rs`, which is where every caller reaches them.
 
 use super::*;
 
@@ -170,7 +171,7 @@ pub fn at_nearest_timestamp_precision(instant: SystemTime) -> SystemTime {
     }
 }
 
-pub(super) fn epoch_millis(instant: SystemTime) -> i128 {
+pub(crate) fn epoch_millis(instant: SystemTime) -> i128 {
     match instant.duration_since(UNIX_EPOCH) {
         Ok(since) => i128::try_from(since.as_millis()).unwrap_or(i128::MAX),
         Err(before) => i128::try_from(before.duration().as_millis())
@@ -179,7 +180,7 @@ pub(super) fn epoch_millis(instant: SystemTime) -> i128 {
 }
 
 /// The same figure for a timestamp a request carried.
-pub(super) fn wire_millis(timestamp: &::aws_smithy_types::DateTime) -> i128 {
+fn wire_millis(timestamp: &::aws_smithy_types::DateTime) -> i128 {
     i128::from(timestamp.secs()) * 1_000 + i128::from(timestamp.subsec_nanos() / 1_000_000)
 }
 
@@ -445,7 +446,7 @@ pub fn backup_not_found(backup_arn: &str) -> RequestError {
 /// So the message names THE EMULATOR as what ran out, and says the service itself imposes
 /// no such limit, rather than sending a client to fix its own input; it is the one refusal
 /// this store answers for its own exhaustion.
-pub(super) fn store_exhausted(table: &str) -> RequestError {
+pub(crate) fn store_exhausted(table: &str) -> RequestError {
     RequestError::Validation(format!(
         "This emulator cannot hold more data for table {table}: its in-process item store \
          is full (at most {MAX_ITEMS_PER_TABLE} items and {MAX_TABLE_SIZE_BYTES} bytes per \
@@ -453,6 +454,14 @@ pub(super) fn store_exhausted(table: &str) -> RequestError {
          imposes no such limit; delete items to make room."
     ))
 }
+
+/// The `ValidationException` message every backup-addressed operation answers a
+/// `BackupArn` it cannot read as a backup ARN of this endpoint with.
+///
+/// AWS's own text, fixed: it states the member's kind and nothing else — no `<N>
+/// validation error(s) detected: ` envelope, no constraint clause and no echo of the
+/// value that was sent, whichever way the value failed.
+pub const INVALID_BACKUP_ARN_MESSAGE: &str = "Invalid Backup ARN";
 
 /// Hold an ARN-addressed BACKUP operation's `BackupArn` to the form such an ARN takes in
 /// the scope the request itself was made in.
@@ -465,12 +474,12 @@ pub(super) fn store_exhausted(table: &str) -> RequestError {
 /// mints for a table of this region. Anything else names no backup whose existence could
 /// be looked up, so it is an INPUT failure ([`RequestError::Validation`]) rather than a
 /// missing resource, and only a well-formed, in-scope ARN reaches the catalogue.
+///
+/// However the value fails, the refusal is AWS's FIXED sentence for this member
+/// ([`INVALID_BACKUP_ARN_MESSAGE`]): one text for "that is not a backup ARN I can
+/// address", with no clause envelope around it and the rejected value NOT echoed back.
 pub fn check_backup_arn(backup_arn: &str, request_region: &str) -> Result<(), RequestError> {
-    let invalid = || {
-        RequestError::Validation(format!(
-            "Invalid BackupArn: Invalid BackupArn provided as input {backup_arn}"
-        ))
-    };
+    let invalid = || RequestError::Validation(INVALID_BACKUP_ARN_MESSAGE.to_string());
     // `arn`, partition, service, region, account, resource — the resource field is the
     // last one and carries `/`, so the split stops at six.
     let fields: Vec<&str> = backup_arn.splitn(6, ':').collect();
@@ -492,199 +501,8 @@ pub fn check_backup_arn(backup_arn: &str, request_region: &str) -> Result<(), Re
     Ok(())
 }
 
-// =============================================================================
-// Imports of table data: the records the import surface reports
-// =============================================================================
 
-/// How far back a listing of imports reaches: "Lists completed imports within the past
-/// 90 days" (the `ListImports` doc), so a record older than that window is no longer
-/// reported. Measured on every read from the instant the import finished, and from the
-/// instant it began while it is still running, so nothing sleeps and no read writes.
-pub const IMPORT_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
-/// A new import's `ImportArn`:
-/// `arn:aws:dynamodb:<region>:<account>:table/<table>/import/<millis>-<id>`, built
-/// through the same core ARN helper every other identifier here is minted with
-/// ([`table_arn`]), in the same construction as [`new_backup_arn`].
-///
-/// The last segment is the instant the import was requested, in zero-padded epoch
-/// milliseconds, followed by a unique suffix: the instant alone does not identify an
-/// import, because two calls can land in the same millisecond. Minted ONCE, when the
-/// import is recorded, and stored on it — and because the fixed-width instant sits
-/// inside it, ascending ARN order IS ascending (table, request instant) order, which is
-/// the order a listing reports and the `NextToken` cursor pages through.
-pub fn new_import_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
-    let millis = requested_at
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis());
-    let unique = ::uuid::Uuid::new_v4().simple().to_string();
-    ::engine::emulator_arn(
-        "dynamodb",
-        region,
-        &format!(
-            "table/{table}/import/{millis:014}-{}",
-            unique.get(..8).unwrap_or(unique.as_str())
-        ),
-    )
-}
 
-/// One recorded import of table data: the source it read, the table it wrote into, and
-/// how far it got.
-///
-/// An import is a RESOURCE OF ITS OWN rather than part of a table: it is addressed by its
-/// own ARN, it outlives the table it imported into, and every member the import readers
-/// report is read from here.
-#[derive(Debug, Clone)]
-pub struct Import {
-    /// The `ImportArn` minted for this import when it was recorded
-    /// ([`new_import_arn`]), which is also the key the store holds it under.
-    pub arn: String,
-    /// The region this import lives in — the one the table it imported into lives in,
-    /// which is the scope every import operation resolves inside.
-    pub region: String,
-    /// The name of the table this import wrote into. The `TableArn` a reader reports is
-    /// minted from it and this region ([`table_arn`]), so one stored table identity
-    /// cannot drift from the ARN the table reports for itself.
-    pub table_name: String,
-    /// Where this import stands: one of the `ImportStatus` values the model declares.
-    pub status: String,
-    /// "The S3 bucket that provides the source for the import"
-    /// (`ImportTable$S3BucketSource`), as the request named it.
-    pub s3_bucket_source: S3BucketSource,
-    /// The log group the import wrote its errors to, where one was made for it
-    /// (`ImportSummary$CloudWatchLogGroupArn`).
-    pub cloud_watch_log_group_arn: Option<String>,
-    /// "The format of the source data" (`ImportSummary$InputFormat`): one of the
-    /// `InputFormat` values the model declares.
-    pub input_format: String,
-    /// "The time at which this import task began" (`ImportSummary$StartTime`).
-    pub started_at: SystemTime,
-    /// "The time at which this import task ended" (`ImportSummary$EndTime`) — `None`
-    /// while the import is still running, so no reader reports an end for work that has
-    /// not finished.
-    pub ended_at: Option<SystemTime>,
-}
 
-impl Import {
-    /// This import as `ListImports` reports it: every member read from the record.
-    pub fn summary(&self) -> ImportSummary {
-        ImportSummary {
-            import_arn: Some(self.arn.clone()),
-            import_status: Some(self.status.clone()),
-            table_arn: Some(table_arn(&self.region, &self.table_name)),
-            s3_bucket_source: Some(self.s3_bucket_source.clone()),
-            cloud_watch_log_group_arn: self.cloud_watch_log_group_arn.clone(),
-            input_format: Some(self.input_format.clone()),
-            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
-            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
-        }
-    }
-
-    /// Whether this record still falls inside the window a listing reaches back over
-    /// ([`IMPORT_HISTORY_WINDOW`]), measured at `now` against the instant the import
-    /// finished — or, while it is still running, the instant it began.
-    pub fn within_history_window(&self, now: SystemTime) -> bool {
-        let marker = self.ended_at.unwrap_or(self.started_at);
-        match now.duration_since(marker) {
-            Ok(age) => age < IMPORT_HISTORY_WINDOW,
-            // Recorded at or after `now`: inside any window measured back from it.
-            Err(_) => true,
-        }
-    }
-}
-
-// =============================================================================
-// Exports of table data: the records the export surface reports
-// =============================================================================
-
-/// How far back a listing of exports reaches: "Lists completed exports within the past
-/// 90 days" (the `ListExports` doc). The same span [`IMPORT_HISTORY_WINDOW`] carries,
-/// named once and shared, so the two listings of this service cannot drift apart.
-/// Measured on every read from the instant the export finished, and from the instant it
-/// began while it is still running, so nothing sleeps and no read writes.
-pub const EXPORT_HISTORY_WINDOW: Duration = IMPORT_HISTORY_WINDOW;
-
-/// A new export's `ExportArn`:
-/// `arn:aws:dynamodb:<region>:<account>:table/<table>/export/<millis>-<id>`, built
-/// through the same core ARN helper every other identifier here is minted with
-/// ([`table_arn`]), in the same construction as [`new_import_arn`].
-///
-/// The last segment is the instant the export was requested, in zero-padded epoch
-/// milliseconds, followed by a unique suffix: the instant alone does not identify an
-/// export, because two calls can land in the same millisecond. Minted ONCE, when the
-/// export is recorded, and stored on it — and because the fixed-width instant sits
-/// inside it, descending ARN order IS descending (table, request instant) order, which
-/// is the "reverse alphanumeric order of ExportArn" a listing reports (the
-/// `ListExports` doc) and the order its `NextToken` cursor pages through.
-pub fn new_export_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
-    let millis = requested_at
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis());
-    let unique = ::uuid::Uuid::new_v4().simple().to_string();
-    ::engine::emulator_arn(
-        "dynamodb",
-        region,
-        &format!(
-            "table/{table}/export/{millis:014}-{}",
-            unique.get(..8).unwrap_or(unique.as_str())
-        ),
-    )
-}
-
-/// One recorded export of a table's data: the table it read, what kind of export it
-/// was, and how far it got.
-///
-/// An export is a RESOURCE OF ITS OWN rather than part of a table, for the reason
-/// [`Import`] is: it is addressed by its own ARN, it outlives the table it was taken
-/// from, and every member the export readers report is read from here.
-#[derive(Debug, Clone)]
-pub struct Export {
-    /// The `ExportArn` minted for this export when it was recorded
-    /// ([`new_export_arn`]), which is also the key the store holds it under.
-    pub arn: String,
-    /// The region this export lives in — the one the table it read lives in, which is
-    /// the scope every export operation resolves inside.
-    pub region: String,
-    /// The name of the table this export read. The `TableArn` an export request selects
-    /// by is minted from it and this region ([`table_arn`]), so one stored table
-    /// identity cannot drift from the ARN the table reports for itself.
-    pub table_name: String,
-    /// Where this export stands: one of the `ExportStatus` values the model declares.
-    /// "Export can be in one of the following states: IN_PROGRESS, COMPLETED, or FAILED"
-    /// (`ExportSummary$ExportStatus`), so a record that has not finished is still a
-    /// record a reader reports.
-    pub status: String,
-    /// "The type of export that was performed" (`ExportSummary$ExportType`): one of the
-    /// `ExportType` values the model declares.
-    pub export_type: String,
-    /// The instant this export task began (`ExportDescription$StartTime`).
-    pub started_at: SystemTime,
-    /// The instant this export task ended (`ExportDescription$EndTime`) — `None` while
-    /// the export is still running, so no reader reports an end for work that has not
-    /// finished.
-    pub ended_at: Option<SystemTime>,
-}
-
-impl Export {
-    /// This export as `ListExports` reports it: every member read from the record.
-    pub fn summary(&self) -> ExportSummary {
-        ExportSummary {
-            export_arn: Some(self.arn.clone()),
-            export_status: Some(self.status.clone()),
-            export_type: Some(self.export_type.clone()),
-        }
-    }
-
-    /// Whether this record still falls inside the window a listing reaches back over
-    /// ([`EXPORT_HISTORY_WINDOW`]), measured at `now` against the instant the export
-    /// finished — or, while it is still running, the instant it began.
-    pub fn within_history_window(&self, now: SystemTime) -> bool {
-        let marker = self.ended_at.unwrap_or(self.started_at);
-        match now.duration_since(marker) {
-            Ok(age) => age < EXPORT_HISTORY_WINDOW,
-            // Recorded at or after `now`: inside any window measured back from it.
-            Err(_) => true,
-        }
-    }
-}
 

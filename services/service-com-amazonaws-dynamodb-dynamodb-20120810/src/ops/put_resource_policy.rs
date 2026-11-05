@@ -253,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let table = store.table_by_arn_mut(&resource).map_err(lift)?;
+        let table = store.table_for_policy_mut(&resource).map_err(lift)?;
         // No status requirement: `CreateTable$ResourcePolicy` attaches a policy to a
         // table that is still `CREATING`, so a policy is not something only an ACTIVE
         // table can carry. A table whose deletion is already due is gone by the time

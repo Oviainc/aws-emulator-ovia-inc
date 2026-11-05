@@ -205,10 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .replicating_kinesis_destination_mut(&input.stream_arn, now)
             .is_some()
         {
-            return Err(lift(crate::state::kinesis_destination_already_enabled(
-                &table_name,
-                &input.stream_arn,
-            )));
+            return Err(lift(crate::state::kinesis_destination_not_enableable()));
         }
         // A table keeps a bounded replication history, so a caller naming new streams
         // without end is answered the control plane's quota error rather than growing

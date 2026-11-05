@@ -37,6 +37,56 @@ pub const DUPLICATE_BATCH_KEYS_MESSAGE: &str = "Provided list of item keys conta
 pub const DUPLICATE_BATCH_TABLE_MESSAGE: &str =
     "Each table name or ARN can be used only once per request";
 
+/// The member path the batched operations' `RequestItems` map is reported under: the
+/// lowerCamel path the request validator builds, which is what the recorded refusals of
+/// that member state.
+pub const REQUEST_ITEMS_MEMBER_PATH: &str = "requestItems";
+
+/// The table one entry of a `RequestItems` map addresses, or how a key that addresses
+/// none is refused.
+///
+/// The key accepts the same two spellings the `TableName` member does — "each table name
+/// or ARN can be used only once per BatchGetItem request"
+/// (`BatchGetItem$RequestItems`) — so it is resolved through the one function that reads
+/// either in the region the request reached ([`resolve_table_name_in`]).
+///
+/// What differs is the REFUSAL of a key that is neither. A map key is not a member of the
+/// request: the validating walk treats it as a path segment, so there is no `tableName`
+/// member to report a bound against, and the constraint that was broken is the one the
+/// map's KEYS are held to. The clause therefore names the MAP member and lists the whole
+/// set a key must satisfy, which is how every service states a refused map key
+/// (`service_common::validation_message::map_key_refusal`, the tree's one rendering of
+/// that clause).
+///
+/// The clause states NO value. AWS echoes the whole `RequestItems` map here, in its own
+/// internal object rendering of the map's structure values — `{<table>=[WriteRequest(
+/// putRequest=PutRequest(item={pk=AttributeValue(s=k0, n=null, …)}, …)…)]}`, over members
+/// this service's model does not declare (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#AttributeValue")` gives `S N B SS NS BS M L NULL BOOL`
+/// and no `workloadProfileName`) — so no rule reachable from the model or the docs
+/// renders that text, and the clause states what is derivable: the member and the
+/// constraint set its keys broke. That is the same choice this service already makes for
+/// a capped collection's echoed value (see "Which form a constraint clause takes" in
+/// `src/service.rs`).
+pub fn batch_table_key(key: &str, region: &str) -> Result<String, RequestError> {
+    resolve_table_name_in(key, region).map_err(|_| {
+        RequestError::Validation(
+            ::service_common::validation_message::map_key_refusal_quoting(
+                REQUEST_ITEMS_MEMBER_PATH,
+                None,
+                i64::try_from(MIN_TABLE_NAME_LENGTH).unwrap_or(0),
+                i64::try_from(MAX_TABLE_NAME_LENGTH).unwrap_or(0),
+                // The expression a key must satisfy, without the anchoring that makes the
+                // match total — the tree's one rendering of that, which the clause above
+                // comes from too (`service_common::validation::unanchored`).
+                Some(&::service_common::validation::unanchored(
+                    TABLE_NAME_PATTERN,
+                )),
+            ),
+        )
+    })
+}
+
 /// How a batch that asks for more operations than it may carry is refused: AWS's
 /// FIXED sentence for that quota, naming the call and neither the ceiling nor the
 /// number asked for ([`MAX_BATCH_WRITE_REQUESTS`]/[`MAX_BATCH_GET_KEYS`] are internal

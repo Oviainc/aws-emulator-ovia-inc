@@ -85,6 +85,7 @@ pub fn projection_expression_paths(
     if !parser.at_end() {
         return Err(parser.syntax());
     }
+    parser.check_no_reserved_name()?;
     Ok(paths)
 }
 

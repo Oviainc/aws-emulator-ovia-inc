@@ -148,13 +148,13 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
     // One real table, so every refusal below is about the ARN and nothing else.
     let real = create_table(&router, REGION, "scoped-table").await;
 
-    // (case, the submitted ResourceArn). The rows span the ways a value can fail to
-    // address a table of this endpoint: the ARN's shape (not an ARN at all, a missing
-    // or wrong resource type, a deeper sub-resource, a table name outside the
-    // documented 3..=255 `[a-zA-Z0-9_.-]+` form) and its scope (another service,
-    // partition, account or region).
+    // (case, the submitted ResourceArn). The rows span the ways a value that IS an ARN
+    // can fail to address a table of this endpoint: the ARN's shape (a missing or wrong
+    // resource type, a deeper sub-resource, a table name outside the documented 3..=255
+    // `[a-zA-Z0-9_.-]+` form) and its scope (another service, partition, account or
+    // region). A value that is no ARN at all breaks a different rule and states that one;
+    // `tests/all/required_member_refusals.rs` drives it.
     let cases: Vec<(&str, String)> = vec![
-        ("a bare table name rather than an ARN", "scoped-table".to_string()),
         ("an ARN with too few fields", format!("arn:aws:dynamodb:{REGION}:table/scoped-table")),
         (
             "an ARN of another service",
@@ -263,7 +263,7 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
 }
 
 #[tokio::test]
-async fn an_in_scope_arn_naming_no_table_is_reported_against_the_resourcearn_member() {
+async fn an_in_scope_arn_naming_no_table_is_reported_by_the_surface_that_was_addressed() {
     let router = emulator();
     // One real table, so the store is not empty: these refusals are about the table the
     // ARN names and not about an empty region.
@@ -292,17 +292,32 @@ async fn an_in_scope_arn_naming_no_table_is_reported_against_the_resourcearn_mem
                  {status} with {answered}"
             );
             let stated = message(&answered);
-            assert_eq!(
-                stated,
-                format!("Requested resource not found: ResourceArn: {resource_arn} not found"),
-                "case {name:?} on {operation}: the refusal names the ResourceArn that was \
-                 sent, got {stated:?}"
-            );
-            assert!(
-                !stated.contains("Table:"),
-                "case {name:?} on {operation}: an ARN-addressed refusal names no derived \
-                 table name, got {stated:?}"
-            );
+            // Each surface words its own refusal: the TAGGING surface names the
+            // `ResourceArn` member it was addressed by and echoes what was sent, while
+            // the resource-POLICY surface reports the resource as the Table it is, by the
+            // bare name inside that ARN.
+            if operation.ends_with("ResourcePolicy") {
+                assert_eq!(
+                    stated,
+                    format!("Requested resource not found: Table: {name} not found"),
+                    "case {name:?} on {operation}: the refusal names the missing table, got \
+                     {stated:?}"
+                );
+            } else {
+                assert_eq!(
+                    stated,
+                    format!(
+                        "Requested resource not found: ResourceArn: {resource_arn} not found"
+                    ),
+                    "case {name:?} on {operation}: the refusal names the ResourceArn that was \
+                     sent, got {stated:?}"
+                );
+                assert!(
+                    !stated.contains("Table:"),
+                    "case {name:?} on {operation}: a tagging refusal names no derived table \
+                     name, got {stated:?}"
+                );
+            }
         }
     }
 

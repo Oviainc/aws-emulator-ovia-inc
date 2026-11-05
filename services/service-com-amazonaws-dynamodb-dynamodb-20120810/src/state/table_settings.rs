@@ -540,13 +540,21 @@ pub fn kinesis_destination_not_active_to_update(table: &str, stream_arn: &str) -
     ))
 }
 
-/// How the command that STARTS replication is refused when the table already replicates
-/// to that stream: the same invalid-state sentence, over the stream and table the
-/// request named. Replication that is already on cannot be started again.
-pub fn kinesis_destination_already_enabled(table: &str, stream_arn: &str) -> RequestError {
+/// How the command that STARTS replication is refused when the table's record for that
+/// stream is in a status an enable cannot start from.
+///
+/// Replication is started from a stream the table either has no record for or has stopped
+/// replicating to, so a record that is `ENABLING`, `ACTIVE`, `UPDATING` or `DISABLING` is
+/// refused — and the refusal is stated over the statuses an enable REQUIRES, the way the
+/// stop command's refusal is stated over the status it requires
+/// ([`kinesis_destination_not_active_to_disable`]): it names neither the table nor the
+/// stream. `ENABLE_FAILED` is named beside `DISABLED` because AWS states both as the
+/// statuses an enable may start from; this store reaches `DISABLED` and never that one,
+/// so no record of it is kept here.
+pub fn kinesis_destination_not_enableable() -> RequestError {
     RequestError::Validation(format!(
-        "{KINESIS_DESTINATION_INVALID_STATE}: Streaming destination with streamArn: \
-         {stream_arn} is already enabled for table with tableName: {table}"
+        "{KINESIS_DESTINATION_INVALID_STATE}: EnableKinesisStreamingDestination must be \
+         DISABLED or ENABLE_FAILED to perform ENABLE operation."
     ))
 }
 

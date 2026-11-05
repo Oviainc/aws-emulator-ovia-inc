@@ -630,6 +630,20 @@ pub fn invalid_member(path: &str, echoed: Option<&str>, requirement: &str) -> Re
     refused(constraint_clause(path, echoed, requirement))
 }
 
+/// How this service states that a parameter its OWN request code requires is not in
+/// the request at all.
+///
+/// Not a clause and not inside the `<N> validation error(s) detected: ` envelope: the
+/// absence is found by the service's own request code before any constraint is walked,
+/// so the whole message is this one sentence, with the member named as the model spells
+/// it on the wire and nothing of the operation that was called. A required member the
+/// generic request walk finds absent keeps that walk's clause instead
+/// ([`constraint_clause`] over `Member must not be null`), which is a different
+/// sentence for a different check.
+pub fn missing_parameter_message(member: &str) -> String {
+    format!("The parameter '{member}' is required but was not present in the request")
+}
+
 /// The refusal a single clause makes: the envelope over that clause, as the 400
 /// `ValidationException` every caller renders.
 fn refused(clause: String) -> RequestError {
@@ -2518,6 +2532,13 @@ impl ResourceTags {
 }
 
 // =============================================================================
+// The per-table settings that each carry a status of their own — continuous backups
+// and point-in-time recovery, contributor insights, time to live, and the Kinesis
+// destinations a table streams to — live in `state/table_settings.rs`, which is the
+// module this one declares and every caller reaches them through.
+// =============================================================================
+
+// =============================================================================
 // ON-DEMAND BACKUPS
 //
 // A backup is a resource of its own: `CreateBackup` catalogues one from a table,
@@ -2529,6 +2550,198 @@ impl ResourceTags {
 // =============================================================================
 // Imports of table data: the records the import surface reports
 // =============================================================================
+
+/// How far back a listing of imports reaches: "Lists completed imports within the past
+/// 90 days" (the `ListImports` doc), so a record older than that window is no longer
+/// reported. Measured on every read from the instant the import finished, and from the
+/// instant it began while it is still running, so nothing sleeps and no read writes.
+pub const IMPORT_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// A new import's `ImportArn`:
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/import/<millis>-<id>`, built
+/// through the same core ARN helper every other identifier here is minted with
+/// ([`table_arn`]), in the same construction as [`new_backup_arn`].
+///
+/// The last segment is the instant the import was requested, in zero-padded epoch
+/// milliseconds, followed by a unique suffix: the instant alone does not identify an
+/// import, because two calls can land in the same millisecond. Minted ONCE, when the
+/// import is recorded, and stored on it — and because the fixed-width instant sits
+/// inside it, ascending ARN order IS ascending (table, request instant) order, which is
+/// the order a listing reports and the `NextToken` cursor pages through.
+pub fn new_import_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
+    let millis = requested_at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let unique = ::uuid::Uuid::new_v4().simple().to_string();
+    ::engine::emulator_arn(
+        "dynamodb",
+        region,
+        &format!(
+            "table/{table}/import/{millis:014}-{}",
+            unique.get(..8).unwrap_or(unique.as_str())
+        ),
+    )
+}
+
+/// One recorded import of table data: the source it read, the table it wrote into, and
+/// how far it got.
+///
+/// An import is a RESOURCE OF ITS OWN rather than part of a table: it is addressed by its
+/// own ARN, it outlives the table it imported into, and every member the import readers
+/// report is read from here.
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// The `ImportArn` minted for this import when it was recorded
+    /// ([`new_import_arn`]), which is also the key the store holds it under.
+    pub arn: String,
+    /// The region this import lives in — the one the table it imported into lives in,
+    /// which is the scope every import operation resolves inside.
+    pub region: String,
+    /// The name of the table this import wrote into. The `TableArn` a reader reports is
+    /// minted from it and this region ([`table_arn`]), so one stored table identity
+    /// cannot drift from the ARN the table reports for itself.
+    pub table_name: String,
+    /// Where this import stands: one of the `ImportStatus` values the model declares.
+    pub status: String,
+    /// "The S3 bucket that provides the source for the import"
+    /// (`ImportTable$S3BucketSource`), as the request named it.
+    pub s3_bucket_source: S3BucketSource,
+    /// The log group the import wrote its errors to, where one was made for it
+    /// (`ImportSummary$CloudWatchLogGroupArn`).
+    pub cloud_watch_log_group_arn: Option<String>,
+    /// "The format of the source data" (`ImportSummary$InputFormat`): one of the
+    /// `InputFormat` values the model declares.
+    pub input_format: String,
+    /// "The time at which this import task began" (`ImportSummary$StartTime`).
+    pub started_at: SystemTime,
+    /// "The time at which this import task ended" (`ImportSummary$EndTime`) — `None`
+    /// while the import is still running, so no reader reports an end for work that has
+    /// not finished.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl Import {
+    /// This import as `ListImports` reports it: every member read from the record.
+    pub fn summary(&self) -> ImportSummary {
+        ImportSummary {
+            import_arn: Some(self.arn.clone()),
+            import_status: Some(self.status.clone()),
+            table_arn: Some(table_arn(&self.region, &self.table_name)),
+            s3_bucket_source: Some(self.s3_bucket_source.clone()),
+            cloud_watch_log_group_arn: self.cloud_watch_log_group_arn.clone(),
+            input_format: Some(self.input_format.clone()),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// Whether this record still falls inside the window a listing reaches back over
+    /// ([`IMPORT_HISTORY_WINDOW`]), measured at `now` against the instant the import
+    /// finished — or, while it is still running, the instant it began.
+    pub fn within_history_window(&self, now: SystemTime) -> bool {
+        let marker = self.ended_at.unwrap_or(self.started_at);
+        match now.duration_since(marker) {
+            Ok(age) => age < IMPORT_HISTORY_WINDOW,
+            // Recorded at or after `now`: inside any window measured back from it.
+            Err(_) => true,
+        }
+    }
+}
+
+// =============================================================================
+// Exports of table data: the records the export surface reports
+// =============================================================================
+
+/// How far back a listing of exports reaches: "Lists completed exports within the past
+/// 90 days" (the `ListExports` doc). The same span [`IMPORT_HISTORY_WINDOW`] carries,
+/// named once and shared, so the two listings of this service cannot drift apart.
+/// Measured on every read from the instant the export finished, and from the instant it
+/// began while it is still running, so nothing sleeps and no read writes.
+pub const EXPORT_HISTORY_WINDOW: Duration = IMPORT_HISTORY_WINDOW;
+
+/// A new export's `ExportArn`:
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/export/<millis>-<id>`, built
+/// through the same core ARN helper every other identifier here is minted with
+/// ([`table_arn`]), in the same construction as [`new_import_arn`].
+///
+/// The last segment is the instant the export was requested, in zero-padded epoch
+/// milliseconds, followed by a unique suffix: the instant alone does not identify an
+/// export, because two calls can land in the same millisecond. Minted ONCE, when the
+/// export is recorded, and stored on it — and because the fixed-width instant sits
+/// inside it, descending ARN order IS descending (table, request instant) order, which
+/// is the "reverse alphanumeric order of ExportArn" a listing reports (the
+/// `ListExports` doc) and the order its `NextToken` cursor pages through.
+pub fn new_export_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
+    let millis = requested_at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let unique = ::uuid::Uuid::new_v4().simple().to_string();
+    ::engine::emulator_arn(
+        "dynamodb",
+        region,
+        &format!(
+            "table/{table}/export/{millis:014}-{}",
+            unique.get(..8).unwrap_or(unique.as_str())
+        ),
+    )
+}
+
+/// One recorded export of a table's data: the table it read, what kind of export it
+/// was, and how far it got.
+///
+/// An export is a RESOURCE OF ITS OWN rather than part of a table, for the reason
+/// [`Import`] is: it is addressed by its own ARN, it outlives the table it was taken
+/// from, and every member the export readers report is read from here.
+#[derive(Debug, Clone)]
+pub struct Export {
+    /// The `ExportArn` minted for this export when it was recorded
+    /// ([`new_export_arn`]), which is also the key the store holds it under.
+    pub arn: String,
+    /// The region this export lives in — the one the table it read lives in, which is
+    /// the scope every export operation resolves inside.
+    pub region: String,
+    /// The name of the table this export read. The `TableArn` an export request selects
+    /// by is minted from it and this region ([`table_arn`]), so one stored table
+    /// identity cannot drift from the ARN the table reports for itself.
+    pub table_name: String,
+    /// Where this export stands: one of the `ExportStatus` values the model declares.
+    /// "Export can be in one of the following states: IN_PROGRESS, COMPLETED, or FAILED"
+    /// (`ExportSummary$ExportStatus`), so a record that has not finished is still a
+    /// record a reader reports.
+    pub status: String,
+    /// "The type of export that was performed" (`ExportSummary$ExportType`): one of the
+    /// `ExportType` values the model declares.
+    pub export_type: String,
+    /// The instant this export task began (`ExportDescription$StartTime`).
+    pub started_at: SystemTime,
+    /// The instant this export task ended (`ExportDescription$EndTime`) — `None` while
+    /// the export is still running, so no reader reports an end for work that has not
+    /// finished.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl Export {
+    /// This export as `ListExports` reports it: every member read from the record.
+    pub fn summary(&self) -> ExportSummary {
+        ExportSummary {
+            export_arn: Some(self.arn.clone()),
+            export_status: Some(self.status.clone()),
+            export_type: Some(self.export_type.clone()),
+        }
+    }
+
+    /// Whether this record still falls inside the window a listing reaches back over
+    /// ([`EXPORT_HISTORY_WINDOW`]), measured at `now` against the instant the export
+    /// finished — or, while it is still running, the instant it began.
+    pub fn within_history_window(&self, now: SystemTime) -> bool {
+        let marker = self.ended_at.unwrap_or(self.started_at);
+        match now.duration_since(marker) {
+            Ok(age) => age < EXPORT_HISTORY_WINDOW,
+            // Recorded at or after `now`: inside any window measured back from it.
+            Err(_) => true,
+        }
+    }
+}
 
 /// Hold an ARN-addressed TABLE member to the form such an ARN takes in the scope the
 /// request itself was made in, answering the table it names.
@@ -2547,6 +2760,158 @@ pub fn check_table_arn(table_arn: &str, request_region: &str) -> Result<String, 
                 "Invalid TableArn: Invalid TableArn provided as input {table_arn}"
             ))
         })
+}
+
+/// One stored table: its configuration, its lifecycle instants, and its items.
+#[derive(Debug)]
+pub struct Table {
+    pub name: String,
+    pub arn: String,
+    /// This table's `TableId`, minted by [`new_table_id`] when the table was created and
+    /// never changed after: "A unique identifier for the table, in UUID format,
+    /// generated by DynamoDB when the table is created" (`TableDescription$TableId`).
+    pub id: String,
+    /// The region this table lives in. A table name is unique only within a region
+    /// ("table names must be unique within each Region" — the `CreateTable` doc), so
+    /// the store keys by region and the table remembers which one it answers for.
+    pub region: String,
+    pub key_schema: Vec<KeySchemaElement>,
+    pub attribute_definitions: Vec<AttributeDefinition>,
+    /// `PROVISIONED` or `PAY_PER_REQUEST`, as resolved at CreateTable and moved by
+    /// `UpdateTable`.
+    pub billing_mode: String,
+    pub provisioned_throughput: Option<ProvisionedThroughput>,
+    /// The warm throughput in force, which every description reports as
+    /// `WarmThroughput`.
+    pub warm_throughput: WarmThroughputSettings,
+    /// The table's own past capacity changes, as `ProvisionedThroughputDescription`
+    /// reports them.
+    pub throughput_history: ThroughputHistory,
+    /// The global secondary indexes defined on this table, in the order they were
+    /// declared, exactly as the request gave them — `DescribeTable` projects each into a
+    /// `GlobalSecondaryIndexDescription` and never stores one.
+    pub global_secondary_indexes: Vec<GlobalSecondaryIndex>,
+    /// The local secondary indexes defined on this table, in the order they were
+    /// declared. Like the global ones they are projected into a description on every
+    /// read and never stored as one; unlike them they can only be defined here, at
+    /// `CreateTable`.
+    pub local_secondary_indexes: Vec<LocalSecondaryIndex>,
+    /// The vector indexes defined on this table, in the order they were declared. Like
+    /// the secondary indexes they are projected into a description on every read and
+    /// never stored as one.
+    pub vector_indexes: Vec<VectorIndex>,
+    pub table_class: Option<String>,
+    /// When the table's class was last UPDATED, which is what
+    /// `TableClassSummary.LastUpdateDateTime` reports: "the date and time at which the
+    /// table class was last updated" (that member's doc). `None` while the class is
+    /// still the one the table was created with, which no call has updated.
+    pub table_class_updated_at: Option<SystemTime>,
+    pub deletion_protection_enabled: bool,
+    /// This table's continuous-backups settings: whether point-in-time recovery is on
+    /// and for how long a period, as `UpdateContinuousBackups` left them and both
+    /// continuous-backups operations report them.
+    pub point_in_time_recovery: PointInTimeRecovery,
+    /// The tags this table carries: the set `CreateTable` seeded and every later
+    /// `TagResource`/`UntagResource` edited, together with the set the eventually
+    /// consistent `ListTagsOfResource` can see yet (see [`ResourceTags`]).
+    pub tags: ResourceTags,
+    pub creation_date_time: SystemTime,
+    /// When the clock owes this table its `CREATING` -> `ACTIVE` transition.
+    pub active_at: SystemTime,
+    /// When the clock owes this table the end of an `UpdateTable` — its `UPDATING` ->
+    /// `ACTIVE` transition. `None` once no update is in flight, which is also the case
+    /// for an update the service applies with the call itself (see `UpdateTable`).
+    pub updated_at: Option<SystemTime>,
+    /// When `PAY_PER_REQUEST` was LAST SET as this table's read/write capacity mode,
+    /// which is what `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports:
+    /// "Represents the time when `PAY_PER_REQUEST` was last set as the read/write
+    /// capacity mode" (that member's doc). `None` for a table that has never been
+    /// on-demand — which is also what makes `BillingModeSummary` itself absent
+    /// ([`Table::billing_mode_summary`]).
+    ///
+    /// The instant stored is the one the CALL that set the mode was made at — the
+    /// create that created the table on-demand, which is that table's creation instant,
+    /// or the `UpdateTable` that switched it — so every description from then on reports
+    /// the same instant, including one taken while the capacity move that switch asked
+    /// for is still settling. It survives a switch back to `PROVISIONED`, because the
+    /// member records when the mode was LAST SET rather than which mode is current.
+    pub pay_per_request_at: Option<SystemTime>,
+    /// When the clock owes this table its removal, set by `DeleteTable`.
+    pub removed_at: Option<SystemTime>,
+    /// The resource-based policy attached to this table, parsed once when it was
+    /// attached, or `None` while the table carries none. This is what the data plane
+    /// evaluates before it reads or writes an item, and what `GetResourcePolicy`
+    /// reports.
+    pub resource_policy: Option<AttachedPolicy>,
+    /// The stream this table publishes to, or `None` for a table that has never had
+    /// one. A table whose stream was disabled keeps it here, disabled, because
+    /// `LatestStreamArn`/`LatestStreamLabel` report the table's latest stream
+    /// whether or not it is currently on.
+    pub stream: Option<TableStream>,
+    pub items: BTreeMap<ItemKey, Item>,
+    /// The metered figures `ItemCount` and `TableSizeBytes` report — refreshed on the
+    /// documented schedule by [`Table::refresh_due_counters`], never on the write path.
+    pub reported_counters: MeteredCounters,
+    /// The summed size of `items`, kept current as items are written and removed.
+    ///
+    /// This is admission-control bookkeeping ONLY: what a response reports as
+    /// `TableSizeBytes` is [`Table::reported_counters`], the metered snapshot
+    /// [`Table::refresh_due_counters`] maintains, so a client is never told this number.
+    /// Keeping it lets `PutItem` check its budget without walking the table.
+    pub stored_bytes: i64,
+    /// What is left of the write capacity this table is provisioned for
+    /// ([`Table::admit_write`]). Like [`Table::stored_bytes`] it is admission-control
+    /// bookkeeping: no response reports it.
+    pub write_budget: CapacityBudget,
+    /// What is left of the READ capacity this table is provisioned for
+    /// ([`Table::admit_read`]). Admission-control bookkeeping like
+    /// [`Table::write_budget`]: no response reports it.
+    pub read_budget: CapacityBudget,
+    /// What is left of the write capacity of each partition key value recently written
+    /// to ([`Table::admit_item_write`]). Admission-control bookkeeping like
+    /// [`Table::write_budget`]: no response reports it.
+    pub key_write_budgets: KeyWriteBudgets,
+    /// This table's contributor insights setting, as the contributor insights
+    /// operations wrote and report it ([`ContributorInsights`]). Its indexes carry
+    /// their own.
+    pub contributor_insights: ContributorInsights,
+    /// This table's Time to Live setting, as `UpdateTimeToLive` wrote it and
+    /// `DescribeTimeToLive` reports it ([`TimeToLive`]) — and what
+    /// [`Table::apply_due_expirations`] expires this table's items by.
+    pub time_to_live: TimeToLive,
+    /// The Kinesis data stream destinations this table replicates its item changes to,
+    /// in the order they were registered ([`KinesisDestination`]).
+    ///
+    /// A destination whose replication has stopped stays here, so the describing
+    /// operation keeps reporting the table's replication history and a later command
+    /// can tell a stream the table once replicated to from one it never did.
+    pub kinesis_destinations: Vec<KinesisDestination>,
+    /// What this table was RESTORED from, for a table a restore created, or `None` for a
+    /// table `CreateTable` created: "Contains details for the restore"
+    /// (`TableDescription$RestoreSummary`), which is what every description of a restored
+    /// table reports ([`TableRestore`]).
+    pub restore: Option<TableRestore>,
+}
+
+/// Where a restored table came from, as `RestoreSummary` reports it: the backup it was
+/// restored from, the table that backup was taken of, and when the restore was asked
+/// for.
+///
+/// Written ONCE, by the restore that created the table, and never changed after — so
+/// every later description reports the same three values. Whether the restore is still
+/// in progress is NOT stored here: it is the table's own `CREATING` span, derived from
+/// the clock like every other transient status ([`Table::status`]).
+#[derive(Debug, Clone)]
+pub struct TableRestore {
+    /// "The Amazon Resource Name (ARN) of the backup from which the table was restored"
+    /// (`RestoreSummary$SourceBackupArn`) — `None` for a restore that was not from a
+    /// backup.
+    pub source_backup_arn: Option<String>,
+    /// "The ARN of the source table of the backup that is being restored"
+    /// (`RestoreSummary$SourceTableArn`).
+    pub source_table_arn: Option<String>,
+    /// "Point in time or source backup time" (`RestoreSummary$RestoreDateTime`).
+    pub restore_date_time: SystemTime,
 }
 
 /// How a listing operation pages over entries already in ascending name order:
@@ -2692,6 +3057,145 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// changes back with the items themselves). Bounded by
     /// [`MAX_PENDING_STREAM_RECORDS`]; drained by [`publish_item_changes`].
     pub pending_stream_records: Vec<PendingStreamRecord>,
+}
+
+/// The `ResourceNotFoundException` message the CONTROL plane answers with: the
+/// table-level operations (`DescribeTable`, `UpdateTable`, the tagging surface)
+/// name the resource they could not find, because the caller addressed that
+/// table by name and the describing surface reports it back.
+fn not_found(name: &str) -> RequestError {
+    RequestError::NotFound(format!("Requested resource not found: Table: {name} not found"))
+}
+
+/// The `ResourceNotFoundException` message for an INDEX the addressed table does not
+/// carry.
+///
+/// "The operation tried to access a nonexistent table or index" (the
+/// `ResourceNotFoundException` doc): the caller addressed this one by a table and an
+/// index name, so the refusal names both, exactly as the name-addressed [`not_found`]
+/// above names the table it could not find.
+pub fn index_not_found(table: &str, index: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: Index not found for table {table}: {index}"
+    ))
+}
+
+/// The `ResourceNotFoundException` message a VECTOR index the addressed table does not
+/// carry is refused with.
+///
+/// Same rule as [`index_not_found`] — "the operation tried to access a nonexistent table
+/// or index" (the `ResourceNotFoundException` doc), named by both the index and the table
+/// it was looked for in — and a different SENTENCE, because the surface that changes a
+/// table's vector indexes words it with the index name first and the table after it. One
+/// sentence per surface rather than one shared one: a message is part of each surface's
+/// contract, so the surfaces that answer the other wording keep it.
+pub fn vector_index_not_found(table: &str, index: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: Index {index} for table {table}"
+    ))
+}
+
+/// The `ResourceNotFoundException` message an ARN-ADDRESSED operation answers with.
+///
+/// The tagging surface and the resource-policy surface carry no `TableName`: the
+/// caller's whole selector is the `ResourceArn` member, so the refusal names THAT
+/// member and echoes the value the request carried — the same construction the
+/// name-addressed [`not_found`] above makes for `Table`, over the identifier that was
+/// actually sent. Nothing derived from the ARN (the table name inside it) appears,
+/// because no member of the request holds it.
+pub fn resource_arn_not_found(resource_arn: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: ResourceArn: {resource_arn} not found"
+    ))
+}
+
+/// The `ValidationException` message an ARN-ADDRESSED operation answers a
+/// `ResourceArn` it cannot address with, in the form that states the rule the value
+/// broke.
+///
+/// This is an INPUT refusal, not a lookup miss: a value that is not an ARN this
+/// service can address names no resource whose existence could be checked. Two rules
+/// can be broken, and the message states the one that was:
+///
+/// * a value that is NOT AN ARN AT ALL — it does not begin with the `arn:` every ARN
+///   begins with — is refused by that rule, with the value the request carried, so a
+///   caller that sent a bare resource name is told what the member takes;
+/// * an ARN that is well formed but addresses no table of this endpoint (another
+///   service, partition, account or region, or a deeper sub-resource) is refused by the
+///   member it was sent in, because the value IS an ARN and the rule it broke is which
+///   resource it names.
+pub fn invalid_resource_arn(resource_arn: &str) -> RequestError {
+    if resource_arn.starts_with(ARN_PREFIX) {
+        RequestError::Validation(format!(
+            "Invalid TableArn: Invalid ResourceArn provided as input {resource_arn}"
+        ))
+    } else {
+        RequestError::Validation(format!(
+            "One or more parameter values were invalid: ARNs must start with '{ARN_PREFIX}': \
+             {resource_arn}"
+        ))
+    }
+}
+
+/// What every ARN begins with, which is the first thing an ARN-addressed member is held
+/// to ([`invalid_resource_arn`]).
+pub const ARN_PREFIX: &str = "arn:";
+
+/// The `ValidationException` message for a request whose tag list repeats a key.
+///
+/// Built from the request: the fixed prefix, then the key found twice. A tag key
+/// identifies at most one tag on a resource ("Each DynamoDB table can only have up to
+/// one tag with the same key" — the `Tag$Key` doc), so a list that names one key twice
+/// asks for two tags that cannot both exist and is refused rather than silently
+/// resolved to one of its values.
+pub fn duplicate_tag_key(key: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Duplicate Tag Keys provided as input: Duplicate Tag Key found {key}"
+    ))
+}
+
+/// The `ResourceNotFoundException` message the DATA plane answers with.
+///
+/// An item operation (`GetItem`, `PutItem`, `DeleteItem`, `Query`, …) against a
+/// table that is absent — or present but not yet serving items — is refused with
+/// AWS's FIXED text, with no resource detail appended: the one message is all a
+/// client sees for "the table you addressed is not there", so nothing about this
+/// store's contents (which name was looked up, whether it exists in another
+/// status) leaks through the data-plane refusal.
+///
+/// A data-plane read of an INDEX that the table declares but that is not serving yet
+/// answers the same sentence, for the same reason: the operation's own
+/// `ResourceNotFoundException` covers both ("The operation tried to access a nonexistent
+/// table or index … or its status might not be ACTIVE").
+pub fn item_resource_not_found() -> RequestError {
+    RequestError::NotFound("Requested resource not found".to_string())
+}
+
+/// The `ValidationException` message for a request that names an index the addressed
+/// table does not declare as the SOURCE IT READS.
+///
+/// An index named in a statement's source — or in an `IndexName` member — is part of the
+/// request's own shape rather than a resource the caller addressed: the table was found,
+/// and what is wrong is that it has no such index, which AWS states with this fixed
+/// sentence. A statement's source is refused with the sentence alone; a member that
+/// carries the name is answered the name as well ([`unknown_index_named`]). (A caller that
+/// addresses an index AS THE RESOURCE, by table and index name, is answered by
+/// [`index_not_found`] instead: there the index is what it asked for.)
+pub const UNKNOWN_INDEX_MESSAGE: &str = "The table does not have the specified index";
+
+/// That message as the refusal it is.
+pub fn unknown_index() -> RequestError {
+    RequestError::Validation(UNKNOWN_INDEX_MESSAGE.to_string())
+}
+
+/// The same refusal for a request that names the index in an `IndexName` MEMBER, which
+/// AWS answers with that sentence and the name the request sent appended after a colon.
+///
+/// The name echoed is the caller's own input, so the refusal still reports nothing of
+/// what the table does carry — a caller that misspelled a member learns which value was
+/// not resolved, which is why AWS echoes it here and not for a statement's source.
+pub fn unknown_index_named(index_name: &str) -> RequestError {
+    RequestError::Validation(format!("{UNKNOWN_INDEX_MESSAGE}: {index_name}"))
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
@@ -3387,6 +3891,927 @@ pub use streams_seam::{
     STREAM_VIEW_TYPE_REQUIRED, STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE,
 };
 
+/// The requirement phrase for a value that is spelled as an ARN and is not a valid one.
+///
+/// A member that takes either a name or an ARN (`TableArn`, which the data-plane
+/// `TableName` members target) states the ARN FORM rather than the name's pattern when
+/// the value it refused was an attempt at an ARN: the pattern a bare table name must
+/// satisfy says nothing about which ARN field was wrong.
+pub const ARN_FORM_REQUIREMENT: &str = "Valid ARN format is \
+     'arn:<awsPartition>:<vendor>:<region>:<awsAccountId>:<resourceType>/<resourceId>'";
+
+/// The form a table name must take: 3..=255 characters of
+/// `[a-zA-Z0-9_.-]` (the `CreateTable$TableName` doc's own length and pattern —
+/// the data-plane members target `TableArn`, which widens the modelled bound to
+/// 1..=1024 so an ARN fits, while the name inside it keeps these).
+const MIN_TABLE_NAME_LENGTH: usize = 3;
+const MAX_TABLE_NAME_LENGTH: usize = 255;
+const TABLE_NAME_PATTERN: &str = "^[a-zA-Z0-9_.-]+$";
+
+/// How AWS's refusals name the table-name member: the `tableName` path its own
+/// request validator reports this constraint against, with the rejected name
+/// echoed.
+///
+/// NOT the wire spelling `src/service.rs` restores for a violation of a bound
+/// the MODEL declares, and deliberately so: the public model does not carry this
+/// bound at all (the data-plane members target `TableArn`, length 1..=1024), so
+/// this is a check the service itself makes, and the recorded AWS refusals for
+/// it state the validator's own form — `Value 'ab' at 'tableName' failed to
+/// satisfy constraint: Member must have length greater than or equal to 3` for
+/// a two-character name on `GetItem`. The same clause is stated for every
+/// operation that resolves a table name, and the echoed value is the name the
+/// caller sent, never a figure of this emulator's.
+pub const TABLE_NAME_MEMBER_PATH: &str = "tableName";
+
+/// The resource type a table's ARN names: `arn:<partition>:dynamodb:<region>:<account>:
+/// table/<name>`, the form [`table_arn`] mints and the only one the `TableName` member
+/// accepts.
+const TABLE_RESOURCE_TYPE: &str = "table";
+
+/// The refusal an ARN of this service that names a resource of ANOTHER KIND earns: the
+/// type is what is wrong with the value, so the clause states that over the ARN the
+/// request sent, with no member path and no constraint — this is the service's own ARN
+/// reader rather than a bound on the member.
+fn invalid_resource_type(arn: &str) -> RequestError {
+    refused(format!("Invalid resource type in '{arn}'"))
+}
+
+/// The `TableName` member accepts a bare table name or the table's ARN ("You can
+/// also provide the Amazon Resource Name (ARN) of the table in this parameter" —
+/// the `CreateTable$TableName` doc). Resolve either to the bare name, refusing a
+/// name outside the documented 3..=255 `[a-zA-Z0-9_.-]+` form.
+///
+/// A name outside that form is refused the way DynamoDB's request validator words a
+/// constraint violation ([`invalid_member`]), because that is what this check is: the
+/// member, the value and the constraint it broke.
+pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
+    // A value spelled as an ARN is refused in one of THREE ways, and which one depends
+    // on what is wrong with it:
+    //
+    //   * a string that is NOT a well-formed ARN — a required field missing or empty —
+    //     is refused by the ARN FORM, because that is what is wrong with it;
+    //   * an ARN OF THIS SERVICE whose resource type is not a table's names a resource
+    //     of another kind, and the refusal says so over the ARN that was sent
+    //     ([`invalid_resource_type`]);
+    //   * any other well-formed ARN that does not name a table of this service is no way
+    //     of naming a table, so it is refused as the table NAME it would have to be,
+    //     by the pattern a table name must satisfy.
+    let malformed_arn = || {
+        invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(table_name),
+            ARN_FORM_REQUIREMENT,
+        )
+    };
+    let not_a_table_arn = || {
+        invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(table_name),
+            &pattern_requirement(TABLE_NAME_PATTERN),
+        )
+    };
+    let name = match table_name.strip_prefix(ARN_PREFIX) {
+        Some(rest) => {
+            let fields: Vec<&str> = rest.splitn(5, ':').collect();
+            let [partition, service, region, account, resource] = fields.as_slice() else {
+                return Err(malformed_arn());
+            };
+            if partition.is_empty()
+                || service.is_empty()
+                || region.is_empty()
+                || account.is_empty()
+                || resource.is_empty()
+            {
+                return Err(malformed_arn());
+            }
+            if *service != "dynamodb" {
+                return Err(not_a_table_arn());
+            }
+            // The resource TYPE this ARN names. An ARN of this service that names a
+            // resource of another kind (a backup, or a mis-cased `Table`) is refused by
+            // THAT, because the type is what is wrong with it.
+            let (resource_type, path) = match resource.split_once('/') {
+                Some((resource_type, path)) => (resource_type, path),
+                None => (*resource, ""),
+            };
+            if resource_type != TABLE_RESOURCE_TYPE {
+                return Err(invalid_resource_type(table_name));
+            }
+            // A sub-resource ARN (`.../index/<i>`, `.../stream/<label>`) names
+            // something other than the table, so what is wrong with it is the resource
+            // type as well.
+            if path.is_empty() || path.contains('/') {
+                return Err(invalid_resource_type(table_name));
+            }
+            path
+        }
+        None => table_name,
+    };
+    let length = name.chars().count();
+    if length < MIN_TABLE_NAME_LENGTH {
+        return Err(invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(name),
+            &min_length_requirement(MIN_TABLE_NAME_LENGTH),
+        ));
+    }
+    if length > MAX_TABLE_NAME_LENGTH {
+        return Err(invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(name),
+            &max_length_requirement(MAX_TABLE_NAME_LENGTH),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+    {
+        return Err(invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(name),
+            &pattern_requirement(TABLE_NAME_PATTERN),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// The clause AWS states for an ARN that addresses a REGION other than the one the
+/// request arrived at: the offending ARN, as the request spelled it.
+///
+/// An endpoint serves one region, so an ARN naming another names nothing this endpoint
+/// can reach. The clause names the VALUE rather than the member it came in: the fact is
+/// about the ARN's own region field.
+fn invalid_arn_region(table_name: &str) -> RequestError {
+    refused(format!("Invalid AWS region in '{table_name}'"))
+}
+
+/// A `TableName` resolved against the REGION the request's endpoint names: the same form
+/// check [`resolve_table_name`] makes, plus the rule that an ARN spelling of the name
+/// must address this endpoint's own region.
+///
+/// "You can also provide the Amazon Resource Name (ARN) of the table in this parameter"
+/// (the `TableName` docs), and an ARN carries a region — while a DynamoDB endpoint
+/// serves exactly one, which is the scope a table name is unique in. So an ARN naming
+/// another region addresses a table this endpoint has no way of reaching, and the
+/// request is refused rather than served from the same-named table of the region it
+/// reached. A BARE name carries no region and is the endpoint's own, so it is unaffected.
+pub fn resolve_table_name_in(table_name: &str, region: &str) -> Result<String, RequestError> {
+    let name = resolve_table_name(table_name)?;
+    if table_arn_region(table_name).is_some_and(|addressed| addressed != region) {
+        return Err(invalid_arn_region(table_name));
+    }
+    Ok(name)
+}
+
+/// The REGION field of a value spelled as an ARN, or `None` when the value is not
+/// spelled as one — a bare table name addresses no region of its own.
+fn table_arn_region(table_name: &str) -> Option<&str> {
+    table_name
+        .strip_prefix(ARN_PREFIX)?
+        .split(':')
+        .nth(2)
+        .filter(|region| !region.is_empty())
+}
+
+/// Hold one attribute value to the documented value rules WITHOUT changing it: the
+/// numeric domain (precision, exponent range, numeric text) and the set rules
+/// (non-empty, distinct members), at every depth.
+///
+/// The rules belong to the value's TYPE, so they hold wherever a request carries a
+/// value and not only where one is stored. The check runs over a copy because the rules
+/// are enforced by the canonicalizing walk ([`canonicalize_attribute_value`]) — one walk
+/// states each rule once, and a value this only reads must come out of it unchanged. The
+/// copy is bounded: the caller sizes the value against the documented item ceiling first.
+pub(crate) fn check_value_rules(value: &AttributeValue) -> Result<(), RequestError> {
+    let mut probe = value.clone();
+    canonicalize_attribute_value(&mut probe)
+}
+
+/// The DynamoDB resource an ARN-addressed operation's `ResourceArn` names: the region
+/// it lives in, the table it is, and the ARN as the request spelled it.
+///
+/// Such a call carries no `TableName`, so the ARN is the caller's whole selector — and
+/// it is also the only identifier the request holds, which is why it is kept here: a
+/// refusal about this resource echoes `arn`, never the `table` derived from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedResource {
+    pub region: String,
+    pub table: String,
+    pub arn: String,
+}
+
+/// Resolve an ARN-addressed operation's `ResourceArn` to the table it names, in the
+/// scope the request itself is made in.
+///
+/// The one place an ARN is classified for the tagging and resource-policy surfaces, so
+/// `TagResource`, `UntagResource`, `ListTagsOfResource` and the three `*ResourcePolicy`
+/// operations share a single rule, in two parts:
+///
+/// * SHAPE — the value must be an ARN of THIS service
+///   (`arn:<partition>:dynamodb:<region>:<account>:table/<name>`) naming a table and
+///   nothing deeper: a sub-resource ARN (`.../index/<i>`, `.../stream/<label>`) is not
+///   a resource this emulator keeps a tag set or a policy for, so it is refused rather
+///   than silently taken for its table;
+/// * SCOPE — the ARN must address a resource of the endpoint the request reached: the
+///   same partition, account and REGION this request is signed for, which is the one
+///   this service answers for. [`table_arn`] mints exactly that form for a table of
+///   this region, so the comparison against it is the whole scope check.
+///
+/// Either way the value names no resource whose existence could be looked up, so it is
+/// an INPUT failure ([`invalid_resource_arn`], 400 `ValidationException`) and not a
+/// missing resource — an out-of-scope ARN is not "absent here", it is unaddressable
+/// from here. Only a well-formed, in-scope ARN reaches the lookup, where a table that
+/// is not there is [`resource_arn_not_found`].
+pub fn resolve_resource_arn(
+    resource_arn: &str,
+    request_region: &str,
+) -> Result<TaggedResource, RequestError> {
+    let invalid = || invalid_resource_arn(resource_arn);
+    // `arn`, partition, service, region, account, resource — the resource field is
+    // the last one and may itself carry `/`, so the split stops at six.
+    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
+    let (partition, service, region, resource) = match fields.as_slice() {
+        ["arn", partition, service, region, _account, resource] => {
+            (*partition, *service, *region, *resource)
+        }
+        _ => return Err(invalid()),
+    };
+    if partition.is_empty() || service != "dynamodb" || region.is_empty() {
+        return Err(invalid());
+    }
+    let path = resource.strip_prefix("table/").ok_or_else(invalid)?;
+    if path.contains('/') {
+        return Err(invalid());
+    }
+    let table = resolve_table_name(path).map_err(|_| invalid())?;
+    // The scope half of the rule: anything but this endpoint's own ARN form for that
+    // table — another partition, another account, another region — is unaddressable
+    // here, whatever this store happens to hold.
+    if resource_arn != table_arn(request_region, &table) {
+        return Err(invalid());
+    }
+    Ok(TaggedResource {
+        region: request_region.to_string(),
+        table,
+        arn: resource_arn.to_string(),
+    })
+}
+
+/// Fold a request's `TagList` into the stored [`TagSet`], refusing a list AWS does not
+/// accept.
+///
+/// The one place a request's tag list becomes a set, so every operation that takes one
+/// (`CreateTable$Tags`, `TagResource$Tags`) enforces the same two rules:
+///
+/// * a tag KEY may appear at most once in one request — "Each DynamoDB table can only
+///   have up to one tag with the same key" (`Tag$Key`), so a list repeating a key asks
+///   for two tags that cannot both exist, and is refused ([`duplicate_tag_key`])
+///   instead of collapsing to whichever value happens to win;
+/// * a key in the reserved `aws:` namespace is refused — the user "cannot assign" it —
+///   so no stored key is ever one AWS alone mints.
+///
+/// Keys are compared as sent: tag keys are case sensitive, so `Env` and `env` are two
+/// keys rather than one repeated.
+pub fn tag_set_from_request(tags: &[Tag]) -> Result<TagSet, RequestError> {
+    let mut set = TagSet::new();
+    for tag in tags {
+        if tag
+            .key
+            .to_ascii_lowercase()
+            .starts_with(RESERVED_TAG_PREFIX)
+        {
+            return Err(RequestError::Validation(format!(
+                "Invalid tag key {}: the {RESERVED_TAG_PREFIX} prefix is reserved for Amazon \
+                 Web Services-assigned tags and cannot be assigned by a caller",
+                tag.key
+            )));
+        }
+        if set.insert(tag.key.clone(), tag.value.clone()).is_some() {
+            return Err(duplicate_tag_key(&tag.key));
+        }
+    }
+    Ok(set)
+}
+
+/// A stored tag set as the modelled `TagList` carries it, in key order.
+pub fn tag_list(tags: &TagSet) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// The `AttributeValue` union member name of a value, for a type-mismatch message.
+pub fn attribute_value_type(value: &AttributeValue) -> &'static str {
+    match value {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::Ss(_) => "SS",
+        AttributeValue::Ns(_) => "NS",
+        AttributeValue::Bs(_) => "BS",
+        AttributeValue::M(_) => "M",
+        AttributeValue::L(_) => "L",
+        AttributeValue::Null(_) => "NULL",
+        AttributeValue::Bool(_) => "BOOL",
+    }
+}
+
+/// The stored size of one attribute value, by the rule the DynamoDB Developer Guide
+/// gives under "Item sizes and formats": a string or binary value is its raw byte
+/// length, a number is "approximately 1 byte per two significant digits + 1 byte", a
+/// boolean or null is 1 byte, and a list or map is "3 bytes of overhead, plus the
+/// size of each element or key-value pair" and 1 byte per element.
+/// The walk is ITERATIVE, over an explicit stack: nesting in a request is chosen by
+/// the caller, so recursing on it would make stack use a function of the request.
+/// Sizes accumulate saturatingly, so the arithmetic here cannot overflow either.
+pub fn attribute_value_size(value: &AttributeValue) -> i64 {
+    let mut total: i64 = 0;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        let own = match value {
+            AttributeValue::S(text) => byte_len(text.len()),
+            AttributeValue::B(bytes) => byte_len(bytes.len()),
+            AttributeValue::N(text) => number_size(text),
+            AttributeValue::Bool(_) | AttributeValue::Null(_) => 1,
+            AttributeValue::Ss(values) => sum_of(values.iter().map(|text| byte_len(text.len()))),
+            AttributeValue::Ns(values) => sum_of(values.iter().map(|text| number_size(text))),
+            AttributeValue::Bs(values) => sum_of(values.iter().map(|bytes| byte_len(bytes.len()))),
+            AttributeValue::L(values) => {
+                // One byte per element, plus the elements themselves, which the
+                // stack picks up rather than a recursive call.
+                pending.extend(values.iter());
+                3i64.saturating_add(byte_len(values.len()))
+            }
+            AttributeValue::M(entries) => {
+                let names = sum_of(
+                    entries
+                        .keys()
+                        .map(|name| byte_len(name.len()).saturating_add(1)),
+                );
+                pending.extend(entries.values());
+                3i64.saturating_add(names)
+            }
+        };
+        total = total.saturating_add(own);
+    }
+    total
+}
+
+/// Whether an attribute value nests deeper than `limit` levels, walked iteratively
+/// for the same reason [`attribute_value_size`] is.
+pub fn attribute_depth_exceeds(value: &AttributeValue, limit: usize) -> bool {
+    let mut pending = vec![(value, 1usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > limit {
+            return true;
+        }
+        match value {
+            AttributeValue::L(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            AttributeValue::M(entries) => {
+                pending.extend(entries.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The stored size of one item: every attribute's name plus its value.
+pub fn item_size(item: &Item) -> i64 {
+    sum_of(
+        item.iter()
+            .map(|(name, value)| byte_len(name.len()).saturating_add(attribute_value_size(value))),
+    )
+}
+
+/// The `ValidationException` a bad `N` value earns, naming the rule its text breaks.
+///
+/// Every clause is DynamoDB's own for the documented rule it states — the unparsable
+/// text, the precision ceiling and the two magnitude bounds — and each is stated
+/// inside the validation envelope ([`validation_message`]), which is where this
+/// service states a clause about a value a request carried. Only the numeric-text
+/// limit is this emulator's, and its message says so.
+pub fn number_rejection(text: &str, fault: NumberFault) -> RequestError {
+    match fault {
+        NumberFault::NotNumeric => refused(format!(
+            "The parameter cannot be converted to a numeric value: {}",
+            clipped(text)
+        )),
+        NumberFault::Precision => refused(format!(
+            "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number"
+        )),
+        NumberFault::Overflow => refused(
+            "Number overflow. Attempting to store a number with magnitude larger than supported \
+             range"
+                .to_string(),
+        ),
+        NumberFault::Underflow => refused(
+            "Number underflow. Attempting to store a number with magnitude smaller than \
+             supported range"
+                .to_string(),
+        ),
+        NumberFault::TextTooLong => RequestError::Validation(format!(
+            "One or more parameter values were invalid: A Number may carry at most \
+             {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's input-size limit"
+        )),
+    }
+}
+
+/// A request value echoed back in a refusal, bounded.
+///
+/// The text is the caller's, so a message that embedded all of it would grow with the
+/// request; the head of it is what identifies the offending value to a human.
+fn clipped(text: &str) -> String {
+    const KEEP: usize = 48;
+    if text.chars().count() <= KEEP {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(KEEP).collect();
+    format!("{head}…")
+}
+
+// THE DOCUMENTED VALUE RULES, which the canonicalizing walk below
+// ([`canonicalize_attribute_value`]) enforces as it goes. None of them is expressible
+// in the Smithy model, so the boundary validator passes a request that breaks them:
+//
+//   * a number carries at most 38 significant digits inside the documented exponent
+//     range ("Number: ... can have up to 38 digits of precision" — "Service, Account,
+//     and Table Quotas"), wherever it appears: an `N`, a member of an `NS`, or either
+//     nested in an `L` or `M`;
+//   * a set is not empty ("Set type attributes cannot be empty. Invalid Requests with
+//     empty values will be rejected with a ValidationException exception" — the
+//     `PutItem` doc);
+//   * a set's members are distinct ("the values within a set must be unique" and "No
+//     two elements can be equal" — the `AttributeValue$SS`/`NS`/`BS` docs and the
+//     Developer Guide's set rules), compared the way the type compares: `NS` members
+//     numerically, so `1` and `1.0` are one member.
+
+/// Which set type a value is, for the refusals whose wording differs between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetType {
+    String,
+    Number,
+    Binary,
+}
+
+impl SetType {
+    /// The clause DynamoDB refuses an EMPTY set of this type with — including the
+    /// double space where the service's template leaves the attribute path empty, and
+    /// the different sentence it uses for binary sets.
+    fn empty_clause(self) -> String {
+        match self {
+            Self::String => "An string set  may not be empty".to_string(),
+            Self::Number => "An number set  may not be empty".to_string(),
+            Self::Binary => "Binary sets should not be empty".to_string(),
+        }
+    }
+}
+
+/// Refuse an empty set, inside the same validation envelope ([`validation_message`])
+/// every other clause is stated in.
+fn check_set_not_empty(set_type: SetType, members: usize) -> Result<(), RequestError> {
+    if members == 0 {
+        return Err(refused(format!(
+            "One or more parameter values were invalid: {}",
+            set_type.empty_clause()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a set that lists one member twice.
+///
+/// The three set types have three wordings, each DynamoDB's own, so the rendered
+/// `collection` is the caller's:
+///
+/// * `SS`: `Input collection ["a", "a"] contains duplicates.`
+/// * `NS`: `Input collection contains duplicates.`
+/// * `BS`: `Input collection ["YQ==","YQ=="]of type BS contains duplicates.`
+///
+/// — down to the comma spacing each uses and the missing space after the bracket in
+/// the binary one.
+fn duplicate_set_member(collection: String) -> RequestError {
+    refused(format!(
+        "One or more parameter values were invalid: Input collection \
+         {collection}contains duplicates."
+    ))
+}
+
+/// The collection as the `SS` message echoes it: quoted members, `, `-separated.
+fn echoed_strings(values: &[String]) -> String {
+    format!(
+        "[{}] ",
+        joined(
+            values.iter().map(|member| format!("\"{}\"", clipped(member))),
+            ", "
+        )
+    )
+}
+
+/// The collection as the `BS` message echoes it: base64 members, `,`-separated, and the
+/// type named with no space after the bracket.
+fn echoed_blobs(values: &[Vec<u8>]) -> String {
+    format!(
+        "[{}]of type BS ",
+        joined(
+            values.iter().map(|member| format!(
+                "\"{}\"",
+                clipped(&::aws_smithy_types::base64::encode(member))
+            )),
+            ","
+        )
+    )
+}
+
+/// Join at most the first few rendered members, eliding the rest.
+///
+/// The set's length is the caller's choice, so a message that echoed every member
+/// would grow with the request.
+fn joined(members: impl Iterator<Item = String>, separator: &str) -> String {
+    const MAX_ECHOED_MEMBERS: usize = 8;
+    let mut rendered: Vec<String> = members.take(MAX_ECHOED_MEMBERS + 1).collect();
+    if rendered.len() > MAX_ECHOED_MEMBERS {
+        rendered.truncate(MAX_ECHOED_MEMBERS);
+        rendered.push("…".to_string());
+    }
+    rendered.join(separator)
+}
+
+/// Add up sizes without overflowing.
+fn sum_of(sizes: impl Iterator<Item = i64>) -> i64 {
+    sizes.fold(0i64, i64::saturating_add)
+}
+
+fn byte_len(len: usize) -> i64 {
+    i64::try_from(len).unwrap_or(i64::MAX)
+}
+
+/// A number's stored size: 1 byte per two significant digits, plus 1 byte. An
+/// unparseable value is sized by its text, which is all there is to store.
+fn number_size(text: &str) -> i64 {
+    match NumberKey::parse(text) {
+        Some(number) => number.significant_digits() / 2 + 1,
+        None => byte_len(text.len()),
+    }
+}
+
+/// One `N` value's canonical stored text, or the refusal for a text that denotes no
+/// number this store can hold — which names the rule the text broke
+/// ([`number_rejection`]), the way the service's own refusals do.
+///
+/// DynamoDB stores the number, so a write normalises the lexeme ONCE here and every
+/// later read reports that form ([`NumberKey::canonical_text`]).
+///
+/// Crate-visible: the write path reaches it through [`canonicalize_item`], and a
+/// handler that needs one value canonicalized (an `UpdateItem` attribute, say) is in
+/// this crate too, so nothing outside it needs this.
+pub(crate) fn canonical_number_text(text: &str) -> Result<String, RequestError> {
+    NumberKey::try_parse(text)
+        .map(|number| number.canonical_text())
+        .map_err(|fault| number_rejection(text, fault))
+}
+
+/// Canonicalize every number inside one attribute value, and hold every set to the
+/// documented set rules.
+///
+/// The rules are about the value TYPE, not about where a value sits, so this reaches
+/// the `N` of a scalar, every member of an `NS`, and every number or set nested in an
+/// `L` or an `M` at any depth: a number is refused unless it is one the documented
+/// precision and exponent range can hold ([`canonical_number_text`]), and a set is
+/// refused if it is empty ([`check_set_not_empty`]) or lists one value twice
+/// ([`duplicate_set_member`]). Set distinctness is checked AFTER canonicalization, so
+/// two spellings of one number are the duplicate member DynamoDB refuses rather than
+/// two members of the stored set. The walk is ITERATIVE, over an explicit stack, for
+/// the reason [`attribute_value_size`]'s is: how deeply a value nests is the caller's
+/// choice, so recursing on it would make stack use a function of the request.
+pub(crate) fn canonicalize_attribute_value(
+    value: &mut AttributeValue,
+) -> Result<(), RequestError> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            AttributeValue::N(text) => *text = canonical_number_text(text)?,
+            AttributeValue::Ns(members) => {
+                check_set_not_empty(SetType::Number, members.len())?;
+                for member in members.iter_mut() {
+                    *member = canonical_number_text(member)?;
+                }
+                if has_duplicate(members) {
+                    // The number-set wording names no members at all.
+                    return Err(duplicate_set_member(String::new()));
+                }
+            }
+            AttributeValue::Ss(members) => {
+                check_set_not_empty(SetType::String, members.len())?;
+                if has_duplicate(members) {
+                    return Err(duplicate_set_member(echoed_strings(members)));
+                }
+            }
+            AttributeValue::Bs(members) => {
+                check_set_not_empty(SetType::Binary, members.len())?;
+                if has_duplicate(members) {
+                    return Err(duplicate_set_member(echoed_blobs(members)));
+                }
+            }
+            AttributeValue::L(members) => pending.extend(members.iter_mut()),
+            AttributeValue::M(entries) => pending.extend(entries.values_mut()),
+            AttributeValue::S(_)
+            | AttributeValue::B(_)
+            | AttributeValue::Bool(_)
+            | AttributeValue::Null(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether a set lists one value twice: a set holds each of its values once, so a
+/// request naming one twice is a `ValidationException` rather than a stored duplicate.
+///
+/// Members are compared as the values they are — numerically for `NS`, because its
+/// members are canonicalized first — and the check sorts BORROWED members, so it costs
+/// O(n log n) and copies nothing.
+fn has_duplicate<T: Ord>(members: &[T]) -> bool {
+    let mut sorted: Vec<&T> = members.iter().collect();
+    sorted.sort_unstable();
+    sorted.windows(2).any(|pair| pair[0] == pair[1])
+}
+
+/// Canonicalize every number in one item and hold its values to the documented rules,
+/// which is what a write does before the item lands.
+///
+/// The attributes are walked in NAME order rather than in the hash map's own order,
+/// and the walk STOPS at the first refusal: two identical requests are therefore
+/// refused with identical messages, and a refused item is left with the attributes
+/// after the failing one untouched. The refusal is passed through as the value rule
+/// worded it, because that is how the service words these: its messages name the rule
+/// the value broke, not the attribute that carried it.
+pub fn canonicalize_item(item: &mut Item) -> Result<(), RequestError> {
+    let mut names: Vec<String> = item.keys().cloned().collect();
+    names.sort_unstable();
+    for name in names {
+        let Some(value) = item.get_mut(&name) else {
+            continue;
+        };
+        canonicalize_attribute_value(value)?;
+    }
+    Ok(())
+}
+
+/// The capacity units a write of `size` bytes consumes: one unit per 1 KB, and never
+/// less than one unit.
+pub fn write_capacity_units(size: i64) -> f64 {
+    units_of(size, WRITE_UNIT_BYTES)
+}
+
+/// The capacity units a read of `size` bytes consumes: one unit per 4 KB when the
+/// read is strongly consistent, half that when it is eventually consistent.
+pub fn read_capacity_units(size: i64, consistent_read: bool) -> f64 {
+    let units = units_of(size, READ_UNIT_BYTES);
+    if consistent_read {
+        units
+    } else {
+        units / 2.0
+    }
+}
+
+/// How many whole units of `unit_bytes` cover `size` bytes, never fewer than one.
+fn units_of(size: i64, unit_bytes: i64) -> f64 {
+    let size = size.max(0);
+    let partial_unit = i64::from(size % unit_bytes != 0);
+    let whole_units = (size / unit_bytes + partial_unit).max(1);
+    f64::from(u32::try_from(whole_units).unwrap_or(u32::MAX))
+}
+
+/// What ONE write consumed, broken down the way `ConsumedCapacity` reports it: the
+/// units the table itself took, and the units each secondary index the write affected
+/// took.
+///
+/// The per-index maps are ordered, so a write reports its indexes in one stable order
+/// whatever order the table declared them in.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteCapacity {
+    /// The units consumed on the table itself.
+    pub table: f64,
+    /// The units consumed on each local secondary index the write affected.
+    pub local_secondary_indexes: BTreeMap<String, f64>,
+    /// The units consumed on each global secondary index the write affected.
+    pub global_secondary_indexes: BTreeMap<String, f64>,
+}
+
+impl WriteCapacity {
+    /// The aggregate `CapacityUnits`: "The total number of capacity units consumed by
+    /// the operation" (`ConsumedCapacity$CapacityUnits`) — the table's units plus those
+    /// of every index the write fanned out to.
+    pub fn total(&self) -> f64 {
+        self.local_secondary_indexes
+            .values()
+            .chain(self.global_secondary_indexes.values())
+            .fold(self.table, |total, units| total + units)
+    }
+}
+
+/// WHICH KIND of capacity an operation consumed, which decides the arm every figure it
+/// reports is carried in beside the aggregate.
+///
+/// `ConsumedCapacity` and `Capacity` each carry an aggregate (`CapacityUnits`, "the total
+/// number of capacity units consumed") and one figure per kind: `ReadCapacityUnits` is
+/// "the total number of read capacity units consumed" and `WriteCapacityUnits` the write
+/// equivalent. A data-plane operation spends capacity of ONE kind — a read reads and a
+/// write writes — so the figure of that kind is the aggregate, and the other kind's is
+/// absent because the operation consumed none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityKind {
+    /// Read capacity: what `GetItem`, `Query`, `Scan` and the transactional and batch
+    /// reads consume.
+    Read,
+    /// Write capacity: what `PutItem`, `UpdateItem`, `DeleteItem` and the transactional
+    /// and batch writes consume.
+    Write,
+}
+
+impl CapacityKind {
+    /// One `Capacity` line — a table's or an index's — of `units` of this kind: the
+    /// aggregate and this kind's own figure, which are the same number.
+    fn line(self, units: f64) -> Capacity {
+        Capacity {
+            capacity_units: Some(units),
+            read_capacity_units: (self == Self::Read).then_some(units),
+            write_capacity_units: (self == Self::Write).then_some(units),
+        }
+    }
+
+    /// A `ConsumedCapacity` reporting `units` of this kind for `table_name`, with no
+    /// per-table or per-index breakdown yet: the operation's aggregate and this kind's
+    /// own figure, filled from [`Self::line`] so one rule decides every arm.
+    fn consumed(self, table_name: &str, units: f64) -> ConsumedCapacity {
+        let aggregate = self.line(units);
+        ConsumedCapacity {
+            table_name: Some(table_name.to_string()),
+            capacity_units: aggregate.capacity_units,
+            read_capacity_units: aggregate.read_capacity_units,
+            write_capacity_units: aggregate.write_capacity_units,
+            ..ConsumedCapacity::default()
+        }
+    }
+}
+
+/// The `ConsumedCapacity` a WRITE that asked for it gets back, or `None` when it asked
+/// for `NONE` (or did not ask at all).
+///
+/// `TOTAL` reports "only the aggregate ConsumedCapacity for the operation"; `INDEXES`
+/// reports "the aggregate ConsumedCapacity for the operation, together with
+/// ConsumedCapacity for each table and secondary index that was accessed" (the
+/// `ReturnConsumedCapacity` doc), so the `Table` and per-index breakdown is returned
+/// only then — and only for the indexes the write actually affected, since an index it
+/// did not reach consumed nothing on it.
+///
+/// Every figure is reported in `kind`'s own arm as well as in the aggregate
+/// ([`CapacityKind`]). The breakdown is a WRITE's — the table's units and those of each
+/// index the write fanned out to — while the arm is the kind the operation BILLED it as,
+/// which is `Write` for a write that was applied and `Read` where the service bills the
+/// same figures as a read (a `ClientRequestToken` replay, which reads the transaction's
+/// items rather than writing them).
+pub fn consumed_write_capacity(
+    requested: Option<&str>,
+    table_name: &str,
+    capacity: &WriteCapacity,
+    kind: CapacityKind,
+) -> Option<ConsumedCapacity> {
+    let detail = match requested {
+        Some("TOTAL") => false,
+        Some("INDEXES") => true,
+        _ => return None,
+    };
+    Some(ConsumedCapacity {
+        table: detail.then(|| kind.line(capacity.table)),
+        local_secondary_indexes: detail
+            .then(|| capacity_breakdown(kind, &capacity.local_secondary_indexes))
+            .flatten(),
+        global_secondary_indexes: detail
+            .then(|| capacity_breakdown(kind, &capacity.global_secondary_indexes))
+            .flatten(),
+        ..kind.consumed(table_name, capacity.total())
+    })
+}
+
+/// One per-index `ConsumedCapacity` map, or `None` when no index of that kind was
+/// reached at all — an index an operation did not touch consumed nothing on it, so it is
+/// left out rather than reported as zero.
+fn capacity_breakdown(
+    kind: CapacityKind,
+    units: &BTreeMap<String, f64>,
+) -> Option<HashMap<String, Capacity>> {
+    (!units.is_empty()).then(|| {
+        units
+            .iter()
+            .map(|(name, units)| (name.clone(), kind.line(*units)))
+            .collect()
+    })
+}
+
+/// Whether a write reports item collection metrics: "If set to SIZE, the response
+/// includes statistics about item collections, if any, that were modified during the
+/// operation ... If set to NONE (the default), no statistics are returned"
+/// (`PutItem$ReturnItemCollectionMetrics`). A value the model's
+/// `ReturnItemCollectionMetrics` enum does not name is a bad request rather than a
+/// silent `NONE`.
+pub fn returns_item_collection_metrics(requested: Option<&str>) -> Result<bool, RequestError> {
+    match requested {
+        None | Some("NONE") => Ok(false),
+        Some("SIZE") => Ok(true),
+        Some(other) => Err(RequestError::Validation(format!(
+            "ReturnItemCollectionMetrics can only be SIZE or NONE, got {other}"
+        ))),
+    }
+}
+
+/// A gigabyte, as `SizeEstimateRangeGB` denominates its bounds. DynamoDB's size quotas
+/// are decimal ("The maximum size of any item collection is 10 GB" — "Service, Account,
+/// and Table Quotas"), so a gigabyte here is 10^9 bytes.
+const BYTES_PER_GB: i64 = 1_000_000_000;
+
+/// The two-element `[lower, upper]` bound, in GB, that brackets `bytes`.
+///
+/// "This value is a two-element array containing a lower bound and an upper bound for
+/// the estimate ... The estimate is subject to change over time; therefore, do not rely
+/// on the precision or accuracy of the estimate"
+/// (`ItemCollectionMetrics$SizeEstimateRangeGB`). The bracket reported here is the whole
+/// gigabyte at or below the measured size and the next one above it, so the measured
+/// size always lies inside the reported range and a collection under a gigabyte reports
+/// `[0.0, 1.0]`.
+pub fn size_estimate_range_gb(bytes: i64) -> Vec<f64> {
+    let whole_gb = bytes.max(0) / BYTES_PER_GB;
+    let lower = f64::from(u32::try_from(whole_gb).unwrap_or(u32::MAX));
+    vec![lower, lower + 1.0]
+}
+
+/// The `ConsumedCapacity` a read SERVED FROM A SECONDARY INDEX reports, or `None` when
+/// the request asked for `NONE` (or did not ask at all).
+///
+/// `INDEXES` asks for "the aggregate ConsumedCapacity for the operation, together with
+/// ConsumedCapacity for each table and secondary index that was accessed" (the
+/// `ReturnConsumedCapacity` doc): a read of an index spends its units ON THAT INDEX, so
+/// the index carries the aggregate and the table's own line is zero — the read did not go
+/// to the table (`Scan$Select`: a read served from the index "reads only the index and not
+/// the table"). Which of the two per-index maps the index appears under is its kind.
+pub fn consumed_index_capacity(
+    requested: Option<&str>,
+    table_name: &str,
+    index: &SecondaryIndex<'_>,
+    units: f64,
+) -> Option<ConsumedCapacity> {
+    let detail = match requested {
+        Some("TOTAL") => false,
+        Some("INDEXES") => true,
+        _ => return None,
+    };
+    let kind = CapacityKind::Read;
+    let mut per_index: BTreeMap<String, f64> = BTreeMap::new();
+    per_index.insert(index.name.to_string(), units);
+    let breakdown = detail.then(|| capacity_breakdown(kind, &per_index)).flatten();
+    Some(ConsumedCapacity {
+        // The read did not go to the table, so its own line is zero rather than absent:
+        // `INDEXES` asks for "each table and secondary index that was accessed", and the
+        // table that holds the index is named by every line of the breakdown.
+        table: detail.then(|| kind.line(0.0)),
+        local_secondary_indexes: (!index.global).then(|| breakdown.clone()).flatten(),
+        global_secondary_indexes: index.global.then_some(breakdown).flatten(),
+        ..kind.consumed(table_name, units)
+    })
+}
+
+/// The `ConsumedCapacity` a READ that asked for it gets back, or `None` when it
+/// asked for `NONE` (or did not ask at all).
+///
+/// `INDEXES` asks for the per-table breakdown as well as the aggregate; on a base
+/// table there is no index to break out, so the table's own capacity is the whole of
+/// it (the `ReturnConsumedCapacity` doc: "specifying INDEXES will only return
+/// ConsumedCapacity information for table(s)").
+///
+/// Every figure is reported in the read arm as well as the aggregate
+/// ([`CapacityKind`]).
+pub fn consumed_capacity(
+    requested: Option<&str>,
+    table_name: &str,
+    units: f64,
+) -> Option<ConsumedCapacity> {
+    let detail = match requested {
+        Some("TOTAL") => false,
+        Some("INDEXES") => true,
+        _ => return None,
+    };
+    let kind = CapacityKind::Read;
+    Some(ConsumedCapacity {
+        table: detail.then(|| kind.line(units)),
+        ..kind.consumed(table_name, units)
+    })
+}
+
 // ===========================================================================
 // What the multi-item paths share: `BatchWriteItem`, `BatchGetItem`,
 // `TransactWriteItems` and `TransactGetItems`
@@ -3417,21 +4842,17 @@ pub use partiql::*;
 // Who a request speaks for, and what every stored record is made of
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Resource-based policies
+// ---------------------------------------------------------------------------
+
 /// Who a data-plane request speaks for, and whether the policies in force let it act on
 /// the table it addresses, in its own file: it is about the CALLER and the documents of
 /// other services, while this module is the table and item store itself. Re-exported
 /// below, so every caller still names it `crate::state::…`.
 pub mod authorization;
-mod capacity;
-mod values;
-mod addressing;
-mod refusals;
 mod regions;
 pub use regions::*;
-pub use refusals::*;
-pub use addressing::*;
-pub use values::*;
-pub use capacity::*;
 
 /// The backup, import and export catalogues: the records a table's COPIES live in,
 /// their ARNs and their status vocabularies. Re-exported below, so every caller still
@@ -3445,36 +4866,36 @@ mod backups;
 /// `crate::state::…`.
 mod expressions;
 
+/// The lookups the RESOURCE-POLICY surface addresses a table by, which word their
+/// refusal as that surface words it. Re-exported below, so every caller still names
+/// them `crate::state::…`.
+mod store;
+
 /// What a read of a table — or of one of its secondary indexes — asks for and reports:
 /// what being pointed at an index means for the read, which index an `IndexName`
-/// resolves to, and what each reported item is narrowed to. Re-exported below, so every
+/// resolves to, the `ProjectionExpression` member's document paths, and what a
+/// single-item read reports of the item one key addresses. Re-exported below, so every
 /// caller still names them `crate::state::…`.
 mod indexed_read;
+mod projection;
+mod reads;
 
 /// The resource-based policy a table carries and the authorization decision it
 /// drives. Re-exported below, so every caller still names them `crate::state::…`.
 mod policies;
-
-/// The `ProjectionExpression` member: the document paths a read asks for, and what
-/// those paths report of one item. Re-exported below, so every caller still names them
-/// `crate::state::…`.
-mod projection;
-
-/// What a single-item read reports: where the projection reader and the projection
-/// itself meet for the one item a key addresses. Re-exported below, so every caller
-/// still names them `crate::state::…`.
-mod reads;
+pub use policies::*;
 
 /// The table record itself — its key schema, its secondary indexes, its items and
 /// everything one table answers about itself. Re-exported below, so every caller still
 /// names them `crate::state::…`.
-mod tables;
+mod table;
 
 /// The per-table settings that each carry a status of their own: continuous backups
 /// and point-in-time recovery, contributor insights, time to live, and the Kinesis
 /// destinations a table streams to. Re-exported below, so every caller still names
 /// them `crate::state::…`.
 mod table_settings;
+pub use table_settings::*;
 mod kinesis;
 pub use kinesis::*;
 
@@ -3482,8 +4903,6 @@ pub use authorization::request_caller;
 pub use backups::*;
 pub use expressions::*;
 pub use indexed_read::*;
-pub use policies::*;
 pub use projection::*;
 pub use reads::*;
-pub use table_settings::*;
-pub use tables::*;
+

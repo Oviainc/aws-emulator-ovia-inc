@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a reporting operation makes: finishing the status changes the
         // clock already made due.
         store.apply_due_transitions(now);
-        let table = store.table_by_arn(&resource).map_err(lift)?;
+        let table = store.table_for_policy(&resource).map_err(lift)?;
         let policy = table.resource_policy.as_ref().ok_or_else(|| {
             GetResourcePolicyError::from(
                 GetResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {

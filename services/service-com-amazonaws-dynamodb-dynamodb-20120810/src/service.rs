@@ -286,7 +286,8 @@ fn stated_enum_order(allowed: &[String]) -> Vec<String> {
 // required member that is absent are both found while READING the request, and
 // both keep the reader's own rendering whichever operation was served (`Value
 // 'NOPE' at 'returnConsumedCapacity' …` on `GetItem`, `Value null at
-// 'TableName' …`).
+// 'streamArn' …`) — except for the required members this service checks itself,
+// which are not reported as a clause at all ([`SERVICE_REQUIRED_MEMBERS`]).
 // =============================================================================
 
 /// The operations whose refusal of a value outside a bound the model declares is
@@ -410,8 +411,11 @@ impl ErasedOperation for OperationScopedClauseForm {
 ///   is stated in ([`stated_enum_order`]). [`SERVICE_CHECKED_ENUM_MEMBER`] is the
 ///   one member that is not reported that way, because the service checks it itself;
 /// * an absent member states the `null` it was, which is a fact of the request's
-///   shape — the framework's rendering again, over the member path spelled as the
-///   model spells it.
+///   shape — the framework's rendering again, over the member path the validating
+///   walk reports it under (`Value null at 'streamArn' …`), which is the path the
+///   recorded refusals of this service state. An absent member this service's OWN
+///   request code requires is not reported as a clause at all
+///   ([`SERVICE_REQUIRED_MEMBERS`]);
 ///
 /// A COLLECTION member past its cap is a clause like any other: in the item-request
 /// form the member and the bound, with nothing echoed. Some recorded AWS refusals of a
@@ -442,13 +446,6 @@ fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
         }
         ViolationKind::MissingRequiredMember | ViolationKind::EnumValue(_) => Some(
             Violation {
-                path: match &violation.kind {
-                    // An absent member names itself as the model spells it; an
-                    // enum violation keeps the reader's own path, which is what
-                    // the recorded refusals for this service state.
-                    ViolationKind::MissingRequiredMember => wire_member_path(&violation.path),
-                    _ => violation.path.clone(),
-                },
                 kind: match &violation.kind {
                     // The admissible set is stated in the order this service states it
                     // ([`stated_enum_order`]), which the framework cannot know because
@@ -466,7 +463,7 @@ fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
         // Every bound the validating walk checks — a `@range`, a `@length`, a
         // `@pattern`, `@uniqueItems` — in the served operation's form.
         _ => match form {
-            ClauseForm::PathAndValue => Some(violation.message()),
+            ClauseForm::PathAndValue => Some(as_stated(violation).message()),
             ClauseForm::WireMemberOnly => Some(crate::state::constraint_clause(
                 &wire_member_path(&violation.path),
                 None,
@@ -476,35 +473,125 @@ fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
     }
 }
 
+/// `violation` with the one requirement this service states differently from the
+/// framework's renderer: a `@pattern`, whose expression is stated WITHOUT the anchoring
+/// the model spells it with (`crate::state::pattern_requirement` states the rule and is
+/// the other half of it — the clause form that echoes no value already goes through it).
+/// Everything else about the violation, and every other requirement, is the renderer's
+/// own.
+fn as_stated(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            kind: ViolationKind::Pattern(
+                ::service_common::validation::unanchored(pattern).to_string(),
+            ),
+            ..violation.clone()
+        },
+        _ => violation.clone(),
+    }
+}
+
 /// The `ValidationException` message for a framework refusal: the same envelope
 /// `crate::state::validation_message` builds for the bounds this service checks
 /// itself, over one clause per violated member.
 ///
+/// A member [`SERVICE_REQUIRED_MEMBERS`] names takes precedence over every clause,
+/// because the check that finds it absent is not the validating walk.
+///
 /// `None` declines the whole refusal — see [`requirement`].
 fn validation_envelope(violations: &[Violation]) -> Option<String> {
-    // A required member the request did not carry at all is stated as its OWN sentence,
-    // naming the parameter as the model spells it. The envelope states clauses about
-    // VALUES a request carried, and an absent member carried none, so what the service
-    // reports is the parameter that is missing rather than a constraint some value
-    // failed. Several missing members have no recorded single sentence, so they keep the
-    // envelope's one-clause-per-member form.
-    if let [violation] = violations {
-        if matches!(violation.kind, ViolationKind::MissingRequiredMember) {
-            return Some(missing_parameter(&wire_member_path(&violation.path)));
-        }
+    if let Some(absent) = missing_service_required_member(violations) {
+        return Some(crate::state::missing_parameter_message(&absent));
     }
     let form = served_clause_form();
-    let clauses: Vec<String> = violations
-        .iter()
+    let clauses: Vec<String> = in_stated_member_order(violations)
+        .into_iter()
         .map(|violation| violation_clause(violation, form))
         .collect::<Option<Vec<_>>>()?;
     crate::state::validation_message(clauses)
 }
 
-/// AWS's sentence for a required parameter the request did not carry: the whole text is
-/// fixed around the member's own name, spelled as the model spells it on the wire.
-fn missing_parameter(member: &str) -> String {
-    format!("The parameter '{member}' is required but was not present in the request")
+/// The inputs whose refusal states its members' clauses in an order of its OWN, each
+/// written as the paths the validating walk reports, in the order the service states
+/// them.
+///
+/// The order several clauses appear in is the order the service validated the input's
+/// members, which is a property of that input and not of the model: the walk reports
+/// them in the order the model declares them, and for the inputs below the service is
+/// observed to state the same members in a different one — `ListTables` states its page
+/// SIZE before its page CURSOR, while the model declares the cursor first. An input this
+/// list does not name keeps the order the walk reported, because that is the order the
+/// service is observed to state it in.
+///
+/// Nothing about the model distinguishes the two groups — the same members, a different
+/// order — so this is the only place the difference is recorded, and an input later found
+/// to be stated in an order of its own needs its own entry here.
+/// `tests/all/required_member_refusals.rs` reads it back over the operation that carries
+/// it, so the difference is visible rather than silent.
+const STATED_MEMBER_ORDERS: &[&[&str]] = &[
+    // `ListTablesInput`, which the model declares as `ExclusiveStartTableName` then
+    // `Limit` (`smithy_query(query="shape",
+    // shape="com.amazonaws.dynamodb#ListTablesInput")`).
+    &["limit", "exclusiveStartTableName"],
+];
+
+/// `violations` in the order their clauses are stated: the order
+/// [`STATED_MEMBER_ORDERS`] publishes for the input they are all members of, and
+/// otherwise the order the walk reported.
+///
+/// An entry applies only when it names EVERY violated member, so a refusal that mixes a
+/// member the entry knows with one it does not keeps the walk's order rather than
+/// guessing where the unknown member belongs.
+fn in_stated_member_order(violations: &[Violation]) -> Vec<&Violation> {
+    let mut stated: Vec<&Violation> = violations.iter().collect();
+    let Some(order) = STATED_MEMBER_ORDERS.iter().find(|order| {
+        violations
+            .iter()
+            .all(|violation| order.contains(&violation.path.as_str()))
+    }) else {
+        return stated;
+    };
+    stated.sort_by_key(|violation| {
+        order
+            .iter()
+            .position(|member| *member == violation.path.as_str())
+            .unwrap_or(order.len())
+    });
+    stated
+}
+
+/// The required members this service's OWN request code demands, named by the path the
+/// framework's validating walk reports them under.
+///
+/// Such a member is not left to that walk: this service resolves and bounds the value
+/// itself (the table-name member is checked against the 3..=255 `[a-zA-Z0-9_.-]+` form
+/// the public model does not carry — `crate::state::resolve_table_name`), so a request
+/// that carries no value for it is refused by that check, with the service's own
+/// parameter-required sentence instead of the walk's `Member must not be null` clause.
+/// Every other required member keeps the walk's clause, because the walk is what finds
+/// it absent (`Value null at 'streamArn' …` for an absent
+/// `EnableKinesisStreamingDestination$StreamArn`).
+///
+/// Nothing about the model distinguishes the two groups — both members are `@required`
+/// — so this list is the only place the difference is recorded, and a member later found
+/// to be refused the same way needs its own entry here.
+/// `tests/all/required_member_refusals.rs` pins both groups side by side so the
+/// difference is visible rather than silent.
+const SERVICE_REQUIRED_MEMBERS: &[&str] = &[crate::state::TABLE_NAME_MEMBER_PATH];
+
+/// The member of [`SERVICE_REQUIRED_MEMBERS`] this refusal found absent, named as the
+/// model spells it on the wire, or `None` when the refusal is about anything else.
+///
+/// One request can omit several members; the one reported is the first in the order the
+/// refusal states them, which is the order the input's members were read.
+fn missing_service_required_member(violations: &[Violation]) -> Option<String> {
+    violations
+        .iter()
+        .find(|violation| {
+            matches!(violation.kind, ViolationKind::MissingRequiredMember)
+                && SERVICE_REQUIRED_MEMBERS.contains(&violation.path.as_str())
+        })
+        .map(|violation| wire_member_path(&violation.path))
 }
 
 /// The service key `::emulator_server::service_from_target` reads out of a

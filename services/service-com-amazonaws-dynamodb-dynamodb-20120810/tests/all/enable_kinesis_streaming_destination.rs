@@ -121,13 +121,13 @@ async fn history(router: &MultiServiceRouter, table: &str) -> Vec<(String, Strin
 }
 
 /// DynamoDB's refusal of a command that starts replication the table already runs: the
-/// stream and the table the request named, under the invalid-state sentence.
-fn already_enabled_message(table: &str, stream_arn: &str) -> String {
-    format!(
-        "Table is not in a valid state to enable Kinesis Streaming Destination: Streaming \
-         destination with streamArn: {stream_arn} is already enabled for table with tableName: \
-         {table}"
-    )
+/// statuses an enable may start from, under the invalid-state sentence, naming neither
+/// the table nor the stream.
+fn already_enabled_message() -> String {
+    "Table is not in a valid state to enable Kinesis Streaming Destination: \
+     EnableKinesisStreamingDestination must be DISABLED or ENABLE_FAILED to perform ENABLE \
+     operation."
+        .to_string()
 }
 
 /// How a row of the registration table below names the precision: not at all, through an
@@ -312,7 +312,7 @@ async fn an_enable_of_a_stream_already_replicating_is_refused() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
-        let wanted = already_enabled_message(&table, &arn);
+        let wanted = already_enabled_message();
         assert_eq!(
             message(&body),
             wanted,

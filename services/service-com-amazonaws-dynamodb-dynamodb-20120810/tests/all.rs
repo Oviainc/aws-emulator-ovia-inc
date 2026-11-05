@@ -111,6 +111,8 @@ mod query_indexes_and_projections;
 #[path = "all/refusal_contracts_and_expression_pre_images.rs"]
 mod refusal_contracts_and_expression_pre_images;
 
+#[path = "all/required_member_refusals.rs"]
+mod required_member_refusals;
 #[path = "all/request_validation_refusals.rs"]
 mod request_validation_refusals;
 

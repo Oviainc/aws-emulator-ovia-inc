@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let table = store.table_by_arn_mut(&resource).map_err(lift)?;
+        let table = store.table_for_policy_mut(&resource).map_err(lift)?;
         // "When you provide an expected revision ID, if the revision ID of the existing
         // policy on the resource doesn't match or if there's no policy attached to the
         // resource, the request will fail and return a PolicyNotFoundException"
