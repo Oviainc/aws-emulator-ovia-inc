@@ -39,6 +39,8 @@ mod delete_cluster_in_flight;
 mod encryption_key_selection;
 #[path = "all/error_contract.rs"]
 mod error_contract;
+#[path = "all/fixed_refusal_sentences.rs"]
+mod fixed_refusal_sentences;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/identifier_format_refusal.rs"]

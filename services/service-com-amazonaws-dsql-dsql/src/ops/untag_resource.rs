@@ -213,15 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
         // The same scoped resolution the other tagging operations use: an ARN of
         // another region, account or partition names a resource this endpoint does not
-        // serve, so it removes nothing and answers the modelled 404 — naming the
-        // missing resource by its own type and its own identifier, which for a nested
-        // stream ARN is the stream rather than the cluster segment the read split at.
-        let identity = state.addressed_identity(&resource, &region);
+        // serve, so it removes nothing and answers the tagging surface's own
+        // not-found — the one refusal all three operations bound to that path share.
         let Some(tags) = state.resource_tags_mut(&resource, &region) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                identity.not_found(&input.resource_arn),
-            )
-            .into());
+            return Err(crate::state::tagging_resource_not_found());
         };
 
         // `tagKeys` asks for an end state, not for the deletion of a specific entry,

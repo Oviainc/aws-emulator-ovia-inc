@@ -227,7 +227,7 @@ async fn a_create_cluster_token_is_resolved_only_at_the_endpoint_that_recorded_i
             let foreign = home.list_tags_for_resource(&away_arn).await;
             assert_eq!(
                 (foreign.status, foreign.error.as_deref()),
-                (404, Some("ResourceNotFoundException")),
+                (404, Some("NotFoundException")),
                 "case {case:?}: {home_region} holds no resource of {away_region} \
                  ({away_arn:?}), got {} {:?}",
                 foreign.status,

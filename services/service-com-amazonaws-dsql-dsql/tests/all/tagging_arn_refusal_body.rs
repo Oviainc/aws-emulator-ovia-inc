@@ -299,8 +299,8 @@ async fn every_tagging_operation_refuses_an_arn_naming_nothing_with_one_modeled_
 
 /// RULE (the other side): an ARN this service DOES read as naming one of its
 /// resources is resolved rather than refused — served when the resource is there,
-/// and answered with the modelled 404 when it is not — so the 400 above is about the
-/// ARN naming nothing here, not about the path or the request body.
+/// and answered with the tagging surface's own 404 when it is not — so the 400 above
+/// is about the ARN naming nothing here, not about the path or the request body.
 #[tokio::test]
 async fn an_arn_this_service_reads_is_resolved_rather_than_refused() {
     let dsql = Dsql::new();
@@ -326,7 +326,7 @@ async fn an_arn_this_service_reads_is_resolved_rather_than_refused() {
     }
 
     // Well-formed, read as naming a cluster of this service, and naming nothing the
-    // store holds: the modelled 404, never the 400 above.
+    // store holds: the tagging surface's own 404, never the 400 above.
     let absent = expected_arn(dsql.region(), &absent_identifier());
     for (operation, answer) in every_tagging_operation(&dsql, &absent).await {
         assert_eq!(
@@ -334,13 +334,11 @@ async fn an_arn_this_service_reads_is_resolved_rather_than_refused() {
             "case {operation:?} with an ARN naming no stored cluster: got {} {:?}",
             answer.status, answer.body
         );
-        assert!(
-            answer
-                .error
-                .as_deref()
-                .is_some_and(|code| code.contains("ResourceNotFoundException")),
+        assert_eq!(
+            answer.error.as_deref(),
+            Some("NotFoundException"),
             "case {operation:?} with an ARN naming no stored cluster: the code must be \
-             ResourceNotFoundException, got {:?}",
+             NotFoundException, got {:?}",
             answer.error
         );
     }

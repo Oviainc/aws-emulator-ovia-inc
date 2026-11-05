@@ -13,7 +13,8 @@
 //! an ARN that names no Aurora DSQL resource at all is a bad request (400
 //! `ValidationException`), and a well-formed one naming nothing this store holds —
 //! including one scoped to another region, account or partition than the endpoint the
-//! request reached — answers the modelled 404. EVERY tagged resource of this service
+//! request reached — answers that surface's own 404 `NotFoundException`
+//! ("Resource was not found"). EVERY tagged resource of this service
 //! resolves —  a
 //! cluster (`cluster/{cluster}`) and a stream of it
 //! (`cluster/{cluster}/stream/{stream}`) — each to its OWN tag map, exactly as in
@@ -221,24 +222,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose deletion came due is not found here either.
         state.settle(std::time::SystemTime::now());
 
-        // The identity every modelled error below reports for the addressed resource:
-        // its own type segment and its own identifier, so a stream of a cluster is
-        // named as a stream rather than as the cluster segment the ARN read split at.
-        let identity = state.addressed_identity(&resource, &region);
+        // The identity the modelled quota refusal below reports for the addressed
+        // resource: its own type segment and its own identifier, so a stream of a
+        // cluster is named as a stream rather than as the cluster segment the ARN read
+        // split at.
+        let identity = state.addressed_identity(&resource);
 
         // The one resolution of a tagging ARN, shared with `ListTagsForResource` and
         // `UntagResource`: it walks every tagged resource of this service — a cluster,
         // and a stream of a cluster addressed by its nested ARN
         // `cluster/{cluster}/stream/{stream}` (`crate::state::stream_arn`) — to that
         // resource's own tag map, within the scope the request reached. A well-formed
-        // ARN naming nothing this store holds answers the modelled 404, whichever of
-        // the two it names — and an ARN of another region, account or partition names
-        // a resource this endpoint neither reads nor writes, so it is absent here too.
+        // ARN naming nothing this store holds is the tagging surface's own not-found,
+        // whichever of the two it named — and an ARN of another region, account or
+        // partition names a resource this endpoint neither reads nor writes, so it is
+        // absent here too.
         let Some(held) = state.resource_tags_mut(&resource, &region) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                identity.not_found(&input.resource_arn),
-            )
-            .into());
+            return Err(crate::state::tagging_resource_not_found());
         };
 
         // The write is all-or-nothing: a request that would leave the resource

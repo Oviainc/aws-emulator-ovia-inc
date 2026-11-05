@@ -1281,66 +1281,38 @@ impl ComAmazonawsDsqlDsqlState {
         }
     }
 
-    /// The identity a modelled error reports for the resource a tagging ARN names:
-    /// that resource's OWN type segment and its OWN identifier.
+    /// The identity a modelled error reports for the resource a tagging ARN
+    /// ADDRESSES: that resource's OWN type segment and its OWN identifier.
     ///
     /// A resource is identified by the type segment it is stored under and the
     /// identifier that segment carries, so a stream of a cluster is a
     /// [`RESOURCE_TYPE_STREAM`] named by its own stream identifier — the identity
     /// [`stream_not_found`] reports for that very stream — and never the leading
     /// `cluster` segment [`parse_resource_arn`] split the resource field at, carrying
-    /// the rest of the path for an identifier.
+    /// the rest of the path for an identifier. An ARN whose path names no resource of
+    /// this service at all is reported exactly as it was spelled, there being no
+    /// resource of this service to name instead.
     ///
-    /// Which of a nested ARN's two resources is the one a REFUSAL names follows the
-    /// same rule the identifier-addressed readers follow: the resource the lookup
-    /// stopped at is the one that is missing, so a nested ARN whose cluster this store
-    /// does not hold — including one in a scope this endpoint serves none of — names
-    /// that cluster, and one whose cluster is held names the stream under it. An ARN
-    /// whose path names no resource of this service at all is reported exactly as it
-    /// was spelled, there being no resource of this service to name instead.
-    pub fn addressed_identity(
-        &self,
-        resource: &ArnResource,
-        endpoint_region: &str,
-    ) -> ResourceIdentity {
-        let Some((cluster_identifier, stream_identifier)) = Self::arn_path(resource) else {
-            return ResourceIdentity {
-                resource_type: resource.resource_type.clone(),
-                resource_id: resource.resource_id.clone(),
-            };
-        };
-        match stream_identifier {
-            Some(stream_identifier)
-                if self.holds_cluster(resource, endpoint_region, cluster_identifier) =>
-            {
-                ResourceIdentity {
-                    resource_type: RESOURCE_TYPE_STREAM.to_string(),
-                    resource_id: stream_identifier.to_string(),
-                }
-            }
-            _ => ResourceIdentity {
+    /// Read by the refusals a tagging operation states ABOUT a resource it resolved —
+    /// the tag ceiling of the resource addressed (`TagResource`'s
+    /// `ServiceQuotaExceededException`). An ARN that resolves to nothing is not such a
+    /// refusal: the tagging surface answers that in its own terms, naming no resource
+    /// at all ([`tagging_resource_not_found`]).
+    pub fn addressed_identity(&self, resource: &ArnResource) -> ResourceIdentity {
+        match Self::arn_path(resource) {
+            Some((_, Some(stream_identifier))) => ResourceIdentity {
+                resource_type: RESOURCE_TYPE_STREAM.to_string(),
+                resource_id: stream_identifier.to_string(),
+            },
+            Some((cluster_identifier, None)) => ResourceIdentity {
                 resource_type: RESOURCE_TYPE_CLUSTER.to_string(),
                 resource_id: cluster_identifier.to_string(),
             },
+            None => ResourceIdentity {
+                resource_type: resource.resource_type.clone(),
+                resource_id: resource.resource_id.clone(),
+            },
         }
-    }
-
-    /// Whether this store holds the cluster `cluster_identifier` names as the ARN
-    /// `resource` names it: in the scope the request reached, and minted with that
-    /// very scope — the same two conditions [`Self::resource_tags`] resolves a
-    /// cluster under, so the identity a refusal reports and the resolution that
-    /// refused never disagree.
-    fn holds_cluster(
-        &self,
-        resource: &ArnResource,
-        endpoint_region: &str,
-        cluster_identifier: &str,
-    ) -> bool {
-        resource.is_scoped_to(endpoint_region)
-            && self
-                .clusters
-                .get(cluster_identifier)
-                .is_some_and(|cluster| resource.is_arn_of(&cluster.arn))
     }
 
     /// The tags of the resource `resource` names, if this service holds it.
@@ -1934,8 +1906,7 @@ impl PageBounds {
     ) -> Result<Self, ValidationException> {
         let resume_after = match next_token {
             Some(token) => Some(
-                decode_pagination_cursor(&scope, token)
-                    .ok_or_else(|| unissued_pagination_token(token))?,
+                decode_pagination_cursor(&scope, token).ok_or_else(unissued_pagination_token)?,
             ),
             None => None,
         };
@@ -2113,12 +2084,6 @@ impl ResourceIdentity {
         }
     }
 
-    /// The modelled `ResourceNotFoundException` for a resource `arn` addressed and
-    /// this service does not hold: [`resource_not_found`] over this identity.
-    pub fn not_found(&self, arn: &str) -> ResourceNotFoundException {
-        resource_not_found(arn, &self.resource_id, &self.resource_type)
-    }
-
     /// The modelled `ConflictException` for a conflict about THIS resource, worded
     /// with `message`.
     ///
@@ -2162,9 +2127,13 @@ impl ResourceIdentity {
 }
 
 /// The modelled `ResourceNotFoundException` for a resource this service does not
-/// hold, worded the way AWS words it: the message NAMES THE ARN the call
-/// addressed, which is how a caller learns which resource was missing. Every
-/// member of the shape is `@required`, so all three are filled.
+/// hold, worded the way AWS words it on the operations addressed by an IDENTIFIER:
+/// the message NAMES THE ARN the call addressed, which is how a caller learns which
+/// resource was missing. Every member of the shape is `@required`, so all three are
+/// filled.
+///
+/// The ARN-addressed tagging surface states its not-found differently
+/// ([`tagging_resource_not_found`]), so this is not reached from there.
 pub fn resource_not_found(
     arn: &str,
     resource_id: &str,
@@ -2272,10 +2241,7 @@ pub fn validate_stream_identifier(member: &str, value: &str) -> Result<(), Valid
         return Ok(());
     }
     Err(ValidationException {
-        message: format!(
-            "Aurora DSQL can't process the request because the {member} that you specified \
-             isn't valid. Provide the {member} in the format '{IDENTIFIER_FORMAT}' and try again."
-        ),
+        message: unreadable_member_message(member, &format!("the format '{IDENTIFIER_FORMAT}'")),
         reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: Some(vec![ValidationExceptionField {
             name: member.to_string(),
@@ -2386,7 +2352,7 @@ pub fn validate_cluster_policy(
 ) -> Result<(), ValidationException> {
     let Some(parsed) = parse_policy(document) else {
         return Err(ValidationException {
-            message: "The policy is not a valid JSON policy document.".to_string(),
+            message: unreadable_member_message(POLICY_MEMBER, POLICY_DOCUMENT_FORM),
             reason: VALIDATION_REASON_CANNOT_PARSE.to_string(),
             field_list: None,
         });
@@ -2403,6 +2369,32 @@ pub fn validate_cluster_policy(
         });
     }
     Ok(())
+}
+
+/// The member a resource-based policy document arrives in, on both operations that
+/// write one (`smithy_query(query="operation",
+/// operation="CreateCluster,PutClusterPolicy")`: `policy`).
+pub const POLICY_MEMBER: &str = "policy";
+
+/// The form a policy document had to be in, as [`unreadable_member_message`] names
+/// it: the document is a whole policy language rather than a value with a spellable
+/// shape, so the sentence asks for a valid format instead of quoting a grammar.
+const POLICY_DOCUMENT_FORM: &str = "a valid format";
+
+/// Aurora DSQL's sentence for a member whose value it cannot read as the thing that
+/// member carries: it names the member and the form the value had to take, and
+/// echoes nothing the caller sent.
+///
+/// `form` completes "Provide the {member} in …", so it is a named format ("the format
+/// '…'") or the bare requirement ("a valid format"). The one place this family of
+/// refusals is worded, so every member refused for the same reason — an identifier
+/// that is no identifier, a policy document that is no policy — is refused in the
+/// same sentence.
+fn unreadable_member_message(member: &str, form: &str) -> String {
+    format!(
+        "Aurora DSQL can't process the request because the {member} that you specified \
+         isn't valid. Provide the {member} in {form} and try again."
+    )
 }
 
 /// Parse a `PolicyDocument` into its JSON object, or `None` when it is not one.
@@ -2706,21 +2698,41 @@ pub fn settled_cluster_status(
 /// The modelled `ValidationException` for a `nextToken` this service never issued,
 /// as [`decode_pagination_cursor`] reads it.
 ///
+/// Aurora DSQL states this failure with the FIXED sentence
+/// [`INVALID_PAGINATION_TOKEN_MESSAGE`], which belongs to the failure rather than to
+/// the request: a cursor is opaque, so there is nothing about the value to report,
+/// and the remedy is the same whatever was sent. The sentence is carried twice — in
+/// `message` and in the single `fieldList` entry — and the entry names the cursor by
+/// the name the caller spelled it with on the wire ([`NEXT_TOKEN_FIELD`]). The
+/// function takes no argument, so no value of the refused request can reach either.
+///
 /// Shared by every paginated reader, so one fabricated cursor is refused the same
 /// way whichever list operation received it — and with the modelled shape's
 /// `@required` `reason` filled, not the synthetic `message`-only one.
-pub fn unissued_pagination_token(value: &str) -> ValidationException {
-    invalid_member_value(
-        NEXT_TOKEN_MEMBER,
-        "must be a nextToken a previous page of this operation returned",
-        value,
-    )
+pub fn unissued_pagination_token() -> ValidationException {
+    ValidationException {
+        message: INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: NEXT_TOKEN_FIELD.to_string(),
+            message: INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+        }]),
+    }
 }
 
-/// The name the paginated operations' cursor member carries on the wire
-/// (`smithy_query(query="operation", operation="ListClusters")`: `nextToken`,
-/// bound to the `next-token` query parameter).
-pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+/// The sentence Aurora DSQL refuses a pagination token it did not issue with. Fixed
+/// text in full: it interpolates nothing, so the same sentence states the failure for
+/// every rejected cursor of every paginated reader.
+pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str =
+    "Invalid pagination token. Request a new token and try again.";
+
+/// The name the paginated operations' cursor carries ON THE WIRE: the `@httpQuery`
+/// parameter the `nextToken` member is bound to (`smithy_query(query="operation",
+/// operation="ListClusters,ListStreams")`: `nextToken`, `httpQuery: "next-token"`).
+///
+/// A `fieldList` entry names the field the CALLER sent, so for a member carried in a
+/// query parameter that is the parameter's name rather than the Smithy member name.
+pub const NEXT_TOKEN_FIELD: &str = "next-token";
 
 /// The name a cluster's and a stream's status member carries on the wire
 /// (`smithy_query(query="operation",
@@ -3055,6 +3067,39 @@ fn decoded_text(member: Option<&::serde_json::Value>) -> Option<Option<String>> 
         None | Some(::serde_json::Value::Null) => Some(None),
         Some(text) => Some(Some(text.as_str()?.to_string())),
     }
+}
+
+/// The wire error code the ARN-addressed tagging surface answers a `resourceArn` it
+/// resolves no resource of this service for with.
+///
+/// NOT a shape this service's model declares — the model lists
+/// `ResourceNotFoundException` (404) on the tagging operations — but the code the
+/// service answers on that surface, as the behavioural corpus records it: the
+/// operations bound to `/tags/{resourceArn}` are fronted by a tagging layer that
+/// states its own refusal, while every operation addressed by an IDENTIFIER answers
+/// the modelled `ResourceNotFoundException` naming the resource
+/// ([`resource_not_found`]). The status and the code are what a client classifies on,
+/// so they follow the recording rather than the model.
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The status [`TAGGING_NOT_FOUND_CODE`] is served on — the same 404 the model gives
+/// `ResourceNotFoundException`, a not-found being a 404 whichever code names it.
+pub const TAGGING_NOT_FOUND_STATUS: u16 = 404;
+
+/// The sentence [`TAGGING_NOT_FOUND_CODE`] carries. Fixed text in full: that surface
+/// reports neither the ARN it refused nor any identifier or remediation, so one
+/// sentence states the failure for every resource.
+pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The refusal the tagging surface answers an ARN it resolves no resource for with,
+/// in whichever tagging operation's error channel: HTTP [`TAGGING_NOT_FOUND_STATUS`]
+/// with [`TAGGING_NOT_FOUND_CODE`] and [`TAGGING_NOT_FOUND_MESSAGE`], and no member
+/// besides the sentence.
+///
+/// Built here rather than per handler, so the three operations bound to
+/// `/tags/{resourceArn}` cannot disagree about the one refusal they share.
+pub fn tagging_resource_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::not_found(TAGGING_NOT_FOUND_MESSAGE)
 }
 
 /// The modelled `ResourceNotFoundException` for a cluster this service does not

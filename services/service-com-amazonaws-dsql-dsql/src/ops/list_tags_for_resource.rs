@@ -6,9 +6,10 @@
 //! the ARN is resolved to a stored resource of this service, and that resource's own
 //! tag map is the answer. A well-formed Aurora DSQL ARN naming a resource this
 //! service does not hold — including one scoped to another region, account or
-//! partition than the endpoint the request reached — answers the modelled
-//! `ResourceNotFoundException` (404); an ARN that names no Aurora DSQL resource at
-//! all is refused as invalid input (400).
+//! partition than the endpoint the request reached — answers the ARN-addressed
+//! tagging surface's own 404 `NotFoundException` ("Resource was not found"), not the
+//! `ResourceNotFoundException` the identifier-addressed operations state; an ARN that
+//! names no Aurora DSQL resource at all is refused as invalid input (400).
 //! Reporting only: the sole write it performs is settling a status change the clock
 //! already owed at this instant, so a cluster whose deletion has come due is no
 //! longer there to list tags for.
@@ -178,15 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another region, account or partition names a resource this endpoint does not
         // serve, which is as absent here as an identifier that was never minted.
         let Some(tags) = state.resource_tags(&resource, &region).cloned() else {
-            // The refusal names the resource that is MISSING by its own type and its
-            // own identifier, which for a nested stream ARN is the stream rather than
-            // the cluster segment the ARN read split at.
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                state
-                    .addressed_identity(&resource, &region)
-                    .not_found(&input.resource_arn),
-            )
-            .into());
+            // The ARN-addressed tagging surface states its own not-found
+            // (`crate::state::tagging_resource_not_found`), the same one whichever of
+            // this service's tagged resources the ARN named; the operations addressed
+            // by an identifier answer the modelled `ResourceNotFoundException`.
+            return Err(crate::state::tagging_resource_not_found());
         };
 
         Ok(ListTagsForResourceOutput {

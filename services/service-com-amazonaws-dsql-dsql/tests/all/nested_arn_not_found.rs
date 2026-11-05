@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Which resource a `ResourceNotFoundException` NAMES when the ARN it refused
-//! addresses a resource nested under another one, end to end over the wire.
+//! How an ARN that addresses a resource nested under another one is refused when the
+//! resource is not there, end to end over the wire.
 //!
-//! RULE under test: a refusal that identifies a resource carries that resource's OWN
-//! type segment and its OWN identifier, and the resource it identifies is the one the
-//! lookup stopped at. For a stream of a cluster — the one nested resource of this
-//! service, addressed as `cluster/{cluster}/stream/{stream}` — that means the stream's
-//! type and its own identifier when the cluster is held and the stream under it is
-//! not, and the cluster's type and identifier when the cluster itself is not held;
-//! never a parent's type segment carrying the rest of the resource path for an
-//! identifier.
-//!
-//! The rule is the service's, not one operation's, so every row is put to all three
-//! operations bound to `/tags/{resourceArn}` (`ListTagsForResource`, `TagResource`,
-//! `UntagResource`), and the identity each answers is compared with what `GetStream`
-//! — the identifier-addressed reader of the very same resources — reports for the
-//! same absent resource. Two paths describing one absent resource must describe it
-//! identically.
+//! RULE under test: the two ways a resource is addressed are refused by two different
+//! surfaces. The operations bound to `/tags/{resourceArn}` (`ListTagsForResource`,
+//! `TagResource`, `UntagResource`) are fronted by the ARN-addressed tagging surface,
+//! which states one refusal for every resource it resolves nothing for — HTTP 404,
+//! wire code `NotFoundException`, the fixed sentence "Resource was not found" and no
+//! other member — so WHICH level of a nested path (`cluster/{cluster}/stream/{stream}`,
+//! the one nested resource of this service) is missing does not change the answer, and
+//! nothing from the request is echoed back. The operations addressed by an IDENTIFIER
+//! answer the modelled `ResourceNotFoundException` instead, naming the resource the
+//! lookup stopped at by that resource's OWN type segment and its OWN identifier.
 //!
 //! The table spans the class the rule generalises over: which level of the nested path
 //! is missing (the stream, the cluster), the stream identifier (two never-created
@@ -29,6 +24,8 @@
 //!
 //! The client is the shared `Dsql` harness in `harness.rs`; `UntagResource`'s query
 //! encoding is the one the `resource_tags` suite spells.
+
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
@@ -42,6 +39,19 @@ const HOME: &str = "us-east-1";
 
 /// A region whose resources this endpoint holds none of.
 const AWAY: &str = "eu-west-1";
+
+/// The wire code and the sentence the ARN-addressed tagging surface refuses an ARN it
+/// resolves nothing for with. Recorded behaviour: that surface answers in its own
+/// terms rather than with the `ResourceNotFoundException` the model lists on those
+/// operations, and its sentence interpolates nothing.
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+/// See [`TAGGING_NOT_FOUND_CODE`].
+const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The members that refusal's body may carry: the sentence, in either casing the
+/// restJson1 envelope allows, plus the envelope's own discriminator. A member outside
+/// this set would mean some other shape was serialized.
+const TAGGING_NOT_FOUND_BODY_MEMBERS: &[&str] = &["__type", "message", "Message"];
 
 /// A `targetDefinition` naming a Kinesis destination, as `CreateStream` requires.
 /// Source: `smithy_query(query="shape", shape="KinesisTargetDefinition")` — a
@@ -79,6 +89,15 @@ fn reported_identity(answer: &Answer) -> (String, String) {
     (answer.str("resourceType"), answer.str("resourceId"))
 }
 
+/// The members a body carries, so a body can be compared against a modelled set.
+fn body_members(answer: &Answer) -> BTreeSet<String> {
+    answer
+        .body
+        .as_object()
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// The cluster and the stream this suite refuses ARNs around.
 struct Held {
     cluster: String,
@@ -114,19 +133,56 @@ async fn held_resources(dsql: &Dsql) -> Held {
     }
 }
 
-/// One refused ARN and the identity every refusal of it must carry.
+/// One refused ARN, and which level of its path is the resource that is missing.
 struct NotFoundCase {
     name: String,
     arn: String,
-    resource_type: &'static str,
-    resource_id: String,
 }
 
-/// RULE: the refusal of an ARN that addresses a nested resource names the resource the
-/// lookup stopped at, by that resource's own type segment and its own identifier — and
-/// the three operations bound to `/tags/{resourceArn}` all name the same one.
+/// Assert one answer IS the tagging surface's own not-found: its status, its code,
+/// its fixed sentence, and no member besides the sentence — and nothing the request
+/// carried echoed back into it.
+fn assert_tagging_surface_not_found(case: &str, arn: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status, 404,
+        "case {case:?}: an ARN naming no resource must answer 404, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error.as_deref(),
+        Some(TAGGING_NOT_FOUND_CODE),
+        "case {case:?}: the wire code must be {TAGGING_NOT_FOUND_CODE}, got {:?}",
+        answer.error
+    );
+    assert_eq!(
+        answer.message(),
+        TAGGING_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected the fixed sentence {TAGGING_NOT_FOUND_MESSAGE:?}, got {:?}",
+        answer.message()
+    );
+    assert!(
+        !answer.message().contains(arn),
+        "case {case:?}: the sentence must echo nothing from the request ({arn:?}), got {:?}",
+        answer.message()
+    );
+    let unexpected: Vec<String> = body_members(answer)
+        .into_iter()
+        .filter(|member| !TAGGING_NOT_FOUND_BODY_MEMBERS.contains(&member.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "case {case:?}: the body must carry only {TAGGING_NOT_FOUND_BODY_MEMBERS:?}, got the \
+         extra {unexpected:?} in {:?}",
+        answer.body
+    );
+}
+
+/// RULE: every operation bound to `/tags/{resourceArn}` refuses an ARN it resolves
+/// nothing for with the tagging surface's own 404 — the same status, code, sentence
+/// and body whichever level of a nested path is missing, and whichever of the three
+/// operations answered.
 #[tokio::test]
-async fn a_nested_arn_is_refused_naming_the_resource_that_is_missing() {
+async fn a_nested_arn_is_refused_by_the_tagging_surface_whatever_is_missing() {
     let dsql = Dsql::new();
     let held = held_resources(&dsql).await;
 
@@ -153,40 +209,27 @@ async fn a_nested_arn_is_refused_naming_the_resource_that_is_missing() {
             name: "a stream never created, under a live cluster that holds another stream"
                 .to_string(),
             arn: expected_stream_arn(HOME, &held.cluster, &missing_a),
-            resource_type: "stream",
-            resource_id: missing_a.clone(),
         },
         NotFoundCase {
             name: "another never-created stream of the same live cluster".to_string(),
             arn: expected_stream_arn(HOME, &held.cluster, &missing_b),
-            resource_type: "stream",
-            resource_id: missing_b.clone(),
         },
         NotFoundCase {
             name: "a stream of a cluster this service never minted".to_string(),
             arn: expected_stream_arn(HOME, &absent_cluster, &missing_a),
-            resource_type: "cluster",
-            resource_id: absent_cluster.clone(),
         },
         NotFoundCase {
             name: "a stream of a cluster whose deletion the clock completed".to_string(),
             arn: expected_stream_arn(HOME, &retired, &missing_a),
-            resource_type: "cluster",
-            resource_id: retired.clone(),
         },
         NotFoundCase {
             name: "a stream path spelled for a region this endpoint serves none of".to_string(),
             arn: expected_stream_arn(AWAY, &held.cluster, &held.stream),
-            resource_type: "cluster",
-            resource_id: held.cluster.clone(),
         },
-        // The non-nested forms the same rule covers: there the type segment the ARN
-        // was split at IS the addressed resource's own type.
+        // The non-nested forms the same rule covers.
         NotFoundCase {
             name: "a plain cluster ARN this service never minted".to_string(),
             arn: expected_arn(HOME, &absent_cluster),
-            resource_type: "cluster",
-            resource_id: absent_cluster.clone(),
         },
         NotFoundCase {
             name: "a top-level ARN of a resource type this service holds none of".to_string(),
@@ -194,19 +237,14 @@ async fn a_nested_arn_is_refused_naming_the_resource_that_is_missing() {
                 "arn:aws:dsql:{HOME}:{}:stream/{missing_a}",
                 engine::EMULATOR_ACCOUNT_ID
             ),
-            resource_type: "stream",
-            resource_id: missing_a.clone(),
         },
-        // A path this service mints no resource for names no resource of it to report
-        // instead, so it is reported exactly as the ARN spelled it.
         NotFoundCase {
             name: "a nested path this service mints no resource for".to_string(),
             arn: format!(
                 "arn:aws:dsql:{HOME}:{}:cluster/{}/snapshot/{missing_a}",
-                engine::EMULATOR_ACCOUNT_ID, held.cluster
+                engine::EMULATOR_ACCOUNT_ID,
+                held.cluster
             ),
-            resource_type: "cluster",
-            resource_id: format!("{}/snapshot/{missing_a}", held.cluster),
         },
     ];
     cases.sort_by(|left, right| left.name.cmp(&right.name));
@@ -229,36 +267,26 @@ async fn a_nested_arn_is_refused_naming_the_resource_that_is_missing() {
         ];
 
         for (operation, answer) in &answers {
+            assert_tagging_surface_not_found(
+                &format!("{operation} with {}", case.name),
+                &case.arn,
+                answer,
+            );
+        }
+
+        // One logical failure, so the three operations answer it identically.
+        let (first_operation, first) = &answers[0];
+        for (operation, answer) in &answers[1..] {
             assert_eq!(
-                answer.status, 404,
-                "case {:?}: {operation} must answer 404, got {} {:?}",
-                case.name, answer.status, answer.body
-            );
-            assert!(
-                answer
-                    .error
-                    .as_deref()
-                    .is_some_and(|code| code.contains("ResourceNotFoundException")),
-                "case {:?}: {operation}'s wire code must be ResourceNotFoundException, got {:?}",
+                (answer.status, answer.error.as_deref(), answer.message()),
+                (first.status, first.error.as_deref(), first.message()),
+                "case {:?}: {operation} must answer exactly as {first_operation}, got {} {:?} \
+                 against {} {:?}",
                 case.name,
-                answer.error
-            );
-            assert_eq!(
-                reported_identity(answer),
-                (case.resource_type.to_string(), case.resource_id.clone()),
-                "case {:?}: {operation} must name ({:?}, {:?}), got {:?}",
-                case.name,
-                case.resource_type,
-                case.resource_id,
-                reported_identity(answer)
-            );
-            assert!(
-                answer.message().contains(&case.arn),
-                "case {:?}: {operation}'s message must name the ARN the request carried ({:?}), \
-                 got {:?}",
-                case.name,
-                case.arn,
-                answer.message()
+                answer.status,
+                answer.body,
+                first.status,
+                first.body
             );
         }
     }
@@ -281,60 +309,75 @@ async fn a_nested_arn_is_refused_naming_the_resource_that_is_missing() {
     );
 }
 
-/// RULE, the other half: the identity a tagging refusal reports for an absent resource
-/// is the identity the identifier-addressed reader of the same resource reports, so one
-/// absent resource is described one way whichever path refused.
+/// RULE, the other half: the IDENTIFIER-addressed reader of the very same resources
+/// answers the modelled `ResourceNotFoundException`, naming the resource the lookup
+/// stopped at — the stream when the cluster is held and the stream under it is not,
+/// the cluster when the cluster itself is not held — while the tagging surface states
+/// its own refusal for that same absent resource, naming no resource at all.
 #[tokio::test]
-async fn the_tagging_and_the_stream_reader_name_one_absent_resource_alike() {
+async fn the_identifier_reader_names_the_resource_the_tagging_surface_does_not() {
     let dsql = Dsql::new();
     let held = held_resources(&dsql).await;
     let absent_cluster = absent_cluster_identifier();
     let [missing_a, missing_b] = absent_stream_identifiers();
 
-    // (case, cluster, stream): a missing stream of a held cluster — twice, so the row
-    // does not depend on one identifier — and a stream of a cluster that is missing
-    // too, where the cluster is what the lookup stops at.
-    let cases: &[(&str, &String, &String)] = &[
+    // (case, cluster, stream, the identity the identifier-addressed reader reports):
+    // a missing stream of a held cluster — twice, so the row does not depend on one
+    // identifier — and a stream of a cluster that is missing too, where the cluster is
+    // what the lookup stops at.
+    let cases: &[(&str, &String, &String, (&str, &String))] = &[
         (
             "a never-created stream of a live cluster",
             &held.cluster,
             &missing_a,
+            ("stream", &missing_a),
         ),
         (
             "another never-created stream of the same cluster",
             &held.cluster,
             &missing_b,
+            ("stream", &missing_b),
         ),
         (
             "a stream of a cluster that was never created either",
             &absent_cluster,
             &missing_a,
+            ("cluster", &absent_cluster),
         ),
     ];
 
-    for (case, cluster, stream) in cases {
+    for (case, cluster, stream, (resource_type, resource_id)) in cases {
         let by_identifier = dsql.get_stream(cluster, stream).await;
         assert_eq!(
             by_identifier.status, 404,
             "case {case:?}: GetStream must answer 404, got {} {:?}",
             by_identifier.status, by_identifier.body
         );
-
-        let by_arn = dsql
-            .list_tags_for_resource(&expected_stream_arn(HOME, cluster, stream))
-            .await;
         assert_eq!(
-            by_arn.status, 404,
-            "case {case:?}: ListTagsForResource must answer 404, got {} {:?}",
-            by_arn.status, by_arn.body
+            by_identifier.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: GetStream's 404 must be the modelled ResourceNotFoundException, \
+             got {:?}",
+            by_identifier.error
         );
         assert_eq!(
-            reported_identity(&by_arn),
             reported_identity(&by_identifier),
-            "case {case:?}: both paths must name one resource, got {:?} by ARN and {:?} by \
-             identifier",
-            reported_identity(&by_arn),
+            ((*resource_type).to_string(), (*resource_id).clone()),
+            "case {case:?}: GetStream must name ({resource_type:?}, {resource_id:?}), got {:?}",
             reported_identity(&by_identifier)
+        );
+
+        let arn = expected_stream_arn(HOME, cluster, stream);
+        let by_arn = dsql.list_tags_for_resource(&arn).await;
+        assert_tagging_surface_not_found(
+            &format!("ListTagsForResource with {case}"),
+            &arn,
+            &by_arn,
+        );
+        assert_ne!(
+            by_arn.error, by_identifier.error,
+            "case {case:?}: the two surfaces state different codes, got {:?} both times",
+            by_arn.error
         );
     }
 }

@@ -301,8 +301,12 @@ async fn tagging_is_accepted_before_the_clock_settles_and_changes_no_status() {
 }
 
 /// RULE: a well-formed Aurora DSQL ARN that names no resource this service holds is
-/// refused with the modelled `ResourceNotFoundException` (404), naming the resource it
-/// could not find, and nothing is written.
+/// refused with the ARN-addressed tagging surface's own 404 `NotFoundException` and
+/// its fixed sentence, and nothing is written.
+///
+/// Which resources that covers, and that the sentence names none of them, is the
+/// subject of `tests/all/fixed_refusal_sentences.rs`; this row set is about the
+/// write leaving the store untouched.
 #[tokio::test]
 async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
     let dsql = Dsql::new();
@@ -322,46 +326,31 @@ async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
     );
     wait_for_the_clock().await;
 
-    let cases: &[(&str, String, &str, String)] = &[
+    let cases: &[(&str, String)] = &[
         (
             "a cluster id this service never minted",
             expected_arn("us-east-1", &absent_identifier()),
-            "cluster",
-            absent_identifier(),
         ),
-        (
-            "a retired cluster's ARN",
-            retired_arn,
-            "cluster",
-            retired.clone(),
-        ),
+        ("a retired cluster's ARN", retired_arn),
         (
             "a resource-type segment this operation resolves nothing for",
             format!(
                 "arn:aws:dsql:us-east-1:{}:stream/abcdefghijklmnopqrstuvwxyz",
                 engine::EMULATOR_ACCOUNT_ID
             ),
-            "stream",
-            "abcdefghijklmnopqrstuvwxyz".to_string(),
         ),
         (
             // The nested form `cluster/{cluster}/stream/{stream}` a stream ARN
             // really takes (`state::stream_arn`) does resolve — see
             // `tagging_resolves_every_tagged_resource_by_its_own_arn` — so this row
             // is about a stream of a LIVE cluster that was never created: the
-            // cluster resolves, the stream under it does not, and the refusal names
-            // the stream that is missing by its own identifier. The identity of
-            // every nested case is pinned in `tests/all/nested_arn_not_found.rs`.
+            // cluster resolves and the stream under it does not.
             "a stream of a live cluster, never created",
             expected_stream_arn("us-east-1", &live, &absent_identifier()),
-            "stream",
-            absent_identifier(),
         ),
         (
             "a stream of a cluster that was never created either",
             expected_stream_arn("us-east-1", &absent_identifier(), &absent_identifier()),
-            "cluster",
-            absent_identifier(),
         ),
         (
             "a cluster ARN written with a colon before the id",
@@ -370,37 +359,28 @@ async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
                 engine::EMULATOR_ACCOUNT_ID,
                 absent_identifier()
             ),
-            "cluster",
-            absent_identifier(),
         ),
     ];
 
-    for (name, arn, resource_type, resource_id) in cases {
+    for (name, arn) in cases {
         let refused = tag_resource(&dsql, arn, &tags(&[("env", "dev")])).await;
         assert_eq!(
             refused.status, 404,
             "case {name:?}: TagResource must answer 404, got {} {:?}",
             refused.status, refused.body
         );
-        assert!(
-            refused
-                .error
-                .as_deref()
-                .is_some_and(|code| code.contains("ResourceNotFoundException")),
-            "case {name:?}: the error code must be ResourceNotFoundException, got {:?}",
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("NotFoundException"),
+            "case {name:?}: the error code must be NotFoundException, got {:?}",
             refused.error
         );
         assert_eq!(
-            refused.str("resourceType"),
-            *resource_type,
-            "case {name:?}: the error must name the resource type, got {:?}",
-            refused.body
-        );
-        assert_eq!(
-            refused.str("resourceId"),
-            *resource_id,
-            "case {name:?}: the error must name the resource id, got {:?}",
-            refused.body
+            refused.message(),
+            "Resource was not found",
+            "case {name:?}: the tagging surface's fixed sentence must state the refusal, \
+             got {:?}",
+            refused.message()
         );
     }
 

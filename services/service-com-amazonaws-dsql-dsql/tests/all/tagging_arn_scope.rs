@@ -12,8 +12,9 @@
 //! when that scope is BOTH the one the endpoint the request reached serves and the
 //! one the named resource was minted with; any other well-formed Aurora DSQL ARN
 //! names a resource of some other region, account or partition, which this endpoint
-//! holds none of, and answers the modelled `ResourceNotFoundException` (404) — never
-//! a successful read of, or a write to, the similarly-identified local resource.
+//! holds none of, and answers the tagging surface's own not-found (404
+//! `NotFoundException`) — never a successful read of, or a write to, the
+//! similarly-identified local resource.
 //!
 //! The rule covers every operation bound to `/tags/{resourceArn}`
 //! (`ListTagsForResource`, `TagResource`, `UntagResource`, which resolve the ARN
@@ -165,25 +166,33 @@ async fn every_tagging_operation(dsql: &Dsql, arn: &str) -> Vec<(&'static str, A
     ]
 }
 
-/// Assert one answer is the modelled "no such resource" refusal, naming the ARN the
-/// request carried rather than some resource the endpoint does hold.
+/// Assert one answer is the tagging surface's own "no such resource" refusal: HTTP
+/// 404 with the wire code `NotFoundException` and that surface's fixed sentence,
+/// which interpolates nothing the request carried. The identifier-addressed
+/// operations answer the modelled `ResourceNotFoundException` instead; the two
+/// surfaces are compared in `tests/all/fixed_refusal_sentences.rs`.
 fn assert_not_found(case: &str, arn: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 404,
         "case {case:?}: an ARN this endpoint does not serve must answer 404, got {} {:?}",
         answer.status, answer.body
     );
-    assert!(
-        answer
-            .error
-            .as_deref()
-            .is_some_and(|code| code.contains("ResourceNotFoundException")),
-        "case {case:?}: the wire code must be ResourceNotFoundException, got {:?}",
+    assert_eq!(
+        answer.error.as_deref(),
+        Some("NotFoundException"),
+        "case {case:?}: the wire code must be NotFoundException, got {:?}",
         answer.error
     );
+    assert_eq!(
+        answer.message(),
+        "Resource was not found",
+        "case {case:?}: the tagging surface's fixed sentence must state the refusal, got {:?}",
+        answer.message()
+    );
     assert!(
-        answer.message().contains(arn),
-        "case {case:?}: the message must name the ARN the request carried ({arn:?}), got {:?}",
+        !answer.message().contains(arn),
+        "case {case:?}: the sentence must interpolate nothing from the request ({arn:?}), \
+         got {:?}",
         answer.message()
     );
 }

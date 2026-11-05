@@ -5,9 +5,9 @@
 //!
 //! RULE under test for the reader: `ListTagsForResource` resolves `resourceArn` to a
 //! resource this service holds and reports exactly the tag map persisted on it — the
-//! empty map for a resource with no tags, `ResourceNotFoundException` (404) for a
-//! well-formed Aurora DSQL ARN that names no stored resource, and `ValidationException`
-//! (400) for an ARN that names no Aurora DSQL resource at all.
+//! empty map for a resource with no tags, the tagging surface's own `NotFoundException`
+//! (404) for a well-formed Aurora DSQL ARN that names no stored resource, and
+//! `ValidationException` (400) for an ARN that names no Aurora DSQL resource at all.
 //!
 //! RULE under test for the writer: `UntagResource`'s `tagKeys` names an END STATE, so
 //! afterwards the resource carries none of the named keys and every other key it held;
@@ -263,8 +263,8 @@ async fn listing_tags_changes_nothing_a_later_caller_sees() {
 }
 
 /// RULE: a well-formed Aurora DSQL ARN that names no resource this service holds
-/// answers the modelled `ResourceNotFoundException` (404), naming the resource it
-/// could not find.
+/// answers the ARN-addressed tagging surface's own 404 `NotFoundException` with its
+/// fixed sentence.
 #[tokio::test]
 async fn an_arn_naming_no_stored_resource_is_not_found() {
     let dsql = Dsql::new();
@@ -289,27 +289,18 @@ async fn an_arn_naming_no_stored_resource_is_not_found() {
     );
     wait_for_the_clock().await;
 
-    let cases: &[(&str, String, &str, String)] = &[
+    let cases: &[(&str, String)] = &[
         (
             "a cluster id this service never minted",
             expected_arn("us-east-1", &absent_identifier()),
-            "cluster",
-            absent_identifier(),
         ),
-        (
-            "a retired cluster's ARN",
-            retired_arn,
-            "cluster",
-            retired.clone(),
-        ),
+        ("a retired cluster's ARN", retired_arn),
         (
             "another Aurora DSQL resource type this store holds none of",
             format!(
                 "arn:aws:dsql:us-east-1:{}:stream/abcdefghijklmnopqrstuvwxyz",
                 engine::EMULATOR_ACCOUNT_ID
             ),
-            "stream",
-            "abcdefghijklmnopqrstuvwxyz".to_string(),
         ),
         (
             "a cluster ARN written with a colon before the id",
@@ -318,55 +309,44 @@ async fn an_arn_naming_no_stored_resource_is_not_found() {
                 engine::EMULATOR_ACCOUNT_ID,
                 absent_identifier()
             ),
-            "cluster",
-            absent_identifier(),
         ),
     ];
 
-    for (name, arn, resource_type, resource_id) in cases {
+    for (name, arn) in cases {
         let answer = list_tags(&dsql, arn).await;
         assert_eq!(
             answer.status, 404,
             "case {name:?}: ListTagsForResource must answer 404, got {} {:?}",
             answer.status, answer.body
         );
-        assert!(
-            answer
-                .error
-                .as_deref()
-                .is_some_and(|code| code.contains("ResourceNotFoundException")),
-            "case {name:?}: the error code must be ResourceNotFoundException, got {:?}",
+        assert_eq!(
+            answer.error.as_deref(),
+            Some("NotFoundException"),
+            "case {name:?}: the error code must be NotFoundException, got {:?}",
             answer.error
         );
         assert_eq!(
-            answer.str("resourceType"),
-            *resource_type,
-            "case {name:?}: the error must name the resource type, got {:?}",
-            answer.body
-        );
-        assert_eq!(
-            answer.str("resourceId"),
-            *resource_id,
-            "case {name:?}: the error must name the resource id, got {:?}",
-            answer.body
+            answer.message(),
+            "Resource was not found",
+            "case {name:?}: the tagging surface's fixed sentence must state the refusal, \
+             got {:?}",
+            answer.message()
         );
     }
 
     // UntagResource addresses its resource through the same ARN read, so the same
     // class of ARN is the same 404 for it.
-    for (name, arn, _, _) in cases {
+    for (name, arn) in cases {
         let answer = untag(&dsql, arn, &keys(&["env"])).await;
         assert_eq!(
             answer.status, 404,
             "case {name:?}: UntagResource must answer 404, got {} {:?}",
             answer.status, answer.body
         );
-        assert!(
-            answer
-                .error
-                .as_deref()
-                .is_some_and(|code| code.contains("ResourceNotFoundException")),
-            "case {name:?}: the error code must be ResourceNotFoundException, got {:?}",
+        assert_eq!(
+            answer.error.as_deref(),
+            Some("NotFoundException"),
+            "case {name:?}: the error code must be NotFoundException, got {:?}",
             answer.error
         );
     }
@@ -807,7 +787,7 @@ async fn a_stream_arn_addresses_the_streams_own_tags() {
     );
 
     // A stream of this cluster that was never created names nothing, so both
-    // operations answer the modelled 404 for it.
+    // operations answer the tagging surface's 404 for it.
     let absent = format!(
         "arn:aws:dsql:{region}:{}:cluster/{}/stream/{}",
         engine::EMULATOR_ACCOUNT_ID,

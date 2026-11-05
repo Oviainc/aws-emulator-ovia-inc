@@ -41,9 +41,11 @@ use crate::harness::{absent_identifier, Answer, Dsql};
 /// `deletionProtectionEnabled`, `other`.
 const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
-/// The member a cursor refusal is about, as the operations bind it on the wire
-/// (`nextToken`, carried in the `next-token` query parameter).
-const NEXT_TOKEN_MEMBER: &str = "nextToken";
+/// The field a cursor refusal names: the `@httpQuery` parameter the `nextToken`
+/// member is bound to (`smithy_query(query="operation",
+/// operation="ListClusters,ListStreams")`: `httpQuery: "next-token"`), which is the
+/// name the caller spelled the value with.
+const NEXT_TOKEN_FIELD: &str = "next-token";
 
 /// The members an error body may carry: the modelled `ValidationException`'s
 /// three, plus the restJson1 envelope's own `__type` discriminator and the
@@ -189,13 +191,13 @@ pub fn assert_modeled_validation_exception(case: &str, answer: &Answer) {
     let fields = field_list.as_array().map(Vec::as_slice).unwrap_or_default();
     assert!(
         fields.iter().any(|field| {
-            field.get("name").and_then(Value::as_str) == Some(NEXT_TOKEN_MEMBER)
+            field.get("name").and_then(Value::as_str) == Some(NEXT_TOKEN_FIELD)
                 && field
                     .get("message")
                     .and_then(Value::as_str)
                     .is_some_and(|message| !message.is_empty())
         }),
-        "case {case:?}: fieldList must name {NEXT_TOKEN_MEMBER} with a message \
+        "case {case:?}: fieldList must name {NEXT_TOKEN_FIELD} with a message \
          saying why, got {field_list:?}"
     );
 }

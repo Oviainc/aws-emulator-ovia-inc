@@ -37,7 +37,9 @@ use crate::harness::{percent_encode_label, wait_for_the_clock, Answer, Dsql};
 const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
 /// One refused request: how the case is named, what came back, and — when the
-/// refusal is about a single input member — the member `fieldList` must name.
+/// refusal is about a single input member — the field `fieldList` must name: the name
+/// the caller spelled the value with, which for a member bound to a query parameter
+/// is that parameter's name.
 struct Refusal {
     case: String,
     answer: Answer,
@@ -111,14 +113,14 @@ async fn handler_refusals(dsql: &Dsql) -> Vec<Refusal> {
         refusals.push(Refusal {
             case: format!("ListClusters next-token={token:?}"),
             answer: dsql.list(&format!("?max-results=10&next-token={token}")).await,
-            member: Some("nextToken"),
+            member: Some("next-token"),
         });
         refusals.push(Refusal {
             case: format!("ListStreams next-token={token:?}"),
             answer: dsql
                 .list_streams(&cluster, &format!("?max-results=10&next-token={token}"))
                 .await,
-            member: Some("nextToken"),
+            member: Some("next-token"),
         });
     }
 

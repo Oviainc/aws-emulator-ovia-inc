@@ -318,9 +318,13 @@ fn policy_cases(region: &str) -> Vec<PolicyCase> {
     ]
 }
 
-/// The one sentence a document that is not a policy document is refused with.
+/// The one sentence a document that is not a policy document is refused with: the
+/// fixed text Aurora DSQL words that error class with, naming the member and the
+/// form it had to be in and echoing nothing the caller sent.
 fn cannot_parse_message() -> String {
-    "The policy is not a valid JSON policy document.".to_string()
+    "Aurora DSQL can't process the request because the policy that you specified isn't \
+     valid. Provide the policy in a valid format and try again."
+        .to_string()
 }
 
 /// The one sentence a document nobody could replace is refused with: it names the
