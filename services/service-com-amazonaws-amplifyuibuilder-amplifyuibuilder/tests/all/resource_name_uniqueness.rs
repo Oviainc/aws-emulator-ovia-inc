@@ -10,9 +10,11 @@
 //! deleting the resource that holds it.
 //!
 //! The rows are the three resource kinds the service names — components, forms and themes —
-//! crossed with the form of the name, so no kind and no spelling is a special case. Each
-//! assertion goes through the router, so a case exercises routing, deserialization, the
-//! handler, the persisted state and serialization — the same path a client takes.
+//! crossed with the form of the name, so no kind and no spelling is a special case, and
+//! crossed with the form of the create's `clientToken`, so neither a retry nor a refusal
+//! moves the rule. Each assertion goes through the router, so a case exercises routing,
+//! deserialization, the handler, the persisted state and serialization — the same path a
+//! client takes.
 //!
 //! Each suite in this crate carries its own request harness (see `component_refusals.rs`),
 //! so this one does too.
@@ -193,6 +195,24 @@ async fn create_in(
 
 async fn create(router: &MultiServiceRouter, kind: &Kind, name: &str) -> Answer {
     create_in(router, kind, APP_ID, ENVIRONMENT, name).await
+}
+
+/// A create of `kind` carrying `token` as its `clientToken`.
+///
+/// `clientToken` is an `@idempotencyToken` bound to the `clientToken` query parameter on
+/// every create of this service, from
+/// `smithy_query(query="operation", operation="CreateComponent,CreateForm,CreateTheme")`.
+async fn create_with_token(
+    router: &MultiServiceRouter,
+    kind: &Kind,
+    name: &str,
+    token: &str,
+) -> Answer {
+    let uri = format!(
+        "{}?clientToken={token}",
+        collection_uri(kind, APP_ID, ENVIRONMENT)
+    );
+    call(router, "POST", &uri, Some((kind.create)(name))).await
 }
 
 async fn rename(router: &MultiServiceRouter, kind: &Kind, id: &str, name: &str) -> Answer {
@@ -478,5 +498,128 @@ async fn resources_with_distinct_names_coexist_in_one_app_environment() {
             kind.collection,
             listed_ids(&router, &kind, APP_ID, ENVIRONMENT).await
         );
+    }
+}
+
+/// The client-token forms a create may carry: `clientToken` is a plain `String`, so the
+/// rows differ only in spelling, and none of them may change whether the name rule holds.
+fn client_token_forms() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("an ascii token", "retry-1"),
+        (
+            "a uuid-shaped token",
+            "6f1f0f28-4c1f-4df5-9a4e-6f2d5a6a0001",
+        ),
+        ("digits only", "20260101"),
+    ]
+}
+
+/// The name rule and the idempotency token do not get in each other's way, and a refusal
+/// changes nothing:
+///
+/// * a create REPLAYING a token reports the resource that token already created, so it is
+///   never refused as a duplicate of itself;
+/// * a create carrying an unseen token and a taken name is refused as a conflict, and that
+///   refused create consumes nothing — the same token still mints when it names a free
+///   name;
+/// * a refused rename leaves the record it addressed and the name's holder exactly as they
+///   were, down to every member the reader reports.
+#[tokio::test]
+async fn a_name_conflict_refusal_neither_consumes_a_client_token_nor_changes_a_record() {
+    let router = emulator();
+
+    for kind in kinds() {
+        for (index, (token_case, token)) in client_token_forms().into_iter().enumerate() {
+            let case = format!("{} / {token_case}", kind.collection);
+            let name = format!("Holder-{index}");
+
+            let holder = create_with_token(&router, &kind, &name, token).await;
+            assert_eq!(
+                holder.status, 200,
+                "case {case:?}: the first create of {name:?} must succeed, got {} with {:?}",
+                holder.status, holder.body
+            );
+
+            // The token names the resource it created, so the retry reports that resource
+            // rather than colliding with the name it holds.
+            let replay = create_with_token(&router, &kind, &name, token).await;
+            assert_eq!(
+                replay.status, 200,
+                "case {case:?}: a retry carrying the same clientToken must be served, got {} \
+                 with {:?}",
+                replay.status, replay.body
+            );
+            assert_eq!(
+                replay.body, holder.body,
+                "case {case:?}: a retry must report the resource the token created, got {:?}",
+                replay.body
+            );
+
+            // Another token asking for the same live name is a duplicate, whatever that
+            // token looks like.
+            let fresh_token = format!("{token}-fresh");
+            let refused = create_with_token(&router, &kind, &name, &fresh_token).await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case:?}: a create under an unseen token naming the live {name:?} must \
+                 be refused with HTTP 409, got {} with {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.message(),
+                DUPLICATE_NAME_MESSAGE,
+                "case {case:?}: expected the message {DUPLICATE_NAME_MESSAGE:?}, got {:?}",
+                refused.message()
+            );
+
+            // The refused create recorded nothing, so its token is still unused: it mints
+            // when it names a free name instead of replaying the refusal.
+            let free_name = format!("Free-{index}");
+            let minted = create_with_token(&router, &kind, &free_name, &fresh_token).await;
+            assert_eq!(
+                minted.status, 200,
+                "case {case:?}: the token of a refused create must still mint {free_name:?}, \
+                 got {} with {:?}",
+                minted.status, minted.body
+            );
+            assert_ne!(
+                minted.id(),
+                holder.id(),
+                "case {case:?}: the minted resource must not be the name's holder"
+            );
+
+            // A refused rename leaves both records byte for byte as they were — the name,
+            // every other member the update carries and the modification instant.
+            let holder_before = get(&router, &kind, &holder.id()).await.body;
+            let minted_before = get(&router, &kind, &minted.id()).await.body;
+            let refused_rename = rename(&router, &kind, &minted.id(), &name).await;
+            assert_eq!(
+                refused_rename.status, 409,
+                "case {case:?}: renaming {free_name:?} onto the live {name:?} must be refused \
+                 with HTTP 409, got {} with {:?}",
+                refused_rename.status, refused_rename.body
+            );
+            assert_eq!(
+                refused_rename.message(),
+                DUPLICATE_NAME_MESSAGE,
+                "case {case:?}: expected the message {DUPLICATE_NAME_MESSAGE:?}, got {:?}",
+                refused_rename.message()
+            );
+            assert_eq!(
+                get(&router, &kind, &minted.id()).await.body,
+                minted_before,
+                "case {case:?}: a refused rename must leave the resource it addressed alone"
+            );
+            assert_eq!(
+                get(&router, &kind, &holder.id()).await.body,
+                holder_before,
+                "case {case:?}: a refused rename must leave the name's holder alone"
+            );
+
+            // Clear the app environment for the next row.
+            for id in [holder.id(), minted.id()] {
+                delete_in(&router, &kind, APP_ID, ENVIRONMENT, &id).await;
+            }
+        }
     }
 }
