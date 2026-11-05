@@ -378,6 +378,27 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         self.instance_onboarding.get(connect_instance_id)
     }
 
+    /// Replace the stored name of one campaign and report what that did. `None` when no
+    /// campaign is stored under that id, in which case nothing is written.
+    ///
+    /// The one place a campaign's name is amended, so the operation that renames a
+    /// campaign and every later reader of it cannot disagree about what a rename does:
+    /// only the name member moves, and the campaign's id, ARN, instance, configs, tags,
+    /// run state and creation order are left exactly as they were.
+    ///
+    /// A campaign that ALREADY carries that name is reported as
+    /// [`AmendApplied::Unchanged`] and nothing is written, which is what makes the rename
+    /// idempotent: a retry after a timeout, or two callers asking for the same name, each
+    /// succeed and leave one stored name behind.
+    pub fn rename_campaign(&mut self, id: &str, name: &str) -> Option<AmendApplied> {
+        let campaign = self.campaigns.get_mut(id)?;
+        if campaign.name == name {
+            return Some(AmendApplied::Unchanged);
+        }
+        campaign.name = name.to_string();
+        Some(AmendApplied::Amended)
+    }
+
     /// Every campaign in creation order — the order `ListCampaigns` pages over.
     pub fn campaigns_in_creation_order(&self) -> Vec<&StoredCampaign> {
         let mut all: Vec<&StoredCampaign> = self.campaigns.values().collect();
@@ -411,6 +432,21 @@ pub enum TransitionApplied {
     Moved(CampaignState),
     /// The campaign already held that state, so nothing was written.
     Unchanged(CampaignState),
+}
+
+/// What a requested amendment to one member of a stored campaign DID, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::rename_campaign`]
+/// reports it.
+///
+/// Both variants are successes, kept apart for the same reason [`TransitionApplied`]'s
+/// are: only one of them changed anything, and an amendment that wrote nothing is not
+/// audited as one that did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmendApplied {
+    /// The campaign's member now carries the value the request asked for.
+    Amended,
+    /// The campaign already carried that value, so nothing was written.
+    Unchanged,
 }
 
 /// Why this store took no dial request for a campaign, as

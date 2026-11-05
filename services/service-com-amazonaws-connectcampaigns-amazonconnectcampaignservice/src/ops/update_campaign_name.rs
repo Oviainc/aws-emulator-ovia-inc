@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCampaignName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCampaignName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCampaignName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the name of one stored campaign. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,23 +157,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = UPDATE_CAMPAIGN_NAME_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Give the campaign the request addresses the name the request carries.
+    ///
+    /// The name is the ONLY member this writes: the campaign keeps its id, ARN, Connect
+    /// instance, dialer and outbound-call configs, tags, run state and place in the
+    /// creation order, so a rename is visible through `DescribeCampaign` and
+    /// `ListCampaigns` and changes nothing else about the campaign. Asking for the name a
+    /// campaign already carries writes nothing and still succeeds, which is the
+    /// idempotence the model declares for this operation.
+    ///
+    /// An id naming no stored campaign writes nothing and is the modelled
+    /// `ResourceNotFoundException` (HTTP 404). `CampaignName`'s length bounds are the
+    /// model's, so the boundary validator has already refused a name outside them before
+    /// this runs.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCampaignName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCampaignNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCampaignName"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCampaignNameError::from(UpdateCampaignNameErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            ))
+        })?;
+
+        let applied = state.lock().rename_campaign(&input.id, &input.name);
+
+        match applied {
+            // A rename that happened is audited; one that wrote nothing — because the
+            // campaign already carried the name asked for — is not, since there is no
+            // change to record. The record names the campaign id only: a campaign's name
+            // is caller-supplied content and never goes into an audit line.
+            Some(crate::state::AmendApplied::Amended) => {
+                crate::state::audit_campaign_change(
+                    ctx.parts(),
+                    "UpdateCampaignName",
+                    &input.id,
+                    "renamed",
+                );
+                Ok(UpdateCampaignNameOutput)
+            }
+            Some(crate::state::AmendApplied::Unchanged) => Ok(UpdateCampaignNameOutput),
+            None => Err(UpdateCampaignNameErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::campaign_not_found_message(&input.id),
+                    x_amz_error_type: None,
+                },
+            )
+            .into()),
+        }
     }
 }

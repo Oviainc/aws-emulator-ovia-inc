@@ -15,6 +15,8 @@
 mod campaign_lifecycle;
 #[path = "all/campaign_plane_refusals.rs"]
 mod campaign_plane_refusals;
+#[path = "all/campaign_rename.rs"]
+mod campaign_rename;
 #[path = "all/campaign_state_batch.rs"]
 mod campaign_state_batch;
 #[path = "all/common.rs"]
