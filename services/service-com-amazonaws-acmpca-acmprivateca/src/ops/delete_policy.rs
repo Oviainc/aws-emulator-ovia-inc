@@ -2,18 +2,16 @@
 
 //! @op DeletePolicy
 //!
-//! ## Where the modelled doc and the service differ
+//! ## What this operation resolves
 //!
-//! The doc text below says "If there is no policy attached to the private CA, this action
-//! will return successful". The service does not: the behavioural corpus records
-//! `DeletePolicy` answering HTTP 400 `ResourceNotFoundException` when it resolves no
-//! policy to remove — "Could not find specified CA" against a CA that does not hold its
-//! certificate yet, and so keeps no policy at all
-//! (`acm-pca.delete-policy-on-pending-ca-is-noop`). A CA that does keep policies and has
-//! none answers the policy sentence `GetPolicy` is recorded with
-//! (`acm-pca.get-policy-not-found`), the pair this operation's sibling documents: "If
-//! either the private CA resource or the policy cannot be found, this action returns a
-//! ResourceNotFoundException". The recording is what this handler follows.
+//! The deletion is delete-if-exists, as the modelled doc text below states: "If there is
+//! no policy attached to the private CA, this action will return successful". So the one
+//! resource it resolves is the AUTHORITY `ResourceArn` names, in whatever lifecycle status
+//! that authority is in, and `ResourceNotFoundException` is reserved for an ARN no
+//! authority of this service answers to. Repeating the call, and racing two of them, both
+//! succeed. The policy sentence `GetPolicy` is recorded with
+//! (`acm-pca.get-policy-not-found`) belongs to the READ: that operation reports a policy
+//! it was asked for and cannot find, while this one removes whatever is there.
 //!
 //! ## Shape of an operation
 //!
@@ -207,6 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // The one thing this operation resolves is the AUTHORITY the ARN names — in
+        // whatever lifecycle status it is in, a CA still waiting for its certificate and a
+        // soft-deleted one included, because a policy lives on the CA record itself. An
+        // ARN no authority of this service answers to is the one absence left to report.
+        //
         // The lookup also materialises the CREATING -> PENDING_CERTIFICATE change the
         // clock already owed, so the CA this call acts on is the one it is at this
         // instant rather than the one its last caller left behind.
@@ -215,26 +218,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ca_not_found());
         };
 
-        // Removing the attached policy IS the deletion: `take` reports whether one was
-        // attached and leaves the CA with none either way, so a later `GetPolicy` or
-        // `DeletePolicy` resolves nothing.
-        if record.resource_policy.take().is_some() {
-            return Ok(DeletePolicyOutput);
-        }
+        // Removing the attached policy IS the deletion, and the deletion is
+        // delete-if-exists: "If there is no policy attached to the private CA, this action
+        // will return successful" (this operation's docs). `take` leaves the CA with no
+        // policy whether or not one was attached, so a repeated call — or two racing ones —
+        // both succeed, and a later `GetPolicy` resolves nothing.
+        record.resource_policy.take();
 
-        // Nothing was attached, and which absence that is decides the sentence: a CA that
-        // keeps policies at all — one holding its own certificate — cannot find the
-        // POLICY, while a CA that does not hold its certificate yet keeps none, so what
-        // cannot be found is the CA (the recorded case).
-        if record.resolves_policies() {
-            return Err(DeletePolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::POLICY_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-        Err(ca_not_found())
+        Ok(DeletePolicyOutput)
     }
 }
 
@@ -247,8 +238,8 @@ fn invalid_arn() -> DeletePolicyError {
 }
 
 /// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
-/// cannot be found." — the answer for an ARN no private CA of this service answers to, and
-/// for one whose CA keeps no policy because it does not hold its certificate yet.
+/// cannot be found." — the answer for an ARN no private CA of this service answers to,
+/// which is the only absence this operation reports.
 fn ca_not_found() -> DeletePolicyError {
     DeletePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),

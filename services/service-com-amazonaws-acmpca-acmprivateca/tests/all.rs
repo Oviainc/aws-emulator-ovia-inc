@@ -45,6 +45,8 @@ mod refusal_message_text;
 mod resource_policy;
 #[path = "all/resource_policy_read.rs"]
 mod resource_policy_read;
+#[path = "all/resource_policy_rules.rs"]
+mod resource_policy_rules;
 #[path = "all/restore_certificate_authority.rs"]
 mod restore_certificate_authority;
 #[path = "all/root_ca_self_signing.rs"]

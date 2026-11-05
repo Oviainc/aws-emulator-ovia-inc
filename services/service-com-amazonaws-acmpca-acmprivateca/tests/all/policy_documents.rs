@@ -514,8 +514,8 @@ fn attach_rows(ca_arn: &str) -> Vec<AttachRow> {
                     {
                         "Sid": "no-issuance",
                         "Effect": "Deny",
-                        "Principal": {"AWS": ["arn:aws:iam::111122223333:root",
-                                              "444455556666"]},
+                        "Principal": {"AWS": [format!("arn:aws:iam::{ACCOUNT}:role/issuer"),
+                                              ACCOUNT]},
                         "Action": "acm-pca:IssueCertificate",
                         "Resource": ca_arn
                     }

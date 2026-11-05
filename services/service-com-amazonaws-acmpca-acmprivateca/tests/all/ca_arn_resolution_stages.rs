@@ -37,7 +37,7 @@ fn policy_for(resource_arn: &str) -> String {
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
-            "Principal": {"AWS": "123456789012"},
+            "Principal": {"AWS": ACCOUNT},
             "Action": "acm-pca:IssueCertificate",
             "Resource": resource_arn
         }]
@@ -193,12 +193,6 @@ async fn a_resolvable_authority_reports_the_sub_resource_as_the_absent_one() {
             POLICY_NOT_FOUND_MESSAGE,
         ),
         (
-            "deleting the policy of a CA that carries none",
-            "DeletePolicy",
-            request("DeletePolicy", &arn),
-            POLICY_NOT_FOUND_MESSAGE,
-        ),
-        (
             "a grant the CA does not hold",
             "DeletePermission",
             request("DeletePermission", &arn),
@@ -228,7 +222,16 @@ async fn a_resolvable_authority_reports_the_sub_resource_as_the_absent_one() {
     }
 
     // And the authority itself is still there: the refusals above were about what it does
-    // not carry, not about the CA.
+    // not carry, not about the CA. The delete of a sub-resource that is not there says the
+    // same thing by succeeding: `DeletePolicy` is delete-if-exists, so a resolved authority
+    // leaves it nothing to report.
+    emulator
+        .ok(
+            "deleting the policy of a CA that carries none",
+            "DeletePolicy",
+            &request("DeletePolicy", &arn),
+        )
+        .await;
     let described = emulator
         .ok(
             "the authority itself",

@@ -225,11 +225,10 @@ pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certif
 /// resolve: one sentence about the CA, naming no ARN of its own, the same for every
 /// operation that resolves one.
 ///
-/// `DeletePolicy` answers it for a CA that does not hold its own certificate yet as well:
-/// the behavioural corpus records that call answering
-/// `("ResourceNotFoundException", "Could not find specified CA")`
-/// (`acm-pca.delete-policy-on-pending-ca-is-noop`) rather than the policy sentence below —
-/// such a CA keeps no policy at all, so what it cannot find is the CA.
+/// It says the AUTHORITY is absent, so it is answered only for an ARN no private CA of
+/// this service answers to — never for a CA that exists in a status the caller did not
+/// expect, and never for a sub-resource such a CA does not carry, which has its own
+/// sentence ([`POLICY_NOT_FOUND_MESSAGE`], [`PERMISSION_NOT_FOUND_MESSAGE`]).
 pub const CA_NOT_FOUND_MESSAGE: &str = "Could not find specified CA";
 
 /// What Amazon Web Services Private CA answers for a resource-based policy document it
@@ -300,6 +299,10 @@ pub const PERMISSION_ALREADY_EXISTS_MESSAGE: &str =
 /// recorded (`acm-pca.get-policy-not-found` for a live CA with no policy,
 /// `acm-pca.ca-arn-validation-precedes-resource-lookup` for an ARN no CA answers to), and
 /// neither names a resource of the request's own.
+///
+/// It belongs to the READ: `DeletePolicy` is delete-if-exists and reports no absent policy
+/// at all ("If there is no policy attached to the private CA, this action will return
+/// successful", its docs).
 pub const POLICY_NOT_FOUND_MESSAGE: &str = "Could not find policy for specified resource.";
 
 /// `SigningAlgorithm`'s members in the order the model DECLARES them, which is the order
@@ -659,8 +662,8 @@ pub fn permission_policy_document(
 ///   refusal is the service's own [`INVALID_POLICY_MESSAGE`];
 /// * each statement has to name WHO it is about, in a `Principal` that names an identity
 ///   ([`unresolvable_principal_reason`]);
-/// * each statement has to name WHAT it grants, in actions of this service
-///   ([`disallowed_action_reason`]);
+/// * each statement has to name WHAT it grants, in actions a certificate authority can be
+///   shared for ([`disallowed_action_reason`]);
 /// * each statement has to be about the CA the policy is attached TO, so every `Resource`
 ///   it names is that CA's ARN ([`different_resource_message`]).
 ///
@@ -776,21 +779,63 @@ pub fn canonical_policy_document(policy: &str) -> String {
     compact
 }
 
+/// The actions a resource-based policy on a private CA can grant: the read-and-issue
+/// surface a private CA is SHARED for, each in this service's action namespace
+/// ([`ARN_SERVICE`]).
+///
+/// A resource policy on a private CA exists to let another account "issue ACM certificates
+/// signed by a CA in another account" (`PutPolicy` docs) — the same thing sharing the CA
+/// through Resource Access Manager does — so what it can grant is what a share grants: the
+/// three actions a permission on a CA carries (`ActionType`, [`ACTIONS_IN_MODEL_ORDER`])
+/// together with the reads of the CA a cross-account issuer has to make to use it (the CA
+/// itself, its certificate, its certification request and its tags).
+///
+/// Everything else this service models is a CA administrator's own: creating, updating,
+/// deleting or restoring the authority, writing its tags, permissions or policy, issuing
+/// an audit report, revoking a certificate. Granting one of those on a certificate
+/// authority is "a statement that is not allowed" (`PutPolicyRequest$Policy` docs), which
+/// the recorded refusal names by resource type
+/// ([`DISALLOWED_POLICY_ACTION_MESSAGE`]).
+pub const POLICY_ALLOWED_ACTIONS: &[&str] = &[
+    "DescribeCertificateAuthority",
+    "GetCertificate",
+    "GetCertificateAuthorityCertificate",
+    "GetCertificateAuthorityCsr",
+    "IssueCertificate",
+    "ListPermissions",
+    "ListTags",
+];
+
+/// What Amazon Web Services Private CA answers a resource policy that grants an action a
+/// certificate authority's policy cannot grant ([`POLICY_ALLOWED_ACTIONS`]).
+///
+/// Wholly fixed text, the resource type it names included: the refusal is about the kind of
+/// resource the policy hangs on, so it carries neither the offending action nor the CA out
+/// of the request.
+pub const DISALLOWED_POLICY_ACTION_MESSAGE: &str =
+    "InvalidPolicy: Input policy containing action that is not allowed for resource type \
+     acm-pca:CertificateAuthority";
+
+/// Whether `action` is one a private CA's resource policy can grant: an action of THIS
+/// service ([`ARN_SERVICE`]) that is on the shared surface
+/// ([`POLICY_ALLOWED_ACTIONS`]). An action of another service, one with no namespace and a
+/// wildcard are none of them.
+fn policy_grants_this_action(action: &str) -> bool {
+    action
+        .strip_prefix(&format!("{ARN_SERVICE}:"))
+        .is_some_and(|named| POLICY_ALLOWED_ACTIONS.contains(&named))
+}
+
 /// Why the `Action` of a policy statement is not one a private CA's resource policy can
 /// grant, or `None` when every action it names is.
 ///
 /// A statement that grants no action is not a grant at all, and a policy attached to a
 /// private CA grants access ON that CA — `PutPolicy` "attaches a resource-based policy to
-/// a private CA" (its docs) — so every action it names belongs to this service's action
-/// namespace (`awsService.arnNamespace`, [`ARN_SERVICE`]). An action of another service is
-/// "a statement that is not allowed" (`PutPolicyRequest$Policy` docs).
+/// a private CA" (its docs) — so every action it names has to be one a certificate
+/// authority can be shared for ([`POLICY_ALLOWED_ACTIONS`]); anything else is "a statement
+/// that is not allowed" (`PutPolicyRequest$Policy` docs).
 fn disallowed_action_reason(action: Option<&::serde_json::Value>) -> Option<String> {
-    let not_allowed = |named: &str| {
-        Some(format!(
-            "The policy includes a statement that is not allowed: {named} is not an action \
-             a resource policy on a private CA can grant."
-        ))
-    };
+    let not_allowed = || Some(DISALLOWED_POLICY_ACTION_MESSAGE.to_string());
     let Some(action) = action else {
         return Some("Each policy statement must name the Action it grants.".to_string());
     };
@@ -803,13 +848,10 @@ fn disallowed_action_reason(action: Option<&::serde_json::Value>) -> Option<Stri
     }
     for entry in entries {
         let Some(named) = entry.as_str() else {
-            return not_allowed("a non-string action");
+            return not_allowed();
         };
-        if named
-            .strip_prefix(&format!("{ARN_SERVICE}:"))
-            .is_none_or(str::is_empty)
-        {
-            return not_allowed(named);
+        if !policy_grants_this_action(named) {
+            return not_allowed();
         }
     }
     None
@@ -819,10 +861,9 @@ fn disallowed_action_reason(action: Option<&::serde_json::Value>) -> Option<Stri
 /// is about an identity it cannot resolve.
 ///
 /// The RULE is that the service resolves the identity a resource policy is about rather
-/// than taking the text on trust; the sentence is the one the recorded refusal carries
-/// (`issues/.../20261022T143159Z-acm-pca-putpolicy-stub.md` records
-/// `InvalidPolicyException` / "InvalidPolicy: Principal not found." for a policy naming
-/// an identity that is not there) and is an EXAMPLE of the wording, not a requirement.
+/// than taking the text on trust, and the sentence is the one the recorded refusal carries
+/// for a policy naming an identity that is not there: wholly fixed text, which is why the
+/// account id or ARN that failed to resolve is not echoed in it.
 pub const POLICY_PRINCIPAL_NOT_FOUND_MESSAGE: &str = "InvalidPolicy: Principal not found.";
 
 /// Why the `Principal` of a policy statement names no identity this service can resolve,
@@ -834,8 +875,9 @@ pub const POLICY_PRINCIPAL_NOT_FOUND_MESSAGE: &str = "InvalidPolicy: Principal n
 /// ([`POLICY_PRINCIPAL_NOT_FOUND_MESSAGE`]).
 ///
 /// What resolves: `*` (every identity), an Amazon Web Services service principal, an
-/// account id, and an ARN that names an identity (an IAM or Organizations ARN). Text that
-/// is none of those names nobody, which is what the refusal says.
+/// account this emulator holds ([`account_resolves`]), and an ARN that names an identity of
+/// such an account (an IAM or Organizations ARN). Text that is none of those names nobody,
+/// which is what the refusal says.
 fn unresolvable_principal_reason(principal: Option<&::serde_json::Value>) -> Option<String> {
     let not_found = || Some(POLICY_PRINCIPAL_NOT_FOUND_MESSAGE.to_string());
     let Some(principal) = principal else {
@@ -886,15 +928,28 @@ fn unresolvable_principal_reason(principal: Option<&::serde_json::Value>) -> Opt
 }
 
 /// Whether an `AWS` principal entry names an identity: every identity (`*`), an account
-/// id (twelve digits, `AccountId`'s own form) or an ARN that names one.
+/// this emulator holds ([`account_resolves`], an account id in `AccountId`'s own twelve-digit
+/// form) or an ARN that names an identity of such an account.
 fn aws_identity_resolves(identity: &str) -> bool {
     if identity == "*" {
         return true;
     }
     if identity.len() == 12 && identity.chars().all(|digit| digit.is_ascii_digit()) {
-        return true;
+        return account_resolves(identity);
     }
     names_an_identity_arn(identity)
+}
+
+/// Whether `account` is an Amazon Web Services account this emulator can resolve.
+///
+/// A resource policy grants access to an account, so the account has to BE there: Amazon
+/// Web Services Private CA resolves it and refuses a document naming one that is not
+/// ([`POLICY_PRINCIPAL_NOT_FOUND_MESSAGE`]). This emulator presents exactly one account —
+/// the one every ARN and every `OwnerAccount` it emits carries
+/// (`emulator_server::emulator_account_id`) — so that is the one account a principal can
+/// resolve to, and any other twelve-digit id names an account that is not here.
+fn account_resolves(account: &str) -> bool {
+    account == ::emulator_server::emulator_account_id()
 }
 
 /// Whether `identity` is an ARN naming an identity: `arn:<partition>:iam::<account>:<id>`
@@ -908,13 +963,24 @@ fn names_an_identity_arn(identity: &str) -> bool {
     let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
         return false;
     };
-    *prefix == "arn"
-        && !partition.is_empty()
-        && matches!(*service, "iam" | "organizations" | "sts")
-        // An identity namespace is global, so its region is empty.
-        && region.is_empty()
-        && !account.is_empty()
-        && !resource.is_empty()
+    if *prefix != "arn" || partition.is_empty() || resource.is_empty() {
+        return false;
+    }
+    // An identity namespace is global, so its region is empty.
+    if !region.is_empty() {
+        return false;
+    }
+    match *service {
+        // An IAM or STS ARN names an entity OF an account — a root, a user, a role, an
+        // assumed-role session — so the account that holds it has to be one this emulator
+        // resolves, exactly as a bare account id does.
+        "iam" | "sts" => account_resolves(account),
+        // An Organizations ARN names an organization or one of its units rather than an
+        // account, and nothing this service holds resolves one, so what is read of it is
+        // the ARN's shape.
+        "organizations" => !account.is_empty(),
+        _ => false,
+    }
 }
 
 /// Whether `identity` names an Amazon Web Services service principal, the form
@@ -1138,19 +1204,6 @@ impl CertificateAuthorityRecord {
             Some(chain) => format!("{ca_certificate}{chain}"),
             None => ca_certificate.clone(),
         })
-    }
-
-    /// Whether the resource-based policy operations resolve this CA at all.
-    ///
-    /// A CA that does not hold its own certificate yet keeps no policy: the corpus records
-    /// `DeletePolicy` against a CA still waiting for one answering
-    /// [`CA_NOT_FOUND_MESSAGE`] — the sentence for a CA that cannot be found — rather than
-    /// [`POLICY_NOT_FOUND_MESSAGE`] or a success
-    /// (`acm-pca.delete-policy-on-pending-ca-is-noop`). Read off the certificate rather
-    /// than off `ACTIVE`, because what a later status (disabled, expired) keeps is the
-    /// certificate it was activated with.
-    pub fn resolves_policies(&self) -> bool {
-        self.ca_certificate_pem.is_some()
     }
 
     /// Whether this CA is being asked for the one certificate it can sign before it holds

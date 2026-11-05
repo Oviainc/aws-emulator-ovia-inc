@@ -30,7 +30,7 @@ use service_com_amazonaws_acmpca_acmprivateca::state::{
 };
 
 use crate::delete_certificate_authority::force_status;
-use crate::private_ca_lifecycle::{root_ca_request, string, wait_for_the_clock, Emulator};
+use crate::private_ca_lifecycle::{root_ca_request, string, wait_for_the_clock, Emulator, ACCOUNT};
 use crate::resource_policy::error_message;
 
 /// What Amazon Web Services Private CA answers a mutation that names a soft-deleted CA.
@@ -60,7 +60,7 @@ fn policy_of(arn: &str) -> String {
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
-            "Principal": {"AWS": "123456789012"},
+            "Principal": {"AWS": ACCOUNT},
             "Action": "acm-pca:IssueCertificate",
             "Resource": arn
         }]

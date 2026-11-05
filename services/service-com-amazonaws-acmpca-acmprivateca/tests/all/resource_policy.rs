@@ -8,12 +8,13 @@
 //!
 //! The rule under test: a policy operation resolves the resource-based policy of the
 //! private CA its ARN names — attaching replaces what was attached, reading hands the
-//! stored document back byte for byte, deleting removes it — and a request that resolves
-//! none is refused with HTTP 400 `ResourceNotFoundException`, naming the resource the stage
-//! that failed was about: the CA where the request names no CA of this service, or one that
-//! does not hold its certificate yet and so keeps no policy, and the POLICY where the CA is
-//! resolved and carries none. The recorded case (`DeletePolicy` against a CA still waiting
-//! for its certificate) is one row of the tables below.
+//! stored document back byte for byte, deleting removes it. A request naming no CA of this
+//! service is refused with HTTP 400 `ResourceNotFoundException` about the CA; a resolved CA
+//! carrying no policy is reported by the READ with the POLICY's own sentence, while the
+//! DELETE succeeds — "If there is no policy attached to the private CA, this action will
+//! return successful" (`DeletePolicy` docs). The documents below are ones this service
+//! attaches: they grant actions a private CA is shared for, to identities it can resolve
+//! (the tables for those two rules are `resource_policy_rules.rs`).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::state::{
@@ -22,6 +23,7 @@ use service_com_amazonaws_acmpca_acmprivateca::state::{
 
 use crate::private_ca_lifecycle::{
     active_ca, blob, certificate_pem, root_ca_request, string, wait_for_the_clock, Emulator,
+    ACCOUNT,
 };
 
 /// The three operations that read or write a CA's resource-based policy.
@@ -69,7 +71,7 @@ fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
         "Statement": [{
             "Sid": "ShareWithAccount",
             "Effect": "Allow",
-            "Principal": {"AWS": "123456789012"},
+            "Principal": {"AWS": ACCOUNT},
             "Action": ["acm-pca:IssueCertificate", "acm-pca:GetCertificate"],
             "Resource": ca_arn
         }]
@@ -86,12 +88,12 @@ fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
     let three_statements = json!({
         "Version": "2012-10-17",
         "Statement": [
-            {"Effect": "Allow", "Principal": {"AWS": "111111111111"},
+            {"Effect": "Allow", "Principal": {"AWS": ACCOUNT},
              "Action": "acm-pca:IssueCertificate", "Resource": ca_arn},
-            {"Effect": "Allow", "Principal": {"AWS": "222222222222"},
+            {"Effect": "Allow", "Principal": {"Service": "acm.amazonaws.com"},
              "Action": "acm-pca:GetCertificate", "Resource": ca_arn},
             {"Effect": "Deny", "Principal": "*",
-             "Action": "acm-pca:DeletePolicy", "Resource": ca_arn}
+             "Action": "acm-pca:ListTags", "Resource": ca_arn}
         ]
     });
     // U+00E9 and U+00FF are inside the pattern's `\u0020-\u00FF` range, so a document
@@ -101,7 +103,7 @@ fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
         "Statement": [{
             "Sid": "Pr\u{00E9}f\u{00E9}rence\u{00FF}",
             "Effect": "Allow",
-            "Principal": {"AWS": "333333333333"},
+            "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT}:root")},
             "Action": "acm-pca:IssueCertificate",
             "Resource": ca_arn
         }]
@@ -113,12 +115,12 @@ fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
         "Statement": [{
             "Sid": "A".repeat(60_000),
             "Effect": "Allow",
-            "Principal": {"AWS": "444444444444"},
+            "Principal": {"AWS": ACCOUNT},
             "Action": "acm-pca:IssueCertificate",
             "Resource": ca_arn
         }]
     });
-    let pretty_statement = json!({"Effect": "Allow", "Principal": {"AWS": "555555555555"},
+    let pretty_statement = json!({"Effect": "Allow", "Principal": {"AWS": ACCOUNT},
                                   "Action": "acm-pca:IssueCertificate", "Resource": ca_arn});
 
     vec![
@@ -282,24 +284,30 @@ async fn a_policy_round_trips_through_put_get_and_delete() {
             )
             .await;
 
-        // The deletion persisted: the policy resolves for nobody afterwards, through
-        // either operation that resolves one.
-        for operation in ["GetPolicy", "DeletePolicy"] {
-            let body = emulator
-                .refused(
-                    case,
-                    operation,
-                    &request(operation, &arn, &document),
-                    "ResourceNotFoundException",
-                )
-                .await;
-            let message = error_message(&body, case);
-            assert_eq!(
-                message, POLICY_NOT_FOUND_MESSAGE,
-                "case {case:?}: expected {operation} after the delete to answer the \
-                 service's policy not-found sentence, got {message:?}"
-            );
-        }
+        // The deletion persisted: the policy resolves for nobody afterwards. The READ is
+        // what reports the absence; the delete is delete-if-exists, so repeating it is a
+        // success that leaves the CA carrying nothing.
+        let body = emulator
+            .refused(
+                case,
+                "GetPolicy",
+                &request("GetPolicy", &arn, &document),
+                "ResourceNotFoundException",
+            )
+            .await;
+        let message = error_message(&body, case);
+        assert_eq!(
+            message, POLICY_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected GetPolicy after the delete to answer the service's \
+             policy not-found sentence, got {message:?}"
+        );
+        emulator
+            .ok(
+                case,
+                "DeletePolicy",
+                &request("DeletePolicy", &arn, &document),
+            )
+            .await;
 
         // And the CA itself is untouched by its policy's deletion.
         let described = emulator
@@ -324,41 +332,45 @@ async fn a_policy_round_trips_through_put_get_and_delete() {
     }
 }
 
-/// A private CA this service resolves but that carries no policy resolves no policy:
-/// `DeletePolicy` (and `GetPolicy`) is refused with `ResourceNotFoundException` and the
-/// policy's own sentence, rather than answering successfully.
+/// A private CA this service resolves but that carries no policy: the READ reports the
+/// policy as the absent resource, while the DELETE has nothing to remove and succeeds.
 #[tokio::test]
 async fn a_resolvable_ca_with_no_policy_resolves_no_policy() {
     let emulator = Emulator::new();
     let case = "ACTIVE CA with no policy";
     let (arn, _certificate) = active_ca(&emulator, "no-policy-active").await;
 
-    for operation in ["DeletePolicy", "GetPolicy"] {
-        let body = emulator
-            .refused(
-                case,
-                operation,
-                &request(operation, &arn, ""),
-                "ResourceNotFoundException",
-            )
-            .await;
-        let message = error_message(&body, case);
-        assert_eq!(
-            message, POLICY_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected {operation} on a CA with no policy to answer the \
-             service's policy not-found sentence, got {message:?}"
-        );
-        // The sentence the corpus recorded for this case, pinned as the literal it was
-        // recorded as: the `GetPolicy` report
-        // (issues/.../20261022T143159Z-acm-pca-getpolicy-stub.md) asserts
-        // ("ResourceNotFoundException", "Could not find policy for specified resource.").
-        assert_eq!(
-            message, "Could not find policy for specified resource.",
-            "case {case:?}: expected the recorded sentence from {operation}, got {message:?}"
-        );
-    }
+    let body = emulator
+        .refused(
+            case,
+            "GetPolicy",
+            &request("GetPolicy", &arn, ""),
+            "ResourceNotFoundException",
+        )
+        .await;
+    let message = error_message(&body, case);
+    assert_eq!(
+        message, POLICY_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected GetPolicy on a CA with no policy to answer the \
+         service's policy not-found sentence, got {message:?}"
+    );
+    // The sentence the corpus recorded for this case, pinned as the literal it was
+    // recorded as: the `GetPolicy` report
+    // (issues/.../20261022T143159Z-acm-pca-getpolicy-stub.md) asserts
+    // ("ResourceNotFoundException", "Could not find policy for specified resource.").
+    assert_eq!(
+        message, "Could not find policy for specified resource.",
+        "case {case:?}: expected the recorded sentence from GetPolicy, got {message:?}"
+    );
 
-    // The same CA takes a policy, so the refusals above are about the policy and not
+    // The delete of a policy that is not there is a success: "If there is no policy
+    // attached to the private CA, this action will return successful" (`DeletePolicy`
+    // docs).
+    emulator
+        .ok(case, "DeletePolicy", &request("DeletePolicy", &arn, ""))
+        .await;
+
+    // The same CA takes a policy, so the refusal above is about the policy and not
     // about the CA.
     let document = policy_for(&arn);
     emulator
@@ -593,18 +605,14 @@ async fn a_policy_belongs_to_exactly_one_ca() {
     );
 }
 
-/// A CA that does not hold its own certificate yet keeps no policy: `DeletePolicy` finds
-/// no CA whose policy it could clear and names the CA (the recorded case), while
-/// `GetPolicy` reports the policy it was asked for as absent. Attaching a policy is what
-/// makes the delete resolve one, and importing the certificate is what turns the absence
-/// into the policy's own refusal.
+/// A CA that does not hold its own certificate yet is still a CA this service resolves:
+/// `DeletePolicy` succeeds against it whatever it carries, and `GetPolicy` reports the
+/// policy it was asked for as the absent resource. Attaching a policy to such a CA is
+/// accepted, and the delete removes it.
 #[tokio::test]
-async fn a_ca_without_its_certificate_keeps_no_policy() {
+async fn a_ca_without_its_certificate_resolves_for_the_policy_operations() {
     let emulator = Emulator::new();
-    // The CA is resolved before the document is judged, so the rows below pin the refusal
-    // about the CA whatever the document names; the attach further down carries a policy
-    // of the CA it goes to.
-    let document = policy_for("arn:aws:acm-pca:eu-west-1:000000000000:certificate-authority/x");
+    // `DeletePolicy` reads no document, so the rows below carry none.
 
     // A CA read straight after `CreateCertificateAuthority` is still CREATING; one read
     // after the transition the clock owes has come due is PENDING_CERTIFICATE. Neither
@@ -626,30 +634,10 @@ async fn a_ca_without_its_certificate_keeps_no_policy() {
     ];
 
     for (case, arn) in &rows {
-        let body = emulator
-            .refused(
-                case,
-                "DeletePolicy",
-                &request("DeletePolicy", arn, &document),
-                "ResourceNotFoundException",
-            )
+        // Delete-if-exists: the CA resolves, so there is nothing left to report.
+        emulator
+            .ok(case, "DeletePolicy", &request("DeletePolicy", arn, ""))
             .await;
-        let message = error_message(&body, case);
-        assert_eq!(
-            message, CA_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected DeletePolicy on a CA with no certificate to answer \
-             the service's CA not-found sentence, got {message:?}"
-        );
-        if *case == "PENDING_CERTIFICATE CA" {
-            // The sentence the corpus recorded for exactly this case, pinned as the
-            // literal it was recorded as: `acm-pca.delete-policy-on-pending-ca-is-noop`
-            // asserts ("ResourceNotFoundException", "Could not find specified CA").
-            assert_eq!(
-                message, "Could not find specified CA",
-                "case {case:?}: expected the recorded sentence from DeletePolicy, got \
-                 {message:?}"
-            );
-        }
 
         // The read names the policy it was asked for, as its own recording has it.
         let body = emulator
@@ -668,8 +656,7 @@ async fn a_ca_without_its_certificate_keeps_no_policy() {
         );
     }
 
-    // Attaching a policy to such a CA is accepted and the delete then removes it, so the
-    // CA sentence above reports the absence rather than refusing to touch that CA.
+    // Attaching a policy to such a CA is accepted and the delete removes it.
     let case = "PENDING_CERTIFICATE CA with a policy attached";
     let (_, arn) = rows.last().expect("the pending row").clone();
     let attachable = policy_for(&arn);
@@ -685,29 +672,25 @@ async fn a_ca_without_its_certificate_keeps_no_policy() {
         "case {case:?}: expected the attached document back, got {returned:?}"
     );
     emulator
-        .ok(
-            case,
-            "DeletePolicy",
-            &request("DeletePolicy", &arn, &document),
-        )
+        .ok(case, "DeletePolicy", &request("DeletePolicy", &arn, ""))
         .await;
     let body = emulator
         .refused(
             case,
-            "DeletePolicy",
-            &request("DeletePolicy", &arn, &document),
+            "GetPolicy",
+            &request("GetPolicy", &arn, ""),
             "ResourceNotFoundException",
         )
         .await;
     let message = error_message(&body, case);
     assert_eq!(
-        message, CA_NOT_FOUND_MESSAGE,
-        "case {case:?}: expected the deleted policy to leave the CA keeping none, got \
+        message, POLICY_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected the deleted policy to leave the CA carrying none, got \
          {message:?}"
     );
 
-    // Import the CA certificate and the same empty CA reports the absence as the policy's,
-    // because a CA holding its certificate is one that keeps policies.
+    // Importing the CA certificate changes none of it: the delete still succeeds and the
+    // read still reports the policy as the absent resource.
     let case = "CA with its certificate imported";
     emulator
         .ok(
@@ -717,18 +700,21 @@ async fn a_ca_without_its_certificate_keeps_no_policy() {
                     "Certificate": blob(&certificate_pem("policy-pending"))}),
         )
         .await;
+    emulator
+        .ok(case, "DeletePolicy", &request("DeletePolicy", &arn, ""))
+        .await;
     let body = emulator
         .refused(
             case,
-            "DeletePolicy",
-            &request("DeletePolicy", &arn, &document),
+            "GetPolicy",
+            &request("GetPolicy", &arn, ""),
             "ResourceNotFoundException",
         )
         .await;
     let message = error_message(&body, case);
     assert_eq!(
         message, POLICY_NOT_FOUND_MESSAGE,
-        "case {case:?}: expected DeletePolicy to answer the service's policy not-found \
+        "case {case:?}: expected GetPolicy to answer the service's policy not-found \
          sentence once the CA holds its certificate, got {message:?}"
     );
 }

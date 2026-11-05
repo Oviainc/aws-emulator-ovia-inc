@@ -236,8 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Judged before anything is written, so a refused document leaves the policy the
-        // CA carried exactly as it was. The document has to be a policy OF THIS CA: every
-        // statement about the CA the request names.
+        // CA carried exactly as it was. What is judged is what a resource-based policy of a
+        // private CA IS: a policy document, about the CA the request names, granting
+        // actions a private CA can be shared for, to identities this service resolves.
         if let Some(reason) = crate::state::invalid_policy_reason(&input.policy, &arn) {
             return Err(PutPolicyErrorModeled::InvalidPolicyException(
                 InvalidPolicyException {
