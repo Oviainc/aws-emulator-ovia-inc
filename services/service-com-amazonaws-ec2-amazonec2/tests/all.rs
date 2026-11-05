@@ -66,6 +66,13 @@ mod refusal_fixed_text;
 // every new ec2 suite inserts its lines.
 #[path = "all/get_managed_prefix_list_entries.rs"]
 mod get_managed_prefix_list_entries;
+// What `GetManagedPrefixListAssociations` reports: the resources that reference the one prefix
+// list a request names — a security group whose rule grants it, a route table routing to it, a
+// transit gateway route table referencing it — each with its own owner, how it pages and what
+// it refuses. Declared beside `get_managed_prefix_list_entries` because the two report two
+// projections of one prefix list.
+#[path = "all/get_managed_prefix_list_associations.rs"]
+mod get_managed_prefix_list_associations;
 // What `DescribeIpamPools` reports out of the IPAM pool store: every member the create stored,
 // how the id list, the documented filters and the page size narrow it, what it refuses, and the
 // state move the clock owes a pool it is read through. Declared after the suite above rather

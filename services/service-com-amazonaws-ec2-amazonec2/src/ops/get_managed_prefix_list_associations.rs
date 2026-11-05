@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedPrefixListAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedPrefixListAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedPrefixListAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources that REFERENCE ONE prefix list the caller can see — the three kinds
+//! of reference this service holds, read off the stores that own them: a security group rule
+//! whose grant names the prefix list
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_rules`]), a route whose
+//! destination is the prefix list
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::route_tables`]) and a prefix list reference
+//! of a transit gateway route table
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::transit_gateway_prefix_list_references`]) —
+//! ONE row per referencing resource however many references it holds, in ascending resource-id
+//! order, cut into `MaxResults`-sized pages. A reporting operation only: it writes nothing, and
+//! no move the clock owes adds or withdraws a reference.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +144,207 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedPrefixListAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedPrefixListAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // The request's own FORM first, before anything is resolved: "not a prefix list id at
+        // all" is a fact about the request, while "no such prefix list" is a fact about what
+        // the caller can see — the order every resource of this crate asks the two questions
+        // in (`crate::state::require_well_formed_id`).
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            &input.prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+
+        // "The token for the next page of results"
+        // (`GetManagedPrefixListAssociationsRequest$NextToken`) — anything else is refused
+        // rather than read as a position, and it is refused before the store is read, so
+        // whether a bogus token is caught never depends on what the store holds. The cursor
+        // carries the PREFIX LIST it was minted for, so a token presented back against another
+        // list is refused rather than resuming inside an association set it never reported.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(token, &input.prefix_list_id)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The maximum number of results to return with a single call"
+        // (`GetManagedPrefixListAssociationsRequest$MaxResults`). A request that names none
+        // gets the largest page the model publishes, so the `NextToken` path below behaves the
+        // same whether or not a page size was asked for. The model's `range 5..255` has already
+        // refused anything outside it; the floor is applied anyway, the way the entry report
+        // applies its own, because a page below it would cut this report finer than a caller
+        // can ask for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .max(MIN_MAX_RESULTS);
+
+        // `DryRun` sits after every parameter has been validated and before anything is read:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused for its own reason is refused with that reason instead. "If you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), and every
+        // caller of this emulator holds them.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the caller
+        // signed for is the Region whose published prefix lists it can see, the same Region
+        // `DescribeManagedPrefixLists` and `GetManagedPrefixListEntries` report those lists
+        // for.
+        let region = state::request_region(ctx.parts());
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let store = state_handle.lock();
+        // Nothing is written here, and no clock-owed move is materialized: what the clock owes
+        // the resources involved is a STATE move — a prefix list reaching `create-complete`, a
+        // transit gateway prefix list reference reaching `available` — and none of those moves
+        // adds or withdraws a reference, so which resources reference this list is the same
+        // before and after they fall due.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedPrefixListAssociations"))
+        // A prefix list nothing the caller can see carries is an error, not an empty
+        // association set — an empty set is what a list nothing references reports. The
+        // visibility asked is the one the entry report asks, so an id names the same list
+        // whichever of the two is called.
+        if store
+            .visible_prefix_list_entries(&region, &input.prefix_list_id)
+            .is_none()
+        {
+            return Err(state::invalid_prefix_list_id_not_found(&input.prefix_list_id));
+        }
+        let associations = prefix_list_associations(&store, &input.prefix_list_id);
+        // The store's lock is not held across the paging below: every row is owned by now, and
+        // nothing else about the store is read.
+        drop(store);
+
+        // "This value is null when there are no more results to return"
+        // (`GetManagedPrefixListAssociationsResult$NextToken`): a token only when a resource
+        // follows this page, scoped to the prefix list this report is of — the crate's one
+        // reading of that rule (`crate::state::scoped_page_from_cursor`), so this report cannot
+        // page differently from the others.
+        let (page, next_token) = state::scoped_page_from_cursor(
+            &input.prefix_list_id,
+            &associations,
+            start_at.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |association| association.resource_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(GetManagedPrefixListAssociationsOutput {
+            prefix_list_associations: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`GetManagedPrefixListAssociationsMaxResults`, `range 5..255`), which is also the most EC2
+/// returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 255;
+
+/// The smallest page this operation will serve: the minimum of that same published range
+/// (`GetManagedPrefixListAssociationsMaxResults`, `range 5..255`). The boundary validator
+/// refuses anything below it, so this is the floor that keeps a page finer than a caller may
+/// ask for unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 5;
+
+/// The resources `store` holds that reference the prefix list `prefix_list_id`, one row per
+/// resource, in ascending resource-id order.
+///
+/// "Describes the resource with which a prefix list is associated" (`PrefixListAssociation`): a
+/// prefix list is referenced BY a resource rather than attached to one, so the association set
+/// is DERIVED from the stores that own those references — there is nothing to keep beside them,
+/// and no second copy to drift from the resource that actually holds the reference.
+///
+/// The three kinds of reference this service holds are:
+///
+/// * a security group rule whose grant names the prefix list — the rule store is the one source
+///   of truth for a group's rules
+///   ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_rules`]), the `IpPermissions`
+///   of the group record being the aggregate written from it, so the referencing RESOURCE is the
+///   group the rule belongs to;
+/// * a route whose destination is the prefix list, in a route table of the account
+///   (`CreateRouteRequest$DestinationPrefixListId`), whose referencing resource is that table;
+/// * a prefix list reference of a transit gateway route table
+///   (`CreateTransitGatewayPrefixListReference`), whose referencing resource is that table.
+///
+/// One resource is reported ONCE however many references it holds — a group may grant the same
+/// prefix list both inbound and outbound — because a row is about the resource, not the
+/// reference. Keying the rows by resource id is both what collapses them and the ascending order
+/// the page cursor names a position in: an id is unique across the account's resources, so that
+/// order is total and a token always advances.
+fn prefix_list_associations(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    prefix_list_id: &str,
+) -> Vec<PrefixListAssociation> {
+    // "The owner of the resource" (`PrefixListAssociation$ResourceOwner`): the account the
+    // referencing resource belongs to, as that resource's own record carries it — and this
+    // emulator's account for a record that carries none, which is the account every resource it
+    // stores belongs to.
+    let account = ::engine::emulator_account_id().to_string();
+    let mut by_resource: ::std::collections::BTreeMap<String, String> =
+        ::std::collections::BTreeMap::new();
+
+    for record in store.security_group_rules.values() {
+        if record.rule.prefix_list_id.as_deref() != Some(prefix_list_id) {
+            continue;
+        }
+        if let Some(group_id) = record.rule.group_id.as_deref() {
+            by_resource.insert(
+                group_id.to_string(),
+                record
+                    .rule
+                    .group_owner_id
+                    .clone()
+                    .unwrap_or_else(|| account.clone()),
+            );
+        }
+    }
+
+    for (route_table_id, route_table) in &store.route_tables {
+        let references = route_table
+            .routes
+            .iter()
+            .flatten()
+            .any(|route| route.destination_prefix_list_id.as_deref() == Some(prefix_list_id));
+        if references {
+            by_resource.insert(
+                route_table_id.clone(),
+                route_table
+                    .owner_id
+                    .clone()
+                    .unwrap_or_else(|| account.clone()),
+            );
+        }
+    }
+
+    for (route_table_id, referenced) in store.transit_gateway_prefix_list_references.keys() {
+        if referenced != prefix_list_id {
+            continue;
+        }
+        // A transit gateway route table carries no owner member of its own
+        // (`TransitGatewayRouteTable`), so the owner is the owner of the gateway the table
+        // belongs to: the account that owns a transit gateway owns its route tables.
+        let owner = store
+            .transit_gateway_route_tables
+            .get(route_table_id)
+            .and_then(|table| table.transit_gateway_id.as_deref())
+            .and_then(|transit_gateway_id| store.transit_gateways.get(transit_gateway_id))
+            .and_then(|transit_gateway| transit_gateway.owner_id.clone())
+            .unwrap_or_else(|| account.clone());
+        by_resource.insert(route_table_id.clone(), owner);
+    }
+
+    by_resource
+        .into_iter()
+        .map(|(resource_id, resource_owner)| PrefixListAssociation {
+            resource_id: Some(resource_id),
+            resource_owner: Some(resource_owner),
+        })
+        .collect()
 }
