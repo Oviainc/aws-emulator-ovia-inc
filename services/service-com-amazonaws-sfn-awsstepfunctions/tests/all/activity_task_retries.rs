@@ -505,27 +505,29 @@ async fn a_failed_activity_task_is_retried_until_its_retrier_is_spent() {
 // Rule 4: what an activity state's members do NOT include
 // ---------------------------------------------------------------------------
 
-/// A two-state definition whose `Task` state polls `activity_arn` and carries `extra`,
-/// with the state a `Catch` catcher transitions to declared beside it: a definition
-/// whose `Next` named no declared state would be refused at create time, which is a
-/// different refusal from the one under test.
+/// A definition whose `Task` state polls `activity_arn` and carries `extra`, with the
+/// state a `Catch` catcher transitions to declared beside it where `extra` declares
+/// one: a definition whose `Next` named no declared state, or that declared a state no
+/// transition reaches, would be refused at create time, which is a different refusal
+/// from the one under test.
 fn definition_with_a_recovery_state(activity_arn: &str, extra: Value) -> String {
     let Value::Object(extra) = extra else {
         panic!("expected an object of state members, got {extra:?}")
     };
+    let catching = extra.contains_key("Catch");
     let mut state = json!({ "Type": "Task", "Resource": activity_arn, "End": true });
     let members = state.as_object_mut().expect("the state is an object");
     for (member, value) in extra {
         members.insert(member, value);
     }
-    json!({
-        "StartAt": "Work",
-        "States": {
-            "Work": state,
-            "Recover": { "Type": "Pass", "End": true },
-        },
-    })
-    .to_string()
+    let mut states = json!({ "Work": state });
+    if catching {
+        states.as_object_mut().expect("the states are an object").insert(
+            "Recover".to_string(),
+            json!({ "Type": "Pass", "End": true }),
+        );
+    }
+    json!({ "StartAt": "Work", "States": states }).to_string()
 }
 
 /// A state whose `Resource` is an activity and which carries a member this emulator

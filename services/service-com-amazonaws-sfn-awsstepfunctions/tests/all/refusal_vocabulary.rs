@@ -626,7 +626,7 @@ async fn a_state_machine_object_reports_its_required_and_unsupported_fields() {
             })
             .to_string(),
             "SCHEMA_VALIDATION_FAILED: These fields are required: [States, StartAt] at \
-             /States/P/Branches/0"
+             /States/P/Branches[0]"
                 .to_string(),
         ),
         (

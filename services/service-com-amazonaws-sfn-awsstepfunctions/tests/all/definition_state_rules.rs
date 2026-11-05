@@ -139,8 +139,9 @@ fn error_at(code: &str, location: &str) -> Value {
 // Rule 1: `Type` names a state type the language defines
 // ---------------------------------------------------------------------------
 
-/// A minimal state of `state_type`, inside a state machine whose only other state is
-/// the `Succeed` a continuing state transitions to.
+/// A minimal state of `state_type`, inside a state machine that declares the
+/// `Succeed` a continuing state transitions to — and nothing else, since a state no
+/// run of the machine reaches is a problem of its own.
 ///
 /// The members are the ones each type needs to satisfy every OTHER rule of the walk,
 /// so the only thing a row can fail on is its `Type`: a continuing type carries
@@ -174,6 +175,11 @@ fn machine_of(state_type: &str) -> String {
         // least a state can carry: a row that fails does so on its `Type` alone.
         _ => json!({ "Type": state_type, "Next": "Done" }),
     };
+    // A type that ENDS an execution transitions nowhere, so the machine declares it
+    // alone; every other row names `Done` and so declares it.
+    if matches!(state_type, "Fail" | "Succeed") {
+        return json!({ "StartAt": "S", "States": { "S": state } }).to_string();
+    }
     json!({
         "StartAt": "S",
         "States": { "S": state, "Done": { "Type": "Succeed" } }
@@ -336,7 +342,7 @@ fn scopes() -> Vec<Scope> {
                 }],
                 "Next": "Done"
             })),
-            expected: vec![unsupported("/States/S/Catch/0/Output/x")],
+            expected: vec![unsupported("/States/S/Catch[0]/Output/x")],
         },
         Scope {
             case: "a Pass state reads its input",
@@ -394,7 +400,7 @@ fn scopes() -> Vec<Scope> {
                 "Output": { "all": ["kept", "{% $states.errorOutput %}"] },
                 "Next": "Done"
             })),
-            expected: vec![unsupported("/States/S/Output/all/1")],
+            expected: vec![unsupported("/States/S/Output/all[1]")],
         },
         Scope {
             case: "a Pass state whose whole Output is the error output",
@@ -600,7 +606,7 @@ async fn a_cross_language_state_is_blamed_on_the_state_itself() {
             .to_string(),
             vec![error_at(
                 SCHEMA_VALIDATION_FAILED,
-                "/States/R/Branches/0/States/B",
+                "/States/R/Branches[0]/States/B",
             )],
         ),
         (

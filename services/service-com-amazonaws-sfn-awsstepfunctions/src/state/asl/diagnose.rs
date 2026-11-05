@@ -232,6 +232,25 @@ pub fn nested_at(prefix: &str, member: impl ::std::fmt::Display) -> String {
     clipped(&format!("{prefix}{member}"), MAX_LOCATION_CHARS)
 }
 
+/// The location of the element at `index` of the array `array` locates: the array's
+/// own location with the index BRACKETED onto it.
+///
+/// RECORDED form, and the ONE place an index is written into a location, so every
+/// diagnostic about an element of a `Retry`, `Catch`, `Choices`, `Branches` or
+/// `ErrorEquals` array addresses it the same way. The index belongs to the FIELD that
+/// holds the array rather than being a segment of its own, so a client reading the
+/// location to point at the offending element of the document it submitted resolves
+/// the node the diagnostic is about.
+pub fn indexed_at(array: &str, index: usize) -> String {
+    nested_at(array, format_args!("[{index}]"))
+}
+
+/// The location of the element at `index` of the array held by `member` of the object
+/// at `prefix` — [`indexed_at`] of that member's own location.
+pub fn element_at(prefix: &str, member: impl ::std::fmt::Display, index: usize) -> String {
+    indexed_at(&nested_at(prefix, format_args!("/{member}")), index)
+}
+
 /// Where a diagnostic about the state machine OBJECT itself was found: the object's
 /// own location, which for the definition as a whole is the document's root.
 ///
@@ -314,17 +333,269 @@ pub fn field_not_supported_message(field: &str) -> String {
     format!("Field '{}' is not supported", echoed(field))
 }
 
-/// What a diagnostic says about a transition target no state declares: the member
-/// that names the target, and the name it named.
+/// The fields the Amazon States Language declares on a state of each type, in the
+/// order its schema states them.
+///
+/// Each set is CLOSED, exactly as a state machine object's is ([`machine_fields`]): a
+/// state's `Type` selects what the state DOES, and the language declares per type the
+/// fields that say how it does it, so a field outside the set of the type the state
+/// declares is a field the language does not define THERE —
+/// [`field_not_supported_message`] is what reports it. A type the language does not
+/// define at all carries no set, because nothing says what such a state would do; it
+/// is reported as the type it names instead ([`diagnose_state`]).
+///
+/// Each set is the UNION of what the two query languages declare for the type — the
+/// `*Path` family and the payload templates of JSONPath beside `Arguments`, `Output`
+/// and `Assign` of JSONata ([`super::executable_members`] and
+/// [`super::jsonata_members`] are the same split for what this emulator RUNS) — plus
+/// the fields the language declares that this emulator does not execute, since a
+/// definition using one is still valid Amazon States Language. Which language's
+/// members a state may MIX is a different rule, reported on its own
+/// ([`diagnose_jsonata_state`]).
+pub fn state_fields(state_type: &str) -> &'static [&'static str] {
+    match state_type {
+        "Pass" => &[
+            "Assign",
+            "Comment",
+            "End",
+            "InputPath",
+            "Next",
+            "Output",
+            "OutputPath",
+            "Parameters",
+            "QueryLanguage",
+            "Result",
+            "ResultPath",
+            "Type",
+        ],
+        "Wait" => &[
+            "Assign",
+            "Comment",
+            "End",
+            "InputPath",
+            "Next",
+            "Output",
+            "OutputPath",
+            "QueryLanguage",
+            "Seconds",
+            "SecondsPath",
+            "Timestamp",
+            "TimestampPath",
+            "Type",
+        ],
+        // A `Choice` goes where its own rules send it, so it declares neither `Next`
+        // nor `End`, and it produces no result of its own, so none of the result-side
+        // members either.
+        "Choice" => &[
+            "Assign",
+            "Choices",
+            "Comment",
+            "Default",
+            "InputPath",
+            "Output",
+            "OutputPath",
+            "QueryLanguage",
+            "Type",
+        ],
+        // The two types that END an execution: there is nowhere for them to go, and no
+        // failure of theirs for a retrier or a catcher to take over. The output a
+        // `Succeed` puts out is the execution's own.
+        "Succeed" => &[
+            "Assign",
+            "Comment",
+            "InputPath",
+            "Output",
+            "OutputPath",
+            "QueryLanguage",
+            "Type",
+        ],
+        "Fail" => &[
+            "Cause",
+            "CausePath",
+            "Comment",
+            "Error",
+            "ErrorPath",
+            "QueryLanguage",
+            "Type",
+        ],
+        // The three types whose work can FAIL — a `Task`'s invocation, and the
+        // machines a `Map` and a `Parallel` run — are the ones that declare `Retry`
+        // and `Catch`.
+        "Task" => &[
+            "Arguments",
+            "Assign",
+            "Catch",
+            "Comment",
+            "Credentials",
+            "End",
+            "HeartbeatSeconds",
+            "HeartbeatSecondsPath",
+            "InputPath",
+            "Next",
+            "Output",
+            "OutputPath",
+            "Parameters",
+            "QueryLanguage",
+            "Resource",
+            "ResultPath",
+            "ResultSelector",
+            "Retry",
+            "TimeoutSeconds",
+            "TimeoutSecondsPath",
+            "Type",
+        ],
+        "Parallel" => &[
+            "Arguments",
+            "Assign",
+            "Branches",
+            "Catch",
+            "Comment",
+            "End",
+            "InputPath",
+            "Next",
+            "Output",
+            "OutputPath",
+            "Parameters",
+            "QueryLanguage",
+            "ResultPath",
+            "ResultSelector",
+            "Retry",
+            "Type",
+        ],
+        "Map" => &[
+            "Assign",
+            "Catch",
+            "Comment",
+            "End",
+            "InputPath",
+            "ItemBatcher",
+            "ItemProcessor",
+            "ItemReader",
+            "ItemSelector",
+            "Items",
+            "ItemsPath",
+            "Iterator",
+            "Label",
+            "MaxConcurrency",
+            "MaxConcurrencyPath",
+            "Next",
+            "Output",
+            "OutputPath",
+            "Parameters",
+            "QueryLanguage",
+            "ResultPath",
+            "ResultSelector",
+            "ResultWriter",
+            "Retry",
+            "ToleratedFailureCount",
+            "ToleratedFailureCountPath",
+            "ToleratedFailurePercentage",
+            "ToleratedFailurePercentagePath",
+            "Type",
+        ],
+        _ => &[],
+    }
+}
+
+/// What a diagnostic says about a transition target no state declares: the name it
+/// named, as the value of the transition field the language calls `Next`.
 ///
 /// RECORDED text. One construction serves every member a transition is named
 /// through — a state's own `Next`, a `Choice` rule's, a `Catch` catcher's and the
 /// `Default` beside them, and the machine's own `StartAt` — because they are one
-/// problem: a name that resolves to no state of the enclosing `States` map. The
-/// target is the caller's own string, so it is clipped by [`echoed`].
-pub fn missing_target_message(member: &str, target: &str) -> String {
-    format!("Missing '{member}' target: {}", echoed(target))
+/// problem: a name that resolves to no state of the enclosing `States` map. The field
+/// the sentence names is `Next` whichever member declared the transition, as the code
+/// it is reported under documents ("The value of \"Next\" field doesn't match a known
+/// state name"); WHICH member that was is what `location` carries. The target is the
+/// caller's own string, so it is clipped by [`echoed`].
+pub fn missing_target_message(target: &str) -> String {
+    format!("Missing 'Next' target: {}", echoed(target))
 }
+
+/// What a diagnostic says about a state nothing in the definition leads to: the
+/// state, quoted, and that nothing reaches it.
+///
+/// RECORDED text. It is reported under the same code an unresolved transition target
+/// is, because it is the other half of one rule about the transition graph: a state
+/// machine's states and the transitions between them must agree, so a name that
+/// resolves to no state and a state no name resolves to are both reported. The name is
+/// the caller's own, so it is clipped by [`echoed`].
+pub fn unreachable_state_message(name: &str) -> String {
+    format!("State \"{}\" is not reachable.", echoed(name))
+}
+
+/// The reserved error name that stands for every error a state can report.
+pub const ALL_ERRORS: &str = "States.ALL";
+
+/// The fields the Amazon States Language declares on one `Retry` retrier, in the
+/// order its schema states them.
+///
+/// From the language's own error-handling rules: a retrier names the errors it takes
+/// over (`ErrorEquals`) and how the attempts it owes are spaced (`IntervalSeconds`,
+/// `MaxAttempts`, `BackoffRate`, `MaxDelaySeconds`, `JitterStrategy`). The set is
+/// CLOSED, like every other object's here.
+const RETRIER_FIELDS: &[&str] = &[
+    "BackoffRate",
+    "Comment",
+    "ErrorEquals",
+    "IntervalSeconds",
+    "JitterStrategy",
+    "MaxAttempts",
+    "MaxDelaySeconds",
+];
+
+/// The field a retrier must carry: the errors it takes over.
+const RETRIER_REQUIRED_FIELDS: &[&str] = &["ErrorEquals"];
+
+/// The fields the language declares on one `Catch` catcher: the errors it takes over,
+/// where the execution continues, and what it puts out on the way there.
+const CATCHER_FIELDS: &[&str] = &[
+    "Assign",
+    "Comment",
+    "ErrorEquals",
+    "Next",
+    "Output",
+    "ResultPath",
+];
+
+/// The fields a catcher must carry, in the order the refusal lists them: the errors it
+/// takes over, and the state the execution continues at.
+const CATCHER_REQUIRED_FIELDS: &[&str] = &["ErrorEquals", "Next"];
+
+/// What a schema diagnostic says about an `ErrorEquals` list naming [`ALL_ERRORS`]
+/// beside other error names.
+///
+/// RECORDED text. The language admits the catch-all only as the single entry of a
+/// retrier's or a catcher's `ErrorEquals`, since a list that holds it matches every
+/// error already and the names beside it can never decide anything.
+pub const ALL_ERRORS_ALONE_MESSAGE: &str = "States.ALL must appear alone and at end of list";
+
+/// What a schema diagnostic says about a member the language declares as a LIST that
+/// a definition carries as something else: the member, and what it holds.
+///
+/// The sentence is this service's own, as every diagnostic about the SHAPE of a value
+/// is: what is recorded is the wording for a field the language does not declare at
+/// all ([`field_not_supported_message`]) and for the fields an object owes
+/// ([`required_fields_message`]); a value of the wrong shape is stated as the rule it
+/// broke, in the words this module states every other such rule in.
+pub fn array_member_message(member: &str) -> String {
+    format!("'{}' must be an array", echoed(member))
+}
+
+/// What a schema diagnostic says about an entry of such a list that is not the object
+/// the language declares there.
+pub fn entry_object_message(member: &str) -> String {
+    format!("every entry of '{}' must be a JSON object", echoed(member))
+}
+
+/// What a schema diagnostic says about an `ErrorEquals` that names nothing: the list
+/// decides which errors the entry takes over, so an empty one takes over none and the
+/// entry can never do anything.
+pub const EMPTY_ERROR_EQUALS_MESSAGE: &str = "'ErrorEquals' must name at least one error";
+
+/// What a schema diagnostic says about an entry of an `ErrorEquals` that is not an
+/// error NAME.
+pub const ERROR_NAME_MESSAGE: &str = "'ErrorEquals' must name errors as strings";
 
 /// What the diagnostic for a state machine that cannot stop says.
 ///
@@ -664,7 +935,7 @@ pub(super) fn diagnose_machine(
                     into.push(error(
                         MISSING_TRANSITION_TARGET,
                         at(prefix, "/StartAt"),
-                        missing_target_message("StartAt", declared),
+                        missing_target_message(declared),
                     ));
                 }
             }
@@ -693,6 +964,11 @@ pub(super) fn diagnose_machine(
         ));
         return;
     }
+    // What the definition's transitions NAME: the state its `StartAt` names, and
+    // every state a transition of a declared state names. Read once per machine,
+    // before any state is judged, because it is a property of the whole graph rather
+    // than of one state.
+    let named = named_states(states, start_at);
     // Which variables each state of THIS machine can count on having been assigned
     // by the time it runs, which is what its own reads are judged against. Built
     // once per machine, before any state is judged, because it is a property of the
@@ -724,6 +1000,32 @@ pub(super) fn diagnose_machine(
             into,
         );
     }
+    // The transition graph is also read the other way round: a state nothing in the
+    // definition names is work this state machine can never do, so it is reported
+    // under the code the transition graph's problems are reported under, at the state
+    // itself — what is wrong is not a member the state carries but that nothing leads
+    // to it. These follow the diagnostics about the states, because they are about
+    // the graph those states form.
+    //
+    // A machine that declares no entry point at all has no graph to judge this way:
+    // that it carries no `StartAt` is already reported above, and every state of it
+    // would be unreached for that one reason.
+    for name in states.keys() {
+        if !into.looking() {
+            break;
+        }
+        if start_at.is_none() || named.contains(name.as_str()) {
+            continue;
+        }
+        into.push(error(
+            MISSING_TRANSITION_TARGET,
+            at(
+                &nested_at(prefix, format_args!("/States/{}", echoed(name))),
+                "",
+            ),
+            unreachable_state_message(name),
+        ));
+    }
     // "MISSING_END_STATE: The workflow does not have a terminal state." A state
     // machine is a graph that must be able to STOP, so at least one of the states it
     // declares ends an execution; one that declares none describes a workflow no run
@@ -749,14 +1051,47 @@ struct Machine<'a> {
     depth: usize,
 }
 
+/// The states of `states` that something NAMES: the one `start_at` names, and every
+/// one a transition of a declared state names ([`transitions`]).
+///
+/// A state outside this set is one nothing in the definition leads to, which is what
+/// [`unreachable_state_message`] reports. A transition naming a state the machine does
+/// not declare names nothing here and is reported on its own
+/// ([`MISSING_TRANSITION_TARGET`]); an entry point that names no declared state leaves
+/// the machine with nothing named but what its states name.
+///
+/// Each state's transitions are read once, so this costs one pass over the machine
+/// whatever shape its graph has.
+fn named_states<'a>(
+    states: &'a Map<String, Value>,
+    start_at: Option<&str>,
+) -> BTreeSet<&'a str> {
+    // The name is taken from the `States` map rather than from what named it, so the
+    // set holds the machine's own text once however many transitions name a state.
+    let declared = |name: &str| {
+        states
+            .get_key_value(name)
+            .map(|(declared, _)| declared.as_str())
+    };
+    let mut named: BTreeSet<&str> = start_at.and_then(declared).into_iter().collect();
+    for state in states.values() {
+        let Some(state) = state.as_object() else {
+            continue;
+        };
+        for transition in transitions(state) {
+            named.extend(declared(transition.target.as_str()));
+        }
+    }
+    named
+}
+
 /// Whether `state` ENDS an execution: a state of a type that terminates one
 /// ([`TERMINAL_STATE_TYPES`]), or any state declaring `"End": true`.
 ///
 /// This is what [`MISSING_END_STATE`] is read off, over every state a machine
 /// DECLARES: what that diagnostic reports is that the workflow has no terminal state,
-/// and a state machine that declares one has one — where this definition's
-/// transitions lead is a different question, and no diagnostic this service reports is
-/// about a state nothing reaches.
+/// and a state machine that declares one has one — whether anything this definition
+/// declares LEADS to it is a different question, and the one [`named_states`] answers.
 fn ends_an_execution(state: &Value) -> bool {
     let Some(state) = state.as_object() else {
         return false;
@@ -845,6 +1180,23 @@ fn diagnose_state<'a>(
         ));
         return;
     }
+    // The language's schema for a state is CLOSED per TYPE, exactly as a state
+    // machine object's is: the type selects what the state does, and the fields
+    // beside it say how ([`state_fields`]), so each field outside that set is
+    // reported on its own, located at the STATE — the field belongs to the state
+    // rather than to a position under it.
+    for field in state.keys() {
+        if !state_fields(state_type).contains(&field.as_str()) {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(&here, ""),
+                field_not_supported_message(field),
+            ));
+        }
+    }
+    // What the state does with a failure of its own work, for a type that declares
+    // it.
+    diagnose_error_handlers(state, state_type, &here, into);
     // A `Fail` state's `Error` and `Cause` are reported verbatim by
     // `DescribeExecution`, through shapes with their own maxima, so a
     // definition carrying a longer one could never be reported.
@@ -872,7 +1224,7 @@ fn diagnose_state<'a>(
             into.push(error(
                 MISSING_TRANSITION_TARGET,
                 at(&here, &transition.path),
-                missing_target_message(transition.member, &transition.target),
+                missing_target_message(&transition.target),
             ));
         }
     }
@@ -1001,13 +1353,136 @@ fn diagnose_state<'a>(
         for (index, branch) in branches.iter().enumerate() {
             diagnose_machine(
                 branch,
-                &nested_at(&here, format_args!("/Branches/{index}")),
+                &element_at(&here, "Branches", index),
                 language,
                 depth + 1,
                 false,
                 outer,
                 into,
             );
+        }
+    }
+}
+
+/// The `Retry` and `Catch` rules of one state: what the language requires of the
+/// retriers and catchers a state of this type declares.
+///
+/// A member the type does not declare at all is not judged here: that it is there is
+/// already reported ([`state_fields`]), and what it holds says nothing more about a
+/// definition whose state cannot carry it.
+fn diagnose_error_handlers(
+    state: &Map<String, Value>,
+    state_type: &str,
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    for member in [RETRY_MEMBER, CATCH_MEMBER] {
+        if !state_fields(state_type).contains(&member) {
+            continue;
+        }
+        let (fields, required) = if member == CATCH_MEMBER {
+            (CATCHER_FIELDS, CATCHER_REQUIRED_FIELDS)
+        } else {
+            (RETRIER_FIELDS, RETRIER_REQUIRED_FIELDS)
+        };
+        let Some(declared) = state.get(member) else {
+            continue;
+        };
+        // The member holds a LIST of entries, so a value that is not one carries no
+        // entry to judge: it is reported as the member it is instead.
+        let Some(entries) = declared.as_array() else {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(here, &format!("/{member}")),
+                array_member_message(member),
+            ));
+            continue;
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            let at_entry = element_at(here, member, index);
+            let Some(entry) = entry.as_object() else {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&at_entry, ""),
+                    entry_object_message(member),
+                ));
+                continue;
+            };
+            // An entry of either array is an object the language declares a closed set
+            // of fields on, reported exactly as a state machine object's and a state's
+            // are: the fields it owes together, each field outside the set on its own,
+            // both located at the ENTRY the fields belong to.
+            let missing: Vec<&str> = required
+                .iter()
+                .copied()
+                .filter(|field| !entry.contains_key(*field))
+                .collect();
+            if !missing.is_empty() {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&at_entry, ""),
+                    required_fields_message(&missing),
+                ));
+            }
+            for field in entry.keys() {
+                if !fields.contains(&field.as_str()) {
+                    into.push(error(
+                        SCHEMA_VALIDATION_FAILED,
+                        at(&at_entry, ""),
+                        field_not_supported_message(field),
+                    ));
+                }
+            }
+            // `ErrorEquals` names the errors the entry takes over, so what it holds is
+            // a non-empty list of error NAMES: a list that is neither is reported at
+            // the member, and one name that is not a string at that name's own
+            // position.
+            let Some(declared) = entry.get(ERROR_EQUALS_MEMBER) else {
+                continue;
+            };
+            let array = nested_at(&at_entry, format_args!("/{ERROR_EQUALS_MEMBER}"));
+            let Some(names) = declared.as_array() else {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&array, ""),
+                    array_member_message(ERROR_EQUALS_MEMBER),
+                ));
+                continue;
+            };
+            if names.is_empty() {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&array, ""),
+                    EMPTY_ERROR_EQUALS_MESSAGE,
+                ));
+            }
+            for (position, name) in names.iter().enumerate() {
+                if !name.is_string() {
+                    into.push(error(
+                        SCHEMA_VALIDATION_FAILED,
+                        at(&indexed_at(&array, position), ""),
+                        ERROR_NAME_MESSAGE,
+                    ));
+                }
+            }
+            // `States.ALL` matches every error there is, so the language admits it
+            // only as the ONE entry of the list it is named in, and only in the LAST
+            // entry of the array that holds that list: a name beside it, and an entry
+            // after it, can never decide anything. Each entry that names it outside
+            // those two positions is reported at the name itself, which is what the
+            // caller has to move.
+            if names.len() < 2 && index + 1 == entries.len() {
+                continue;
+            }
+            for (position, name) in names.iter().enumerate() {
+                if name.as_str() == Some(ALL_ERRORS) {
+                    into.push(error(
+                        SCHEMA_VALIDATION_FAILED,
+                        at(&indexed_at(&array, position), ""),
+                        ALL_ERRORS_ALONE_MESSAGE,
+                    ));
+                }
+            }
         }
     }
 }
@@ -1182,6 +1657,7 @@ impl<'a> Scopes<'a> {
         // A machine whose entry point names no declared state has no run to reason
         // about, so no state of it reaches a read with anything assigned.
         let entry = start_at.filter(|start_at| states.contains_key(*start_at));
+        // Where a run can be at all: the states a read of a variable is judged in.
         let reachable = reached_from(entry, &graph, &blocks, None);
         let mut followed = 0_usize;
         for name in declared {
@@ -1426,6 +1902,12 @@ pub(super) const NESTED_MACHINE_MEMBERS: &[&str] = &["Branches", "ItemProcessor"
 /// only ones the error output is in scope in.
 pub(super) const CATCH_MEMBER: &str = "Catch";
 
+/// The member a state declares the retries of its own work in.
+pub(super) const RETRY_MEMBER: &str = "Retry";
+
+/// The member a retrier and a catcher name the errors they take over in.
+pub(super) const ERROR_EQUALS_MEMBER: &str = "ErrorEquals";
+
 /// The reserved term a JSONata expression reads the error of a caught failure
 /// through, which the language scopes to a `Catch`: `$states.errorOutput` holds "the
 /// error output" of the state that failed, and only that `Catch`'s own `Assign` and
@@ -1504,7 +1986,7 @@ fn diagnose_jsonata_state(
                 diagnose_jsonata_rule(
                     name,
                     rule,
-                    &nested_at(here, format_args!("/Choices/{index}")),
+                    &element_at(here, "Choices", index),
                     MAX_EXPRESSION_DEPTH,
                     into,
                 );
@@ -1569,7 +2051,7 @@ fn diagnose_jsonata_rule(
                         diagnose_jsonata_rule(
                             name,
                             rule,
-                            &nested_at(here, format_args!("/{}/{index}", echoed(member))),
+                            &element_at(here, echoed(member), index),
                             depth,
                             into,
                         );
@@ -1622,11 +2104,7 @@ fn walk_fields(roots: Vec<(String, &Value, bool)>, mut visit: impl FnMut(&str, &
             Value::String(text) => visit(&path, text, reference_field),
             Value::Array(items) => {
                 for (index, item) in items.iter().enumerate() {
-                    pending.push((
-                        nested_at(&path, format_args!("/{index}")),
-                        item,
-                        reference_field,
-                    ));
+                    pending.push((indexed_at(&path, index), item, reference_field));
                 }
             }
             Value::Object(members) => {
@@ -1790,14 +2268,11 @@ fn looks_like_an_intrinsic(text: &str) -> bool {
 }
 
 /// One transition a state declares: where it goes, where in the state the member that
-/// names it sits, that member's own NAME — which a diagnostic about an unresolved
-/// target reports, since `Default` and `Next` are different fields to fix — and
-/// whether it is taken because the state FAILED.
+/// names it sits, and whether it is taken because the state FAILED.
 pub(super) struct Transition {
     pub(super) target: String,
     /// The path from the state to the member naming the target.
     path: String,
-    member: &'static str,
     /// `Some(index)` for the `Next` of the `Catch` catcher at that index: a
     /// transition the state's own work never completed, so the state's own `Assign`
     /// did not run and that catcher's did.
@@ -1821,7 +2296,6 @@ pub(super) fn transitions(state: &Map<String, Value>) -> Vec<Transition> {
             transitions.push(Transition {
                 target: target.to_string(),
                 path: format!("/{member}"),
-                member,
                 caught: None,
             });
         }
@@ -1836,8 +2310,7 @@ pub(super) fn transitions(state: &Map<String, Value>) -> Vec<Transition> {
             if let Some(target) = entry.get("Next").and_then(Value::as_str) {
                 transitions.push(Transition {
                     target: target.to_string(),
-                    path: nested_at("", format_args!("/{member}/{index}/Next")),
-                    member: "Next",
+                    path: nested_at(&element_at("", member, index), "/Next"),
                     caught: caught.then_some(index),
                 });
             }

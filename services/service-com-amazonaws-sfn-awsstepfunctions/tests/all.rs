@@ -41,6 +41,8 @@ mod client_refusal_status;
 mod completed_map_run_refusal;
 #[path = "all/control_plane_refusal_classes.rs"]
 mod control_plane_refusal_classes;
+#[path = "all/definition_field_schema.rs"]
+mod definition_field_schema;
 #[path = "all/definition_graph_diagnostics.rs"]
 mod definition_graph_diagnostics;
 #[path = "all/definition_path_diagnostics.rs"]

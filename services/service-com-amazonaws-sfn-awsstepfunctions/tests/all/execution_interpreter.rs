@@ -964,15 +964,18 @@ async fn a_definition_past_what_the_interpreter_bounds_fails_rather_than_running
             "States.ResultPathMatchFailure",
         ),
         (
+            // The state the cycle ends at is reached from the `Choice` beside it, so
+            // the only problem this definition carries is the one under test: a
+            // state nothing reaches is an error of its own.
             "a definition that doubles its document on every transition",
-            r#"{"StartAt":"G","States":{"G":{"Type":"Pass","Parameters":{"a.$":"$","b.$":"$"},"Next":"G"},"Done":{"Type":"Succeed"}}}"#
+            r#"{"StartAt":"G","States":{"G":{"Type":"Pass","Parameters":{"a.$":"$","b.$":"$"},"Next":"C"},"C":{"Type":"Choice","Choices":[{"Variable":"$.stop","IsPresent":true,"Next":"Done"}],"Default":"G"},"Done":{"Type":"Succeed"}}}"#
                 .to_string(),
             format!(r#"{{"seed":"{}"}}"#, "s".repeat(1_024)),
             "States.DataLimitExceeded",
         ),
         (
             "a definition that nests its document one level deeper on every transition",
-            r#"{"StartAt":"W","States":{"W":{"Type":"Pass","Parameters":{"a.$":"$"},"Next":"W"},"Done":{"Type":"Succeed"}}}"#
+            r#"{"StartAt":"W","States":{"W":{"Type":"Pass","Parameters":{"a.$":"$"},"Next":"C"},"C":{"Type":"Choice","Choices":[{"Variable":"$.stop","IsPresent":true,"Next":"Done"}],"Default":"W"},"Done":{"Type":"Succeed"}}}"#
                 .to_string(),
             "{}".to_string(),
             "States.DataLimitExceeded",

@@ -431,7 +431,7 @@ async fn a_diagnostic_reports_where_the_problem_is() {
             // the diagnostic is located at the nested machine itself.
             "a missing StartAt inside a Parallel branch",
             r#"{"StartAt":"P","States":{"P":{"Type":"Parallel","Branches":[{"States":{"B":{"Type":"Succeed"}}}],"End":true}}}"#,
-            "/States/P/Branches/0",
+            "/States/P/Branches[0]",
         ),
         (
             "a payload-template member of a JSONPath state",
@@ -553,11 +553,22 @@ async fn severity_selects_which_diagnostics_are_reported() {
 async fn max_results_bounds_the_reported_diagnostics() {
     let emulator = Emulator::new();
 
-    // One state per diagnostic: each transitions to a state no definition declares,
-    // so the count of errors is known exactly.
+    // One state per diagnostic: each state's `Default` transitions to a state no
+    // definition declares, so the count of errors is known exactly — and each one is
+    // CHAINED to the next through a rule of its own, because a state no run of the
+    // machine reaches is a problem of its own.
     const STATES: usize = 12;
     let mut states: Vec<String> = (0..STATES)
-        .map(|index| format!(r#""S{index}":{{"Type":"Pass","Next":"Nowhere"}}"#))
+        .map(|index| {
+            let onward = if index + 1 < STATES {
+                format!("S{}", index + 1)
+            } else {
+                "Done".to_string()
+            };
+            format!(
+                r#""S{index}":{{"Type":"Choice","Choices":[{{"Variable":"$.go","IsPresent":true,"Next":"{onward}"}}],"Default":"Nowhere"}}"#
+            )
+        })
         .collect();
     // Somewhere to stop, so the twelve dangling transitions are the only problem
     // this definition carries.
@@ -683,15 +694,56 @@ async fn warnings_do_not_crowd_out_an_error() {
     /// 100, plus one so `truncated` can be reported).
     const MANY: usize = 150;
 
-    /// A definition of `MANY` states that each earn one diagnostic of the given
-    /// shape, plus — when `with_error` — one state named last that breaks a rule.
+    /// A definition of `MANY` `Pass` states CHAINED one to the next, each carrying
+    /// `member`: `value` so that each earns one diagnostic of that member's kind, and
+    /// ending either at the one state that breaks a rule (`with_error`) or at the
+    /// chain's own terminal state.
+    ///
+    /// The states are chained rather than declared beside one another because a state
+    /// no run of the machine reaches is a problem of its own, which would be one
+    /// diagnostic per state on top of the ones under test.
     fn crowded(member: &str, value: &str, with_error: bool) -> String {
         let mut states: Vec<String> = (0..MANY)
-            .map(|index| format!(r#""S{index:03}":{{"Type":"Pass","{member}":"{value}","End":true}}"#))
+            .map(|index| {
+                let onward = if index + 1 < MANY {
+                    format!(r#""Next":"S{:03}""#, index + 1)
+                } else if with_error {
+                    r#""Next":"ZLast""#.to_string()
+                } else {
+                    r#""End":true"#.to_string()
+                };
+                format!(r#""S{index:03}":{{"Type":"Pass","{member}":"{value}",{onward}}}"#)
+            })
             .collect();
         if with_error {
-            states.push(r#""ZLast":{"Type":"Pass","Next":"Nowhere"}"#.to_string());
+            // The one state that breaks a rule: its `Default` names a state nothing
+            // declares, while its one rule reaches the machine's terminal state.
+            states.push(
+                r#""ZLast":{"Type":"Choice","Choices":[{"Variable":"$.go","IsPresent":true,"Next":"ZEnd"}],"Default":"Nowhere"}"#
+                    .to_string(),
+            );
+            states.push(r#""ZEnd":{"Type":"Succeed"}"#.to_string());
         }
+        format!(r#"{{"StartAt":"S000","States":{{{}}}}}"#, states.join(","))
+    }
+
+    /// A definition of `MANY` chained `Choice` states, each one's `Default` naming a
+    /// state nothing declares: one ERROR per state, which is past the per-severity
+    /// budget.
+    fn every_state_in_error() -> String {
+        let mut states: Vec<String> = (0..MANY)
+            .map(|index| {
+                let onward = if index + 1 < MANY {
+                    format!("S{:03}", index + 1)
+                } else {
+                    "ZEnd".to_string()
+                };
+                format!(
+                    r#""S{index:03}":{{"Type":"Choice","Choices":[{{"Variable":"$.go","IsPresent":true,"Next":"{onward}"}}],"Default":"Nowhere"}}"#
+                )
+            })
+            .collect();
+        states.push(r#""ZEnd":{"Type":"Succeed"}"#.to_string());
         format!(r#"{{"StartAt":"S000","States":{{{}}}}}"#, states.join(","))
     }
 
@@ -796,7 +848,7 @@ async fn warnings_do_not_crowd_out_an_error() {
     );
 
     // Past the ERROR budget, the reported list is capped and truncated says so.
-    let many_errors = crowded("Next", "Nowhere", false);
+    let many_errors = every_state_in_error();
     let body = validate(
         &emulator,
         "more errors than the budget",

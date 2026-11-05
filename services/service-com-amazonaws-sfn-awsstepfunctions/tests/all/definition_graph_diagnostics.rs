@@ -14,8 +14,10 @@
 //! 1. a transition target the enclosing `States` map does not declare is one problem
 //!    whichever member names it — a state's own `Next`, a `Choice` rule's `Next`, the
 //!    `Default` beside them, a `Catch` catcher's `Next`, the machine's own `StartAt` —
-//!    reported as `MISSING_TRANSITION_TARGET` at that member, stating the member and
-//!    the name it named;
+//!    reported as `MISSING_TRANSITION_TARGET` at that member, naming the target it
+//!    named as the value of the transition field the language calls `Next`; and the
+//!    same code reports the other half of that rule, a state the transitions reach
+//!    nowhere, at the state itself;
 //! 2. a state machine must declare at least one state that ENDS an execution — a
 //!    `Succeed`, a `Fail`, or any state declaring `"End": true` — and one that
 //!    declares none earns `MISSING_END_STATE`, located at the machine rather than at a
@@ -96,21 +98,23 @@ async fn created(emulator: &Emulator, name: &str, definition: &str) -> (u16, Str
 // Rule 1: a transition target no state declares, through every member that names one
 // ---------------------------------------------------------------------------
 
-/// One definition naming exactly ONE target no state declares, and the diagnostic it
+/// One definition naming exactly ONE target no state declares, and the diagnostics it
 /// earns.
 struct TargetCase {
     case: &'static str,
     definition: String,
     location: String,
-    /// The member the diagnostic names, which is the field the caller has to change.
-    member: &'static str,
+    /// The states the unresolved transition leaves with nothing reaching them, each at
+    /// its own location: a dangling transition is also a state the graph does not
+    /// reach, and both halves are reported.
+    unreachable: Vec<&'static str>,
 }
 
 /// The rows rule 1 spans: WHICH member names the unresolved target, where in the
 /// document that member sits (a state, a `Choice` rule, a catcher, the machine
 /// itself), how deeply the machine is nested, and what the target is called.
 fn target_cases() -> Vec<TargetCase> {
-    let rows: Vec<(&'static str, Value, &'static str, &'static str)> = vec![
+    let rows: Vec<(&'static str, Value, &'static str, Vec<&'static str>)> = vec![
         (
             "a state's own Next",
             json!({
@@ -121,13 +125,13 @@ fn target_cases() -> Vec<TargetCase> {
                 },
             }),
             "/States/A/Next",
-            "Next",
+            vec!["/States/Done"],
         ),
         (
             "the machine's own StartAt",
             json!({ "StartAt": UNDECLARED, "States": { "A": { "Type": "Succeed" } } }),
             "/StartAt",
-            "StartAt",
+            vec!["/States/A"],
         ),
         (
             "a Choice rule's own Next",
@@ -145,8 +149,8 @@ fn target_cases() -> Vec<TargetCase> {
                     "Done": { "Type": "Succeed" },
                 },
             }),
-            "/States/C/Choices/1/Next",
-            "Next",
+            "/States/C/Choices[1]/Next",
+            vec![],
         ),
         (
             "the Default beside a Choice's rules",
@@ -162,7 +166,7 @@ fn target_cases() -> Vec<TargetCase> {
                 },
             }),
             "/States/C/Default",
-            "Default",
+            vec![],
         ),
         (
             "a Catch catcher's Next",
@@ -181,8 +185,8 @@ fn target_cases() -> Vec<TargetCase> {
                     "Done": { "Type": "Succeed" },
                 },
             }),
-            "/States/T/Catch/1/Next",
-            "Next",
+            "/States/T/Catch[1]/Next",
+            vec![],
         ),
         (
             "a Next inside a Map's ItemProcessor",
@@ -203,7 +207,7 @@ fn target_cases() -> Vec<TargetCase> {
                 },
             }),
             "/States/M/ItemProcessor/States/I/Next",
-            "Next",
+            vec!["/States/M/ItemProcessor/States/Stop"],
         ),
         (
             "a StartAt inside a Parallel branch",
@@ -220,24 +224,25 @@ fn target_cases() -> Vec<TargetCase> {
                     },
                 },
             }),
-            "/States/P/Branches/0/StartAt",
-            "StartAt",
+            "/States/P/Branches[0]/StartAt",
+            vec!["/States/P/Branches[0]/States/B"],
         ),
     ];
 
     rows.into_iter()
-        .map(|(case, definition, location, member)| TargetCase {
+        .map(|(case, definition, location, unreachable)| TargetCase {
             case,
             definition: definition.to_string(),
             location: location.to_string(),
-            member,
+            unreachable,
         })
         .collect()
 }
 
 /// An unresolved transition target is reported at the member that names it, as the
-/// member and the name it named — the same construction whichever member that is — and
-/// it fails the definition, so a create with it is refused.
+/// target it named under the transition field the language calls `Next` — the same
+/// construction whichever member that is — beside the states the dangling transition
+/// leaves unreached, and it fails the definition, so a create with it is refused.
 #[tokio::test]
 async fn an_unresolved_transition_target_is_reported_at_the_member_that_names_it() {
     let emulator = Emulator::new();
@@ -247,7 +252,7 @@ async fn an_unresolved_transition_target_is_reported_at_the_member_that_names_it
             case,
             definition,
             location,
-            member,
+            unreachable,
         } = row;
         let body = validate(
             &emulator,
@@ -260,11 +265,19 @@ async fn an_unresolved_transition_target_is_reported_at_the_member_that_names_it
             VALIDATION_RESULT_FAIL,
             "case {case:?}: a target no state declares fails the definition, got {body:?}"
         );
-        let expected = vec![error_at(
+        let mut expected = vec![error_at(
             MISSING_TRANSITION_TARGET,
             &location,
-            &format!("Missing '{member}' target: {UNDECLARED}"),
+            &format!("Missing 'Next' target: {UNDECLARED}"),
         )];
+        for state in unreachable {
+            let name = state.rsplit('/').next().unwrap_or_default();
+            expected.push(error_at(
+                MISSING_TRANSITION_TARGET,
+                state,
+                &format!("State \"{name}\" is not reachable."),
+            ));
+        }
         let found = diagnostics(&body);
         assert_eq!(
             found, expected,
@@ -293,8 +306,10 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
 
     // Rows differ along WHICH form declares the terminal state (a `Succeed`, a
     // `Fail`, `"End": true`), whether one is declared at all, and at which level of
-    // nesting the machine missing one sits.
-    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+    // nesting the machine missing one sits. The last element of each row is the state
+    // the definition leaves unreached, if any: that is a problem of its own, and not
+    // the one under test.
+    let rows: Vec<(&str, Value, Option<&str>, Option<&str>)> = vec![
         (
             "a cycle with nothing that ends it",
             json!({
@@ -307,6 +322,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
             // The machine as a whole is what is missing a terminal state, so the
             // diagnostic carries no location at all.
             Some(""),
+            None,
         ),
         (
             "a single state looping onto itself",
@@ -315,6 +331,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                 "States": { "A": { "Type": "Pass", "Next": "A" } },
             }),
             Some(""),
+            None,
         ),
         (
             "a Map's ItemProcessor with nothing that ends it",
@@ -332,6 +349,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                 },
             }),
             Some("/States/M/ItemProcessor"),
+            None,
         ),
         (
             "a Parallel branch with nothing that ends it",
@@ -348,12 +366,14 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                     },
                 },
             }),
-            Some("/States/P/Branches/0"),
+            Some("/States/P/Branches[0]"),
+            None,
         ),
         (
             // The rule is read off the states a machine DECLARES: what it reports is
             // that the workflow has no terminal state, and a declared one is one it
-            // has, whether or not this definition's transitions lead to it.
+            // has, whether or not this definition's transitions lead to it — which is
+            // reported on its own, as the state nothing reaches.
             "a cycle beside a terminal state no run of it reaches",
             json!({
                 "StartAt": "A",
@@ -364,6 +384,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                 },
             }),
             None,
+            Some("Done"),
         ),
         (
             "a cycle a Succeed state ends",
@@ -379,6 +400,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                     "Done": { "Type": "Succeed" },
                 },
             }),
+            None,
             None,
         ),
         (
@@ -396,6 +418,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                 },
             }),
             None,
+            None,
         ),
         (
             "a chain one state of which declares End",
@@ -406,6 +429,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                     "B": { "Type": "Pass", "End": true },
                 },
             }),
+            None,
             None,
         ),
         (
@@ -424,10 +448,11 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                 },
             }),
             None,
+            None,
         ),
     ];
 
-    for (index, (case, definition, expected)) in rows.into_iter().enumerate() {
+    for (index, (case, definition, expected, unreached)) in rows.into_iter().enumerate() {
         let definition = definition.to_string();
         let body = validate(&emulator, case, &json!({ "definition": definition })).await;
         let found = of_code(&body, MISSING_END_STATE);
@@ -466,16 +491,36 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                     "case {case:?}: a machine that declares somewhere to stop earns no \
                      {MISSING_END_STATE}, got {found:?}"
                 );
+                // A state nothing reaches is the only other problem these rows carry,
+                // and it is an error of its own: the definition that carries one is
+                // refused, the definition that carries none is created.
+                let (expected_result, expected_create) = match unreached {
+                    Some(state) => {
+                        let unreachable = of_code(&body, MISSING_TRANSITION_TARGET);
+                        let expected = vec![error_at(
+                            MISSING_TRANSITION_TARGET,
+                            &format!("/States/{state}"),
+                            &format!("State \"{state}\" is not reachable."),
+                        )];
+                        assert_eq!(
+                            unreachable, expected,
+                            "case {case:?}: expected the diagnostics {expected:?}, got {body:?}"
+                        );
+                        (VALIDATION_RESULT_FAIL, 400)
+                    }
+                    None => (VALIDATION_RESULT_OK, 200),
+                };
                 assert_eq!(
                     result_of(&body),
-                    VALIDATION_RESULT_OK,
-                    "case {case:?}: expected the definition to pass verification, got {body:?}"
+                    expected_result,
+                    "case {case:?}: expected the result {expected_result}, got {body:?}"
                 );
                 let (status, code) =
                     created(&emulator, &format!("ending-{index}"), &definition).await;
                 assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected the create to succeed, got {status} {code}"
+                    status, expected_create,
+                    "case {case:?}: expected the create to answer {expected_create}, got {status} \
+                     {code}"
                 );
             }
         }

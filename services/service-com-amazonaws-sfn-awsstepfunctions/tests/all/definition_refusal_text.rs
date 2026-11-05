@@ -190,7 +190,7 @@ fn field_reads() -> Vec<FieldRead> {
                 "Output": { "all": ["kept", "{% $states.errorOutput.Error %}"] },
                 "Next": "Done"
             })),
-            expected: vec![at("/States/S/Output/all/1", "$states.errorOutput.Error")],
+            expected: vec![at("/States/S/Output/all[1]", "$states.errorOutput.Error")],
         },
         FieldRead {
             case: "the term read in the Catch that handles a failure",
@@ -206,7 +206,7 @@ fn field_reads() -> Vec<FieldRead> {
                 "Next": "Done"
             })),
             expected: vec![at(
-                "/States/S/Catch/0/Assign/seen",
+                "/States/S/Catch[0]/Assign/seen",
                 "$states.result.Payload",
             )],
         },
@@ -294,7 +294,7 @@ fn clashing_machines(name: &str) -> Vec<(&'static str, String, String)> {
                 }
             })
             .to_string(),
-            format!("/States/R/Branches/0/States/{name}"),
+            format!("/States/R/Branches[0]/States/{name}"),
         ),
     ]
 }
