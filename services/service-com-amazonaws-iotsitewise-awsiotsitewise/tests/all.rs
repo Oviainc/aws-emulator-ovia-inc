@@ -25,6 +25,12 @@
 // in the sorted list or at the END: those are the two stretches every concurrent
 // iotsitewise change puts a declaration of its own in. Fold it into the list once
 // the churn settles.
+// `asset_model_delete_interface_applications` is declared HERE, beside the
+// suites below, for the reason the notes above give. Fold it into the list once
+// the churn settles.
+#[path = "all/asset_model_delete_interface_applications.rs"]
+mod asset_model_delete_interface_applications;
+
 #[path = "all/describe_dataset_reads.rs"]
 mod describe_dataset_reads;
 

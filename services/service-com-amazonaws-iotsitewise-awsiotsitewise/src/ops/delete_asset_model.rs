@@ -375,7 +375,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Removing the model removes every application of an interface it stood on
+        // either side of, so each OTHER model that implemented this one as an
+        // interface stops implementing it. That change is a write to THAT model, so
+        // it carries a new version and owes the transition back to `ACTIVE` — the
+        // same rule `DeleteAssetModelInterfaceRelationship` follows when the
+        // application is removed on its own, and the one every mutating call on a
+        // record follows. The applied-to models are read BEFORE the removal, because
+        // the relationships naming them go away with the model; a set, so a model is
+        // written once however many applications named it. The model being deleted is
+        // never one of them: it is gone.
+        let applied_to: ::std::collections::BTreeSet<String> = store
+            .interface_relationships
+            .values()
+            .filter(|relationship| {
+                relationship.interface_asset_model_id == id && relationship.asset_model_id != id
+            })
+            .map(|relationship| relationship.asset_model_id.clone())
+            .collect();
+
         store.forget_asset_model(&id);
+
+        for applied_to_id in &applied_to {
+            // An entry exists only for a model this store holds, so the lookup
+            // answers for every id collected above; a missing record is a store
+            // invariant this call has no answer for, and skipping it is what
+            // leaves the rest of the removal intact.
+            if let Some(record) = store.asset_models.get_mut(applied_to_id) {
+                // The definition it supersedes is read before this call's write
+                // lands, so it stays that model's ACTIVE version until the new one
+                // settles. The model's PROPERTIES stay, the ones the application
+                // created included: what went away is the application, which is all
+                // this call removed.
+                let superseded = record.definition();
+                record.begin_update(superseded, now);
+            }
+        }
 
         // The token is spent only now that the delete has succeeded: a refused
         // request removed nothing, so the caller may send its token again.
