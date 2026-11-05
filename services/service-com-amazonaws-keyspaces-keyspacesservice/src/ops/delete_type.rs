@@ -241,25 +241,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same judgement the keyspace-wide in-flight check makes. The type stays
         // exactly as it was: the request is answered with the conflict and nothing is
         // written.
+        //
+        // WHETHER anything still uses the type is what the users decide; WHICH resources
+        // they are is not in the refusal. The service states the fault alone — the
+        // formatted type name and the fixed clause — so the sentence does not vary with
+        // the number of users and names no sibling resource of the keyspace.
         let referring_tables = keyspace.referring_tables_still_using(&type_name);
         let parent_types = keyspace.parent_types_still_using(&type_name);
         if !referring_tables.is_empty() || !parent_types.is_empty() {
-            let mut users: Vec<String> = referring_tables
-                .iter()
-                .map(|table| format!("table '{}.{table}'", input.keyspace_name))
-                .collect();
-            users.extend(
-                parent_types
-                    .iter()
-                    .map(|parent| format!("type '{}.{parent}'", input.keyspace_name)),
-            );
             return Err(DeleteTypeErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Type '{}.{type_name}' is still used by {} and can only be deleted once \
-                     nothing uses it.",
-                    input.keyspace_name,
-                    users.join(", ")
-                )),
+                message: Some(crate::state::type_still_referenced_rejection(&type_name)),
             })
             .into());
         }

@@ -20,8 +20,10 @@
 //!    com-amazonaws-keyspaces-keyspacesservice.json")`), the operations that answer them,
 //!    and both the handler path and the boundary validator's own refusal.
 //! 2. A refusal sentence is the service's own fixed template plus the names the REQUEST
-//!    supplied — unquoted, unqualified, with no trailing period and nothing taken from the
-//!    caller's credential scope. The rows span the resource kind the sentence is about
+//!    supplied — with nothing taken from the caller's credential scope — one template per
+//!    fault, so the operation that DROPS a resource has its own (pinned in
+//!    `refusal_sentences`) rather than the one an operation that READS it answers with.
+//!    The rows span the resource kind the sentence is about
 //!    (keyspace, table, user-defined type), the fault (a name already held, a name nothing
 //!    holds) and the form of the name (shortest, longest, mixed case, double-quoted).
 //! 3. A request the BOUNDARY validator refuses is stated as AWS's own validation envelope
@@ -421,11 +423,13 @@ async fn a_name_nothing_holds_is_refused_with_the_requested_name_and_nothing_els
             "Keyspace Absent_Ks9 does not exist".to_string()),
         ("keyspace/prefix_of_a_held_name".to_string(), "GetKeyspace", json!({"keyspaceName": "absence"}),
             "Keyspace absence does not exist".to_string()),
-        // The same sentence whichever operation looked the keyspace up.
+        // The same sentence whichever operation looked the keyspace up — but the DROP
+        // states the fault it hit, a failed drop, which `refusal_sentences` pins over the
+        // whole class.
         ("keyspace/through_list_types".to_string(), "ListTypes", json!({"keyspaceName": "z"}),
             "Keyspace z does not exist".to_string()),
         ("keyspace/through_delete".to_string(), "DeleteKeyspace", json!({"keyspaceName": "z"}),
-            "Keyspace z does not exist".to_string()),
+            "Cannot drop non existing keyspace 'z'".to_string()),
         // A table nothing holds, in a keyspace that is held.
         ("table/plain".to_string(), "GetTable",
             json!({"keyspaceName": keyspace, "tableName": "absent_tbl"}),

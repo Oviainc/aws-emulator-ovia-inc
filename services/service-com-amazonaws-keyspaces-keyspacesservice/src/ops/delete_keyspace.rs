@@ -191,9 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A keyspace this Region does not hold cannot be dropped. This operation IS the
+        // drop, so the absence is refused in the drop's own words rather than in the
+        // lookup sentence an operation that only reads a keyspace answers with — which is
+        // what tells a caller at the re-delete boundary that the keyspace is already gone
+        // rather than that a read failed.
         let Some(keyspace) = store.keyspace_mut(&region, &input.keyspace_name) else {
             return Err(DeleteKeyspaceErrorModeled::ResourceNotFoundException(
-                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+                crate::state::keyspace_drop_not_found(&region, &input.keyspace_name),
             )
             .into());
         };

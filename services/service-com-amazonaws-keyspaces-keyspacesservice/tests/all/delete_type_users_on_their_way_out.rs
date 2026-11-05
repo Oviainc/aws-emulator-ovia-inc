@@ -42,21 +42,11 @@ enum User {
 }
 
 impl User {
-    /// This user's own resource name, which is how a refusal names it.
+    /// This user's own resource name, which is how its own reader addresses it.
     fn name(self) -> &'static str {
         match self {
             Self::Table { name, .. } | Self::Type { name, .. } => name,
         }
-    }
-
-    /// How a refusal that still counts this user names it:
-    /// `table '<keyspace>.<name>'` or `type '<keyspace>.<name>'`.
-    fn named_in_a_refusal(self, ks: &str) -> String {
-        let kind = match self {
-            Self::Table { .. } => "table",
-            Self::Type { .. } => "type",
-        };
-        format!("{kind} '{ks}.{}'", self.name())
     }
 
     /// The `GetType` member a report of the used type names this user under.
@@ -315,7 +305,7 @@ async fn delete_type_accepts_a_type_whose_users_are_already_being_deleted() {
 }
 
 /// RULE, the other half: a user that is NOT on its way out still blocks the deletion,
-/// whatever status it is in, and the refusal names it.
+/// whatever status it is in, and the refusal states the fault about the type alone.
 #[tokio::test]
 async fn delete_type_refuses_a_type_whose_user_is_not_on_its_way_out() {
     /// What a row leaves its user in before the delete is attempted.
@@ -448,13 +438,21 @@ async fn delete_type_refuses_a_type_whose_user_is_not_on_its_way_out() {
 
         let (status, body) = delete_type(&emulator, ks, row.used).await;
         assert_failure(row.case, (status, body.clone()), 400, "ConflictException");
+        // The sentence states the fault and nothing else: the type the request named,
+        // never the user that blocked it nor the keyspace it lives in.
         let refusal = message(&body);
+        assert_eq!(
+            refusal,
+            keyspaces::type_still_referenced_rejection(row.used),
+            "case {:?}: unexpected refusal sentence, got {refusal:?}",
+            row.case
+        );
         assert!(
-            refusal.contains(&row.user.named_in_a_refusal(ks)),
-            "case {:?}: the refusal must name the user {:?} that still uses the type, got \
-             {refusal:?}",
+            !refusal.contains(row.user.name()) && !refusal.contains(ks),
+            "case {:?}: the refusal must disclose neither the user {:?} nor the keyspace, \
+             got {refusal:?}",
             row.case,
-            row.user.named_in_a_refusal(ks)
+            row.user.name()
         );
 
         // The refused delete wrote nothing: the type is still there and still usable.
@@ -470,8 +468,9 @@ async fn delete_type_refuses_a_type_whose_user_is_not_on_its_way_out() {
 }
 
 /// RULE, per user: the filter is per resource rather than all-or-nothing — a type with
-/// several users is refused while ANY of them is not on its way out, the refusal names
-/// exactly those, and it is accepted once the last one's deletion is accepted too.
+/// several users is refused while ANY of them is not on its way out, in the same words
+/// whichever and however many they are, and it is accepted once the last one's deletion is
+/// accepted too.
 #[tokio::test]
 async fn delete_type_counts_each_user_on_its_own() {
     let departing = [
@@ -510,25 +509,21 @@ async fn delete_type_counts_each_user_on_its_own() {
         user.delete(&emulator, case, ks).await;
     }
 
-    // Two users are on their way out and two are not, so the type is still used — by
-    // exactly the two that remain, which are the only ones the refusal names.
+    // Two users are on their way out and two are not, so the type is still used — and the
+    // refusal is the same one-user sentence, naming no user at all however many there are.
     let (status, body) = delete_type(&emulator, ks, "used_by_four").await;
     assert_failure(case, (status, body.clone()), 400, "ConflictException");
     let refusal = message(&body);
-    for user in &remaining {
+    assert_eq!(
+        refusal,
+        keyspaces::type_still_referenced_rejection("used_by_four"),
+        "case {case:?}: unexpected refusal sentence, got {refusal:?}"
+    );
+    for user in departing.iter().chain(remaining.iter()) {
         assert!(
-            refusal.contains(&user.named_in_a_refusal(ks)),
-            "case {case:?}: the refusal must name the user {:?} that still uses the type, \
-             got {refusal:?}",
-            user.named_in_a_refusal(ks)
-        );
-    }
-    for user in &departing {
-        assert!(
-            !refusal.contains(&user.named_in_a_refusal(ks)),
-            "case {case:?}: the refusal must not name {:?}, whose own deletion is already \
-             accepted, got {refusal:?}",
-            user.named_in_a_refusal(ks)
+            !refusal.contains(user.name()),
+            "case {case:?}: the refusal must not name the user {:?}, got {refusal:?}",
+            user.name()
         );
     }
 

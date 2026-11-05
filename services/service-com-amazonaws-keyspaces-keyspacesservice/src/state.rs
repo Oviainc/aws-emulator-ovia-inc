@@ -456,6 +456,17 @@ pub fn table_not_restorable_rejection(
     )
 }
 
+/// The refusal a deletion of a user-defined type that something still uses carries: "You
+/// can only delete a type that is not used in a table or another UDT."
+///
+/// Amazon Keyspaces states the fault and nothing else — the formatted type name, then the
+/// fixed clause about the kinds of user a type can have. It names neither the keyspace nor
+/// any individual user, so the sentence is the SAME whichever and however many resources
+/// refer to the type, and it discloses no sibling resource name.
+pub fn type_still_referenced_rejection(type_name: &str) -> String {
+    format!("{type_name} is referenced by other UDTs or tables.")
+}
+
 /// Whether `status` is one whose own change is still in flight: the resource is neither
 /// settled nor on its way out, so the clock still owes it a transition.
 ///
@@ -2516,11 +2527,14 @@ pub fn type_arn(region: &str, keyspace_name: &str, type_name: &str) -> String {
     )
 }
 
-/// The `ResourceNotFoundException` payload for a keyspace that is not in state.
+/// The `ResourceNotFoundException` payload for a keyspace an operation tried to ACCESS
+/// and that is not in state.
 ///
-/// The message is the Cassandra-style form Amazon Keyspaces builds from the request for
-/// a keyspace lookup — the bare `keyspaceName`, unquoted and with no trailing period —
-/// the same shape of sentence a missing type takes ([`type_not_found`]).
+/// The message is the Cassandra-style form Amazon Keyspaces builds from the request for a
+/// keyspace lookup — the bare `keyspaceName`, unquoted and with no trailing period —
+/// the same shape of sentence a missing type takes ([`type_not_found`]). The operation
+/// that DROPS a keyspace words the same absence as a failed drop instead
+/// ([`keyspace_drop_not_found`]).
 ///
 /// The ARN of the resource that was looked for goes in the modelled
 /// `resourceArn` member, which is what a client reads to learn WHICH resource
@@ -2528,6 +2542,24 @@ pub fn type_arn(region: &str, keyspace_name: &str, type_name: &str) -> String {
 pub fn keyspace_not_found(region: &str, keyspace_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Keyspace {keyspace_name} does not exist")),
+        resource_arn: Some(keyspace_arn(region, keyspace_name)),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a DROP of a keyspace that is not in state.
+///
+/// A keyspace that is not there is refused in the words of the fault the request actually
+/// hit, and dropping a keyspace is a DDL drop rather than a lookup: Amazon Keyspaces words
+/// the failed drop as one — `Cannot drop non existing keyspace '<name>'`, the name in
+/// single quotes, with no trailing period — where an operation that merely ACCESSES a
+/// keyspace gets the lookup sentence ([`keyspace_not_found`]). So a caller can tell a
+/// failed drop from a failed read, which is the boundary a re-delete sits on.
+///
+/// The ARN of the keyspace the drop looked for goes in the modelled `resourceArn` member,
+/// exactly as on the lookup path.
+pub fn keyspace_drop_not_found(region: &str, keyspace_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Cannot drop non existing keyspace '{keyspace_name}'")),
         resource_arn: Some(keyspace_arn(region, keyspace_name)),
     }
 }
