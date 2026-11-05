@@ -12,7 +12,8 @@
 //! role the mappings were set with and every VMware-to-Amazon tag mapping in the stored
 //! order — and refuses with the modelled `ResourceNotFoundException` when the store holds
 //! no such resource: a missing hypervisor (`ErrorCode` `HypervisorNotFound`) or a
-//! hypervisor carrying no mappings (`ErrorCode` `MappingsNotFound`). Being a read, it
+//! hypervisor carrying no mappings (`ErrorCode` `HypervisorPropertyMappingsNotFound`).
+//! Being a read, it
 //! changes nothing a later caller sees.
 //!
 //! The tables below span that class — mapping sets differing in count, in order, in
@@ -37,7 +38,7 @@ use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gat
 
 use backup_gateway::state::{
     service_state, StoredPropertyMappings, VmwareToAwsTagMapping, HYPERVISOR_NOT_FOUND,
-    HYPERVISOR_ONLINE, MAPPINGS_NOT_FOUND,
+    HYPERVISOR_ONLINE, MAPPINGS_NOT_FOUND, MAPPINGS_NOT_FOUND_MESSAGE,
 };
 
 use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
@@ -300,7 +301,8 @@ async fn get_hypervisor_property_mappings_reports_the_stored_mappings() {
 
 /// A hypervisor the store really holds, carrying NO mappings, is refused as a missing
 /// MAPPINGS resource: the modelled `ResourceNotFoundException` with `ErrorCode`
-/// `MappingsNotFound`, whatever else the record carries — and whether it never had
+/// `HypervisorPropertyMappingsNotFound`, whatever else the record carries — and whether it
+/// never had
 /// mappings or no longer does.
 #[tokio::test]
 async fn a_hypervisor_with_no_mappings_is_refused_as_missing_mappings() {
@@ -347,9 +349,15 @@ async fn a_hypervisor_with_no_mappings_is_refused_as_missing_mappings() {
             (
                 reply.status,
                 reply.code.as_deref(),
-                reply.str_at("/ErrorCode")
+                reply.str_at("/ErrorCode"),
+                reply.str_at("/Message"),
             ),
-            (404, Some("ResourceNotFoundException"), Some(MAPPINGS_NOT_FOUND)),
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some(MAPPINGS_NOT_FOUND),
+                Some(MAPPINGS_NOT_FOUND_MESSAGE),
+            ),
             "case {case:?}: a hypervisor with no mappings must be refused as missing \
              mappings, got {} {:?}",
             reply.status,

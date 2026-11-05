@@ -254,7 +254,7 @@ async fn a_mapping_whose_aws_tag_pair_breaks_a_tag_rule_is_refused() {
             let read = get_mappings(&router, &hypervisor).await;
             assert_eq!(
                 (read.status, read.str_at("/ErrorCode")),
-                (404, Some(MAPPINGS_NOT_FOUND)),
+                (400, Some(MAPPINGS_NOT_FOUND)),
                 "case {case:?}: the hypervisor must still carry no mappings, got {} {:?}",
                 read.status,
                 read.body

@@ -275,9 +275,10 @@ async fn get_bandwidth_rate_limit_schedule_reports_the_stored_schedule() {
 }
 
 /// A well-formed `GatewayArn` the store holds no gateway under is refused with the
-/// modelled `ResourceNotFoundException` — HTTP 404, the status that shape's `@httpError`
-/// declares, and no `ErrorCode`, the way every other gateway operation of this service
-/// refuses one — whatever the ARN's partition, resource type, id or length.
+/// modelled `ResourceNotFoundException` — HTTP 400 carrying `ErrorCode` `GatewayNotFound`
+/// and the fixed sentence this service states for a missing gateway, the way every other
+/// gateway operation of this service refuses one — whatever the ARN's partition, resource
+/// type, id or length.
 #[tokio::test]
 async fn an_arn_with_no_stored_gateway_is_refused_as_not_found() {
     let engine = build_engine();
@@ -325,11 +326,17 @@ async fn an_arn_with_no_stored_gateway_is_refused_as_not_found() {
             (
                 reply.status,
                 reply.code.as_deref(),
-                reply.body.get("ErrorCode").cloned()
+                reply.str_at("/ErrorCode"),
+                reply.str_at("/Message"),
             ),
-            (404, Some("ResourceNotFoundException"), None),
-            "case {case:?}: an ARN with no stored gateway must be refused 404 \
-             ResourceNotFoundException, got {} {:?}",
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some("GatewayNotFound"),
+                Some("The specified gateway was not found."),
+            ),
+            "case {case:?}: an ARN with no stored gateway must be refused 400 \
+             ResourceNotFoundException / GatewayNotFound, got {} {:?}",
             reply.status,
             reply.body
         );
@@ -354,7 +361,7 @@ async fn an_arn_with_no_stored_gateway_is_refused_as_not_found() {
     let gone = get_schedule(&router, &live).await;
     assert_eq!(
         (gone.status, gone.code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
+        (400, Some("ResourceNotFoundException")),
         "a deleted gateway must be refused like one that never existed, got {} {:?}",
         gone.status,
         gone.body

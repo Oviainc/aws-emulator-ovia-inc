@@ -176,8 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The status, the `ErrorCode` and the sentence come from
             // `crate::state::MissingResource`, the one place this service chooses how it
             // refuses an ARN it holds no record under — not from this handler, so every
-            // operation that resolves such an ARN answers the condition alike.
-            let missing = crate::state::MissingResource::Other;
+            // operation that resolves such an ARN answers the condition alike. This
+            // operation resolves exactly one resource type, so what is missing is the
+            // GATEWAY it was asked for, whatever resource type the ARN spells.
+            let missing = crate::state::MissingResource::Gateway;
             let error = UpdateGatewaySoftwareNowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     error_code: missing.error_code().map(str::to_string),

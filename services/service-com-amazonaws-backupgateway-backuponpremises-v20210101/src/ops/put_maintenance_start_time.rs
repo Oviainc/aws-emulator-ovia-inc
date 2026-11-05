@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None
         };
         let Some(updated) = written else {
-            let missing = crate::state::MissingResource::Other;
+            let missing = crate::state::MissingResource::Gateway;
             let error = PutMaintenanceStartTimeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     error_code: missing.error_code().map(str::to_string),

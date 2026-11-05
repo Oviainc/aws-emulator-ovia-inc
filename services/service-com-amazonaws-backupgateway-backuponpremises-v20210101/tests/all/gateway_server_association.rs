@@ -13,8 +13,8 @@
 //! later read of that record reports it — so an association is visible to `GetGateway`
 //! and `ListGateways` as the server's `HypervisorId`, asserting the link that already
 //! exists changes nothing, a link to a second server is refused with the modelled
-//! `ConflictException`, an ARN naming a resource the store does not hold is refused with
-//! the modelled `ValidationException` and writes nothing, and the link is a fact about the
+//! `ConflictException`, an ARN naming a resource the store does not hold is refused as the
+//! missing resource it is and writes nothing, and the link is a fact about the
 //! record it was written on rather than about the pair, so removing the other end does not
 //! clear it.
 //!
@@ -32,7 +32,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
-use backup_gateway::state::{service_state, HYPERVISOR_PENDING};
+use backup_gateway::state::{
+    service_state, GATEWAY_NOT_FOUND_MESSAGE, HYPERVISOR_NOT_FOUND_MESSAGE, HYPERVISOR_PENDING,
+};
 
 use crate::gateway_lifecycle::{
     build_engine, build_router, call, create, never_created_arn, Reply, REGION,
@@ -345,11 +347,14 @@ async fn associating_a_gateway_with_a_server_round_trips_through_the_store() {
     );
 }
 
-/// The rule's refusal half: an ARN naming a resource the store does not hold is refused
-/// with the modelled `ValidationException` — this operation declares no
-/// `ResourceNotFoundException`
-/// (`smithy_query(query="operation",operation="AssociateGatewayToServer")`) — carrying an
-/// `ErrorCode` that names the missing resource, and nothing is written.
+/// The rule's refusal half: an ARN naming a resource the store does not hold is refused as
+/// the MISSING RESOURCE it is — the modelled `ResourceNotFoundException` at HTTP 400,
+/// carrying the `ErrorCode` that names which end of the link is missing and the fixed
+/// sentence this service states for that resource type — and nothing is written. This
+/// operation declares no `ResourceNotFoundException` of its own
+/// (`smithy_query(query="operation",operation="AssociateGatewayToServer")`), and still
+/// answers the condition in the shape every other operation of this service answers it in:
+/// an ARN that resolves to nothing is a not-found condition, not an invalid request.
 #[tokio::test]
 async fn an_association_naming_a_resource_the_store_does_not_hold_is_refused() {
     let engine = build_engine();
@@ -370,29 +375,33 @@ async fn an_association_naming_a_resource_the_store_does_not_hold_is_refused() {
         deleted.status, deleted.body
     );
 
-    // (case, GatewayArn, ServerArn, the ErrorCode the refusal must carry). Every row is a
+    // (case, GatewayArn, ServerArn, the ErrorCode the refusal must carry, its sentence).
+    // Every row is a
     // well-formed ARN of this service, so it reaches the handler rather than the boundary
     // validator; the rows differ in which end of the link is missing, in the resource type
     // the ARN names, in the id, and — for the ServerArn — in length, including each
     // published bound of the modelled shape (len 50..500).
-    let rows: [(&str, String, String, &str); 9] = [
+    let rows: [(&str, String, String, &str, &str); 9] = [
         (
             "a gateway that was never created",
             never_created_arn(),
             server_arn.clone(),
             "GatewayNotFound",
+            GATEWAY_NOT_FOUND_MESSAGE,
         ),
         (
             "a GatewayArn naming a hypervisor resource",
             server_arn.clone(),
             server_arn.clone(),
             "GatewayNotFound",
+            GATEWAY_NOT_FOUND_MESSAGE,
         ),
         (
             "a GatewayArn naming a virtual machine",
             arn_of("vm", "vm-1111111111111111"),
             server_arn.clone(),
             "GatewayNotFound",
+            GATEWAY_NOT_FOUND_MESSAGE,
         ),
         (
             "a GatewayArn in another partition",
@@ -402,56 +411,64 @@ async fn an_association_naming_a_resource_the_store_does_not_hold_is_refused() {
             ),
             server_arn.clone(),
             "GatewayNotFound",
+            GATEWAY_NOT_FOUND_MESSAGE,
         ),
         (
             "a server that was never imported",
             gateway_arn.clone(),
             arn_of("hypervisor", "hv-1111111111111111"),
             "HypervisorNotFound",
+            HYPERVISOR_NOT_FOUND_MESSAGE,
         ),
         (
             "a server that was deleted",
             gateway_arn.clone(),
             deleted_server_arn.clone(),
             "HypervisorNotFound",
+            HYPERVISOR_NOT_FOUND_MESSAGE,
         ),
         (
             "a ServerArn naming a gateway resource",
             gateway_arn.clone(),
             gateway_arn.clone(),
             "HypervisorNotFound",
+            HYPERVISOR_NOT_FOUND_MESSAGE,
         ),
         (
             "a ServerArn at the modelled 50-character minimum",
             gateway_arn.clone(),
             arn_of_length(50),
             "HypervisorNotFound",
+            HYPERVISOR_NOT_FOUND_MESSAGE,
         ),
         (
             "a ServerArn at the modelled 500-character maximum",
             gateway_arn.clone(),
             arn_of_length(500),
             "HypervisorNotFound",
+            HYPERVISOR_NOT_FOUND_MESSAGE,
         ),
     ];
 
-    for (case, gateway, server, error_code) in &rows {
+    for (case, gateway, server, error_code, message) in &rows {
         let refused = associate(&router, gateway, server).await;
         assert_eq!(
             (
                 refused.status,
                 refused.code.as_deref(),
                 refused.str_at("/ErrorCode"),
+                message_of(&refused).as_str(),
             ),
-            (400, Some("ValidationException"), Some(*error_code)),
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some(*error_code),
+                *message,
+            ),
             "case {case:?}: an ARN with no record must be refused with 400 \
-             ValidationException / ErrorCode {error_code:?}, got {} {:?}",
+             ResourceNotFoundException / ErrorCode {error_code:?} and the sentence \
+             {message:?}, got {} {:?}",
             refused.status,
-            refused.body
-        );
-        assert!(
-            !message_of(&refused).is_empty(),
-            "case {case:?}: the refusal must state why it refused, got {:?}",
             refused.body
         );
         assert!(

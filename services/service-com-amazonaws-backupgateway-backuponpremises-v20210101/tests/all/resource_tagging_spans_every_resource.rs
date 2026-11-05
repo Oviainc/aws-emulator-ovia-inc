@@ -619,18 +619,24 @@ async fn the_tagging_operations_resolve_exactly_the_machines_the_service_reports
                 reply.body
             );
             if !*reported {
-                // A hypervisor ARN aside, a resource this service holds no record for is
-                // refused with the modelled `ResourceNotFoundException` at the 404 its
-                // `@httpError` declares and no `ErrorCode`.
+                // Every row that is refused here names a virtual machine, so the refusal
+                // is the modelled `ResourceNotFoundException` at HTTP 400 carrying the
+                // `ErrorCode` that names the machine.
                 assert_eq!(
                     (
                         reply.status,
                         reply.code.as_deref(),
-                        reply.str_at("/ErrorCode")
+                        reply.str_at("/ErrorCode"),
+                        reply.str_at("/Message"),
                     ),
-                    (404, Some("ResourceNotFoundException"), None),
-                    "case {case:?}: {operation} must refuse an ARN with no record 404 \
-                     ResourceNotFoundException, got {} {:?}",
+                    (
+                        400,
+                        Some("ResourceNotFoundException"),
+                        Some("VirtualMachineNotFound"),
+                        Some("The virtual machine is not found."),
+                    ),
+                    "case {case:?}: {operation} must refuse an ARN with no record 400 \
+                     ResourceNotFoundException / VirtualMachineNotFound, got {} {:?}",
                     reply.status,
                     reply.body
                 );

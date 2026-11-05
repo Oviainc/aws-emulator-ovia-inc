@@ -475,9 +475,9 @@ async fn a_disassociation_changes_only_the_servers_link() {
 }
 
 /// The rule's refusal half: an ARN naming no gateway this store holds is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404), a gateway associated with no server
-/// with the modelled `ConflictException` (HTTP 409) naming that condition, and neither
-/// writes anything.
+/// modelled `ResourceNotFoundException` (HTTP 400, `ErrorCode` `GatewayNotFound`), a
+/// gateway associated with no server with the modelled `ConflictException` (HTTP 409)
+/// naming that condition, and neither writes anything.
 #[tokio::test]
 async fn a_disassociation_naming_nothing_to_clear_is_refused() {
     let engine = build_engine();
@@ -546,17 +546,21 @@ async fn a_disassociation_naming_nothing_to_clear_is_refused() {
                 refused.code.as_deref(),
                 refused.str_at("/ErrorCode"),
             ),
-            (404, Some("ResourceNotFoundException"), None),
-            "case {case:?}: an ARN with no gateway must be refused with 404 \
-             ResourceNotFoundException and no ErrorCode, got {} {:?}",
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some("GatewayNotFound"),
+            ),
+            "case {case:?}: an ARN with no gateway must be refused with 400 \
+             ResourceNotFoundException / GatewayNotFound, got {} {:?}",
             refused.status,
             refused.body
         );
         assert_eq!(
             message_of(&refused),
-            format!("The resource '{arn}' was not found."),
-            "case {case:?}: the refusal must state the one sentence this service words an \
-             ARN it holds no record under with, got {:?}",
+            "The specified gateway was not found.",
+            "case {case:?}: the refusal must state the one fixed sentence this service \
+             words a missing gateway with, got {:?}",
             refused.body
         );
         assert!(

@@ -308,7 +308,7 @@ async fn a_schedule_whose_intervals_cannot_hold_together_is_refused_and_writes_n
     let gone = get_schedule(&router, &unknown).await;
     assert_eq!(
         (gone.status, gone.code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
+        (400, Some("ResourceNotFoundException")),
         "a refused put must not have created a record, got {} {:?}",
         gone.status,
         gone.body

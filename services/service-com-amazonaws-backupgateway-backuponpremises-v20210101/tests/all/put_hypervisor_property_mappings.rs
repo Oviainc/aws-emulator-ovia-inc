@@ -12,7 +12,8 @@
 //! request's IAM role and tag mappings — in the order they were sent, replacing whatever
 //! the record carried — on the hypervisor its `ServerArn` resolves to and answers with
 //! that record's stored ARN ONLY when a gateway is associated with it; with none it
-//! refuses with HTTP 400 `ValidationException` carrying `ErrorCode` `GatewayOutOfDate`
+//! refuses with HTTP 400 `ValidationException` carrying the `ErrorCode` AWS states for an
+//! out-of-date gateway (the `GATEWAY_OUT_OF_DATE` constant this suite asserts)
 //! and writes nothing, however often the call is repeated. An ARN the store holds no
 //! hypervisor under never reaches that gate: it is refused as this service's one missing
 //! hypervisor (`put_property_mappings_one_answer_for_a_missing_hypervisor`).
@@ -359,7 +360,8 @@ async fn a_later_put_replaces_the_mappings_and_repeating_one_changes_nothing() {
 
 /// With no gateway associated with a hypervisor the store HOLDS there is no appliance that
 /// can apply the mappings, so the put is refused with HTTP 400 `ValidationException` /
-/// `ErrorCode` `GatewayOutOfDate` — the same answer however often it is repeated — and
+/// the `ErrorCode` AWS states for an out-of-date gateway — the same answer however often
+/// it is repeated — and
 /// nothing is written.
 ///
 /// An ARN the store holds no hypervisor under is a different condition and takes this
@@ -377,7 +379,7 @@ async fn a_put_with_no_gateway_associated_is_refused_deterministically() {
     assert_eq!(
         (GATEWAY_OUT_OF_DATE, GATEWAY_OUT_OF_DATE_MESSAGE),
         (
-            "GatewayOutOfDate",
+            " OutdatedGateway",
             "The specified gateway is out of date."
         ),
         "the refusal's wire ErrorCode and sentence must not drift"
@@ -489,7 +491,7 @@ async fn a_put_with_no_gateway_associated_is_refused_deterministically() {
             let read = get_mappings(&router, arn).await;
             assert_eq!(
                 (read.status, read.str_at("/ErrorCode")),
-                (404, Some(MAPPINGS_NOT_FOUND)),
+                (400, Some(MAPPINGS_NOT_FOUND)),
                 "case {case:?}: the hypervisor must still carry no mappings, got {} {:?}",
                 read.status,
                 read.body

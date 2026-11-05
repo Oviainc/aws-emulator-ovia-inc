@@ -176,7 +176,7 @@ impl Observed {
             let expected: (u16, Option<&str>) = if self.listed.contains(&machine.arn) {
                 (200, None)
             } else {
-                (404, Some("ResourceNotFoundException"))
+                (400, Some("ResourceNotFoundException"))
             };
             if (machine.reply.status, machine.reply.code.as_deref()) != expected {
                 return Some(format!(

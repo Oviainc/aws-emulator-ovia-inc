@@ -257,17 +257,51 @@ pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
 /// See [`HYPERVISOR_NOT_FOUND`].
 pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
 
-/// `ValidationException$ErrorCode` for a well-formed gateway ARN that names no gateway,
-/// on an operation whose model declares no `ResourceNotFoundException` to answer with.
+/// `ErrorCode` for a well-formed gateway ARN that names no gateway, and the sentence that
+/// states it. See [`MissingResource::Gateway`].
 ///
-/// Phrased like [`HYPERVISOR_NOT_FOUND`], so the two resources this service resolves are
-/// named the same way; AWS publishes no vocabulary for the member, so the requirement is
-/// the error shape, its status and a code that names the missing resource.
-///
-/// The SENTENCE such a refusal states is NOT a second constant beside this one: a gateway
-/// ARN this service holds no record under is worded by [`resource_not_found_message`]
-/// whichever modelled shape carries it, so one condition reads as one sentence.
+/// Read like [`HYPERVISOR_NOT_FOUND`]: it is `ResourceNotFoundException$ErrorCode` — "a
+/// description of which resource wasn't found" — for an operation that models that shape,
+/// and the same code inside whatever other modelled shape an operation that does not model
+/// it has to carry the condition in, so one condition is named one way whichever shape
+/// carries it.
 pub const GATEWAY_NOT_FOUND: &str = "GatewayNotFound";
+
+/// See [`GATEWAY_NOT_FOUND`]: the sentence AWS states for that refusal, entirely fixed
+/// text. No part of it comes from the request — the ARN that resolved to nothing is a
+/// request value, so it is not echoed back.
+pub const GATEWAY_NOT_FOUND_MESSAGE: &str = "The specified gateway was not found.";
+
+/// `ErrorCode` for a well-formed virtual-machine ARN that names no virtual machine this
+/// service reports, and the sentence that states it. See
+/// [`MissingResource::VirtualMachine`].
+///
+/// The third resource type this service resolves ([`VIRTUAL_MACHINE_RESOURCE_TYPE`]), named
+/// in `ResourceNotFoundException$ErrorCode` the way [`HYPERVISOR_NOT_FOUND`] and
+/// [`GATEWAY_NOT_FOUND`] name their own, so a client can tell which of the three resolved
+/// to nothing.
+pub const VIRTUAL_MACHINE_NOT_FOUND: &str = "VirtualMachineNotFound";
+
+/// See [`VIRTUAL_MACHINE_NOT_FOUND`]: the sentence AWS states for that refusal, entirely
+/// fixed text with no part taken from the request.
+pub const VIRTUAL_MACHINE_NOT_FOUND_MESSAGE: &str = "The virtual machine is not found.";
+
+/// `ValidationException$ErrorCode` for a request whose parameters this service will not act
+/// on, and the sentence that states it.
+///
+/// `TestHypervisorConfiguration` "tests your hypervisor configuration to validate that
+/// backup gateway can connect with the hypervisor and its resources"
+/// (`smithy_query(query="operation",operation="TestHypervisorConfiguration")`): the whole
+/// request is the configuration under test, so a `GatewayArn` that names no gateway makes
+/// the REQUEST invalid rather than naming a resource the caller asked to read — AWS
+/// answers it with the common `ValidationException` and this code rather than resolving the
+/// ARN. `ValidationException$ErrorCode` is documented "A description of what caused the
+/// validation error" (`smithy_query(query="shape",shape="ValidationException")`).
+pub const INVALID_PARAMETER: &str = "InvalidParameter";
+
+/// See [`INVALID_PARAMETER`]: the sentence AWS states for that refusal, entirely fixed
+/// text — it names no member and echoes no value, so nothing of the request reaches it.
+pub const INVALID_PARAMETER_MESSAGE: &str = "The specified request contains invalid parameters.";
 
 /// `ConflictException$ErrorCode` for associating a gateway that is already associated
 /// with a DIFFERENT server, and the sentence that states it.
@@ -315,14 +349,14 @@ pub const GATEWAY_NOT_ASSOCIATED_MESSAGE: &str = "The gateway is not associated 
 ///
 /// `ErrorCode` is documented as "A description of which resource wasn't found"
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), and the resource
-/// that is missing here is the MAPPINGS, not the hypervisor — so the code names them,
-/// the way [`HYPERVISOR_NOT_FOUND`] names the hypervisor.
-pub const MAPPINGS_NOT_FOUND: &str = "MappingsNotFound";
+/// that is missing here is the hypervisor's property MAPPINGS, not the hypervisor — so the
+/// code names them, the way [`HYPERVISOR_NOT_FOUND`] names the hypervisor.
+pub const MAPPINGS_NOT_FOUND: &str = "HypervisorPropertyMappingsNotFound";
 
-/// See [`MAPPINGS_NOT_FOUND`]. Phrased like [`HYPERVISOR_NOT_FOUND_MESSAGE`], the
-/// sentence this service is recorded stating for a resource it holds nothing for; the
-/// requirement is the error shape and the `ErrorCode`, and this wording is an example.
-pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
+/// See [`MAPPINGS_NOT_FOUND`]: the sentence AWS states for that refusal, entirely fixed
+/// text — including its number disagreement, which is part of the fixed string — with no
+/// part taken from the request.
+pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The hypervisor property mappings is not found.";
 
 /// `AccessDeniedException$ErrorCode` for a metadata sync asked for a `HypervisorArn` this
 /// store holds no property mappings for.
@@ -380,9 +414,10 @@ pub const MAPPINGS_NOT_CONFIGURED_STATUS: u16 = 400;
 ///
 /// `ValidationException$ErrorCode` is documented as "A description of what caused the
 /// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
-/// publishes no vocabulary for that member, so this value names the condition the way
-/// [`HYPERVISOR_NOT_FOUND`] names its own.
-pub const GATEWAY_OUT_OF_DATE: &str = "GatewayOutOfDate";
+/// publishes no vocabulary for that member, so the value is the one AWS is recorded
+/// sending — its LEADING SPACE included, which is part of the token and not a transcription
+/// slip, so a client keyed on the recorded code matches.
+pub const GATEWAY_OUT_OF_DATE: &str = " OutdatedGateway";
 
 /// See [`GATEWAY_OUT_OF_DATE`]: the sentence AWS is recorded stating for that refusal
 /// (`issues/.../backup-gateway-puthypervisorpropertymappings-stub.md`), kept in one place
@@ -402,7 +437,7 @@ pub const GATEWAY_OUT_OF_DATE_MESSAGE: &str = "The specified gateway is out of d
 /// `ValidationException$ErrorCode` is documented as "A description of what caused the
 /// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
 /// publishes no vocabulary for that member, so this value names the condition the way
-/// [`GATEWAY_OUT_OF_DATE`] names its own.
+/// [`HYPERVISOR_NOT_FOUND`] names its own.
 pub const MAINTENANCE_START_TIME_INVALID: &str = "InvalidMaintenanceStartTime";
 
 /// See [`MAINTENANCE_START_TIME_INVALID`]. AWS publishes no wording for this refusal, so
@@ -3227,13 +3262,18 @@ pub enum DisassociationRefusal {
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.
 ///
-/// Every such refusal is the modelled `ResourceNotFoundException`, but this service does
-/// not answer alike for all resource types: a missing HYPERVISOR is answered at HTTP 400
-/// with `ErrorCode` [`HYPERVISOR_NOT_FOUND`], where every other resource type takes the
-/// 404 that shape's `@httpError` declares and states no `ErrorCode`. All three parts of a
-/// refusal — the status, the code and the sentence ([`Self::message`]) — are read off this
-/// one value, so they cannot be chosen apart, and no handler composes a sentence of its
-/// own for an ARN it could not resolve.
+/// Every such refusal is the modelled `ResourceNotFoundException`, answered at HTTP 400 —
+/// the status AWS is recorded giving every client refusal of this service, whatever status
+/// the error shape's `@httpError` declares — and carrying the `ErrorCode` that names WHICH
+/// kind of resource was not found, paired with the fixed sentence AWS states for that kind.
+/// All three parts of a refusal — the status, the code and the sentence ([`Self::message`])
+/// — are read off this one value, so they cannot be chosen apart, and no handler composes a
+/// sentence of its own for an ARN it could not resolve.
+///
+/// A sentence AWS states for one of these kinds carries NO part of the request: the ARN a
+/// caller sent is a request value, not a part of the template, so only the arm for a
+/// resource type this service does not name at all ([`Self::Other`]) words the condition
+/// around the ARN that was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingResource {
     /// A `hypervisor/<id>` ARN with no hypervisor behind it.
@@ -3249,14 +3289,24 @@ pub enum MissingResource {
     /// the ARN names a hypervisor in both cases, and only the record says which of the
     /// two is missing.
     PropertyMappings,
-    /// Every other resource type, including a `gateway/<id>` ARN with no gateway
-    /// behind it.
+    /// A `gateway/<id>` ARN with no gateway behind it.
     ///
-    /// Named directly by an operation that resolves exactly ONE resource type other than
-    /// the hypervisor — a gateway operation, or the virtual-machine read — because the
-    /// resource that is missing is then the one that operation resolves, whatever type the
-    /// ARN happens to spell; [`Self::for_arn`] reaches it for the tagging operations,
-    /// which take any of this service's resources in one member.
+    /// Named directly by every operation that resolves a gateway, because the resource
+    /// that is missing is then the gateway that operation was asked for, whatever resource
+    /// type the ARN happens to spell; [`Self::for_arn`] reaches it for the tagging
+    /// operations, which take any of this service's resources in one member.
+    Gateway,
+    /// A `vm/<id>` ARN naming no virtual machine this service reports, reached the same
+    /// two ways [`Self::Gateway`] is.
+    VirtualMachine,
+    /// A resource type this service does not name at all — neither a gateway, nor a
+    /// hypervisor, nor a virtual machine.
+    ///
+    /// Reached only through [`Self::for_arn`], for the tagging operations: they take any of
+    /// this service's resources in ONE member, so an ARN of a type this service never
+    /// mints reaches a handler and names no kind of resource whose refusal AWS states. It
+    /// is the one arm that keeps the status its error shape declares and words the
+    /// condition around the ARN, because there is no kind of resource to name instead.
     Other,
 }
 
@@ -3265,6 +3315,8 @@ impl MissingResource {
     pub fn for_arn(arn: &str) -> Self {
         match arn_resource_type(arn) {
             Some(HYPERVISOR_RESOURCE_TYPE) => Self::Hypervisor,
+            Some(GATEWAY_RESOURCE_TYPE) => Self::Gateway,
+            Some(VIRTUAL_MACHINE_RESOURCE_TYPE) => Self::VirtualMachine,
             _ => Self::Other,
         }
     }
@@ -3276,6 +3328,8 @@ impl MissingResource {
         match self {
             Self::Hypervisor => Some(HYPERVISOR_NOT_FOUND),
             Self::PropertyMappings => Some(MAPPINGS_NOT_FOUND),
+            Self::Gateway => Some(GATEWAY_NOT_FOUND),
+            Self::VirtualMachine => Some(VIRTUAL_MACHINE_NOT_FOUND),
             Self::Other => None,
         }
     }
@@ -3285,29 +3339,39 @@ impl MissingResource {
         match self {
             Self::Hypervisor => HYPERVISOR_NOT_FOUND_MESSAGE.to_string(),
             Self::PropertyMappings => MAPPINGS_NOT_FOUND_MESSAGE.to_string(),
+            Self::Gateway => GATEWAY_NOT_FOUND_MESSAGE.to_string(),
+            Self::VirtualMachine => VIRTUAL_MACHINE_NOT_FOUND_MESSAGE.to_string(),
             Self::Other => resource_not_found_message(arn),
         }
     }
 
     /// The status this service answers the refusal with where it is NOT the one
-    /// `ResourceNotFoundException`'s `@httpError` declares (404), and `None` where it
-    /// is: a missing hypervisor is answered 400 with the same shape.
+    /// `ResourceNotFoundException`'s `@httpError` declares (404), and `None` where it is.
+    ///
+    /// Every kind of resource this service names is answered 400: that is the status AWS
+    /// is recorded giving these refusals, and it is one answer for the condition rather
+    /// than one per operation. Only [`Self::Other`] — an ARN of a resource type this
+    /// service does not name, for which no refusal of AWS's is recorded — keeps the status
+    /// the shape declares.
     pub fn status_override(self) -> Option<u16> {
         match self {
-            Self::Hypervisor => Some(400),
-            // No recording shows this service answering a missing mappings resource with
-            // anything but the status `ResourceNotFoundException`'s `@httpError` declares,
-            // so that case keeps the model's 404 like every other resource type.
-            Self::PropertyMappings | Self::Other => None,
+            Self::Hypervisor
+            | Self::PropertyMappings
+            | Self::Gateway
+            | Self::VirtualMachine => Some(400),
+            Self::Other => None,
         }
     }
 }
 
-/// The sentence this service states for an ARN it holds no record for. One wording for
-/// every operation that resolves an ARN, reached through [`MissingResource::message`] by
-/// the operations whose model carries `ResourceNotFoundException` and directly by the one
-/// that has to state the same condition inside another modelled shape
-/// ([`GATEWAY_NOT_FOUND`]).
+/// The sentence this service states for an ARN of a resource type it does not name at all
+/// and holds no record for, reached through [`MissingResource::message`] on its
+/// [`MissingResource::Other`] arm.
+///
+/// Every resource type this service DOES name is worded by the fixed sentence AWS states
+/// for that type ([`GATEWAY_NOT_FOUND_MESSAGE`], [`HYPERVISOR_NOT_FOUND_MESSAGE`],
+/// [`VIRTUAL_MACHINE_NOT_FOUND_MESSAGE`]), which carries no part of the request; this one
+/// names the ARN because there is no kind of resource to name instead.
 pub fn resource_not_found_message(arn: &str) -> String {
     format!("The resource '{arn}' was not found.")
 }

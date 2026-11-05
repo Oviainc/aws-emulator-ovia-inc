@@ -335,15 +335,16 @@ async fn untag_resource_refuses_an_arn_with_no_record() {
     let live = create(&router, "gw-live").await;
     tag(&router, "live", &live, &[("env", "test")]).await;
 
-    // (case, the ARN, expected status, expected ErrorCode member) — a missing hypervisor
-    // is answered 400 with `ErrorCode` `HypervisorNotFound`, every other type the 404 the
-    // shape's `@httpError` declares and no `ErrorCode`.
+    // (case, the ARN, expected status, expected ErrorCode member) — every resource type
+    // this service names is answered 400 with the `ErrorCode` naming that type; an ARN of
+    // a type this service does not name takes the 404 the shape's `@httpError` declares
+    // and no `ErrorCode`.
     let rows: [(&str, String, u16, Option<&str>); 4] = [
         (
             "a gateway that was never created",
             never_created_arn(),
-            404,
-            None,
+            400,
+            Some("GatewayNotFound"),
         ),
         (
             "a hypervisor that was never imported",
@@ -354,8 +355,8 @@ async fn untag_resource_refuses_an_arn_with_no_record() {
         (
             "a virtual machine",
             arn_of("vm", "vm-2222222222222222"),
-            404,
-            None,
+            400,
+            Some("VirtualMachineNotFound"),
         ),
         (
             "a resource type this service does not name",

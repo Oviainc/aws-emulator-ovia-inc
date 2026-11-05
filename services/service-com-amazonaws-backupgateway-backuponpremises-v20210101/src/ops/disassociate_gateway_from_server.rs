@@ -190,9 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // refused the way every other operation of this service refuses an ARN it
             // holds no record under: the status, the `ErrorCode` and the sentence are all
             // read off `crate::state::MissingResource`, the one place this service chooses
-            // that refusal, rather than composed here.
+            // that refusal, rather than composed here. The member asked for is a
+            // `GatewayArn`, so what is missing is the GATEWAY whatever resource type the
+            // ARN spells.
             Err(crate::state::DisassociationRefusal::NoSuchGateway) => {
-                let missing = crate::state::MissingResource::Other;
+                let missing = crate::state::MissingResource::Gateway;
                 let error = DisassociateGatewayFromServerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         error_code: missing.error_code().map(str::to_string),

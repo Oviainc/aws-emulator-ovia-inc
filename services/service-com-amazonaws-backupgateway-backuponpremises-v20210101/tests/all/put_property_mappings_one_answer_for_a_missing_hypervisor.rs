@@ -23,7 +23,8 @@
 //!
 //! The counterpart is asserted too, so resolving the record first did not flatten the
 //! refusal it precedes: a hypervisor this store HOLDS that no gateway is associated with
-//! keeps the gateway refusal (`ValidationException` / `GatewayOutOfDate`), and associating
+//! keeps the gateway refusal (`ValidationException` with the `ErrorCode` AWS states for an
+//! out-of-date gateway), and associating
 //! a gateway with that very record makes the same request succeed.
 
 use std::collections::BTreeSet;

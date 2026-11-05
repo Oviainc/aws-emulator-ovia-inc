@@ -172,16 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(machine) = resolved else {
             // This operation resolves exactly one resource type, so an ARN it cannot
             // resolve is a missing VIRTUAL MACHINE whatever else the ARN spells — and
-            // this service answers that with the modelled `ResourceNotFoundException` at
-            // the HTTP 404 its `@httpError` declares, stating no `ErrorCode`
-            // (`crate::state::MissingResource::Other`), the one place the status and the
-            // code are chosen together. Deliberately NOT
-            // `crate::state::MissingResource::for_arn`, which reads the refusal off the
-            // ARN's resource type: that is for the tagging operations, which take any of
-            // this service's resources in one member and so have to tell them apart. Here
-            // the resource that is missing is the virtual machine the caller asked for,
-            // whatever type the ARN happens to spell.
-            let missing = crate::state::MissingResource::Other;
+            // this service answers that with the modelled `ResourceNotFoundException`
+            // carrying the `ErrorCode` that names the machine
+            // (`crate::state::MissingResource::VirtualMachine`), the one place the status,
+            // the code and the sentence are chosen together. Named directly rather than
+            // through `crate::state::MissingResource::for_arn`, which reads the refusal
+            // off the ARN's resource type: that is for the tagging operations, which take
+            // any of this service's resources in one member and so have to tell them
+            // apart. Here the resource that is missing is the virtual machine the caller
+            // asked for, whatever type the ARN happens to spell.
+            let missing = crate::state::MissingResource::VirtualMachine;
             let error = GetVirtualMachineErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     error_code: missing.error_code().map(str::to_string),

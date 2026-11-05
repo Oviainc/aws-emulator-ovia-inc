@@ -633,8 +633,8 @@ async fn gateway_lifecycle_round_trips_through_the_store() {
     let fetched = call(&router, "GetGateway", &json!({ "GatewayArn": arn })).await;
     assert_eq!(
         (fetched.status, fetched.code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
-        "case get-after-delete: expected 404 ResourceNotFoundException, got {} {:?}",
+        (400, Some("ResourceNotFoundException")),
+        "case get-after-delete: expected 400 ResourceNotFoundException, got {} {:?}",
         fetched.status,
         fetched.body
     );
@@ -647,7 +647,7 @@ async fn gateway_lifecycle_round_trips_through_the_store() {
     let deleted_again = call(&router, "DeleteGateway", &json!({ "GatewayArn": arn })).await;
     assert_eq!(
         (deleted_again.status, deleted_again.code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
+        (400, Some("ResourceNotFoundException")),
         "case delete-twice: a gateway that is no longer stored is not found, got {} {:?}",
         deleted_again.status,
         deleted_again.body
@@ -791,13 +791,14 @@ async fn pagination_enumerates_every_gateway_exactly_once_at_every_page_size() {
 }
 
 /// Every operation that takes an ARN resolves it in the store, so a well-formed ARN with
-/// no record behind it is `ResourceNotFoundException` (404) — not a 200 with an empty
-/// body, and not a 501.
+/// no record behind it is `ResourceNotFoundException` (HTTP 400, the status this service
+/// answers its client refusals with) — not a 200 with an empty body, and not a 501.
 #[tokio::test]
 async fn an_arn_with_no_record_is_resource_not_found() {
     let engine = build_engine();
     let router = build_router(&engine);
-    // One real gateway exists, so a 404 below means "this ARN", not "the store is empty".
+    // One real gateway exists, so a refusal below means "this ARN", not "the store is
+    // empty".
     let live = create(&router, "gw-live").await;
     let missing = never_created_arn();
 
@@ -825,10 +826,20 @@ async fn an_arn_with_no_record_is_resource_not_found() {
     for (case, operation, body) in rows {
         let reply = call(&router, operation, &body).await;
         assert_eq!(
-            (reply.status, reply.code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?}: {operation} on an ARN with no record must answer 404 \
-             ResourceNotFoundException, got {} {:?}",
+            (
+                reply.status,
+                reply.code.as_deref(),
+                reply.str_at("/ErrorCode"),
+                reply.str_at("/Message"),
+            ),
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some("GatewayNotFound"),
+                Some("The specified gateway was not found."),
+            ),
+            "case {case:?}: {operation} on an ARN with no record must answer 400 \
+             ResourceNotFoundException / GatewayNotFound, got {} {:?}",
             reply.status,
             reply.body
         );

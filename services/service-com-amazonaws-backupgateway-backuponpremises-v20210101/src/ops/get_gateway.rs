@@ -168,9 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // this service chooses how it refuses an ARN it holds no record under, so
             // this operation and the tagging operations cannot word the same condition
             // two different ways. This operation resolves exactly one resource type, so
-            // the resource that is missing is the gateway it was asked for, whatever the
+            // the resource that is missing is the GATEWAY it was asked for, whatever the
             // ARN's resource type reads.
-            let missing = crate::state::MissingResource::Other;
+            let missing = crate::state::MissingResource::Gateway;
             let error = GetGatewayErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     error_code: missing.error_code().map(str::to_string),

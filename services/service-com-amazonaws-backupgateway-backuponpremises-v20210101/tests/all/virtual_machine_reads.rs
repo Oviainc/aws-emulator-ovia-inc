@@ -564,7 +564,9 @@ async fn a_resynced_machine_is_read_back_as_the_inventory_now_reports_it() {
 }
 
 /// A well-formed `ResourceArn` the store holds no virtual machine under is refused with
-/// the modelled `ResourceNotFoundException` at the HTTP 404 its `@httpError` declares —
+/// the modelled `ResourceNotFoundException` at HTTP 400, carrying `ErrorCode`
+/// `VirtualMachineNotFound` and the fixed sentence this service states for a missing
+/// machine —
 /// whatever the ARN's resource type, partition, id or length, including at each published
 /// bound of the modelled shape's length, and whether or not the ARN names some OTHER
 /// resource this service really holds.
@@ -645,16 +647,26 @@ async fn an_arn_with_no_recorded_machine_is_resource_not_found() {
     for (case, arn) in &cases {
         let refused = get_machine(&router, arn).await;
         assert_eq!(
-            (refused.status, refused.code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
+            (
+                refused.status,
+                refused.code.as_deref(),
+                refused.str_at("/ErrorCode"),
+            ),
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some("VirtualMachineNotFound"),
+            ),
             "case {case:?}: GetVirtualMachine on an ARN with no stored machine must answer \
-             404 ResourceNotFoundException, got {} {:?}",
+             400 ResourceNotFoundException / VirtualMachineNotFound, got {} {:?}",
             refused.status,
             refused.body
         );
-        assert!(
-            message_of(&refused).contains(arn.as_str()),
-            "case {case:?}: the refusal must name the resource that was asked for, got {:?}",
+        assert_eq!(
+            message_of(&refused),
+            "The virtual machine is not found.",
+            "case {case:?}: the refusal must state the fixed sentence for a missing machine \
+             and echo nothing of the request, got {:?}",
             refused.body
         );
         assert!(
@@ -671,9 +683,9 @@ async fn an_arn_with_no_recorded_machine_is_resource_not_found() {
     }
 }
 
-/// A `ResourceArn` outside the modelled constraints is refused as invalid — not answered
-/// 404, and not answered 501: the shape of the request is wrong, which is a different
-/// claim from "no such machine".
+/// A `ResourceArn` outside the modelled constraints is refused as invalid — not answered as
+/// a missing machine, and not answered 501: the shape of the request is wrong, which is a
+/// different claim from "no such machine".
 #[tokio::test]
 async fn a_request_outside_the_modelled_constraint_is_refused_with_400() {
     let engine = build_engine();
@@ -764,7 +776,7 @@ async fn reads_do_not_change_what_a_later_caller_sees() {
     for _ in 0..3 {
         let refused = get_machine(&router, &missing).await;
         assert_eq!(
-            refused.status, 404,
+            refused.status, 400,
             "a refused read must stay refused, got {} {:?}",
             refused.status, refused.body
         );

@@ -10,7 +10,8 @@
 //! The rule under test: the test is answered from the records this service holds — it
 //! passes with an empty 200 when the `GatewayArn` names a gateway in the store AND the
 //! `Host` is one the store holds a hypervisor configuration for, it refuses a gateway the
-//! store does not hold the way every other gateway operation of this service does, and it
+//! store does not hold as an invalid REQUEST (`ValidationException` / `InvalidParameter`),
+//! and it
 //! refuses a host no record carries the way this service refuses a missing hypervisor. The
 //! credentials decide nothing, the gateway's own association decides nothing, and the test
 //! writes nothing, so the store is byte-for-byte what it was before every call.
@@ -30,7 +31,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
-use backup_gateway::state::{service_state, HYPERVISOR_NOT_FOUND, HYPERVISOR_NOT_FOUND_MESSAGE};
+use backup_gateway::state::{
+    service_state, HYPERVISOR_NOT_FOUND, HYPERVISOR_NOT_FOUND_MESSAGE, INVALID_PARAMETER,
+    INVALID_PARAMETER_MESSAGE,
+};
 
 use crate::gateway_lifecycle::{
     build_engine, build_router, call, create, never_created_arn, Reply, REGION,
@@ -280,9 +284,10 @@ async fn a_test_of_a_configuration_this_service_holds_passes_and_writes_nothing(
 }
 
 /// RULE (its refusal half, for the GATEWAY): a `GatewayArn` naming no gateway this store
-/// holds is refused the way every other gateway operation of this service refuses it — the
-/// 404 the modelled `ResourceNotFoundException` declares, no `ErrorCode`, and a message
-/// naming the ARN — and the refusal comes before the host is looked at.
+/// holds makes the configuration under test an invalid REQUEST, so it is refused with the
+/// common `ValidationException` at HTTP 400 carrying `ErrorCode` `InvalidParameter` and a
+/// fixed sentence that echoes nothing of the request — and the refusal comes before the
+/// host is looked at.
 #[tokio::test]
 async fn a_test_naming_a_gateway_this_service_does_not_hold_is_refused() {
     let engine = build_engine();
@@ -354,17 +359,22 @@ async fn a_test_naming_a_gateway_this_service_does_not_hold_is_refused() {
                 refused.code.as_deref(),
                 refused.str_at("/ErrorCode"),
             ),
-            (404, Some("ResourceNotFoundException"), None),
-            "case {case:?}: a GatewayArn with no gateway behind it must be refused with 404 \
-             ResourceNotFoundException and no ErrorCode, got {} {:?}",
+            (
+                400,
+                Some("ValidationException"),
+                Some(INVALID_PARAMETER),
+            ),
+            "case {case:?}: a GatewayArn with no gateway behind it must be refused with 400 \
+             ValidationException / ErrorCode {INVALID_PARAMETER}, got {} {:?}",
             refused.status,
             refused.body
         );
-        let message = message_of(&refused);
-        assert!(
-            message.contains(gateway_arn.as_str()),
-            "case {case:?}: the refusal must name the ARN it could not resolve, got \
-             {message:?}"
+        assert_eq!(
+            message_of(&refused),
+            INVALID_PARAMETER_MESSAGE,
+            "case {case:?}: the refusal must state the fixed sentence for an invalid \
+             request and echo nothing of it, got {:?}",
+            refused.body
         );
         assert_eq!(
             store_snapshot(&engine),

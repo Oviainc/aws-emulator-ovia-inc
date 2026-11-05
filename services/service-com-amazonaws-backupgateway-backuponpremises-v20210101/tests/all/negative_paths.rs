@@ -14,9 +14,10 @@
 //!    constraint it failed and nothing of the value it held; a member that is not
 //!    sensitive still reports its value.
 //! 2. An operation that takes a `ResourceARN` resolves it as the resource type the ARN
-//!    NAMES: a hypervisor ARN with no hypervisor behind it is refused with HTTP 400
-//!    `ValidationException` / `ErrorCode` `HypervisorNotFound`, and every other
-//!    resource type with the modelled 404 `ResourceNotFoundException`.
+//!    NAMES: an ARN with no record behind it is refused with the modelled
+//!    `ResourceNotFoundException` at HTTP 400 carrying the `ErrorCode` of THAT resource
+//!    type, and an ARN of a type this service does not name at all with the 404 the shape
+//!    declares.
 //!
 //! What `CreateGateway` does with the `ActivationKey` it is handed lives in
 //! `gateway_activation`.
@@ -201,9 +202,10 @@ async fn a_constraint_violation_on_a_sensitive_member_never_echoes_the_value() {
 }
 
 /// Rule 2: an operation that takes a `ResourceARN` answers for the resource type the ARN
-/// names — a missing hypervisor is the modelled `ResourceNotFoundException` answered at
-/// HTTP 400 and carrying `ErrorCode` `HypervisorNotFound`, every other type the same
-/// shape at the 404 its `@httpError` declares and with no `ErrorCode`.
+/// names — the modelled `ResourceNotFoundException` answered at HTTP 400 carrying the
+/// `ErrorCode` of the resource type that was not found, and for an ARN of a type this
+/// service does not name at all the same shape at the 404 its `@httpError` declares with no
+/// `ErrorCode`.
 #[tokio::test]
 async fn a_missing_resource_is_refused_as_the_type_its_arn_names() {
     let engine = build_engine();
@@ -231,16 +233,16 @@ async fn a_missing_resource_is_refused_as_the_type_its_arn_names() {
         (
             "a gateway that was never created",
             never_created_arn(),
-            404,
+            400,
             "ResourceNotFoundException",
-            None,
+            Some("GatewayNotFound"),
         ),
         (
             "a virtual machine",
             arn_of("vm", "vm-1111111111111111"),
-            404,
+            400,
             "ResourceNotFoundException",
-            None,
+            Some("VirtualMachineNotFound"),
         ),
         (
             "a resource type this service does not name",

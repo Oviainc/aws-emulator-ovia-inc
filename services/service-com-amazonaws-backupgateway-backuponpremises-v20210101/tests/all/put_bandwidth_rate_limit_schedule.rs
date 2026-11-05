@@ -228,8 +228,9 @@ async fn putting_a_schedule_replaces_the_schedule_before_it() {
 }
 
 /// A well-formed `GatewayArn` the store holds no gateway under is refused with the
-/// modelled `ResourceNotFoundException` — HTTP 404, the status that shape's `@httpError`
-/// declares, and no `ErrorCode`, the way every other gateway operation of this service
+/// modelled `ResourceNotFoundException` — HTTP 400 carrying `ErrorCode` `GatewayNotFound`
+/// and the fixed sentence this service states for a missing gateway, the way every other
+/// gateway operation of this service
 /// refuses one — whatever the ARN's partition, resource type, id or length, and nothing is
 /// written.
 #[tokio::test]
@@ -278,18 +279,24 @@ async fn a_put_for_an_arn_with_no_stored_gateway_is_refused_and_writes_nothing()
             (
                 reply.status,
                 reply.code.as_deref(),
-                reply.body.get("ErrorCode").cloned()
+                reply.str_at("/ErrorCode"),
+                reply.str_at("/Message"),
             ),
-            (404, Some("ResourceNotFoundException"), None),
-            "case {case:?}: an ARN with no stored gateway must be refused 404 \
-             ResourceNotFoundException, got {} {:?}",
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some("GatewayNotFound"),
+                Some("The specified gateway was not found."),
+            ),
+            "case {case:?}: an ARN with no stored gateway must be refused 400 \
+             ResourceNotFoundException / GatewayNotFound, got {} {:?}",
             reply.status,
             reply.body
         );
         let gone = get_schedule(&router, arn).await;
         assert_eq!(
             (gone.status, gone.code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
+            (400, Some("ResourceNotFoundException")),
             "case {case:?}: a refused put must not have created a record, got {} {:?}",
             gone.status,
             gone.body
@@ -321,7 +328,7 @@ async fn a_put_for_an_arn_with_no_stored_gateway_is_refused_and_writes_nothing()
     let after_delete = put_schedule(&router, &live, &live_schedule).await;
     assert_eq!(
         (after_delete.status, after_delete.code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
+        (400, Some("ResourceNotFoundException")),
         "a deleted gateway must be refused like one that never existed, got {} {:?}",
         after_delete.status,
         after_delete.body

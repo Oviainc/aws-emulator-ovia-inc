@@ -9,9 +9,9 @@
 //! and a key the resource does not carry is nothing to remove — so the call succeeds and
 //! repeating it changes nothing.
 //!
-//! An ARN with no record behind it is refused as the resource TYPE it names: a missing
-//! hypervisor takes the modelled `ResourceNotFoundException` shape at HTTP 400 with
-//! `ErrorCode` `HypervisorNotFound`, every other type the 404 that shape declares
+//! An ARN with no record behind it is refused as the resource TYPE it names: the modelled
+//! `ResourceNotFoundException` shape at HTTP 400, carrying the `ErrorCode` that names
+//! which of this service's resource types was not found
 //! ([`crate::state::MissingResource`]).
 //!
 //! ## Shape of an operation
@@ -174,9 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hypervisor's inventory), so one lookup spans all three stores, resolving a
         // machine against the clock exactly as `GetVirtualMachine` does — and an ARN with
         // no record behind it takes the refusal that resource type carries: the same
-        // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
-        // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
-        // takes the shape's own 404 (`crate::state::MissingResource`).
+        // modelled `ResourceNotFoundException` shape throughout, answered 400 with the
+        // `ErrorCode` naming the resource type that was not found
+        // (`crate::state::MissingResource`).
         let removed = if in_request_region {
             state.remove_resource_tags(
                 &input.resource_arn,

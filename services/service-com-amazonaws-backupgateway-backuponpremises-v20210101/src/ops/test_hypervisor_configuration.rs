@@ -29,6 +29,12 @@
 //! moves no status — so a test leaves the store exactly as it found it and every later
 //! read reports what the last write left.
 //!
+//! The two lookups are refused in two different ways, because they are two different
+//! conditions: a `GatewayArn` naming no gateway makes the configuration under test an
+//! invalid REQUEST (`ValidationException` with [`crate::state::INVALID_PARAMETER`]),
+//! while a `Host` no record of this service names is the missing HYPERVISOR this service
+//! refuses one way everywhere ([`crate::state::MissingResource::Hypervisor`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -102,14 +108,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `TestHypervisorConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+// `extra_errors` widens the set with the errors this SERVICE models for every operation
+// (`smithy_query(query="service_info")` -> `common_errors`) but that
+// `TestHypervisorConfiguration` does not repeat in its own `errors` list; both shapes are
+// declared in `types::shared_types`. The common `ValidationException` is what this
+// operation refuses a request it will not act on with — see the handler.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupgateway#TestHypervisorConfiguration",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["ValidationException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum TestHypervisorConfigurationErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
     InternalServerException(InternalServerException),
 }
 
@@ -194,23 +206,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the boundary validator before `handle` runs, so reaching here means every
         // modelled constraint holds; whether the ARN names a gateway is a fact of the
         // STORE, which is what this lookup asks. A gateway that was never created and one
-        // already deleted are both simply absent, and the member asked for is a
-        // `GatewayArn`, so the resource that is missing is the GATEWAY whatever the ARN's
-        // resource type reads — refused the way every other operation of this service
-        // refuses an ARN it holds no record under, its status, its `ErrorCode` and its
-        // sentence all read off `crate::state::MissingResource` rather than composed here.
+        // already deleted are both simply absent.
+        //
+        // What this operation is asked to do is test a CONFIGURATION — the gateway, the
+        // host and the credentials together — so a `GatewayArn` that names no gateway
+        // makes the request itself one this service will not act on rather than naming a
+        // resource the caller asked to read: it is refused with the common
+        // `ValidationException` and `crate::state::INVALID_PARAMETER`, not through
+        // `crate::state::MissingResource`. The sentence states no member and echoes no
+        // value, so nothing of the request comes back in it.
         if !gateway_in_request_region || store.gateway(&input.gateway_arn).is_none() {
-            let missing = crate::state::MissingResource::Other;
-            let error = TestHypervisorConfigurationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    error_code: missing.error_code().map(str::to_string),
-                    message: Some(missing.message(&input.gateway_arn)),
+            return Err(TestHypervisorConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    error_code: Some(crate::state::INVALID_PARAMETER.to_string()),
+                    message: Some(crate::state::INVALID_PARAMETER_MESSAGE.to_string()),
                 },
-            );
-            return Err(match missing.status_override() {
-                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
-                None => error.into(),
-            });
+            )
+            .into());
         }
 
         // The hypervisor this test is to reach is named by its HOST and not by an ARN, so

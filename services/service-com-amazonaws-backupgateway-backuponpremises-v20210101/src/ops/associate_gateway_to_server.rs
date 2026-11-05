@@ -88,20 +88,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `AssociateGatewayToServerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with the two errors this SERVICE models for every
+// `extra_errors` widens the set with the errors this SERVICE models for every
 // operation (`smithy_query(query="service_info")` -> `common_errors`) but that
-// `AssociateGatewayToServer` does not repeat in its own `errors` list; both shapes are
-// declared in `types::shared_types`. This operation models no `ResourceNotFoundException`
-// at all (`smithy_query(query="operation",operation="AssociateGatewayToServer")`), so an
-// ARN naming no resource this service holds is refused with the common
-// `ValidationException` and an `ErrorCode` that says which resource was missing.
+// `AssociateGatewayToServer` does not repeat in its own `errors` list, plus the
+// `ResourceNotFoundException` it declares none of
+// (`smithy_query(query="operation",operation="AssociateGatewayToServer")`): an ARN that
+// resolves to no resource is a NOT-FOUND condition whichever operation resolved it, so it
+// is carried by that shape here as it is everywhere else in this service rather than
+// re-told as an input-validation failure. Every shape is declared in
+// `types::shared_types`.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupgateway#AssociateGatewayToServer",
-    extra_errors = ["ValidationException", "InternalServerException"]
+    extra_errors = ["ResourceNotFoundException", "ValidationException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum AssociateGatewayToServerErrorModeled {
     ConflictException(ConflictException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
     InternalServerException(InternalServerException),
 }
@@ -118,6 +121,28 @@ pub type AssociateGatewayToServerError = crate::scaffolded::Scaffolded<Associate
 impl From<AssociateGatewayToServerErrorModeled> for AssociateGatewayToServerError {
     fn from(modeled: AssociateGatewayToServerErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The refusal this operation answers an ARN that names no record with, as this
+/// operation's error channel carries it.
+///
+/// All three parts — the status, the `ErrorCode` naming WHICH resource was not found, and
+/// the sentence — are read off [`crate::state::MissingResource`], the one place this
+/// service chooses that refusal, so this operation cannot word the condition differently
+/// from the ones that resolve the same ARNs on their own.
+fn missing_resource(
+    missing: crate::state::MissingResource,
+    arn: &str,
+) -> AssociateGatewayToServerError {
+    let error =
+        AssociateGatewayToServerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            error_code: missing.error_code().map(str::to_string),
+            message: Some(missing.message(arn)),
+        });
+    match missing.status_override() {
+        Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+        None => error.into(),
     }
 }
 
@@ -187,33 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let associated = store
             .associate_gateway_to_server(&input.gateway_arn, &input.server_arn, &region)
             .map_err(|refusal| match refusal {
+                // Either end naming no record is the same condition every other operation
+                // of this service refuses for an ARN it holds nothing under: a missing
+                // resource, not a malformed request. So the refusal is read off
+                // `crate::state::MissingResource` here too — the status, the `ErrorCode`
+                // naming WHICH end is missing, and the sentence — and this operation
+                // carries it in the same modelled shape the rest of the service does.
                 crate::state::AssociationRefusal::NoSuchGateway => {
-                    // This operation declares no `ResourceNotFoundException`, so the
-                    // condition is carried by the modelled `ValidationException` whose
-                    // `ErrorCode` names which end of the link is missing — but the
-                    // SENTENCE is the one this service states for an ARN it holds no
-                    // record under, so the same condition reads the same way whichever
-                    // shape carries it.
-                    AssociateGatewayToServerErrorModeled::ValidationException(
-                        ValidationException {
-                            error_code: Some(crate::state::GATEWAY_NOT_FOUND.to_string()),
-                            message: Some(crate::state::resource_not_found_message(
-                                &input.gateway_arn,
-                            )),
-                        },
-                    )
+                    missing_resource(crate::state::MissingResource::Gateway, &input.gateway_arn)
                 }
-                crate::state::AssociationRefusal::NoSuchServer => {
-                    // The hypervisor is the one resource type this service is recorded
-                    // refusing in its own words, so that sentence stays the recorded one
-                    // (`crate::state::MissingResource::Hypervisor`).
-                    AssociateGatewayToServerErrorModeled::ValidationException(
-                        ValidationException {
-                            error_code: Some(crate::state::HYPERVISOR_NOT_FOUND.to_string()),
-                            message: Some(crate::state::HYPERVISOR_NOT_FOUND_MESSAGE.to_string()),
-                        },
-                    )
-                }
+                crate::state::AssociationRefusal::NoSuchServer => missing_resource(
+                    crate::state::MissingResource::Hypervisor,
+                    &input.server_arn,
+                ),
                 crate::state::AssociationRefusal::AlreadyAssociated(current) => {
                     AssociateGatewayToServerErrorModeled::ConflictException(ConflictException {
                         error_code: crate::state::GATEWAY_ALREADY_ASSOCIATED.to_string(),
@@ -221,6 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &current,
                         )),
                     })
+                    .into()
                 }
             })?;
 

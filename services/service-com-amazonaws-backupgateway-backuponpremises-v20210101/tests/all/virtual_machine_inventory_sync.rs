@@ -606,7 +606,7 @@ async fn deleting_a_hypervisor_takes_the_inventory_its_sync_materialised() {
         let read = get_machine(&router, &machine.resource_arn).await;
         assert_eq!(
             (read.status, read.code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
+            (400, Some("ResourceNotFoundException")),
             "a machine of a deleted hypervisor must not be readable, got {} {:?}",
             read.status,
             read.body
