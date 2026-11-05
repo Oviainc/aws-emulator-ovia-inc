@@ -919,6 +919,8 @@ mod revoke_security_group_ingress;
 mod route_server_endpoints;
 #[path = "all/route_server_peers.rs"]
 mod route_server_peers;
+#[path = "all/route_server_routing_database.rs"]
+mod route_server_routing_database;
 #[path = "all/route_servers.rs"]
 mod route_servers;
 // What `DescribeScheduledInstanceAvailability` computes a schedule search from — the Scheduled
