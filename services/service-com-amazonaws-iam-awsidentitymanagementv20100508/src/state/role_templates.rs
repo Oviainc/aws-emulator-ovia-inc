@@ -6,9 +6,10 @@
 //! One concern, held in one place: the catalog [`PUBLISHED_ROLE_TEMPLATES`], the row types
 //! ([`PublishedRoleTemplate`], [`PublishedTemplateParameter`]), the lookups over them
 //! ([`published_role_template`], [`published_role_template_version`]), the `@{parameter}`
-//! substitution every templated member goes through ([`substitute_parameters`]) and the
-//! wording of a call addressing a template the account holds none of
-//! ([`role_template_not_found`]).
+//! substitution every templated member goes through ([`substitute_parameters`]), the FORM a
+//! caller-supplied `TemplateArn` has to take ([`role_template_arn_refusal`]) and the wording
+//! of a call addressing a template nothing resolves ([`role_template_not_found`] for
+//! `AcquireRole`, [`role_template_version_not_found`] for `GetRoleTemplateVersion`).
 
 #[allow(unused_imports)]
 use super::*;
@@ -25,12 +26,74 @@ use super::*;
 /// It names the TEMPLATE and nothing else: the resource such a call addresses is the role
 /// template, which its ARN identifies — the minor version is a separate parameter of the
 /// request rather than part of what identifies the resource — so a minor version the
-/// account holds no such version of is described by this one sentence too. Stated ONCE here
-/// so `AcquireRole` and `GetRoleTemplateVersion` cannot describe the same missing template
-/// two ways.
+/// account holds no such version of is described by this one sentence too.
+///
+/// This is the sentence `AcquireRole` refuses a template it cannot create from with.
+/// `GetRoleTemplateVersion` answers its own, measured sentence
+/// ([`role_template_version_not_found`]): both live here, so the wording of an absent role
+/// template is stated in ONE module and a reader sees at a glance which operation answers
+/// which.
 pub fn role_template_not_found(template_arn: &str) -> String {
     format!("Role template not found: {template_arn}")
 }
+
+/// The message a READ of a role template version nothing resolves is refused with — the
+/// `NoSuchEntityException` message, whose fixed text is `Role Template `, the ARN the request
+/// supplied, and ` cannot be found.`
+///
+/// MEASURED wording, for `GetRoleTemplateVersion`: the `<Entity> … cannot be found.` form IAM
+/// words an absent entity with, with the entity named by the ARN that identifies it and
+/// nothing else quoted. The ARN comes from the REQUEST, so the fixed text is the sentence and
+/// the ARN is the slot.
+///
+/// It names the TEMPLATE and nothing else, for the reason [`role_template_not_found`] gives,
+/// so a minor version the resolved template does not carry is described by this one sentence
+/// too.
+pub fn role_template_version_not_found(template_arn: &str) -> String {
+    format!("Role Template {template_arn} cannot be found.")
+}
+
+/// How IAM refuses a role-template ARN whose ACCOUNT field is not the publisher every role
+/// template's ARN carries ([`AWS_MANAGED_POLICY_ACCOUNT`]).
+///
+/// MEASURED wording, entirely fixed: it quotes neither the member nor the value, and states
+/// the field and the form the ARN has to take instead.
+///
+/// A stronger rule than [`TEMPLATE_ARN_WITH_ACCOUNT_NUMBER`], which refuses only an account
+/// field of digits and so admits the account-less and other-publisher forms this one refuses.
+/// That sentence stays what `CreateDelegationRequest` refuses a POLICY-template ARN with,
+/// whose own wording this rule does not speak to.
+pub const ROLE_TEMPLATE_ARN_WRONG_ACCOUNT: &str =
+    "The specified role template ARN is not valid. The ARN must use 'aws' as the account \
+     field (e.g., arn:aws:iam::aws:role-template/...).";
+
+/// What `value` is not, as a role template's ARN — the sentence the reading that refused it
+/// is stated with — or `None` when it IS one.
+///
+/// `arnType` bounds only the length (20..2048), so the FORM of a caller-supplied `TemplateArn`
+/// is read here, in ONE place, before any template is resolved: a member documented as "the
+/// Amazon Resource Name (ARN) of the role template" has to carry that ARN, and a value that
+/// does not is one IAM cannot accept rather than a template that happens to be missing.
+///
+/// The three readings narrow one parse down in the order they exclude more — it has to be an
+/// ARN ([`ARN_UNPARSEABLE`]), then the ARN of a role template in IAM's own namespace
+/// ([`ARN_WRONG_RESOURCE_TYPE`]), then one whose account field names the publisher
+/// ([`ROLE_TEMPLATE_ARN_WRONG_ACCOUNT`]) — so one value cannot answer two sentences. The six
+/// fields come from the crate's ONE caller-supplied-ARN parse (`service_common::arn`).
+pub fn role_template_arn_refusal(value: &str) -> Option<&'static str> {
+    let Some(arn) = ::service_common::arn::parse(value) else {
+        return Some(ARN_UNPARSEABLE);
+    };
+    if arn.vendor != IAM_ARN_VENDOR || arn.resource_type() != ROLE_TEMPLATE_ARN_RESOURCE {
+        return Some(ARN_WRONG_RESOURCE_TYPE);
+    }
+    (arn.account != AWS_MANAGED_POLICY_ACCOUNT).then_some(ROLE_TEMPLATE_ARN_WRONG_ACCOUNT)
+}
+
+/// The ARN vendor field an IAM resource carries — the service namespace that says a value
+/// names something of IAM's at all, which a role template's ARN has to spell
+/// ([`role_template_arn_refusal`]).
+const IAM_ARN_VENDOR: &str = "iam";
 
 /// The `@{` ... `}` placeholder a role template's patterns carry, as
 /// `RoleTemplateVersion$RoleNamePattern` states it: "the pattern can include

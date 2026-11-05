@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRoleTemplateVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRoleTemplateVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! ## What this operation answers on the wire
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRoleTemplateVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED, and a READ: it "retrieves information about a version of the specified role
+//! template" and writes nothing. The `TemplateArn` the request carries, with the minor
+//! version it names, is resolved through the ONE resolution this crate holds
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::role_template_version`])
+//! — the templates the account recorded itself first, and otherwise the ones AWS services
+//! publish ([`crate::state::PUBLISHED_ROLE_TEMPLATES`]) — so this reader and `AcquireRole`
+//! cannot address two different versions of one template, and what this reports is exactly
+//! the version a role is created from.
+//!
+//! "If you do not specify a minor version, the service returns the template's default minor
+//! version" (`GetRoleTemplateVersion$MinorVersion`), which that same resolution decides.
+//!
+//! The version is reported AS HELD, including `Enabled` and `VersionEnabled`: a disabled
+//! template is one no role can be created from, which is what `AcquireRole` refuses, while
+//! reporting it is how a caller learns that it is disabled — and this operation models no
+//! refusal for a disabled template.
+//!
+//! The refusals, each the modelled one for what it refuses:
+//!
+//! * a `TemplateArn` whose FORM is not that of a role template's ARN is a value IAM cannot
+//!   accept rather than a template that happens to be missing, so it is refused before the
+//!   store is read at all: `400` `<Code>ValidationError</Code>` — the MEASURED code for this
+//!   operation's refusal of such a value, and the code IAM answers a value it cannot accept
+//!   with throughout this API (`CreateDelegationRequest` answers its own two ARN members with
+//!   it), rather than the modelled `InvalidInputException`'s `<Code>InvalidInput</Code>`,
+//!   which no reading of this member produces — worded with the sentence for the reading that
+//!   refused it, through the ONE reading of a caller-supplied role-template ARN this crate
+//!   holds ([`crate::state::role_template_arn_refusal`]).
+//! * an ARN this service resolves no template under, and a minor version no such template
+//!   carries, reference "a resource entity that does not exist": `404`
+//!   `<Code>NoSuchEntity</Code>` naming the template the request addressed
+//!   ([`crate::state::role_template_version_not_found`], the sentence measured for this
+//!   READ, which `crate::state::role_templates` holds beside the one `AcquireRole` refuses a
+//!   template it cannot create from with).
+//!
+//! A caller whose identity-based policies do not permit the call is refused before the
+//! template is resolved, `403` `<Code>AccessDenied</Code>`
+//! ([`crate::state::authorization::authorize_named`]), so a refused caller learns nothing
+//! about which templates the account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +183,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRoleTemplateVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRoleTemplateVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRoleTemplateVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRoleTemplateVersionErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `arnType` bounds only the length (20..2048), so the FORM of the value is read
+        // before the store is touched at all, through the ONE reading of a caller-supplied
+        // role-template ARN this crate holds: a value whose form is not that ARN is one IAM
+        // cannot accept rather than a template that happens to be missing, and the sentence
+        // it answers is the one for the reading that refused it.
+        if let Some(refusal) = crate::state::role_template_arn_refusal(&input.template_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
+
+        // A READ: the store is only consulted, so reporting a template version changes
+        // nothing a later caller sees.
+        let store = state.lock();
+
+        // IAM decides a call against the caller's policies before it reads the resource,
+        // and on the ARN of the TEMPLATE the request names — the same ARN whether or not
+        // the account holds a template under it, which is what keeps a refused caller from
+        // learning which templates the account holds.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_ROLE_TEMPLATE_VERSION,
+            &input.template_arn,
+            &format!("role template {}", input.template_arn),
+        )?;
+
+        // "If you do not specify a minor version, the service returns the template's
+        // default minor version" — the one resolution of that rule this crate holds,
+        // shared with `AcquireRole`, so the version reported here is the version a role
+        // would be created from.
+        let Some(version) = store.role_template_version(&input.template_arn, input.minor_version)
+        else {
+            // An ARN this service resolves no template under and a minor version no such
+            // template carries are the same missing resource — the role template the
+            // request addressed — so both carry the family's one sentence.
+            return Err(GetRoleTemplateVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::role_template_version_not_found(
+                        &input.template_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetRoleTemplateVersionOutput {
+            role_template_version: version,
+        })
     }
 }

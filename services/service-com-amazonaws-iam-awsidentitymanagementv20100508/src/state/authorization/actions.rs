@@ -187,6 +187,9 @@ pub const ASSOCIATE_DELEGATION_REQUEST: &str = "iam:AssociateDelegationRequest";
 /// `iam:AcquireRole`.
 pub const ACQUIRE_ROLE: &str = "iam:AcquireRole";
 
+/// `iam:GetRoleTemplateVersion`.
+pub const GET_ROLE_TEMPLATE_VERSION: &str = "iam:GetRoleTemplateVersion";
+
 /// `iam:GenerateCredentialReport`.
 pub const GENERATE_CREDENTIAL_REPORT: &str = "iam:GenerateCredentialReport";
 

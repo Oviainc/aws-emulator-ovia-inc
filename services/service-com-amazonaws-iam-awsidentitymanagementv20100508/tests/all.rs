@@ -259,12 +259,14 @@ mod role_protection_and_refusal_messages;
 mod role_settings;
 #[path = "all/role_tag_listing.rs"]
 mod role_tag_listing;
-#[path = "all/role_template_acquisition.rs"]
-mod role_template_acquisition;
 #[path = "all/role_tag_removal.rs"]
 mod role_tag_removal;
 #[path = "all/role_tags.rs"]
 mod role_tags;
+#[path = "all/role_template_acquisition.rs"]
+mod role_template_acquisition;
+#[path = "all/role_template_version_reads.rs"]
+mod role_template_version_reads;
 #[path = "all/role_trust_policy.rs"]
 mod role_trust_policy;
 #[path = "all/saml_provider_deletion.rs"]
