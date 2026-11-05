@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let caller = crate::state::caller_arn(ctx.parts());
+        // The same containers `CreateFlow` materialises on a definition it stores, so a
+        // re-defined flow is shaped exactly like a created one and a read of it answers
+        // with the same members.
+        crate::state::materialize_definition_containers(
+            &mut input.trigger_config,
+            &mut input.destination_flow_config_list,
+            &mut input.tasks,
+            &mut input.metadata_catalog_config,
+        );
+        let input = input;
         // A definition this service cannot render is a fault in the service, not in the
         // request, so it is reported as one rather than as a rejected input.
         let unrenderable = || {

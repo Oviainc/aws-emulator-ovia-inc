@@ -19,6 +19,8 @@ mod connector_describe;
 mod flow_execution_cancellation;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/flow_state_fidelity.rs"]
+mod flow_state_fidelity;
 #[path = "all/flow_update.rs"]
 mod flow_update;
 #[path = "all/state_roundtrip.rs"]

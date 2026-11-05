@@ -9,7 +9,9 @@
 //!
 //! The modelled shapes (`TriggerConfig`, `SourceFlowConfig`, `Task`, …) are stored as
 //! they arrived rather than re-modelled, so `DescribeFlow` can return exactly what
-//! `CreateFlow` was given.
+//! `CreateFlow` was given — with the configuration containers AppFlow itself materialises
+//! filled in on the way in (see [`materialize_definition_containers`]), because they are
+//! part of the definition the service keeps.
 //!
 //! Beside the account's own resources it also holds the CATALOG of connectors AppFlow
 //! vends — a property of the service rather than of the account, which is why it is a
@@ -103,6 +105,85 @@ pub fn scheduled_trigger_missing_schedule(trigger_config: &TriggerConfig) -> boo
             .as_ref()
             .and_then(|properties| properties.scheduled.as_ref())
             .is_none()
+}
+
+/// The status a flow is STORED with, decided by the trigger that runs it.
+///
+/// A flow AppFlow runs only when a caller asks for it is finished the moment it is
+/// stored, so it is created ACTIVE and can be run straight away. A flow that runs
+/// itself — on a schedule, or on an event in the source application — is created as a
+/// DRAFT, because its trigger has not been armed yet; activating it is what `StartFlow`
+/// does for such a flow (see [`Flow::activate_trigger`]).
+///
+/// Shared by every operation that stores a new definition, so no two of them can decide
+/// a flow's initial status differently. The two value sets are the model's
+/// (`smithy_query(query="shape", shape="FlowStatus,TriggerType")`); which status goes
+/// with which trigger type is recorded behaviour.
+pub fn initial_flow_status(trigger_config: &TriggerConfig) -> FlowStatus {
+    if trigger_config.trigger_type == TRIGGER_TYPE_ON_DEMAND {
+        FlowStatus::Active
+    } else {
+        FlowStatus::Draft
+    }
+}
+
+/// Fill in the configuration containers AppFlow MATERIALISES on the flow it stores.
+///
+/// A flow's stored definition is not the sparse request body it arrived in: AppFlow
+/// fills in the containers whose contents it defaults — the trigger's properties, each
+/// task's properties, the prefix configuration of an S3 output format, and the metadata
+/// catalog configuration — so every flow carries them, empty where nothing inside was
+/// configured, and a read of the flow answers with the container rather than omitting
+/// it. The members INSIDE a container are left exactly as they arrived: nothing here
+/// invents a value.
+///
+/// Shared by every operation that stores a definition (`CreateFlow`, `UpdateFlow`), so
+/// the two cannot store two different shapes of the same flow — and applied before a
+/// definition is compared with a stored one, so a retry carrying the sparse body still
+/// compares equal to what was stored for it.
+pub fn materialize_definition_containers(
+    trigger_config: &mut TriggerConfig,
+    destination_flow_config_list: &mut [DestinationFlowConfig],
+    tasks: &mut [Task],
+    metadata_catalog_config: &mut Option<MetadataCatalogConfig>,
+) {
+    trigger_config.trigger_properties.get_or_insert_default();
+    for destination in destination_flow_config_list {
+        // Only the S3 destination has an output format whose prefix configuration is
+        // optional; Upsolver's `UpsolverS3OutputFormatConfig$prefixConfig` is required,
+        // so it is already present on every stored flow.
+        if let Some(output_format) = destination
+            .destination_connector_properties
+            .s3
+            .as_mut()
+            .and_then(|s3| s3.s3_output_format_config.as_mut())
+        {
+            output_format.prefix_config.get_or_insert_default();
+        }
+    }
+    for task in tasks {
+        task.task_properties.get_or_insert_default();
+    }
+    metadata_catalog_config.get_or_insert_default();
+}
+
+/// The KMS key AppFlow manages for an account, as the key ARN a flow reports.
+///
+/// "This is required if you do not want to use the Amazon AppFlow-managed KMS key. If
+/// you don't provide anything here, Amazon AppFlow uses the Amazon AppFlow-managed KMS
+/// key" (`smithy_query(query="doc", shape="CreateFlowRequest", member="kmsArn")`) — so
+/// every flow has a key, and a read of a flow reports the key that encrypts it rather
+/// than only a key the caller chose to name.
+///
+/// The key ID is the one KMS minted for the key, so it is opaque: this emulator mints it
+/// ONCE for the account (see
+/// [`ComAmazonawsAppflowSandstoneconfigurationservicelambdaState::managed_kms_key_arn`])
+/// and every flow that names no key of its own reports that same key, which is what
+/// makes it the account's managed key rather than a value made up per flow. The ARN
+/// satisfies `KMSArn`'s `^arn:aws:kms:.*:[0-9]+:`
+/// (`smithy_query(query="shape", shape="KMSArn")`).
+pub fn kms_key_arn(region: &str, key_id: &str) -> String {
+    ::emulator_server::emulator_arn("kms", region, &format!("key/{key_id}"))
 }
 
 /// A flow's `flowStatus` (`smithy_query(query="shape", shape="FlowStatus")`).
@@ -284,6 +365,24 @@ impl Flow {
     /// event.
     pub fn is_on_demand(&self) -> bool {
         self.trigger_config.trigger_type == TRIGGER_TYPE_ON_DEMAND
+    }
+
+    /// Arm the trigger of a flow that runs ITSELF, answering whether this call armed it.
+    ///
+    /// A schedule- or event-triggered flow is stored as a draft (see
+    /// [`initial_flow_status`]); `StartFlow` on such a flow activates its trigger
+    /// instead of running it now, which is why that call "[r]eturns the internal
+    /// execution ID of an on-demand flow when the flow is started. For scheduled or
+    /// event-triggered flows, this value is null"
+    /// (`smithy_query(query="doc", shape="StartFlowResponse", member="executionId")`).
+    /// An on-demand flow has no trigger to arm — it is already active — so nothing moves
+    /// for one.
+    pub fn activate_trigger(&mut self) -> bool {
+        if self.is_on_demand() || self.flow_status != FlowStatus::Draft {
+            return false;
+        }
+        self.flow_status = FlowStatus::Active;
+        true
     }
 
     /// The DEFINITION this flow was created with, as one comparable value, so a retried
@@ -497,6 +596,11 @@ pub struct ComAmazonawsAppflowSandstoneconfigurationservicelambdaState {
     /// Reserved for the connector-registration slice (`RegisterConnector`), which is
     /// still scaffolded. Keyed by `connectorLabel`.
     pub registered_connectors: BTreeMap<String, crate::ops::types::ConnectorDetail>,
+    /// The key id of the AppFlow-managed KMS key this account's flows are encrypted
+    /// with, minted on the first flow that names no key of its own (see
+    /// [`Self::managed_kms_key_arn`]). ONE id for the account, so nothing a request can
+    /// choose — the region it is signed for, the number of flows — grows this store.
+    pub managed_kms_key_id: Option<String>,
 }
 
 impl ComAmazonawsAppflowSandstoneconfigurationservicelambdaState {
@@ -508,6 +612,18 @@ impl ComAmazonawsAppflowSandstoneconfigurationservicelambdaState {
         self.flows
             .values()
             .find(|flow| flow.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The ARN of the AppFlow-managed KMS key for a flow in `region`, minting the key on
+    /// first use.
+    ///
+    /// The key belongs to the ACCOUNT rather than to a flow, so it is minted once and
+    /// then reported by every flow created without a key of its own: two flows cannot
+    /// report two different managed keys, and a flow reports the same key every time it
+    /// is read. See [`kms_key_arn`] for why the key id is opaque.
+    pub fn managed_kms_key_arn(&mut self, region: &str) -> String {
+        let key_id = self.managed_kms_key_id.get_or_insert_with(new_key_id);
+        kms_key_arn(region, key_id)
     }
 }
 
@@ -730,6 +846,14 @@ pub fn schema_descriptor(tasks: &[Task]) -> ::serde_json::Value {
 /// concurrently.
 pub fn new_execution_id() -> String {
     ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// A fresh KMS key id: the opaque, canonically hyphenated UUID KMS mints for a key.
+///
+/// The same uuid-backed generator [`new_execution_id`] uses, for the same reason — an id
+/// a service mints is opaque to its caller, and nothing here is a hand-rolled generator.
+pub fn new_key_id() -> String {
+    new_execution_id()
 }
 
 /// The smallest page the model allows a caller to ask for (`MaxResults`'s lower

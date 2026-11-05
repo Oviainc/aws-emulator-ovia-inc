@@ -258,12 +258,12 @@ async fn update_flow_replaces_the_definition_describe_flow_returns() {
     for (index, case) in update_cases().into_iter().enumerate() {
         let flow_name = format!("update-case-{index}");
         let before = create_base_flow(&router, case.name, &flow_name).await;
-        // The base flow is a draft: nothing has completed its definition yet, so the
-        // activation below is a transition this update made.
+        // The base flow runs on demand, so it was stored ready to run; an update does not
+        // move it out of that status.
         assert_eq!(
             before.string("flowStatus"),
-            "Draft",
-            "case {:?}: expected the created on-demand flow to be a draft, got {:?}",
+            "Active",
+            "case {:?}: expected the created on-demand flow to be active, got {:?}",
             case.name,
             before.get("flowStatus")
         );
@@ -296,12 +296,21 @@ async fn update_flow_replaces_the_definition_describe_flow_returns() {
         );
 
         // Every member the update carried is what a later read returns; a member it
-        // omitted is gone, because an update re-defines the flow rather than patching it.
+        // omitted is gone, because an update re-defines the flow rather than patching it
+        // — except for a container AppFlow materialises on every flow, which is left
+        // empty rather than absent.
         for member in UPDATABLE_MEMBERS {
             match request.get(member) {
                 Some(sent) => assert!(
                     contains(after.get(member), sent),
                     "case {:?}: expected DescribeFlow to return the updated {member}\n  sent: {sent}\n  got:  {}",
+                    case.name,
+                    after.get(member)
+                ),
+                None if member == "metadataCatalogConfig" => assert_eq!(
+                    after.get(member),
+                    &json!({}),
+                    "case {:?}: expected the omitted {member} to be cleared to its empty container, got {:?}",
                     case.name,
                     after.get(member)
                 ),

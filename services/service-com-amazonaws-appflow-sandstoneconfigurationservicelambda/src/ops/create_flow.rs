@@ -187,6 +187,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::caller_arn(ctx.parts());
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.clone().unwrap_or_default().into_iter().collect();
+        let mut store = state.lock();
+
+        // The definition AppFlow STORES, rather than the sparse body it arrived in: the
+        // containers AppFlow materialises are filled in, and the flow's encryption key
+        // is resolved, before the definition is compared or persisted — so a retry
+        // carrying the same body renders the same definition the first call stored.
+        let mut trigger_config = input.trigger_config;
+        let mut destination_flow_config_list = input.destination_flow_config_list;
+        let mut tasks = input.tasks;
+        let mut metadata_catalog_config = input.metadata_catalog_config;
+        crate::state::materialize_definition_containers(
+            &mut trigger_config,
+            &mut destination_flow_config_list,
+            &mut tasks,
+            &mut metadata_catalog_config,
+        );
+        let kms_arn = match input.kms_arn {
+            Some(requested) => requested,
+            None => store.managed_kms_key_arn(&region),
+        };
         // The definition this request carries, as one comparable value. A definition
         // this service cannot render is a fault in the service, not in the request, so
         // it is reported as one rather than as a rejected input.
@@ -201,17 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_definition = crate::state::definition_descriptor(
             &input.flow_name,
             input.description.as_deref(),
-            input.kms_arn.as_deref(),
-            &input.trigger_config,
+            Some(kms_arn.as_str()),
+            &trigger_config,
             &input.source_flow_config,
-            &input.destination_flow_config_list,
-            &input.tasks,
+            &destination_flow_config_list,
+            &tasks,
             &tags,
-            input.metadata_catalog_config.as_ref(),
+            metadata_catalog_config.as_ref(),
         )
         .ok_or_else(unrenderable)?;
-
-        let mut store = state.lock();
 
         // A retried CreateFlow carrying the same `@idempotencyToken` answers with the
         // FIRST result, rather than the conflict a second create would raise — unless
@@ -264,18 +282,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let flow_status = if input.trigger_config.trigger_type
-            == crate::state::TRIGGER_TYPE_ON_DEMAND
-        {
-            // Creating an on-demand flow does not activate it: it stays a draft until
-            // a caller runs it.
-            crate::state::FlowStatus::Draft
-        } else {
-            // A scheduled or event-triggered flow runs without being asked, so
-            // creating it activates it.
-            crate::state::FlowStatus::Active
-        };
-
         let flow_name = input.flow_name.clone();
         let flow = crate::state::Flow {
             flow_arn: crate::state::flow_arn(&region, &flow_name),
@@ -284,15 +290,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No `UpdateFlow` has re-defined this flow yet.
             last_update_client_token: None,
             description: input.description,
-            kms_arn: input.kms_arn,
-            flow_status,
+            kms_arn: Some(kms_arn),
+            flow_status: crate::state::initial_flow_status(&trigger_config),
             flow_status_message: None,
-            trigger_config: input.trigger_config,
+            trigger_config,
             source_flow_config: input.source_flow_config,
-            destination_flow_config_list: input.destination_flow_config_list,
-            tasks: input.tasks,
+            destination_flow_config_list,
+            tasks,
             tags,
-            metadata_catalog_config: input.metadata_catalog_config,
+            metadata_catalog_config,
             created_at: now,
             last_updated_at: now,
             created_by: caller.clone(),

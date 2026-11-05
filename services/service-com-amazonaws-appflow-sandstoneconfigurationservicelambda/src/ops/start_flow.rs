@@ -175,8 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // Starting a schedule- or event-triggered flow ACTIVATES it, so one that is
-        // already active has nothing left to start.
+        // Starting a schedule- or event-triggered flow ARMS its trigger, so one whose
+        // trigger is already armed has nothing left to start.
         if !flow.is_on_demand() && flow.flow_status == crate::state::FlowStatus::Active {
             return Err(StartFlowErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
@@ -189,11 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Starting a flow does not re-define it, so nothing about the stored definition
         // moves here: `lastUpdatedAt`/`lastUpdatedBy` describe the definition, and only
-        // the run history below changes. Re-activating a schedule- or event-triggered
-        // flow that is NOT `Active` is unreachable in this slice (`CreateFlow` stores
-        // such a flow `Active`, and the check above refuses one that is), so it is left
-        // to the slice that first moves a flow out of `Active` — `StopFlow`,
-        // `UpdateFlow` — rather than sitting here untested.
+        // the trigger and the run history below change.
+        //
+        // A flow that runs ITSELF is activated rather than run now, and reports no run:
+        // `executionId` "[r]eturns the internal execution ID of an on-demand flow when
+        // the flow is started. For scheduled or event-triggered flows, this value is
+        // null" (`smithy_query(query="doc", shape="StartFlowResponse",
+        // member="executionId")`). Only an on-demand flow starts a run here.
+        if flow.activate_trigger() {
+            return Ok(StartFlowOutput {
+                flow_arn: Some(flow.flow_arn.clone()),
+                flow_status: Some(flow.flow_status.as_str().to_string()),
+                execution_id: None,
+            });
+        }
+
         let execution_id = crate::state::new_execution_id();
         flow.record_execution(crate::state::FlowExecution {
             execution_id: execution_id.clone(),

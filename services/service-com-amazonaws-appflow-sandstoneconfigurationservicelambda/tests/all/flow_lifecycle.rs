@@ -241,7 +241,7 @@ fn flow_cases() -> Vec<FlowCase> {
                 "tasks": [map_task("order_id", "id")],
                 "tags": { "env": "test", "team": "data" }
             }),
-            expected_status: "Draft",
+            expected_status: "Active",
         },
         FlowCase {
             name: "scheduled salesforce to s3 with two tasks",
@@ -252,7 +252,7 @@ fn flow_cases() -> Vec<FlowCase> {
                 "destinationFlowConfigList": [s3_destination("salesforce-archive")],
                 "tasks": [filter_task(&["Id", "Name"]), map_task("Name", "name")]
             }),
-            expected_status: "Active",
+            expected_status: "Draft",
         },
         FlowCase {
             name: "event marketo to eventbridge",
@@ -264,7 +264,7 @@ fn flow_cases() -> Vec<FlowCase> {
                 "tasks": [map_task("leadId", "lead_id")],
                 "tags": { "env": "prod" }
             }),
-            expected_status: "Active",
+            expected_status: "Draft",
         },
         FlowCase {
             name: "on-demand s3 to s3 with kms and catalog config",
@@ -283,7 +283,7 @@ fn flow_cases() -> Vec<FlowCase> {
                     }
                 }
             }),
-            expected_status: "Draft",
+            expected_status: "Active",
         },
     ]
 }
@@ -724,8 +724,8 @@ async fn start_flow_records_a_run_that_describe_flow_execution_records_returns()
     );
     assert_eq!(
         described.string("flowStatus"),
-        FlowStatus::Draft.as_str(),
-        "expected running an on-demand flow to leave it unactivated, got {:?}",
+        FlowStatus::Active.as_str(),
+        "expected running an on-demand flow to leave it active, got {:?}",
         described.get("flowStatus")
     );
 
@@ -804,9 +804,24 @@ async fn an_already_activated_scheduled_flow_cannot_be_started_again() {
     .await;
     assert_eq!(
         created.string("flowStatus"),
-        FlowStatus::Active.as_str(),
-        "expected creating a scheduled flow to activate it, got {:?}",
+        FlowStatus::Draft.as_str(),
+        "expected creating a scheduled flow to leave its schedule unarmed, got {:?}",
         created.get("flowStatus")
+    );
+
+    // Starting it ARMS the schedule rather than running the flow now, so it reports no
+    // run and the flow becomes active.
+    let activated = call(&router, "/start-flow", &json!({ "flowName": flow_name })).await;
+    assert_eq!(
+        activated.string("flowStatus"),
+        FlowStatus::Active.as_str(),
+        "expected starting a scheduled flow to activate it, got {:?}",
+        activated.get("flowStatus")
+    );
+    assert!(
+        activated.get("executionId").is_null(),
+        "expected no run id for a scheduled flow, got {:?}",
+        activated.get("executionId")
     );
 
     let refused = call(&router, "/start-flow", &json!({ "flowName": flow_name })).await;
