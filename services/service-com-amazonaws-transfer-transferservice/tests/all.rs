@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -126,7 +124,6 @@ mod certificate_import;
 // `connector_remote_operations` is declared HERE rather than in its alphabetical place
 // beside the other `connector_*` suites, for the reason the notes above record: the
 // sorted list is where every concurrent change inserts. Fold it into the list once the
-// churn settles.
 #[path = "all/connector_remote_operations.rs"]
 mod connector_remote_operations;
 // `connector_plane`, likewise: the provisioning update that brings a connector into
@@ -138,6 +135,10 @@ mod connector_plane;
 // every concurrent change inserts. Fold it into the list once the churn settles.
 #[path = "all/connector_gated_workflow.rs"]
 mod connector_gated_workflow;
+// `agreement_updates`, likewise: what `UpdateAgreement` persists onto a stored
+// agreement, and what the read that follows it reports.
+#[path = "all/agreement_updates.rs"]
+mod agreement_updates;
 // `end_to_end_transfer_flow`, likewise appended rather than inserted: the whole documented
 // connector flow, polled the way a client polls it.
 #[path = "all/end_to_end_transfer_flow.rs"]

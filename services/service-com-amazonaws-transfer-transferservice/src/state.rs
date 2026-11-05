@@ -4181,6 +4181,35 @@ pub fn agreement_directory_violation(
     )
 }
 
+/// The documented cross-member requirement an agreement UPDATE's directory
+/// configuration violates, worded as the refusal states it — `None` when it violates
+/// none.
+///
+/// `UpdateAgreement` states the same sentence the create does ("Specify either
+/// `BaseDirectory` or `CustomDirectories`, but not both. Specifying both causes the
+/// command to fail."), and then states what naming ONE of them does to the other: "If
+/// you update an agreement from using base directory to custom directories, the base
+/// directory is no longer used. Similarly, if you change from custom directories to a
+/// base directory, the custom directories are no longer used." So an update can only
+/// violate the "not both" half: a request naming NEITHER replaces neither, and leaves
+/// the agreement with the one configuration it was written with — which is why
+/// [`agreement_directory_violation`]'s other half, the one that reports that nothing
+/// configures the resource, cannot apply to an update. The wording of the half that
+/// does apply is [`not_both_of`]'s, so the create and the update report the same
+/// condition the same way.
+///
+/// What counts as "specified" is EMPTINESS, exactly as at create time
+/// ([`agreement_base_directory`]): a blank `BaseDirectory` names no directory, so it
+/// neither replaces the agreement's configuration nor makes the request name two.
+pub fn agreement_directory_update_violation(
+    base_directory: Option<&str>,
+    custom_directories: Option<&CustomDirectoriesType>,
+) -> Option<String> {
+    let based = agreement_base_directory(base_directory).is_some();
+    (based && custom_directories.is_some())
+        .then(|| not_both_of("BaseDirectory", "CustomDirectories"))
+}
+
 impl ComAmazonawsTransferTransferserviceState {
     /// The agreements stored for `server_id`, in `ListAgreements` paging order.
     ///

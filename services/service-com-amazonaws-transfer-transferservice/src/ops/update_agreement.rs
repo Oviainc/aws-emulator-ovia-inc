@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgreement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgreement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgreement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies to the stored agreement every member the request names, leaves every member
+//! it does not name as the agreement already had it, and answers the `AgreementId` it
+//! updated — so `DescribeAgreement` reports the updated record rather than the one the
+//! create wrote. The two directory configurations are alternatives, so naming one clears
+//! the other; naming BOTH is refused and nothing is written, as are a
+//! `(ServerId, AgreementId)` pair the store does not hold and a profile id it cannot
+//! resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +197,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgreement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgreementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgreement"))
+        use crate::state as st;
+
+        // The agreement is addressed by the identifiers the request carries and keeps
+        // the ARN it was minted with, so this operation reads no request metadata; the
+        // engine comes from `self`.
+        let _ = ctx;
+
+        // A directory configuration the service would never write is refused BEFORE
+        // anything is read or written, with the modelled `InvalidRequestException`
+        // (HTTP 400) the model documents as "thrown when the client submits a malformed
+        // request": this operation's own documentation states "Specify either
+        // BaseDirectory or CustomDirectories, but not both. Specifying both causes the
+        // command to fail."
+        if let Some(message) = st::agreement_directory_update_violation(
+            input.base_directory.as_deref(),
+            input.custom_directories.as_ref(),
+        ) {
+            return Err(UpdateAgreementErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgreementErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // A profile the update names must RESOLVE, on the create's rule: an agreement is
+        // what the service combines out of a server and two profiles, so an id the store
+        // does not hold is refused rather than written into an agreement whose
+        // references nothing else can resolve. Read before the record is reached for
+        // writing, so neither member is applied when either one is unresolvable.
+        let unresolved_profile = [&input.local_profile_id, &input.partner_profile_id]
+            .into_iter()
+            .flatten()
+            .find(|profile_id| !guard.profiles.contains_key(*profile_id))
+            .cloned();
+
+        // An agreement is addressed by the pair the model makes `AgreementResource`'s
+        // identifiers, so the lookup is that pair, exactly as `DescribeAgreement`
+        // resolves it: a `(ServerId, AgreementId)` the store does not hold — never
+        // created, or already deleted — is this service's not-found refusal, and it
+        // leaves the store untouched. The addressed resource is resolved FIRST, so a
+        // request that misses it is answered for that rather than for a reference it
+        // carries.
+        let key = (input.server_id.clone(), input.agreement_id.clone());
+        let stored = guard.agreements.get_mut(&key).ok_or_else(|| {
+            st::not_found(UpdateAgreementErrorModeled::ResourceNotFoundException(
+                st::unknown_agreement(&input.agreement_id),
+            ))
+        })?;
+        if let Some(profile_id) = unresolved_profile {
+            return Err(st::not_found(
+                UpdateAgreementErrorModeled::ResourceNotFoundException(st::unknown_profile(
+                    &profile_id,
+                )),
+            ));
+        }
+
+        // Nothing can be refused past here. Each member the request names REPLACES the
+        // stored one ("To replace the existing description, provide a short description
+        // for the agreement"; "You can update the status for the agreement, either
+        // activating an inactive agreement or the reverse"), and each member it leaves
+        // out keeps the value the agreement already has, so updating one setting cannot
+        // reset another. None of these members carries an update-time default: an absent
+        // member names no new value at all.
+        if let Some(description) = input.description {
+            stored.description = Some(description);
+        }
+        if let Some(status) = input.status {
+            stored.status = status;
+        }
+        if let Some(access_role) = input.access_role {
+            stored.access_role = access_role;
+        }
+        if let Some(local_profile_id) = input.local_profile_id {
+            stored.local_profile_id = local_profile_id;
+        }
+        if let Some(partner_profile_id) = input.partner_profile_id {
+            stored.partner_profile_id = partner_profile_id;
+        }
+        if let Some(preserve_filename) = input.preserve_filename {
+            stored.preserve_filename = preserve_filename;
+        }
+        if let Some(enforce_message_signing) = input.enforce_message_signing {
+            stored.enforce_message_signing = enforce_message_signing;
+        }
+        // The two directory configurations are ALTERNATIVES, so the one this update
+        // names replaces the other: "If you update an agreement from using base
+        // directory to custom directories, the base directory is no longer used.
+        // Similarly, if you change from custom directories to a base directory, the
+        // custom directories are no longer used." A blank `BaseDirectory` names no
+        // directory (`state::agreement_base_directory`), so it replaces nothing — the
+        // reading every other write in this crate gives that member.
+        if let Some(base_directory) = st::agreement_base_directory(input.base_directory.as_deref())
+        {
+            stored.base_directory = Some(base_directory);
+            stored.custom_directories = None;
+        } else if let Some(custom_directories) = input.custom_directories {
+            stored.custom_directories = Some(custom_directories);
+            stored.base_directory = None;
+        }
+        drop(guard);
+
+        Ok(UpdateAgreementOutput {
+            agreement_id: input.agreement_id,
+        })
     }
 }
