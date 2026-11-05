@@ -41,6 +41,11 @@ mod applicationinsights_resource_group_admission;
 // landing suites add their line to.
 #[path = "all/sagemaker_create_admission.rs"]
 mod sagemaker_create_admission;
+// Declared in this same head region, for the reason the entry above records: the appended
+// tail and the sorted `s…` span (where the other sagemaker suites land) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/sagemaker_execution_role_admission.rs"]
+mod sagemaker_execution_role_admission;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `g…` span (beside the other greengrass/glue suites) are both regions
 // concurrently landing suites add their line to.

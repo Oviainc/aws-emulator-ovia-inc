@@ -139,10 +139,12 @@ pub use admission::{
 /// single [`ComAmazonawsSagemakerSagemakerState::cluster_policies`] field.
 pub mod cluster_policy;
 
-/// The reader half of the HyperPod cluster slice: the one lookup that resolves the
-/// `ClusterNameOrArn` every cluster operation takes, and the `*Details` / `*Output`
-/// projections a reader builds from the [`Cluster`] record this module stores.
+/// The HyperPod cluster slice: the [`Cluster`] record `CreateCluster` writes with its
+/// quota, status span and id mint, the one lookup that resolves the `ClusterNameOrArn`
+/// every cluster operation takes, and the `*Details` / `*Output` projections a reader
+/// builds from the stored record.
 pub mod cluster;
+pub use cluster::*;
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
 /// also SageMaker's sigv4 signing name).
@@ -931,35 +933,100 @@ pub const APP_STATUS_IN_SERVICE: &str = "InService";
 /// flight, which never happens here.
 pub const STATUS_COMPLETED: &str = "Completed";
 
-// The algorithm slice lives in its own module file, re-exported so handlers keep naming
-// `crate::state::...`: see `state/algorithms.rs`.
+// One module file per resource slice of this state, each re-exported with `pub use` so
+// every handler keeps naming what it needs as `crate::state::…` whichever file holds it.
+// A slice owns its records, its bounds, its statuses and clock-owed spans, and the
+// sentences it refuses a request with. They live in their own files so this module stays
+// inside the project's file-length limit and so a slice's state reads as one unit instead
+// of another block appended to a shared region.
+
+/// The algorithm slice: see `state/algorithms.rs`.
 pub mod algorithms;
-
-// One module file per resource family, each holding that family's records, clock spans,
-// quotas and refusal wordings EXACTLY as they were written here, and each re-exported
-// below so every handler keeps naming them `crate::state::...`. They live in their own
-// files so this module stays inside the project's file-length limit and so a family's
-// state reads as one unit instead of another block appended to a shared region.
-mod custom_image;
-mod endpoints;
-mod experiments;
-mod feature_group;
-mod jobs;
-mod lineage;
-mod model_card;
-mod notebook_instance;
-mod pipeline_definition;
-
 pub use algorithms::*;
-pub use custom_image::*;
+
+/// The AI-benchmark-job slice: see `state/ai_benchmark_job.rs`.
+pub mod ai_benchmark_job;
+pub use ai_benchmark_job::*;
+
+/// The AI-workload-configuration slice: see `state/ai_workload_config.rs`.
+pub mod ai_workload_config;
+pub use ai_workload_config::*;
+
+/// The compute-allocation slice: see `state/compute_quota.rs`.
+pub mod compute_quota;
+pub use compute_quota::*;
+
+/// The hosting slice (endpoints and their configurations): see `state/endpoints.rs`.
+pub mod endpoints;
 pub use endpoints::*;
-pub use experiments::*;
+
+/// The experiment-management slice: see `state/experiment.rs`.
+pub mod experiment;
+pub use experiment::*;
+
+/// The experiment-tracking slice: see `state/trial_component.rs`.
+pub mod trial_component;
+pub use trial_component::*;
+
+/// Both experiment slices under one name, the way `state/experiments.rs` gathers them.
+pub mod experiments;
+
+/// The Feature Store control-plane slice: see `state/feature_group.rs`.
+pub mod feature_group;
 pub use feature_group::*;
+
+/// The custom-image slice: see `state/image.rs`.
+pub mod image;
+pub use image::*;
+
+/// The custom-image slice under the name `state/custom_image.rs` gathers it.
+pub mod custom_image;
+
+/// The job slices (training, processing and transform jobs): see `state/jobs.rs`.
+pub mod jobs;
 pub use jobs::*;
-pub use lineage::*;
+
+/// The lineage-action slice: see `state/lineage_action.rs`.
+pub mod lineage_action;
+pub use lineage_action::*;
+
+/// The lineage-association slice: see `state/lineage_association.rs`.
+pub mod lineage_association;
+pub use lineage_association::*;
+
+/// The lineage-context slice: see `state/lineage_context.rs`.
+pub mod lineage_context;
+pub use lineage_context::*;
+
+/// The lineage-group slice: see `state/lineage_group.rs`.
+pub mod lineage_group;
+pub use lineage_group::*;
+
+/// Every lineage slice under one name, the way `state/lineage.rs` gathers them.
+pub mod lineage;
+
+/// The MLflow tracking-server slice: see `state/mlflow_tracking_server.rs`.
+pub mod mlflow_tracking_server;
+pub use mlflow_tracking_server::*;
+
+/// The model-card slice: see `state/model_card.rs`.
+pub mod model_card;
 pub use model_card::*;
+
+/// The notebook-instance slice: see `state/notebook_instance.rs`.
+pub mod notebook_instance;
 pub use notebook_instance::*;
+
+/// The partner-AI-app slice: see `state/partner_app.rs`.
+pub mod partner_app;
+pub use partner_app::*;
+
+/// The pipeline-definition slice: see `state/pipeline_definition.rs`.
+pub mod pipeline_definition;
 pub use pipeline_definition::*;
+
+/// The resource-lookup slice: see `state/resource_lookups.rs`.
+pub mod resource_lookups;
 
 // ---------------------------------------------------------------------------
 // The resource-tagging slice: the ONE `ResourceArn` -> tag-list resolution that
@@ -3714,177 +3781,11 @@ pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
 // so this one resource kind reads as one slice.
 // ---------------------------------------------------------------------------
 
-/// The ARN resource kind an AI workload configuration carries, i.e. the `<kind>` in
-/// [`resource_arn`]. Fixed by `AIWorkloadConfigArn`'s modelled pattern
-/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:ai-workload-config/...`), and named
-/// once here so the create and the describe mint and match the same ARN.
-pub const AI_WORKLOAD_CONFIG_KIND: &str = "ai-workload-config";
-
-/// See [`MODEL_QUOTA`]. Bounds the AI workload configuration store the same way, and is
-/// what `CreateAIWorkloadConfig` answers `ResourceLimitExceeded` past.
-pub const AI_WORKLOAD_CONFIG_QUOTA: usize = 1_000;
-
-/// Why a reader could not resolve an AI workload configuration, named once here so every
-/// operation that READS one refuses an unknown name with the same sentence: the family's
-/// [`ai_entity_not_found`], quoting the identifier the request presented. The delete
-/// relays the inner service's rendering of it instead
-/// ([`ai_entity_not_found_relayed`]).
-pub fn ai_workload_config_not_found(identifier: &str) -> String {
-    ai_entity_not_found(AI_WORKLOAD_CONFIG_ENTITY, identifier)
-}
-
-/// Why a create that references an AI workload configuration could not resolve it: the
-/// family's [`ai_entity_not_found_for_account`], quoting the
-/// `AIWorkloadConfigIdentifier` the request presented.
-///
-/// Named once here so `CreateAIBenchmarkJob` and `CreateAIRecommendationJob` refuse an
-/// unresolvable reference with the same sentence.
-pub fn ai_workload_config_not_found_for_account(identifier: &str) -> String {
-    ai_entity_not_found_for_account(AI_WORKLOAD_CONFIG_ENTITY, identifier)
-}
-
-/// An AI workload configuration created by `CreateAIWorkloadConfig`, as
-/// `DescribeAIWorkloadConfig` replays it.
-///
-/// A workload configuration is inert data — a dataset configuration plus a benchmark
-/// tool specification — so it carries no status: the service returns it ready, and
-/// there is no transition for the clock to owe.
-#[derive(Debug, Clone)]
-pub struct AIWorkloadConfig {
-    pub name: String,
-    pub arn: String,
-    pub dataset_config: Option<crate::ops::types::AIDatasetConfig>,
-    pub workload_configs: Option<crate::ops::types::AIWorkloadConfigs>,
-    pub tags: Vec<Tag>,
-    pub creation_time: SystemTime,
-}
-
-impl ComAmazonawsSagemakerSagemakerState {
-    /// Whether another AI workload configuration fits, i.e. the store is below
-    /// [`AI_WORKLOAD_CONFIG_QUOTA`]. A second inherent `impl` block, beside this slice's
-    /// own types rather than in the one above.
-    pub fn ai_workload_configs_below_quota(&self) -> bool {
-        self.ai_workload_configs.len() < AI_WORKLOAD_CONFIG_QUOTA
-    }
-
-    /// Whether another AI benchmark job fits, i.e. the store is below
-    /// [`AI_BENCHMARK_JOB_QUOTA`].
-    pub fn ai_benchmark_jobs_below_quota(&self) -> bool {
-        self.ai_benchmark_jobs.len() < AI_BENCHMARK_JOB_QUOTA
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The AI benchmark job slice: what `CreateAIBenchmarkJob` writes and
 // `DescribeAIBenchmarkJob` replays, beside the workload-configuration slice the jobs
 // reference.
 // ---------------------------------------------------------------------------
-
-/// The ARN resource kind an AI benchmark job carries, i.e. the `<kind>` in
-/// [`resource_arn`]. Fixed by `AIBenchmarkJobArn`'s modelled pattern
-/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:ai-benchmark-job/...`), and named
-/// once here so the create and the describe mint and match the same ARN.
-pub const AI_BENCHMARK_JOB_KIND: &str = "ai-benchmark-job";
-
-/// See [`MODEL_QUOTA`]. Bounds the AI benchmark job store the same way, and is what
-/// `CreateAIBenchmarkJob` answers `ResourceLimitExceeded` past.
-pub const AI_BENCHMARK_JOB_QUOTA: usize = 1_000;
-
-/// Why a reader could not resolve an AI benchmark job: the family's
-/// [`ai_entity_not_found`], quoting the name the request presented. Named once here so
-/// every operation that resolves a benchmark-job reference words the same fact the same
-/// way.
-pub fn ai_benchmark_job_not_found(name: &str) -> String {
-    ai_entity_not_found(AI_BENCHMARK_JOB_ENTITY, name)
-}
-
-/// `AIBenchmarkJobStatus`'s members this emulator moves a benchmark job through
-/// (`smithy_query(query="shape",shape="AIBenchmarkJobStatus")` answers `InProgress`,
-/// `Completed`, `Failed`, `Stopping` and `Stopped`; the `Completed` and stop states are
-/// not reached by creating one). Named once here so no handler compares a bare string
-/// literal.
-pub const AI_BENCHMARK_STATUS_IN_PROGRESS: &str = "InProgress";
-/// See [`AI_BENCHMARK_STATUS_IN_PROGRESS`].
-pub const AI_BENCHMARK_STATUS_FAILED: &str = "Failed";
-
-/// How long after `CreateAIBenchmarkJob` the clock owes the job's move out of
-/// `InProgress` into its terminal status.
-///
-/// A span chosen by this emulator (AWS documents no duration for a benchmark run),
-/// inside the 250–750 ms band the project fixes for a transition the clock owes. It is
-/// never zero, so a caller that describes the job straight after creating it still
-/// observes `InProgress`, and one that waits observes the terminal status, so a waiter
-/// terminates.
-pub const AI_BENCHMARK_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
-
-/// `FailureReason` of a benchmark job whose run nothing could perform here.
-///
-/// A benchmark job drives real traffic at a live inference endpoint and measures its
-/// latency, throughput and cost. This emulator serves no inference data plane and runs
-/// no benchmark tool, and the engine contract (`vendor/engine/src/lib.rs`) forbids
-/// reporting a status, duration or measurement for work nothing ran — so the run the
-/// caller asked for ends in the modelled `Failed` state with this reason, and no
-/// `StartTime`, `Completed` status or benchmark result is invented. Everything around
-/// the run — accepting the job, resolving its workload configuration, minting its ARN,
-/// replaying it, reporting its terminal status — is real.
-pub const NO_BENCHMARK_RUNTIME_REASON: &str =
-    "This emulator serves no inference data plane and runs no benchmark tool, so the \
-     benchmark job's run was never started";
-
-/// An AI benchmark job created by `CreateAIBenchmarkJob`, as `DescribeAIBenchmarkJob`
-/// replays it.
-///
-/// `ends_at` is the instant the clock owes the move out of `InProgress`; it is stored,
-/// never slept on, and materialised by whichever reporting call first runs at or after
-/// it (see [`AIBenchmarkJob::settle_status`]).
-#[derive(Debug, Clone)]
-pub struct AIBenchmarkJob {
-    pub name: String,
-    pub arn: String,
-    /// The `AIWorkloadConfigIdentifier` the request presented, kept VERBATIM (a bare
-    /// name or the configuration's ARN) so the read replays what the caller sent rather
-    /// than a form it did not use.
-    pub workload_config_identifier: String,
-    pub benchmark_target: crate::ops::types::AIBenchmarkTarget,
-    /// What the request's `OutputConfig` carried. `DescribeAIBenchmarkJob` reports it as
-    /// an `AIBenchmarkOutputResult`, which adds the log streams of a run — and nothing
-    /// ran here, so that member stays absent.
-    pub output_config: crate::ops::types::AIBenchmarkOutputConfig,
-    pub network_config: Option<crate::ops::types::AIBenchmarkNetworkConfig>,
-    pub role_arn: String,
-    pub tags: Vec<Tag>,
-    pub status: String,
-    pub failure_reason: Option<String>,
-    pub creation_time: SystemTime,
-    pub end_time: Option<SystemTime>,
-    pub ends_at: SystemTime,
-}
-
-impl AIBenchmarkJob {
-    /// Materialise the move out of `InProgress` the clock already owes.
-    ///
-    /// This is the one write a reporting operation may make: the move was due at
-    /// `ends_at` whether or not anybody described the job, so the observer makes no
-    /// difference to the result. `EndTime` takes the instant the move was due, not
-    /// "now", so it is stable across later reads.
-    ///
-    /// The terminal status is [`AI_BENCHMARK_STATUS_FAILED`] with
-    /// [`NO_BENCHMARK_RUNTIME_REASON`]: nothing benchmarked the target, so no
-    /// `Completed` status and no `StartTime` is invented for it.
-    ///
-    /// Answers whether the transition happened on this call, so the caller can record it.
-    pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == AI_BENCHMARK_STATUS_IN_PROGRESS && now >= self.ends_at {
-            self.status = AI_BENCHMARK_STATUS_FAILED.to_string();
-            self.failure_reason = Some(NO_BENCHMARK_RUNTIME_REASON.to_string());
-            // The instant the service gave up on the run, which is when the job ended.
-            // No start time is recorded beside it: the run never started.
-            self.end_time = Some(self.ends_at);
-            return true;
-        }
-        false
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The compute-allocation slice: the definitions `ListComputeQuotas` lists and
@@ -3895,121 +3796,6 @@ impl AIBenchmarkJob {
 // Kept together at the end of the file, rather than interleaved with the blocks
 // above, so this slice is one block to read — and one block to merge.
 // ---------------------------------------------------------------------------
-
-/// How long after `CreateComputeQuota` the clock owes the `Creating` -> `Created`
-/// transition, for the same reason [`ENDPOINT_IN_SERVICE_AFTER`] exists: a caller that
-/// describes or lists the quota straight after creating it still observes `Creating`,
-/// one that waits observes `Created`. Real SageMaker publishes no span for it; this one
-/// is the emulator's own, compressed and never zero.
-pub const COMPUTE_QUOTA_CREATED_AFTER: Duration = Duration::from_millis(300);
-
-/// `SchedulerResourceStatus`'s members a compute quota reaches in this emulator: a
-/// create is reported `Creating` until the clock owes `Created`. The modelled enum also
-/// carries the update, rollback and delete states, which this slice does not reach.
-/// Named separately from [`STATUS_CREATING`] (an `EndpointStatus` member that happens to
-/// share the literal) so each handler compares against its own modelled enum.
-pub const STATUS_QUOTA_CREATING: &str = "Creating";
-/// See [`STATUS_QUOTA_CREATING`].
-pub const STATUS_QUOTA_CREATED: &str = "Created";
-
-/// `ActivationState`'s documented default ("Use to enable or disable compute
-/// allocation. Default is `Enabled`.").
-pub const DEFAULT_ACTIVATION_STATE: &str = "Enabled";
-
-/// The version `CreateComputeQuota` stamps on a new compute allocation definition;
-/// `UpdateComputeQuota` is the only operation that moves it, so every quota this slice
-/// holds carries this one.
-pub const FIRST_COMPUTE_QUOTA_VERSION: i32 = 1;
-
-/// The length `ComputeQuotaId`'s modelled pattern `^[a-z0-9]{12}$` fixes.
-const COMPUTE_QUOTA_ID_LEN: usize = 12;
-
-/// How many draws [`ComAmazonawsSagemakerSagemakerState::mint_compute_quota_id`] takes
-/// from [`mint_opaque_resource_id`] before falling back. One suffices unless its cut
-/// collides with a stored id; the bound is what keeps the minting terminating.
-const COMPUTE_QUOTA_ID_DRAWS: u32 = 16;
-
-/// A compute allocation definition created by `CreateComputeQuota`, as
-/// `DescribeComputeQuota` replays it and `ListComputeQuotas` summarises it.
-///
-/// `created_status_at` is the instant the clock owes the `Creating` -> `Created`
-/// transition; it is stored, never slept on, and materialised by whichever reporting
-/// call first runs at or after it (see [`ComputeQuota::settle_status`]).
-///
-/// The two configuration shapes are named by full path rather than through the module's
-/// shared import list, the way the slices above do it: that list is the hottest line in
-/// this file, and a slice that stays out of it stays out of its merge conflicts.
-#[derive(Debug, Clone)]
-pub struct ComputeQuota {
-    pub id: String,
-    pub arn: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub version: i32,
-    pub status: String,
-    pub failure_reason: Option<String>,
-    pub cluster_arn: String,
-    pub config: crate::ops::types::ComputeQuotaConfig,
-    pub target: crate::ops::types::ComputeQuotaTarget,
-    pub activation_state: String,
-    pub tags: Vec<Tag>,
-    pub creation_time: SystemTime,
-    pub last_modified_time: SystemTime,
-    pub created_status_at: SystemTime,
-}
-
-impl ComputeQuota {
-    /// Materialise the `Creating` -> `Created` transition the clock already owes, the
-    /// way [`Endpoint::settle_status`] does: it was due at `created_status_at` whether
-    /// or not anybody read the quota, so the observer makes no difference to the
-    /// result, and `LastModifiedTime` moves to the instant it was due rather than to
-    /// "now".
-    ///
-    /// Answers whether the transition happened on this call, so the caller can record it.
-    pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == STATUS_QUOTA_CREATING && now >= self.created_status_at {
-            self.status = STATUS_QUOTA_CREATED.to_string();
-            self.last_modified_time = self.created_status_at;
-            return true;
-        }
-        false
-    }
-}
-
-impl ComAmazonawsSagemakerSagemakerState {
-    /// A `ComputeQuotaId` no record in this store holds. A second inherent `impl` block,
-    /// beside this slice's own types rather than in the one above.
-    ///
-    /// The id is the server's, not derived from the request: `CreateComputeQuota` twice
-    /// with the same input in two clusters mints two distinct quotas. It comes from this
-    /// module's ONE id mint, [`mint_opaque_resource_id`] (32 lowercase hex digits), cut
-    /// to the 12 characters `ComputeQuotaId`'s `^[a-z0-9]{12}$` fixes — hex is a subset
-    /// of that class, so the id satisfies the pattern by construction — the way
-    /// [`mint_cluster_id`] derives its own. The loop re-draws on the vanishing
-    /// chance that the cut collides with a stored id, and is bounded: past
-    /// [`COMPUTE_QUOTA_ID_DRAWS`] draws the fallback walks the 12-digit lowercase-hex
-    /// numbers until one is free, which terminates because the store is finite.
-    ///
-    /// `CreateComputeQuota` is still a scaffold stub (its own issue owns it, together
-    /// with the `ClusterArn`-existence precondition SageMaker applies before it stores
-    /// anything), so the minting seam is exercised today by this crate's compute-quota
-    /// tests, which seed the store the create will write.
-    pub fn mint_compute_quota_id(&self) -> String {
-        for _ in 0..COMPUTE_QUOTA_ID_DRAWS {
-            let minted = mint_opaque_resource_id();
-            // The mint yields 32 hex digits, so the cut is always `COMPUTE_QUOTA_ID_LEN`
-            // long; only a collision with a stored id makes this draw unusable.
-            let id: String = minted.chars().take(COMPUTE_QUOTA_ID_LEN).collect();
-            if !self.compute_quotas.contains_key(&id) {
-                return id;
-            }
-        }
-        (0..=u64::try_from(self.compute_quotas.len()).unwrap_or(u64::MAX))
-            .map(|sequence| format!("{sequence:012x}"))
-            .find(|id| !self.compute_quotas.contains_key(id))
-            .unwrap_or_else(|| "0".repeat(COMPUTE_QUOTA_ID_LEN))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The lineage-context slice: `CreateContext`, `DescribeContext`, `UpdateContext` and
@@ -4024,477 +3810,12 @@ impl ComAmazonawsSagemakerSagemakerState {
 // above are, so this resource kind reads as one slice — and merges as one block.
 // ---------------------------------------------------------------------------
 
-/// `PartnerAppStatus`'s members this emulator moves a partner AI app through (both are
-/// members of `crate::ops::types::PARTNER_APP_STATUS_VALUES`; the modelled enum also
-/// carries the update, failure and delete states, which this slice does not reach).
-/// A separate pair from [`STATUS_CREATING`], which names `EndpointStatus`'s members.
-pub const PARTNER_APP_STATUS_CREATING: &str = "Creating";
-/// See [`PARTNER_APP_STATUS_CREATING`].
-pub const PARTNER_APP_STATUS_AVAILABLE: &str = "Available";
-
-/// `ListPartnerApps`' documented `MaxResults` default, applied when the caller names
-/// none: "The default value for MaxResults is 10."
-/// (`smithy_query(query="doc",shape="ListPartnerAppsRequest",member="MaxResults")`).
-/// [`MAX_PAGE_SIZE`] still caps the page above it, as it does for every listing here.
-pub const PARTNER_APP_DEFAULT_PAGE_SIZE: i32 = 10;
-
-/// See [`MODEL_QUOTA`]. Bounds the partner-app store, and is what `CreatePartnerApp`
-/// answers `ResourceLimitExceeded` past.
-pub const PARTNER_APP_QUOTA: usize = 1_000;
-
-/// How long after `CreatePartnerApp` the clock owes the `Creating` -> `Available`
-/// transition of `PartnerAppStatus`.
-///
-/// Same contract as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that lists or describes the
-/// app straight after creating it still observes `Creating` (and the state refusals that
-/// go with it), one that waits observes `Available`. Real SageMaker takes minutes to
-/// provision a partner application; the span is compressed, never zero, and the due
-/// instant is stored rather than slept on.
-pub const PARTNER_APP_AVAILABLE_AFTER: Duration = ENDPOINT_IN_SERVICE_AFTER;
-
-/// Where the partner app `app_id` is served in `region`: the host SageMaker gives one
-/// partner AI app, which `DescribePartnerApp` reports as `BaseUrl` and
-/// `CreatePartnerAppPresignedUrl` builds its URL on. The app's own id is what makes it
-/// unique, so the host carries it.
-pub fn partner_app_base_url(region: &str, app_id: &str) -> String {
-    format!("https://{app_id}.{region}.partner-app.sagemaker.aws")
-}
-
-/// A fresh partner-app id: `app-` and the twelve upper-case characters the modelled
-/// `PartnerAppArn` pattern admits after it (`partner-app\/app-[A-Z0-9]{12}`).
-///
-/// The caller never supplies it — a partner app is addressed by its ARN, so the id is the
-/// server's to generate, and it is derived from nothing in the request. Same scheme as
-/// every other id in this crate ([`mint_short_id`]), upper-cased to the alphabet this
-/// pattern admits.
-pub fn mint_partner_app_id() -> String {
-    format!("app-{}", mint_short_id().to_ascii_uppercase())
-}
-
-/// How the partner-app operations state an app this account holds none of.
-///
-/// A FIXED sentence carrying NOTHING from the request: a partner AI app is addressed by
-/// its ARN, and the service names no identifier here, so the refusal does not echo back
-/// the ARN a caller probed with. Stated once here so the reader (`DescribePartnerApp`) and
-/// the URL mint (`CreatePartnerAppPresignedUrl`) cannot word the same fact differently.
-pub const PARTNER_APP_NOT_FOUND: &str = "App entity does not exist.";
-
-/// How `CreatePartnerApp` refuses a `Type` this account holds no partner-application
-/// subscription for: the type asked for, and what the caller has to do about it.
-///
-/// A partner AI app runs a third party's application, which is licensed to the account
-/// through AWS Marketplace rather than through this API — so a type the account has not
-/// subscribed to cannot be provisioned, and the refusal names the subscription that is
-/// missing. See [`ComAmazonawsSagemakerSagemakerState::subscribed_to_partner_app`].
-pub fn partner_app_not_subscribed(app_type: &str) -> String {
-    format!(
-        "This account does not have an active AWS Marketplace subscription for the \
-         SageMaker Partner AI App type {app_type}. Subscribe to the partner application \
-         in AWS Marketplace before creating the app."
-    )
-}
-
-/// The configuration one partner AI app carries: everything `CreatePartnerApp` is given
-/// about HOW the app runs, as opposed to the identity SageMaker mints for it.
-///
-/// Kept as one record so `DescribePartnerApp` reports exactly what the create stored, and
-/// so `UpdatePartnerApp` — which takes the same members again — replaces the
-/// configuration without touching the app's identity, status or grants.
-#[derive(Debug, Clone, Default)]
-pub struct PartnerAppSettings {
-    /// `ExecutionRoleArn` — the IAM role the partner application uses.
-    pub execution_role_arn: String,
-    /// `Tier` — the instance type and size of the cluster attached to the app.
-    pub tier: String,
-    /// `AuthType` — the authorization type users access the app with.
-    pub auth_type: String,
-    /// `KmsKeyId`, when the request named a customer managed key.
-    pub kms_key_id: Option<String>,
-    pub maintenance_config: Option<crate::ops::types::PartnerAppMaintenanceConfig>,
-    pub application_config: Option<crate::ops::types::PartnerAppConfig>,
-    /// `IdcConfig` — the Identity Center instance an `IDC` app federates with.
-    pub idc_config: Option<crate::ops::types::IdcConfigInput>,
-    pub enable_iam_session_based_identity: Option<bool>,
-    pub enable_auto_minor_version_upgrade: Option<bool>,
-}
-
-/// A SageMaker Partner AI App, as `ListPartnerApps` summarises it and
-/// `DescribePartnerApp` reports it.
-///
-/// Keyed in state by [`PartnerApp::app_id`] (the ARN's `app-...` resource id), which AWS
-/// mints and every later call addresses the app by. `CreatePartnerApp` fills the store and
-/// `ListPartnerApps` pages whatever it holds; the updating and deleting handlers extend
-/// [`ComAmazonawsSagemakerSagemakerState::partner_apps`] rather than adding a second map.
-///
-/// `available_at` is the instant the clock owes the `Creating` -> `Available` transition;
-/// it is stored, never slept on, and materialised by whichever reporting call first runs
-/// at or after it.
-#[derive(Debug, Clone)]
-pub struct PartnerApp {
-    pub app_id: String,
-    pub arn: String,
-    pub name: String,
-    pub app_type: String,
-    pub status: String,
-    pub creation_time: SystemTime,
-    pub last_modified_time: SystemTime,
-    pub available_at: SystemTime,
-    /// Where the app itself is served; the presigned URL
-    /// `CreatePartnerAppPresignedUrl` answers is this plus the grant it minted.
-    pub base_url: String,
-    /// How the app runs, as the create was given it. See [`PartnerAppSettings`].
-    pub settings: PartnerAppSettings,
-    /// The `ClientToken` the create that minted this app presented, if any, so a retried
-    /// create answers the app it already made instead of a second one.
-    pub client_token: Option<String>,
-    /// The `Tags` the create carried, which the tag operations read and write.
-    pub tags: Vec<Tag>,
-    /// Every presigned-URL grant minted for this app that has not expired, oldest
-    /// first. See [`PresignedUrlGrant`].
-    pub grants: Vec<PresignedUrlGrant>,
-}
-
-impl PartnerApp {
-    /// Materialise the `Creating` -> `Available` transition the clock already owes, the
-    /// same way [`Endpoint::settle_status`] does for an endpoint: it was due at
-    /// `available_at` whether or not anybody listed the apps, so the observer makes no
-    /// difference to the result, and `LastModifiedTime` moves to the instant the
-    /// transition was due rather than to "now".
-    ///
-    /// Answers whether the transition happened on this call, so the caller can record it.
-    pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == PARTNER_APP_STATUS_CREATING && now >= self.available_at {
-            self.status = PARTNER_APP_STATUS_AVAILABLE.to_string();
-            self.last_modified_time = self.available_at;
-            return true;
-        }
-        false
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The SageMaker HyperPod cluster slice: everything `CreateCluster` writes and
 // `ListClusters` reports, kept together at the end of this module the way the
 // lineage-action and AI-workload slices above are, with its own quota, its own
 // clock-owed span and its own inherent `impl` block on the state struct.
 // ---------------------------------------------------------------------------
-
-/// How long after `CreateCluster` the clock owes the `Creating` -> `InService`
-/// transition of a HyperPod cluster. Same compressed, never-zero span as
-/// [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that lists clusters straight after creating
-/// one still observes `Creating`, one that waits observes `InService`. Real HyperPod
-/// provisioning takes many minutes; the span is the emulator's own choice.
-pub const CLUSTER_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
-
-/// How long after `DeleteCluster` the clock owes the `Deleting` -> gone transition of a
-/// HyperPod cluster. The same compressed, never-zero span as
-/// [`CLUSTER_IN_SERVICE_AFTER`]: a caller that describes the cluster straight after
-/// asking for its deletion still observes `Deleting`, one that waits observes the
-/// cluster gone. Real HyperPod teardown takes many minutes; the span is the emulator's
-/// own choice.
-pub const CLUSTER_RELEASED_AFTER: Duration = CLUSTER_IN_SERVICE_AFTER;
-
-/// `ClusterStatus`'s terminal failure member. Nothing in this emulator fails a cluster,
-/// so no record carries it — it is named because a delete is admitted for a cluster in
-/// it as well as for one `InService` ([`Cluster::accepts_deletion`]), and a handler must
-/// not compare a bare string literal.
-pub const CLUSTER_STATUS_FAILED: &str = "Failed";
-
-/// See [`MODEL_QUOTA`]; bounds the cluster store, and is released by `DeleteCluster`.
-pub const CLUSTER_QUOTA: usize = 1_000;
-
-/// `ClusterSortBy`'s documented default ("The field by which to sort results. The
-/// default value is `CREATION_TIME`." — `ListClusters`' member doc). `ListClusters` has
-/// its own default and its own enum tokens, which is why it does not share
-/// [`DEFAULT_SORT_BY`].
-pub const CLUSTER_SORT_BY_CREATION_TIME: &str = "CREATION_TIME";
-/// `ClusterSortBy`'s other member.
-pub const CLUSTER_SORT_BY_NAME: &str = "NAME";
-/// `SortOrder`'s documented default for `ListClusters` ("The sort order for results. The
-/// default value is `Ascending`.") — the opposite of [`DEFAULT_SORT_ORDER`], which is
-/// what `ListModels` documents. The descending token is [`ORDER_DESCENDING`].
-pub const CLUSTER_DEFAULT_SORT_ORDER: &str = ORDER_ASCENDING;
-
-/// A SageMaker HyperPod cluster created by `CreateCluster`, as `ListClusters`
-/// summarises it and `DescribeCluster` replays it.
-///
-/// The whole creation spec is stored, not only the members `ListClusters` reports: the
-/// record is the resource, so the readers of the rest (`DescribeCluster`,
-/// `ListClusterNodes`) read it from here rather than re-deriving it.
-///
-/// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
-/// transition; it is stored, never slept on, and materialised by whichever reporting
-/// call first runs at or after it.
-#[derive(Debug, Clone)]
-pub struct Cluster {
-    pub name: String,
-    /// The 12-character id the `ClusterArn` pattern carries
-    /// (`…:cluster/[a-z0-9]{12}`), minted once at create time.
-    pub id: String,
-    pub arn: String,
-    pub status: String,
-    pub instance_groups: Vec<crate::ops::types::ClusterInstanceGroupSpecification>,
-    pub restricted_instance_groups:
-        Vec<crate::ops::types::ClusterRestrictedInstanceGroupSpecification>,
-    pub restricted_instance_groups_config:
-        Option<crate::ops::types::ClusterRestrictedInstanceGroupsConfig>,
-    pub vpc_config: Option<VpcConfig>,
-    pub orchestrator: Option<crate::ops::types::ClusterOrchestrator>,
-    pub node_recovery: Option<String>,
-    pub tiered_storage_config: Option<crate::ops::types::ClusterTieredStorageConfig>,
-    pub node_provisioning_mode: Option<String>,
-    pub cluster_role: Option<String>,
-    pub auto_scaling: Option<crate::ops::types::ClusterAutoScalingConfig>,
-    pub tags: Vec<Tag>,
-    pub creation_time: SystemTime,
-    pub in_service_at: SystemTime,
-    /// The instant the clock owes this cluster's deletion, set by
-    /// [`Cluster::begin_deletion`]; `None` while no `DeleteCluster` has asked for one.
-    /// Past it the cluster is gone for every caller ([`Cluster::is_released`]), whether
-    /// or not a sweep has released the record yet.
-    pub removal_due_at: Option<SystemTime>,
-    /// The cluster's nodes, keyed by `NodeLogicalId` — the instances its groups were
-    /// created asking for plus the ones `BatchAddClusterNodes` added, which
-    /// `ListClusterNodes` reports, `DescribeClusterNode` replays and
-    /// `AttachClusterNodeVolume` attaches storage inside. A cluster still `Creating`
-    /// holds none: its groups' instances are minted when it reaches `InService`, by
-    /// [`Cluster::settle_status`].
-    pub nodes: BTreeMap<String, ClusterNode>,
-    /// What a `BatchAddClusterNodes` `ClientToken` replays: the outcome of the first call
-    /// carrying that token. Keyed by the token.
-    pub node_additions: BTreeMap<String, NodeAdditionRecord>,
-}
-
-impl Cluster {
-    /// Whether a delete may begin on this cluster: its status is a settled one.
-    ///
-    /// A cluster the service is already moving — provisioning it, updating it, rolling
-    /// an update back, or tearing it down — cannot take a second change at the same
-    /// time, which is the conflict `DeleteCluster` models `ConflictException` for. The
-    /// settled statuses are `InService` and [`CLUSTER_STATUS_FAILED`].
-    pub fn accepts_deletion(&self) -> bool {
-        self.status == STATUS_IN_SERVICE || self.status == CLUSTER_STATUS_FAILED
-    }
-
-    /// Start the deletion `DeleteCluster` asked for: the cluster reports `Deleting`, and
-    /// the clock owes its release [`CLUSTER_RELEASED_AFTER`] later.
-    ///
-    /// The record is NOT dropped here: SageMaker answers a cluster in `ClusterStatus`'s
-    /// `Deleting` until the teardown finishes, so the transient status is observable and
-    /// the removal is the clock's — stored as an instant and never slept on.
-    pub fn begin_deletion(&mut self, now: SystemTime) {
-        self.status = STATUS_DELETING.to_string();
-        self.removal_due_at = Some(now + CLUSTER_RELEASED_AFTER);
-    }
-
-    /// Whether a `DeleteCluster` has asked for this cluster's deletion, i.e. it is
-    /// `Deleting` and on its way out.
-    pub fn is_deleting(&self) -> bool {
-        self.removal_due_at.is_some()
-    }
-
-    /// Whether the deletion the clock owed has completed, i.e. the cluster is gone.
-    ///
-    /// A lookup answers `None` for such a cluster and a listing leaves it out, so no
-    /// caller sees a cluster whose teardown was already due — the record itself is
-    /// dropped by [`ComAmazonawsSagemakerSagemakerState::release_deleted_clusters`],
-    /// which frees the name and the quota slot it held.
-    pub fn is_released(&self, now: SystemTime) -> bool {
-        self.removal_due_at.is_some_and(|due| now >= due)
-    }
-
-    /// Materialise the `Creating` -> `InService` transition the clock already owes.
-    ///
-    /// The one write a reporting operation may make: the transition was due at
-    /// `in_service_at` whether or not anybody listed the cluster, so the observer makes
-    /// no difference to the result. Answers whether it happened on this call.
-    pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == STATUS_CREATING && now >= self.in_service_at {
-            self.status = STATUS_IN_SERVICE.to_string();
-            self.provision_group_instances(now);
-            return true;
-        }
-        false
-    }
-
-    /// Bring every instance group up to the number of instances it declares, minting the
-    /// ones it is short of as `Running` nodes of that group.
-    ///
-    /// `InstanceCount` is "the number of instances to add to the instance group", so a
-    /// group that declares N holds N of them once the cluster is provisioned — the same N
-    /// that [`Cluster::instance_group_details`] reports as realised in `CurrentCount`, so
-    /// the cluster's counts and its node list cannot disagree. They come up WITH the
-    /// cluster, which is why this runs at the instant it reaches `InService` and never
-    /// before: a caller listing nodes straight after the create sees none, and one that
-    /// waits sees the instances the groups asked for.
-    ///
-    /// A group is short by however many nodes it does not already hold, so the nodes a
-    /// call added to it (which raised its count by the same amount) are not minted twice.
-    /// The whole cluster stays inside [`CLUSTER_NODE_QUOTA`], the bound every other node
-    /// path honours.
-    fn provision_group_instances(&mut self, now: SystemTime) {
-        // The groups' settings are read off first, so the nodes can be written while
-        // iterating them. A restricted group's instances are instances of this cluster
-        // too, and `ListClusterNodes` reports "the list of instances ... in a SageMaker
-        // HyperPod cluster".
-        let declared: Vec<(String, i32, Option<String>, Option<i32>)> = self
-            .instance_groups
-            .iter()
-            .map(|group| {
-                (
-                    group.instance_group_name.clone(),
-                    group.instance_count,
-                    instance_group_types(group).first().cloned(),
-                    group.threads_per_core,
-                )
-            })
-            .chain(self.restricted_instance_groups.iter().map(|group| {
-                (
-                    group.instance_group_name.clone(),
-                    group.instance_count,
-                    Some(group.instance_type.clone()),
-                    group.threads_per_core,
-                )
-            }))
-            .collect();
-
-        for (group_name, instance_count, instance_type, threads_per_core) in declared {
-            let held = self
-                .nodes
-                .values()
-                .filter(|node| node.instance_group_name == group_name)
-                .count();
-            let declared_count = usize::try_from(instance_count).unwrap_or_default();
-            for _ in held..declared_count {
-                if self.nodes.len() >= CLUSTER_NODE_QUOTA {
-                    return;
-                }
-                let logical_id = mint_node_logical_id();
-                self.nodes.insert(
-                    logical_id.clone(),
-                    ClusterNode {
-                        logical_id: logical_id.clone(),
-                        // An instance that is up has its id, the same one the
-                        // `Pending` -> `Running` transition mints for an added node.
-                        instance_id: Some(mint_instance_id()),
-                        instance_group_name: group_name.clone(),
-                        instance_type: instance_type.clone(),
-                        status: NODE_STATUS_RUNNING.to_string(),
-                        // A group's zones follow from the subnets of its VPC
-                        // configuration, which this emulator does not resolve.
-                        availability_zone: None,
-                        threads_per_core,
-                        launch_time: now,
-                        running_at: now,
-                        // Nothing has asked for this node's hardware to be replaced.
-                        replacement_due_at: None,
-                        volume_attachments: BTreeMap::new(),
-                    },
-                );
-            }
-        }
-    }
-
-    /// The training plans this cluster's capacity is reserved against, in first-seen
-    /// order with duplicates dropped.
-    ///
-    /// `ClusterSummary::TrainingPlanArns` is "a list of ARNs of the training plans
-    /// associated with this cluster", and a cluster is associated with a plan through
-    /// the `TrainingPlanArn` of an instance group it was created with — so the list is
-    /// computed from the stored groups rather than stored a second time.
-    pub fn training_plan_arns(&self) -> Vec<String> {
-        let mut arns: Vec<String> = Vec::new();
-        let from_groups = self
-            .instance_groups
-            .iter()
-            .map(|group| group.training_plan_arn.as_ref())
-            .chain(
-                self.restricted_instance_groups
-                    .iter()
-                    .map(|group| group.training_plan_arn.as_ref()),
-            );
-        for arn in from_groups.flatten() {
-            if !arns.iter().any(|seen| seen == arn) {
-                arns.push(arn.clone());
-            }
-        }
-        arns
-    }
-}
-
-/// The instance types an instance group admits: the one its specification names, or the
-/// list its `InstanceRequirements` names.
-///
-/// The model makes the two mutually exclusive ("The `InstanceType` and
-/// `InstanceRequirements` properties are mutually exclusive" —
-/// `ClusterInstanceRequirements`' own doc), and a group may name neither, which is why
-/// this answers a list that can be empty: a group that names no type admits any.
-pub fn instance_group_types(
-    group: &crate::ops::types::ClusterInstanceGroupSpecification,
-) -> Vec<String> {
-    if let Some(instance_type) = &group.instance_type {
-        return vec![instance_type.clone()];
-    }
-    group
-        .instance_requirements
-        .as_ref()
-        .map(|requirements| requirements.instance_types.clone())
-        .unwrap_or_default()
-}
-
-/// Mint the id a `ClusterArn` carries: the 12 lowercase hex digits
-/// [`mint_short_id`] produces, which is exactly the `[a-z0-9]{12}` the
-/// modelled `ClusterArn` pattern admits.
-///
-/// One minter for the service: the entropy, its bounds and the reasons it is not a
-/// secret are stated once, on [`mint_opaque_resource_id`]. `CreateCluster` still
-/// re-mints on a collision rather than assuming uniqueness.
-pub fn mint_cluster_id() -> String {
-    mint_short_id()
-}
-
-impl ComAmazonawsSagemakerSagemakerState {
-    /// Whether another cluster fits, i.e. the store is below [`CLUSTER_QUOTA`]. A second
-    /// inherent `impl` block, beside this slice's own types rather than in the one above.
-    pub fn clusters_below_quota(&self) -> bool {
-        self.clusters.len() < CLUSTER_QUOTA
-    }
-
-    /// Drop every cluster whose deletion the clock already completed, answering their
-    /// ARNs in store order.
-    ///
-    /// Materialises only what was already due: the release was owed at the stored instant
-    /// whether or not anybody called, and a lookup already answers `None` for such a
-    /// cluster ([`Cluster::is_released`]), so this changes nothing a later caller sees —
-    /// it frees the name and the quota slot the gone cluster still held.
-    pub fn release_deleted_clusters(&mut self, now: SystemTime) -> Vec<String> {
-        let released: Vec<(String, String)> = self
-            .clusters
-            .values()
-            .filter(|cluster| cluster.is_released(now))
-            .map(|cluster| (cluster.name.clone(), cluster.arn.clone()))
-            .collect();
-        for (name, _) in &released {
-            self.clusters.remove(name);
-        }
-        released.into_iter().map(|(_, arn)| arn).collect()
-    }
-
-    /// The cluster whose `ClusterArn` is `arn`, if this account holds one.
-    ///
-    /// [`Self::clusters`] is keyed by `ClusterName` — the identifier `CreateCluster`
-    /// takes — while another resource that BELONGS to a cluster names it by ARN
-    /// (`CreateClusterSchedulerConfig$ClusterArn`), so the lookup is by the stored
-    /// `Cluster::arn`. One place for it, so every operation resolving a `ClusterArn`
-    /// resolves it against the same records `CreateCluster` writes and `ListClusters`
-    /// reports, rather than against a second copy of the cluster.
-    pub fn cluster_by_arn(&self, arn: &str) -> Option<&Cluster> {
-        self.clusters
-            .values()
-            .find(|cluster| cluster.arn == arn)
-            .filter(|cluster| !cluster.is_released(SystemTime::now()))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The lineage-group slice: the record `DescribeLineageGroup` reports, and the two
@@ -4509,134 +3830,11 @@ impl ComAmazonawsSagemakerSagemakerState {
 // through the blocks around it, so this one resource kind reads as one block.
 // ---------------------------------------------------------------------------
 
-/// The ARN resource kind an MLflow tracking server carries, i.e. the `<kind>` in
-/// [`resource_arn`]. Fixed by `TrackingServerArn`'s modelled pattern
-/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:mlflow-tracking-server/`), and
-/// named once here so the create and the describe mint and match the same ARN.
-pub const TRACKING_SERVER_KIND: &str = "mlflow-tracking-server";
-
-/// See [`MODEL_QUOTA`]. Bounds the MLflow tracking-server store the same way, and is
-/// what `CreateMlflowTrackingServer` answers `ResourceLimitExceeded` past.
-pub const MLFLOW_TRACKING_SERVER_QUOTA: usize = 1_000;
-
-/// How long after `CreateMlflowTrackingServer` the clock owes the `Creating` ->
-/// `Created` transition on a tracking server. Same shape as
-/// [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the server straight after
-/// creating it still observes `Creating`, one that waits observes `Created`. Real
-/// SageMaker takes minutes; the span is compressed, never zero.
-pub const TRACKING_SERVER_CREATED_AFTER: Duration = Duration::from_millis(300);
-
-/// `TrackingServerStatus`'s members this emulator moves a tracking server through. The
-/// modelled enum also carries the update, stop, start and maintenance states, which
-/// `CreateMlflowTrackingServer` and `DescribeMlflowTrackingServer` do not reach. Named
-/// here rather than shared with [`STATUS_CREATING`]: that one is an `EndpointStatus`
-/// member, a different modelled enum that happens to spell one state the same way.
-pub const TRACKING_SERVER_CREATING: &str = "Creating";
-/// See [`TRACKING_SERVER_CREATING`].
-pub const TRACKING_SERVER_CREATED: &str = "Created";
-
-/// `IsTrackingServerActive`'s two members: a tracking server is reported `Active` once
-/// it has finished being created, and `Inactive` while it is still coming up.
-pub const TRACKING_SERVER_ACTIVE: &str = "Active";
-/// See [`TRACKING_SERVER_ACTIVE`].
-pub const TRACKING_SERVER_INACTIVE: &str = "Inactive";
-
-/// The size a tracking server gets when `CreateMlflowTrackingServer` names none:
-/// `TrackingServerSize`'s model doc says "The default MLflow Tracking Server
-/// configuration size is \"Small\"".
-pub const DEFAULT_TRACKING_SERVER_SIZE: &str = "Small";
-
-/// An MLflow tracking server created by `CreateMlflowTrackingServer`, as
-/// `DescribeMlflowTrackingServer` replays it.
-///
-/// `created_due_at` is the instant the clock owes the `Creating` -> `Created`
-/// transition; it is stored, never slept on, and materialised by whichever reporting
-/// call first runs at or after it.
-///
-/// `mlflow_version` and `weekly_maintenance_window_start` stay `None` when the create
-/// named neither: the model documents no default for either, so the server reports no
-/// value rather than one the request never asked for. `tags` is stored so a later
-/// `ListTags` reports what the create carried; `DescribeMlflowTrackingServer` models no
-/// tag member, so `ListTags` is the one reader that surfaces it.
-#[derive(Debug, Clone)]
-pub struct MlflowTrackingServer {
-    pub name: String,
-    pub arn: String,
-    pub artifact_store_uri: String,
-    pub size: String,
-    pub mlflow_version: Option<String>,
-    pub role_arn: String,
-    pub automatic_model_registration: bool,
-    pub weekly_maintenance_window_start: Option<String>,
-    pub s3_bucket_owner_account_id: String,
-    pub s3_bucket_owner_verification: bool,
-    pub status: String,
-    pub tags: Vec<Tag>,
-    pub creation_time: SystemTime,
-    pub last_modified_time: SystemTime,
-    pub created_due_at: SystemTime,
-}
-
-impl MlflowTrackingServer {
-    /// Materialise the `Creating` -> `Created` transition the clock already owes, the
-    /// way [`Endpoint::settle_status`] does for an endpoint: it was due at
-    /// `created_due_at` whether or not anybody described the server, so the observer
-    /// makes no difference to the result, and `LastModifiedTime` moves to the instant
-    /// the transition was due rather than to "now".
-    ///
-    /// Answers whether the transition happened on this call, so the caller can record it.
-    pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == TRACKING_SERVER_CREATING && now >= self.created_due_at {
-            self.status = TRACKING_SERVER_CREATED.to_string();
-            self.last_modified_time = self.created_due_at;
-            return true;
-        }
-        false
-    }
-
-    /// `IsActive` for the status the server is in, as one of
-    /// `IsTrackingServerActive`'s two modelled members: a server is active once it is
-    /// `Created`, and not before.
-    pub fn is_active(&self) -> &'static str {
-        if self.status == TRACKING_SERVER_CREATED {
-            TRACKING_SERVER_ACTIVE
-        } else {
-            TRACKING_SERVER_INACTIVE
-        }
-    }
-}
-
-impl ComAmazonawsSagemakerSagemakerState {
-    /// Whether another MLflow tracking server fits, i.e. the store is below
-    /// [`MLFLOW_TRACKING_SERVER_QUOTA`]. A second inherent `impl` block, beside this
-    /// slice's own types rather than in the one above.
-    pub fn mlflow_tracking_servers_below_quota(&self) -> bool {
-        self.mlflow_tracking_servers.len() < MLFLOW_TRACKING_SERVER_QUOTA
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The experiment-tracking slice: `CreateTrialComponent` and `DescribeTrialComponent`.
 // Kept together at the end of this module, the way the AI-benchmarking slice above is,
 // rather than spread through the blocks at the top.
 // ---------------------------------------------------------------------------
-
-/// The ARN resource kind a trial component carries, i.e. the `<kind>` in
-/// [`resource_arn`]. Fixed by `TrialComponentArn`'s modelled pattern
-/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment-trial-component/`), and
-/// named once here so the create and the describe mint and match the same ARN.
-pub const TRIAL_COMPONENT_KIND: &str = "experiment-trial-component";
-
-/// See [`MODEL_QUOTA`]. Bounds the trial-component store the same way, and is what
-/// `CreateTrialComponent` answers `ResourceLimitExceeded` past.
-pub const TRIAL_COMPONENT_QUOTA: usize = 1_000;
-
-/// See [`ASSOCIATION_QUOTA`], which bounds the lineage-edge store for the same reason and
-/// at the same figure: a trial-component membership is an EDGE too — the index grows with
-/// the PAIRS of trial and component a caller attaches, not with either resource — so it is
-/// higher than the per-resource bounds, and it is what `AssociateTrialComponent` answers
-/// `ResourceLimitExceeded` past.
-pub const TRIAL_COMPONENT_TRIAL_QUOTA: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // The experiment-management slice: `CreateExperiment`, `DescribeExperiment` and the
@@ -4668,108 +3866,3 @@ pub const TRIAL_COMPONENT_TRIAL_QUOTA: usize = 10_000;
 // rather than in the first one, so a slice added beside them edits its own block
 // instead of the one every other slice also edits.
 // ---------------------------------------------------------------------------
-
-impl ComAmazonawsSagemakerSagemakerState {
-    /// The cluster a `ClusterNameOrArn` member names: by ARN when the value is one, by
-    /// name otherwise — the two forms the model accepts for the one resource.
-    /// A cluster whose deletion the clock already completed answers `None` here, as it
-    /// does from every other cluster lookup ([`Cluster::is_released`]).
-    pub fn cluster_by_name_or_arn(&self, value: &str) -> Option<&Cluster> {
-        let now = SystemTime::now();
-        if value.starts_with(ARN_PREFIX) {
-            return self
-                .clusters
-                .values()
-                .find(|cluster| cluster.arn == value)
-                .filter(|cluster| !cluster.is_released(now));
-        }
-        self.clusters
-            .get(value)
-            .filter(|cluster| !cluster.is_released(now))
-    }
-
-    /// [`Self::cluster_by_name_or_arn`], for a caller that writes.
-    pub fn cluster_by_name_or_arn_mut(&mut self, value: &str) -> Option<&mut Cluster> {
-        let now = SystemTime::now();
-        if value.starts_with(ARN_PREFIX) {
-            return self
-                .clusters
-                .values_mut()
-                .find(|cluster| cluster.arn == value)
-                .filter(|cluster| !cluster.is_released(now));
-        }
-        self.clusters
-            .get_mut(value)
-            .filter(|cluster| !cluster.is_released(now))
-    }
-
-    /// [`Self::cluster_by_arn`], for a caller that writes.
-    pub fn cluster_by_arn_mut(&mut self, value: &str) -> Option<&mut Cluster> {
-        let now = SystemTime::now();
-        self.clusters
-            .values_mut()
-            .find(|cluster| cluster.arn == value)
-            .filter(|cluster| !cluster.is_released(now))
-    }
-
-    /// The partner app whose ARN is `value`.
-    pub fn partner_app_by_arn_mut(&mut self, value: &str) -> Option<&mut PartnerApp> {
-        self.partner_apps
-            .values_mut()
-            .find(|app| app.arn == value)
-    }
-
-    /// Whether this account holds a partner-application subscription for `app_type`, which
-    /// is what `CreatePartnerApp` admits a `Type` by.
-    ///
-    /// A partner AI app runs a third party's licensed application: the account subscribes
-    /// to it in AWS Marketplace, which is a purchase outside SageMaker's API surface — no
-    /// operation this service models adds to this set. So an account that has subscribed to
-    /// nothing holds none, and every type is refused ([`partner_app_not_subscribed`]) until
-    /// a subscription for it is held.
-    pub fn subscribed_to_partner_app(&self, app_type: &str) -> bool {
-        self.partner_app_subscriptions.contains(app_type)
-    }
-
-    /// Whether another partner app fits, i.e. the store is below [`PARTNER_APP_QUOTA`].
-    pub fn partner_apps_below_quota(&self) -> bool {
-        self.partner_apps.len() < PARTNER_APP_QUOTA
-    }
-
-    /// The partner app this account holds under `name`, the one identity a caller chooses
-    /// for an app (its id and ARN are SageMaker's to mint).
-    ///
-    /// ACCOUNT-WIDE rather than per Region, which is the scope
-    /// [`Self::partner_apps`] has: the store is keyed by the app id alone and
-    /// `ListPartnerApps` pages all of it, so a name is unique across everything a caller
-    /// of this emulator can see. Narrowing both to the Region of the app's ARN is one
-    /// change covering the listing as well, not a property of the create alone.
-    pub fn partner_app_named(&self, name: &str) -> Option<&PartnerApp> {
-        self.partner_apps.values().find(|app| app.name == name)
-    }
-
-    /// The partner app a create presenting `token` already minted, so the retry of that
-    /// create answers the app it made rather than a second one.
-    pub fn partner_app_for_client_token(&self, token: &str) -> Option<&PartnerApp> {
-        self.partner_apps
-            .values()
-            .find(|app| app.client_token.as_deref() == Some(token))
-    }
-
-    /// Whether another trial fits, i.e. the store is below [`TRIAL_QUOTA`].
-    pub fn trials_below_quota(&self) -> bool {
-        self.trials.len() < TRIAL_QUOTA
-    }
-
-    /// The trial `name` identifies, whatever case it is written in — `TrialName` is
-    /// unique per account and not case-sensitive, so the lookup folds case the way
-    /// [`Self::experiment`] does for an experiment.
-    pub fn trial(&self, name: &str) -> Option<&Trial> {
-        self.trials.get(&entity_key(name))
-    }
-
-    /// Whether another compute quota fits, i.e. the store is below [`COMPUTE_QUOTA_QUOTA`].
-    pub fn compute_quotas_below_quota(&self) -> bool {
-        self.compute_quotas.len() < COMPUTE_QUOTA_QUOTA
-    }
-}

@@ -6,6 +6,11 @@
 //! supplies (each container's `Mode`, `EnableNetworkIsolation`), and refuses a name
 //! already in use. This is the ONLY file to touch for this operation.
 //!
+//! The model's containers RUN AS the `ExecutionRoleArn` the request names, so a role this
+//! account's IAM HOLDS and whose trust policy does not admit SageMaker is refused with 400
+//! `ValidationException` and nothing is stored; a role IAM holds nothing under is accepted,
+//! which is what the recorded service does (see [`crate::state::admission`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,6 +181,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // The model's containers RUN AS `ExecutionRoleArn`, so the role is settled before
+        // anything is stored and before the store is locked: only what the emulator's OWN
+        // IAM ANSWERED is refused, and — because this family is recorded registering a
+        // model around a role this account's IAM holds nothing under — only what a STORED
+        // trust document itself withholds (see `crate::state::admission`). The member is
+        // modelled optional, so a request that names no role asks for none to be assumed.
+        if let Some(role_arn) = input.execution_role_arn.as_deref() {
+            if crate::state::admission::held_execution_role_is_unassumable(ctx, &region, role_arn)
+                .await
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::admission::execution_role_arn_is_invalid(role_arn),
+                ));
+            }
+        }
         let arn = crate::state::resource_arn(&region, "model", &input.model_name);
 
         // The service's own defaulting step, applied ONCE here so the stored model is the

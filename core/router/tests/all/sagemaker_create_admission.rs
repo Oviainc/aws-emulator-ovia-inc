@@ -33,16 +33,16 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use serde_json::{json, Value};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every request below is signed for.
 const REGION: &str = "us-east-1";
 
 /// The account the emulator serves, which is the only registry and the only IAM it holds.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// A syntactically valid account id that is NOT this one.
-const OTHER_ACCOUNT: &str = "123456789012";
+pub(crate) const OTHER_ACCOUNT: &str = "123456789012";
 
 /// The `X-Amz-Target` prefix ECR routes on.
 const ECR_TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
@@ -83,7 +83,7 @@ fn send(
 }
 
 /// Drive one awsJson1_1 SageMaker call.
-fn sagemaker(
+pub(crate) fn sagemaker(
     router: &smithy_server_runtime::MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     operation: &str,
@@ -120,7 +120,7 @@ fn ecr(
 
 /// Drive one awsQuery IAM action: `POST /` with the parameters in the form body. Every
 /// value here is free of `&`, `=`, `+` and `%`, so it needs no escaping.
-fn iam(
+pub(crate) fn iam(
     router: &smithy_server_runtime::MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     action: &str,
@@ -150,7 +150,7 @@ fn parsed(text: &str) -> Value {
 }
 
 /// The awsJson error code, without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -161,7 +161,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The error message, whichever casing the envelope carries it under.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
@@ -173,7 +173,7 @@ fn error_message(body: &Value) -> String {
 ///
 /// Written compactly and with no `&`, `=`, `+` or `%`, so it travels in an `awsQuery` form
 /// body as written.
-fn trust_policy(effect: &str, action: &str, service: &str) -> String {
+pub(crate) fn trust_policy(effect: &str, action: &str, service: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
          \"Principal\":{{\"Service\":{service}}},\"Action\":{action}}}]}}"
@@ -274,10 +274,12 @@ fn role_cases() -> Vec<RoleCase> {
     ]
 }
 
-/// How SageMaker's JOB family words a role it cannot assume. The HOSTING family (a model,
-/// an endpoint configuration) words the same fact differently and is not driven here: the
-/// behavioural corpus records `CreateModel` ACCEPTING a role this account does not hold, so
-/// that operation resolves no role.
+/// How SageMaker's JOB family words a role it cannot assume. The families that word the
+/// same fact differently — the AI services, HyperPod, hosting, and the generic
+/// sts:AssumeRole sentence — are driven by `sagemaker_execution_role_admission` instead,
+/// which also covers the hosting reading: the behavioural corpus records `CreateModel`
+/// ACCEPTING a role this account's IAM holds nothing under, so that operation refuses only
+/// what a STORED trust document withholds.
 fn could_not_assume(role_arn: &str) -> String {
     format!(
         "Could not assume role {role_arn}. Please ensure that the role exists and allows \

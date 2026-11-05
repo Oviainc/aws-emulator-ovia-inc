@@ -65,6 +65,8 @@ mod delete_and_stop_preconditions;
 mod endpoint_config_deletion;
 #[path = "all/endpoint_hosting_quota.rs"]
 mod endpoint_hosting_quota;
+#[path = "all/execution_role_admission.rs"]
+mod execution_role_admission;
 #[path = "all/experiment_deletion.rs"]
 mod experiment_deletion;
 #[path = "all/experiment_lifecycle.rs"]

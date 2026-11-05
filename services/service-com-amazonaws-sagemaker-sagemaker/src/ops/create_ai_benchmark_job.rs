@@ -7,6 +7,10 @@
 //! `DescribeAIBenchmarkJob` replays what is stored here; this is the ONLY file to touch
 //! for this operation.
 //!
+//! The job RUNS AS the `RoleArn` the request names, so a role this account's IAM answers
+//! SageMaker cannot assume is refused with 400 `ValidationException` and nothing is stored
+//! (see [`crate::state::admission`]).
+//!
 //! The run itself is not performed: a benchmark drives traffic at a live inference
 //! endpoint, which this emulator does not serve, so the accepted job starts in the
 //! modelled `InProgress` status and the clock owes its move into the modelled `Failed`
@@ -170,6 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // The job RUNS AS the role the request names, so the role is settled before
+        // anything is stored and before the store is locked: only what the emulator's OWN
+        // IAM ANSWERED is refused (see `crate::state::admission`).
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::admission::ROLE_CANNOT_BE_ASSUMED,
+            ));
+        }
         let arn = crate::state::resource_arn(
             &region,
             crate::state::AI_BENCHMARK_JOB_KIND,

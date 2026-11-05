@@ -4,6 +4,12 @@
 //! IMPLEMENTED: mints a HyperPod cluster in `crate::state` and answers its `ClusterArn`.
 //! This is the ONLY file to touch for this operation.
 //!
+//! Each instance group is ASSUMED BY HyperPod under the `ExecutionRole` it declares, so a
+//! role this account's IAM answers SageMaker cannot assume is refused with 400
+//! `ValidationException` and no cluster is stored (see [`crate::state::admission`]) — which
+//! is also why the `DeleteCluster` that follows such a request reports the cluster as not
+//! found rather than busy.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -205,6 +211,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // Every instance group of the cluster is ASSUMED BY HyperPod under the
+        // `ExecutionRole` it declares, and the optional `ClusterRole` is what HyperPod
+        // assumes to scale the cluster, so each is settled before anything is stored and
+        // before the store is locked: only what the emulator's OWN IAM ANSWERED is refused
+        // (see `crate::state::admission`). The request's own order decides which role a
+        // refusal names, and the modelled bounds on the two group lists (`len 1..100`
+        // each) bound how many roles one request can have resolved.
+        let declared_roles: Vec<&str> = input
+            .instance_groups
+            .iter()
+            .flatten()
+            .map(|group| group.execution_role.as_str())
+            .chain(
+                input
+                    .restricted_instance_groups
+                    .iter()
+                    .flatten()
+                    .map(|group| group.execution_role.as_str()),
+            )
+            .chain(input.cluster_role.as_deref())
+            .collect();
+        if let Some(role_arn) = crate::state::admission::first_unassumable_execution_role(
+            ctx,
+            &region,
+            declared_roles,
+        )
+        .await
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::admission::hyperpod_cannot_assume_execution_role(role_arn),
+            ));
+        }
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();

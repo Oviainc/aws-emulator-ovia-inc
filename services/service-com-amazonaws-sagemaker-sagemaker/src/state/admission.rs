@@ -10,6 +10,11 @@
 //! * the execution role the resource would RUN AS ([`execution_role_is_unassumable`]);
 //! * the network placement it asks for ([`SECURITY_GROUPS_NOT_SPECIFIED`]).
 //!
+//! One QUESTION about the role, several SENTENCES: the recorded refusals word an
+//! unassumable role per resource family (the AI services, HyperPod, hosting, and the
+//! generic sts:AssumeRole sentence the rest answer with), so each wording is stated here
+//! once, beside the one reading they all share, rather than inline in a handler.
+//!
 //! Each refusal is 400 `ValidationException` — the class recorded SageMaker answers a
 //! request it understood and will not accept — carried through
 //! [`crate::scaffolded::Scaffolded::validation`], because none of these operations models
@@ -28,17 +33,94 @@
 /// principal (sagemaker.amazonaws.com) permissions to assume this role".
 pub const SERVICE_PRINCIPAL: &str = "sagemaker.amazonaws.com";
 
-/// How SageMaker words a `RoleArn` it cannot assume: the role ARN AS THE CALLER SENT IT,
-/// then the fixed sentence naming what the role has to allow.
+/// How the AutoML creates word a `RoleArn` SageMaker cannot assume: the role ARN AS THE
+/// CALLER SENT IT, then the fixed sentence naming what the role has to allow.
 ///
-/// Stated once here so every create that runs a resource as a caller-supplied role words
-/// the same fact the same way.
+/// Stated once here so every create of that family words the same fact the same way.
 #[must_use]
 pub fn could_not_assume_role(role_arn: &str) -> String {
     format!(
         "Could not assume role {role_arn}. Please ensure that the role exists and allows \
          principal '{SERVICE_PRINCIPAL}' to assume the role."
     )
+}
+
+/// How the AI-service creates word a `RoleArn` SageMaker cannot assume: a FIXED sentence
+/// carrying nothing from the request, as that inner service states the fact.
+///
+/// Stated once here beside the other wordings so the operations of that family cannot word
+/// it differently.
+pub const ROLE_CANNOT_BE_ASSUMED: &str = "Unable to assume the provided RoleArn. Ensure the \
+                                          role exists and its trust policy allows this \
+                                          service to assume it.";
+
+/// How the generic SageMaker create words a role it cannot assume: a FIXED sentence naming
+/// the action the role has to allow and the principal it has to allow it for.
+pub const UNABLE_TO_PERFORM_ASSUME_ROLE: &str =
+    "SageMaker is unable to perform: sts:AssumeRole on the role. Check if you have a trust \
+     relationship for 'sagemaker.amazonaws.com' to assume the role.";
+
+/// How HyperPod words an execution role it cannot assume: the role ARN AS THE CALLER SENT
+/// IT, then the fixed sentence naming the action and the principal it has to be allowed
+/// for.
+#[must_use]
+pub fn hyperpod_cannot_assume_execution_role(role_arn: &str) -> String {
+    format!(
+        "SageMaker HyperPod cannot assume the execution role {role_arn}. Please ensure that \
+         the execution role allows the action sts:AssumeRole for the service principal \
+         {SERVICE_PRINCIPAL}."
+    )
+}
+
+/// How the hosting creates word an `ExecutionRoleArn` SageMaker cannot assume: the role ARN
+/// AS THE CALLER SENT IT, quoted, then the fixed sentence naming what its trust
+/// relationship has to allow.
+#[must_use]
+pub fn execution_role_arn_is_invalid(role_arn: &str) -> String {
+    format!(
+        "The execution role ARN \"{role_arn}\" is invalid. Please ensure that the role exists \
+         and that its trust relationship policy allows the action \"sts:AssumeRole\" for the \
+         service principal \"{SERVICE_PRINCIPAL}\"."
+    )
+}
+
+/// How a resource whose create was ACCEPTED with a role SageMaker cannot assume reports why
+/// it never became usable: the `FailureReason` it carries once the clock settles it into its
+/// modelled failed status, naming the role the request supplied.
+///
+/// Not every create resolves the role synchronously: a custom image is accepted and the
+/// failure surfaces on the resource, so the sentence is a resource's own reason rather than
+/// a refusal of the call.
+#[must_use]
+pub fn unable_to_assume_role_with_arn(role_arn: &str) -> String {
+    format!("Unable to assume role with RoleArn {role_arn}")
+}
+
+/// The FIRST of `role_arns` this emulator's own IAM answers is unassumable
+/// ([`execution_role_is_unassumable`]), or `None` when it answers that about none of them.
+///
+/// A create that takes SEVERAL roles — one per instance group of a cluster, one per training
+/// job definition of a tuning job — settles them in the order the request carries them, so
+/// the refusal names the same role whichever other roles the request also names. The roles
+/// are resolved one after another and the first answer short-circuits, so a request whose
+/// first role is unassumable asks IAM once; a role the request repeats is asked about once,
+/// so the questions are bounded by the DISTINCT roles the request names rather than by how
+/// many members carry one.
+pub async fn first_unassumable_execution_role<'role>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arns: impl IntoIterator<Item = &'role str>,
+) -> Option<&'role str> {
+    let mut asked = ::std::collections::BTreeSet::new();
+    for role_arn in role_arns {
+        if !asked.insert(role_arn) {
+            continue;
+        }
+        if execution_role_is_unassumable(ctx, region, role_arn).await {
+            return Some(role_arn);
+        }
+    }
+    None
 }
 
 /// Whether this emulator's own IAM ANSWERED that `role_arn` is a role SageMaker cannot
@@ -59,6 +141,27 @@ pub async fn execution_role_is_unassumable(
     role_arn: &str,
 ) -> bool {
     ::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL).await
+}
+
+/// Whether this emulator's own IAM ANSWERED that `role_arn` is a role it HOLDS and
+/// SageMaker cannot assume: this account holds a role under that name and the trust policy
+/// that stored role carries does not admit [`SERVICE_PRINCIPAL`].
+///
+/// The same question [`execution_role_is_unassumable`] answers, for the operations whose
+/// recorded behaviour SERVES a request naming a role this account's IAM holds nothing
+/// under: the hosting creates are recorded registering a resource around a role not held
+/// here, and refusing one whose stored trust document admits another service only. Which of
+/// the two readings an operation asks is therefore decided by what the recordings show that
+/// operation doing, never by taste — and the shared reading
+/// (`service_common::iam_role::held_role_is_unassumable`) is the same one every emulated
+/// service with that recorded behaviour takes.
+pub async fn held_execution_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    ::service_common::iam_role::held_role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL)
+        .await
 }
 
 /// How SageMaker words a request that places a resource in a VPC subnet and names no

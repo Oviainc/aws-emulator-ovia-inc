@@ -6,6 +6,10 @@
 //! the store's bound with the modelled `ResourceLimitExceeded`. This is the ONLY file
 //! to touch for this operation.
 //!
+//! The app reaches its artifact store AS the `RoleArn` the request names, so a role this
+//! account's IAM answers SageMaker cannot assume is refused with 400 `ValidationException`
+//! and nothing is stored (see [`crate::state::admission`]).
+//!
 //! The ARN's resource segment is a server-minted id, NOT the app's name: the model doc
 //! for `Name` says the string "is not part of the ... ARN", and `MlflowAppArn` is
 //! `len 1..128` while `MlflowAppName` is `len 1..256`, so a name-bearing ARN could not
@@ -172,6 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // The app accesses its artifact store AS the role the request names, so the role
+        // is settled before anything is stored and before the store is locked: only what
+        // the emulator's OWN IAM ANSWERED is refused (see `crate::state::admission`).
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::admission::UNABLE_TO_PERFORM_ASSUME_ROLE,
+            ));
+        }
         let arn = crate::state::resource_arn(
             &region,
             "mlflow-app",

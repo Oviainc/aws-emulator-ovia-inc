@@ -9,6 +9,11 @@
 //! stores the job in `crate::state` as `InProgress` together with the instant the clock
 //! owes its terminal status. This is the ONLY file to touch for this operation.
 //!
+//! Each training job the tuning job runs RUNS AS the `RoleArn` its definition names, so a
+//! role this account's IAM answers SageMaker cannot assume is refused with 400
+//! `ValidationException` and nothing is stored (see [`crate::state::admission`]) — which is
+//! also why the `Stop`/`Describe` that follow such a request report the job as not found.
+//!
 //! ## No training job ever runs here
 //!
 //! A tuning job's work is the training jobs it launches, and this emulator runs no
@@ -578,6 +583,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // Each training job the tuning job runs RUNS AS the `RoleArn` its definition
+        // names, so each is settled before anything is stored and before the store is
+        // locked: only what the emulator's OWN IAM ANSWERED is refused (see
+        // `crate::state::admission`).
+        let declared_roles: Vec<&str> = input
+            .training_job_definition
+            .iter()
+            .chain(input.training_job_definitions.iter().flatten())
+            .map(|definition| definition.role_arn.as_str())
+            .collect();
+        // WHICH of the declared roles was refused is not read: this family's sentence is
+        // fixed text carrying nothing from the request, so the answer only decides whether
+        // the request is refused at all.
+        if crate::state::admission::first_unassumable_execution_role(
+            ctx,
+            &region,
+            declared_roles,
+        )
+        .await
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::admission::UNABLE_TO_PERFORM_ASSUME_ROLE,
+            ));
+        }
         let arn = crate::state::resource_arn(
             &region,
             "hyper-parameter-tuning-job",

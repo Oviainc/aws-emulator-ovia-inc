@@ -4,8 +4,14 @@
 //! IMPLEMENTED: registers an image in `crate::state` under its `ImageName`, minting the
 //! `ImageArn` from the request's region, and refuses a name already in use with the
 //! modelled `ResourceInUse`. A created image is reported `CREATING` until the instant
-//! the clock owes it the move to `CREATED`. This is the ONLY file to touch for this
+//! the clock owes it its settled status. This is the ONLY file to touch for this
 //! operation.
+//!
+//! This create is ACCEPTED whatever the `RoleArn` names: the image is built under that
+//! role, and a role this account's IAM answers SageMaker cannot assume is reported on the
+//! image — the clock settles it into the modelled `CREATE_FAILED` with the `FailureReason`
+//! naming the role — rather than as a refusal of this call (see
+//! [`crate::state::admission`]).
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::resource_arn(&region, "image", &input.image_name);
         let now = ::std::time::SystemTime::now();
 
+        // The image is BUILT UNDER the role the request names, and SageMaker accepts this
+        // create before it finds out whether it can assume it: the answer travels on the
+        // image, as the `CREATE_FAILED` status and the `FailureReason` the clock owes it,
+        // rather than as a refusal of this call. Settled before the store is locked, since
+        // the question is asked of this emulator's OWN IAM (see
+        // `crate::state::admission`), and only what IAM ANSWERED is reported.
+        let creation_failure_reason =
+            crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn)
+                .await
+                .then(|| crate::state::admission::unable_to_assume_role_with_arn(&input.role_arn));
+
         let mut store = state.lock();
         // The store is bounded, so a caller varying `ImageName` cannot grow it without
         // end. `ResourceLimitExceeded` is the limit failure this operation models.
@@ -194,6 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 role_arn: input.role_arn,
                 status: crate::state::IMAGE_STATUS_CREATING.to_string(),
                 failure_reason: None,
+                creation_failure_reason,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 last_modified_time: now,
