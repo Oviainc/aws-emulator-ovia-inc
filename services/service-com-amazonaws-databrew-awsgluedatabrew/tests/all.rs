@@ -19,6 +19,8 @@ mod databrew_harness;
 mod dataset_in_use_refusal;
 #[path = "all/dataset_update_lifecycle.rs"]
 mod dataset_update_lifecycle;
+#[path = "all/project_delete.rs"]
+mod project_delete;
 #[path = "all/project_lifecycle.rs"]
 mod project_lifecycle;
 #[path = "all/recipe_lifecycle.rs"]

@@ -174,3 +174,66 @@ pub async fn create_dataset(emulator: &Emulator, name: &str, input: Value) -> Re
         )
         .await
 }
+
+/// The role a project assumes, as `CreateProjectRequest$RoleArn` takes it (modelled
+/// `len 20..2048`).
+pub const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/brew";
+
+/// `CreateProject`: `POST /projects` (model: `smithy_query(query="operation",
+/// operation="CreateProject")`).
+pub async fn create_project(emulator: &Emulator, body: Value) -> Reply {
+    emulator.call("POST", "/projects", Some(body)).await
+}
+
+/// `DescribeProject`: `GET /projects/{Name}`.
+pub async fn describe_project(emulator: &Emulator, name: &str) -> Reply {
+    emulator
+        .call("GET", &format!("/projects/{}", label(name)), None)
+        .await
+}
+
+/// `DescribeRecipe` of a recipe's working draft: a created recipe holds only that
+/// draft, which the `LATEST_WORKING` alias addresses.
+pub async fn describe_working_recipe(emulator: &Emulator, name: &str) -> Reply {
+    emulator
+        .call(
+            "GET",
+            &format!("/recipes/{}?recipeVersion=LATEST_WORKING", label(name)),
+            None,
+        )
+        .await
+}
+
+/// Seed the dataset and recipe a project is created against, and answer their names.
+pub async fn seed_dataset_and_recipe(emulator: &Emulator, suffix: &str) -> (String, String) {
+    let dataset = format!("ds-{suffix}");
+    let recipe = format!("rc-{suffix}");
+    let created_dataset = emulator
+        .call(
+            "POST",
+            "/datasets",
+            Some(json!({"Name": dataset, "Input": s3_input("orders.csv"), "Format": "CSV"})),
+        )
+        .await;
+    assert_eq!(
+        created_dataset.status, 200,
+        "the dataset a project acts upon must be created, got {} {:?}",
+        created_dataset.status, created_dataset.body
+    );
+    let created_recipe = emulator
+        .call(
+            "POST",
+            "/recipes",
+            Some(json!({
+                "Name": recipe,
+                "Steps": [{"Action": {"Operation": "UPPER_CASE", "Parameters": {"sourceColumn": "name"}}}],
+            })),
+        )
+        .await;
+    assert_eq!(
+        created_recipe.status, 200,
+        "the recipe a project develops must be created, got {} {:?}",
+        created_recipe.status, created_recipe.body
+    );
+    (dataset, recipe)
+}

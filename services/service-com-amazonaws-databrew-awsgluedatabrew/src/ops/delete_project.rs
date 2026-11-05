@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the project record, so the `DescribeProject` that follows answers 404, and
+//! releases what the project held while it existed: the recipe it developed reports no
+//! project again, and the dataset it acted upon can be deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -82,10 +77,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `DeleteProjectError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#DeleteProject")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#DeleteProject",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteProjectErrorModeled {
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -139,20 +141,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProject"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteProjectErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        if store.projects.remove(&input.name).is_none() {
+            return Err(DeleteProjectErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::not_found_message("Project", &input.name)),
+                },
+            )
+            .into());
+        }
+        // A recipe is developed in ONE project and reports the project it belongs to
+        // (model: `Recipe$ProjectName` — "The name of the project that the recipe is
+        // associated with"), so a project that is gone can no longer be the one any
+        // recipe reports: the delete releases every attachment to it, so no recipe is
+        // left naming a project that resolves nothing. That is also what lets a later
+        // project take such a recipe up. A recipe is a resource of its own and outlives
+        // the project.
+        for recipe in store.recipes.values_mut() {
+            if recipe.project_name.as_deref() == Some(input.name.as_str()) {
+                recipe.project_name = None;
+            }
+        }
+        // Nothing else holds the project: a JOB that names one resolves it when it RUNS
+        // (`CreateRecipeJob` takes a `ProjectName` without requiring the project to
+        // exist), so this delete leaves no dangling reference and there is no
+        // inconsistent state for the modelled `ConflictException` to report.
+
+        Ok(DeleteProjectOutput { name: input.name })
     }
 }
+
