@@ -84,10 +84,20 @@ pub(crate) fn field_list(reply: &Reply) -> Vec<(String, String)> {
 /// refused request field. Spelled out here, independently of the handler, so what the test
 /// pins is the envelope rather than the code that built it. `pub(crate)` for the same
 /// reason as [`field_list`].
+///
+/// Each entry's name and message go through `serde_json`, so a sentence carrying a
+/// character a JSON string cannot hold literally — the quotes a reason puts around the
+/// member it names — is spelled in the document the way a document spells it.
 pub(crate) fn validation_error_fields(entries: &[(&str, &str)]) -> String {
     let fields = entries
         .iter()
-        .map(|(name, message)| format!(r#"{{"Name":"{name}","Message":"{message}"}}"#))
+        .map(|(name, message)| {
+            format!(
+                r#"{{"Name":{},"Message":{}}}"#,
+                Value::String((*name).to_string()),
+                Value::String((*message).to_string()),
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!(r#"{{"ValidationErrorFields":[{fields}]}}"#)

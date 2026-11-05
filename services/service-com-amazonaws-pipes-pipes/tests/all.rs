@@ -31,6 +31,8 @@ mod pipe_dynamodb_stream_source;
 mod pipe_execution_role;
 #[path = "all/pipe_filter_body_format.rs"]
 mod pipe_filter_body_format;
+#[path = "all/pipe_filter_clause_form.rs"]
+mod pipe_filter_clause_form;
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
 #[path = "all/pipe_lifecycle_conflicts.rs"]
@@ -39,6 +41,8 @@ mod pipe_lifecycle_conflicts;
 mod pipe_metric_attribution;
 #[path = "all/pipe_metrics.rs"]
 mod pipe_metrics;
+#[path = "all/pipe_record_envelope.rs"]
+mod pipe_record_envelope;
 #[path = "all/pipe_refusal_bodies.rs"]
 mod pipe_refusal_bodies;
 #[path = "all/pipe_source_checkout.rs"]

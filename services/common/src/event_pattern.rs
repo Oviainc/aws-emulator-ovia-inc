@@ -154,6 +154,65 @@ pub fn parse(source: &str) -> Result<Value, String> {
     Ok(pattern)
 }
 
+/// Why a member of `pattern` is in neither CLAUSE FORM, or `None` when every
+/// member of it is in one.
+///
+/// A pattern's member is a CLAUSE, written in one of two forms: a nested
+/// pattern object, which descends into the nested document the event carries
+/// under that member, or an array of candidate values, of which any one
+/// matching is enough. A member holding a bare value is in neither form — it
+/// names nothing to descend into and no candidate to compare — so a pattern
+/// carrying one is not a pattern, and the reason names that member as the
+/// pattern spells it. [`matches_within`] matches nothing for such a member, and
+/// [`validate`] refuses it with this same reason, so this is that ONE rule
+/// answered on its own: a service that refuses only this fault — because its own
+/// wording for the others is its own — reads it here rather than stating the rule
+/// again.
+///
+/// The rule holds at every level, because a nested clause is itself a pattern,
+/// and [`OR`] carries no clause of its own: it lists whole patterns that are
+/// alternatives to one another, so each branch it lists is read as a pattern in
+/// its own right. `depth` bounds the walk at [`MAX_PATTERN_DEPTH`], the depth a
+/// stored pattern is matched within, so a text nesting past it carries no clause
+/// this rule places.
+pub fn clause_form_fault(pattern: &Value) -> Option<String> {
+    clause_form_fault_within(pattern.as_object()?, 1)
+}
+
+fn clause_form_fault_within(members: &Map<String, Value>, depth: usize) -> Option<String> {
+    if depth > MAX_PATTERN_DEPTH {
+        return None;
+    }
+    for (member, clause) in members {
+        match clause {
+            Value::Object(nested) => {
+                if let Some(reason) = clause_form_fault_within(nested, depth + 1) {
+                    return Some(reason);
+                }
+            }
+            Value::Array(branches) if member == OR => {
+                for branch in branches {
+                    if let Value::Object(nested) = branch {
+                        if let Some(reason) = clause_form_fault_within(nested, depth + 1) {
+                            return Some(reason);
+                        }
+                    }
+                }
+            }
+            Value::Array(_) => continue,
+            _ => return Some(not_a_clause(member)),
+        }
+    }
+    None
+}
+
+/// The reason a member whose value is in neither clause form is refused with,
+/// stated once for both readers of the rule ([`clause_form_fault`] and
+/// [`validate`]).
+fn not_a_clause(member: &str) -> String {
+    format!("\"{member}\" must be an object or an array")
+}
+
 /// Whether `event` matches `pattern`, spending `budget`.
 ///
 /// Both must be JSON objects: an event pattern names fields, so there is
@@ -284,11 +343,7 @@ fn validate(pattern: &Value, depth: usize) -> Result<(), String> {
                     validate_candidate(field, candidate)?;
                 }
             }
-            _ => {
-                return Err(format!(
-                    "\"{field}\" must hold an array of values or a nested object"
-                ))
-            }
+            _ => return Err(not_a_clause(field)),
         }
     }
     Ok(())

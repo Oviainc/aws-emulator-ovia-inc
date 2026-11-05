@@ -511,12 +511,13 @@ pub fn configured_batch_size(parameters: &PipeSourceParameters) -> Option<i32> {
 /// The field a `FilterCriteria` this service cannot accept is refused as, or `None` when
 /// every pattern it carries is one.
 ///
-/// A pipe's filter patterns are EventBridge EVENT PATTERNS: each is a JSON object matched
-/// against the event, so text that is not a JSON object is not a pattern at all. The model
-/// types `Filter.Pattern` as a plain string, which no boundary constraint can express, so
-/// the write that stores one parses it. An absent or empty pattern carries no event pattern
-/// and is left alone — `FilterCriteria` with an empty `Filters` array is how a caller
-/// REMOVES filtering.
+/// A pipe's filter patterns are EventBridge EVENT PATTERNS: each is a JSON object whose
+/// members are clauses matched against the event, so text that is not a JSON object is not
+/// a pattern at all, and neither is an object whose clauses are not clauses
+/// ([`event_pattern_reason`]). The model types `Filter.Pattern` as a plain string, which no
+/// boundary constraint can express, so the write that stores one compiles it. An absent or
+/// empty pattern carries no event pattern and is left alone — `FilterCriteria` with an
+/// empty `Filters` array is how a caller REMOVES filtering.
 fn filter_criteria_field(criteria: &FilterCriteria) -> Option<ValidationExceptionField> {
     let patterns = criteria.filters.iter().flat_map(|filters| filters.iter());
     for filter in patterns {
@@ -540,10 +541,13 @@ fn filter_criteria_field(criteria: &FilterCriteria) -> Option<ValidationExceptio
 /// The reason is the PARSER's own diagnostic, read through
 /// [`::service_common::json_parse_fault`] — the one place this tree states where a
 /// submitted JSON document stopped parsing and what was expected there — so two services
-/// handed the same text cannot disagree about it. Two readings are this service's own:
+/// handed the same text cannot disagree about it. Three readings are this service's own:
 ///
 /// * a text that PARSES but is not an object is not a filter, which is the one fault with
 ///   no parse failure to report ([`NOT_AN_OBJECT_REASON`]);
+/// * a text that parses to an object is read on: an object whose CLAUSES are not clauses
+///   is not a pattern either, which the one reading of the pattern language in this tree
+///   answers ([`::service_common::event_pattern::clause_form_fault`]);
 /// * the parser this service hands a pattern to reads the filter's MEMBERS, so its first
 ///   expectation is a member name. Where the text does not open the filter object, the
 ///   parse never begins and stops on its very first character — so that parse is the one
@@ -552,7 +556,9 @@ fn filter_criteria_field(criteria: &FilterCriteria) -> Option<ValidationExceptio
 ///   the expectation still come from the parse itself.
 fn event_pattern_reason(pattern: &str) -> Option<String> {
     let error = match ::serde_json::from_str::<::serde_json::Value>(pattern) {
-        Ok(::serde_json::Value::Object(_)) => return None,
+        Ok(filter @ ::serde_json::Value::Object(_)) => {
+            return ::service_common::event_pattern::clause_form_fault(&filter);
+        }
         Ok(_) => return Some(NOT_AN_OBJECT_REASON.to_string()),
         Err(error) => error,
     };

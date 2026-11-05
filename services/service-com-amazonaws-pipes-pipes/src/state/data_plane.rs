@@ -1744,8 +1744,18 @@ fn path_view(event: &Value) -> Cow<'_, Value> {
     read_body(event).1
 }
 
+/// The member a record envelope reports the digest of its MESSAGE ATTRIBUTES under —
+/// "an MD5 digest of the non-URL-encoded message attribute string"
+/// (`ReceiveMessage`'s `Message$MD5OfMessageAttributes`), which is what lets a consumer
+/// of a forwarded record check the attributes reached it intact.
+///
+/// Amazon SQS reports that digest for a message that CARRIES message attributes and
+/// reports none for a message with none, so the envelope carries the member exactly when
+/// the record it was built from has one.
+const RECORD_MD5_OF_MESSAGE_ATTRIBUTES: &str = "md5OfMessageAttributes";
+
 /// One polled Amazon SQS message as the record envelope a pipe hands to its enrichment
-/// and its target: the message's own id, receipt handle, body and MD5, its system and
+/// and its target: the message's own id, receipt handle, body and MD5s, its system and
 /// message attributes, and which source it came from.
 fn queue_record_envelope(
     message: &::aws_sdk_sqs::types::Message,
@@ -1771,7 +1781,7 @@ fn queue_record_envelope(
         }
         message_attributes.insert(name.clone(), rendered);
     }
-    json!({
+    let mut envelope = json!({
         "messageId": message.message_id.clone().unwrap_or_default(),
         "receiptHandle": message.receipt_handle.clone().unwrap_or_default(),
         "body": message.body.clone().unwrap_or_default(),
@@ -1781,7 +1791,14 @@ fn queue_record_envelope(
         "eventSource": SQS_EVENT_SOURCE,
         "eventSourceARN": source_arn,
         "awsRegion": region,
-    })
+    });
+    // The attribute digest is the one the RECEIVE that handed this message over reported,
+    // never one computed here: the digest is Amazon SQS's own and a record it reports none
+    // for (one carrying no message attributes) carries none on the envelope either.
+    if let Some(digest) = message.md5_of_message_attributes.clone() {
+        envelope[RECORD_MD5_OF_MESSAGE_ATTRIBUTES] = Value::String(digest);
+    }
+    envelope
 }
 
 /// One read DynamoDB stream record as the record envelope a pipe hands to its enrichment

@@ -105,6 +105,11 @@ const MAX_MESSAGES_PER_BATCH: usize = 1_000;
 /// The `eventSource` each record of the event a queue mapping hands its function carries.
 const SQS_EVENT_SOURCE: &str = "aws:sqs";
 
+/// The member a record reports the digest of its MESSAGE ATTRIBUTES under, beside
+/// `md5OfBody` — the counterpart of `Message$MD5OfMessageAttributes`, which Amazon SQS
+/// publishes for a message carrying message attributes and for no other.
+const RECORD_MD5_OF_MESSAGE_ATTRIBUTES: &str = "md5OfMessageAttributes";
+
 /// How much work ONE pass may spend deciding which of its messages its mapping's filter
 /// criteria admit, in the steps the shared matcher charges.
 ///
@@ -543,7 +548,7 @@ fn queue_event(invoking: &[String], polled: &[PolledMessage]) -> Value {
 }
 
 /// One stored message as the record of the event Lambda hands a function for a queue
-/// source: the message's own id, receipt handle, body and MD5 digest, the system attributes
+/// source: the message's own id, receipt handle, body and MD5 digests, the system attributes
 /// the queue records for it, its message attributes, and which source it came from.
 fn queue_record(
     message: &sqs::state::StoredMessage,
@@ -597,7 +602,7 @@ fn queue_record(
         }
         message_attributes.insert(name.clone(), rendered);
     }
-    json!({
+    let mut record = json!({
         "messageId": message.message_id.clone(),
         "receiptHandle": receipt_handle,
         "body": message.body.clone(),
@@ -607,7 +612,14 @@ fn queue_record(
         "eventSource": SQS_EVENT_SOURCE,
         "eventSourceARN": queue_arn,
         "awsRegion": region,
-    })
+    });
+    // The digest of the message's ATTRIBUTES, as Amazon SQS computes one: a message
+    // carrying attributes has one and a message carrying none has none, so the record
+    // reports it for exactly the messages the queue publishes it for.
+    if let Some(digest) = sqs::state::md5_of_message_attributes(&message.message_attributes) {
+        record[RECORD_MD5_OF_MESSAGE_ATTRIBUTES] = Value::String(digest);
+    }
+    record
 }
 
 /// The messages of `processed` this attempt may consume, given the order their queue hands
@@ -931,7 +943,7 @@ mod tests {
 
     use super::{
         filter_event, invisible_for_seconds, minute_of, processed_in_group_order, queue_event,
-        queue_record, PolledMessage,
+        queue_record, PolledMessage, RECORD_MD5_OF_MESSAGE_ATTRIBUTES,
     };
 
     /// The queue every envelope row below is built for, and the Region it lives in.
@@ -1107,6 +1119,80 @@ mod tests {
                 "case {case:?}: expected the record {expected}, got {record}"
             );
         }
+    }
+
+    #[test]
+    fn a_record_reports_the_attribute_digest_for_the_messages_that_have_one() {
+        // The rows differ along the attributes the digest is computed over: none at all,
+        // one, the same one again (the digest is of the attributes, so it is the same), a
+        // different value for that name, and several attributes of several data types.
+        type Row = (&'static str, Vec<(&'static str, MessageAttributeValue)>);
+        let rows: [Row; 5] = [
+            ("no message attributes", vec![]),
+            ("one String attribute", vec![("kind", string_attribute("String", "order"))]),
+            (
+                "that same attribute again",
+                vec![("kind", string_attribute("String", "order"))],
+            ),
+            (
+                "that attribute carrying another value",
+                vec![("kind", string_attribute("String", "refund"))],
+            ),
+            (
+                "three attributes of three types",
+                vec![
+                    ("kind", string_attribute("String", "order")),
+                    ("count", string_attribute("Number", "17")),
+                    ("payload", binary_attribute(&[0x00, 0x01])),
+                ],
+            ),
+        ];
+        let mut digests: BTreeMap<&str, String> = BTreeMap::new();
+        for (case, attributes) in rows {
+            let mut message = stored_message();
+            let carried = !attributes.is_empty();
+            for (name, attribute) in attributes {
+                message.message_attributes.insert(name.to_string(), attribute);
+            }
+            let record = queue_record(&message, RECEIPT_HANDLE, QUEUE_ARN, REGION);
+            let reported = record[RECORD_MD5_OF_MESSAGE_ATTRIBUTES].as_str();
+            if !carried {
+                assert!(
+                    reported.is_none(),
+                    "case {case:?}: a message carrying no message attributes has no \
+                     attribute digest, got {record}"
+                );
+                continue;
+            }
+            let digest = reported.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: a message carrying message attributes reports their \
+                     digest, got {record}"
+                )
+            });
+            assert!(
+                digest.len() == 32 && digest.chars().all(|character| character.is_ascii_hexdigit()),
+                "case {case:?}: expected an MD5 hex digest, got {digest:?}"
+            );
+            digests.insert(case, digest.to_string());
+        }
+        // The digest is OF the attributes: the same attributes digest alike and different
+        // attributes do not.
+        assert_eq!(
+            digests.get("one String attribute"),
+            digests.get("that same attribute again"),
+            "the same message attributes must digest alike, got {digests:?}"
+        );
+        assert_ne!(
+            digests.get("one String attribute"),
+            digests.get("that attribute carrying another value"),
+            "different message attributes must digest differently, got {digests:?}"
+        );
+        assert_ne!(
+            digests.get("one String attribute"),
+            digests.get("three attributes of three types"),
+            "different message attributes must digest differently, got {digests:?}"
+        );
     }
 
     #[test]
