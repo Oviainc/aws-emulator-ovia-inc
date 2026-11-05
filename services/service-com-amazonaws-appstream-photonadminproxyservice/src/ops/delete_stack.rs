@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStack
-//! IMPLEMENTED: removes the stack record from this service's store, so the matching
-//! `DescribeStacks` no longer reports it. An unknown name answers
+//! IMPLEMENTED: removes the stack record from this service's store, along with the custom
+//! branding theme that stack owns, so the matching `DescribeStacks` no longer reports it.
+//! An unknown name answers
 //! `ResourceNotFoundException` (HTTP 404); a stack that still has an associated fleet
 //! answers `ResourceInUseException` (HTTP 400) until `DisassociateFleet` clears the edge.
 //!
@@ -164,6 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         state.stacks.remove(&input.name);
+        // The stack's custom branding belongs to the stack, so it goes with it: a stack
+        // later created under the same name starts with the default appearance.
+        state.themes.remove(&input.name);
         Ok(DeleteStackOutput {})
     }
 }

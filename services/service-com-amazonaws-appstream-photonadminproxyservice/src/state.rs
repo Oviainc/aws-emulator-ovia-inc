@@ -9,6 +9,12 @@
 //! `ListAssociatedFleets` reports the edges a stack has, and `DeleteStack`/`DeleteFleet`
 //! refuse while an edge still names the resource.
 //!
+//! A stack's custom branding lives here as well: `CreateThemeForStack` writes one
+//! [`ThemeRecord`] under the stack it brands, `UpdateThemeForStack` applies the members
+//! it is given to that record and clears the fields its `AttributesToDelete` names,
+//! `DescribeThemeForStack` renders the stored record back, and `DeleteThemeForStack`
+//! removes it — as does deleting the stack itself, which is what the branding belongs to.
+//!
 //! Usage reporting lives here too: it is ONE account-and-Region-wide setting, so
 //! `CreateUsageReportSubscription` writes the single [`UsageReportSubscriptionRecord`]
 //! this struct holds and `DescribeUsageReportSubscriptions` renders that same record
@@ -32,9 +38,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ops::types::{
     AccessEndpoint, AgentAccessConfig, ApplicationSettingsResponse, ComputeCapacityStatus,
     ContentRedirection, DomainJoinInfo, Fleet, FleetError, LastReportGenerationExecutionError,
-    S3Location, Stack, StackError, StorageConnector, StreamingExperienceSettings,
-    UsageReportSubscription, User, UserSetting, UserStackAssociation, UserStackAssociationError,
-    VolumeConfig, VpcConfig,
+    S3Location, Stack, StackError, StorageConnector, StreamingExperienceSettings, Theme,
+    ThemeFooterLink, UsageReportSubscription, User, UserSetting, UserStackAssociation,
+    UserStackAssociationError, VolumeConfig, VpcConfig,
 };
 
 /// The ARN namespace this service stamps on every resource ARN
@@ -93,6 +99,37 @@ pub const STACK_KIND: &str = "stack";
 
 /// The word AWS's refusal sentences use for a fleet.
 pub const FLEET_KIND: &str = "fleet";
+
+/// The words AWS's refusal sentences use for a stack's custom branding theme.
+///
+/// A theme has no name of its own — the theme operations take only a `StackName` — so it
+/// is identified by the stack it brands: the `<kind>` slot of
+/// [`resource_not_found_message`] and [`resource_already_exists_message`] carries
+/// `theme for stack` and the `<name>` slot that stack's name, giving AWS's sentence
+/// `The theme for stack <stack name> for account <account id> does not exist.`
+pub const THEME_KIND: &str = "theme for stack";
+
+/// AWS's `ResourceNotFoundException` sentence for a stack that has no custom branding
+/// theme: `The theme for stack <stack name> for account <account id>  does not exist.`
+///
+/// The two spaces after the account id are AWS's: the sentence is built from a template
+/// whose slot between the account and `does not exist` is empty, and the doubled space
+/// survives into the message clients see, exactly as it does in
+/// [`resource_already_exists_message`]. The resource the sentence names is the theme and
+/// the stack it brands, because a theme has no name of its own.
+pub fn theme_not_found_message(stack_name: &str) -> String {
+    let account = ::emulator_server::emulator_account_id();
+    format!("The {THEME_KIND} {stack_name} for account {account}  does not exist.")
+}
+
+/// The `ThemeState` a freshly created theme carries.
+///
+/// `CreateThemeForStack` is what turns custom branding ON for a stack, and
+/// `UpdateThemeForStack` is the only operation that models a `State` member (so it is
+/// the only way to disable the branding again): a created theme is therefore ENABLED,
+/// a terminal state the clock owes no transition out of. The value is `ThemeState`'s
+/// (`THEME_STATE_VALUES` in `ops/types/shared_types.rs`).
+pub const THEME_STATE_CREATED: &str = "ENABLED";
 
 /// AWS's `ResourceAlreadyExistsException` sentence for a user pool identity that is
 /// already taken.
@@ -319,6 +356,54 @@ impl StackRecord {
     }
 }
 
+/// The URL a theme reports for one of its branding assets: the virtual-hosted-style URL
+/// of the S3 object the request named.
+///
+/// A theme's logo and favicon are given as an `S3Location` (a bucket and a key) and
+/// reported back as URLs, so the URL is DERIVED from that location: the bucket's
+/// regional endpoint followed by the object key. Nothing is copied or fetched — the
+/// object belongs to S3 and keeps its own lifecycle — so what this addresses is exactly
+/// the object the caller pointed at, and a later read reports the same URL. `region` is
+/// the request's own ([`request_region`]), the Region whose endpoint addresses a bucket.
+pub fn theme_asset_url(region: &str, location: &S3Location) -> String {
+    let bucket = &location.s3_bucket;
+    let key = location.s3_key.as_deref().unwrap_or_default();
+    format!("https://{bucket}.s3.{region}.amazonaws.com/{key}")
+}
+
+/// A persisted AppStream custom branding theme — one stack's catalog-page branding,
+/// written by `CreateThemeForStack` and rendered back by `DescribeThemeForStack`.
+#[derive(Debug, Clone)]
+pub struct ThemeRecord {
+    pub stack_name: String,
+    pub state: String,
+    pub title_text: String,
+    pub styling: String,
+    pub footer_links: Vec<ThemeFooterLink>,
+    pub organization_logo_url: String,
+    pub favicon_url: String,
+    pub created_time: ::aws_smithy_types::DateTime,
+}
+
+impl ThemeRecord {
+    /// Render the stored record as the modelled `Theme` every reader returns.
+    pub fn to_theme(&self) -> Theme {
+        Theme {
+            stack_name: Some(self.stack_name.clone()),
+            state: Some(self.state.clone()),
+            theme_title_text: Some(self.title_text.clone()),
+            theme_styling: Some(self.styling.clone()),
+            // A theme with no footer links is a theme that displays none, so the member
+            // is ABSENT rather than present-and-empty — the same representation the
+            // stack's own collections use.
+            theme_footer_links: reported(&self.footer_links),
+            theme_organization_logo_url: Some(self.organization_logo_url.clone()),
+            theme_favicon_url: Some(self.favicon_url.clone()),
+            created_time: Some(self.created_time),
+        }
+    }
+}
+
 /// A persisted AppStream fleet.
 #[derive(Debug, Clone)]
 pub struct FleetRecord {
@@ -532,6 +617,13 @@ impl UserStackAssociationFilter<'_> {
 pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// Stacks by `Name`. `BTreeMap` so every Describe page walks a stable order.
     pub stacks: BTreeMap<String, StackRecord>,
+    /// Custom branding themes by the `StackName` of the stack they brand — one theme per
+    /// stack, which is what makes the stack name the key.
+    ///
+    /// This store needs no ceiling of its own: a theme can only be created for a stack
+    /// that exists, so it holds at most as many records as `stacks`, which is itself
+    /// bounded by [`MAX_RECORDS_PER_STORE`].
+    pub themes: BTreeMap<String, ThemeRecord>,
     /// Fleets by `Name`.
     pub fleets: BTreeMap<String, FleetRecord>,
     /// `(FleetName, StackName)` edges written by `AssociateFleet`.

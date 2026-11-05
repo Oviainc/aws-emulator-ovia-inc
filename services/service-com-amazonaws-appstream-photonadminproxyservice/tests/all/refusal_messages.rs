@@ -42,7 +42,10 @@ pub(crate) fn not_found_sentence(kind: &str, name: &str) -> String {
 
 /// AWS's `ResourceAlreadyExistsException` sentence for a name already taken. The two
 /// spaces after the account id are AWS's own.
-fn already_exists_sentence(kind: &str, name: &str) -> String {
+///
+/// Shared with the other suites in this target (`tests/all/stack_theme.rs`), so every
+/// suite states the sentence once.
+pub(crate) fn already_exists_sentence(kind: &str, name: &str) -> String {
     format!(
         "The {kind} {name} for account {ACCOUNT}  already exists. \
          Use a unique name within an AWS region in your AWS account."

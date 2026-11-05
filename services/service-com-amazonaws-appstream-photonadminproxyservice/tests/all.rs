@@ -19,6 +19,8 @@ mod refusal_messages;
 mod stack_fleet_lifecycle;
 #[path = "all/stack_registry.rs"]
 mod stack_registry;
+#[path = "all/stack_theme.rs"]
+mod stack_theme;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_stack.rs"]

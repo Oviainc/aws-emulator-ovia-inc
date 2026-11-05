@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThemeForStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThemeForStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThemeForStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request carries to the
+//! [`crate::state::ThemeRecord`] stored for the named stack, clears the fields its
+//! `AttributesToDelete` names, and returns the modelled `Theme` rendered from the updated
+//! record. A stack with no stored branding answers `ResourceNotFoundException`
+//! (HTTP 404), and a request that both sets a field and deletes it
+//! `InvalidParameterCombinationException` (HTTP 400), leaving the theme untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThemeForStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThemeForStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThemeForStack"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("UpdateThemeForStack"))?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        let attributes_to_delete = input.attributes_to_delete.clone().unwrap_or_default();
+        for attribute in &attributes_to_delete {
+            if !THEME_ATTRIBUTE_VALUES.contains(&attribute.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AttributesToDelete contains an unknown theme attribute: {attribute}"
+                )));
+            }
+            // Setting a field and deleting it in one request asks for two different
+            // outcomes for the same field, which is an incorrect combination of
+            // parameters.
+            if let Some(member) = supplied_member(&input, attribute) {
+                return Err(
+                    UpdateThemeForStackErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "{member} cannot be specified while AttributesToDelete \
+                                 contains {attribute}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The branding is what this operation updates, so the theme is the resource that
+        // has to exist: a stack that was never given one has nothing to update.
+        let record = state.themes.get_mut(&input.stack_name).ok_or_else(|| {
+            UpdateThemeForStackErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::theme_not_found_message(&input.stack_name)),
+            })
+        })?;
+
+        // Every member the request carries replaces the stored field; a member the
+        // request omits leaves that field alone.
+        if let Some(title_text) = input.title_text {
+            record.title_text = title_text;
+        }
+        if let Some(styling) = input.theme_styling {
+            record.styling = styling;
+        }
+        if let Some(footer_links) = input.footer_links {
+            record.footer_links = footer_links;
+        }
+        if let Some(location) = &input.organization_logo_s3_location {
+            record.organization_logo_url = crate::state::theme_asset_url(&region, location);
+        }
+        if let Some(location) = &input.favicon_s3_location {
+            record.favicon_url = crate::state::theme_asset_url(&region, location);
+        }
+        // `State` is what enables or disables the branding for the stack.
+        if let Some(state) = input.state {
+            record.state = state;
+        }
+        for attribute in &attributes_to_delete {
+            delete_attribute(record, attribute);
+        }
+
+        Ok(UpdateThemeForStackOutput {
+            theme: Some(record.to_theme()),
+        })
+    }
+}
+
+/// The `UpdateThemeForStack` member that SETS the theme field `attribute` clears, when
+/// this request carries it — so naming both can be refused rather than silently resolved
+/// one way.
+///
+/// The attribute values are `ThemeAttribute`'s (`smithy_query(query="shape",
+/// shape="ThemeAttribute")`, also kept as `THEME_ATTRIBUTE_VALUES` in
+/// `types/shared_types.rs`).
+fn supplied_member(input: &UpdateThemeForStackInput, attribute: &str) -> Option<&'static str> {
+    match attribute {
+        "FOOTER_LINKS" => input.footer_links.is_some().then_some("FooterLinks"),
+        _ => None,
+    }
+}
+
+/// Clear the stored field `attribute` names, so the rendered theme no longer carries it.
+///
+/// A cleared collection is left with no entries, which is what makes the member absent
+/// from the rendered `Theme` (see `crate::state`).
+fn delete_attribute(record: &mut crate::state::ThemeRecord, attribute: &str) {
+    if attribute == "FOOTER_LINKS" {
+        record.footer_links.clear();
     }
 }
