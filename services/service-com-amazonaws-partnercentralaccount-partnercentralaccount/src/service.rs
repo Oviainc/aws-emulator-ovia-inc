@@ -54,6 +54,14 @@
 //! `ValidationException` envelope below instead. The violations come from the
 //! framework's OWN deserializer and constraint walk, so the wrapper cannot refuse a
 //! different set of requests than the walk that follows it.
+//!
+//! Two clauses are worded by this service rather than by the framework, both in
+//! [`as_stated`] and so in both refusal paths: a `@pattern` is named without the
+//! anchors the model brackets it with, and an enumerated type's admissible set is
+//! listed in the order this service enumerates a set in (the [`enum_value_set`]
+//! module), which follows the values themselves rather than the model's declaration.
+
+mod enum_value_set;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
@@ -308,22 +316,32 @@ fn validation_exception(
 ///
 /// The clauses come from the framework's own renderer, so a constraint class added
 /// upstream cannot arrive with a sentence of its own; [`as_stated`] only names a
-/// `@pattern` the way this service names it.
+/// `@pattern` and an enumerated type's admissible set the way this service names
+/// them.
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
     constraints::envelope(&stated)
 }
 
 /// A violation as this service states it: the framework's clause, with a `@pattern`
-/// named without the anchors the model brackets it with.
+/// named without the anchors the model brackets it with, and an enumerated type's
+/// admissible set listed in the order this service enumerates a set in
+/// ([`enum_value_set`]) rather than the order the model declares the type in.
 ///
-/// The clause already says the whole member must satisfy the expression, so the
-/// anchors would be restating the sentence. Every other clause is the framework's
-/// unchanged.
+/// A `@pattern` clause already says the whole member must satisfy the expression, so
+/// the anchors would be restating the sentence. An enum clause states WHICH values
+/// the type admits, and this service enumerates them out of a hash table keyed on the
+/// values themselves, so the order follows the values rather than the declaration —
+/// the same set whichever member, operation or request reached it. Every other clause
+/// is the framework's unchanged.
 fn as_stated(violation: &Violation) -> Violation {
     match &violation.kind {
         ViolationKind::Pattern(regex) => Violation {
             kind: ViolationKind::Pattern(unanchored(regex).to_string()),
+            ..violation.clone()
+        },
+        ViolationKind::EnumValue(declared) => Violation {
+            kind: ViolationKind::EnumValue(enum_value_set::as_enumerated(declared)),
             ..violation.clone()
         },
         _ => violation.clone(),
