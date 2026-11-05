@@ -15,10 +15,12 @@
 //! The rule under test: a definition IS the metric it defines — the members a request
 //! carries — and the `MetricDefinitionId` is only the handle the service minted for it, so
 //! a write that would leave one destination holding two definitions of one metric is
-//! refused with the modelled `ConflictException` (HTTP 409) naming the definition that
-//! already exists, while a write that leaves one definition per metric is accepted. That is
-//! the identity `BatchCreateRumMetricDefinitions` resolves a requested definition against
-//! (which is what makes it `@idempotent`), and `UpdateRumMetricDefinition` is `@idempotent`
+//! refused — the single-definition update with the modelled `ConflictException` (HTTP 409)
+//! naming the definition that already exists, and the batch create with that error as the
+//! offending entry's own per-item error — while a write that leaves one definition per
+//! metric is accepted. That is the identity
+//! `BatchCreateRumMetricDefinitions` resolves a requested definition against, and
+//! `UpdateRumMetricDefinition` is `@idempotent`
 //! on the same identity: replacing a definition by the one it already is changes nothing
 //! and is accepted.
 //!
@@ -29,8 +31,8 @@
 //! — over extended and custom metrics, and each row runs against both `MetricDestination`
 //! values. Per row the suite checks both directions of the conflict, that the refusal
 //! stored nothing, that the self-update is accepted, that a replacement defining a third
-//! metric is accepted and read back, that the idempotent create still resolves the
-//! untouched definition to its own id, and that no destination ever holds two definitions
+//! metric is accepted and read back, that the create still resolves the untouched
+//! definition to its own id, and that no destination ever holds two definitions
 //! that differ only in their id.
 
 use std::collections::BTreeMap;
@@ -42,9 +44,10 @@ use crate::metric_definitions::{
     EXTENDED_DIMENSION_KEYS,
 };
 use crate::support::{
-    all_metric_definitions, assert_metric_definition, create, created_metric_definitions, emulator,
-    experiment_arn, message, metric_definition_id, put_metrics_destination,
-    update_metric_definition, update_metric_definition_reply, METRIC_DEFINITION_MEMBERS,
+    all_metric_definitions, assert_metric_definition, conflicting_metric_definitions, create,
+    created_metric_definitions, emulator, experiment_arn, message, metric_definition_id,
+    put_metrics_destination, update_metric_definition, update_metric_definition_reply,
+    METRIC_DEFINITION_MEMBERS,
 };
 
 /// The modelled error a write that would duplicate a stored definition is refused with, and
@@ -352,10 +355,11 @@ async fn no_write_leaves_one_destination_holding_two_definitions_of_one_metric()
             assert_metric_definition(case, &held[&first_id], &first, &first_id);
             assert_no_two_define_the_same_metric(case, &held);
 
-            // The definition the writes left alone is still the one the idempotent create
-            // resolves for its metric, under the id it already carries — so neither stored
-            // definition has become unreachable through the create.
-            let recreated = created_metric_definitions(
+            // The definition the writes left alone is still the one the create resolves for
+            // its metric: the create finds it already defined and answers that entry's own
+            // conflict under the id it already carries — so neither stored definition has
+            // become unreachable through the create.
+            let recreated = conflicting_metric_definitions(
                 &router,
                 case,
                 monitor,

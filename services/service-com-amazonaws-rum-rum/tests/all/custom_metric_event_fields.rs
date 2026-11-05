@@ -9,17 +9,20 @@
 //! computed from the RUM events its pattern matches, so every first-level key its
 //! `ValueKey`, `EventPattern` and `DimensionKeys` name has to be a field a RUM event
 //! carries, an `EventPattern` that filters on a non-empty `event_details` has to carry a
-//! non-empty `event_type` too, and an array in an `EventPattern` matches its field against
-//! exactly one value.
+//! non-empty `event_type` too, and the array a FIRST-LEVEL key of an `EventPattern` carries
+//! matches that field against exactly one value — while the matchers the member's own
+//! documented examples nest below such a key (a value list under `metadata`, a numeric range
+//! clause under `event_details`) carry as many values as the matcher needs.
 //!
 //! The tables span the rule rather than one request: the acceptance table carries one
 //! definition per RUM event field the model lists, beside a pattern nested several levels
-//! deep, a dotted `ValueKey`, dimensions the pattern names and an empty `event_details`
-//! (which needs no `event_type`); the refusal table varies WHICH member names the key that
+//! deep, the documented multi-value matchers, a dotted `ValueKey`, dimensions the pattern
+//! names and an empty `event_details` (which needs no `event_type`); the refusal table varies
+//! WHICH member names the key that
 //! is no event field (`ValueKey`, `EventPattern`, `DimensionKeys`, and a listed field
 //! spelled in the wrong case), how the `event_details`/`event_type` pairing is broken
-//! (absent, and present but empty) and where the array that is not a single value sits (at
-//! the pattern's top level, nested under another field, inside another array, and empty).
+//! (absent, and present but empty) and how a first-level key's array is not a single value
+//! (two values, and none).
 //! Every refused definition is then shown to have been stored nowhere, read back through
 //! `BatchGetRumMetricDefinitions`.
 
@@ -224,6 +227,71 @@ fn accepted_definitions() -> Vec<(String, Value)> {
             ),
         ),
         (
+            // The model's own example patterns for this member: the matchers NESTED below a
+            // first-level key carry as many values as the matcher needs — a value list under
+            // `metadata`, and a numeric range clause under `event_details`.
+            // Source: `smithy_query(query="doc", shape="MetricDefinitionRequest",
+            // member="EventPattern")`.
+            "a pattern matching a metadata field against several values".to_string(),
+            custom_metric(
+                "MetadataValueList",
+                json!({
+                    "EventPattern": pattern(json!({
+                        "event_type": ["com.amazon.rum.performance_navigation_event"],
+                        "metadata": {"browserName": ["Chrome", "Firefox"]},
+                    })),
+                }),
+            ),
+        ),
+        (
+            "a pattern thresholding on a nested numeric range".to_string(),
+            custom_metric(
+                "NumericRange",
+                json!({
+                    "ValueKey": "event_details.duration",
+                    "EventPattern": pattern(json!({
+                        "event_type": ["com.amazon.rum.performance_navigation_event"],
+                        "event_details": {"duration": [{"numeric": [">=", 2000, "<", 8000]}]},
+                    })),
+                }),
+            ),
+        ),
+        (
+            // The boundary of the single-value rule, inferred rather than recorded: the rule
+            // binds the array a first-level key carries DIRECTLY, so an array below one is
+            // the matcher's own shape whatever it holds — an empty nested matcher list is a
+            // case neither the documented examples nor a recording settles, and it is
+            // accepted because the rule does not reach it.
+            "a pattern whose nested array carries no value at all".to_string(),
+            custom_metric(
+                "EmptyNestedList",
+                json!({
+                    "EventPattern": pattern(json!({
+                        "event_type": ["com.example.page_view"],
+                        "metadata": {"browserName": []},
+                    })),
+                }),
+            ),
+        ),
+        (
+            // A nested numeric range whose bounds carry several decimals: the pattern is a
+            // JSON string on the wire, so what a read reports is the text the request sent,
+            // decimals and all.
+            "a pattern thresholding on fractional bounds".to_string(),
+            custom_metric(
+                "FractionalRange",
+                json!({
+                    "ValueKey": "event_details.duration",
+                    "EventPattern": pattern(json!({
+                        "event_type": ["com.amazon.rum.performance_navigation_event"],
+                        "event_details": {
+                            "duration": [{"numeric": [">=", 1234.567891, "<", 987654.321098]}],
+                        },
+                    })),
+                }),
+            ),
+        ),
+        (
             "a pattern carrying no array at all".to_string(),
             custom_metric(
                 "ScalarMatchers",
@@ -306,8 +374,10 @@ fn refused_definitions() -> Vec<(String, Value, String)> {
             "event_type".to_string(),
         ),
         (
-            // "In EventPattern, any JSON array must contain only one value."
-            "an EventPattern whose top-level array carries two values".to_string(),
+            // "In EventPattern, any JSON array must contain only one value" — the array a
+            // FIRST-LEVEL key carries, which is where that rule and the documented example
+            // patterns agree (the examples nest multi-value matchers below one).
+            "an EventPattern whose first-level array carries two values".to_string(),
             custom_metric(
                 "CartDepth2",
                 json!({
@@ -319,45 +389,17 @@ fn refused_definitions() -> Vec<(String, Value, String)> {
             "event_type".to_string(),
         ),
         (
-            "an EventPattern whose nested array carries two values".to_string(),
+            "an EventPattern whose first-level array carries no value at all".to_string(),
             custom_metric(
-                "TwoBrowsers",
+                "NoType",
                 json!({
                     "EventPattern": pattern(json!({
-                        "event_type": ["com.example.page_view"],
-                        "metadata": {"browserName": ["Chrome", "Safari"]},
+                        "event_type": [],
+                        "metadata": {"browserName": ["Chrome"]},
                     })),
                 }),
             ),
-            "metadata.browserName".to_string(),
-        ),
-        (
-            // A numeric matcher's operator/bound list is an array too, and a custom metric's
-            // pattern may not carry one — the rule is about ANY array in the pattern.
-            "an EventPattern whose array inside an array carries several values".to_string(),
-            custom_metric(
-                "RangedDuration",
-                json!({
-                    "EventPattern": pattern(json!({
-                        "event_type": ["com.example.navigation"],
-                        "event_details": {"duration": [{"numeric": [">", 2000, "<", 8000]}]},
-                    })),
-                }),
-            ),
-            "event_details.duration[0].numeric".to_string(),
-        ),
-        (
-            "an EventPattern whose array carries no value at all".to_string(),
-            custom_metric(
-                "NoBrowser",
-                json!({
-                    "EventPattern": pattern(json!({
-                        "event_type": ["com.example.page_view"],
-                        "metadata": {"browserName": []},
-                    })),
-                }),
-            ),
-            "metadata.browserName".to_string(),
+            "event_type".to_string(),
         ),
     ]
 }

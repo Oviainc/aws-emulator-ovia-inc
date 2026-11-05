@@ -477,27 +477,24 @@ async fn a_target_the_store_does_not_hold_is_not_found_and_an_empty_one_is_a_pag
             code, NOT_FOUND_CODE,
             "case {case:?}: expected {NOT_FOUND_CODE}, got {code:?}"
         );
-        // The refusal is built from the request: it names the monitor and the destination
-        // the caller asked about, and the experiment ARN only where the request named one.
+        // RECORDED: the refusal names the app monitor the request addressed and refers to
+        // the `(Destination, DestinationArn)` pair as "the specified parameters", so neither
+        // the destination kind nor the experiment ARN is echoed into it.
         let document = reply.json(case);
         let reported = message(&document)
             .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no message: {document}"));
-        assert!(
-            reported.contains(monitor) && reported.contains(destination),
-            "case {case:?}: expected the message to name {monitor:?} and {destination:?}, got \
-             {reported:?}"
+        let expected = format!(
+            "No destination for Rum metric definitions exists on app monitor {monitor}, for \
+             the specified parameters. Please try again."
         );
-        match destination_arn {
-            Some(arn) => assert!(
-                reported.contains(arn),
-                "case {case:?}: expected the message to name the experiment {arn:?}, got \
-                 {reported:?}"
-            ),
-            None => assert!(
-                !reported.contains("arn:"),
-                "case {case:?}: the message named an ARN the request did not carry: {reported:?}"
-            ),
-        }
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the message {expected:?}, got {reported:?}"
+        );
+        assert!(
+            !reported.contains("arn:"),
+            "case {case:?}: the message echoed an ARN: {reported:?}"
+        );
     }
 
     // The contrast: a destination that EXISTS and holds no definition is a page, not a

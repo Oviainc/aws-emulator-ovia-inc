@@ -552,6 +552,114 @@ pub(crate) fn canonical_metric_definition(requested: &Value) -> Value {
 /// parameter must be omitted or set to `AWS/RUM`".
 pub(crate) const EXTENDED_METRICS_NAMESPACE: &str = "AWS/RUM";
 
+/// The `ErrorCode` the batch create reports for a definition the addressed destination
+/// already holds.
+/// Source: `smithy_query(query="operation",
+/// operation="BatchCreateRumMetricDefinitions")` — the modelled `ConflictException`, "This
+/// operation attempted to create a resource that already exists".
+pub(crate) const CONFLICT_CODE: &str = "ConflictException";
+
+/// The `ErrorMessage` that per-definition conflict carries: the definition the request asked
+/// for, printed as the service prints a modelled structure — the shape's name over its
+/// members in the order the model declares them, each as `name=value`, with `null` for a
+/// member the request left out and a map as its entries in key order.
+///
+/// Spelled out here rather than read back out of the crate, so these cases pin the wording
+/// instead of agreeing with it by construction.
+pub(crate) fn already_defined_message(requested: &Value) -> String {
+    let printed = |member: &str| match requested.get(member).and_then(Value::as_str) {
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
+    };
+    let dimension_keys = match requested.get("DimensionKeys").and_then(Value::as_object) {
+        Some(keys) => {
+            // In KEY order, which is the order the service prints a map in — and the one
+            // order one request's map can be printed in twice, since nothing carries the
+            // order the request spelled its entries in.
+            let mut entries: Vec<String> = keys
+                .iter()
+                .map(|(field, dimension)| {
+                    format!("{field}={}", dimension.as_str().unwrap_or_default())
+                })
+                .collect();
+            entries.sort();
+            format!("{{{}}}", entries.join(", "))
+        }
+        None => "null".to_string(),
+    };
+    format!(
+        "Metric definition already exists: MetricDefinitionRequest(name={}, valueKey={}, \
+         unitLabel={}, dimensionKeys={dimension_keys}, eventPattern={}, namespace={})",
+        printed("Name"),
+        printed("ValueKey"),
+        printed("UnitLabel"),
+        printed("EventPattern"),
+        printed("Namespace"),
+    )
+}
+
+/// Assert the `Errors` of an answered batch create report exactly one conflict per
+/// definition of `conflicting`, in the order the request named them: the modelled error's
+/// code, the definition that caused it and the message above.
+pub(crate) fn assert_definition_conflicts(case: &str, answered: &Value, conflicting: &[Value]) {
+    let errors = answered["Errors"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        errors.len(),
+        conflicting.len(),
+        "case {case:?}: expected {} per-definition conflict(s), got {errors:?}",
+        conflicting.len()
+    );
+    for (requested, error) in conflicting.iter().zip(errors.iter()) {
+        assert_eq!(
+            &error["MetricDefinition"], requested,
+            "case {case:?}: expected the conflict to carry the definition that caused it, \
+             got {error}"
+        );
+        assert_eq!(
+            error["ErrorCode"].as_str(),
+            Some(CONFLICT_CODE),
+            "case {case:?}: expected the error code {CONFLICT_CODE}, got {error}"
+        );
+        let expected = already_defined_message(requested);
+        assert_eq!(
+            error["ErrorMessage"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the message {expected:?}, got {error}"
+        );
+    }
+    assert_eq!(
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {case:?}: expected the create to report no MetricDefinitions, got {answered}"
+    );
+}
+
+/// A `BatchCreateRumMetricDefinitions` whose every definition the addressed destination
+/// ALREADY holds: asserts the 200 and one per-item conflict per definition
+/// ([`assert_definition_conflicts`]), and reports the definition the destination holds for
+/// each of them — the stored definitions the refused call left alone.
+pub(crate) async fn conflicting_metric_definitions(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    definitions: &[Value],
+) -> Vec<Value> {
+    let reply =
+        batch_create_metric_definitions(router, monitor, destination, destination_arn, definitions)
+            .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: expected BatchCreateRumMetricDefinitions to answer 200, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_definition_conflicts(case, &reply.json(case), definitions);
+    held_metric_definitions(router, case, monitor, destination, destination_arn, definitions).await
+}
+
 /// Create ONE metric definition under a destination and report the `MetricDefinitionId`
 /// the service minted for it.
 ///

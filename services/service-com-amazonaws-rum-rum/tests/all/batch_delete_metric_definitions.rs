@@ -701,7 +701,19 @@ struct GrantCase {
     /// calling role's ARN.
     resource: Option<String>,
     allowed: bool,
+    /// For a refused row, the clause the refusal ends in: the policy KIND that took the
+    /// decision. RECORDED for the row that holds no policy at all; the explicit-deny forms
+    /// are AWS's wording for the kind of policy that carries the deny.
+    reason: &'static str,
 }
+
+/// The clause a refusal states when no statement of the caller's identity-based policies
+/// allowed the action.
+const NO_IDENTITY_POLICY: &str =
+    "because no identity-based policy allows the rum:BatchDeleteRumMetricDefinitions action";
+
+/// The clause it states when the RESOURCE's own policy denied the action outright.
+const RESOURCE_POLICY_DENY: &str = "with an explicit deny in a resource-based policy";
 
 #[tokio::test]
 async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing() {
@@ -715,12 +727,14 @@ async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing
             ))),
             resource: None,
             allowed: false,
+            reason: NO_IDENTITY_POLICY,
         },
         GrantCase {
             case: "a role with no policy at all",
             identity: None,
             resource: None,
             allowed: false,
+            reason: NO_IDENTITY_POLICY,
         },
         GrantCase {
             case: "an identity policy allowing exactly this action",
@@ -729,12 +743,14 @@ async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing
             ))),
             resource: None,
             allowed: true,
+            reason: "",
         },
         GrantCase {
             case: "no identity policy, a resource policy naming the caller",
             identity: None,
             resource: Some(resource_policy("Allow", "{role}", ACTION, None)),
             allowed: true,
+            reason: "",
         },
         GrantCase {
             case: "an identity policy that allows and a resource policy that denies",
@@ -743,6 +759,7 @@ async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing
             ))),
             resource: Some(resource_policy("Deny", "*", ACTION, None)),
             allowed: false,
+            reason: RESOURCE_POLICY_DENY,
         },
     ];
 
@@ -848,6 +865,22 @@ async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing
                 "case {case:?}: expected {ACCESS_DENIED_CODE}, got {:?}",
                 String::from_utf8_lossy(&reply.body)
             );
+            // The refusal is worded about the decision that was taken: the principal the
+            // credential speaks for, the action it asked for, the app monitor it asked to
+            // act on, and the policy kind that withheld the grant.
+            let expected = format!(
+                "User: arn:aws:sts::{}:assumed-role/{role}/probe is not authorized to \
+                 perform: {ACTION} on resource: {} {}",
+                crate::authorization::account(),
+                crate::authorization::monitor_arn(&monitor),
+                row.reason
+            );
+            assert_eq!(
+                reply.message(case),
+                expected,
+                "case {case:?}: expected the message {expected:?}, got {:?}",
+                reply.message(case)
+            );
         }
 
         // What the destination holds afterwards, read back with the account's own
@@ -882,4 +915,119 @@ async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing
              {held:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_iam_user_holding_no_policy_is_refused_and_the_definition_survives() {
+    let case = "an IAM user with no identity-based policy";
+    let emulator = Emulator::new();
+    let monitor = "del-auth-user";
+    emulator.create_monitor(monitor).await;
+    let seeded = emulator
+        .rum(
+            ACCOUNT_KEY,
+            "POST",
+            &format!("/rummetrics/{monitor}/metricsdestination"),
+            Some(json!({"Destination": "CloudWatch"})),
+        )
+        .await;
+    assert_eq!(
+        seeded.status, 200,
+        "case {case:?}: seeding the destination must succeed, got {} {:?}",
+        seeded.status,
+        String::from_utf8_lossy(&seeded.body)
+    );
+    let created = emulator
+        .rum(
+            ACCOUNT_KEY,
+            "POST",
+            &format!("/rummetrics/{monitor}/metrics"),
+            Some(json!({
+                "Destination": "CloudWatch",
+                "MetricDefinitions": [definition(0)],
+            })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: seeding the definition must succeed, got {} {:?}",
+        created.status,
+        String::from_utf8_lossy(&created.body)
+    );
+    let page = emulator
+        .rum(
+            ACCOUNT_KEY,
+            "GET",
+            &format!(
+                "/rummetrics/{monitor}/metrics?{}",
+                destination_query("CloudWatch", None)
+            ),
+            None,
+        )
+        .await;
+    let id = page.json(case)["MetricDefinitions"][0]["MetricDefinitionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: the seed minted no MetricDefinitionId"))
+        .to_string();
+
+    // An IAM user created through IAM's own calls, holding NO policy at all, signing with
+    // the long-term key IAM minted for it: a principal of another kind than the sessions
+    // the table above drives, judged by the same rule.
+    let user = "metric-deleter-user";
+    let key = emulator.iam_user_key(user, None).await;
+    let reply = emulator
+        .rum(
+            &key,
+            "DELETE",
+            &format!(
+                "/rummetrics/{monitor}/metrics?{}&metricDefinitionIds={}",
+                destination_query("CloudWatch", None),
+                percent_encoded(&id)
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        reply.status, 403,
+        "case {case:?}: expected HTTP 403, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_eq!(
+        reply.error_code(case),
+        ACCESS_DENIED_CODE,
+        "case {case:?}: expected {ACCESS_DENIED_CODE}, got {:?}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let expected = format!(
+        "User: arn:aws:iam::{}:user/{user} is not authorized to perform: {ACTION} on \
+         resource: {} {NO_IDENTITY_POLICY}",
+        crate::authorization::account(),
+        crate::authorization::monitor_arn(monitor)
+    );
+    assert_eq!(
+        reply.message(case),
+        expected,
+        "case {case:?}: expected the message {expected:?}, got {:?}",
+        reply.message(case)
+    );
+
+    // And the definition the unauthorized caller asked to delete is still there.
+    let read = emulator
+        .rum(
+            ACCOUNT_KEY,
+            "GET",
+            &format!(
+                "/rummetrics/{monitor}/metrics?{}",
+                destination_query("CloudWatch", None)
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        read.json(case)["MetricDefinitions"][0]["MetricDefinitionId"].as_str(),
+        Some(id.as_str()),
+        "case {case:?}: a refused delete removed the definition: {:?}",
+        String::from_utf8_lossy(&read.body)
+    );
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for the form a metric definition is STORED in, and therefore for
-//! the identity `BatchCreateRumMetricDefinitions` keys its `@idempotent` create on.
+//! the identity `BatchCreateRumMetricDefinitions` resolves a requested definition against.
 //!
 //! The rule under test: an optional member of a `MetricDefinitionRequest` whose value
 //! declares nothing — an `EventPattern` that is empty or carries only whitespace, a
@@ -37,9 +37,9 @@ use crate::metric_definitions::{
     EXTENDED_METRICS,
 };
 use crate::support::{
-    all_metric_definitions, assert_metric_definition, create, created_metric_definitions,
-    emulator, experiment_arn, metric_definition_id, metric_definition_without,
-    put_metrics_destination, update_metric_definition,
+    all_metric_definitions, assert_metric_definition, conflicting_metric_definitions, create,
+    created_metric_definitions, emulator, experiment_arn, metric_definition_id,
+    metric_definition_without, put_metrics_destination, update_metric_definition,
 };
 
 /// Both values `MetricDestination` admits, as the `(Destination, experiment slug)` pair a
@@ -266,9 +266,11 @@ async fn a_definition_member_declaring_nothing_is_stored_as_an_absent_one() {
                 &id,
             );
 
-            // The OTHER spelling names that same definition: it is reported under the id
-            // the first call minted, and nothing is stored a second time.
-            let again = created_metric_definitions(
+            // The OTHER spelling names that same definition, which the destination already
+            // holds: the call reports it as that entry's own conflict, the stored
+            // definition keeps the id the first call minted and nothing is stored a second
+            // time.
+            let again = conflicting_metric_definitions(
                 &router,
                 case,
                 &monitor,
@@ -290,9 +292,10 @@ async fn a_definition_member_declaring_nothing_is_stored_as_an_absent_one() {
                  {after:?}"
             );
 
-            // Both spellings in ONE batch are one definition too: each entry reports the
-            // definition the destination already holds.
-            let batched = created_metric_definitions(
+            // Both spellings in ONE batch are one definition too: each entry names the
+            // definition the destination already holds, so each is answered as its own
+            // conflict.
+            let batched = conflicting_metric_definitions(
                 &router,
                 case,
                 &monitor,
@@ -433,8 +436,10 @@ async fn an_update_stores_a_member_declaring_nothing_as_an_absent_one() {
         );
 
         // And the definition the update stored is the one a create of the canonical
-        // spelling names: the update wrote the same canonical form a create writes.
-        let again = created_metric_definitions(
+        // spelling names: the create finds that definition already there, so it answers the
+        // conflict for it rather than storing a second copy — which is the evidence that
+        // the update wrote the same canonical form a create writes.
+        let again = conflicting_metric_definitions(
             &router,
             case,
             &monitor,

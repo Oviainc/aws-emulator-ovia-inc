@@ -241,11 +241,11 @@ async fn passing_a_role_to_a_metrics_destination_requires_the_callers_iam_pass_r
             );
             // The refusal is worded about the decision that was taken: the principal, the
             // `iam:PassRole` action and the role ARN the request asked to pass, with the
-            // reason the grant was withheld.
+            // policy kind that withheld the grant.
             let reason = if row.grant == PassRole::DeniedOnThatRole {
-                "with an explicit deny in a policy for the iam:PassRole action"
+                "with an explicit deny in an identity-based policy".to_string()
             } else {
-                "because no policy allows the iam:PassRole action"
+                "because no identity-based policy allows the iam:PassRole action".to_string()
             };
             let expected = format!(
                 "User: arn:aws:sts::{}:assumed-role/{caller_role}/probe is not authorized \

@@ -63,10 +63,12 @@ const TAG_KEY_PATTERN: &str = r"(?!aws:)[a-zA-Z+-=._:/]+";
 /// writes it. Source: the same shape.
 const MODELLED_TAG_KEY_PATTERN: &str = r"^(?!aws:)[a-zA-Z+-=._:/]+$";
 
-/// `DimensionName`'s `@pattern`. It carries no `^`/`$` pair around the WHOLE expression
-/// (there is no trailing `$`), so a refusal quotes it verbatim.
-/// Source: `smithy_query(query="shape", shape="DimensionKeysMap")`, value.
-const DIMENSION_NAME_PATTERN: &str = r"^(?!:).*[^\s].*";
+/// `DimensionName`'s `@pattern` as a refusal QUOTES it: the expression the WHOLE value must
+/// match. The model anchors the START only, so the `^` goes and the open end is already
+/// spelled with the unconstrained run the expression ends in.
+/// Source: `smithy_query(query="shape", shape="DimensionKeysMap")`, value, whose modelled
+/// pattern is `^(?!:).*[^\s].*`.
+const DIMENSION_NAME_PATTERN: &str = r"(?!:).*[^\s].*";
 
 /// The modelled bounds the rows below stand at one side of.
 /// Sources: `smithy_query(query="shape", shape="AppMonitorDomain,AppMonitorDomainList,

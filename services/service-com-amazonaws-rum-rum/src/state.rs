@@ -2102,30 +2102,24 @@ pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
 pub const NOT_FOUND_MESSAGE: &str = "Resource not found";
 
 /// `ResourceNotFoundException` for a destination the named app monitor does not have —
-/// what the operations that READ a destination's metric definitions answer for a
+/// what the operations that address a destination's metric DEFINITIONS answer for a
 /// `(Destination, DestinationArn)` pair the monitor holds no record under.
 ///
-/// The message is built from the request: the destination kind it named, and the Evidently
-/// experiment ARN only where there is one to name. Like every other not-found body of this
-/// service it carries `message` ALONE — `resourceName`/`resourceType` are off the wire for
-/// this shape (see [`crate::ops::types::ResourceNotFoundException`]).
+/// RECORDED: the message names the app monitor the request addressed and refers to the pair
+/// as "the specified parameters" rather than echoing it, so the destination kind and the
+/// experiment ARN are not part of the text. Like every other not-found body of this service
+/// it carries `message` ALONE — `resourceName`/`resourceType` are off the wire for this
+/// shape (see [`crate::ops::types::ResourceNotFoundException`]).
 ///
 /// The operations that ADD metric definitions to a destination refuse the same missing
 /// destination in their own words ([`adding_metrics_destination_not_found`]).
-pub fn metric_destination_not_found(
-    app_monitor_name: &str,
-    destination: &str,
-    destination_arn: Option<&str>,
-) -> ResourceNotFoundException {
-    let message = match destination_arn {
-        Some(arn) => format!(
-            "App monitor {app_monitor_name} has no {destination} metrics destination {arn}."
+pub fn metric_destination_not_found(app_monitor_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No destination for Rum metric definitions exists on app monitor \
+             {app_monitor_name}, for the specified parameters. Please try again."
         ),
-        None => {
-            format!("App monitor {app_monitor_name} has no {destination} metrics destination.")
-        }
-    };
-    ResourceNotFoundException { message }
+    }
 }
 
 /// The dotted member path the framework's walk reports a violation inside the
@@ -2308,8 +2302,8 @@ fn self_applied(
 /// * The event fields a CUSTOM metric reads and the pattern it reads them by (from the
 ///   model): every first-level key its `ValueKey`, `EventPattern` and `DimensionKeys` name
 ///   has to be a field a RUM event carries, a pattern filtering on `event_details` has to
-///   filter on `event_type` too, and an array in its pattern carries one value
-///   ([`custom_metric_refusal`]).
+///   filter on `event_type` too, and the array a first-level key of its pattern carries holds
+///   one value ([`custom_metric_refusal`]).
 ///
 /// Which DESTINATION the request names is deliberately none of them, which is why this
 /// judge takes the definition alone. The destination scoping of `DimensionKeys` ("Use this
@@ -2358,10 +2352,9 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
     // decides: a definition published to RUM's own namespace, or to none at all, is an
     // extended metric, and one published to a namespace of the caller's own is a custom
     // metric.
-    let extended_namespace =
-        namespace.is_none_or(|namespace| namespace == EXTENDED_METRICS_NAMESPACE);
+    let extended_namespace = names_extended_namespace(definition);
     if extended_namespace {
-        if let Some(message) = extended_metric_refusal(definition, namespace, pattern.as_ref()) {
+        if let Some(message) = extended_metric_refusal(definition, pattern.as_ref()) {
             return Some(message);
         }
     } else if let Some(message) = custom_metric_refusal(definition, pattern.as_ref()) {
@@ -2404,27 +2397,19 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
 /// ("For extended metrics, valid values for the entries in this field are the following",
 /// [`EXTENDED_DIMENSION_ENTRIES`]) — RUM computes those dimensions itself, so neither the
 /// field path nor the name it is published under is the caller's to choose. A name the
-/// catalog does NOT list is a custom metric, and a custom metric cannot be published here
-/// at all: "The namespace can't be omitted and can't be `AWS/RUM`. You can use the
-/// `AWS/RUM` namespace only for extended metrics."
+/// catalog does NOT list is no extended metric at all, which invalidates the whole request
+/// ([`extended_metric_name_refusal`]) rather than this definition alone.
 fn extended_metric_refusal(
     definition: &MetricDefinitionRequest,
-    namespace: Option<&str>,
     pattern: Option<&::serde_json::Value>,
 ) -> Option<String> {
     let name = definition.name.as_str();
     let Some(entry) = extended_metric(name) else {
-        return Some(match namespace {
-            Some(namespace) => format!(
-                "Namespace {namespace} can be used only for extended metrics, and {name} is \
-                 not an extended metric: a custom metric is published to a namespace of its \
-                 own."
-            ),
-            None => format!(
-                "Namespace is required for the custom metric {name}: a custom metric's \
-                 namespace cannot be omitted."
-            ),
-        });
+        // The name is not one RUM recognizes, which is the whole REQUEST's failure rather
+        // than this definition's alone ([`extended_metric_name_refusal`]); the wording is
+        // that one rule's, stated in one place, so the batch create's whole-request refusal
+        // and the update's say the same thing.
+        return Some(metric_name_not_valid(name));
     };
 
     // "Only certain combinations of values for Name, ValueKey, and EventPattern are
@@ -2494,6 +2479,59 @@ fn extended_metric_refusal(
     None
 }
 
+/// Whether `definition` is addressed to RUM's extended-metrics namespace, i.e. whether its
+/// `Namespace` is [`EXTENDED_METRICS_NAMESPACE`] or omitted.
+///
+/// From the model (`MetricDefinitionRequest`): "For extended metrics that are sent to the
+/// `AWS/RUM` namespace … The `Namespace` parameter must be omitted or set to `AWS/RUM`" —
+/// so the two spellings name the same namespace and a definition carrying either is judged
+/// by the extended-metric rules.
+fn names_extended_namespace(definition: &MetricDefinitionRequest) -> bool {
+    definition
+        .namespace
+        .as_deref()
+        .is_none_or(|namespace| namespace == EXTENDED_METRICS_NAMESPACE)
+}
+
+/// The refusal for a `Name` RUM does not recognize as one of its extended metrics, worded
+/// the way the service states an invalid metric value.
+fn metric_name_not_valid(name: &str) -> String {
+    format!("Metric value {name} is not valid.")
+}
+
+/// Why the WHOLE request carrying `definition` is not valid, or `None` when nothing about
+/// its `Name` makes it so.
+///
+/// A definition addressed to RUM's extended-metrics namespace — named outright or left to
+/// the omission the model equates with it ([`names_extended_namespace`]) — defines one of
+/// RUM's OWN metrics, so its `Name` has to be one the catalog lists
+/// ([`EXTENDED_METRIC_CATALOG`]): "You can use the `AWS/RUM` namespace only for extended
+/// metrics", and the catalog is the set of extended metrics there are. A name outside it is
+/// a value the request may not carry at all rather than a definition the service declines to
+/// store, so it refuses the whole call with `ValidationException` and nothing is written —
+/// which is why this is asked BEFORE any per-definition processing, by every operation that
+/// accepts a definition.
+///
+/// A definition published to a namespace of the caller's own is a custom metric, which "can
+/// specify any name that you like", so this says nothing about it.
+#[must_use]
+pub fn extended_metric_name_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
+    (names_extended_namespace(definition) && extended_metric(&definition.name).is_none())
+        .then(|| metric_name_not_valid(&definition.name))
+}
+
+/// The same, for the `MetricDefinitions` LIST a batch request carries: the first definition
+/// whose `Name` makes the request invalid, in request order.
+///
+/// One such definition invalidates the whole request, so the batch form reports the first
+/// one rather than accumulating — there is one refusal to state.
+#[must_use]
+pub fn metric_definitions_name_refusal(
+    definitions: &[MetricDefinitionRequest],
+) -> Option<String> {
+    definitions.iter().find_map(extended_metric_name_refusal)
+}
+
 /// Why this definition is not the CUSTOM metric its namespace says it is, or `None` when
 /// it is one.
 ///
@@ -2509,8 +2547,11 @@ fn extended_metric_refusal(
 ///   `event_type`", restated as "For every non-empty `event_details`, there must be a
 ///   non-empty `event_type`" — the event's type is what decides which details it carries,
 ///   so details are filtered on only beside a type.
-/// * "In `EventPattern`, any JSON array must contain only one value" — an array in a
-///   pattern is the one value its field is matched against.
+/// * "In `EventPattern`, any JSON array must contain only one value" — applied to the array
+///   a FIRST-LEVEL key carries, which is as far as that sentence and the patterns the model
+///   gives as valid examples agree: those examples match every first-level key against one
+///   value and nest the multi-value matchers (a value list, a numeric range clause) below one
+///   ([`single_value_array_violation`]).
 fn custom_metric_refusal(
     definition: &MetricDefinitionRequest,
     pattern: Option<&::serde_json::Value>,
@@ -2566,10 +2607,10 @@ fn custom_metric_refusal(
              {EVENT_TYPE_FIELD}: the event's type is what decides which details it has."
         ));
     }
-    single_value_array_violation(pattern, "").map(|(path, held)| {
+    single_value_array_violation(pattern).map(|(field, held)| {
         format!(
-            "EventPattern matches the field {path} against {held} values: an array in an \
-             EventPattern carries only one value."
+            "EventPattern matches the event field {field} against {held} values: the array a \
+             first-level key of an EventPattern carries holds only one value."
         )
     })
 }
@@ -2596,36 +2637,39 @@ fn pattern_member_is_empty(member: Option<&::serde_json::Value>) -> bool {
     }
 }
 
-/// The path of the first array inside `value` that does not carry exactly ONE value, and
-/// how many values it carries — or `None` when every array in it carries one.
+/// The first FIRST-LEVEL key of `pattern` whose value is an array not carrying exactly ONE
+/// value, and how many values that array carries — or `None` when every such array carries
+/// one.
 ///
-/// The path is spelled the way a request spells a field path: the member names from the
-/// pattern's root, dot-separated, with an index where the walk went through an array. The
-/// walk descends an ALREADY-PARSED pattern, whose nesting the JSON parser bounded, so a
-/// caller cannot choose how deep it goes.
-fn single_value_array_violation(
-    value: &::serde_json::Value,
-    path: &str,
-) -> Option<(String, usize)> {
-    match value {
-        ::serde_json::Value::Object(members) => members.iter().find_map(|(member, held)| {
-            let nested = if path.is_empty() {
-                member.clone()
-            } else {
-                format!("{path}.{member}")
-            };
-            single_value_array_violation(held, &nested)
-        }),
-        ::serde_json::Value::Array(items) => {
-            if items.len() != 1 {
-                return Some((path.to_string(), items.len()));
+/// The model states the rule as "In `EventPattern`, any JSON array must contain only one
+/// value", and it is applied to the array a first-level key carries DIRECTLY, because that
+/// is as far as the rule and the documented patterns agree: every pattern the model gives as
+/// a valid example matches a first-level key against a single value, while the matchers
+/// those examples NEST below one carry as many values as the matcher needs — a value list
+/// (`"metadata": { "browserName": [ "Chrome", "Firefox" ] }`) and a numeric range clause
+/// (`"event_details": { "duration": [{ "numeric": [ ">=", 2000, "<", 8000 ] }] }`), which
+/// are also the forms the catalog's own required patterns are written in
+/// ([`EXTENDED_METRIC_CATALOG`]). So a nested array is the matcher's own shape and is not
+/// counted ([`MetricDefinitionRequest$EventPattern`]'s documentation is the source of both
+/// examples).
+///
+/// The keys are judged in SORTED order, so the field a refusal names is the same whichever
+/// order the request spelled the pattern's members in.
+fn single_value_array_violation(pattern: &::serde_json::Value) -> Option<(String, usize)> {
+    let mut offending: Vec<(&str, usize)> = pattern
+        .as_object()?
+        .iter()
+        .filter_map(|(field, held)| match held {
+            ::serde_json::Value::Array(values) if values.len() != 1 => {
+                Some((field.as_str(), values.len()))
             }
-            items.iter().enumerate().find_map(|(index, held)| {
-                single_value_array_violation(held, &format!("{path}[{index}]"))
-            })
-        }
-        _ => None,
-    }
+            _ => None,
+        })
+        .collect();
+    offending.sort_unstable();
+    offending
+        .first()
+        .map(|(field, held)| ((*field).to_string(), *held))
 }
 
 /// Whether the event pattern `pattern` INCLUDES everything `required` asks for.
@@ -3490,6 +3534,52 @@ pub fn metric_definition_already_exists(metric_definition_id: &str) -> ConflictE
 pub const CONFLICT_MESSAGE_PREFIX: &str = "Resource ";
 /// See [`CONFLICT_MESSAGE_PREFIX`].
 pub const CONFLICT_MESSAGE_SUFFIX: &str = " already exists";
+
+/// The message a BATCH create reports per definition the addressed destination already
+/// holds — the per-item conflict, so what it names is the definition the request asked for
+/// rather than an id.
+///
+/// The requested definition is printed the way the service prints a modelled structure: the
+/// shape's name over its members in the order the model declares them, each member as
+/// `name=value`, with the literal `null` for a member the request left out — so a caller
+/// reading the message sees exactly the definition that was refused, including which of its
+/// optional members carried nothing. A `DimensionKeys` map prints as its entries in KEY
+/// order, which is the one order one request's map can be printed in twice: the map reaches
+/// a handler as the built input's own unordered map, so the order the request spelled its
+/// entries in is not recoverable here.
+pub fn metric_definition_already_defined(definition: &MetricDefinitionRequest) -> String {
+    let dimension_keys = definition
+        .dimension_keys
+        .as_ref()
+        .map(|keys| {
+            let entries: BTreeMap<&String, &String> = keys.iter().collect();
+            let rendered: Vec<String> = entries
+                .into_iter()
+                .map(|(field, dimension)| format!("{field}={dimension}"))
+                .collect();
+            format!("{{{}}}", rendered.join(", "))
+        })
+        .unwrap_or_else(|| PRINTED_NULL.to_string());
+    format!(
+        "Metric definition already exists: MetricDefinitionRequest(name={}, valueKey={}, \
+         unitLabel={}, dimensionKeys={dimension_keys}, eventPattern={}, namespace={})",
+        definition.name,
+        printed(definition.value_key.as_deref()),
+        printed(definition.unit_label.as_deref()),
+        printed(definition.event_pattern.as_deref()),
+        printed(definition.namespace.as_deref()),
+    )
+}
+
+/// How a printed structure spells a member the request left out.
+const PRINTED_NULL: &str = "null";
+
+/// An optional member as a printed structure spells it: the value the request carried, or
+/// [`PRINTED_NULL`] for a member it left out. An empty value is a value, so it prints as
+/// itself.
+fn printed(value: Option<&str>) -> &str {
+    value.unwrap_or(PRINTED_NULL)
+}
 
 /// `ServiceQuotaExceededException` for a create that would take the store past an
 /// app-monitor ceiling, naming the ceiling it reached.

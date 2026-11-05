@@ -276,11 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !monitor.has_metric_destination(&input.destination, destination_arn) {
             return Err(
                 BatchGetRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
-                    crate::state::metric_destination_not_found(
-                        &input.app_monitor_name,
-                        &input.destination,
-                        destination_arn,
-                    ),
+                    crate::state::metric_destination_not_found(&input.app_monitor_name),
                 )
                 .into(),
             );

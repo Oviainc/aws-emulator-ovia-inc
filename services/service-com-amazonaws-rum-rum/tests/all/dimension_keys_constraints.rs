@@ -74,9 +74,11 @@ const KEY_MAX_LENGTH: usize = 280;
 const NAME_MIN_LENGTH: usize = 1;
 const NAME_MAX_LENGTH: usize = 255;
 
-/// `DimensionName`'s modelled `@pattern`, as a refusal quotes it. It carries no `^`/`$` pair
-/// around the WHOLE expression (there is no trailing `$`), so the service quotes it verbatim.
-const NAME_PATTERN: &str = r"^(?!:).*[^\s].*";
+/// `DimensionName`'s modelled `@pattern` as a refusal QUOTES it: the expression the WHOLE
+/// value must match. The model anchors its START only (`^(?!:).*[^\s].*`), so the `^` is not
+/// part of the character grammar a caller satisfies, and the end the model leaves open is
+/// already spelled with the unconstrained run the expression ends in.
+const NAME_PATTERN: &str = r"(?!:).*[^\s].*";
 
 /// The path segment a definition's dimension map is reported under: the lowerCamel spelling
 /// of `MetricDefinitionRequest$DimensionKeys`.

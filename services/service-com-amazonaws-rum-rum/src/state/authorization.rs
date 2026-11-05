@@ -173,19 +173,42 @@ pub struct Denied {
     pub action: String,
     /// The resource it asked to act on.
     pub resource: String,
-    /// Set when a statement explicitly denied the action, rather than no statement
-    /// allowing it.
-    pub explicit: bool,
+    /// Which policy kind took the decision, which is the reason a refusal states.
+    pub reason: Reason,
+}
+
+/// Why the grant was withheld, as a refusal states it: which KIND of policy decided.
+///
+/// AWS words an authorization refusal about the policy that took the decision — an explicit
+/// `Deny` names the policy kind that carries it, and a request no statement allows names the
+/// kind that would have had to allow it — so the evaluation reports which side it was and
+/// the message is built from that rather than from a bare "refused".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// No statement of the caller's identity-based policies allowed the action.
+    NoIdentityPolicyAllows,
+    /// A statement of the caller's identity-based policies denied it outright.
+    DeniedByIdentityPolicy,
+    /// A statement of the resource's own policy denied it outright.
+    DeniedByResourcePolicy,
 }
 
 impl Denied {
     /// The refusal in AWS's own wording, built from the three things the decision was made
-    /// about: the principal, the action and the resource.
+    /// about — the principal, the action and the resource — and the policy kind that took
+    /// it ([`Reason`]).
     pub fn message(&self) -> String {
-        let reason = if self.explicit {
-            format!("with an explicit deny in a policy for the {} action", self.action)
-        } else {
-            format!("because no policy allows the {} action", self.action)
+        let reason = match self.reason {
+            Reason::NoIdentityPolicyAllows => format!(
+                "because no identity-based policy allows the {} action",
+                self.action
+            ),
+            Reason::DeniedByIdentityPolicy => {
+                "with an explicit deny in an identity-based policy".to_string()
+            }
+            Reason::DeniedByResourcePolicy => {
+                "with an explicit deny in a resource-based policy".to_string()
+            }
         };
         format!(
             "User: {} is not authorized to perform: {} on resource: {} {reason}",
@@ -214,15 +237,15 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     let resource_said = resource_policy
         .map(|document| iam::resource_decision(document, &request))
         .unwrap_or(Decision::NotStated);
-    let refusal = |explicit: bool| Denied {
+    let refusal = |reason: Reason| Denied {
         principal: caller.arn.clone(),
         action: action.to_string(),
         resource: resource.to_string(),
-        explicit,
+        reason,
     };
     // An explicit deny wins over every grant, including the account's own credential.
     if resource_said == Decision::Denied {
-        return Err(refusal(true));
+        return Err(refusal(Reason::DeniedByResourcePolicy));
     }
     if caller.identity_is_unbounded() {
         return Ok(());
@@ -231,7 +254,11 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if iam::is_allowed(identity_said, resource_said) {
         return Ok(());
     }
-    Err(refusal(identity_said == Decision::Denied))
+    Err(refusal(if identity_said == Decision::Denied {
+        Reason::DeniedByIdentityPolicy
+    } else {
+        Reason::NoIdentityPolicyAllows
+    }))
 }
 
 /// Whether IAM lets this request perform `action`, judged on the caller's identity-based

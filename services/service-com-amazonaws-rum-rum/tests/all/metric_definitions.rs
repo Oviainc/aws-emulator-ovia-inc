@@ -22,7 +22,7 @@
 //! namespace table walks both sides of the reserved-prefix boundary; the pagination test is
 //! an invariant check over a grid of store sizes and page sizes; the `MaxResults` table
 //! walks each published bound of the modelled range plus one past each, beside the
-//! documented default page size; and the `@idempotent` table re-sends a batch of definitions
+//! documented default page size; and the re-send table re-sends a batch of definitions
 //! over both destination kinds, batch sizes and member combinations, beside a batch that
 //! repeats and adds, a definition differing in one member, and one identity named twice in
 //! a single batch.
@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::support::{
-    call, canonical_metric_definition, create, emulator, message, percent_encoded, Reply, REGION,
+    assert_definition_conflicts, call, canonical_metric_definition, create, emulator, message,
+    percent_encoded, Reply, REGION,
 };
 
 /// Every value `MetricDestination` admits.
@@ -1066,17 +1067,31 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
     // cannot start with `AWS/`, and the extended-metrics namespace itself is closed to it
     // ("You can use the AWS/RUM namespace only for extended metrics"). The prefix is
     // matched as written, so a namespace that merely resembles it is accepted.
-    let rows: [(&str, &str, bool); 7] = [
-        ("the extended-metrics namespace itself", "AWS/RUM", false),
-        ("another AWS namespace", "AWS/Billing", false),
-        ("a longer name under the prefix", "AWS/RUMExtended", false),
-        ("the prefix with nothing after it", "AWS/", false),
-        ("the prefix without its separator", "AWSCustom", true),
-        ("the prefix in another case", "aws/rum", true),
-        ("a namespace of one's own", "MyApp/Checkout", true),
+    //
+    // The two refusals differ in CHANNEL, because they are two different rules: a
+    // definition addressed to the extended-metrics namespace defines one of RUM's own
+    // metrics, so a `Name` outside that catalog makes the whole REQUEST invalid (HTTP 400,
+    // nothing stored), while any other namespace under the reserved prefix is a namespace
+    // this one definition may not be published to, which fails that definition alone inside
+    // a 200.
+    //
+    // (case, namespace, created, refused for the whole request)
+    let rows: [(&str, &str, bool, bool); 7] = [
+        (
+            "the extended-metrics namespace itself",
+            "AWS/RUM",
+            false,
+            true,
+        ),
+        ("another AWS namespace", "AWS/Billing", false, false),
+        ("a longer name under the prefix", "AWS/RUMExtended", false, false),
+        ("the prefix with nothing after it", "AWS/", false, false),
+        ("the prefix without its separator", "AWSCustom", true, false),
+        ("the prefix in another case", "aws/rum", true, false),
+        ("a namespace of one's own", "MyApp/Checkout", true, false),
     ];
 
-    for (index, (case, namespace, accepted)) in rows.iter().enumerate() {
+    for (index, (case, namespace, accepted, whole_request)) in rows.iter().enumerate() {
         let monitor = format!("namespace-{index}");
         create_monitor(&router, case, &monitor).await;
         put_destination(&router, case, &monitor, &destination).await;
@@ -1086,10 +1101,11 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
         // and the update, where it fails the call.
         let create_reply =
             batch_create(&router, &monitor, &destination, std::slice::from_ref(&definition)).await;
+        let create_status = if *whole_request { 400 } else { 200 };
         assert_eq!(
             create_reply.status,
-            200,
-            "case {case:?}: expected the batch create to answer 200, got {} {:?}",
+            create_status,
+            "case {case:?}: expected the batch create to answer {create_status}, got {} {:?}",
             create_reply.status,
             String::from_utf8_lossy(&create_reply.body)
         );
@@ -1101,9 +1117,15 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
         let created = all_definitions(&router, case, &monitor, &destination)
             .await
             .len();
+        let expected_counts = match (*accepted, *whole_request) {
+            (true, _) => (1, 0),
+            // A whole-request refusal carries no per-definition error list at all.
+            (false, true) => (0, 0),
+            (false, false) => (0, 1),
+        };
         assert_eq!(
             (created, refused),
-            if *accepted { (1, 0) } else { (0, 1) },
+            expected_counts,
             "case {case:?}: expected namespace {namespace:?} to be {}, got {answered}",
             if *accepted { "created" } else { "refused" }
         );
@@ -1627,10 +1649,10 @@ async fn definitions_belong_to_the_destination_they_were_created_under() {
 }
 
 #[tokio::test]
-async fn a_repeated_batch_create_stores_no_second_copy_of_a_definition() {
+async fn a_repeated_batch_create_reports_a_conflict_and_stores_no_second_copy() {
     let (router, _engine) = emulator();
 
-    // One row per batch to create and then re-send. `@idempotent` is a rule about the
+    // One row per batch to create and then re-send. The conflict is a rule about the
     // IDENTITY a create is keyed by, not about one request, so the rows differ along what
     // that identity is read off: which destination the definitions live under, how many
     // definitions one call carries, and which members a definition uses — from an extended
@@ -1691,20 +1713,19 @@ async fn a_repeated_batch_create_stores_no_second_copy_of_a_definition() {
             "case {case:?}: expected one stored definition per requested one, got {stored:?}"
         );
 
-        // The SAME request again — what `@idempotent` licenses a retry to send: every
-        // definition is reported under the id the first delivery minted for it, and the
-        // stored state is exactly the one that delivery left.
-        let repeated =
-            create_definitions(&router, case, &monitor, &destination, &definitions).await;
+        // The SAME request again: every definition the destination already holds is a
+        // definition that already exists, so each is reported as its own per-item
+        // `ConflictException` and the stored state is exactly the one the first delivery
+        // left.
+        let repeated = batch_create(&router, &monitor, &destination, &definitions).await;
         assert_eq!(
-            repeated.len(),
-            definitions.len(),
-            "case {case:?}: expected the repeat to report one definition per requested one, \
-             got {repeated:?}"
+            repeated.status,
+            200,
+            "case {case:?}: expected the repeat to answer 200, got {} {:?}",
+            repeated.status,
+            String::from_utf8_lossy(&repeated.body)
         );
-        for ((requested, id), reported) in definitions.iter().zip(&ids).zip(&repeated) {
-            assert_definition(case, reported, requested, id);
-        }
+        assert_definition_conflicts(case, &repeated.json(case), &definitions);
         let after_repeat = stored_by_id(&router, case, &monitor, &destination).await;
         assert_eq!(
             after_repeat, stored,
@@ -1713,39 +1734,43 @@ async fn a_repeated_batch_create_stores_no_second_copy_of_a_definition() {
         );
 
         // A batch that repeats those definitions and adds ONE the destination does not
-        // hold: only the addition is created, and the repeated ones keep their ids.
+        // hold: only the addition is created, the repeated ones are the conflicts, and the
+        // stored definitions keep their ids.
         let added = custom(&format!("Added{index}"), "MyApp/Added");
         let mut with_added = definitions.clone();
         with_added.push(added.clone());
-        let answered = create_definitions(&router, case, &monitor, &destination, &with_added).await;
-        let answered_ids: Vec<String> = answered.iter().map(|one| id_of(case, one)).collect();
+        let reply = batch_create(&router, &monitor, &destination, &with_added).await;
         assert_eq!(
-            &answered_ids[..ids.len()],
-            &ids[..],
-            "case {case:?}: expected the repeated definitions to keep their ids, got \
-             {answered_ids:?}"
+            reply.status,
+            200,
+            "case {case:?}: expected the mixed batch to answer 200, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
         );
-        let added_id = answered_ids
-            .last()
-            .cloned()
-            .unwrap_or_else(|| panic!("case {case:?}: the call reported nothing: {answered:?}"));
-        assert!(
-            !ids.contains(&added_id),
-            "case {case:?}: expected the added definition to get an id of its own, got \
-             {added_id:?} among {ids:?}"
-        );
-        assert_definition(
-            case,
-            answered.last().expect("the call reported the addition"),
-            &added,
-            &added_id,
-        );
+        assert_definition_conflicts(case, &reply.json(case), &definitions);
         let after_addition = stored_by_id(&router, case, &monitor, &destination).await;
         assert_eq!(
             after_addition.len(),
             definitions.len() + 1,
             "case {case:?}: expected only the added definition to be stored beside the \
              existing ones, got {after_addition:?}"
+        );
+        for (requested, id) in definitions.iter().zip(&ids) {
+            assert_definition(
+                case,
+                after_addition
+                    .get(id)
+                    .unwrap_or_else(|| panic!("case {case:?}: {id:?} is gone: {after_addition:?}")),
+                requested,
+                id,
+            );
+        }
+        let added_id = added_definition_id(case, &after_addition, &ids);
+        assert_definition(
+            case,
+            &after_addition[&added_id],
+            &added,
+            &added_id,
         );
 
         // A definition that differs from a stored one in ONE member defines another metric,
@@ -1767,29 +1792,26 @@ async fn a_repeated_batch_create_stores_no_second_copy_of_a_definition() {
         );
         assert_definition(case, &answered[0], &changed, &changed_id);
 
-        // And the same identity named twice in ONE batch is one definition too: both
-        // entries report the definition the call stored once.
+        // The same identity named twice in ONE batch: the entries are processed in request
+        // order, so the first creates the definition and the second finds it already
+        // defined, which is the same conflict.
         let twice = custom(&format!("Twice{index}"), "MyApp/Added");
-        let answered = create_definitions(
+        let reply = batch_create(
             &router,
-            case,
             &monitor,
             &destination,
             &[twice.clone(), twice.clone()],
         )
         .await;
         assert_eq!(
-            answered.len(),
-            2,
-            "case {case:?}: expected one report per requested definition, got {answered:?}"
+            reply.status,
+            200,
+            "case {case:?}: expected the batch naming one definition twice to answer 200, \
+             got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
         );
-        let twice_id = id_of(case, &answered[0]);
-        assert_eq!(
-            id_of(case, &answered[1]),
-            twice_id,
-            "case {case:?}: expected both entries to name the one stored definition, got \
-             {answered:?}"
-        );
+        assert_definition_conflicts(case, &reply.json(case), std::slice::from_ref(&twice));
         let finally = stored_by_id(&router, case, &monitor, &destination).await;
         assert_eq!(
             finally.len(),
@@ -1798,4 +1820,23 @@ async fn a_repeated_batch_create_stores_no_second_copy_of_a_definition() {
              repeated ones, got {finally:?}"
         );
     }
+}
+
+/// The ONE id of `held` that is not among `existing` — the definition a mixed batch added.
+fn added_definition_id(
+    case: &str,
+    held: &BTreeMap<String, Value>,
+    existing: &[String],
+) -> String {
+    let mut fresh = held
+        .keys()
+        .filter(|id| !existing.contains(id))
+        .cloned()
+        .collect::<Vec<String>>();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "case {case:?}: expected exactly one definition beside the stored ones, got {fresh:?}"
+    );
+    fresh.remove(0)
 }

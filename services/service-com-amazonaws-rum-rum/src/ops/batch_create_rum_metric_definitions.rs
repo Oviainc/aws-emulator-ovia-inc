@@ -5,11 +5,11 @@
 //! Creates metric definitions — extended metrics and custom metrics — under ONE
 //! extended-metrics destination of the app monitor the request names, in this service's
 //! persisted state. A definition the destination does not hold yet is stored under a
-//! freshly minted `MetricDefinitionId`; a definition it already holds keeps the id it
-//! already carries and is stored no second time, which is the `@idempotent` the model
-//! declares for this operation — re-sending a batch leaves the state its first delivery
-//! did. The answer reports NO definition: `MetricDefinitions` carries the empty list
-//! whatever the call created, so the ids it minted are learned from
+//! freshly minted `MetricDefinitionId`; a definition it ALREADY holds is a definition that
+//! already exists, so that entry of the batch is refused with a per-item
+//! `ConflictException` naming the definition the request asked for, and the stored one keeps
+//! its id and its content. The answer reports NO definition: `MetricDefinitions` carries the
+//! empty list whatever the call created, so the ids it minted are learned from
 //! `BatchGetRumMetricDefinitions`, which reads the same map back (and
 //! `UpdateRumMetricDefinition` replaces one entry of it). Each definition the call refuses
 //! is reported in `Errors` while the rest still succeed, which is what the model asks for:
@@ -277,6 +277,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A `Name` RUM does not recognize as one of its extended metrics invalidates the
+        // WHOLE request rather than the definition that carries it: a definition addressed
+        // to the extended-metrics namespace defines one of RUM's own metrics, and a name
+        // outside that catalog is a value the request may not carry at all. Judged here,
+        // before any definition is processed and before anything is written
+        // ([`crate::state::metric_definitions_name_refusal`]) — beside the other checks on
+        // the request's own values, so a request whose values are not admissible is refused
+        // the same way whoever sent it, rather than the answer depending on what the caller
+        // is allowed to do.
+        if let Some(message) =
+            crate::state::metric_definitions_name_refusal(&input.metric_definitions)
+        {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into(),
+            );
+        }
+
         // May this caller define THIS app monitor's metrics? Decided per call from the
         // caller's identity-based policies and the monitor's resource policy, with the
         // monitor and the policy in force read under a SHORT lock. The `AppMonitorName`
@@ -350,24 +370,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
-            // The operation is `@idempotent`, so the identity this create is keyed by is
-            // the definition itself: a definition the destination already holds is the one
-            // a previous call created, and applying the same request again names THAT
-            // definition, under the id that call minted. Nothing is stored for it, so a
-            // retried or re-sent batch leaves exactly the state its first delivery did —
-            // it also takes no second slot of the destination's capacity and needs no
-            // second delete to undo.
-            if monitor
+            // A destination holds at most ONE definition of a given metric, and the
+            // identity of a definition is the definition ITSELF — the members the request
+            // carries. So a requested definition the destination already holds is a
+            // definition that already exists: it is reported as this item's own
+            // `ConflictException`, under the definition the request asked for, and the
+            // stored one is left exactly as the call that created it wrote it — its id and
+            // its content unchanged. The rest of the batch still succeeds.
+            //
+            // The definitions are processed in request order, so a definition this very
+            // batch created in an EARLIER entry already exists too by the time a later
+            // entry names it, which is the same conflict.
+            let already_defined = monitor
                 .metric_definition_defining(&input.destination, destination_arn, requested)
                 .is_some()
-            {
-                continue;
-            }
-            // The same identity, within the one request: a definition named twice in one
-            // batch is one definition too, so the second entry creates nothing of its own.
-            if to_create.iter().any(|earlier| {
-                crate::state::MetricDefinitionRecord::same_definition(earlier, requested)
-            }) {
+                || to_create.iter().any(|earlier| {
+                    crate::state::MetricDefinitionRecord::same_definition(earlier, requested)
+                });
+            if already_defined {
+                errors.push(BatchCreateRumMetricDefinitionsError2 {
+                    metric_definition: requested.clone(),
+                    error_code: CONFLICT_ERROR_CODE.to_string(),
+                    error_message: crate::state::metric_definition_already_defined(requested),
+                });
                 continue;
             }
             if held >= crate::state::MAX_METRIC_DEFINITIONS_PER_DESTINATION {
@@ -431,6 +456,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `UpdateRumMetricDefinition` answers `ValidationException` for, so the per-definition
 /// error reports that modelled error's name.
 const VALIDATION_ERROR_CODE: &str = "ValidationException";
+
+/// The `ErrorCode` for a definition the addressed destination already holds — the conflict
+/// error this operation models (`ConflictException`, "This operation attempted to create a
+/// resource that already exists"), reported per definition because the rest of the list
+/// still succeeds.
+const CONFLICT_ERROR_CODE: &str = "ConflictException";
 
 /// The `ErrorCode` for a definition that would take the destination past the most
 /// definitions it may contain — the quota error this operation models

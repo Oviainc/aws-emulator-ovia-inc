@@ -16,12 +16,14 @@
 //! The tables span the rule rather than one request: the acceptance table carries the
 //! pinned combination of EVERY extended metric the model lists, a pattern that includes
 //! the required object and more, both namespaces an extended metric may name, and custom
-//! metrics from a bare one to one carrying every member; the refusal table varies which
-//! part of the combination is wrong (a `ValueKey` where the model wants none, none where it
-//! wants one, another's value, another metric's pattern, a pattern missing a nested
-//! matcher, no pattern at all) and which namespace rule a custom metric breaks, including
-//! names just outside the catalog. Every refused definition is then shown to have been
-//! stored nowhere, read back through `BatchGetRumMetricDefinitions`.
+//! metrics from a bare one to one carrying every member; the per-definition refusal table
+//! varies which part of the combination is wrong (a `ValueKey` where the model wants none,
+//! none where it wants one, another's value, another metric's pattern, a pattern missing a
+//! nested matcher, no pattern at all); and the whole-request refusal table walks the ways a
+//! `Name` can miss RUM's extended-metric catalog while the definition is addressed to the
+//! extended-metrics namespace, which invalidates the request itself. Every refused
+//! definition is then shown to have been stored nowhere, read back through
+//! `BatchGetRumMetricDefinitions`.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
@@ -261,44 +263,15 @@ fn accepted_definitions() -> Vec<(String, Value)> {
     rows
 }
 
-/// Definitions the model declares INVALID, each with the reason it is one.
+/// Definitions the model declares INVALID per DEFINITION: the batch create fails each on
+/// its own and the rest of the list still succeeds, while the update fails the call. Each
+/// row carries the reason it is invalid.
+///
+/// A definition whose `Name` is not one of RUM's extended metrics is NOT here: that
+/// invalidates the whole request rather than the definition
+/// ([`refused_requests`]).
 fn refused_definitions() -> Vec<(String, Value)> {
     vec![
-        (
-            // "The namespace can't be omitted."
-            "a custom metric with no namespace at all".to_string(),
-            json!({"Name": "MyCustomMetric"}),
-        ),
-        (
-            "a custom metric carrying every member but a namespace".to_string(),
-            json!({
-                "Name": "CartSize",
-                "ValueKey": "event_details.items",
-                "UnitLabel": "Count",
-                "EventPattern": event_pattern("com.example.cart", &[]),
-            }),
-        ),
-        (
-            // A name is matched as written, so one differing only in case from a catalog
-            // name is a custom metric and needs a namespace.
-            "a name differing from an extended one only in case, with no namespace"
-                .to_string(),
-            json!({"Name": "jserrorcount"}),
-        ),
-        (
-            "a name an extended one is a prefix of, with no namespace".to_string(),
-            json!({"Name": format!("{}Extra", EXTENDED_METRICS[8].name)}),
-        ),
-        (
-            // "The namespace … can't be AWS/RUM. You can use the AWS/RUM namespace only
-            // for extended metrics."
-            "a custom metric published to the extended-metrics namespace".to_string(),
-            custom("MyCustomMetric", EXTENDED_NAMESPACE),
-        ),
-        (
-            "a name differing from an extended one only in case, under AWS/RUM".to_string(),
-            custom("jserrorcount", EXTENDED_NAMESPACE),
-        ),
         (
             // "If Name is JsErrorCount, then ValueKey must be null."
             "an extended metric carrying a ValueKey the model wants null".to_string(),
@@ -371,6 +344,67 @@ fn refused_definitions() -> Vec<(String, Value)> {
                 "EventPattern",
                 json!(row(EXTENDED_METRICS[13].name).event_pattern),
             ),
+        ),
+    ]
+}
+
+/// Definitions that invalidate the WHOLE request, each with the reason they do, and the
+/// message the refusal carries.
+///
+/// A definition addressed to RUM's extended-metrics namespace — named outright or left to
+/// the omission the model equates with it ("The `Namespace` parameter must be omitted or set
+/// to `AWS/RUM`") — defines one of RUM's OWN metrics, so its `Name` has to be one the model
+/// pins a combination for: "You can use the `AWS/RUM` namespace only for extended metrics",
+/// and the pinned list is the set of extended metrics there are. A name outside it is a value
+/// the request may not carry at all, so the whole call is refused with the modelled
+/// `ValidationException` (HTTP 400) and nothing is stored — including the valid definitions
+/// the same batch carried.
+///
+/// The rows vary HOW the name misses the catalog (a name of the caller's own, one differing
+/// only in case, one an extended name is a prefix of) and how the namespace is spelled (left
+/// out, or `AWS/RUM` outright), plus a definition carrying every member beside its name.
+fn refused_requests() -> Vec<(String, Value, String)> {
+    let not_valid = |name: &str| format!("Metric value {name} is not valid.");
+    vec![
+        (
+            "a name of the caller's own with no namespace at all".to_string(),
+            json!({"Name": "MyCustomMetric"}),
+            not_valid("MyCustomMetric"),
+        ),
+        (
+            "every member but a namespace".to_string(),
+            json!({
+                "Name": "CartSize",
+                "ValueKey": "event_details.items",
+                "UnitLabel": "Count",
+                "EventPattern": event_pattern("com.example.cart", &[]),
+            }),
+            not_valid("CartSize"),
+        ),
+        (
+            // A name is matched as written, so one differing only in case from a catalog
+            // name is no extended metric.
+            "a name differing from an extended one only in case, with no namespace"
+                .to_string(),
+            json!({"Name": "jserrorcount"}),
+            not_valid("jserrorcount"),
+        ),
+        (
+            "a name an extended one is a prefix of, with no namespace".to_string(),
+            json!({"Name": format!("{}Extra", EXTENDED_METRICS[8].name)}),
+            not_valid(&format!("{}Extra", EXTENDED_METRICS[8].name)),
+        ),
+        (
+            // "The namespace … can't be AWS/RUM. You can use the AWS/RUM namespace only
+            // for extended metrics."
+            "a name of the caller's own under the extended-metrics namespace".to_string(),
+            custom("MyCustomMetric", EXTENDED_NAMESPACE),
+            not_valid("MyCustomMetric"),
+        ),
+        (
+            "a name differing from an extended one only in case, under AWS/RUM".to_string(),
+            custom("jserrorcount", EXTENDED_NAMESPACE),
+            not_valid("jserrorcount"),
         ),
     ]
 }
@@ -562,4 +596,62 @@ async fn no_definition_the_model_declares_invalid_is_stored_by_either_operation(
         "refused"
     );
     assert_definition("refused", &held[0], &valid);
+}
+
+#[tokio::test]
+async fn a_name_that_is_no_extended_metric_refuses_the_whole_request_and_stores_nothing() {
+    let (router, _engine) = emulator();
+    let monitor = "validation-whole-request";
+    seeded_monitor(&router, "whole request", monitor).await;
+
+    // The subject the update replaces, and the definition every batch below carries BESIDE
+    // the offending one: a definition the model declares valid, so the rows show that the
+    // refusal is the whole request's — the valid definition is not created either.
+    let valid = extended(EXTENDED_METRICS[8].name);
+
+    for (case, definition, expected) in refused_requests() {
+        let case = case.as_str();
+        let reply = batch_create(&router, monitor, &[valid.clone(), definition.clone()]).await;
+        assert_eq!(
+            reply.status,
+            400,
+            "case {case:?}: expected the batch create to answer 400, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(
+            reply.error_code(case),
+            VALIDATION_CODE,
+            "case {case:?}: expected a {VALIDATION_CODE}, got {:?}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body = reply.json(case);
+        assert_eq!(
+            message(&body),
+            Some(expected.as_str()),
+            "case {case:?}: expected the message {expected:?}, got {body}"
+        );
+        assert!(
+            stored(&router, case, monitor).await.is_empty(),
+            "case {case:?}: a refused request stored a definition"
+        );
+
+        // The single-definition update judges the same definition the same way, and with
+        // the same message: the rule is the request's, whichever operation carries it.
+        let subject = "00000000-0000-0000-0000-000000000000";
+        let reply = update(&router, monitor, subject, &definition).await;
+        assert_eq!(
+            reply.status,
+            400,
+            "case {case:?}: expected the update to answer 400, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body = reply.json(case);
+        assert_eq!(
+            message(&body),
+            Some(expected.as_str()),
+            "case {case:?}: expected the update's message {expected:?}, got {body}"
+        );
+    }
 }

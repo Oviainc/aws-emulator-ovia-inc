@@ -61,11 +61,14 @@
 //!    failed in the FRAMEWORK's own words — read back out of [`Violation::message`] rather
 //!    than re-spelled, so a requirement class cannot drift from the way the framework
 //!    words it;
-//! 3. a reported `@pattern` is the expression WITHOUT the `^` / `$` pair a model writes
-//!    around it to demand a whole-string match
-//!    (`service_common::validation::unanchored`): a caller that lifts the advertised
-//!    expression out of the message and re-applies it locally must get the character
-//!    grammar the service publishes. The CHECK always runs the model's pattern as written;
+//! 3. a reported `@pattern` is the expression the WHOLE value must match
+//!    (`service_common::validation::whole_value_expression`): a caller that lifts the
+//!    advertised expression out of the message and re-applies it locally must get the
+//!    character grammar the service publishes, and a Smithy `@pattern` is a FIND rather than
+//!    a total match — so each end the model ANCHORS loses its `^`/`$`, and each end it
+//!    leaves OPEN is spelled with the unconstrained run (`.*`) that end admits, which is how
+//!    the ARN members of this service (`DestinationArn`, `IamRoleArn`, `Arn`) are advertised.
+//!    The CHECK always runs the model's pattern as written;
 //! 4. a constraint broken by an ELEMENT of a list is stated at the LIST member — no
 //!    element position and no `member` step in the path — with the element shape's WHOLE
 //!    modelled constraint set nested inside `Member must satisfy constraint: [ … ]` and the
@@ -102,7 +105,7 @@ use aws_smithy_schema_server::constraints::{
     self, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait, Violation,
     ViolationKind,
 };
-use service_common::validation::{list_of_element, unanchored};
+use service_common::validation::{list_of_element, whole_value_expression};
 
 /// The wire error code a constraint refusal of an app-monitor call carries: the
 /// `ValidationException` this service's model declares, which is also the code the
@@ -738,12 +741,12 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         .map(|(_, requirement)| requirement.to_string())
 }
 
-/// The violation class as this service reports it: a `@pattern` without the anchor pair a
-/// model writes around it (rule 3), and an enum value set in the order this service lists
-/// that enum's values (rule 5). Every other class is the framework's, untouched.
+/// The violation class as this service reports it: a `@pattern` as the expression the WHOLE
+/// value must match (rule 3), and an enum value set in the order this service lists that
+/// enum's values (rule 5). Every other class is the framework's, untouched.
 fn stated_kind(kind: &ViolationKind) -> ViolationKind {
     match kind {
-        ViolationKind::Pattern(regex) => ViolationKind::Pattern(unanchored(regex)),
+        ViolationKind::Pattern(regex) => ViolationKind::Pattern(whole_value_expression(regex)),
         ViolationKind::EnumValue(values) => ViolationKind::EnumValue(listed(values)),
         other => other.clone(),
     }
