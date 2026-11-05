@@ -223,9 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         None => errors.push(BatchDeleteError {
                             resource_arn: resource_arn.clone(),
                             code: crate::state::BATCH_DELETE_ERROR_RESOURCE_NOT_FOUND.to_string(),
-                            message: crate::state::instrumentation_configuration_missing(
-                                resource_arn,
-                            ),
+                            message: crate::state::INSTRUMENTATION_CONFIGURATION_GONE.to_string(),
                         }),
                     }
                 }

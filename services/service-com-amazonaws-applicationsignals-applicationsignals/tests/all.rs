@@ -101,6 +101,8 @@ mod page_token_spelling;
 mod paged_cursor_selection_binding;
 #[path = "all/paged_cursor_subject_binding.rs"]
 mod paged_cursor_subject_binding;
+#[path = "all/refusal_prose.rs"]
+mod refusal_prose;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/resource_entity_metric_dimensions.rs"]

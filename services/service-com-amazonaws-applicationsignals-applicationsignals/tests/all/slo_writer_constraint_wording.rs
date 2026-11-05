@@ -6,10 +6,13 @@
 //! input rules the model cannot state — the two SLI configs are mutually exclusive, a create
 //! must define one of them, and an update may not supply one of the other kind than the
 //! stored record — beside the documented tag maximum and every constraint the model DOES
-//! state. Whichever rule fires, a client reads ONE form of `ValidationException` message: the
-//! `N validation error(s) detected:` envelope over a `Value at '<memberPath>' failed to
-//! satisfy constraint: <requirement>` clause that names the member the request must fix, in
-//! the lower-camel spelling the boundary validator uses, and nothing of the rejected value.
+//! state. A rule that constrains ONE member is refused in the `N validation error(s)
+//! detected:` envelope over a `Value at '<memberPath>' failed to satisfy constraint:
+//! <requirement>` clause that names the member the request must fix, in the lower-camel
+//! spelling the boundary validator uses, and nothing of the rejected value. The two rules that
+//! constrain no single member — a definition that must populate one of a PAIR, and an update
+//! that would switch the stored SLO's evaluation kind — state the rule itself instead; the
+//! suite that owns that prose is `refusal_prose`.
 //!
 //! The rows span what the rule generalises over: which OPERATION refuses (the create, the
 //! update), which KIND of rule fires (two mutually exclusive members, a member one of a pair
@@ -24,11 +27,10 @@
 //! all answered.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_applicationsignals_applicationsignals::state::{
-    EVALUATION_TYPE_PERIOD_BASED, EVALUATION_TYPE_REQUEST_BASED, MAX_TAGS_PER_RESOURCE,
-};
+use service_com_amazonaws_applicationsignals_applicationsignals::state::MAX_TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::refusal_prose::{kind_switch_refusal, MISSING_SLI_CONFIG, PERIOD_BASED, REQUEST_BASED};
 use crate::resource_tags::{tag, tag_list};
 use crate::slo_evaluation_kind::{
     request_based_sli_config, request_based_sli_config_with_queries, sli_config_with_queries,
@@ -74,14 +76,16 @@ fn member_path_of(message: &str) -> Option<&str> {
 /// config itself. A row that refuses a CREATE stores nothing first.
 type Stored = (&'static str, Value);
 
-/// One refused row: the request, the member the refusal must name and the requirement it must
-/// state, plus the caller input the message must not echo.
+/// One refused row: the request, the whole message the refusal must carry, the member the
+/// clause must name when the rule constrains ONE member (`None` for a rule that constrains
+/// none, whose refusal states the rule instead), plus the caller input the message must not
+/// echo.
 struct Refused {
     label: &'static str,
     stored: Option<Stored>,
     body: Value,
-    member_path: &'static str,
-    requirement: String,
+    member_path: Option<&'static str>,
+    message: String,
     rejected: Vec<String>,
 }
 
@@ -99,8 +103,10 @@ fn period_based(threshold: f64) -> Value {
 
 /// The refused rows, over every input constraint the two SLO writers enforce.
 fn refused_rows() -> Vec<Refused> {
-    let exclusive = "Member must be null when sliConfig is provided".to_string();
-    let absent = "Member must not be null when requestBasedSliConfig is not provided".to_string();
+    let exclusive = one_clause(
+        "requestBasedSliConfig",
+        "Member must be null when sliConfig is provided",
+    );
     vec![
         Refused {
             label: "create, both configs on entities",
@@ -109,8 +115,8 @@ fn refused_rows() -> Vec<Refused> {
                 "SliConfig": period_based(100.0),
                 "RequestBasedSliConfig": request_based_sli_config("checkout"),
             }),
-            member_path: "requestBasedSliConfig",
-            requirement: exclusive.clone(),
+            member_path: Some("requestBasedSliConfig"),
+            message: exclusive.clone(),
             rejected: vec!["checkout".to_string(), "GET /cart".to_string()],
         },
         Refused {
@@ -120,16 +126,16 @@ fn refused_rows() -> Vec<Refused> {
                 "SliConfig": sli_config_with_queries(),
                 "RequestBasedSliConfig": request_based_sli_config_with_queries(),
             }),
-            member_path: "requestBasedSliConfig",
-            requirement: exclusive.clone(),
+            member_path: Some("requestBasedSliConfig"),
+            message: exclusive.clone(),
             rejected: vec!["5XXError".to_string(), "AWS/ApiGateway".to_string()],
         },
         Refused {
             label: "create, neither config, name only",
             stored: None,
             body: json!({}),
-            member_path: "sliConfig",
-            requirement: absent.clone(),
+            member_path: None,
+            message: MISSING_SLI_CONFIG.to_string(),
             rejected: Vec::new(),
         },
         Refused {
@@ -143,8 +149,8 @@ fn refused_rows() -> Vec<Refused> {
                 "CreateRecommendedSlo": true,
                 "AutoInvestigationEnabled": true,
             }),
-            member_path: "sliConfig",
-            requirement: absent.clone(),
+            member_path: None,
+            message: MISSING_SLI_CONFIG.to_string(),
             rejected: vec![
                 "an objective with no indicator".to_string(),
                 "99.9".to_string(),
@@ -158,20 +164,27 @@ fn refused_rows() -> Vec<Refused> {
                 "SliConfig": period_based(110.0),
                 "Tags": tag_list(&generated_tags(MAX_TAGS_PER_RESOURCE + 1)),
             }),
-            member_path: "tags",
-            requirement: format!(
-                "Member must have length less than or equal to {MAX_TAGS_PER_RESOURCE}"
+            member_path: Some("tags"),
+            message: one_clause(
+                "tags",
+                &format!(
+                    "Member must have length less than or equal to {MAX_TAGS_PER_RESOURCE}"
+                ),
             ),
             rejected: vec!["key-000".to_string()],
         },
         // The create's control row: a constraint the MODEL states, refused by the boundary
-        // validator before the handler runs — the wording every row above has to match.
+        // validator before the handler runs — the wording every single-member row above has
+        // to match.
         Refused {
             label: "create, a Name the modelled pattern refuses",
             stored: None,
             body: json!({ "Name": NAME_TOO_SHORT, "SliConfig": period_based(120.0) }),
-            member_path: "name",
-            requirement: format!("Member must satisfy regular expression pattern: {NAME_PATTERN}"),
+            member_path: Some("name"),
+            message: one_clause(
+                "name",
+                &format!("Member must satisfy regular expression pattern: {NAME_PATTERN}"),
+            ),
             rejected: Vec::new(),
         },
         Refused {
@@ -181,8 +194,8 @@ fn refused_rows() -> Vec<Refused> {
                 "SliConfig": period_based(140.0),
                 "RequestBasedSliConfig": request_based_sli_config("checkout"),
             }),
-            member_path: "requestBasedSliConfig",
-            requirement: exclusive.clone(),
+            member_path: Some("requestBasedSliConfig"),
+            message: exclusive.clone(),
             rejected: vec!["checkout".to_string()],
         },
         Refused {
@@ -192,18 +205,16 @@ fn refused_rows() -> Vec<Refused> {
                 "SliConfig": sli_config_with_queries(),
                 "RequestBasedSliConfig": request_based_sli_config_with_queries(),
             }),
-            member_path: "requestBasedSliConfig",
-            requirement: exclusive,
+            member_path: Some("requestBasedSliConfig"),
+            message: exclusive,
             rejected: vec!["orders".to_string()],
         },
         Refused {
             label: "update, a request-based config on a period-based record",
             stored: Some(("SliConfig", period_based(150.0))),
             body: json!({ "RequestBasedSliConfig": request_based_sli_config("checkout") }),
-            member_path: "requestBasedSliConfig",
-            requirement: format!(
-                "Member must be null for a {EVALUATION_TYPE_PERIOD_BASED} service level objective"
-            ),
+            member_path: None,
+            message: kind_switch_refusal(PERIOD_BASED, REQUEST_BASED),
             rejected: vec!["checkout".to_string()],
         },
         Refused {
@@ -215,10 +226,8 @@ fn refused_rows() -> Vec<Refused> {
                 "Goal": { "AttainmentGoal": 95.0 },
                 "AutoInvestigationEnabled": true,
             }),
-            member_path: "requestBasedSliConfig",
-            requirement: format!(
-                "Member must be null for a {EVALUATION_TYPE_PERIOD_BASED} service level objective"
-            ),
+            member_path: None,
+            message: kind_switch_refusal(PERIOD_BASED, REQUEST_BASED),
             rejected: vec!["after".to_string(), "95".to_string()],
         },
         Refused {
@@ -228,22 +237,16 @@ fn refused_rows() -> Vec<Refused> {
                 request_based_sli_config_with_queries(),
             )),
             body: json!({ "SliConfig": period_based(160.0) }),
-            member_path: "sliConfig",
-            requirement: format!(
-                "Member must be null for a {EVALUATION_TYPE_REQUEST_BASED} service level \
-                 objective"
-            ),
+            member_path: None,
+            message: kind_switch_refusal(REQUEST_BASED, PERIOD_BASED),
             rejected: vec!["160".to_string()],
         },
         Refused {
             label: "update, a period-based entity config on a request-based record",
             stored: Some(("RequestBasedSliConfig", request_based_sli_config("payments"))),
             body: json!({ "SliConfig": sli_config_with_queries() }),
-            member_path: "sliConfig",
-            requirement: format!(
-                "Member must be null for a {EVALUATION_TYPE_REQUEST_BASED} service level \
-                 objective"
-            ),
+            member_path: None,
+            message: kind_switch_refusal(REQUEST_BASED, PERIOD_BASED),
             rejected: vec!["payments".to_string()],
         },
         // The update's control row: a constraint the MODEL states on this operation.
@@ -251,9 +254,10 @@ fn refused_rows() -> Vec<Refused> {
             label: "update, a Description longer than the model admits",
             stored: Some(("SliConfig", period_based(170.0))),
             body: json!({ "Description": "d".repeat(DESCRIPTION_MAX + 1) }),
-            member_path: "description",
-            requirement: format!(
-                "Member must have length less than or equal to {DESCRIPTION_MAX}"
+            member_path: Some("description"),
+            message: one_clause(
+                "description",
+                &format!("Member must have length less than or equal to {DESCRIPTION_MAX}"),
             ),
             rejected: Vec::new(),
         },
@@ -344,9 +348,10 @@ async fn send(
     }
 }
 
-/// Every input constraint the SLO writers enforce is refused with the one
-/// `ValidationException` wording the boundary validator uses: the envelope, the clause, the
-/// member path and the requirement — and nothing of the rejected value. A refused create
+/// Every input constraint the SLO writers enforce is refused with the wording its RULE calls
+/// for: a constraint on one member in the `ValidationException` envelope the boundary
+/// validator uses — the clause, the member path and the requirement, and nothing of the
+/// rejected value — and a rule on no single member in its own sentence. A refused create
 /// stores nothing and a refused update leaves the stored record exactly as it was.
 #[tokio::test]
 async fn every_slo_writer_constraint_states_its_member_and_requirement() {
@@ -368,10 +373,9 @@ async fn every_slo_writer_constraint_states_its_member_and_requirement() {
         );
         let message = answer["message"].as_str().unwrap_or_default();
         assert_eq!(
-            message,
-            one_clause(case.member_path, &case.requirement),
-            "case {label:?}: expected the one envelope and clause this service words a \
-             constraint violation with, got {message:?}"
+            message, case.message,
+            "case {label:?}: expected {:?}, got {message:?}",
+            case.message
         );
         for rejected in &case.rejected {
             assert!(
@@ -398,12 +402,16 @@ async fn every_slo_writer_constraint_states_its_member_and_requirement() {
     }
 }
 
-/// Every refusal spells its member path the way the boundary validator spells one for this
-/// service: lower camel case, a `.` between the steps of a nested member and no other
-/// separator — so a client reads one spelling of one member whichever side refused it.
+/// Every refusal that names a member spells its member path the way the boundary validator
+/// spells one for this service: lower camel case, a `.` between the steps of a nested member
+/// and no other separator — so a client reads one spelling of one member whichever side
+/// refused it. A row whose rule constrains no single member names none, and is skipped.
 #[tokio::test]
 async fn every_slo_writer_refusal_spells_its_member_path_the_one_way() {
     for (index, case) in refused_rows().into_iter().enumerate() {
+        let Some(expected_path) = case.member_path else {
+            continue;
+        };
         let label = case.label;
         let router = router();
         let name = format!("path-{index:02}");
@@ -413,6 +421,10 @@ async fn every_slo_writer_refusal_spells_its_member_path_the_one_way() {
         let message = answer["message"].as_str().unwrap_or_default().to_string();
         let path = member_path_of(&message)
             .unwrap_or_else(|| panic!("case {label:?}: no member path in {message:?}"));
+        assert_eq!(
+            path, expected_path,
+            "case {label:?}: expected the clause to name {expected_path:?}, got {path:?}"
+        );
         for step in path.split('.') {
             let first = step.chars().next().unwrap_or(' ');
             assert!(

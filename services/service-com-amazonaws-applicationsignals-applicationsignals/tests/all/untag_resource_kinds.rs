@@ -35,6 +35,9 @@ use crate::instrumentation_configuration_tags::{
 use crate::resource_tags::{
     expected_map, list_tags_raw, reported_tags, slo_arn, tag, tag_list, untag, SLO_RESOURCE_TYPE,
 };
+// The tagging plane's own not-found wording, owned by the suite that holds this service's
+// refusal prose.
+use crate::refusal_prose::tagged_resource_missing;
 use crate::slo_lifecycle::{arn_uri_segment, call, create, sli_config, ACCOUNT, REGION};
 
 /// A request that proves the resource a removal addressed is still served afterwards: the tags
@@ -421,19 +424,15 @@ async fn an_arn_naming_no_stored_resource_is_refused_and_detaches_nothing() {
                 "case {:?}: expected the type the ARN addresses, got {error}",
                 row.label
             );
-            assert_eq!(
-                error["Message"].as_str(),
-                Some(
-                    format!(
-                        "{resource_type} with arn '{}' does not exist.",
-                        row.resource_arn
-                    )
-                    .as_str()
-                ),
-                "case {:?}: expected the refusal to state the type and the ARN, got {error}",
-                row.label
-            );
         }
+        // The MESSAGE is the tagging plane's own: it names the resource generically,
+        // whichever kind the ARN addresses, and echoes the ARN the request carried.
+        assert_eq!(
+            error["Message"].as_str(),
+            Some(tagged_resource_missing(&row.resource_arn).as_str()),
+            "case {:?}: expected the tagging plane's generic wording, got {error}",
+            row.label
+        );
 
         // The refused removal wrote nothing: the live configuration still carries its tags.
         let (status, after) = list_tags_raw(&router, &arn_uri_segment(&live_arn)).await;

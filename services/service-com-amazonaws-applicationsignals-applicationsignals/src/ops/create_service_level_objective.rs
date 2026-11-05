@@ -225,9 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request-based SLO", and the only source of `EvaluationType` and
         // `MetricSourceType`. The model can express neither half of that rule, so the
         // boundary validator admits both shapes and each is refused here, BEFORE any state
-        // is read or written: a refused create stores nothing. Both refusals are worded
-        // through the service's one constraint-violation builder, like the tag maximum
-        // below, so a client reads the member it must fix whichever rule fired.
+        // is read or written: a refused create stores nothing. The exclusion is a constraint
+        // on ONE member, so it is worded through the service's constraint-violation builder
+        // like the tag maximum below; the missing indicator is satisfied by either member,
+        // so its refusal states the pair and the requirement on it instead.
         if let Some(message) = crate::state::exclusive_sli_configs_refusal(
             input.sli_config.as_ref(),
             input.request_based_sli_config.as_ref(),
@@ -262,12 +263,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx.parts());
         let mut store = state.lock();
 
-        // The conflicting resource is identified by ITS OWN ARN, read off the stored record
-        // rather than minted from this request: the record's ARN is what a client resolves
-        // or adopts the existing SLO by.
-        if let Some(existing) = store.slos.get(input.name.as_str()) {
+        // A second create under a name already stored is a conflict on the IDENTIFIER the
+        // request sent, which is what its refusal states: the stored record is read only to
+        // learn that there is one.
+        if store.slos.contains_key(input.name.as_str()) {
             return Err(CreateServiceLevelObjectiveErrorModeled::ConflictException(
-                crate::state::slo_already_exists(&existing.arn),
+                crate::state::slo_already_exists(),
             )
             .into());
         }

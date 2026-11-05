@@ -2,15 +2,21 @@
 
 //! How this service IDENTIFIES things in an error body.
 //!
-//! Two rules, each asserted over a set of inputs rather than on one recorded request:
+//! Three rules, each asserted over a set of inputs rather than on one recorded request:
 //!
-//! 1. An error about a service level objective identifies it by its ARN, and reports the
-//!    resource's capitalised type name — never the bare name the request happened to send
-//!    and never the lower-case segment an ARN spells.
-//! 2. A constraint-violation message states the member path and the requirement it
+//! 1. An error about a service level objective that cannot be RESOLVED identifies it by its
+//!    ARN, and reports the resource's capitalised type name — never the bare name the
+//!    request happened to send and never the lower-case segment an ARN spells.
+//! 2. A create refused because the identifier it sent is taken states that generically: the
+//!    identifier at fault is the caller's own `Name`, so the conflict names no resource, no
+//!    name and no ARN.
+//! 3. A constraint-violation message states the member path and the requirement it
 //!    violated, in AWS's `N validation error(s) detected: ` envelope, with no echo of the
 //!    rejected value and with a `@pattern` requirement rendered without the `^`/`$` anchors
 //!    the model spells it with.
+//!
+//! The request helpers (`router`, `call`, …) are the ones `slo_lifecycle` already drives
+//! this service's `restJson1` surface with, so both suites speak to one harness.
 //!
 //! The request helpers (`router`, `call`, …) are the ones `slo_lifecycle` already drives
 //! this service's `restJson1` surface with, so both suites speak to one harness.
@@ -23,6 +29,9 @@ use crate::slo_lifecycle::{
 // The work-item wording the update path answers, asserted over more inputs in the suite that
 // owns that rule.
 use crate::refusal_wording::assert_work_item_wording;
+// The sentence a create whose identifier is already taken is refused with, owned by the suite
+// that holds this service's refusal prose and asserted here over this suite's rows too.
+use crate::refusal_prose::IDENTIFIER_TAKEN;
 
 /// The `ResourceType` every SLO failure reports: the resource's type NAME, capitalised.
 const SLO_RESOURCE_TYPE: &str = "Slo";
@@ -144,14 +153,14 @@ async fn a_missing_slo_is_identified_by_its_arn_on_every_read_write_and_delete()
     }
 }
 
-/// Rule 1 on the conflict path: a create under a name already stored reports the ARN of the
-/// SLO that already exists, read off the stored record.
+/// Rule 2: a create under a name already stored is refused with the one generic sentence,
+/// which identifies nothing — not the SLO, not its name and not its ARN.
 ///
 /// The rows differ along the name's form and along the rest of the repeated request, which
-/// the identification must not depend on: a different description, the other (mutually
+/// the wording must not depend on: a different description, the other (mutually
 /// exclusive) SLI config, a goal and burn rates the stored record does not carry.
 #[tokio::test]
-async fn a_repeated_create_identifies_the_conflicting_slo_by_its_arn() {
+async fn a_repeated_create_conflicts_without_identifying_anything() {
     for name in [
         "conflict-slo",
         "conflict.slo.dotted",
@@ -193,14 +202,18 @@ async fn a_repeated_create_identifies_the_conflicting_slo_by_its_arn() {
                 status, 409,
                 "case {name:?}/{index}: expected HTTP 409 for a repeated name, got {status} with {error}"
             );
+            let message = error["Message"].as_str().unwrap_or_default();
             assert_eq!(
-                error["Message"].as_str(),
-                Some(
-                    format!("{SLO_RESOURCE_TYPE} with arn '{stored_arn}' already exists.").as_str()
-                ),
-                "case {name:?}/{index}: expected the conflict to name the stored ARN {stored_arn:?}, got {:?}",
-                error["Message"]
+                message, IDENTIFIER_TAKEN,
+                "case {name:?}/{index}: expected {IDENTIFIER_TAKEN:?}, got {message:?}"
             );
+            for identifier in [name, stored_arn.as_str(), SLO_RESOURCE_TYPE] {
+                assert!(
+                    !message.contains(identifier),
+                    "case {name:?}/{index}: the conflict must identify nothing, but it states \
+                     {identifier:?}: {message:?}"
+                );
+            }
         }
     }
 }
@@ -225,7 +238,7 @@ fn instrumentation_request(service: &str) -> Value {
     })
 }
 
-/// Rule 2: a refused request is answered with AWS's constraint-violation envelope, naming
+/// Rule 3: a refused request is answered with AWS's constraint-violation envelope, naming
 /// the member and the requirement and NOTHING of the value that was rejected; a `@pattern`
 /// requirement is the model's expression minus its anchors.
 ///

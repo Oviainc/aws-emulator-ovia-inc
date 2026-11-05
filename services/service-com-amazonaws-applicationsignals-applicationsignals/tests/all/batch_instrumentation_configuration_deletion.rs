@@ -30,6 +30,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::slo_lifecycle::{arn_uri_segment, call, router, ACCOUNT, REGION};
+// The sentence a per-item failure's `Message` states, owned by the suite that holds this
+// service's refusal prose.
+use crate::refusal_prose::CONFIGURATION_GONE;
 // The scope spellings an ARN of this service may be written with, and the rewriter that
 // produces them, shared with the suite that asserts the same rule for the tagging operations.
 use crate::tagged_arn_identity::{respelled, spellings};
@@ -698,9 +701,13 @@ async fn an_arn_list_selection_deletes_what_resolves_and_reports_the_rest_per_it
                 "case {case:?}: expected the {RESOURCE_NOT_FOUND} code for an ARN that names nothing, got {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, CONFIGURATION_GONE,
+                "case {case:?}: expected the per-item sentence {CONFIGURATION_GONE:?}, got {error}"
+            );
             assert!(
-                message.contains(error["ResourceArn"].as_str().unwrap_or_default()),
-                "case {case:?}: expected the per-item message to name the ARN it is about, got {error}"
+                !message.contains("arn:"),
+                "case {case:?}: expected the per-item message to name no ARN, got {error}"
             );
         }
 
@@ -812,9 +819,13 @@ async fn an_arn_list_selection_resolves_each_arn_whatever_scope_it_carries() {
                 "case {case:?}: expected the {RESOURCE_NOT_FOUND} code for an ARN that names nothing, got {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, CONFIGURATION_GONE,
+                "case {case:?}: expected the per-item sentence {CONFIGURATION_GONE:?}, got {error}"
+            );
             assert!(
-                message.contains(error["ResourceArn"].as_str().unwrap_or_default()),
-                "case {case:?}: expected the per-item message to name the ARN it is about, got {error}"
+                !message.contains("arn:"),
+                "case {case:?}: expected the per-item message to name no ARN, got {error}"
             );
         }
 
