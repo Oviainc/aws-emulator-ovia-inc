@@ -11,6 +11,8 @@
 //! nothing here either: the documented client request token must be present
 //! (`BadRequest`), and every subnet identifier the request names must name a subnet the
 //! account has in the signed Region (`InvalidNetworkSettings`, naming the offending id).
+//! Subnets are Amazon EC2's resources, so that second guard asks EC2 what the account has
+//! (`crate::state::resolve_requested_subnets`) rather than deciding it here.
 //!
 //! The ONLY file to touch for this operation.
 //!
@@ -310,11 +312,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A file system lives in the subnets the request names, so each identifier has to
         // name a subnet the account HAS in that Region before anything is allocated: one
         // that names nothing is `InvalidNetworkSettings`, carrying the offending id in
-        // `InvalidSubnetId`. The resolution also yields the VPC the file system reports.
-        let resolved_subnets = match resolve_requested_subnets(&region, &named_subnet_ids(&input)) {
-            Ok(resolved) => resolved,
-            Err(invalid) => return Err(subnet_does_not_exist(&invalid)),
-        };
+        // `InvalidSubnetId`. The resolution asks the service that OWNS subnets, so a subnet
+        // the client minted with `ec2:CreateSubnet` is one a file system can be placed in,
+        // and it yields the VPC the file system reports.
+        let resolved_subnets =
+            match resolve_requested_subnets(ctx, &region, &named_subnet_ids(&input)).await {
+                Ok(resolved) => resolved,
+                Err(invalid) => return Err(subnet_does_not_exist(&invalid)),
+            };
 
         let fingerprint = create_parameter_fingerprint(&input);
 
@@ -378,8 +383,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| DEFAULT_STORAGE_TYPE.to_string()),
             // The VPC the resolved subnets sit in, so `FileSystem$VpcId` reports the
-            // network the file system was actually placed in.
-            vpc_id: resolved_subnets.first().map(|subnet| subnet.vpc_id.clone()),
+            // network the file system was actually placed in. A resolved subnet whose owner
+            // reports no VPC of its own places the file system in none that can be named.
+            vpc_id: resolved_subnets
+                .first()
+                .map(|subnet| subnet.vpc_id.clone())
+                .filter(|vpc_id| !vpc_id.is_empty()),
             subnet_ids: input.subnet_ids.clone(),
             security_group_ids: input.security_group_ids.clone().unwrap_or_default(),
             network_interface_ids: Vec::new(),

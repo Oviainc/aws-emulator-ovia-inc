@@ -14,8 +14,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
-
 use crate::ops::types::{
     CreateFileSystemLustreConfiguration, CreateFileSystemOntapConfiguration,
     CreateFileSystemOpenZFSConfiguration, CreateFileSystemWindowsConfiguration,
@@ -491,49 +489,19 @@ pub fn fsx_arn(region: &str, resource_type: &str, resource_id: &str) -> String {
     ::emulator_server::emulator_arn("fsx", region, &format!("{resource_type}/{resource_id}"))
 }
 
-/// Every subnet identifier a create request names, resolved against the subnets the
-/// account's network has in `region`.
+/// Resolving the subnet identifiers a create names against the subnets the ACCOUNT has,
+/// which is Amazon EC2's state and not this service's. Re-exported below, so a handler
+/// reaches [`resolve_requested_subnets`] through `crate::state` the way it reaches
+/// everything else here.
+mod ec2_subnets;
+pub use ec2_subnets::resolve_requested_subnets;
+
+/// One subnet of the account, as the service that OWNS subnets reports it: the identifier a
+/// request names, the VPC it belongs to and the Availability Zone it sits in.
 ///
-/// A file system is placed in the subnets the request names, so an identifier that names
-/// no subnet of the account cannot be placed at all: the caller answers the modelled
-/// `InvalidNetworkSettings`, naming the identifier in `InvalidSubnetId`, and stores
-/// NOTHING. `Err` carries the FIRST such identifier, in the order the request lists them,
-/// so the answer does not depend on how many of them are wrong.
-///
-/// The resolution is [`resolve_subnet`]'s, the account's network as every service that
-/// places a resource in a subnet must see it, so FSx and its peers never disagree about
-/// which subnets exist.
-pub fn resolve_requested_subnets(
-    region: &str,
-    subnet_ids: &[&str],
-) -> Result<Vec<SubnetRecord>, String> {
-    let mut resolved = Vec::with_capacity(subnet_ids.len());
-    for subnet_id in subnet_ids {
-        match resolve_subnet(region, subnet_id) {
-            Some(subnet) => resolved.push(subnet),
-            None => return Err((*subnet_id).to_string()),
-        }
-    }
-    Ok(resolved)
-}
-
-/// How many hex characters an EC2 subnet identifier carries in its long form
-/// (`subnet-0bb1c79de3example`), which is the form [`region_subnets`] mints. The modelled
-/// `SubnetId` is `length 15..24` with pattern `^(subnet-[0-9a-f]{8,})$`, which this form
-/// satisfies.
-const SUBNET_ID_HEX_LEN: usize = 17;
-
-/// How many digest BYTES go into an EC2 VPC identifier's short form (`vpc-1a2b3c4d`): two
-/// hex characters each, so four make the 8 the form carries. The modelled `VpcId` is
-/// `length 12..21` with pattern `^(vpc-[0-9a-f]{8,})$`.
-const VPC_ID_DIGEST_BYTES: usize = 4;
-
-/// The Availability Zone suffixes a Region's default subnets sit in. A Region has at least
-/// three Availability Zones, and a default VPC has one default subnet in each.
-const AVAILABILITY_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
-
-/// A subnet of the account's network in one Region: the identifier a request names, the
-/// VPC it belongs to and the Availability Zone it sits in.
+/// Every field is read off EC2's own record (see [`resolve_requested_subnets`]); nothing
+/// here is derived from a Region or a request, so a placement this service reports is the
+/// network the account really has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubnetRecord {
     /// The EC2 subnet identifier, as a request names it.
@@ -542,65 +510,6 @@ pub struct SubnetRecord {
     pub vpc_id: String,
     /// The Availability Zone this subnet sits in.
     pub availability_zone: String,
-}
-
-/// The id of the account's default VPC in `region`.
-///
-/// AWS gives an account a default VPC in every Region and this emulator models no other,
-/// so the id is DERIVED from the Region name — stable, so every read reports the same
-/// VPC — in EC2's short `vpc-<8 hex>` form.
-pub fn default_vpc_id(region: &str) -> String {
-    format!(
-        "vpc-{}",
-        hex::encode(&Sha256::digest(region.as_bytes())[..VPC_ID_DIGEST_BYTES])
-    )
-}
-
-/// The subnets that exist in `region`: the default VPC's default subnet in each
-/// Availability Zone of that Region.
-///
-/// AWS creates the default VPC with "a size /16 IPv4 CIDR block and a default subnet in
-/// each Availability Zone" (EC2's `CreateDefaultVpc`), so these subnets are facts of the
-/// account's Region rather than resources an FSx request creates — the same reasoning the
-/// EC2 service's own state module gives for deriving a Region's Availability Zones instead
-/// of storing them. Each identifier is derived from the name of what it names (the Region
-/// for the VPC, the zone for a subnet), so a Region always reports the same network and
-/// [`resolve_subnet`] can tell an identifier that names a subnet of the account from one
-/// that names nothing at all.
-///
-/// THE SAME derivation, constant for constant, as the one
-/// `services/service-com-amazonaws-dax-amazondaxv3/src/state.rs` applies to
-/// `CreateSubnetGroup$SubnetIds` (`region_subnets` / `resolve_subnet` / `default_vpc_id`
-/// there), both written against the contract `services/common/src/network.rs` states, so
-/// the two services report ONE account network and a client that places a DAX subnet
-/// group and an FSx file system in "the same" subnet is talking to one account. The
-/// derivation itself moves into that shared module once one change may carry both service
-/// crates' manifests; keep the two in step until then, and when EC2's subnet operations
-/// stop answering 501, [`resolve_subnet`] is the one place here that has to start
-/// consulting the stored subnets beside these derived ones.
-pub fn region_subnets(region: &str) -> Vec<SubnetRecord> {
-    let vpc_id = default_vpc_id(region);
-    AVAILABILITY_ZONE_SUFFIXES
-        .iter()
-        .map(|suffix| {
-            let availability_zone = format!("{region}{suffix}");
-            let digest = hex::encode(Sha256::digest(availability_zone.as_bytes()));
-            SubnetRecord {
-                subnet_id: format!("subnet-{}", &digest[..SUBNET_ID_HEX_LEN]),
-                vpc_id: vpc_id.clone(),
-                availability_zone,
-            }
-        })
-        .collect()
-}
-
-/// The subnet `subnet_id` names in `region`, or `None` when no subnet of that Region
-/// carries that identifier — which is what lets a request naming it be refused instead of
-/// stored.
-pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<SubnetRecord> {
-    region_subnets(region)
-        .into_iter()
-        .find(|subnet| subnet.subnet_id == subnet_id)
 }
 
 /// The resource types FSx owns, as the `<type>/<id>` half of a `ResourceARN`.

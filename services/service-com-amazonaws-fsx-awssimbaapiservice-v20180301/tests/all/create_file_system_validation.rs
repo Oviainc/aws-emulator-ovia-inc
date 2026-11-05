@@ -12,21 +12,23 @@
 //! 1. A file system is placed in the subnets the request names, so every subnet
 //!    identifier it names must name a subnet the account HAS in the Region the request is
 //!    signed for; one that names none is refused with the modelled
-//!    `InvalidNetworkSettings` carrying that identifier, and nothing is stored.
+//!    `InvalidNetworkSettings` carrying that identifier, and nothing is stored. The rows
+//!    here name the Region's DEFAULT subnets; the subnets a client minted through Amazon
+//!    EC2 are the `create_file_system_resolves_ec2_subnets` suite's rows.
 //! 2. The operation requires a client request token ("This operation requires a client
 //!    request token in the request that Amazon FSx uses to ensure idempotent creation"),
 //!    so a request that omits it is refused with the modelled `BadRequest` before
 //!    anything is stored.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_fsx_awssimbaapiservice_v20180301::state::{
-    default_vpc_id, region_subnets,
-};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::file_system_lifecycle::{
-    call, emulator, ok, subnet_a, with_client_request_token, ACCOUNT_SUBNETS, REGION,
-};
+use crate::create_file_system_resolves_ec2_subnets::{create_subnet, create_vpc, delete_subnet};
+use crate::file_system_lifecycle::{call, emulator, ok, with_client_request_token};
+
+/// An Availability Zone of the Region these requests are signed for, for the one subnet this
+/// suite has EC2 mint and then delete.
+const ZONE: &str = "us-west-2a";
 
 /// The modelled `ErrorMessage` length (`length 1..256`), which every `Message` member in
 /// this service's errors targets.
@@ -57,10 +59,11 @@ fn error_code(body: &Value) -> String {
 /// in groups — which is what the rule generalises over.
 #[tokio::test]
 async fn subnets_the_account_has_are_accepted_and_report_their_vpc() {
-    let router = emulator();
-    let all: Vec<&str> = ACCOUNT_SUBNETS
+    let router = emulator().await;
+    let all: Vec<&str> = router
+        .account_subnets()
         .iter()
-        .map(|subnet| subnet.subnet_id.as_str())
+        .map(String::as_str)
         .collect();
     let mut cases: Vec<Vec<&str>> = all.iter().map(|id| vec![*id]).collect();
     cases.push(vec![all[0], all[1]]);
@@ -68,7 +71,9 @@ async fn subnets_the_account_has_are_accepted_and_report_their_vpc() {
     // The same subnets in another order are the same placement.
     cases.push(all.iter().rev().copied().collect());
 
-    let expected_vpc = default_vpc_id(REGION);
+    // The VPC those subnets sit in, as the service that OWNS them reports it — not a value
+    // this suite builds.
+    let expected_vpc = router.subnet_vpc(all[0]).await;
     for case in &cases {
         let created = ok(
             &router,
@@ -128,15 +133,19 @@ async fn subnets_the_account_has_are_accepted_and_report_their_vpc() {
 /// identifier in `InvalidSubnetId`, and NOTHING is stored.
 ///
 /// The table spans the forms the modelled `SubnetId` (`length 15..24`, pattern
-/// `^(subnet-[0-9a-f]{8,})$`) allows — the shortest and the longest, a subnet of ANOTHER
-/// Region's network — and the position of the offending identifier in the request: first,
-/// last, or in a per-type configuration's `PreferredSubnetId`.
+/// `^(subnet-[0-9a-f]{8,})$`) allows — the shortest and the longest — a subnet the account
+/// HELD and holds no longer, and the position of the offending identifier in the request:
+/// first, last, or in a per-type configuration's `PreferredSubnetId`.
 #[tokio::test]
 async fn a_subnet_the_account_does_not_have_is_refused() {
-    let router = emulator();
-    // A subnet of another Region's network: a well-formed identifier that names a subnet
-    // this Region does not have.
-    let other_region = region_subnets("eu-central-1")[0].subnet_id.clone();
+    let router = emulator().await;
+    // A subnet EC2 minted for this account and then removed again through its own API: an
+    // identifier the account HELD and holds no longer, which is a different thing from one
+    // it never had. (The suite that resolves client-created subnets end to end is
+    // `create_file_system_resolves_ec2_subnets`; its EC2 helpers are reused here.)
+    let vpc = create_vpc(&router, "a deleted subnet", "10.3.0.0/16").await;
+    let deleted = create_subnet(&router, "a deleted subnet", &vpc, "10.3.1.0/24", ZONE).await;
+    delete_subnet(&router, "a deleted subnet", &deleted).await;
     // (case, request members, the identifier the refusal must name)
     let cases: Vec<(&str, Value, String)> = vec![
         (
@@ -155,18 +164,18 @@ async fn a_subnet_the_account_does_not_have_is_refused() {
             "subnet-0123456789abcdef0".to_string(),
         ),
         (
-            "a subnet of another Region's network",
-            json!({ "SubnetIds": [other_region.clone()] }),
-            other_region.clone(),
+            "a subnet EC2 minted for this account and then deleted",
+            json!({ "SubnetIds": [deleted.clone()] }),
+            deleted.clone(),
         ),
         (
             "an absent identifier after one that resolves",
-            json!({ "SubnetIds": [subnet_a(), "subnet-00000000deadbeef"] }),
+            json!({ "SubnetIds": [router.subnet_a(), "subnet-00000000deadbeef"] }),
             "subnet-00000000deadbeef".to_string(),
         ),
         (
             "an absent identifier before one that resolves",
-            json!({ "SubnetIds": ["subnet-00000000deadbeef", subnet_a()] }),
+            json!({ "SubnetIds": ["subnet-00000000deadbeef", router.subnet_a()] }),
             "subnet-00000000deadbeef".to_string(),
         ),
         (
@@ -177,7 +186,7 @@ async fn a_subnet_the_account_does_not_have_is_refused() {
         (
             "a PreferredSubnetId that resolves to nothing",
             json!({
-                "SubnetIds": [subnet_a()],
+                "SubnetIds": [router.subnet_a()],
                 "WindowsConfiguration": {
                     "ThroughputCapacity": 32,
                     "PreferredSubnetId": "subnet-00000000cafebabe",
@@ -238,7 +247,7 @@ async fn a_subnet_the_account_does_not_have_is_refused() {
 /// the account does not have is refused for the token.
 #[tokio::test]
 async fn a_create_without_a_client_request_token_is_refused() {
-    let router = emulator();
+    let router = emulator().await;
     // (case, the body without a ClientRequestToken, whether the body is otherwise valid)
     let cases: Vec<(&str, Value, bool)> = vec![
         (
@@ -246,13 +255,13 @@ async fn a_create_without_a_client_request_token_is_refused() {
             json!({
                 "FileSystemType": "WINDOWS",
                 "StorageCapacity": 32,
-                "SubnetIds": [subnet_a()],
+                "SubnetIds": [router.subnet_a()],
             }),
             true,
         ),
         (
             "LUSTRE, no StorageCapacity",
-            json!({ "FileSystemType": "LUSTRE", "SubnetIds": [subnet_a()] }),
+            json!({ "FileSystemType": "LUSTRE", "SubnetIds": [router.subnet_a()] }),
             true,
         ),
         (
@@ -260,10 +269,10 @@ async fn a_create_without_a_client_request_token_is_refused() {
             json!({
                 "FileSystemType": "ONTAP",
                 "StorageCapacity": 1024,
-                "SubnetIds": ACCOUNT_SUBNETS
+                "SubnetIds": router.account_subnets()
                     .iter()
                     .take(2)
-                    .map(|subnet| subnet.subnet_id.clone())
+                    .cloned()
                     .collect::<Vec<String>>(),
                 "Tags": [{ "Key": "env", "Value": "dev" }],
             }),
@@ -274,7 +283,7 @@ async fn a_create_without_a_client_request_token_is_refused() {
             json!({
                 "FileSystemType": "OPENZFS",
                 "StorageCapacity": 2_147_483_647_i64,
-                "SubnetIds": [subnet_a()],
+                "SubnetIds": [router.subnet_a()],
             }),
             true,
         ),

@@ -7,15 +7,16 @@
 //! dispatched by the real `MultiServiceRouter`. Nothing here reaches into the store
 //! directly, so a response that is not computed from persisted state cannot pass.
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_fsx_awssimbaapiservice_v20180301::state::{
-    region_subnets, SubnetRecord, MAX_FILE_SYSTEMS, MAX_ROUTE_TABLE_IDS,
+    MAX_FILE_SYSTEMS, MAX_ROUTE_TABLE_IDS,
 };
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// The `X-Amz-Target` prefix from the model's service shape (OPERATIONS.md, "Wire
 /// protocol").
@@ -31,23 +32,6 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// Longer than the service's own clock-owed transition span, so a transition that was due
 /// has certainly fallen due by the next call.
 pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
-
-/// The subnets the account's network has in [`REGION`], which is what `CreateFileSystem`
-/// resolves `SubnetIds` against (the service's own `state::region_subnets`). A create
-/// below places its file system in these, because a subnet the account does not have is
-/// refused.
-pub(crate) static ACCOUNT_SUBNETS: LazyLock<Vec<SubnetRecord>> =
-    LazyLock::new(|| region_subnets(REGION));
-
-/// The first subnet of the account's network in [`REGION`].
-pub(crate) fn subnet_a() -> &'static str {
-    ACCOUNT_SUBNETS[0].subnet_id.as_str()
-}
-
-/// The second subnet of the account's network in [`REGION`], in another Availability Zone.
-pub(crate) fn subnet_b() -> &'static str {
-    ACCOUNT_SUBNETS[1].subnet_id.as_str()
-}
 
 /// `body` with a fresh `ClientRequestToken` stamped on it when it carries none.
 ///
@@ -65,18 +49,134 @@ pub(crate) fn with_client_request_token(body: &Value) -> Value {
     body
 }
 
-/// One emulator over one shared engine, with the service mounted the way the router mounts
-/// it in production.
-pub(crate) fn emulator() -> MultiServiceRouter {
+/// One emulator over one shared engine: this service the way the router mounts it in
+/// production, PLUS Amazon EC2 — the service that owns subnets — because
+/// `CreateFileSystem` places a file system in the subnets the ACCOUNT has and resolves
+/// every identifier it names against EC2. An EC2 client over the router's own in-process
+/// callback comes with it: the very seam that resolution reaches EC2 through, and what the
+/// suites that build their own network mint subnets with.
+///
+/// Derefs to the router, so every helper below still takes `&MultiServiceRouter`.
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) ec2: ::aws_sdk_ec2::Client,
+    subnets: Vec<String>,
+}
+
+impl Deref for Emulator {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+impl Emulator {
+    /// The subnets the account has in [`REGION`], as EC2 reported them, ordered by
+    /// Availability Zone. These are the default VPC's default subnets, which EC2
+    /// materialises for every Region of the account and mints the ids of — nothing here
+    /// derives an identifier of its own.
+    pub(crate) fn account_subnets(&self) -> &[String] {
+        &self.subnets
+    }
+
+    /// The account's subnet in the first Availability Zone of [`REGION`].
+    pub(crate) fn subnet_a(&self) -> &str {
+        &self.subnets[0]
+    }
+
+    /// The account's subnet in the second Availability Zone of [`REGION`], so a case that
+    /// needs two subnets names two zones.
+    pub(crate) fn subnet_b(&self) -> &str {
+        &self.subnets[1]
+    }
+
+    /// The VPC `subnet_id` belongs to, as the service that OWNS subnets reports it. What a
+    /// created file system's `VpcId` is compared against, so nothing here builds that value
+    /// itself.
+    pub(crate) async fn subnet_vpc(&self, subnet_id: &str) -> String {
+        self.ec2
+            .describe_subnets()
+            .subnet_ids(subnet_id)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("EC2 must report the subnet {subnet_id}: {error:?}"))
+            .subnets()
+            .iter()
+            .find(|subnet| subnet.subnet_id() == Some(subnet_id))
+            .and_then(::aws_sdk_ec2::types::Subnet::vpc_id)
+            .unwrap_or_else(|| panic!("EC2 must report a VPC for the subnet {subnet_id}"))
+            .to_string()
+    }
+}
+
+/// An EC2 client for `region` over `callback`, the in-process seam this emulator routes on:
+/// no socket is opened and the endpoint URL is only the address that transport routes by.
+pub(crate) fn ec2_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_ec2::Client {
+    let config = ::aws_sdk_ec2::Config::builder()
+        .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+        .region(::aws_sdk_ec2::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://ec2.{region}.amazonaws.com"))
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_ec2::Client::from_conf(config)
+}
+
+/// One emulator with both services mounted, and the account's subnets read back from EC2.
+pub(crate) async fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not the subject of these tests; the requests still carry the SigV4
     // credential scope, which is what routes them and names the region.
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_fsx_awssimbaapiservice_v20180301::EmulatedService::new(engine),
+        service_com_amazonaws_fsx_awssimbaapiservice_v20180301::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()), REGION);
+
+    // ASKED, never assumed: the ids below are the ones EC2 answers with for this account,
+    // which is also what the service under test resolves `SubnetIds` against. Only the
+    // subnets in a zone OF THIS REGION are kept, so a case names a subnet of the Region its
+    // requests are signed for.
+    let described = ec2
+        .describe_subnets()
+        .send()
+        .await
+        .expect("EC2 must report the account's subnets");
+    let mut reported: Vec<(String, String)> = described
+        .subnets()
+        .iter()
+        .filter_map(|subnet| {
+            Some((
+                subnet.availability_zone()?.to_string(),
+                subnet.subnet_id()?.to_string(),
+            ))
+        })
+        .filter(|(zone, _)| zone.starts_with(REGION))
+        .collect();
+    reported.sort();
+    let subnets: Vec<String> = reported.into_iter().map(|(_, id)| id).collect();
+    assert!(
+        subnets.len() >= 2,
+        "the account must have at least two subnets in {REGION} for these cases, got \
+         {subnets:?}"
+    );
+
+    Emulator {
+        router,
+        ec2,
+        subnets,
+    }
 }
 
 /// Dispatch one operation and return `(status, body)`.
@@ -252,16 +352,16 @@ fn create_request(file_system_type: &str, storage_type: &str, subnets: &[&str]) 
 /// subnet count, which is what the rule generalises over.
 #[tokio::test]
 async fn create_persists_every_file_system_type_and_describe_reports_it_back() {
-    let router = emulator();
+    let router = emulator().await;
     // (FileSystemType, StorageType) from the modelled `FileSystemType` /
     // `StorageType` enums, plus one and two subnets.
     let cases: &[(&str, &str, &[&str])] = &[
-        ("WINDOWS", "SSD", &[subnet_a()]),
-        ("WINDOWS", "HDD", &[subnet_a(), subnet_b()]),
-        ("LUSTRE", "SSD", &[subnet_a()]),
-        ("LUSTRE", "INTELLIGENT_TIERING", &[subnet_a()]),
-        ("ONTAP", "SSD", &[subnet_a(), subnet_b()]),
-        ("OPENZFS", "INTELLIGENT_TIERING", &[subnet_a()]),
+        ("WINDOWS", "SSD", &[router.subnet_a()]),
+        ("WINDOWS", "HDD", &[router.subnet_a(), router.subnet_b()]),
+        ("LUSTRE", "SSD", &[router.subnet_a()]),
+        ("LUSTRE", "INTELLIGENT_TIERING", &[router.subnet_a()]),
+        ("ONTAP", "SSD", &[router.subnet_a(), router.subnet_b()]),
+        ("OPENZFS", "INTELLIGENT_TIERING", &[router.subnet_a()]),
     ];
 
     let mut minted: Vec<String> = Vec::new();
@@ -381,7 +481,7 @@ async fn create_persists_every_file_system_type_and_describe_reports_it_back() {
 /// member it carries is stored as given.
 #[tokio::test]
 async fn documented_defaults_are_applied_only_where_the_request_is_silent() {
-    let router = emulator();
+    let router = emulator().await;
     // (StorageType in the request, NetworkType in the request, expected stored pair).
     // Defaults: "Default value is SSD" (CreateFileSystem$StorageType) and "The default is
     // IPV4" (CreateFileSystem$NetworkType).
@@ -397,7 +497,7 @@ async fn documented_defaults_are_applied_only_where_the_request_is_silent() {
         let (storage_type, network_type, expected_storage, expected_network) = *case;
         let mut request = json!({
             "FileSystemType": "WINDOWS",
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
             "StorageCapacity": 32,
         });
         if let Some(storage_type) = storage_type {
@@ -432,7 +532,7 @@ async fn documented_defaults_are_applied_only_where_the_request_is_silent() {
 /// to FSx for Lustre only, and an explicit value always wins.
 #[tokio::test]
 async fn lustre_file_system_type_version_takes_its_documented_default() {
-    let router = emulator();
+    let router = emulator().await;
     // (FileSystemType, Lustre DeploymentType, metadata configuration mode, requested
     // version, expected stored version).
     type VersionCase<'a> = (
@@ -475,7 +575,7 @@ async fn lustre_file_system_type_version_takes_its_documented_default() {
         let (file_system_type, deployment_type, metadata_mode, requested, expected) = *case;
         let mut request = json!({
             "FileSystemType": file_system_type,
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
             "StorageCapacity": 1200,
         });
         if let Some(requested) = requested {
@@ -510,19 +610,19 @@ async fn lustre_file_system_type_version_takes_its_documented_default() {
 /// back; a secret in it never is.
 #[tokio::test]
 async fn per_type_configuration_round_trips_without_echoing_secrets() {
-    let router = emulator();
+    let router = emulator().await;
     let created = ok(
         &router,
         "CreateFileSystem",
         &json!({
             "FileSystemType": "WINDOWS",
             "ClientRequestToken": "per-type-configuration",
-            "SubnetIds": [subnet_a(), subnet_b()],
+            "SubnetIds": [router.subnet_a(), router.subnet_b()],
             "StorageCapacity": 64,
             "WindowsConfiguration": {
                 "ThroughputCapacity": 32,
                 "DeploymentType": "MULTI_AZ_1",
-                "PreferredSubnetId": subnet_b(),
+                "PreferredSubnetId": router.subnet_b(),
                 "WeeklyMaintenanceStartTime": "1:05:00",
                 "DailyAutomaticBackupStartTime": "03:00",
                 "AutomaticBackupRetentionDays": 7,
@@ -547,7 +647,7 @@ async fn per_type_configuration_round_trips_without_echoing_secrets() {
     for (member, expected) in [
         ("ThroughputCapacity", json!(32)),
         ("DeploymentType", json!("MULTI_AZ_1")),
-        ("PreferredSubnetId", json!(subnet_b())),
+        ("PreferredSubnetId", json!(router.subnet_b())),
         ("WeeklyMaintenanceStartTime", json!("1:05:00")),
         ("DailyAutomaticBackupStartTime", json!("03:00")),
         ("AutomaticBackupRetentionDays", json!(7)),
@@ -610,14 +710,14 @@ async fn per_type_configuration_round_trips_without_echoing_secrets() {
 /// report; an absent member leaves the stored value alone.
 #[tokio::test]
 async fn update_mutates_the_stored_record_member_by_member() {
-    let router = emulator();
+    let router = emulator().await;
     let created = ok(
         &router,
         "CreateFileSystem",
         &json!({
             "FileSystemType": "LUSTRE",
             "ClientRequestToken": "update-member-by-member",
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
             "StorageCapacity": 1200,
             "StorageType": "SSD",
             "FileSystemTypeVersion": "2.12",
@@ -696,14 +796,14 @@ async fn update_mutates_the_stored_record_member_by_member() {
 /// state errors that go with it.
 #[tokio::test]
 async fn lifecycle_transitions_fall_due_after_the_call_that_starts_them() {
-    let router = emulator();
+    let router = emulator().await;
     let created = ok(
         &router,
         "CreateFileSystem",
         &json!({
             "FileSystemType": "OPENZFS",
             "ClientRequestToken": "lifecycle-transitions",
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
             "StorageCapacity": 64,
         }),
     )
@@ -827,7 +927,7 @@ async fn lifecycle_transitions_fall_due_after_the_call_that_starts_them() {
 /// once.
 #[tokio::test]
 async fn describe_selects_by_id_and_pages_at_max_results() {
-    let router = emulator();
+    let router = emulator().await;
     let mut ids: Vec<String> = Vec::new();
     for index in 0..5 {
         let created = ok(
@@ -836,7 +936,7 @@ async fn describe_selects_by_id_and_pages_at_max_results() {
             &json!({
                 "FileSystemType": "WINDOWS",
                 "ClientRequestToken": format!("paging-{index}"),
-                "SubnetIds": [subnet_a()],
+                "SubnetIds": [router.subnet_a()],
                 "StorageCapacity": 32 + index,
             }),
         )
@@ -1055,14 +1155,14 @@ async fn describe_selects_by_id_and_pages_at_max_results() {
 /// `DescribeFileSystems` report the result.
 #[tokio::test]
 async fn tags_are_stored_once_and_read_back_everywhere() {
-    let router = emulator();
+    let router = emulator().await;
     let created = ok(
         &router,
         "CreateFileSystem",
         &json!({
             "FileSystemType": "WINDOWS",
             "ClientRequestToken": "tagging",
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
             "StorageCapacity": 32,
             "Tags": [{ "Key": "env", "Value": "dev" }],
         }),
@@ -1328,10 +1428,10 @@ async fn tags_are_stored_once_and_read_back_everywhere() {
 /// parameters is `IncompatibleParameterError`.
 #[tokio::test]
 async fn create_replays_one_client_request_token_to_one_file_system() {
-    let router = emulator();
+    let router = emulator().await;
     let base = json!({
         "FileSystemType": "WINDOWS",
-        "SubnetIds": [subnet_a()],
+        "SubnetIds": [router.subnet_a()],
         "StorageCapacity": 32,
         "StorageType": "SSD",
         "Tags": [
@@ -1367,7 +1467,7 @@ async fn create_replays_one_client_request_token_to_one_file_system() {
     let conflicts: &[(&str, Value)] = &[
         ("StorageCapacity", json!(64)),
         ("StorageType", json!("HDD")),
-        ("SubnetIds", json!([subnet_b()])),
+        ("SubnetIds", json!([router.subnet_b()])),
         ("FileSystemType", json!("LUSTRE")),
         ("Tags", json!([{ "Key": "env", "Value": "prod" }])),
         ("NetworkType", json!("DUAL")),
@@ -1442,10 +1542,10 @@ async fn create_replays_one_client_request_token_to_one_file_system() {
 /// `ServiceLimitExceeded`, and freeing a file system makes room for exactly one more.
 #[tokio::test]
 async fn create_is_refused_once_the_file_system_count_limit_is_reached() {
-    let router = emulator();
+    let router = emulator().await;
     let request = json!({
         "FileSystemType": "WINDOWS",
-        "SubnetIds": [subnet_a()],
+        "SubnetIds": [router.subnet_a()],
         "StorageCapacity": 32,
     });
 
@@ -1513,14 +1613,14 @@ async fn create_is_refused_once_the_file_system_count_limit_is_reached() {
 /// the record exactly as it was.
 #[tokio::test]
 async fn route_table_ids_merge_as_a_bounded_set() {
-    let router = emulator();
+    let router = emulator().await;
     let created = ok(
         &router,
         "CreateFileSystem",
         &json!({
             "FileSystemType": "ONTAP",
             "ClientRequestToken": "route-table-merge",
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
             "StorageCapacity": 1024,
             "OntapConfiguration": {
                 "DeploymentType": "SINGLE_AZ_1",
@@ -1641,7 +1741,7 @@ async fn route_table_ids_merge_as_a_bounded_set() {
 /// refused with the modelled network error, not accepted and not answered with a 501.
 #[tokio::test]
 async fn create_without_a_subnet_is_refused() {
-    let router = emulator();
+    let router = emulator().await;
     let cases: &[Value] = &[
         json!({ "FileSystemType": "WINDOWS", "SubnetIds": [], "StorageCapacity": 32 }),
         json!({ "FileSystemType": "LUSTRE", "SubnetIds": [] }),

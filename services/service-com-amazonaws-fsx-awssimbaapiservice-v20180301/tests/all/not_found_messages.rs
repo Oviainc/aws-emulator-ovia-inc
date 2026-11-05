@@ -17,7 +17,7 @@ use service_com_amazonaws_fsx_awssimbaapiservice_v20180301::state::MAX_ERROR_MES
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::file_system_lifecycle::{
-    call, emulator, ok, subnet_a, with_client_request_token, ACCOUNT, REGION,
+    call, emulator, ok, with_client_request_token, Emulator, ACCOUNT, REGION,
 };
 
 /// Absent `FileSystemId`s spanning the modelled `FileSystemId` shape: pattern
@@ -81,14 +81,14 @@ async fn error_of(
 }
 
 /// Create one file system and return its `(FileSystemId, ResourceARN)`.
-async fn create_one(router: &MultiServiceRouter) -> (String, String) {
+async fn create_one(router: &Emulator) -> (String, String) {
     let created = ok(
         router,
         "CreateFileSystem",
         &with_client_request_token(&json!({
             "FileSystemType": "WINDOWS",
             "StorageCapacity": 32,
-            "SubnetIds": [subnet_a()],
+            "SubnetIds": [router.subnet_a()],
         })),
     )
     .await;
@@ -123,7 +123,7 @@ fn assert_message_length(case: &str, message: &str) {
 /// differing hex payloads), which is what the rule generalises over.
 #[tokio::test]
 async fn file_system_not_found_message_is_built_from_the_requested_id() {
-    let router = emulator();
+    let router = emulator().await;
     let mut seen: Vec<String> = Vec::new();
 
     for id in ABSENT_FILE_SYSTEM_IDS {
@@ -184,7 +184,7 @@ async fn file_system_not_found_message_is_built_from_the_requested_id() {
 /// file system exists at all.
 #[tokio::test]
 async fn describe_names_the_requested_id_that_is_missing() {
-    let router = emulator();
+    let router = emulator().await;
     let (existing, _) = create_one(&router).await;
     let absent_a = "fs-00000000deadbeef";
     let absent_b = "fs-0123456789abcdef0";
@@ -242,7 +242,7 @@ async fn describe_names_the_requested_id_that_is_missing() {
 /// all three tagging operations.
 #[tokio::test]
 async fn tagging_not_found_message_is_built_from_the_requested_arn() {
-    let router = emulator();
+    let router = emulator().await;
 
     for case in ABSENT_RESOURCES {
         let (resource_type, resource_id) = *case;

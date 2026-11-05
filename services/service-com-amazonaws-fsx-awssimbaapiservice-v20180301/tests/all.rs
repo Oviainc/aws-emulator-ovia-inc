@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/constraint_refusals.rs"]
 mod constraint_refusals;
+#[path = "all/create_file_system_resolves_ec2_subnets.rs"]
+mod create_file_system_resolves_ec2_subnets;
 #[path = "all/create_file_system_validation.rs"]
 mod create_file_system_validation;
 #[path = "all/file_system_lifecycle.rs"]

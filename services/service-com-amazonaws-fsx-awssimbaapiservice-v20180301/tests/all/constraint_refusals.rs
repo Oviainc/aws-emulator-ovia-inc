@@ -20,13 +20,16 @@
 //! `X-Amz-Target: AWSSimbaAPIService_v20180301.<Operation>` on an `awsJson1_1` body,
 //! dispatched by the real `MultiServiceRouter`.
 
-use std::sync::Arc;
-
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::PatternTrait;
 use serde_json::{json, Value};
 use service_com_amazonaws_fsx_awssimbaapiservice_v20180301::ops;
 use smithy_server_runtime::MultiServiceRouter;
+
+// ONE emulator per suite: the harness that mounts this service beside the owner of subnets
+// and reads the account's network back from it comes from the lifecycle suite rather than a
+// second copy of it here.
+use crate::file_system_lifecycle::{emulator, Emulator};
 
 /// The `X-Amz-Target` prefix from the model's service shape (OPERATIONS.md, "Wire
 /// protocol").
@@ -35,12 +38,12 @@ const TARGET_PREFIX: &str = "AWSSimbaAPIService_v20180301";
 /// The region every request below is signed for.
 const REGION: &str = "us-west-2";
 
-/// A subnet the account has in [`REGION`], which is what `CreateFileSystem` resolves
-/// `SubnetIds` against (the service's own `state::region_subnets`): a create below that is
-/// meant to SUCCEED must name one, and a create meant to be refused for something else
-/// must not be refused for its subnet instead.
-fn subnet() -> &'static str {
-    crate::file_system_lifecycle::subnet_a()
+/// A subnet the account has in [`REGION`], as Amazon EC2 — the service that owns subnets,
+/// and the one `CreateFileSystem` resolves `SubnetIds` against — reports it. A create below
+/// that is meant to SUCCEED must name one, and a create meant to be refused for something
+/// else must not be refused for its subnet instead.
+fn subnet(router: &Emulator) -> &str {
+    router.subnet_a()
 }
 
 /// A `ResourceARN` that satisfies the modelled pattern but names a file system that was
@@ -51,19 +54,6 @@ const WELL_FORMED_ARN: &str = "arn:aws:fsx:us-west-2:000000000000:file-system/fs
 /// An `AssociationId` matching the modelled `DataRepositoryAssociationId` pattern
 /// `^(dra-[0-9a-f]{8,})$` with `length` 13..23.
 const ASSOCIATION_ID: &str = "dra-0123456789abcdef0";
-
-/// One emulator over one shared engine, mounted the way the router mounts it.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signatures are not the subject of these tests; the requests still carry the SigV4
-    // credential scope, which is what routes them and names the region.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_fsx_awssimbaapiservice_v20180301::EmulatedService::new(engine),
-    );
-    router
-}
 
 /// Dispatch one operation and return `(status, body)`.
 async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
@@ -162,19 +152,19 @@ async fn assert_refused(
 /// declared set, and a JSON type the member's target cannot hold.
 #[tokio::test]
 async fn a_value_the_modelled_type_cannot_hold_is_refused_generically() {
-    let router = emulator();
+    let router = emulator().await;
     // (case, request) — each otherwise satisfies every constraint.
     let rows: [(&str, Value); 6] = [
         (
             // The recorded instance this issue was filed for.
             "FileSystemType outside WINDOWS | LUSTRE | ONTAP | OPENZFS",
-            json!({"FileSystemType": "GLACIER", "SubnetIds": [subnet()], "StorageCapacity": 1200}),
+            json!({"FileSystemType": "GLACIER", "SubnetIds": [subnet(&router)], "StorageCapacity": 1200}),
         ),
         (
             "StorageType outside HDD | INTELLIGENT_TIERING | SSD",
             json!({
                 "FileSystemType": "WINDOWS",
-                "SubnetIds": [subnet()],
+                "SubnetIds": [subnet(&router)],
                 "StorageCapacity": 1200,
                 "StorageType": "TAPE",
             }),
@@ -182,23 +172,23 @@ async fn a_value_the_modelled_type_cannot_hold_is_refused_generically() {
         (
             // Layering: the unreadable value is refused before the constraint one.
             "an unreadable value alongside a constraint violation",
-            json!({"FileSystemType": "GLACIER", "SubnetIds": [subnet()], "StorageCapacity": -1}),
+            json!({"FileSystemType": "GLACIER", "SubnetIds": [subnet(&router)], "StorageCapacity": -1}),
         ),
         (
             "a string where StorageCapacity is an integer",
             json!({
                 "FileSystemType": "WINDOWS",
-                "SubnetIds": [subnet()],
+                "SubnetIds": [subnet(&router)],
                 "StorageCapacity": "twelve hundred",
             }),
         ),
         (
             "a bare string where SubnetIds is a list",
-            json!({"FileSystemType": "WINDOWS", "SubnetIds": subnet(), "StorageCapacity": 1200}),
+            json!({"FileSystemType": "WINDOWS", "SubnetIds": subnet(&router), "StorageCapacity": 1200}),
         ),
         (
             "a list where FileSystemType is a string",
-            json!({"FileSystemType": ["WINDOWS"], "SubnetIds": [subnet()], "StorageCapacity": 1200}),
+            json!({"FileSystemType": ["WINDOWS"], "SubnetIds": [subnet(&router)], "StorageCapacity": 1200}),
         ),
     ];
 
@@ -218,14 +208,14 @@ async fn a_value_the_modelled_type_cannot_hold_is_refused_generically() {
 /// refusal names the member and the requirement it failed, in `BadRequest`'s `Message`.
 #[tokio::test]
 async fn every_constraint_class_is_refused_as_bad_request_naming_the_requirement() {
-    let router = emulator();
+    let router = emulator().await;
 
     // (case, operation, request, expected Message)
     let rows: Vec<(&str, &str, Value, String)> = vec![
         (
             "a range minimum (StorageCapacity, range 0..2147483647)",
             "CreateFileSystem",
-            json!({"FileSystemType": "WINDOWS", "SubnetIds": [subnet()], "StorageCapacity": -1}),
+            json!({"FileSystemType": "WINDOWS", "SubnetIds": [subnet(&router)], "StorageCapacity": -1}),
             "1 validation error detected: Value at 'storageCapacity' failed to satisfy \
              constraint: Member must have value greater than or equal to 0"
                 .to_string(),
@@ -233,7 +223,7 @@ async fn every_constraint_class_is_refused_as_bad_request_naming_the_requirement
         (
             "an absent @required member (FileSystemType)",
             "CreateFileSystem",
-            json!({"SubnetIds": [subnet()], "StorageCapacity": 1200}),
+            json!({"SubnetIds": [subnet(&router)], "StorageCapacity": 1200}),
             "1 validation error detected: Value null at 'fileSystemType' failed to satisfy \
              constraint: Member must not be null"
                 .to_string(),
@@ -243,7 +233,7 @@ async fn every_constraint_class_is_refused_as_bad_request_naming_the_requirement
             "CreateFileSystem",
             json!({
                 "FileSystemType": "LUSTRE",
-                "SubnetIds": [subnet()],
+                "SubnetIds": [subnet(&router)],
                 "StorageCapacity": 1200,
                 "ClientRequestToken": "token with spaces",
             }),
@@ -317,7 +307,7 @@ async fn every_constraint_class_is_refused_as_bad_request_naming_the_requirement
 /// the one envelope.
 #[tokio::test]
 async fn several_violations_are_counted_in_one_envelope() {
-    let router = emulator();
+    let router = emulator().await;
     // `fs-0` is shorter than the modelled `length` minimum of 11 AND outside the
     // `@pattern`, which wants at least eight hex digits.
     let (status, answered) = call(
@@ -366,7 +356,7 @@ async fn several_violations_are_counted_in_one_envelope() {
 /// pattern rather than a copy of it.
 #[tokio::test]
 async fn a_member_outside_its_pattern_is_refused_before_the_value_is_interpreted() {
-    let router = emulator();
+    let router = emulator().await;
 
     // Values that satisfy the ARN's @length (8..512) — so the boundary validator passes
     // them — and not its @pattern.
@@ -436,7 +426,7 @@ async fn a_member_outside_its_pattern_is_refused_before_the_value_is_interpreted
 /// counted envelope, as a single refusal of a single request.
 #[tokio::test]
 async fn violations_from_both_walks_share_one_envelope() {
-    let router = emulator();
+    let router = emulator().await;
     let pattern = modelled_pattern(ops::types::TAG_RESOURCE_INPUT_SCHEMA, "ResourceARN");
     let (status, answered) = call(
         &router,
@@ -490,7 +480,7 @@ async fn violations_from_both_walks_share_one_envelope() {
 /// an ARN may name, which is what the rule generalises over.
 #[tokio::test]
 async fn a_not_found_refusal_names_the_resource_the_request_asked_about() {
-    let router = emulator();
+    let router = emulator().await;
     // (resource type, the id in the ARN) — `file-system` and `backup` are both in the
     // modelled set of FSx resource types, and neither id is in the store.
     let resources: [(&str, &str); 3] = [
@@ -545,7 +535,7 @@ async fn a_not_found_refusal_names_the_resource_the_request_asked_about() {
 /// operation with a `@required` member is refused, and one without is served.
 #[tokio::test]
 async fn no_operation_answers_a_foreign_validation_exception() {
-    let router = emulator();
+    let router = emulator().await;
     let operations: [&str; 48] = [
         "AssociateFileSystemAliases",
         "CancelDataRepositoryTask",
@@ -625,14 +615,14 @@ async fn no_operation_answers_a_foreign_validation_exception() {
 /// implemented yet still answers 501 rather than a fabricated refusal.
 #[tokio::test]
 async fn a_request_inside_every_constraint_is_served() {
-    let router = emulator();
+    let router = emulator().await;
 
     let (status, created) = call(
         &router,
         "CreateFileSystem",
         &json!({
             "FileSystemType": "WINDOWS",
-            "SubnetIds": [subnet()],
+            "SubnetIds": [subnet(&router)],
             "StorageCapacity": 1200,
             "ClientRequestToken": "token-1",
             "Tags": [{"Key": "Name", "Value": "one"}],
