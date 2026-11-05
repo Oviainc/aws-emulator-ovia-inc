@@ -195,165 +195,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::INVALID_NETWORK_ACL_ID_MALFORMED,
         )?;
 
-        // "The rule number for the entry… Constraints: Positive integer from 1 to 32766. The
-        // range 32767 to 65535 is reserved for internal use" (`$RuleNumber`). The model puts
-        // no `@range` on the member, so the handler is the only place that bound can be
-        // enforced, and it is enforced before the ACL is looked up.
-        if !state::NETWORK_ACL_ENTRY_RULE_NUMBERS.contains(&input.rule_number) {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({number}) for parameter ruleNumber is invalid. Rulenumber must be \
-                 in range {first}..{last}",
-                number = input.rule_number,
-                first = state::NETWORK_ACL_ENTRY_RULE_NUMBERS.start(),
-                last = state::NETWORK_ACL_ENTRY_RULE_NUMBERS.end(),
-            )));
-        }
-
-        // "The protocol number. A value of `-1` means all protocols" (`$Protocol`) — a
-        // NUMBER, not one of the protocol names a security group rule may carry, so a value
-        // outside the single byte a protocol number occupies is refused rather than stored.
-        let protocol = input.protocol.trim();
-        let protocol_number = if protocol == state::ALL_IP_PROTOCOLS {
-            None
-        } else {
-            match protocol.parse::<i32>() {
-                Ok(number) if (0..=state::MAX_PROTOCOL_NUMBER).contains(&number) => Some(number),
-                _ => {
-                    return Err(state::invalid_parameter_value(format!(
-                        "Value ({protocol}) for parameter protocol is invalid. The protocol \
-                         number must be between 0 and {max}, or {all} for all protocols",
-                        max = state::MAX_PROTOCOL_NUMBER,
-                        all = state::ALL_IP_PROTOCOLS,
-                    )))
-                }
-            }
-        };
-
-        // "The IPv4 network range to allow or deny, in CIDR notation" (`$CidrBlock`) and
-        // "The IPv6 network range" (`$Ipv6CidrBlock`): a rule matches a range of ONE family,
-        // so exactly one of them says which traffic the rule applies to. "We modify the
-        // specified CIDR block to its canonical form; for example, if you specify
-        // 100.68.0.18/18, we modify it to 100.68.0.0/18" (`$CidrBlock`), so the stored range
-        // is the canonical one, whichever of a range's equivalent spellings the request used.
-        let requested_ipv4 = input
-            .cidr_block
-            .as_deref()
-            .filter(|value| !value.is_empty());
-        let requested_ipv6 = input
-            .ipv6_cidr_block
-            .as_deref()
-            .filter(|value| !value.is_empty());
-        let (cidr_block, ipv6_cidr_block) = match (requested_ipv4, requested_ipv6) {
-            (None, None) => {
-                return Err(state::missing_parameter(
-                    "The request must contain the parameter cidrBlock or ipv6CidrBlock",
-                ))
-            }
-            (Some(_), Some(_)) => {
-                return Err(state::invalid_parameter_combination(
-                    "Only one of cidrBlock and ipv6CidrBlock may be specified: a network \
-                     ACL entry matches a range of one address family",
-                ))
-            }
-            (Some(requested), None) => (
-                Some(state::canonical_ipv4_cidr(requested).map_err(
-                    |_: state::CidrProblem| {
-                        state::invalid_parameter_value(format!(
-                            "Value ({requested}) for parameter cidrBlock is invalid. This is \
-                             not a valid CIDR block."
-                        ))
-                    },
-                )?),
-                None,
-            ),
-            (None, Some(requested)) => (
-                None,
-                Some(state::canonical_ipv6_cidr(requested).map_err(
-                    |_: state::CidrProblem| {
-                        state::invalid_parameter_value(format!(
-                            "Value ({requested}) for parameter ipv6CidrBlock is invalid. \
-                             This is not a valid CIDR block."
-                        ))
-                    },
-                )?),
-            ),
-        };
-
-        // "TCP or UDP protocols: The range of ports the rule applies to. Required if
-        // specifying protocol 6 (TCP) or 17 (UDP)" (`$PortRange`). A range that IS given has
-        // to be a range of ports, whatever the protocol: "The first port in the range"
-        // (`PortRange$From`) and the last, in order.
-        let port_range = input.port_range.clone().filter(|range| {
-            range.from.is_some() || range.to.is_some()
-        });
-        let needs_port_range = matches!(
-            protocol_number,
-            Some(state::NETWORK_ACL_PROTOCOL_TCP) | Some(state::NETWORK_ACL_PROTOCOL_UDP)
-        );
-        if needs_port_range && port_range.is_none() {
-            return Err(state::missing_parameter(format!(
-                "The request must contain the parameter portRange for protocol {protocol}"
-            )));
-        }
-        if let Some(range) = port_range.as_ref() {
-            // A range is both of its ports: a request that sends one of them has not named a
-            // range at all, which is the member that is missing rather than a range whose
-            // ports are in the wrong order.
-            let (Some(from), Some(to)) = (range.from, range.to) else {
-                return Err(state::missing_parameter(format!(
-                    "The request must contain the parameter portRange.{half}",
-                    half = if range.from.is_none() { "from" } else { "to" },
-                )));
-            };
-            if !(0..=state::MAX_PORT).contains(&from) || !(0..=state::MAX_PORT).contains(&to) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({from}, {to}) for parameter portRange is invalid. A port is \
-                     between 0 and {max}",
-                    max = state::MAX_PORT,
-                )));
-            }
-            if from > to {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({from}, {to}) for parameter portRange is invalid. The first \
-                     port of the range must not be above the last"
-                )));
-            }
-        }
-
-        // "ICMP protocol: The ICMP or ICMPv6 type and code. Required if specifying protocol
-        // 1 (ICMP) or protocol 58 (ICMPv6) with an IPv6 CIDR block" (`$IcmpTypeCode`) —
-        // ICMPv6 over an IPv4 range needs none, because then "traffic for all ICMP types and
-        // codes allowed, regardless of any that you specify" (`$Protocol`).
-        let needs_icmp_type_code = protocol_number == Some(state::NETWORK_ACL_PROTOCOL_ICMP)
-            || (protocol_number == Some(state::NETWORK_ACL_PROTOCOL_ICMPV6)
-                && ipv6_cidr_block.is_some());
-        if needs_icmp_type_code && input.icmp_type_code.is_none() {
-            return Err(state::missing_parameter(format!(
-                "The request must contain the parameter icmpTypeCode for protocol {protocol}"
-            )));
-        }
-
-        // The entry this request describes, built out of the validated members so nothing
-        // the request sent is stored unchecked. "Indicates whether this is an egress rule"
-        // (`$Egress`) is what separates the ACL's two sets of numbered rules, and
-        // `RuleAction` targets a modelled enum, so the boundary validator has already
-        // refused any word but `allow` and `deny`.
-        let entry = NetworkAclEntry {
-            cidr_block,
-            egress: Some(input.egress),
+        // "The rule number for the entry", the protocol, the range and the ports or ICMP
+        // numbers, read through the ONE definition of what a rule a caller may write looks
+        // like — the same one `ReplaceNetworkAclEntry` holds its request to, so neither can
+        // store a rule the other would refuse. Every member is read before the ACL is
+        // looked up.
+        let entry = state::validated_network_acl_entry(&state::RequestedNetworkAclEntry {
+            rule_number: input.rule_number,
+            egress: input.egress,
+            protocol: &input.protocol,
+            rule_action: &input.rule_action,
+            cidr_block: input.cidr_block.as_deref(),
+            ipv6_cidr_block: input.ipv6_cidr_block.as_deref(),
             icmp_type_code: input.icmp_type_code.clone(),
-            ipv6_cidr_block,
-            port_range,
-            protocol: Some(
-                // The number's own spelling, so a request that wrote `06` and one that wrote
-                // `6` store and report the same rule, the way a CIDR block is stored
-                // canonicalised.
-                protocol_number
-                    .map_or_else(|| state::ALL_IP_PROTOCOLS.to_string(), |number| number.to_string()),
-            ),
-            rule_action: Some(input.rule_action.clone()),
-            rule_number: Some(input.rule_number),
-        };
+            port_range: input.port_range.clone(),
+        })?;
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();

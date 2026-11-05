@@ -193,7 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a separate set of numbered egress rules" (`CreateNetworkAclEntry`) — so an
         // entry the ACL does not hold is refused rather than deleted as a no-op.
         if !store.network_acl_holds_entry(network_acl_id, input.rule_number, input.egress) {
-            return Err(state::invalid_network_acl_entry_not_found(input.rule_number));
+            return Err(state::invalid_network_acl_entry_not_found(
+                network_acl_id,
+                input.rule_number,
+                input.egress,
+            ));
         }
 
         // The request is one that would have succeeded, so a dry run stops HERE: "If you
@@ -209,7 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_network_acl_entry(network_acl_id, input.rule_number, input.egress)
             .is_none()
         {
-            return Err(state::invalid_network_acl_entry_not_found(input.rule_number));
+            return Err(state::invalid_network_acl_entry_not_found(
+                network_acl_id,
+                input.rule_number,
+                input.egress,
+            ));
         }
 
         // The operation's modelled output is `Unit`, so there is nothing to project.

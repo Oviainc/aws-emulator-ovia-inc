@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplaceNetworkAclEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplaceNetworkAclEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplaceNetworkAclEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: overwrites the entry (rule) the network ACL already holds at the rule number
+//! and in the direction the request names, in the place the service reports it in, so
+//! `DescribeNetworkAcls` reads back the rule the caller replaced it with and the ACL reports
+//! no second rule at that number. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplaceNetworkAclEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplaceNetworkAclEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplaceNetworkAclEntry"))
+        use crate::state;
+
+        // A network ACL carries no Region or ARN member — the modelled `NetworkAcl` has
+        // neither — so nothing here depends on the Region the request was signed for. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the ACL" (`$NetworkAclId`): the id's FORM first, before any other
+        // member is looked at and before the store is — a value that is not a network ACL id
+        // at all names nothing that could exist in any account. `CreateNetworkAclEntry` and
+        // `DeleteNetworkAclEntry` read it in the same order, so the three cannot disagree
+        // about which refusal a request with two faults gets.
+        let network_acl_id = input.network_acl_id.as_str();
+        state::require_well_formed_id(
+            state::NETWORK_ACL_ID_PREFIX,
+            network_acl_id,
+            state::INVALID_NETWORK_ACL_ID_MALFORMED,
+        )?;
+
+        // "The rule number of the entry to replace" (`$RuleNumber`), the protocol, the range
+        // and the ports or ICMP numbers, read through the ONE definition of what a rule a
+        // caller may write looks like — the same one `CreateNetworkAclEntry` holds its
+        // request to, since "you must either replace it, or create an entry and delete the
+        // old one" (`CreateNetworkAclEntry`) makes a replacement rule exactly a rule that may
+        // be created. Every member is read before the ACL is looked up.
+        let entry = state::validated_network_acl_entry(&state::RequestedNetworkAclEntry {
+            rule_number: input.rule_number,
+            egress: input.egress,
+            protocol: &input.protocol,
+            rule_action: &input.rule_action,
+            cidr_block: input.cidr_block.as_deref(),
+            ipv6_cidr_block: input.ipv6_cidr_block.as_deref(),
+            icmp_type_code: input.icmp_type_code.clone(),
+            port_range: input.port_range.clone(),
+        })?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The id itself, now that the store can be asked: a rule cannot be replaced on an
+        // ACL the account does not hold.
+        if !store.network_acls.contains_key(network_acl_id) {
+            return Err(state::invalid_network_acl_id_not_found(network_acl_id));
+        }
+
+        // "Replaces an entry (rule) in a network ACL" (this operation's own doc): it replaces
+        // an entry the ACL HOLDS and never creates one, so a rule number the ACL holds
+        // nothing at in the direction `Egress` names is refused rather than written —
+        // "Indicates whether to replace the egress rule" (`$Egress`), and "Each network ACL
+        // has a set of numbered ingress rules and a separate set of numbered egress rules"
+        // (`CreateNetworkAclEntry`), so the number names one entry WITHIN a direction.
+        // `DeleteNetworkAclEntry` resolves the same pair the same way.
+        if !store.network_acl_holds_entry(network_acl_id, input.rule_number, input.egress) {
+            return Err(state::invalid_network_acl_entry_not_found(
+                network_acl_id,
+                input.rule_number,
+                input.egress,
+            ));
+        }
+
+        // A replacement stores no further rule, so the ACL's own rule ceiling cannot be
+        // crossed by one; what CAN grow is the store's byte budget, since the ranges a rule
+        // carries are text the caller chose the length of. What the store will charge for
+        // this replacement is asked of the store, through the one definition of it, so the
+        // gate and the write cannot disagree about it.
+        let growth = store.network_acl_entry_replacement_growth(network_acl_id, &entry);
+        if store.would_exceed_stored_bytes(growth) {
+            return Err(state::network_acl_entry_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {growth} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The rule goes onto the ACL `DescribeNetworkAcls` reads, in the place of the one it
+        // displaces — the one writer that overwrites a stored ACL's entry. The ACL and the
+        // entry inside it were both resolved under this same lock, so the only reason left
+        // for a write that stored nothing is the store's own room, the way
+        // `CreateNetworkAclEntry` reads a create that stored nothing.
+        if store
+            .replace_network_acl_entry(network_acl_id, entry)
+            .is_none()
+        {
+            return Err(state::network_acl_entry_limit_exceeded(format!(
+                "The network acl '{network_acl_id}' has no room for that entry"
+            )));
+        }
+
+        // The operation's modelled output is `Unit`: "Returns true if the request succeeds"
+        // is all the wire carries, so there is nothing to project.
+        Ok(ReplaceNetworkAclEntryOutput)
     }
 }

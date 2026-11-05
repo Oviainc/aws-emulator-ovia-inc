@@ -140,7 +140,7 @@ pub async fn operator_role_is_unassumable(
     region: &str,
     operator_role_arn: &str,
 ) -> bool {
-    ::service_common::iam_role::role_is_unassumable(
+    ::service_common::iam_role::held_role_is_unassumable(
         ctx,
         region,
         operator_role_arn,
