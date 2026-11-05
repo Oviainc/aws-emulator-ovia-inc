@@ -25,6 +25,8 @@ mod multicast_group_lifecycle;
 mod service_profile_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wireless_device_provisioning_refusals.rs"]
+mod wireless_device_provisioning_refusals;
 #[path = "all/wireless_gateway_lifecycle.rs"]
 mod wireless_gateway_lifecycle;
 #[path = "all/wireless_gateway_task_definition_lifecycle.rs"]

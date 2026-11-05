@@ -246,6 +246,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // LoRaWAN key material is specification-version specific: `OtaaV1_1`/`AbpV1_1`
+        // provision a 1.1 device and `OtaaV1_0_x`/`AbpV1_0_x` a 1.0.x one, while the
+        // referenced device profile declares the MAC version the devices it provisions
+        // run. A profile that cannot provision the supplied key material is refused
+        // before any device exists; a profile this account does not hold constrains
+        // nothing, so the cross-check applies only to one the store resolves.
+        if let Some(lorawan) = input.lo_ra_wan.as_ref() {
+            if let Some(profile) = lorawan
+                .device_profile_id
+                .as_deref()
+                .and_then(|profile_id| store.device_profiles.get(profile_id))
+            {
+                if let Some(mac_version) = crate::state::mismatched_mac_version(lorawan, profile) {
+                    return Err(CreateWirelessDeviceErrorModeled::ValidationException(
+                        crate::state::mac_version_mismatch(&mac_version),
+                    )
+                    .into());
+                }
+            }
+        }
+
         // A `DevEui` identifies exactly one device on the network, and
         // `GetWirelessDevice?identifierType=DevEui` resolves by it, so a second device
         // claiming one already registered is the inconsistent state `ConflictException`
@@ -255,17 +276,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|lorawan| lorawan.dev_eui.clone());
         if let Some(dev_eui) = dev_eui.as_deref() {
-            if let Some(owner) = store.dev_eui_index.get(dev_eui) {
-                return Err(
-                    CreateWirelessDeviceErrorModeled::ConflictException(ConflictException {
-                        message: Some(format!(
-                            "DevEui {dev_eui} is already registered to wireless device {owner}"
-                        )),
-                        resource_id: Some(owner.clone()),
-                        resource_type: Some("WirelessDevice".to_string()),
-                    })
-                    .into(),
-                );
+            if store.dev_eui_index.contains_key(dev_eui) {
+                return Err(CreateWirelessDeviceErrorModeled::ConflictException(
+                    crate::state::duplicate_dev_eui(),
+                )
+                .into());
             }
         }
 

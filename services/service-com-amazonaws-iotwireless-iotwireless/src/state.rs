@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway, LoRaWANMulticast,
-    LoRaWANServiceProfile, ResourceNotFoundException, SidewalkDevice, Tag,
-    UpdateWirelessGatewayTaskCreate,
+    ConflictException, LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway,
+    LoRaWANMulticast, LoRaWANServiceProfile, ResourceNotFoundException, SidewalkDevice, Tag,
+    UpdateWirelessGatewayTaskCreate, ValidationException,
 };
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
@@ -181,6 +181,103 @@ pub struct DeviceProfile {
     pub profile_type: String,
     pub lorawan: Option<LoRaWANDeviceProfile>,
     pub tags: Vec<Tag>,
+}
+
+/// The sentence this service's 409 carries when a create claims a `DevEui` another
+/// device in the account already holds: FIXED text with no variable part, so a client
+/// can tell this conflict from the idempotency-token conflict the same operation raises
+/// with the same error code, and so the refusal discloses nothing about the device that
+/// holds the identifier.
+pub const DUPLICATE_DEV_EUI_MESSAGE: &str = "Device with given DevEui already exists";
+
+/// The `ConflictException` body for a `DevEui` already registered in the account.
+///
+/// One function, so every operation that claims a `DevEui` refuses a duplicate with the
+/// same body: [`DUPLICATE_DEV_EUI_MESSAGE`] and the two optional members the model
+/// merely permits (`ResourceId`, `ResourceType`) left unset, which keeps the owning
+/// device's identity out of a refusal served to a caller that cannot read it.
+pub fn duplicate_dev_eui() -> ConflictException {
+    ConflictException {
+        message: Some(DUPLICATE_DEV_EUI_MESSAGE.to_string()),
+        resource_id: None,
+        resource_type: None,
+    }
+}
+
+/// The LoRaWAN specification version the 1.1 provisioning members (`OtaaV1_1`,
+/// `AbpV1_1`) carry key material for.
+/// Source: `LoRaWANDevice`'s members, `smithy_query(query="shape",
+/// shape="LoRaWANDevice")` ("OTAA device object for v1.1", "ABP device object for
+/// create APIs for v1.1").
+pub const LORAWAN_VERSION_1_1: &str = "1.1";
+
+/// The LoRaWAN specification version the 1.0.x provisioning members (`OtaaV1_0_x`,
+/// `AbpV1_0_x`) carry key material for, at the granularity provisioning is defined at:
+/// 1.0.x key material is the same across the 1.0 revisions.
+/// Source: the same `LoRaWANDevice` members ("for v1.0.x").
+pub const LORAWAN_VERSION_1_0: &str = "1.0";
+
+/// The specification version family a `MacVersion` names: its first two dot-separated
+/// components, since a device profile's `MacVersion` is a revision of a family
+/// (`1.0.3` is a revision of `1.0`) and provisioning is version-specific only down to
+/// the family.
+///
+/// `MacVersion` is a free-form string in the model (`length 0..64`), so an
+/// unrecognisable value is its own family and matches only itself.
+pub fn mac_version_family(mac_version: &str) -> &str {
+    match mac_version.match_indices('.').nth(1) {
+        Some((second_dot, _)) => &mac_version[..second_dot],
+        None => mac_version,
+    }
+}
+
+/// Every LoRaWAN specification version the provisioning members of `lorawan` carry key
+/// material for, in the order the model declares them.
+pub fn provisioning_versions(lorawan: &LoRaWANDevice) -> Vec<&'static str> {
+    let mut versions = Vec::new();
+    if lorawan.otaa_v1_1.is_some() || lorawan.abp_v1_1.is_some() {
+        versions.push(LORAWAN_VERSION_1_1);
+    }
+    if lorawan.otaa_v1_0_x.is_some() || lorawan.abp_v1_0_x.is_some() {
+        versions.push(LORAWAN_VERSION_1_0);
+    }
+    versions
+}
+
+/// The referenced profile's `MacVersion` when it cannot provision the key material
+/// `lorawan` carries, and `None` when the two agree.
+///
+/// A device profile declares the MAC version the devices it provisions run, and each
+/// provisioning member a create carries declares the version ITS key material is for,
+/// so EVERY member the create carries must name the profile's version family — a create
+/// carrying material for two families cannot agree with a profile that declares one. A
+/// profile that declares no `MacVersion` (absent, or the empty string the model's
+/// `length 0..64` permits), and a create that carries no provisioning member, constrain
+/// nothing.
+pub fn mismatched_mac_version(lorawan: &LoRaWANDevice, profile: &DeviceProfile) -> Option<String> {
+    let mac_version = profile
+        .lorawan
+        .as_ref()?
+        .mac_version
+        .as_deref()
+        .filter(|declared| !declared.is_empty())?;
+    let family = mac_version_family(mac_version);
+    provisioning_versions(lorawan)
+        .into_iter()
+        .any(|requested| requested != family)
+        .then(|| mac_version.to_string())
+}
+
+/// The `ValidationException` body for key material the referenced device profile's
+/// `MacVersion` cannot provision: fixed text whose only variable part is that stored
+/// `MacVersion`.
+pub fn mac_version_mismatch(mac_version: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Validation error: the input profile version is not match macVersion defines in \
+             deviceProfile: {mac_version}"
+        )),
+    }
 }
 
 /// A service profile: the LoRaWAN network-server settings a set of wireless devices
