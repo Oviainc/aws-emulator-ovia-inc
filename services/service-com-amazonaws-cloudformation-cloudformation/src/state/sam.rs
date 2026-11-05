@@ -31,7 +31,14 @@
 //!   stage. A `HttpApi` event does the same through `AWS::ApiGatewayV2::Api` and its
 //!   `$default` stage.
 //! * `AWS::Serverless::Api` and `AWS::Serverless::HttpApi` become that same API trio from
-//!   the definition the declaration states.
+//!   the definition the declaration states — and "if neither `DefinitionUri` nor
+//!   `DefinitionBody` are specified, AWS SAM generates [one] based on your template
+//!   configuration": the API's definition is generated from the routes of the events routed
+//!   through it ([`api_definition_paths`]), whether that API is the implicit one or one a
+//!   declaration spells, so an API the transform emits always carries the definition that
+//!   NAMES it. An HTTP API is created by IMPORTING that document, so what the declaration
+//!   says about the api itself — its name, description, CORS and endpoint configuration and
+//!   its tags — travels inside it ([`http_definition_members`]).
 //! * A declaration's `Policies` is what the role generated for it grants: every entry that
 //!   is not an AWS managed policy becomes one INLINE policy on that role, named for the
 //!   declaration and the entry's position ([`role_policies`]), and the role carries the
@@ -144,6 +151,53 @@ const REF: &str = "Ref";
 const FN_SUB: &str = "Fn::Sub";
 const DEPENDS_ON: &str = "DependsOn";
 const DELETION_POLICY: &str = "DeletionPolicy";
+
+/// The members of an OpenAPI definition the expansion writes into: the document's `paths`,
+/// and the `info` block that carries the api's name and description — "`info.title`" is
+/// what an imported api's `Name` comes from, which is why a generated definition always
+/// states one.
+const DEFINITION_PATHS: &str = "paths";
+const DEFINITION_INFO: &str = "info";
+const DEFINITION_TITLE: &str = "title";
+const DEFINITION_DESCRIPTION: &str = "description";
+
+/// The document-level extension an OpenAPI definition carries an HTTP api's CORS
+/// configuration in — where an `AWS::Serverless::HttpApi`'s `CorsConfiguration` belongs,
+/// since such an api is created by importing its definition.
+const CORS_EXTENSION: &str = "x-amazon-apigateway-cors";
+
+/// The `CorsConfiguration` members of an API declaration, against the names the definition's
+/// CORS extension spells them with: the extension's members are the modelled `Cors` ones
+/// with a lower-cased initial letter.
+const CORS_MEMBERS: &[(&str, &str)] = &[
+    ("AllowCredentials", "allowCredentials"),
+    ("AllowHeaders", "allowHeaders"),
+    ("AllowMethods", "allowMethods"),
+    ("AllowOrigins", "allowOrigins"),
+    ("ExposeHeaders", "exposeHeaders"),
+    ("MaxAge", "maxAge"),
+];
+
+/// The document-level extension an OpenAPI definition carries an api's endpoint
+/// configuration in, and the member of it that answers for `DisableExecuteApiEndpoint`.
+const ENDPOINT_CONFIGURATION_EXTENSION: &str = "x-amazon-apigateway-endpoint-configuration";
+const DISABLE_EXECUTE_API_ENDPOINT: &str = "disableExecuteApiEndpoint";
+
+/// The root member an OpenAPI definition carries an api's tags in, and the members one
+/// entry of it spells a tag's name and value under: an imported api's tags travel inside
+/// its definition.
+const DEFINITION_TAGS: &str = "tags";
+const DEFINITION_TAG_NAME: &str = "name";
+const DEFINITION_TAG_VALUE: &str = "x-amazon-apigateway-tag-value";
+
+/// The property an API declaration states its stage's name under, which the `Globals`
+/// section of neither API type carries for the IMPLICIT API: that one is deployed to the
+/// stage the macro names for it.
+const STAGE_NAME_PROPERTY: &str = "StageName";
+
+/// The properties an API declaration states its definition under.
+const DEFINITION_BODY_PROPERTY: &str = "DefinitionBody";
+const DEFINITION_URI_PROPERTY: &str = "DefinitionUri";
 
 /// What the content hash below is derived under, so it cannot be the same digits as another
 /// identifier this crate derives from the same text (see
@@ -394,7 +448,7 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Expans
                     &mut primary,
                     &mut added,
                     (logical_id, declaration, &properties),
-                    &Map::new(),
+                    &api_definition_paths(&events, logical_id, true),
                 );
             }
             Some(HTTP_API) => {
@@ -403,7 +457,7 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Expans
                     &mut primary,
                     &mut added,
                     (logical_id, declaration, &properties),
-                    &Map::new(),
+                    &api_definition_paths(&events, logical_id, false),
                 );
             }
             Some(SIMPLE_TABLE) => {
@@ -454,8 +508,8 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Expans
 
     // The implicit APIs: one REST API for every `Api` event that named no `RestApiId`, one
     // HTTP API for every `HttpApi` event that named no `ApiId`.
-    implicit_api(&mut added, &events, true);
-    implicit_api(&mut added, &events, false);
+    implicit_api(&mut added, &events, globals, true);
+    implicit_api(&mut added, &events, globals, false);
 
     let mut out = primary;
     for (logical_id, resource) in added {
@@ -572,7 +626,7 @@ fn api_stages(resources: &Map<String, Value>, globals: &Value) -> Map<String, Va
             _ => continue,
         };
         let properties = merged(globals.get(section), declaration.get("Properties"));
-        if let Some(name) = properties.get("StageName") {
+        if let Some(name) = properties.get(STAGE_NAME_PROPERTY) {
             stages.insert(logical_id.clone(), name.clone());
         }
     }
@@ -1001,13 +1055,25 @@ fn expand_rest_api(
     copy_through(&mut api, properties, REST_API_PASSTHROUGH);
     // "DefinitionBody: The OpenAPI specification that describes your API", which
     // `AWS::ApiGateway::RestApi` spells `Body`; "DefinitionUri: The Amazon S3 URI … of the
-    // OpenAPI document", which it spells `BodyS3Location`.
-    if !paths.is_empty() {
-        api.insert("Body".to_string(), rest_definition(paths));
-    } else if let Some(body) = properties.get("DefinitionBody") {
-        api.insert("Body".to_string(), body.clone());
-    } else if let Some(uri) = properties.get("DefinitionUri").and_then(s3_location) {
-        api.insert("BodyS3Location".to_string(), uri);
+    // OpenAPI document", which it spells `BodyS3Location`. "If neither … is specified, AWS
+    // SAM generates [the definition] based on your template configuration" — and the part of
+    // that configuration an API's definition is generated from is the routes of the events
+    // routed through it, which are merged INTO a definition the declaration states as well:
+    // an event routed through an API is a route of it however that API's definition was
+    // written. A definition held in Amazon S3 is the one case nothing can be merged into
+    // here, since the document is not in the template.
+    match properties.get(DEFINITION_URI_PROPERTY).and_then(s3_location) {
+        Some(uri) if properties.get(DEFINITION_BODY_PROPERTY).is_none() => {
+            api.insert("BodyS3Location".to_string(), uri);
+        }
+        _ => {
+            let mut body = properties
+                .get(DEFINITION_BODY_PROPERTY)
+                .cloned()
+                .unwrap_or_else(rest_definition);
+            merge_definition_paths(&mut body, paths);
+            api.insert("Body".to_string(), body);
+        }
     }
     if let Some(tags) = properties.get("Tags") {
         api.insert("Tags".to_string(), tag_list(Some(tags), None));
@@ -1043,7 +1109,7 @@ fn expand_rest_api(
         ),
     );
     let stage_name = properties
-        .get("StageName")
+        .get(STAGE_NAME_PROPERTY)
         .cloned()
         .unwrap_or_else(|| json!(IMPLICIT_STAGE));
     let mut stage = Map::new();
@@ -1063,6 +1129,14 @@ fn expand_rest_api(
 
 /// Expand one `AWS::Serverless::HttpApi` (or the implicit HTTP API) into the API and its
 /// stage. An HTTP API deploys itself (`AutoDeploy`), so there is no deployment resource.
+///
+/// An HTTP API is created by IMPORTING its OpenAPI definition, so the definition is the
+/// api: it carries the api's name (`info.title`), its description, its CORS configuration
+/// and its tags, and "if neither `DefinitionUri` nor `DefinitionBody` are specified, AWS SAM
+/// generates [it] based on your template configuration" — the routes of the events routed
+/// through this api. That is why the generated resource always carries a definition: an
+/// `AWS::ApiGatewayV2::Api` that carries neither a definition nor a `Name` is one the API
+/// Gateway v2 create refuses for a null name.
 fn expand_http_api(
     primary: &mut Map<String, Value>,
     added: &mut Map<String, Value>,
@@ -1072,24 +1146,37 @@ fn expand_http_api(
     let (logical_id, declaration, properties) = declared;
     let condition = declaration.get("Condition");
     let mut api = Map::new();
-    if !routes.is_empty() {
-        api.insert("Body".to_string(), http_definition(routes));
-    } else if let Some(body) = properties.get("DefinitionBody") {
-        api.insert("Body".to_string(), body.clone());
-    } else if let Some(uri) = properties.get("DefinitionUri").and_then(s3_location) {
-        api.insert("BodyS3Location".to_string(), uri);
+    match properties.get(DEFINITION_URI_PROPERTY).and_then(s3_location) {
+        // A definition held in Amazon S3 is not in the template, so nothing can be written
+        // into it: what the declaration states about the api travels beside it instead.
+        Some(uri) if properties.get(DEFINITION_BODY_PROPERTY).is_none() => {
+            api.insert("BodyS3Location".to_string(), uri);
+            copy_through(&mut api, properties, &["Description", "Name"]);
+            if let Some(tags) = properties.get("Tags") {
+                api.insert("Tags".to_string(), tags.clone());
+            }
+        }
+        _ => {
+            let mut body = properties
+                .get(DEFINITION_BODY_PROPERTY)
+                .cloned()
+                .unwrap_or_else(http_definition);
+            merge_definition_paths(&mut body, routes);
+            http_definition_members(&mut body, properties);
+            api.insert("Body".to_string(), body);
+        }
     }
-    copy_through(&mut api, properties, &["Description", "Name", "FailOnWarnings"]);
-    if let Some(tags) = properties.get("Tags") {
-        api.insert("Tags".to_string(), tags.clone());
-    }
+    // "FailOnWarnings: … whether to roll back the API creation when a warning is
+    // encountered" is how the definition is READ rather than part of it, so it is stated on
+    // the resource either way.
+    copy_through(&mut api, properties, &["FailOnWarnings"]);
     primary.insert(
         logical_id.clone(),
         carried_over(declaration, "AWS::ApiGatewayV2::Api", api),
     );
 
     let stage_name = properties
-        .get("StageName")
+        .get(STAGE_NAME_PROPERTY)
         .cloned()
         .unwrap_or_else(|| json!(HTTP_DEFAULT_STAGE));
     let mut stage = Map::new();
@@ -1124,25 +1211,16 @@ fn expand_http_api(
 
 /// The implicit API the `Api` (or `HttpApi`) events that named no API of their own are
 /// routed through, where the template has any.
-fn implicit_api(added: &mut Map<String, Value>, events: &[ApiEvent], rest: bool) {
-    let mut paths: Map<String, Value> = Map::new();
-    for event in events
+fn implicit_api(
+    added: &mut Map<String, Value>,
+    events: &[ApiEvent],
+    globals: &Value,
+    rest: bool,
+) {
+    if !events
         .iter()
-        .filter(|event| event.implicit && event.rest == rest)
+        .any(|event| event.implicit && event.rest == rest)
     {
-        let item = if rest {
-            rest_path_item(&event.function)
-        } else {
-            http_path_item(&event.function)
-        };
-        let methods = paths
-            .entry(event.path.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(methods) = methods.as_object_mut() {
-            methods.insert(method_key(&event.method), item);
-        }
-    }
-    if paths.is_empty() {
         return;
     }
     let logical_id = if rest {
@@ -1150,10 +1228,12 @@ fn implicit_api(added: &mut Map<String, Value>, events: &[ApiEvent], rest: bool)
     } else {
         IMPLICIT_HTTP_API.to_string()
     };
-    // The implicit API is declared by nothing, so it carries no resource attributes and no
-    // properties of its own: its definition is the routes its events state.
+    // The implicit API is declared by nothing, so it carries no resource attributes: what it
+    // states is what the `Globals` section states for every API of its type, and its
+    // definition is the routes its events state.
     let declaration = Value::Object(Map::new());
-    let properties = Value::Object(Map::new());
+    let properties = implicit_api_properties(globals, rest);
+    let paths = api_definition_paths(events, &logical_id, rest);
     let mut primary = Map::new();
     if rest {
         expand_rest_api(
@@ -1175,21 +1255,194 @@ fn implicit_api(added: &mut Map<String, Value>, events: &[ApiEvent], rest: bool)
     }
 }
 
-/// The OpenAPI 2.0 document the implicit REST API's routes make up.
-fn rest_definition(paths: &Map<String, Value>) -> Value {
+/// What the implicit API of one type states: the `Globals` section of that type —
+/// "properties that you specify in the Globals section … apply to all your serverless
+/// functions and APIs", and the API the macro adds is one of them — less the stage's name,
+/// which neither section's published property set carries and which for this API is the one
+/// the macro names ([`IMPLICIT_STAGE`] for a REST API, [`HTTP_DEFAULT_STAGE`] for an HTTP
+/// one).
+fn implicit_api_properties(globals: &Value, rest: bool) -> Value {
+    let mut properties = object(globals.get(if rest { "Api" } else { "HttpApi" }));
+    properties.remove(STAGE_NAME_PROPERTY);
+    Value::Object(properties)
+}
+
+/// The OpenAPI path items the events routed through ONE api contribute to its definition,
+/// keyed by the path each states and, inside that, by its method.
+///
+/// Every event names the api it is routed through — the implicit one, or the one its
+/// `RestApiId`/`ApiId` spells — so this is read for an API the macro adds and for one a
+/// declaration spells alike: "if neither `DefinitionUri` nor `DefinitionBody` are specified,
+/// AWS SAM generates [the definition] based on your template configuration", and these
+/// routes are that configuration.
+fn api_definition_paths(events: &[ApiEvent], api: &str, rest: bool) -> Map<String, Value> {
+    let mut paths: Map<String, Value> = Map::new();
+    for event in events
+        .iter()
+        .filter(|event| event.rest == rest && event.api == api)
+    {
+        let item = if rest {
+            rest_path_item(&event.function)
+        } else {
+            http_path_item(&event.function)
+        };
+        let methods = paths
+            .entry(event.path.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(methods) = methods.as_object_mut() {
+            methods.insert(method_key(&event.method), item);
+        }
+    }
+    paths
+}
+
+/// Merge the path items of the events routed through an api into that api's definition.
+///
+/// A path item the DEFINITION already states WINS: the document is what the client wrote
+/// about that route, and the generated item would describe a different integration for it.
+/// Each method is merged on its own, so an event adds `post` to a path whose `get` the
+/// definition declares. A definition that is not an object (one left as an expression for
+/// CloudFormation to resolve) is left exactly as it was written.
+fn merge_definition_paths(body: &mut Value, paths: &Map<String, Value>) {
+    if paths.is_empty() {
+        return;
+    }
+    let Some(document) = body.as_object_mut() else {
+        return;
+    };
+    let declared = document
+        .entry(DEFINITION_PATHS.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(declared) = declared.as_object_mut() else {
+        return;
+    };
+    for (path, methods) in paths {
+        let item = declared
+            .entry(path.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if let Some(methods) = methods.as_object() {
+            for (method, operation) in methods {
+                item.entry(method.clone())
+                    .or_insert_with(|| operation.clone());
+            }
+        }
+    }
+}
+
+/// State on an HTTP api's OpenAPI definition what the declaration says about the API
+/// ITSELF, since that api is created by importing the document rather than from properties
+/// beside it: its `Name` is the definition's `info.title` (which is where an imported api's
+/// name comes from), its `Description` the `info.description`, its `CorsConfiguration` the
+/// document's CORS extension, its `DisableExecuteApiEndpoint` the endpoint-configuration
+/// extension's own member, and its `Tags` the document's `tags`.
+///
+/// What the DEFINITION states wins everywhere: a declaration that carries a `DefinitionBody`
+/// has already said these things inside it.
+fn http_definition_members(body: &mut Value, properties: &Value) {
+    if let Some(name) = properties.get("Name") {
+        state_info_member(body, DEFINITION_TITLE, name.clone());
+    }
+    if let Some(description) = properties.get("Description") {
+        state_info_member(body, DEFINITION_DESCRIPTION, description.clone());
+    }
+    let Some(document) = body.as_object_mut() else {
+        return;
+    };
+    if let Some(cors) = properties.get("CorsConfiguration").and_then(cors_extension) {
+        document
+            .entry(CORS_EXTENSION.to_string())
+            .or_insert(cors);
+    }
+    if let Some(disabled) = properties.get("DisableExecuteApiEndpoint") {
+        let mut configuration = Map::new();
+        configuration.insert(
+            DISABLE_EXECUTE_API_ENDPOINT.to_string(),
+            disabled.clone(),
+        );
+        document
+            .entry(ENDPOINT_CONFIGURATION_EXTENSION.to_string())
+            .or_insert_with(|| Value::Object(configuration));
+    }
+    if let Some(tags) = properties.get("Tags").and_then(definition_tags) {
+        document.entry(DEFINITION_TAGS.to_string()).or_insert(tags);
+    }
+}
+
+/// State one member of a definition's `info` block, where the document carries one that can
+/// hold it: the block is created when the definition states none, and a definition whose
+/// `info` is something other than an object is left as it was written.
+fn state_info_member(body: &mut Value, member: &str, value: Value) {
+    let Some(document) = body.as_object_mut() else {
+        return;
+    };
+    let info = document
+        .entry(DEFINITION_INFO.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(members) = info.as_object_mut() {
+        members.insert(member.to_string(), value);
+    }
+}
+
+/// The CORS extension a `CorsConfiguration` becomes: the members the declaration states,
+/// under the names a definition spells them with ([`CORS_MEMBERS`]).
+///
+/// "You can also provide a string of the allowed origin", which is a shorthand for that one
+/// member. Anything else states no configuration this can read, so it contributes none
+/// rather than one nothing declared.
+fn cors_extension(declared: &Value) -> Option<Value> {
+    let mut cors = Map::new();
+    match declared {
+        Value::String(origin) => {
+            cors.insert("allowOrigins".to_string(), json!([origin]));
+        }
+        Value::Object(members) => {
+            for (property, member) in CORS_MEMBERS {
+                if let Some(value) = members.get(*property) {
+                    cors.insert((*member).to_string(), value.clone());
+                }
+            }
+        }
+        _ => return None,
+    }
+    (!cors.is_empty()).then_some(Value::Object(cors))
+}
+
+/// The `tags` an api's definition carries, from the tag MAP the declaration states: one
+/// entry per tag, its name beside the extension a tag's value travels in.
+fn definition_tags(tags: &Value) -> Option<Value> {
+    let declared = tags.as_object()?;
+    let entries: Vec<Value> = declared
+        .iter()
+        .map(|(key, value)| {
+            let mut entry = Map::new();
+            entry.insert(DEFINITION_TAG_NAME.to_string(), json!(key));
+            entry.insert(DEFINITION_TAG_VALUE.to_string(), value.clone());
+            Value::Object(entry)
+        })
+        .collect();
+    (!entries.is_empty()).then_some(Value::Array(entries))
+}
+
+/// The OpenAPI 2.0 document a REST API's generated definition starts from — the skeleton
+/// AWS SAM generates for an API whose declaration states none, whose `info.title` is the
+/// stack's own name.
+fn rest_definition() -> Value {
     json!({
         "swagger": "2.0",
         "info": { "title": { "Fn::Sub": "${AWS::StackName}" }, "version": "1.0" },
-        "paths": paths,
+        "paths": {},
     })
 }
 
-/// The OpenAPI 3.0 document the implicit HTTP API's routes make up.
-fn http_definition(paths: &Map<String, Value>) -> Value {
+/// The OpenAPI 3.0 document an HTTP API's generated definition starts from.
+fn http_definition() -> Value {
     json!({
         "openapi": "3.0.1",
         "info": { "title": { "Fn::Sub": "${AWS::StackName}" }, "version": "1.0" },
-        "paths": paths,
+        "paths": {},
     })
 }
 

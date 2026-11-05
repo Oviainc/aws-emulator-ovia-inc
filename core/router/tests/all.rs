@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -26,7 +24,6 @@ mod cloudformation_refuses_s3vectors_vector_buckets;
 // their line to.
 #[path = "all/ebs_start_snapshot_resolves_its_kms_key.rs"]
 mod ebs_start_snapshot_resolves_its_kms_key;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `s…` span (where every sqs suite lands) are both regions
 // concurrently landing suites add their line to.
 #[path = "all/sqs_queue_policy_governs_cross_service_delivery.rs"]
@@ -38,52 +35,35 @@ mod sqs_queue_policy_governs_cross_service_delivery;
 mod applicationinsights_resource_group_admission;
 // Declared at the head for the reason the entry above records: the appended tail and the
 // sorted `s…` span (where the other sagemaker suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/sagemaker_create_admission.rs"]
 mod sagemaker_create_admission;
 // Declared in this same head region, for the reason the entry above records: the appended
 // tail and the sorted `s…` span (where the other sagemaker suites land) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/sagemaker_execution_role_admission.rs"]
 mod sagemaker_execution_role_admission;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `g…` span (beside the other greengrass/glue suites) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/greengrass_signing_name_routing.rs"]
 mod greengrass_signing_name_routing;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_deployed_domain_index_lifecycle.rs"]
 mod cloudformation_deployed_domain_index_lifecycle;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `g…` span (beside the other glue suites) are both regions concurrently landing
 // suites add their line to.
 #[path = "all/glue_studio_notebook_catalog_through_the_router.rs"]
 mod glue_studio_notebook_catalog_through_the_router;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `e…` span (where every elbv2 suite lands) are both regions concurrently landing
-// suites add their line to.
 #[path = "all/elbv2_dualstack_and_security_group_classes.rs"]
 mod elbv2_dualstack_and_security_group_classes;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_codeartifact_resources.rs"]
 mod cloudformation_provisions_codeartifact_resources;
-// Declared in this same head region, for the reason the entry above records: the appended
 // tail and the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_glue_catalog.rs"]
 mod cloudformation_provisions_glue_catalog;
 // Declared in this same head region, for the reason the entries above record: the appended
 // tail and the sorted `s…` span (where every ssm suite would land) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/ssm_securestring_ciphertext_decrypts_in_kms.rs"]
 mod ssm_securestring_ciphertext_decrypts_in_kms;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `s…` span (where every ses suite lands) are both regions concurrently landing
-// suites add their line to.
 #[path = "all/ses_raw_send_under_a_shared_domain_identity.rs"]
 mod ses_raw_send_under_a_shared_domain_identity;
 // Declared here, at the head, for the reason the entries below record: the appended tail
@@ -91,33 +71,22 @@ mod ses_raw_send_under_a_shared_domain_identity;
 // are both regions concurrently landing suites add their line to.
 #[path = "all/codepipeline_execution_controls.rs"]
 mod codepipeline_execution_controls;
-// Declared in this same head region, for the reason the entry above records: the appended
 // tail and the sorted `c…` span (where every codepipeline suite would land) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/codepipeline_management_events.rs"]
 mod codepipeline_management_events;
-// Declared here, at the head, for the reason the entries below record: the appended tail
 // and the sorted `i…` span are both regions concurrently landing suites add their line to.
 #[path = "all/iam_management_events.rs"]
 mod iam_management_events;
-// Declared in this same head region, for the reason the entry above records: the appended
 // tail and the sorted `s…` span are both regions concurrently landing suites add their line
 // to. `sts_management_events` pins that an STS call — a read-only one included — is in
 // CloudTrail event history, and that no credential material reaches a record.
 #[path = "all/sts_management_events.rs"]
 mod sts_management_events;
-// Declared here, at the head, for the reason the entries below record: the appended tail
 // and the sorted `a…` span are both regions concurrently landing suites add their line to.
 #[path = "all/assembled_router_refusal_identities.rs"]
 mod assembled_router_refusal_identities;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_apigateway_custom_domains.rs"]
 mod cloudformation_apigateway_custom_domains;
-// Declared in this same head region, for the reason the entry above records: the appended
-// tail and the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_guardduty_ip_set.rs"]
 mod cloudformation_provisions_guardduty_ip_set;
 // Declared in this same head region, for the reason the entries above record.
@@ -127,89 +96,50 @@ mod cloudformation_provisions_wafv2_web_acl_associations;
 // the sorted `k…` span are both regions concurrently landing suites add their line to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `k…` span (beside the other kafka/kinesis suites) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/kafka_placement_subnets_resolve_in_ec2.rs"]
 mod kafka_placement_subnets_resolve_in_ec2;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `b…` span (where every batch suite would land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/batch_job_state_change_is_scoped_to_its_own_job_queue.rs"]
 mod batch_job_state_change_is_scoped_to_its_own_job_queue;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `t…` span are both regions concurrently landing suites add their line to.
 #[path = "all/tagged_hosted_zone_selects_a_sending_domain.rs"]
 mod tagged_hosted_zone_selects_a_sending_domain;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every codeartifact and cloudformation suite would land) are
 // both regions concurrently landing suites add their line to.
 #[path = "all/codeartifact_package_version_events.rs"]
 mod codeartifact_package_version_events;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_opensearch_domain_access_policies.rs"]
 mod cloudformation_opensearch_domain_access_policies;
-// Declared in this same head region, for the reason the entries above record.
 #[path = "all/cloudformation_opensearch_domain_deployments.rs"]
 mod cloudformation_opensearch_domain_deployments;
-// Declared in this same head region, for the reason the entries above record.
 #[path = "all/cloudformation_opensearch_vpc_endpoint_access.rs"]
 mod cloudformation_opensearch_vpc_endpoint_access;
-// Declared in this same head region, for the reason the entries above record: the appended
-// tail and the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_search_indexing_pipeline_outputs.rs"]
 mod cloudformation_search_indexing_pipeline_outputs;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_ec2_ebs_instance_estate.rs"]
 mod cloudformation_ec2_ebs_instance_estate;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `k…` span (beside the other kinesis suites) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/kinesisanalytics_signing_name_routing.rs"]
 mod kinesisanalytics_signing_name_routing;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `s…` span (where the other s3 suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/s3control_tags_a_general_purpose_bucket.rs"]
 mod s3control_tags_a_general_purpose_bucket;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_kinesis_streams.rs"]
 mod cloudformation_provisions_kinesis_streams;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `e…` span (where the other ecr/eks suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/ecr_public_action_scoped_iam_identity.rs"]
 mod ecr_public_action_scoped_iam_identity;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `a…` span (where the other apigateway suites land) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/apigateway_private_vpce_invoke.rs"]
 mod apigateway_private_vpce_invoke;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `a…` span (where the other apigateway suites land) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/apigateway_s3_service_integration.rs"]
 mod apigateway_s3_service_integration;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `b…` span (where the other bedrock suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/bedrock_model_customization_pass_role.rs"]
 mod bedrock_model_customization_pass_role;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `b…` span (where the other bedrock suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/bedrock_model_invocation_logging_pass_role.rs"]
 mod bedrock_model_invocation_logging_pass_role;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_firehose_stream_stabilisation.rs"]
 mod cloudformation_firehose_stream_stabilisation;
 // Declared beside the suite above rather than in the head region: both are regions
@@ -218,34 +148,16 @@ mod cloudformation_firehose_stream_stabilisation;
 // still held by the service that owned it.
 #[path = "all/cloudformation_resource_removal_stabilisation.rs"]
 mod cloudformation_resource_removal_stabilisation;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_opensearch_domains.rs"]
 mod cloudformation_provisions_opensearch_domains;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_glue_jobs.rs"]
 mod cloudformation_provisions_glue_jobs;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_glue_job_redeploy_across_regions.rs"]
 mod cloudformation_glue_job_redeploy_across_regions;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_backup_resources.rs"]
 mod cloudformation_provisions_backup_resources;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_route53_health_checks.rs"]
 mod cloudformation_provisions_route53_health_checks;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_kms_aliases.rs"]
 mod cloudformation_provisions_kms_aliases;
 // Declared beside the entry above, at the head, for the same reason: the appended tail and
@@ -253,30 +165,20 @@ mod cloudformation_provisions_kms_aliases;
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudwatch_alarm_action_reaches_its_subscribed_queue.rs"]
 mod cloudwatch_alarm_action_reaches_its_subscribed_queue;
-// Declared beside the entry above, at the head, for the same reason: the appended tail and
-// the sorted `c…` span (where the other cloudwatch/cloudformation suites land) are both
-// regions concurrently landing suites add their line to.
 #[path = "all/cloudwatch_breaching_alarm_fires_through_the_whole_router.rs"]
 mod cloudwatch_breaching_alarm_fires_through_the_whole_router;
 // Declared beside the entry above, at the head, for the same reason.
 #[path = "all/cloudwatch_composite_alarm_rule_decides_its_sns_action.rs"]
 mod cloudwatch_composite_alarm_rule_decides_its_sns_action;
-// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where the other cloudwatch suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/contributor_insights_log_events.rs"]
 mod contributor_insights_log_events;
-// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/cloudformation_records_per_resource_stack_events.rs"]
 mod cloudformation_records_per_resource_stack_events;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `i…` span (where the other iam suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/iam_holds_the_principal_sts_reports.rs"]
 mod iam_holds_the_principal_sts_reports;
-// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `s…` span are both regions concurrently landing suites add their line to.
 #[path = "all/sts_does_not_disclose_an_absent_role.rs"]
 mod sts_does_not_disclose_an_absent_role;
@@ -284,33 +186,24 @@ mod sts_does_not_disclose_an_absent_role;
 // and the sorted `s…` span are both regions concurrent suites add their line to.
 #[path = "all/signer_revocation_status_across_services.rs"]
 mod signer_revocation_status_across_services;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `e…` span (where the other ecs/elbv2 suites land) are both regions concurrently
-// landing suites add their line to.
 #[path = "all/ecs_awsvpc_configuration_over_an_ec2_network.rs"]
 mod ecs_awsvpc_configuration_over_an_ec2_network;
-// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `l…` span are both regions concurrently landing suites add their line to.
 #[path = "all/log_alarm_scheduled_query.rs"]
 mod log_alarm_scheduled_query;
-// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
-// suites add their line to.
 #[path = "all/cloudformation_provisions_codebuild_report_groups.rs"]
 mod cloudformation_provisions_codebuild_report_groups;
 #[path = "all/cloudformation_provisions_codecommit_repositories.rs"]
 mod cloudformation_provisions_codecommit_repositories;
-// Declared here, at the head, for the reason the entry above records: the appended tail
 // and the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrent suites add their line to.
 #[path = "all/cloudformation_provisions_transfer_servers.rs"]
 mod cloudformation_provisions_transfer_servers;
 // Declared beside the entry above, at the head, for the same reason: the appended tail
-// and the sorted `c…` span (where every cloudformation suite lands) are both regions
-// concurrent suites add their line to.
 #[path = "all/cloudformation_provisions_batch_resources.rs"]
 mod cloudformation_provisions_batch_resources;
-// Declared beside the entry above, at the head, for the same reason: the appended tail
 // and the sorted `s…` span are both regions concurrent suites land in.
 #[path = "all/ses_family_signing_name_routing.rs"]
 mod ses_family_signing_name_routing;
@@ -321,37 +214,21 @@ mod ses_family_signing_name_routing;
 mod ses_event_destination_setup_across_services;
 // Declared beside its two sibling suites, at the head, for the reason the entries above
 // record: the appended tail and the sorted `s…` span are both regions concurrently landing
-// suites add their line to.
 #[path = "all/ses_firehose_event_destination_setup.rs"]
 mod ses_firehose_event_destination_setup;
 // Declared beside its sibling ses suites, at the head, for the reason the entries above
-// record: the appended tail and the sorted `s…` span are both regions concurrently landing
-// suites add their line to.
 #[path = "all/ses_v1_receipt_rule_sets_through_the_router.rs"]
 mod ses_v1_receipt_rule_sets_through_the_router;
-// Declared beside its sibling ses suites, at the head, for the reason the entries above
-// record: the appended tail and the sorted `s…` span are both regions concurrently landing
-// suites add their line to.
 #[path = "all/ses_identities_shared_across_v1_and_v2.rs"]
 mod ses_identities_shared_across_v1_and_v2;
-// Declared beside its sibling ses suites, at the head, for the reason the entries above
-// record: the appended tail and the sorted `s…` span are both regions concurrently landing
-// suites add their line to.
 #[path = "all/ses_easy_dkim_shared_across_surfaces.rs"]
 mod ses_easy_dkim_shared_across_surfaces;
-// Declared beside its sibling ses suites, at the head, for the reason the entries above
-// record: the appended tail and the sorted `s…` span are both regions concurrently landing
-// suites add their line to.
 #[path = "all/ses_identity_policies_shared_across_surfaces.rs"]
 mod ses_identity_policies_shared_across_surfaces;
 // Declared beside the suites above, at the head, for the same reason: the appended tail and
-// the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
-// suites add their line to.
 #[path = "all/cloudformation_provisions_ses_configuration_sets.rs"]
 mod cloudformation_provisions_ses_configuration_sets;
-// Declared beside its sibling suite, at the head, for the reason the entries above record:
 // the appended tail and the sorted `c…` span (where every cloudformation suite lands) are
-// both regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_ses_receipt_rule_sets.rs"]
 mod cloudformation_provisions_ses_receipt_rule_sets;
 // At the head for the same reason, and moved here out of the `c…` span of the sorted
@@ -371,18 +248,14 @@ mod cognito_vended_session_is_audited;
 #[path = "all/cognito_vended_session_is_an_assumed_role_caller.rs"]
 mod cognito_vended_session_is_an_assumed_role_caller;
 // Declared beside its sibling cognito suites, at the head, for the same reason they are
-// here: the appended tail and the sorted `c…` span are both regions concurrent suites land in.
 #[path = "all/cognito_post_confirmation_lambda_trigger.rs"]
 mod cognito_post_confirmation_lambda_trigger;
-// Declared beside its sibling cognito suites, at the head, for the same reason they are
-// here: the appended tail and the sorted `c…` span are both regions concurrent suites land in.
 #[path = "all/cognito_group_role_mapping.rs"]
 mod cognito_group_role_mapping;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 // At the head for the reason the entries above record: the appended tail and the sorted
 // `e…` span (where the other events suites land) are both regions concurrent suites add
-// their line to.
 #[path = "all/events_fan_out_to_each_matched_target.rs"]
 mod events_fan_out_to_each_matched_target;
 // Out of order for the same reason as the two entries above it.
@@ -446,13 +319,10 @@ mod cloudformation_provisions_acm_acme_endpoints;
 // Declared in this same quiet span, for the reason the note above gives.
 #[path = "all/cloudformation_provisions_acm_certificates.rs"]
 mod cloudformation_provisions_acm_certificates;
-// Declared in this same quiet span, for the reason the note above gives.
 #[path = "all/cloudformation_activates_acmpca_certificate_authorities.rs"]
 mod cloudformation_activates_acmpca_certificate_authorities;
-// Declared in this same quiet span, for the reason the note above gives.
 #[path = "all/cloudformation_admits_acmpca_resource_types.rs"]
 mod cloudformation_admits_acmpca_resource_types;
-// Declared in this same quiet span, for the reason the note above gives.
 #[path = "all/cloudformation_provisions_acmpca_certificate_authorities.rs"]
 mod cloudformation_provisions_acmpca_certificate_authorities;
 #[path = "all/cloudformation_provisions_codedeploy_resources.rs"]
@@ -470,13 +340,11 @@ mod cloudformation_provisions_eks_access_entries;
 mod cloudformation_provisions_eks_clusters;
 #[path = "all/cloudformation_provisions_cognito_user_pool_groups.rs"]
 mod cloudformation_provisions_cognito_user_pool_groups;
-// Declared in this same quiet span of the sorted list, for the reason the note above gives:
 // the tail of this file is where every concurrently landing router suite appends.
 #[path = "all/cloudformation_provisions_cloudwatch_dashboards.rs"]
 mod cloudformation_provisions_cloudwatch_dashboards;
 #[path = "all/cloudformation_provisions_sagemaker_model_package_group.rs"]
 mod cloudformation_provisions_sagemaker_model_package_group;
-// Declared in this span of the sorted list rather than appended at the end of this file,
 // for the reason the notes above give: the tail is where every concurrently landing router
 // suite appends, so a line added there conflicts with all of them.
 #[path = "all/cloudformation_provisions_scheduler_schedules.rs"]
@@ -504,12 +372,9 @@ mod cloudtrail_channel_target_routing;
 // this file is where every concurrent suite lands.
 #[path = "all/cloudtrail_channel_routing.rs"]
 mod cloudtrail_channel_routing;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
-// tail is where every suite landing in the same window appends, so it is the contended
 // region, while this span of the sorted list is untouched by those appends.
 #[path = "all/cloudtrail_import_failures_routing.rs"]
 mod cloudtrail_import_failures_routing;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every suite landing in the same window appends, so a line added there
 // conflicts with every other one; this span of the sorted list is untouched by those
 // appends.
@@ -526,14 +391,10 @@ mod ddb_stream_lambda_esm_provisioning;
 mod dynamodb_data_plane_authorization;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every landing in the same window appends, so it is the contended region,
 // while this span of the sorted list is untouched by those appends.
 #[path = "all/ecr_repository_policy_principal.rs"]
 mod ecr_repository_policy_principal;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
-// tail is where every landing in the same window appends, so it is the contended region,
-// while this span of the sorted list is untouched by those appends.
 #[path = "all/ecs_service_target_group_association.rs"]
 mod ecs_service_target_group_association;
 // Declared HERE, in the sorted list, rather than appended at the end of this file like
@@ -561,11 +422,8 @@ mod elbv2_subnet_and_elastic_ip_resolution;
 #[path = "all/elbv2_subnet_vpc_membership.rs"]
 mod elbv2_subnet_vpc_membership;
 // Declared beside its sibling ELBv2 suites, in this span of the sorted list rather than
-// appended at the tail of this file, for the reason the notes above give.
 #[path = "all/elbv2_certificate_in_use_by_acm.rs"]
 mod elbv2_certificate_in_use_by_acm;
-// Declared beside its sibling ELBv2 suites, in this span of the sorted list rather than
-// appended at the tail of this file, for the reason the notes above give.
 #[path = "all/elbv2_load_balancer_security_groups.rs"]
 mod elbv2_load_balancer_security_groups;
 // Declared beside the Classic/ELBv2 suites above, in this span of the sorted list rather
@@ -586,7 +444,6 @@ mod emr_job_flow_role_instance_profile;
 // the note above gives: the appended region at the end of this file is where every
 // concurrent router suite lands, so a line added there conflicts with every other suite
 // in the same window — this fix lost four serialized squash merges to exactly that. These
-// neighbouring lines are stable.
 #[path = "all/es_opensearch_and_elasticsearch_signing_name_routing.rs"]
 mod es_opensearch_and_elasticsearch_signing_name_routing;
 #[path = "all/events_signing_name_routing.rs"]
@@ -629,7 +486,6 @@ mod sfn_lambda_task_invocation;
 // stable.
 #[path = "all/guardduty_runtime_coverage.rs"]
 mod guardduty_runtime_coverage;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every concurrently landing router suite appends, so a line added there
 // conflicts with all of them, while these neighbouring lines are stable.
 #[path = "all/sagemaker_feature_store_control_plane_handoff.rs"]
@@ -666,7 +522,6 @@ mod iot_command_execution_lifecycle;
 // Declared HERE, beside the command-execution suite it is the sibling of, rather than
 // appended at the end of this file: the tail is where every suite landing in the same
 // window appends, so it is the contended region, while these neighbouring lines are
-// stable.
 #[path = "all/iot_command_executions_are_listed_across_planes.rs"]
 mod iot_command_executions_are_listed_across_planes;
 #[path = "all/iot_job_execution_reaches_the_device.rs"]
@@ -700,11 +555,8 @@ mod lambda_execution_role_trust;
 mod lambda_capacity_provider_operator_role;
 // Declared in this span of the sorted list, beside the other `l…` suites, rather than at
 // the head of this file or in its appended tail: both of those are where concurrently
-// landing suites put their line, so a declaration there loses a squash merge to every one
-// of them, while these neighbouring lines are stable.
 #[path = "all/lakeformation_catalog_resource_resolution.rs"]
 mod lakeformation_catalog_resource_resolution;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every concurrently landing router suite appends its line, so a
 // declaration placed there conflicts with every one of them. (The build script requires
 // every suite under `tests/all/` to be declared in this file, so it cannot live anywhere
@@ -723,9 +575,6 @@ mod chime_app_instance_admin_authorization;
 // for the reason the entry above records.
 #[path = "all/chime_identity_name_projection.rs"]
 mod chime_identity_name_projection;
-// Declared HERE, in the sorted list, rather than appended at the end of this file: the
-// tail is where every landing in the same window appends, so it is the contended region,
-// while this span of the sorted list is untouched by those appends.
 #[path = "all/mediaconvert_input_probe.rs"]
 mod mediaconvert_input_probe;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail, the head
@@ -749,9 +598,6 @@ mod cloudformation_ec2_network_stack_routes;
 // every concurrently landing suite puts its line.
 #[path = "all/cloudformation_provisions_wafv2_entities.rs"]
 mod cloudformation_provisions_wafv2_entities;
-// Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail or in the
-// `c…` span beside the other `cloudformation_provisions_*` suites: both of those are where
-// every concurrently landing suite puts its line.
 #[path = "all/cloudformation_provisions_codepipeline_pipelines.rs"]
 mod cloudformation_provisions_codepipeline_pipelines;
 // Declared HERE, in this quiet `n`/`o` gap rather than in the appended tail or beside the
@@ -784,7 +630,6 @@ mod logs_emf_extraction_policy_scope;
 mod logs_emf_declared_projections;
 // Declared HERE, beside the sibling `logs_*` suites in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the head of the
-// list are both regions every concurrently landing router suite puts its line in.
 #[path = "all/logs_export_task_destination_bucket.rs"]
 mod logs_export_task_destination_bucket;
 #[path = "all/partnercentral_channel_target_routing.rs"]
@@ -807,7 +652,6 @@ mod payment_cryptography_signing_name_routing;
 // either collides with all of them.
 #[path = "all/pinpoint_sms_voice_signing_name_routing.rs"]
 mod pinpoint_sms_voice_signing_name_routing;
-// Declared HERE, in this quiet span of the sorted list, rather than appended at the end of
 // this file or beside the other `cloudformation_provisions_*` suites in the `c` span: both
 // of those are where every concurrently landing suite puts its line, so a declaration there
 // conflicts with all of them.
@@ -817,7 +661,6 @@ mod cloudformation_provisions_redshift_clusters;
 mod cloudformation_provisions_route53resolver_rules;
 // Declared HERE, beside the sibling Route 53 Resolver suite in the same quiet span, for the
 // reason that entry records: the appended tail at the end of this file and the `c` span are
-// both regions every concurrently landing router suite puts its line in.
 #[path = "all/cloudformation_provisions_route53resolver_firewall.rs"]
 mod cloudformation_provisions_route53resolver_firewall;
 // Declared HERE, beside the sibling CloudFormation provisioning suites in the same quiet
@@ -858,12 +701,10 @@ mod resiliencehub_signing_name_routing;
 // Declared HERE, in the sorted list at its own name, rather than appended at the end of
 // this file: the tail is where every concurrently landing router suite appends its line, so
 // a declaration there conflicts with every one of them, while these neighbouring lines are
-// stable.
 #[path = "all/route53_health_check_status_metric.rs"]
 mod route53_health_check_status_metric;
 // Declared beside the suite above for the same reason its own comment gives: this is a
 // quiet span of the sorted list, while the tail of this file and the `c` span are where
-// every concurrently landing suite puts its line.
 #[path = "all/cloudformation_provisions_route53_hosted_zones.rs"]
 mod cloudformation_provisions_route53_hosted_zones;
 #[path = "all/s3files_create_file_system_bucket.rs"]
@@ -880,7 +721,6 @@ mod servicecatalog_signing_name_routing;
 mod ses_family_pre_dispatch_refusals;
 // Declared HERE, beside the sibling SES suite above in this quiet span, rather than with the
 // other SES suites at the head of this file or in its appended tail: both of those are where
-// every concurrently landing suite puts its line.
 #[path = "all/sesv2_sns_event_destination_topic_policy.rs"]
 mod sesv2_sns_event_destination_topic_policy;
 // Declared HERE, beside the sibling SESv2 suite above in this quiet span, for the same
@@ -913,7 +753,6 @@ mod batch_job_state_change_reaches_matching_rules;
 mod unsigned_entry_points_reach_their_service;
 #[path = "all/wisdom_qconnect_signing_name_routing.rs"]
 mod wisdom_qconnect_signing_name_routing;
-
 // Declared last, out of the sorted order above, on purpose: every new router suite adds
 // a line to this file, and a line inserted in the middle of the list conflicts with
 // every other suite landing in the same window. Appending keeps this change out of that
@@ -1002,3 +841,9 @@ mod events_lambda_target_resource_policy;
 mod cloudformation_provisions_lambda_functions;
 #[path = "all/cloudformation_updates_lambda_functions.rs"]
 mod cloudformation_updates_lambda_functions;
+// Declared here, in the sorted block, for the reason the entries above give: the appended
+// tail of this file is the contended region every other new suite lands in.
+#[path = "all/cloudformation_sam_http_api_definitions.rs"]
+mod cloudformation_sam_http_api_definitions;
+#[path = "all/zz_probe_whole_emulator.rs"]
+mod zz_probe_whole_emulator;

@@ -247,6 +247,8 @@ mod rolled_back_stack_configuration;
 mod s3vectors_resource_types;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
+#[path = "all/sam_api_definitions.rs"]
+mod sam_api_definitions;
 #[path = "all/sam_deployed_resources.rs"]
 mod sam_deployed_resources;
 #[path = "all/sam_layer_version_references.rs"]
