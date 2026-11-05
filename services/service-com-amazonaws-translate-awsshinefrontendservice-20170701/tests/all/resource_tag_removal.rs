@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::terminology_lifecycle::{
-    call, error_code, expected_arn, import, message, router, EN_FR_CSV,
+    call, error_code, expected_arn, import, listed_tags, message, router, tag_list, tag_pairs,
+    EN_FR_CSV,
 };
 
 /// The documented tag limit for one resource: "There can be a maximum of 50
@@ -36,35 +37,8 @@ struct Row {
     left: Vec<(String, String)>,
 }
 
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
-    entries
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
 fn keys(entries: &[&str]) -> Vec<String> {
     entries.iter().map(|key| (*key).to_string()).collect()
-}
-
-/// The `TagList` wire shape of a set of key-value pairs.
-fn tag_list(entries: &[(String, String)]) -> Value {
-    Value::Array(
-        entries
-            .iter()
-            .map(|(key, value)| json!({"Key": key, "Value": value}))
-            .collect(),
-    )
-}
-
-/// The tags the resource reports, read back through `ListTagsForResource`.
-async fn tags_of(router: &MultiServiceRouter, arn: &str) -> Vec<Value> {
-    let (status, body) = call(router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
-    assert_eq!(status, 200, "ListTagsForResource answered {body}");
-    body.pointer("/Tags")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
 }
 
 /// Import a terminology under `name` and leave it holding `held`.
@@ -108,68 +82,68 @@ fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "no key named",
-            held: pairs(&[("env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
             remove: Vec::new(),
-            left: pairs(&[("env", "prod"), ("owner", "platform")]),
+            left: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
         },
         Row {
             case: "one of several keys",
-            held: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
             remove: keys(&["owner"]),
-            left: pairs(&[("env", "prod"), ("cost", "42")]),
+            left: tag_pairs(&[("env", "prod"), ("cost", "42")]),
         },
         Row {
             case: "several keys at once",
-            held: pairs(&[
+            held: tag_pairs(&[
                 ("env", "prod"),
                 ("owner", "platform"),
                 ("cost", "42"),
                 ("team", "nlp"),
             ]),
             remove: keys(&["env", "cost", "team"]),
-            left: pairs(&[("owner", "platform")]),
+            left: tag_pairs(&[("owner", "platform")]),
         },
         Row {
             case: "every key the resource holds",
-            held: pairs(&[("env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
             remove: keys(&["env", "owner"]),
             left: Vec::new(),
         },
         Row {
             case: "a key the resource does not carry",
-            held: pairs(&[("env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
             remove: keys(&["absent"]),
-            left: pairs(&[("env", "prod"), ("owner", "platform")]),
+            left: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
         },
         Row {
             case: "a held key beside one the resource does not carry",
-            held: pairs(&[("env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
             remove: keys(&["owner", "absent"]),
-            left: pairs(&[("env", "prod")]),
+            left: tag_pairs(&[("env", "prod")]),
         },
         Row {
             case: "a key differing from a held one only in case",
-            held: pairs(&[("Env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("Env", "prod"), ("owner", "platform")]),
             remove: keys(&["env", "OWNER"]),
-            left: pairs(&[("Env", "prod"), ("owner", "platform")]),
+            left: tag_pairs(&[("Env", "prod"), ("owner", "platform")]),
         },
         Row {
             case: "keys named in the reverse of the held order",
-            held: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
             remove: keys(&["cost", "env"]),
-            left: pairs(&[("owner", "platform")]),
+            left: tag_pairs(&[("owner", "platform")]),
         },
         Row {
             case: "one key named twice in the same call",
-            held: pairs(&[("env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
             remove: keys(&["env", "env"]),
-            left: pairs(&[("owner", "platform")]),
+            left: tag_pairs(&[("owner", "platform")]),
         },
         Row {
             case: "a key whose stored value is empty",
-            held: pairs(&[("env", ""), ("owner", "platform")]),
+            held: tag_pairs(&[("env", ""), ("owner", "platform")]),
             remove: keys(&["env"]),
-            left: pairs(&[("owner", "platform")]),
+            left: tag_pairs(&[("owner", "platform")]),
         },
         Row {
             case: "half the keys of a resource at the tag limit",
@@ -218,7 +192,7 @@ async fn untag_resource_removes_exactly_the_named_keys() {
             row.case
         );
 
-        let held = tags_of(&router, &arn).await;
+        let held = listed_tags(&router, row.case, &arn).await;
         assert_eq!(
             held, expected,
             "case {:?}: expected the resource to be left holding {expected:?}, got {held:?}",
@@ -240,7 +214,7 @@ async fn untag_resource_removes_exactly_the_named_keys() {
             "case {:?}: the repeated removal answered {status} {answered}",
             row.case
         );
-        let held_again = tags_of(&router, &arn).await;
+        let held_again = listed_tags(&router, row.case, &arn).await;
         assert_eq!(
             held_again, expected,
             "case {:?}: the repeated removal must leave {expected:?}, got {held_again:?}",
@@ -254,7 +228,7 @@ async fn untag_resource_removes_exactly_the_named_keys() {
 #[tokio::test]
 async fn untag_resource_touches_only_the_resource_its_arn_names() {
     let router = router();
-    let shared = pairs(&[("env", "prod"), ("owner", "platform")]);
+    let shared = tag_pairs(&[("env", "prod"), ("owner", "platform")]);
     let first = tagged_resource(&router, "first-untag-terms", &shared).await;
     let second = tagged_resource(&router, "second-untag-terms", &shared).await;
 
@@ -267,12 +241,12 @@ async fn untag_resource_touches_only_the_resource_its_arn_names() {
     assert_eq!(status, 200, "UntagResource answered {status} {answered}");
 
     assert_eq!(
-        tags_of(&router, &first).await,
+        listed_tags(&router, "the named resource", &first).await,
         vec![json!({"Key": "owner", "Value": "platform"})],
         "the named resource loses the named key"
     );
     assert_eq!(
-        tags_of(&router, &second).await,
+        listed_tags(&router, "another resource holding the same keys", &second).await,
         vec![
             json!({"Key": "env", "Value": "prod"}),
             json!({"Key": "owner", "Value": "platform"}),
@@ -307,7 +281,7 @@ async fn untag_resource_refuses_an_arn_naming_no_resource() {
     let arn = tagged_resource(
         &router,
         "present-untag-terms",
-        &pairs(&[("env", "prod")]),
+        &tag_pairs(&[("env", "prod")]),
     )
     .await;
 
@@ -343,7 +317,7 @@ async fn untag_resource_refuses_an_arn_naming_no_resource() {
     }
 
     assert_eq!(
-        tags_of(&router, &arn).await,
+        listed_tags(&router, "the resource that is there", &arn).await,
         vec![json!({"Key": "env", "Value": "prod"})],
         "a refused removal leaves every stored resource's tags as they were"
     );

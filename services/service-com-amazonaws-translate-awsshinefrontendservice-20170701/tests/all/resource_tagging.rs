@@ -22,7 +22,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::terminology_lifecycle::{
-    call, error_code, expected_arn, import, message, router, string_at, EN_FR_CSV,
+    call, error_code, expected_arn, import, listed_tags, message, router, string_at, tag_list,
+    tag_pairs, EN_FR_CSV,
 };
 
 /// The documented tag limit for one resource: "There can be a maximum of 50
@@ -48,34 +49,11 @@ struct Row {
     expected: Vec<(String, String)>,
 }
 
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
-    entries
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-/// The `TagList` wire shape of a set of key-value pairs.
-fn tag_list(entries: &[(String, String)]) -> Value {
-    Value::Array(
-        entries
-            .iter()
-            .map(|(key, value)| json!({"Key": key, "Value": value}))
-            .collect(),
-    )
-}
-
 /// The tags the resource reports, keyed by tag key so a row states the SET one
 /// call leaves rather than an order the service does not document. A duplicate
 /// key would collapse here, so the reported count is asserted beside it.
 async fn held_tags(router: &MultiServiceRouter, arn: &str) -> (BTreeMap<String, String>, usize) {
-    let (status, body) = call(router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
-    assert_eq!(status, 200, "ListTagsForResource answered {status} {body}");
-    let reported = body
-        .pointer("/Tags")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let reported = listed_tags(router, "the tagged resource", arn).await;
     let set = reported
         .iter()
         .map(|tag| {
@@ -147,67 +125,67 @@ fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "a request carrying no tag at all",
-            held: pairs(&[("env", "prod")]),
+            held: tag_pairs(&[("env", "prod")]),
             requested: Vec::new(),
-            expected: pairs(&[("env", "prod")]),
+            expected: tag_pairs(&[("env", "prod")]),
         },
         Row {
             case: "one tag onto a resource holding none",
             held: Vec::new(),
-            requested: pairs(&[("env", "prod")]),
-            expected: pairs(&[("env", "prod")]),
+            requested: tag_pairs(&[("env", "prod")]),
+            expected: tag_pairs(&[("env", "prod")]),
         },
         Row {
             case: "several tags onto a resource holding none",
             held: Vec::new(),
-            requested: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
-            expected: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            requested: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
         },
         Row {
             case: "every requested key is one the resource does not hold",
-            held: pairs(&[("env", "prod")]),
-            requested: pairs(&[("owner", "platform"), ("cost", "42")]),
-            expected: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            held: tag_pairs(&[("env", "prod")]),
+            requested: tag_pairs(&[("owner", "platform"), ("cost", "42")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
         },
         Row {
             case: "a requested key the resource already holds takes the new value",
-            held: pairs(&[("env", "staging"), ("owner", "platform")]),
-            requested: pairs(&[("env", "prod")]),
-            expected: pairs(&[("env", "prod"), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "staging"), ("owner", "platform")]),
+            requested: tag_pairs(&[("env", "prod")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
         },
         Row {
             case: "a held key beside a new one",
-            held: pairs(&[("env", "staging"), ("owner", "platform")]),
-            requested: pairs(&[("env", "prod"), ("cost", "42")]),
-            expected: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            held: tag_pairs(&[("env", "staging"), ("owner", "platform")]),
+            requested: tag_pairs(&[("env", "prod"), ("cost", "42")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
         },
         Row {
             case: "every held key restated",
-            held: pairs(&[("env", "staging"), ("owner", "platform")]),
-            requested: pairs(&[("owner", "nlp"), ("env", "prod")]),
-            expected: pairs(&[("env", "prod"), ("owner", "nlp")]),
+            held: tag_pairs(&[("env", "staging"), ("owner", "platform")]),
+            requested: tag_pairs(&[("owner", "nlp"), ("env", "prod")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "nlp")]),
         },
         Row {
             case: "one key stated twice in the same call",
-            held: pairs(&[("owner", "platform")]),
-            requested: pairs(&[("env", "first"), ("env", "last")]),
-            expected: pairs(&[("owner", "platform"), ("env", "last")]),
+            held: tag_pairs(&[("owner", "platform")]),
+            requested: tag_pairs(&[("env", "first"), ("env", "last")]),
+            expected: tag_pairs(&[("owner", "platform"), ("env", "last")]),
         },
         Row {
             case: "a key differing from a held one only in case",
-            held: pairs(&[("Env", "prod")]),
-            requested: pairs(&[("env", "dev")]),
-            expected: pairs(&[("Env", "prod"), ("env", "dev")]),
+            held: tag_pairs(&[("Env", "prod")]),
+            requested: tag_pairs(&[("env", "dev")]),
+            expected: tag_pairs(&[("Env", "prod"), ("env", "dev")]),
         },
         Row {
             case: "a held value replaced by the empty string",
-            held: pairs(&[("env", "prod"), ("owner", "platform")]),
-            requested: pairs(&[("env", "")]),
-            expected: pairs(&[("env", ""), ("owner", "platform")]),
+            held: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
+            requested: tag_pairs(&[("env", "")]),
+            expected: tag_pairs(&[("env", ""), ("owner", "platform")]),
         },
         Row {
             case: "a value at the model's maximum length",
-            held: pairs(&[("env", "prod")]),
+            held: tag_pairs(&[("env", "prod")]),
             requested: vec![("long-value".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS))],
             expected: vec![
                 ("env".to_string(), "prod".to_string()),
@@ -216,7 +194,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a key at the model's maximum length",
-            held: pairs(&[("env", "prod")]),
+            held: tag_pairs(&[("env", "prod")]),
             requested: vec![("k".repeat(MAX_TAG_KEY_CHARS), "long".to_string())],
             expected: vec![
                 ("env".to_string(), "prod".to_string()),
@@ -316,7 +294,7 @@ async fn tag_resource_merges_the_requested_tags_by_key() {
 #[tokio::test]
 async fn tag_resource_touches_only_the_resource_its_arn_names() {
     let router = router();
-    let shared = pairs(&[("env", "staging")]);
+    let shared = tag_pairs(&[("env", "staging")]);
     let first = import_holding(&router, "first-tag-terms", &shared).await;
     let second = import_holding(&router, "second-tag-terms", &shared).await;
 
@@ -360,7 +338,7 @@ async fn tag_resource_touches_only_the_resource_its_arn_names() {
 #[tokio::test]
 async fn a_refused_merge_leaves_the_stored_tags_as_they_were() {
     let router = router();
-    let held = pairs(&[("env", "prod"), ("owner", "platform")]);
+    let held = tag_pairs(&[("env", "prod"), ("owner", "platform")]);
     let arn = import_holding(&router, "refused-tag-terms", &held).await;
     let expected: BTreeMap<String, String> = held.iter().cloned().collect();
 
@@ -427,10 +405,10 @@ async fn a_refused_merge_leaves_the_stored_tags_as_they_were() {
     let unknown = expected_arn("no-such-terms", b"no-such-file");
     let cases: [(&str, Vec<(String, String)>); 3] = [
         ("no tag", Vec::new()),
-        ("one tag", pairs(&[("env", "prod")])),
+        ("one tag", tag_pairs(&[("env", "prod")])),
         (
             "several tags",
-            pairs(&[("env", "prod"), ("owner", "platform")]),
+            tag_pairs(&[("env", "prod"), ("owner", "platform")]),
         ),
     ];
     for (case, requested) in cases {

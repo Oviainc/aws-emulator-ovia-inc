@@ -26,10 +26,10 @@
 //! report of one stored tag set cannot drift from the other.
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 use crate::terminology_lifecycle::{
-    call, error_code, expected_arn, import, message, router, EN_FR_CSV,
+    call, error_code, expected_arn, import, listed_tags, message, router, tag_list, tag_pairs,
+    EN_FR_CSV,
 };
 
 /// `Tag$Key` is `length 1..128` and `Tag$Value` is `length 0..256`
@@ -55,39 +55,6 @@ struct Row {
     expected: Vec<(String, String)>,
 }
 
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
-    entries
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-/// The `TagList` wire shape of a set of key-value pairs.
-fn tag_list(entries: &[(String, String)]) -> Value {
-    Value::Array(
-        entries
-            .iter()
-            .map(|(key, value)| json!({"Key": key, "Value": value}))
-            .collect(),
-    )
-}
-
-/// The tags one `ListTagsForResource` call reports, asserted to be a 200 that
-/// carries the `Tags` member.
-async fn listed_tags(router: &MultiServiceRouter, case: &str, arn: &str) -> Vec<Value> {
-    let (status, body) = call(router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected 200 from ListTagsForResource, got {status} {body}"
-    );
-    let tags = body.pointer("/Tags");
-    assert!(
-        tags.and_then(Value::as_array).is_some(),
-        "case {case:?}: expected a Tags list, got {body}"
-    );
-    tags.and_then(Value::as_array).cloned().unwrap_or_default()
-}
-
 fn rows() -> Vec<Row> {
     let long_key = "k".repeat(MAX_TAG_KEY_CHARS);
     let long_value = "v".repeat(MAX_TAG_VALUE_CHARS);
@@ -110,42 +77,42 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "one tag",
-            tag_calls: vec![pairs(&[("env", "prod")])],
+            tag_calls: vec![tag_pairs(&[("env", "prod")])],
             remove: Vec::new(),
-            expected: pairs(&[("env", "prod")]),
+            expected: tag_pairs(&[("env", "prod")]),
         },
         Row {
             case: "several tags in one call",
-            tag_calls: vec![pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")])],
+            tag_calls: vec![tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")])],
             remove: Vec::new(),
-            expected: pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")]),
         },
         Row {
             case: "two calls adding disjoint keys",
-            tag_calls: vec![pairs(&[("env", "prod")]), pairs(&[("owner", "platform")])],
+            tag_calls: vec![tag_pairs(&[("env", "prod")]), tag_pairs(&[("owner", "platform")])],
             remove: Vec::new(),
-            expected: pairs(&[("env", "prod"), ("owner", "platform")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
         },
         Row {
             case: "a key a later call restates",
             tag_calls: vec![
-                pairs(&[("env", "staging"), ("owner", "platform")]),
-                pairs(&[("env", "prod")]),
+                tag_pairs(&[("env", "staging"), ("owner", "platform")]),
+                tag_pairs(&[("env", "prod")]),
             ],
             remove: Vec::new(),
-            expected: pairs(&[("env", "prod"), ("owner", "platform")]),
+            expected: tag_pairs(&[("env", "prod"), ("owner", "platform")]),
         },
         Row {
             case: "keys differing only in case are distinct tags",
-            tag_calls: vec![pairs(&[("Env", "prod"), ("env", "staging")])],
+            tag_calls: vec![tag_pairs(&[("Env", "prod"), ("env", "staging")])],
             remove: Vec::new(),
-            expected: pairs(&[("Env", "prod"), ("env", "staging")]),
+            expected: tag_pairs(&[("Env", "prod"), ("env", "staging")]),
         },
         Row {
             case: "a tag whose value is empty",
-            tag_calls: vec![pairs(&[("env", ""), ("owner", "platform")])],
+            tag_calls: vec![tag_pairs(&[("env", ""), ("owner", "platform")])],
             remove: Vec::new(),
-            expected: pairs(&[("env", ""), ("owner", "platform")]),
+            expected: tag_pairs(&[("env", ""), ("owner", "platform")]),
         },
         Row {
             case: "a key and a value at their published length bounds",
@@ -155,21 +122,21 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a non-ASCII key and value",
-            tag_calls: vec![pairs(&[("équipe", "traduction"), ("チーム", "翻訳")])],
+            tag_calls: vec![tag_pairs(&[("équipe", "traduction"), ("チーム", "翻訳")])],
             remove: Vec::new(),
-            expected: pairs(&[("équipe", "traduction"), ("チーム", "翻訳")]),
+            expected: tag_pairs(&[("équipe", "traduction"), ("チーム", "翻訳")]),
         },
         Row {
             case: "every tag removed again",
-            tag_calls: vec![pairs(&[("env", "prod"), ("owner", "platform")])],
+            tag_calls: vec![tag_pairs(&[("env", "prod"), ("owner", "platform")])],
             remove: vec!["env".to_string(), "owner".to_string()],
             expected: Vec::new(),
         },
         Row {
             case: "some tags removed again",
-            tag_calls: vec![pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")])],
+            tag_calls: vec![tag_pairs(&[("env", "prod"), ("owner", "platform"), ("cost", "42")])],
             remove: vec!["owner".to_string()],
-            expected: pairs(&[("env", "prod"), ("cost", "42")]),
+            expected: tag_pairs(&[("env", "prod"), ("cost", "42")]),
         },
         Row {
             case: "as many tags as one resource may hold",
@@ -257,10 +224,10 @@ async fn list_tags_for_resource_reports_only_the_resource_its_arn_names() {
 
     let mut arns = Vec::new();
     for (name, tags) in [
-        ("first-listed-terms", pairs(&[("env", "prod")])),
+        ("first-listed-terms", tag_pairs(&[("env", "prod")])),
         (
             "second-listed-terms",
-            pairs(&[("env", "dev"), ("owner", "platform")]),
+            tag_pairs(&[("env", "dev"), ("owner", "platform")]),
         ),
         ("third-listed-terms", Vec::new()),
     ] {
@@ -320,7 +287,7 @@ async fn list_tags_for_resource_never_reports_a_tag_the_shape_refused() {
     assert_eq!(status, 200, "ImportTerminology answered {imported}");
     let arn = expected_arn(name, EN_FR_CSV);
 
-    let held = pairs(&[("env", "prod")]);
+    let held = tag_pairs(&[("env", "prod")]);
     let (status, answered) = call(
         &router,
         "TagResource",

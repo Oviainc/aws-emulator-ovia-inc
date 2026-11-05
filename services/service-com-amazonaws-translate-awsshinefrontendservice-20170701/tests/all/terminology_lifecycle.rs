@@ -158,6 +158,52 @@ pub(crate) async fn import(
 /// codes and one term per later row.
 pub(crate) const EN_FR_CSV: &[u8] = b"en,fr\nhello,bonjour\ngoodbye,au revoir\n";
 
+/// The key-value pairs one tag table row states, as owned strings.
+///
+/// The tag surface is reached by three suites (`resource_tagging`,
+/// `resource_tag_removal`, `resource_tag_listing`), so the two renderings of a
+/// tag set and the one read of it live here beside the harness those suites
+/// already share: the wire shape of a `TagList` is then written once and cannot
+/// drift between them.
+pub(crate) fn tag_pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// The `TagList` wire shape of a set of key-value pairs.
+pub(crate) fn tag_list(entries: &[(String, String)]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect(),
+    )
+}
+
+/// The tags one `ListTagsForResource` call reports for `arn`, in the order the
+/// resource holds them, asserted to be a 200 that carries the `Tags` member —
+/// so a resource holding none is read as an empty list rather than as a missing
+/// member.
+pub(crate) async fn listed_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Vec<Value> {
+    let (status, body) = call(router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from ListTagsForResource, got {status} {body}"
+    );
+    let tags = body.pointer("/Tags");
+    assert!(
+        tags.and_then(Value::as_array).is_some(),
+        "case {case:?}: expected a Tags list, got {body}"
+    );
+    tags.and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
 /// The same shape tab-separated.
 const EN_ES_TSV: &[u8] = b"en\tes\nhello\thola\n";
 
