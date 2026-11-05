@@ -126,7 +126,10 @@
 //!   range to;
 //! * a precondition that did not hold — the `<Condition>` naming the conditional HEADER
 //!   that failed, which is the only thing that tells a conditional-retry loop which of
-//!   several headers it carried to change.
+//!   several headers it carried to change;
+//! * a request asking for functionality the service does not implement for the resource it
+//!   addressed — the `<Header>` or the `<QueryParameter>` that asked for it, which is what a
+//!   client feature-detecting by that refusal drops before it retries.
 
 use std::sync::LazyLock;
 
@@ -406,7 +409,10 @@ pub const DOCUMENTED_ERROR_MESSAGES: &[(&str, &str)] = &[
         "InvalidObjectState",
         "Object is archived and inaccessible until restored.",
     ),
-    ("InvalidPrefix", "The annotation prefix you provided is invalid."),
+    // The sentence S3 sends on the wire for this code reads "you have provided", where the
+    // model's prose for the same shape reads "you provided"; what a client sees is the
+    // former, so that is the text this catalog carries.
+    ("InvalidPrefix", "The annotation prefix you have provided is invalid."),
     (
         "InvalidRequest",
         "A parameter or header in your request isn't valid. For details, see the description \
@@ -858,6 +864,48 @@ static TAG_VALUE: Schema = Schema::new_member(
 )
 .with_xml_name("TagValue");
 
+/// The `<Header>` of an S3 error document: the request HEADER whose functionality the
+/// service does not implement for the resource the request addressed.
+static UNIMPLEMENTED_HEADER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#Unimplemented$header",
+        "smithy.framework",
+        "header",
+    ),
+    ShapeType::String,
+    "header",
+    19,
+)
+.with_xml_name("Header");
+
+/// The `<QueryParameter>` of an S3 error document: the request QUERY PARAMETER whose
+/// functionality the service does not implement for the resource the request addressed.
+static UNIMPLEMENTED_QUERY_PARAMETER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#Unimplemented$queryParameter",
+        "smithy.framework",
+        "queryParameter",
+    ),
+    ShapeType::String,
+    "queryParameter",
+    20,
+)
+.with_xml_name("QueryParameter");
+
+/// The `<Message>` S3 sends with [`crate::state::NOT_IMPLEMENTED_CODE`] when it is a QUERY
+/// PARAMETER that asked for functionality the service does not implement for the resource
+/// addressed: "NotImplemented — A query parameter you provided implies functionality that is
+/// not implemented" (Amazon S3 "Error responses", list of error codes), the sibling of
+/// [`crate::state::NOT_IMPLEMENTED_HEADER_MESSAGE`].
+///
+/// Fixed text that names the parameter CLASS rather than the parameter, so nothing of the
+/// request is interpolated into it; the parameter itself is the `<QueryParameter>` member of
+/// the same document. It lives beside the constructor that attaches that member
+/// ([`Scaffolded::not_implemented_query_parameter`]), so the sentence and the member a
+/// refusal of this class carries are read from one place.
+pub const NOT_IMPLEMENTED_QUERY_PARAMETER_MESSAGE: &str =
+    "A query parameter you provided implies functionality that is not implemented";
+
 /// The wire error codes whose document is about one multipart UPLOAD, and so names the
 /// `uploadId` the request addressed.
 ///
@@ -1013,6 +1061,31 @@ pub enum ErrorDetail {
     /// A precondition that did not hold, named by `<Condition>`: the conditional HEADER of
     /// the request that failed.
     Condition(String),
+    /// A request asking for functionality the service does not implement for the resource it
+    /// addressed, named by the `<Header>` or the `<QueryParameter>` that asked for it: the
+    /// sentence of that class names only the KIND of thing that implied it, so the member is
+    /// the only place the refusal says which one the caller must drop.
+    Unimplemented(UnimplementedBy),
+}
+
+/// What asked for functionality the service does not implement — see
+/// [`ErrorDetail::Unimplemented`]. S3 publishes one sentence per kind, and the document
+/// carries the matching member, so the two travel together.
+#[derive(Debug, Clone)]
+pub enum UnimplementedBy {
+    /// A request HEADER, as the model binds it (`crate::state`'s `*_CONDITION` constants).
+    Header(String),
+    /// A request QUERY PARAMETER, as the model's `@http` uri pins it.
+    QueryParameter(String),
+}
+
+impl UnimplementedBy {
+    /// The name that asked for it, whichever kind it is.
+    fn name(&self) -> &str {
+        match self {
+            Self::Header(name) | Self::QueryParameter(name) => name,
+        }
+    }
 }
 
 impl ErrorDetail {
@@ -1094,6 +1167,12 @@ impl ErrorDetail {
                 s.write_long(&ACTUAL_OBJECT_SIZE, *actual_object_size)
             }
             Self::Condition(condition) => s.write_string(&UNMET_CONDITION, condition),
+            Self::Unimplemented(UnimplementedBy::Header(header)) => {
+                s.write_string(&UNIMPLEMENTED_HEADER, header)
+            }
+            Self::Unimplemented(UnimplementedBy::QueryParameter(parameter)) => {
+                s.write_string(&UNIMPLEMENTED_QUERY_PARAMETER, parameter)
+            }
         }
     }
 
@@ -1110,6 +1189,7 @@ impl ErrorDetail {
             | Self::Argument { name, .. }
             | Self::Upload(name)
             | Self::Condition(name) => name.clone(),
+            Self::Unimplemented(by) => by.name().to_string(),
             // The first of the series, which is the one such a refusal is reported by.
             Self::Arguments(arguments) => arguments
                 .first()
@@ -1274,6 +1354,46 @@ impl<E> Scaffolded<E> {
             proposed_size,
             min_size_allowed,
         })
+    }
+
+    /// The refusal S3 answers a request that asks, through a HEADER, for functionality it
+    /// does not implement for the resource the request addressed:
+    /// [`crate::state::NOT_IMPLEMENTED_CODE`] at
+    /// [`crate::state::NOT_IMPLEMENTED_STATUS`], the fixed sentence that code publishes for
+    /// a header ([`crate::state::NOT_IMPLEMENTED_HEADER_MESSAGE`]) and the `<Header>`
+    /// naming the one that asked for it.
+    ///
+    /// The sentence names the header CLASS and not the member, so the element is the only
+    /// part of the refusal that says which header the caller must drop — exactly what
+    /// `<Condition>` is for a precondition that failed. `header` is the name the model binds
+    /// the member from, so nothing is invented here.
+    ///
+    /// The ONE place that refusal is built, so every operation that serves one kind of
+    /// bucket a member the other kind's alone refuses it identically.
+    pub fn not_implemented_header(header: &str) -> Self {
+        Self::unmodeled(
+            crate::state::NOT_IMPLEMENTED_CODE,
+            crate::state::NOT_IMPLEMENTED_STATUS,
+            crate::state::NOT_IMPLEMENTED_HEADER_MESSAGE,
+        )
+        .naming(ErrorDetail::Unimplemented(UnimplementedBy::Header(
+            header.to_string(),
+        )))
+    }
+
+    /// The same refusal for a request that asks for it through a QUERY PARAMETER: the same
+    /// code and status, the sentence that code publishes for a query parameter
+    /// ([`NOT_IMPLEMENTED_QUERY_PARAMETER_MESSAGE`]) and the `<QueryParameter>` naming the
+    /// one that asked for it.
+    pub fn not_implemented_query_parameter(parameter: &str) -> Self {
+        Self::unmodeled(
+            crate::state::NOT_IMPLEMENTED_CODE,
+            crate::state::NOT_IMPLEMENTED_STATUS,
+            NOT_IMPLEMENTED_QUERY_PARAMETER_MESSAGE,
+        )
+        .naming(ErrorDetail::Unimplemented(UnimplementedBy::QueryParameter(
+            parameter.to_string(),
+        )))
     }
 
     /// The refusal S3 answers a request whose conditional header did not hold with:

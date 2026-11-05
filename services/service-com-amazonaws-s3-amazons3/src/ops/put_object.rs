@@ -584,6 +584,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket_record) = store.bucket(&input.bucket) else {
             return Err(PutObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+
+        // A write addressed to a GENERAL PURPOSE bucket under a query parameter S3 serves
+        // only for directory buckets asks for functionality that bucket's endpoint does not
+        // implement, whatever the rest of the request carries: the refusal is the 501
+        // `NotImplemented` naming that parameter
+        // ([`crate::service::object_write::directory_bucket_only_query_parameter`] holds the
+        // catalog), answered before anything is stored so a rename a general purpose bucket
+        // cannot serve never lands as an ordinary write of the bytes it carried. The
+        // parameter is read off the request's own query string, because it is a
+        // discriminator this operation's members do not carry.
+        if !bucket_record.is_directory() {
+            if let Some(parameter) =
+                crate::service::object_write::directory_bucket_only_query_parameter(
+                    ctx.parts().uri.query().unwrap_or_default(),
+                )
+            {
+                return Err(
+                    crate::scaffolded::Scaffolded::not_implemented_query_parameter(parameter),
+                );
+            }
+        }
         let encryption = if requested.names_no_member() {
             bucket_record.default_object_encryption()
         } else {

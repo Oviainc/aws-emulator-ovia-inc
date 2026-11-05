@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RenameObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RenameObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: a rename IN a directory bucket answers HTTP 501
+//! `NotImplemented` and asserts NOTHING about `RenameObject`'s real behaviour. Implement it
+//! here — this is the ONLY file to touch for this operation.
+//!
+//! What IS implemented is the answer a rename addressed to a GENERAL PURPOSE bucket earns,
+//! because that is not this operation's behaviour but a refusal of the `?renameObject`
+//! parameter itself: S3 serves a rename for directory buckets alone, so the parameter implies
+//! functionality a general purpose bucket's endpoint does not implement and the request is
+//! refused with HTTP 501 `NotImplemented` naming it
+//! ([`crate::service::object_write::DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS`], the catalog the
+//! object-write path is judged by too, since a request carrying the parameter without this
+//! operation's required members is shaped like an ordinary write). A bucket this emulator
+//! does not hold answers `NoSuchBucket` (HTTP 404), as the write path answers the same
+//! address.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`RenameObject::handle`] with real behaviour and
@@ -207,7 +218,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = ctx;
+
+        // A rename addressed to a GENERAL PURPOSE bucket asks for functionality that
+        // bucket's endpoint does not implement: this operation "renames an existing object in
+        // a directory bucket that uses the S3 Express One Zone storage class" (its own
+        // documentation), and the `?renameObject` parameter that addresses it is therefore
+        // one a general purpose bucket serves nothing for — the 501 `NotImplemented` naming
+        // that parameter, which is the same answer the write the request would otherwise be
+        // read as gives it ([`crate::service::object_write`] holds the catalog both read).
+        // Judged on the bucket the store holds, so the two kinds of bucket are told apart by
+        // what this emulator recorded rather than by the shape of the name — and a bucket
+        // this emulator does not hold answers that instead, the way the write path answers it
+        // for the same address, since the kind of a bucket that is not there says nothing.
+        let held = crate::state::service_state(&*self.engine)
+            .map(|state| state.lock().bucket(&input.bucket).map(|bucket| bucket.is_directory()));
+        match held {
+            Some(None) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_BUCKET_CODE,
+                    NO_SUCH_BUCKET_STATUS,
+                    crate::state::NO_SUCH_BUCKET_MESSAGE,
+                ))
+            }
+            Some(Some(true)) => {}
+            _ => {
+                return Err(
+                    crate::scaffolded::Scaffolded::not_implemented_query_parameter(
+                        crate::service::object_write::RENAME_OBJECT_PARAMETER,
+                    ),
+                )
+            }
+        }
+
         // Implement `RenameObject` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(RenameObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
@@ -220,3 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Err(crate::scaffolded::Scaffolded::not_implemented("RenameObject"))
     }
 }
+
+/// The status S3 answers [`crate::state::NO_SUCH_BUCKET_CODE`] with: 404, the one every
+/// bucket-scoped operation of this crate answers a bucket this emulator does not hold with.
+const NO_SUCH_BUCKET_STATUS: u16 = 404;

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What an object WRITE must satisfy about the name and the class it names, before anything
-//! is stored: the bytes an object key may carry, and the storage classes the bucket it is
-//! written into can host.
+//! is stored: the bytes an object key may carry, the storage classes the bucket it is
+//! written into can host, and the query parameters that bucket's endpoint serves at all.
 //!
-//! Both rules are the bucket's and the key's rather than one operation's, so every write that
-//! names a key or a class — `PutObject`, `CopyObject`, `CreateMultipartUpload` — is judged by
-//! the same two functions here and answers the same code for the same value.
+//! Every rule here is the bucket's and the key's rather than one operation's, so every write
+//! that names a key or a class — `PutObject`, `CopyObject`, `CreateMultipartUpload` — is
+//! judged by the same functions here and answers the same code for the same value.
 
 use crate::state::{self, Bucket};
 
@@ -115,6 +115,38 @@ pub fn key_refusal(key: &str) -> Option<(&'static str, String)> {
 /// the key nor the ceiling (Amazon S3 "Error responses": "KeyTooLongError — Your key is too
 /// long").
 pub const KEY_TOO_LONG_MESSAGE: &str = "Your key is too long";
+
+/// The query parameter that addresses the RENAME of an object: `?renameObject`, as the model
+/// pins it on the operation's URI (`smithy_query(query="operation",operation="RenameObject")`
+/// reports `http {method: "PUT", uri: "/{Bucket}/{Key+}?renameObject"}`).
+pub const RENAME_OBJECT_PARAMETER: &str = "renameObject";
+
+/// The query parameters of an object WRITE that S3 serves for DIRECTORY buckets alone.
+///
+/// `RenameObject` "renames an existing object in a directory bucket that uses the S3 Express
+/// One Zone storage class" (its own documentation) and is addressed by the one parameter
+/// above, so a general purpose bucket's endpoint implements no functionality for it: the
+/// PARAMETER, not the value in it, is what cannot be served there — which is the 501
+/// `NotImplemented` S3 answers a query parameter it cannot honour with
+/// ([`crate::scaffolded::Scaffolded::not_implemented_query_parameter`]), the query-parameter
+/// sibling of the refusal a directory-bucket-only conditional HEADER earns.
+pub const DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS: [&str; 1] = [RENAME_OBJECT_PARAMETER];
+
+/// The directory-bucket-only query parameter `query` carries, or `None` when it carries none
+/// — the one rule every object write addressed to a general purpose bucket is judged by,
+/// whichever operation the request's shape routes it to.
+///
+/// `query` is the raw query string of the request (`ctx.parts().uri.query()`), because the
+/// parameter is a discriminator the matched operation's own members do not carry: a write
+/// that names it reaches `PutObject` when it is shaped like one, and `RenameObject` when it
+/// carries that operation's required members. Each name is looked for through the one reader
+/// this crate asks a query string for a parameter with ([`crate::service::query_carries`]),
+/// so a parameter arriving as a bare flag is found here exactly as it is everywhere else.
+pub fn directory_bucket_only_query_parameter(query: &str) -> Option<&'static str> {
+    DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS
+        .into_iter()
+        .find(|parameter| crate::service::query_carries(query, parameter))
+}
 
 #[cfg(test)]
 mod tests {

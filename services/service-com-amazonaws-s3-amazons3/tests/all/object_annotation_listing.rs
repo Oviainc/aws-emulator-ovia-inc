@@ -24,7 +24,8 @@
 //!   with — past the 512-byte name maximum
 //!   (`PutObjectAnnotationRequest$AnnotationName`), or under a prefix S3 reserves
 //!   (`DeleteObjectAnnotationRequest$AnnotationName`: names "cannot start with `aws` or `s3`
-//!   (case-insensitive)") — is the modelled `InvalidPrefix` (HTTP 400).
+//!   (case-insensitive)") — is the modelled `InvalidPrefix` (HTTP 400), whose `<Message>` is
+//!   the sentence S3 sends on the wire for that code.
 //! * "Results are paginated, with a maximum of 1,000 annotations per object" (same
 //!   documentation): `MaxAnnotationResults` caps a page, the pages partition the selected
 //!   annotations in name order, each page echoes "the continuation token used in this
@@ -56,9 +57,9 @@ use super::object_versioning::set_versioning;
 /// `x-amz-expected-bucket-owner` carrying it names an owner no bucket here has.
 const NOT_THE_OWNER: &str = "123456789012";
 
-/// The `<Message>` the model's own error shape publishes for a prefix this namespace has no
-/// names under: "The annotation prefix you provided is invalid."
-const INVALID_PREFIX_MESSAGE: &str = "The annotation prefix you provided is invalid.";
+/// The `<Message>` S3 sends for a prefix this namespace has no names under, as it reads on
+/// the wire: "The annotation prefix you have provided is invalid."
+const INVALID_PREFIX_MESSAGE: &str = "The annotation prefix you have provided is invalid.";
 
 /// The page size a listing applies when the request names none: "Results are paginated, with
 /// a maximum of 1,000 annotations per object" (`ListObjectAnnotations`'s own documentation).
@@ -865,7 +866,7 @@ async fn a_listing_outside_its_published_rules_is_refused() {
         "the test's own multi-byte prefix must be past the bound in BYTES, got {} bytes",
         past_the_bound_in_bytes.len()
     );
-    let rows: [RefusalRow<'_>; 10] = [
+    let rows: [RefusalRow<'_>; 11] = [
         (
             "a bucket this emulator does not hold",
             "annotation-refusal-absent",
@@ -937,6 +938,15 @@ async fn a_listing_outside_its_published_rules_is_refused() {
             "annotation-refusal-bucket",
             "present.txt",
             "&annotation-prefix=aws-owned".to_string(),
+            Vec::new(),
+            400,
+            "InvalidPrefix",
+        ),
+        (
+            "a prefix that is exactly a reserved namespace",
+            "annotation-refusal-bucket",
+            "present.txt",
+            "&annotation-prefix=s3".to_string(),
             Vec::new(),
             400,
             "InvalidPrefix",

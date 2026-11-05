@@ -16,7 +16,8 @@
 //! metadata configuration [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP
 //! 404), an `x-amz-expected-bucket-owner` that is not this account's HTTP 403
 //! `AccessDenied`, an encryption configuration naming SSE-KMS with no KMS key ARN beside it
-//! `InvalidArgument` (HTTP 400), and an enable that would leave the annotation table with
+//! `InvalidArgument` (HTTP 400), a configuration whose journal table is not yet in service
+//! and an enable that would leave the annotation table with
 //! no managing IAM role at all [`crate::state::INVALID_REQUEST_CODE`] (HTTP 400) — each
 //! with nothing written.
 //!
@@ -303,6 +304,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // configuration is not there is the variable part of the envelope.
             .naming_bucket(&input.bucket));
         };
+
+        // The configuration's journal table has to be in service before a table of that
+        // configuration can be reconfigured, which is the one rule every update of one of
+        // them is judged by ([`crate::service::metadata_tables::journal_table_refusal`]).
+        // Judged at the instant of this call and before anything is written, so a refused
+        // update leaves the bucket carrying exactly the configuration it carried.
+        if let Some(message) = bucket.metadata_configuration().and_then(|configuration| {
+            crate::service::metadata_tables::journal_table_refusal(
+                configuration,
+                crate::service::metadata_tables::UpdatedTable::DependingOnTheJournal,
+                now,
+            )
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                message,
+            ));
+        }
 
         // "The IAM role must have a trust policy that allows the Amazon S3 metadata service
         // to assume it, and a permissions policy that grants the actions needed to read

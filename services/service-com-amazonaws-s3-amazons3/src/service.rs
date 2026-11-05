@@ -64,6 +64,9 @@
 // the request carries, and the account the request says owns the bucket — see
 // `service/authorization.rs`.
 pub mod authorization;
+// What an update of one of an S3 Metadata configuration's tables must satisfy about the
+// configuration's journal table — see `service/metadata_tables.rs`.
+pub mod metadata_tables;
 // What an object WRITE must satisfy about the key it names and the class it asks for, before
 // anything is stored — see `service/object_write.rs`.
 pub mod object_write;

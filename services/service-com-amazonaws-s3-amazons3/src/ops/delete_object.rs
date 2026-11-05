@@ -14,7 +14,10 @@
 //! `x-amz-if-match-size` is CONDITIONAL on the version it addresses still being the one
 //! those members describe: it is carried out when every condition holds and refused with
 //! HTTP 412 `PreconditionFailed` when one does not
-//! ([`crate::state::unmet_delete_precondition`] carries the rule), taking nothing away.
+//! ([`crate::state::unmet_delete_precondition`] carries the rule), taking nothing away. The
+//! last two are a DIRECTORY bucket's conditions, so a delete carrying either against a
+//! general purpose bucket is refused with HTTP 501 `NotImplemented` naming that header,
+//! whatever its value says.
 //!
 //! A delete that really would remove a stored version is subject to S3 OBJECT LOCK: while a
 //! legal hold is on that version, or its retention period is still running, the delete is
@@ -399,16 +402,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             // directory buckets" (`DeleteObject`'s own documentation, and the same note on
             // `DeleteObjectRequest$IfMatchSize`) — so those two members on a general purpose
             // bucket ask for functionality the service does not implement there, which is
-            // the 501 S3 answers a header it cannot honour with. The delete is refused
-            // whole: an unserved condition must not be dropped and the object deleted anyway.
-            if !bucket_record.is_directory()
-                && names_directory_bucket_only_condition(&input)
-            {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::NOT_IMPLEMENTED_CODE,
-                    crate::state::NOT_IMPLEMENTED_STATUS,
-                    crate::state::NOT_IMPLEMENTED_HEADER_MESSAGE,
-                ));
+            // the 501 S3 answers a header it cannot honour with, naming that header in the
+            // `<Header>` member its document carries. The delete is refused whole, whatever
+            // the value says: an unserved condition must not be dropped and the object
+            // deleted anyway, and a value that happens to match is no more served than one
+            // that does not.
+            if !bucket_record.is_directory() {
+                if let Some(header) = directory_bucket_only_condition(&input) {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented_header(
+                        header,
+                    ));
+                }
             }
             // A delete that names a `versionId` addresses that stored version; one that
             // names none addresses the key's CURRENT object, which is nothing at all where
@@ -644,14 +648,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
     }
 }
 
-/// Whether `input` makes its delete conditional on a member S3 supports only for DIRECTORY
-/// buckets.
+/// The HEADER of `input` that makes its delete conditional on a member S3 supports only for
+/// DIRECTORY buckets, or `None` when it carries none.
 ///
 /// "The `If-Match` header is supported for both general purpose and directory buckets.
 /// `IfMatchLastModifiedTime` and `IfMatchSize` is only supported for directory buckets"
 /// (`DeleteObject`'s own documentation), so those two are the members a delete addressed to a
 /// general purpose bucket cannot be judged by — and `If-Match`, which both kinds support, is
-/// not among them.
-fn names_directory_bucket_only_condition(input: &DeleteObjectInput) -> bool {
-    input.if_match_last_modified_time.is_some() || input.if_match_size.is_some()
+/// not among them. Each is named as the model binds it (`crate::state`'s `*_CONDITION`
+/// constants), in the model's own member order, which is the order a request carrying both is
+/// reported by.
+fn directory_bucket_only_condition(input: &DeleteObjectInput) -> Option<&'static str> {
+    [
+        (
+            crate::state::IF_MATCH_LAST_MODIFIED_TIME_CONDITION,
+            input.if_match_last_modified_time.is_some(),
+        ),
+        (
+            crate::state::IF_MATCH_SIZE_CONDITION,
+            input.if_match_size.is_some(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(header, carried)| carried.then_some(header))
 }

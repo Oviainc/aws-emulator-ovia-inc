@@ -13,7 +13,9 @@
 //! A bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404), one carrying no
 //! metadata configuration [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP
 //! 404), an
-//! `x-amz-expected-bucket-owner` that is not this account's HTTP 403 `AccessDenied`, and an
+//! `x-amz-expected-bucket-owner` that is not this account's HTTP 403 `AccessDenied`, a
+//! configuration whose journal table is not yet in service `InvalidRequest` (HTTP 400), and
+//! an
 //! encryption configuration naming SSE-KMS with no KMS key ARN beside it `InvalidArgument`
 //! (HTTP 400) with nothing written.
 //!
@@ -263,6 +265,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a bucket that does not exist (the order every other bucket-subresource write in this
         // crate keeps).
         let mut store = state.lock();
+        // The configuration's journal table has to be in service before a table of that
+        // configuration can be reconfigured, which is the one rule every update of one of
+        // them is judged by ([`crate::service::metadata_tables::journal_table_refusal`]).
+        // Judged at the instant of this call and BEFORE anything is written, so a refused
+        // update leaves the bucket carrying exactly the configuration it carried; a bucket
+        // this emulator does not hold, or one carrying no configuration at all, is left to
+        // the state seam below, which answers what is not there rather than reporting the
+        // state of a journal table that does not exist.
+        if let Some(message) = store
+            .bucket(&input.bucket)
+            .and_then(crate::state::Bucket::metadata_configuration)
+            .and_then(|configuration| {
+                crate::service::metadata_tables::journal_table_refusal(
+                    configuration,
+                    crate::service::metadata_tables::UpdatedTable::DependingOnTheJournal,
+                    now,
+                )
+            })
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                message,
+            ));
+        }
         match store.update_metadata_inventory_table(
             &input.bucket,
             input

@@ -7,7 +7,9 @@
 //! reports it back. Refused before anything is written when the configuration is not one
 //! S3 can apply: a bucket whose versioning is not `Enabled` (`InvalidRequest`), a
 //! configuration naming no rule or more than [`crate::state::MAX_REPLICATION_RULES`]
-//! (`MalformedXML` / `InvalidRequest`), a `Role` that is not an IAM role ARN or a rule
+//! (`MalformedXML` / `InvalidRequest`), a rule written in the V2 schema (one carrying a
+//! `Filter`) that leaves out an element that schema requires (`InvalidRequest`), a `Role`
+//! that is not an IAM role ARN or a rule
 //! `Destination.Bucket` that is not an S3 bucket ARN (`InvalidArgument`).
 //!
 //! The read side is `GetBucketReplication`, implemented in the same change so a put can be
@@ -329,6 +331,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for rule in &configuration.rules {
+            // "When you add the Filter element in the configuration, you must also add the
+            // following elements: DeleteMarkerReplication, Status, and Priority" (this
+            // operation's own documentation): a rule carrying a `Filter` is written in the
+            // V2 schema of the configuration, and that schema requires those three elements
+            // of every rule. `Status` is already `@required` on `ReplicationRule`, so the
+            // boundary refuses a rule without it; the other two are optional members of the
+            // shape and so are required HERE, for a V2 rule alone — a rule written in the
+            // earlier schema (one carrying `Prefix` rather than `Filter`) names neither, and
+            // is accepted exactly as before. A configuration the schema does not admit is a
+            // request S3 cannot carry out rather than a payload it cannot parse, which is
+            // what `InvalidRequest` reports, and it is refused before anything is written.
+            if rule.filter.is_some() {
+                if let Some(element) = v2_element_missing(rule) {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        missing_v2_element_message(element),
+                    ));
+                }
+            }
+
             // "The Amazon Resource Name (ARN) of the bucket where you want Amazon S3 to
             // store the results" (`Destination$Bucket`): the destination travels as a
             // bucket ARN, so a value that is not one — a bare bucket name, say — is
@@ -364,6 +387,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(PutBucketReplicationOutput)
     }
 }
+
+/// The element a V2 `ReplicationRule` leaves out, or `None` when it names the one the schema
+/// requires of it beside the `@required` `Status`.
+///
+/// "When you add the Filter element in the configuration, you must also add the following
+/// elements: DeleteMarkerReplication, Status, and Priority" (this operation's own
+/// documentation). `Status` is already `@required` on the shape
+/// (`smithy_query(query="shape",shape="ReplicationRule")`), so the request boundary refuses a
+/// rule without it before this handler runs. `DeleteMarkerReplication` is NOT required here:
+/// the same documentation's backward-compatibility note — "if you are using an earlier
+/// version of the replication configuration, Amazon S3 handles replication of delete markers
+/// differently" — is about how a rule naming none is READ, so a rule that leaves it out
+/// replicates no delete marker rather than being refused, which is how
+/// [`crate::state::ComAmazonawsS3Amazons3State::replicate_delete_marker`] reads it.
+/// `Priority` has no such
+/// reading: it "indicates which rule has precedence whenever two or more replication rules
+/// conflict" (`ReplicationRule$Priority`), a question a rule that names none leaves
+/// unanswerable, which is why the schema requires it.
+fn v2_element_missing(rule: &ReplicationRule) -> Option<&'static str> {
+    rule.priority.is_none().then_some(PRIORITY_ELEMENT)
+}
+
+/// The `<Message>` S3 sends with [`crate::state::INVALID_REQUEST_CODE`] for a V2 replication
+/// rule that leaves `element` out.
+///
+/// Fixed text but for the element it names: the sentence states which element the schema
+/// requires and says nothing else about the configuration, so the only variable part is the
+/// member name — taken from the rule the request carried.
+fn missing_v2_element_message(element: &str) -> String {
+    format!(
+        "{element} must be specified for this version of Cross Region Replication \
+         configuration schema. Please refer to S3 Developer Guide for more information."
+    )
+}
+
+/// The `ReplicationRule` member the V2 schema requires, spelled as the model names the
+/// element (`ReplicationRule$Priority`) — which is how the sentence above names it.
+const PRIORITY_ELEMENT: &str = "Priority";
 
 /// Whether `value` is the ARN of an IAM role:
 /// `arn:<partition>:iam::<account>:role/<name>`.

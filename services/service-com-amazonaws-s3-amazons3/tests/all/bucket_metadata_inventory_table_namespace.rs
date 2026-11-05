@@ -255,6 +255,9 @@ async fn an_inventory_table_the_update_provisioned_keeps_its_name_in_the_managed
         // The configuration that takes the name, through whichever operation this row names.
         configuration_on(&router, first_bucket, case, first == First::CreateEnables).await;
         if first == First::UpdateEnables {
+            // A table of a configuration may be reconfigured only once that configuration's
+            // journal table is in service, so the row waits for it exactly as a caller must.
+            wait_for_the_tables();
             set_inventory_state(&router, first_bucket, case, "ENABLED").await;
         }
         // Its tables reach service first, so the row acts on the state the API asks a caller
@@ -315,6 +318,10 @@ async fn an_inventory_table_the_update_provisioned_keeps_its_name_in_the_managed
             Second::UpdateEnables => {
                 if needs_a_configuration {
                     configuration_on(&router, second_bucket, case, false).await;
+                    // A table of a configuration may be reconfigured only once that
+                    // configuration's journal table is in service, so the row waits for the
+                    // configuration it has just created exactly as a caller must.
+                    wait_for_the_tables();
                 }
                 set_inventory_state(&router, second_bucket, case, "ENABLED").await;
             }

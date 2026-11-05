@@ -139,6 +139,8 @@ mod listing_encoding_type;
 mod listing_optional_members;
 #[path = "all/listing_resume_markers.rs"]
 mod listing_resume_markers;
+#[path = "all/metadata_table_update_journal_status.rs"]
+mod metadata_table_update_journal_status;
 #[path = "all/multipart_checksum_type.rs"]
 mod multipart_checksum_type;
 #[path = "all/multipart_part_checksums.rs"]
@@ -273,6 +275,8 @@ mod refusal_messages_published;
 mod refusal_resource_naming;
 #[path = "all/refused_argument_envelope.rs"]
 mod refused_argument_envelope;
+#[path = "all/rename_object_query_parameter.rs"]
+mod rename_object_query_parameter;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
 #[path = "all/scratch_probe.rs"]

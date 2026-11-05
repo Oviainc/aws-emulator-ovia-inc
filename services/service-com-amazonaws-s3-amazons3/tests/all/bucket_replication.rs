@@ -27,6 +27,11 @@
 //! * `ReplicationConfiguration$Role` is "the ARN of the IAM role that Amazon S3 assumes"
 //!   and `Destination$Bucket` "the ARN of the bucket where you want Amazon S3 to store the
 //!   results": a value that is not such an ARN is refused with `InvalidArgument` (HTTP 400).
+//! * "When you add the Filter element in the configuration, you must also add the following
+//!   elements: DeleteMarkerReplication, Status, and Priority" (same documentation): a rule
+//!   carrying a `Filter` is written in the configuration's V2 schema, so a rule of that
+//!   schema that names no `Priority` is refused with `InvalidRequest` (HTTP 400) — while a
+//!   rule of the earlier schema, which carries the deprecated bare `Prefix`, needs none.
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refused payload leaves the stored configuration exactly as it
@@ -663,6 +668,183 @@ async fn replication_needs_a_versioning_enabled_bucket_that_exists() {
         "case \"no such bucket (get)\": expected NoSuchBucket, got {:?}",
         read.error_code()
     );
+}
+
+/// One `<Rule>` spelled out, so a row can name a `Filter` in a form no [`Rule`] builder
+/// field expresses — the three child elements `ReplicationRuleFilter` admits ("a `Filter`
+/// must specify exactly one `Prefix`, `Tag`, or an `And` child element",
+/// `smithy_query(query="shape",shape="ReplicationRuleFilter")`) and the empty container.
+fn rule_with_filter(filter: &str, priority: Option<i32>) -> String {
+    let priority = match priority {
+        Some(priority) => format!("<Priority>{priority}</Priority>"),
+        None => String::new(),
+    };
+    format!(
+        "<Rule>{priority}{filter}<Status>Enabled</Status>\
+         <Destination><Bucket>{DESTINATION_ARN}</Bucket></Destination></Rule>"
+    )
+}
+
+/// The `ReplicationConfiguration` payload carrying `rules` spelled out.
+fn configuration_of(rules: &[String]) -> String {
+    format!(
+        "<ReplicationConfiguration xmlns=\"{XMLNS}\"><Role>{ROLE_ARN}</Role>{}\
+         </ReplicationConfiguration>",
+        rules.concat()
+    )
+}
+
+/// The `<Message>` the refusal of a V2 rule that names no `Priority` carries: the sentence
+/// S3 publishes for that condition, written out here rather than taken from the code under
+/// test.
+const PRIORITY_REQUIRED_MESSAGE: &str =
+    "Priority must be specified for this version of Cross Region Replication configuration \
+     schema. Please refer to S3 Developer Guide for more information.";
+
+/// The rows of the V2-schema table: the case, the rules the configuration carries, and
+/// whether S3 accepts it.
+///
+/// They differ along what the rule generalises over: WHICH form of `Filter` makes the rule a
+/// V2 one (each of the three child elements the filter admits, and the empty container),
+/// WHICH rule of a multi-rule configuration carries it, whether a `Priority` is named beside
+/// it (including the zero that bounds the member at its low end), and the earlier schema's
+/// own form — a rule carrying the deprecated bare `Prefix` instead of a `Filter`, which
+/// names no `Priority` and is accepted.
+fn v2_schema_rows() -> Vec<(&'static str, Vec<String>, bool)> {
+    let prioritised = rule_with_filter("<Filter><Prefix>logs/</Prefix></Filter>", Some(7));
+    vec![
+        (
+            "a filter naming a prefix, with no priority",
+            vec![rule_with_filter(
+                "<Filter><Prefix>logs/</Prefix></Filter>",
+                None,
+            )],
+            false,
+        ),
+        (
+            "a filter naming a tag, with no priority",
+            vec![rule_with_filter(
+                "<Filter><Tag><Key>stage</Key><Value>archive</Value></Tag></Filter>",
+                None,
+            )],
+            false,
+        ),
+        (
+            "a filter naming an And of a prefix and a tag, with no priority",
+            vec![rule_with_filter(
+                "<Filter><And><Prefix>logs/</Prefix>\
+                 <Tag><Key>stage</Key><Value>archive</Value></Tag></And></Filter>",
+                None,
+            )],
+            false,
+        ),
+        (
+            "an empty filter container, with no priority",
+            vec![rule_with_filter("<Filter></Filter>", None)],
+            false,
+        ),
+        (
+            "the SECOND rule of two carrying the filter with no priority",
+            vec![
+                prioritised.clone(),
+                rule_with_filter("<Filter><Prefix>images/</Prefix></Filter>", None),
+            ],
+            false,
+        ),
+        (
+            "a filter with a priority beside it",
+            vec![prioritised.clone()],
+            true,
+        ),
+        (
+            "a filter with the lowest priority a caller can name",
+            vec![rule_with_filter(
+                "<Filter><Prefix>logs/</Prefix></Filter>",
+                Some(0),
+            )],
+            true,
+        ),
+        (
+            "the earlier schema's bare Prefix, which names no priority",
+            vec![format!(
+                "<Rule><Prefix>legacy/</Prefix><Status>Enabled</Status>\
+                 <Destination><Bucket>{DESTINATION_ARN}</Bucket></Destination></Rule>"
+            )],
+            true,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_v2_rule_that_names_no_priority_is_refused_and_records_nothing() {
+    let router = router();
+
+    for (index, (case, rules, accepted)) in v2_schema_rows().into_iter().enumerate() {
+        let bucket = format!("replication-v2-schema-{index}");
+        versioned_bucket(&router, &bucket).await;
+        // A configuration already on the bucket, so a refused put is visible as the earlier
+        // one surviving rather than as nothing having been there in the first place.
+        let standing = put_replication(
+            &router,
+            &bucket,
+            ROLE_ARN,
+            &[Rule::enabled().with_id("standing")],
+        )
+        .await;
+        assert_eq!(
+            standing.status, 200,
+            "case {case:?}: the standing configuration must be recorded, got {} ({})",
+            standing.status,
+            String::from_utf8_lossy(&standing.body)
+        );
+        let before = String::from_utf8_lossy(&get_replication(&router, &bucket).await.body)
+            .to_string();
+
+        let answer = put_replication_payload(&router, &bucket, &configuration_of(&rules), &[]).await;
+        if accepted {
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: expected HTTP 200, got {} ({})",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            let read = get_replication(&router, &bucket).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: the accepted configuration must read back, got {}",
+                read.status
+            );
+            continue;
+        }
+
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: expected HTTP 400, got {} ({})",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidRequest",
+            "case {case:?}: expected InvalidRequest, got {:?}",
+            answer.error_code()
+        );
+        assert_eq!(
+            answer.error_message(),
+            PRIORITY_REQUIRED_MESSAGE,
+            "case {case:?}: expected the published sentence, got {:?}",
+            answer.error_message()
+        );
+        let after =
+            String::from_utf8_lossy(&get_replication(&router, &bucket).await.body).to_string();
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused put must leave the stored configuration exactly as it \
+             was"
+        );
+    }
 }
 
 /// The owner gate both calls carry: an `ExpectedBucketOwner` that is not this account's is

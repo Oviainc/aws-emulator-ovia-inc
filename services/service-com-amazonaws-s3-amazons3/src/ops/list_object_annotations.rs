@@ -238,12 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Filter results to annotations whose name begins with the specified prefix"
         // (`ListObjectAnnotationsRequest$AnnotationPrefix`): the prefix selects annotation
         // NAMES, so a prefix no acceptable name could begin with selects nothing and is not
-        // a prefix of this namespace at all — which is the modelled `InvalidPrefix` (400),
-        // "the annotation prefix you provided is invalid". Judged by the one place the name
-        // rules live ([`crate::state::annotation_name_rejection`]), so the prefix filter and
-        // the writer agree on which names exist: past the 512-byte name maximum, or under a
-        // prefix S3 reserves for itself. An EMPTY prefix is not a name — it filters nothing
-        // out — so it is the whole listing, exactly as if none had been sent.
+        // a prefix of this namespace at all — which is the modelled `InvalidPrefix` (400).
+        // Judged by the one place the name rules live
+        // ([`crate::state::annotation_name_rejection`]), so the prefix filter and the writer
+        // agree on which names exist: past the 512-byte name maximum, or under a prefix S3
+        // reserves for itself. An EMPTY prefix is not a name — it filters nothing out — so it
+        // is the whole listing, exactly as an empty `prefix` is for an object listing.
         if let Some(prefix) = input.annotation_prefix.as_deref() {
             match crate::state::annotation_name_rejection(prefix) {
                 None | Some(crate::state::AnnotationNameRejection::Empty) => {}

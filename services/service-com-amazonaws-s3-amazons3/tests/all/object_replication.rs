@@ -85,9 +85,21 @@ async fn put_replication(router: &MultiServiceRouter, name: &str, rules: &str) -
 
 /// One `<Rule>` replicating to `destination`, with `scope` (a `Prefix` or a `Filter`
 /// element, or nothing at all) and `extra` (a `DeleteMarkerReplication` element, say).
+///
+/// A rule carrying a `Filter` is written in the configuration's V2 schema, which requires a
+/// `Priority` of every rule ("when you add the Filter element in the configuration, you must
+/// also add the following elements: DeleteMarkerReplication, Status, and Priority",
+/// `PutBucketReplication`'s own documentation), so one is named for exactly those rules —
+/// these rows are about which objects a rule COVERS, and a configuration S3 would refuse
+/// covers nothing.
 fn rule(destination: &str, status: &str, scope: &str, extra: &str) -> String {
+    let priority = if scope.contains("<Filter>") {
+        "<Priority>1</Priority>"
+    } else {
+        ""
+    };
     format!(
-        "<Rule><ID>only-rule</ID><Status>{status}</Status>{scope}{extra}\
+        "<Rule><ID>only-rule</ID>{priority}<Status>{status}</Status>{scope}{extra}\
          <Destination><Bucket>arn:aws:s3:::{destination}</Bucket></Destination></Rule>"
     )
 }

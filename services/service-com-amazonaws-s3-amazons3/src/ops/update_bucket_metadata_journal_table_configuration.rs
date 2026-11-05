@@ -13,9 +13,10 @@
 //! A bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404), one carrying no
 //! metadata configuration [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP
 //! 404), an
-//! `x-amz-expected-bucket-owner` that is not this account's HTTP 403 `AccessDenied`, and a
-//! retention outside the published day range `InvalidArgument` (HTTP 400) with nothing
-//! written.
+//! `x-amz-expected-bucket-owner` that is not this account's HTTP 403 `AccessDenied`, a
+//! configuration whose journal table has not got an `ACTIVE` status `InvalidRequest` (HTTP
+//! 400), and a retention outside the published day range `InvalidArgument` (HTTP 400) with
+//! nothing written.
 //!
 //! ## Shape of an operation
 //!
@@ -241,7 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
         // hold answers that rather than reporting whatever is wrong with the state of a
         // bucket that does not exist (the order every other bucket-subresource write in this
-        // crate keeps).
+        // crate keeps). One clock read for the whole call, so every judgement below is made
+        // at one instant.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             // The refusal names the bucket it is about, the way every resource-scoped
@@ -259,9 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has no records to expire — the mutation is refused with the metadata
         // configuration's own not-there condition, the same one a READ of it answers, and
         // nothing is written (never a silent no-op that would look like a success).
-        if !bucket.update_metadata_journal_record_expiration(
-            input.journal_table_configuration.record_expiration.clone(),
-        ) {
+        let Some(configuration) = bucket.metadata_configuration() else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
@@ -269,6 +270,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             // The code and the message are fixed text for this condition; the bucket whose
             // configuration is not there is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
+        };
+        // The configuration's journal table has to be in service before its settings can be
+        // changed, which is the one rule every update of a table of a metadata configuration
+        // is judged by ([`crate::service::metadata_tables::journal_table_refusal`]). Judged
+        // at the instant of this call, and before anything is written, so a refused update
+        // leaves the configuration expiring its journal records exactly as it did.
+        if let Some(message) = crate::service::metadata_tables::journal_table_refusal(
+            configuration,
+            crate::service::metadata_tables::UpdatedTable::Journal,
+            now,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                message,
+            ));
+        }
+        if !bucket.update_metadata_journal_record_expiration(
+            input.journal_table_configuration.record_expiration.clone(),
+        ) {
+            // Unreachable: the configuration was read above under this same guard.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
+            )
             .naming_bucket(&input.bucket));
         }
 

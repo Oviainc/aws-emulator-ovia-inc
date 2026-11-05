@@ -17,6 +17,10 @@
 //! implies functionality that is not implemented" — and nothing is deleted: a condition that
 //! cannot be judged must not be dropped and the object removed anyway.
 //!
+//! The sentence that code carries names the header CLASS rather than the member, so the
+//! document carries the `<Header>` naming the one that asked for it — the only part of the
+//! refusal a client feature-detecting the member reads to learn which header to drop.
+//!
 //! The rows differ along what the rule generalises over: which of the two directory-only
 //! members the request carries and how many at once, whether the value it carries HOLDS for
 //! the stored object, whether `If-Match` (supported by both kinds) is carried beside it, and
@@ -67,10 +71,13 @@ fn identifier(key: &str, last_modified_time: Option<&str>, size: Option<usize>) 
 /// the conditional-delete suite beside this one sends its own time member in.
 const ANOTHER_TIME: &str = "2015-01-01T00:00:00Z";
 
-/// One row: the case name and the conditional headers the delete carries.
+/// One row: the case name, the conditional headers the delete carries, and the header the
+/// refusal must NAME — the first directory-only member the request carries, in the model's
+/// own member order (`IfMatchLastModifiedTime` before `IfMatchSize`).
 struct Row {
     case: &'static str,
     headers: Vec<(&'static str, &'static str)>,
+    named: &'static str,
 }
 
 #[tokio::test]
@@ -95,14 +102,17 @@ async fn a_condition_only_directory_buckets_support_is_not_implemented_on_a_gene
         Row {
             case: "a size that is the object's",
             headers: vec![("x-amz-if-match-size", held_size)],
+            named: "x-amz-if-match-size",
         },
         Row {
             case: "a size that is not the object's",
             headers: vec![("x-amz-if-match-size", "7")],
+            named: "x-amz-if-match-size",
         },
         Row {
             case: "a modification time that is not the object's",
             headers: vec![("x-amz-if-match-last-modified-time", ANOTHER_TIME)],
+            named: "x-amz-if-match-last-modified-time",
         },
         Row {
             case: "both directory-only members at once",
@@ -110,10 +120,12 @@ async fn a_condition_only_directory_buckets_support_is_not_implemented_on_a_gene
                 ("x-amz-if-match-size", held_size),
                 ("x-amz-if-match-last-modified-time", ANOTHER_TIME),
             ],
+            named: "x-amz-if-match-last-modified-time",
         },
         Row {
             case: "a size beside the wildcard If-Match both kinds support",
             headers: vec![("if-match", "*"), ("x-amz-if-match-size", held_size)],
+            named: "x-amz-if-match-size",
         },
     ];
 
@@ -149,6 +161,16 @@ async fn a_condition_only_directory_buckets_support_is_not_implemented_on_a_gene
             NOT_IMPLEMENTED_HEADER_MESSAGE,
             "case {case:?}: expected the published sentence, got {:?}",
             refused.error_message()
+        );
+        // The sentence names the header CLASS and not the member, so the `<Header>` element
+        // is the only part of the refusal that says which header the caller must drop.
+        assert_eq!(
+            refused.element("Header").as_deref(),
+            Some(row.named),
+            "case {case:?}: the refusal must name the header that asked for it, got {:?} in \
+             {:?}",
+            refused.element("Header"),
+            text(&refused)
         );
 
         // A refused delete took nothing away: the object is still there with its bytes.
@@ -207,6 +229,14 @@ async fn a_condition_only_directory_buckets_support_is_not_implemented_on_a_gene
             NOT_IMPLEMENTED_CODE,
             "case {case:?}: expected the published code, got {:?}",
             refused.error_code()
+        );
+        // A batch carries its conditions as MEMBERS of the request document rather than as
+        // headers, so there is no header name for the refusal to name.
+        assert_eq!(
+            refused.element("Header"),
+            None,
+            "case {case:?}: no header asked for it, so the refusal names none, got {:?}",
+            refused.element("Header")
         );
         for key in batch_keys {
             let after = get_object(&router, name, key, "", &[]).await;
