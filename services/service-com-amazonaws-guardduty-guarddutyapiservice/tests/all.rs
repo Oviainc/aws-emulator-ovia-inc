@@ -227,6 +227,8 @@ mod organization_statistics;
 mod page_token_listing_identity;
 #[path = "all/page_token_spelling.rs"]
 mod page_token_spelling;
+#[path = "all/published_detection_rule_catalog.rs"]
+mod published_detection_rule_catalog;
 #[path = "all/publishing_destination_delete.rs"]
 mod publishing_destination_delete;
 #[path = "all/publishing_destination_lifecycle.rs"]

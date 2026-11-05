@@ -133,7 +133,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Nothing in this report depends on the request beyond the `RuleId` it
+        // names: the catalogue is AWS's own, the same in every Region and every
+        // account, so the request context selects nothing here.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -143,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let region = crate::state::request_region(ctx);
 
         // A pure report: nothing below writes to the store.
         let state = state.lock();
@@ -169,10 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetCustomDetectionRuleOutput {
             rule: RuleDetail {
                 rule_id: rule.rule_id.clone(),
-                // Derived from the rule's own id and the Region serving the read, so
-                // a read cannot report an ARN that disagrees with the id it was
-                // asked about.
-                arn: crate::state::custom_detection_rule_arn(&region, &rule.rule_id),
+                // Derived from the rule's own id, so a read cannot report an ARN
+                // that disagrees with the id it was asked about. A published rule
+                // is an AWS-managed catalogue object rather than a resource of the
+                // account reading it, so the ARN names neither.
+                arn: crate::state::custom_detection_rule_arn(&rule.rule_id),
                 name: rule.name.clone(),
                 description: rule.description.clone(),
                 severity: rule.severity.clone(),

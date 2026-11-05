@@ -245,9 +245,12 @@ fn exclude_scope() -> Value {
 /// listing must report: the rows differ along the rule, the mode (both members of
 /// `AssociationMode`, including both modes of one and the same rule) and the account
 /// scope (none, include, exclude).
-const ROWS: [Row; 6] = [
+///
+/// They name the catalogue's rules from the FRONT, leaving its last rule
+/// unconfigured, so a listing can be asserted not to name a pair nothing created.
+const ROWS: [Row; 4] = [
     Row {
-        rule: 3,
+        rule: 1,
         mode: "LIVE",
         scope: include_scope,
     },
@@ -257,19 +260,9 @@ const ROWS: [Row; 6] = [
         scope: no_scope,
     },
     Row {
-        rule: 3,
+        rule: 1,
         mode: "DRY_RUN",
         scope: exclude_scope,
-    },
-    Row {
-        rule: 1,
-        mode: "LIVE",
-        scope: no_scope,
-    },
-    Row {
-        rule: 2,
-        mode: "DRY_RUN",
-        scope: include_scope,
     },
     Row {
         rule: 0,

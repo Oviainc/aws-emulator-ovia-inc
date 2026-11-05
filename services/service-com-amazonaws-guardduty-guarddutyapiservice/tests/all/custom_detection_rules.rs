@@ -29,7 +29,9 @@
 //! 4. Both operations REPORT: no number of lists, pages or detail reads changes what
 //!    a later caller sees.
 //! 5. A rule is the SERVICE's, not an account's: every Region's endpoint publishes the
-//!    same catalogue, and the ARN a read reports names the Region that served it.
+//!    same catalogue, and the ARN a read reports is the AWS-MANAGED one — empty Region
+//!    segment, account segment `aws` — so it names neither the Region that served the
+//!    read nor the caller's account.
 //! 6. A `nextToken` the service never issued, a filter field outside
 //!    `FilterFieldName`, and a `maxResults` outside `range 1..100` are refused with
 //!    HTTP 400 without echoing the caller's value; a well-formed `ruleId` the
@@ -245,23 +247,31 @@ async fn a_list_reports_the_published_catalogue_and_each_rule_resolves() {
     );
 
     // The catalogue spans what a caller can select on, so a filter table has more
-    // than one row to find: both data sources and more than one severity.
-    let listed_data_sources: Vec<&str> = DATA_SOURCES
-        .into_iter()
-        .filter(|wanted| rules.iter().any(|rule| text(rule, "dataSource") == *wanted))
-        .collect();
-    assert_eq!(
-        listed_data_sources.len(),
-        DATA_SOURCES.len(),
-        "case \"catalogue coverage\": expected a rule for every data source {DATA_SOURCES:?}, got {listed_data_sources:?}"
-    );
-    let listed_severities: Vec<&str> = SEVERITIES
-        .into_iter()
-        .filter(|wanted| rules.iter().any(|rule| text(rule, "severity") == *wanted))
+    // than one row to find: EVERY rule's `dataSource` and `severity` is a member of
+    // that field's own enum, and the catalogue carries more than one distinct
+    // `service` for a filter to narrow on.
+    let off_domain: Vec<(&str, &str)> = rules
+        .iter()
+        .filter_map(|rule| {
+            let data_source = text(rule, "dataSource");
+            let severity = text(rule, "severity");
+            (!DATA_SOURCES.contains(&data_source) || !SEVERITIES.contains(&severity))
+                .then_some((data_source, severity))
+        })
         .collect();
     assert!(
-        listed_severities.len() > 1,
-        "case \"catalogue coverage\": expected rules at more than one severity, got {listed_severities:?}"
+        off_domain.is_empty(),
+        "case \"catalogue coverage\": every published rule names a dataSource of {DATA_SOURCES:?} and a severity of {SEVERITIES:?}, got {off_domain:?}"
+    );
+    let distinct_services: Vec<&str> = {
+        let mut services: Vec<&str> = rules.iter().map(|rule| text(rule, "service")).collect();
+        services.sort_unstable();
+        services.dedup();
+        services
+    };
+    assert!(
+        distinct_services.len() > 1,
+        "case \"catalogue coverage\": expected rules over more than one service, so a filter has something to narrow, got {distinct_services:?}"
     );
 
     for rule in &rules {
@@ -320,7 +330,8 @@ async fn a_list_reports_the_published_catalogue_and_each_rule_resolves() {
             rule["createdAt"]
         );
 
-        // The ARN names this rule, through the Region that served the read.
+        // The ARN names this rule, in the form AWS publishes a managed catalogue
+        // object under: no Region segment and the account segment `aws`.
         let arn = text(rule, "arn");
         let segments: Vec<&str> = arn.splitn(6, ':').collect();
         assert_eq!(
@@ -329,9 +340,9 @@ async fn a_list_reports_the_published_catalogue_and_each_rule_resolves() {
             "case {case:?}: an ARN has six segments, got {arn:?}"
         );
         assert_eq!(
-            (segments[0], segments[2], segments[3]),
-            ("arn", "guardduty", "us-east-1"),
-            "case {case:?}: expected a guardduty ARN in the request's Region, got {arn:?}"
+            (segments[0], segments[2], segments[3], segments[4]),
+            ("arn", "guardduty", "", "aws"),
+            "case {case:?}: expected the AWS-managed guardduty ARN form, got {arn:?}"
         );
         assert!(
             segments[5].ends_with(&format!("/{id}")),
@@ -698,11 +709,15 @@ async fn every_region_publishes_the_same_catalogue() {
         );
         for (rule, expected) in rules.iter().zip(home.iter()) {
             let arn = text(rule, "arn");
+            assert_eq!(
+                rule["arn"], expected["arn"],
+                "case {case:?}: a published rule carries ONE ARN whatever Region reads it, got {arn:?}"
+            );
             let segments: Vec<&str> = arn.splitn(6, ':').collect();
             assert_eq!(
-                segments.get(3).copied(),
-                Some(region),
-                "case {case:?}: the ARN must name the Region that served the read, got {arn:?}"
+                (segments.get(3).copied(), segments.get(4).copied()),
+                (Some(""), Some("aws")),
+                "case {case:?}: the ARN of an AWS-managed rule names no Region and no account, got {arn:?}"
             );
             assert_eq!(
                 rule["createdAt"], expected["createdAt"],

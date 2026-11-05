@@ -399,8 +399,11 @@ async fn get_members_reports_a_repeated_account_id_once() {
 /// `smithy_query(shape="AccountId")`).
 const SCOPE_ACCOUNTS: [&str; 3] = ["111122223333", "222233334444", "333344445555"];
 
-/// The mode the scope rows are configured in (`smithy_query(shape="AssociationMode")`).
-const MODE: &str = "LIVE";
+/// The modes the scope rows are configured in
+/// (`smithy_query(shape="AssociationMode")`). A rule holds one configuration per
+/// mode, so the rows below are spread over `(rule, mode)` pairs rather than over
+/// rules alone.
+const MODES: [&str; 2] = ["LIVE", "DRY_RUN"];
 
 #[tokio::test]
 async fn an_organization_configuration_scopes_a_repeated_account_once() {
@@ -429,24 +432,34 @@ async fn an_organization_configuration_scopes_a_repeated_account_once() {
         ),
     ];
 
+    // Each row needs a `(rule, mode)` pair of its own, since a rule holds one
+    // configuration per mode: the catalogue has to publish enough rules for the rows
+    // to pair off against both modes.
+    assert!(
+        rules.len() * MODES.len() >= cases.len(),
+        "the catalogue must publish enough rules for {} distinct (rule, mode) pairs, got {rules:?}",
+        cases.len()
+    );
+
     for (index, (label, requested, expected)) in cases.into_iter().enumerate() {
-        // One rule per row: a rule holds one configuration per mode, so the rows
-        // cannot share one.
-        let rule_id = rules
-            .get(index)
-            .unwrap_or_else(|| panic!("case {label:?}: the catalogue must publish {} rules, got {rules:?}", index + 1));
+        // One `(rule, mode)` pair per row: a rule holds one configuration per mode,
+        // so the rows cannot share one.
+        let rule_id = rules.get(index % rules.len()).unwrap_or_else(|| {
+            panic!("case {label:?}: the catalogue must publish a rule, got {rules:?}")
+        });
+        let mode = MODES[(index / rules.len()) % MODES.len()];
 
         // The create stores the scope the request names, on the INCLUDE side.
         let (status, body) = create_org_configuration(
             &router,
-            json!({"ruleId": rule_id, "mode": MODE, "includeAccountIds": requested}),
+            json!({"ruleId": rule_id, "mode": mode, "includeAccountIds": requested}),
         )
         .await;
         assert_eq!(
             status, 200,
             "case {label:?}: create-org-configuration expected 200, got {status} {body:?}"
         );
-        let (status, body) = get_org_configuration(&router, rule_id, MODE).await;
+        let (status, body) = get_org_configuration(&router, rule_id, mode).await;
         assert_eq!(
             status, 200,
             "case {label:?}: get-org-configuration expected 200, got {status} {body:?}"
@@ -463,14 +476,14 @@ async fn an_organization_configuration_scopes_a_repeated_account_once() {
         let (status, body) = update_org_configuration(
             &router,
             rule_id,
-            json!({"mode": MODE, "excludeAccountIds": requested}),
+            json!({"mode": mode, "excludeAccountIds": requested}),
         )
         .await;
         assert_eq!(
             status, 200,
             "case {label:?}: update-org-configuration expected 200, got {status} {body:?}"
         );
-        let (status, body) = get_org_configuration(&router, rule_id, MODE).await;
+        let (status, body) = get_org_configuration(&router, rule_id, mode).await;
         assert_eq!(
             status, 200,
             "case {label:?}: get-org-configuration expected 200, got {status} {body:?}"

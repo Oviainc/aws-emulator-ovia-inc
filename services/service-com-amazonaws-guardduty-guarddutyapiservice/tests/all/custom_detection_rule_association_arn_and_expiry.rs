@@ -11,9 +11,12 @@
 //! The rules under test, each asserted over a SET of inputs rather than one recorded
 //! call:
 //!
-//! 1. A custom detection rule's ARN names the resource `detection-rule/custom/<ruleId>`
-//!    through the Region serving the read, and an association's ARN EXTENDS its rule's
-//!    with `/association/<associationId>` — the one `DetectionRuleArn`
+//! 1. A published rule's ARN is the AWS-MANAGED one — `detection-rule/custom/<ruleId>`
+//!    with an EMPTY Region segment and the account segment `aws`, because the rule
+//!    belongs to GuardDuty and not to the account reading it — while an association's
+//!    ARN is the ACCOUNT's: it extends the same resource path with
+//!    `/association/<associationId>` and carries the Region and account that own it.
+//!    Both are the one `DetectionRuleArn`
 //!    (`smithy_query(shape="RuleSummary,AssociationDetail")`) every operation that
 //!    reports either resource derives, so the create, the detail read and both
 //!    listings agree. Asserted over every published rule, in both modes and through
@@ -236,10 +239,12 @@ async fn every_rule_and_association_arn_carries_the_custom_rule_path() {
 
         for (index, (rule_id, rule_arn)) in listed.iter().enumerate() {
             let case = format!("{rule_id} in {region}");
-            // The rule's own resource path, spelled out: the resource type and the
-            // `custom` family it belongs to, then the rule's id.
+            // The published rule's own ARN: the resource type and the `custom`
+            // family it belongs to, then the rule's id — under the AWS-managed
+            // empty-Region, `aws`-account form, because the rule is GuardDuty's and
+            // not the account's.
             let expected_rule_arn =
-                format!("arn:aws:guardduty:{region}:{account}:detection-rule/custom/{rule_id}");
+                format!("arn:aws:guardduty::aws:detection-rule/custom/{rule_id}");
             assert_eq!(
                 rule_arn, &expected_rule_arn,
                 "case {case:?}: expected the rule ARN {expected_rule_arn:?}, got {rule_arn:?}"
@@ -258,12 +263,15 @@ async fn every_rule_and_association_arn_carries_the_custom_rule_path() {
                 "case {case:?}: the detail read must report the listed ARN, got {detail:?}"
             );
 
-            // The association's ARN extends its rule's, whichever mode it is in.
+            // The association's ARN extends its rule's resource path, whichever
+            // mode it is in — but in the ACCOUNT's own namespace, because the
+            // association is a resource this account created in this Region.
             let mode = MODES[index % MODES.len()];
             let created = associate(&router, region, rule_id, mode).await;
             let association_id = text(&created, "associationId", &case).to_string();
-            let expected_association_arn =
-                format!("{expected_rule_arn}/association/{association_id}");
+            let expected_association_arn = format!(
+                "arn:aws:guardduty:{region}:{account}:detection-rule/custom/{rule_id}/association/{association_id}"
+            );
             assert_eq!(
                 text(&created, "arn", &case),
                 expected_association_arn,

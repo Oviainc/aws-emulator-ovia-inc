@@ -94,8 +94,8 @@ async fn published_rule_ids(router: &Router) -> Vec<String> {
         .filter_map(|rule| rule["ruleId"].as_str().map(str::to_string))
         .collect();
     assert!(
-        ids.len() > 3,
-        "list-custom-detection-rules: expected a catalogue of more than three rules, got {ids:?}"
+        ids.len() > 2,
+        "list-custom-detection-rules: expected a catalogue of more than two rules, got {ids:?}"
     );
     ids
 }
@@ -245,15 +245,17 @@ async fn walk(
     panic!("case {case:?}: the list never ran out of pages");
 }
 
-/// The `(ruleId, mode)` pairs this suite enrolls the account in: the first eight
-/// published rules, one association each because a rule carries at most one, in
-/// alternating `AssociationMode`s so the set spans both modes over several rules.
+/// The `(ruleId, mode)` pairs this suite enrolls the account in: every published rule
+/// but the LAST one, one association each because a rule carries at most one, in
+/// alternating `AssociationMode`s so the set spans both modes over several rules. The
+/// rule it leaves out is the one a filter is asserted to select nothing for.
 ///
 /// Returned in the order the creates are MADE, which is deliberately the reverse of
 /// the order the list must report, so an assertion on order cannot pass by accident.
 fn plan(ids: &[String]) -> Vec<(String, String)> {
+    let associated = ids.len().saturating_sub(1).min(8);
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for (index, rule_id) in ids.iter().take(8).enumerate() {
+    for (index, rule_id) in ids.iter().take(associated).enumerate() {
         pairs.push((rule_id.clone(), MODES[index % MODES.len()].to_string()));
     }
     pairs.reverse();

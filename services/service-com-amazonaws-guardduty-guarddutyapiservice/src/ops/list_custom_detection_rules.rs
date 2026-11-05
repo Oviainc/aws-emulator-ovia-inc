@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let rules = page
             .iter()
             .filter_map(|rule_id| state.custom_detection_rules.rule(rule_id))
-            .map(|rule| summary(rule, &region))
+            .map(summary)
             .collect();
 
         Ok(ListCustomDetectionRulesOutput { rules, next_token })
@@ -259,14 +259,17 @@ fn matches_filter(
     })
 }
 
-/// The `RuleSummary` projection of a stored rule, as `region`'s endpoint reports it.
+/// The `RuleSummary` projection of a stored rule.
 ///
 /// Every member is read off the record; only the ARN is derived, from the rule's own
-/// id and the Region serving the read.
-fn summary(rule: &crate::state::CustomDetectionRuleRecord, region: &str) -> RuleSummary {
+/// id. The Region serving the read is NOT part of it: a published rule is an
+/// AWS-managed catalogue object rather than a resource of the account reading it, so
+/// every endpoint reports the one ARN AWS publishes it under
+/// ([`crate::state::custom_detection_rule_arn`]).
+fn summary(rule: &crate::state::CustomDetectionRuleRecord) -> RuleSummary {
     RuleSummary {
         rule_id: rule.rule_id.clone(),
-        arn: crate::state::custom_detection_rule_arn(region, &rule.rule_id),
+        arn: crate::state::custom_detection_rule_arn(&rule.rule_id),
         name: rule.name.clone(),
         description: rule.description.clone(),
         severity: rule.severity.clone(),
