@@ -308,6 +308,11 @@ const REQUIREMENT_MANDATORY: &str = "MANDATORY";
 /// envelope element names `CreateStarterMappingTemplate` keys a starter template's
 /// elements by, so a parsed document and a starter template describe the same tree with
 /// the same keys.
+///
+/// Six of the names are read off a recorded canonical document — ISA01, ISA06, ISA13 and
+/// ISA15 above, plus GS01 and GS08 in [`GS_ELEMENTS`]. The rest are that same short-form
+/// rule applied to the remaining elements, so a later recording that spells one of them
+/// differently corrects that entry rather than the rule.
 pub(crate) const ISA_ELEMENTS: &[&str] = &[
     "AuthorizationQualifier",
     "AuthorizationInformation",
@@ -954,6 +959,12 @@ fn envelope_members(segment: &Segment, names: &[&str]) -> Vec<(String, Node)> {
 /// An element that is present but EMPTY is the X12 encoding of an absent element, so it
 /// is left out rather than carried as an empty value.
 fn body_segment_node(segment: &Segment, delimiters: &Delimiters) -> Node {
+    Node::Map(body_segment_members(segment, delimiters))
+}
+
+/// The members of one body segment: its `segment_id`, then its elements (see
+/// [`body_segment_node`], which is this list as a map).
+fn body_segment_members(segment: &Segment, delimiters: &Delimiters) -> Vec<(String, Node)> {
     let mut members = vec![(
         SEGMENT_ID_KEY.to_string(),
         Node::Text(segment.id.clone()),
@@ -982,7 +993,7 @@ fn body_segment_node(segment: &Segment, delimiters: &Delimiters) -> Node {
             members.push((key, Node::Text(value.clone())));
         }
     }
-    Node::Map(members)
+    members
 }
 
 /// `segments` as a named list of body segments, or nothing when there are none.
@@ -1117,8 +1128,8 @@ fn transaction_body_member(
 /// One occurrence of a detail loop: the opening segment's own members, and the segments
 /// that follow it inside that occurrence as its own `segments` list.
 fn occurrence_node(segment: &Segment, inside: &[&Segment], delimiters: &Delimiters) -> Node {
-    let mut occurrence = body_segment_node(segment, delimiters);
-    if let (Node::Map(members), false) = (&mut occurrence, inside.is_empty()) {
+    let mut members = body_segment_members(segment, delimiters);
+    if !inside.is_empty() {
         members.push((
             SEGMENTS_KEY.to_string(),
             Node::List {
@@ -1130,7 +1141,7 @@ fn occurrence_node(segment: &Segment, inside: &[&Segment], delimiters: &Delimite
             },
         ));
     }
-    occurrence
+    Node::Map(members)
 }
 
 /// One functional group holding `transactions`: its GS elements, the segments that sit

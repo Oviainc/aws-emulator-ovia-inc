@@ -318,7 +318,8 @@ fn xml_elements(case: &str, xml: &str) -> Vec<(String, String)> {
 /// `<SEGMENT>-8000_loop` entry holding one object per occurrence, each occurrence carrying
 /// the segments inside it in its own `segments` list. Flattening is what lets a row below
 /// state the segments it expects in document order whatever the grouping; the grouping
-/// itself is asserted by `detail_loops` in `edi_parsing.rs`.
+/// itself is asserted by `a_detail_loop_is_grouped_as_one_entry_per_occurrence` in
+/// `canonical_document.rs`.
 pub(crate) fn body_segments_in_order(segments: &[Value]) -> Vec<Value> {
     let mut flat: Vec<Value> = Vec::new();
     for entry in segments {
