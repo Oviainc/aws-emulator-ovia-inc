@@ -211,14 +211,13 @@ async fn a_table_that_never_streamed_reports_no_specification_either() {
     // The same absence, reached without ever enabling a stream: a create that says
     // nothing about streams and one that explicitly turns them off are the same table.
     // Neither reports a specification, and neither names a stream at all — which is
-    // what distinguishes them from the disabled table above.
+    // what distinguishes them from the disabled table above. A specification that
+    // leaves the stream off and still names a view type is not a row here: it states a
+    // setting for a stream it is not asking for and is refused, which
+    // `crate::request_validation_refusals` asserts.
     for (case, specification) in [
         ("no StreamSpecification", None),
         ("StreamEnabled false", Some(json!({"StreamEnabled": false}))),
-        (
-            "StreamEnabled false with a view type",
-            Some(json!({"StreamEnabled": false, "StreamViewType": "NEW_IMAGE"})),
-        ),
     ] {
         let router = emulator_with_streams();
         ddb_ok(

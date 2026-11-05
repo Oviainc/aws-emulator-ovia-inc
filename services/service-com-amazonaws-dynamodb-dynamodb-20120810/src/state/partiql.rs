@@ -71,9 +71,13 @@ pub const MAX_STATEMENT_DEPTH: usize = 16;
 /// How a statement this dialect does not spell is refused: a `ValidationException`,
 /// which is what DynamoDB answers a statement it cannot parse with. The statement
 /// itself is not echoed back.
+///
+/// AWS states the fact as a term it did not expect at the position the parse stopped at
+/// — the same sentence family as [`unexpected_token_after_statement`], which is the one
+/// case where the parse stopped PAST a complete statement rather than inside one.
 fn statement_syntax_error() -> RequestError {
     RequestError::Validation(
-        "Invalid Statement: statement wasn't well formed, could not be parsed".to_string(),
+        "Statement wasn't well formed, can't be processed: Unexpected term".to_string(),
     )
 }
 
@@ -81,6 +85,101 @@ fn statement_syntax_error() -> RequestError {
 /// refused, naming the rule it broke.
 fn statement_refused(detail: &str) -> RequestError {
     RequestError::Validation(format!("Invalid Statement: {detail}"))
+}
+
+/// How a statement that reads as a COMPLETE statement and is then followed by more
+/// tokens is refused.
+///
+/// A statement is one expression, so anything after the one the parser read is not part
+/// of it and nothing in the dialect can be — which is a different fact from a statement
+/// that never parsed, and AWS states it with its own fixed sentence naming the position
+/// the surplus token sits at.
+fn unexpected_token_after_statement() -> RequestError {
+    RequestError::Validation(
+        "Statement wasn't well formed, can't be processed: Unexpected token after expression"
+            .to_string(),
+    )
+}
+
+/// The type codes `attribute_type` may name, in the order the STATEMENT surface's own
+/// refusal lists them.
+///
+/// The same closed set the expression surface holds the function to
+/// ([`crate::state::ATTRIBUTE_TYPE_NAMES`] — the members of the `AttributeValue` union),
+/// listed in the order AWS states it in for a statement, which is not the order its
+/// expression refusals use.
+const STATEMENT_ATTRIBUTE_TYPE_NAMES: [&str; 10] =
+    ["N", "BS", "L", "B", "NULL", "M", "S", "SS", "NS", "BOOL"];
+
+/// `attribute_type`'s second operand names a TYPE, so a statement that spells a literal
+/// which is not one of the type codes is refused as it is read.
+///
+/// The statement surface states the clause on its own, the way it states every other
+/// refusal about a statement, and over its own ordering of the code set.
+fn check_statement_type_name(operand: &PredicateOperand) -> Result<(), RequestError> {
+    let PredicateOperand::Value(value) = operand else {
+        return Ok(());
+    };
+    if let AttributeValue::S(name) = value {
+        if STATEMENT_ATTRIBUTE_TYPE_NAMES.contains(&name.as_str()) {
+            return Ok(());
+        }
+        return Err(RequestError::Validation(format!(
+            "Invalid attribute type name found; type: {name}, valid types: {{{}}}",
+            STATEMENT_ATTRIBUTE_TYPE_NAMES.join(",")
+        )));
+    }
+    Err(RequestError::Validation(format!(
+        "Incorrect operand type for operator or function; operator or function: attribute_type, \
+         operand type: {}",
+        attribute_value_type(value)
+    )))
+}
+
+/// The relational operators compare ONE value with another, so each operand is a scalar.
+///
+/// "<, <=, >, >=" and `BETWEEN` order their operands, and only the scalar types `S`,
+/// `N` and `B` have an order — a list, a map, a set, a boolean or the null type has no
+/// place on either side of one. The operand is a literal the statement already spells,
+/// so the statement is refused as it is read, naming the operator and the type of the
+/// offending operand. Equality is not included: two values of any type can be equal.
+fn check_relational_operands(
+    operator: CompareOp,
+    left: &PredicateOperand,
+    right: &PredicateOperand,
+) -> Result<(), RequestError> {
+    let operator = match operator {
+        CompareOp::Equal | CompareOp::NotEqual => return Ok(()),
+        CompareOp::Less => "<",
+        CompareOp::LessOrEqual => "<=",
+        CompareOp::Greater => ">",
+        CompareOp::GreaterOrEqual => ">=",
+    };
+    check_scalar_operands(operator, [left, right])
+}
+
+/// Hold every literal operand of an ordering comparison to the scalar types, naming the
+/// operator the way the statement spells it.
+fn check_scalar_operands<'o>(
+    operator: &str,
+    operands: impl IntoIterator<Item = &'o PredicateOperand>,
+) -> Result<(), RequestError> {
+    for operand in operands {
+        let PredicateOperand::Value(value) = operand else {
+            continue;
+        };
+        if !matches!(
+            value,
+            AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+        ) {
+            return Err(RequestError::Validation(format!(
+                "Incorrect operand type for operator or function; operator or function: \
+                 {operator}, operand type: {}",
+                attribute_value_type(value)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// How a WRITE statement whose source is qualified with an index is refused.
@@ -582,7 +681,7 @@ pub fn parse_statement(
     };
     let parsed = parser.statement()?;
     if !parser.at_end() {
-        return Err(statement_syntax_error());
+        return Err(unexpected_token_after_statement());
     }
     // "The parameters for the PartiQL statement, if any" (`Parameters`): a request
     // that sends more values than the statement has markers for has sent a statement
@@ -783,8 +882,14 @@ impl StatementParser<'_> {
         Ok(InsertStatement { table, item })
     }
 
-    /// `UPDATE source (SET assignment, … | REMOVE path, …)+ WHERE predicate
+    /// `UPDATE source (SET assignment | REMOVE path)+ WHERE predicate
     /// [RETURNING values]`.
+    ///
+    /// Each clause states ONE action, and several actions are stated by repeating the
+    /// keyword — "UPDATE "Music" SET AwardsWon=1 SET AwardDetail={…} WHERE …" is how the
+    /// dialect spells two of them. A comma after a complete assignment or path is
+    /// therefore a token the grammar has no place for, and the statement is refused as
+    /// one token past its expression rather than read as a list.
     fn update(&mut self) -> Result<UpdateStatement, RequestError> {
         let (table, index) = self.source()?;
         if index.is_some() {
@@ -793,21 +898,13 @@ impl StatementParser<'_> {
         let mut clauses = Vec::new();
         loop {
             if self.accept_word("set") {
-                loop {
-                    clauses.push(self.assignment()?);
-                    if !self.accept(&Token::Comma) {
-                        break;
-                    }
-                }
+                clauses.push(self.assignment()?);
+                self.refuse_clause_list()?;
                 continue;
             }
             if self.accept_word("remove") {
-                loop {
-                    clauses.push(UpdateClause::Remove(self.path()?));
-                    if !self.accept(&Token::Comma) {
-                        break;
-                    }
-                }
+                clauses.push(UpdateClause::Remove(self.path()?));
+                self.refuse_clause_list()?;
                 continue;
             }
             break;
@@ -848,9 +945,17 @@ impl StatementParser<'_> {
         })
     }
 
+    /// Refuse a comma where one clause of an `UPDATE` has just ended: the clause states
+    /// one action, so the comma is a token past a complete expression.
+    fn refuse_clause_list(&mut self) -> Result<(), RequestError> {
+        if self.peek() == Some(&Token::Comma) {
+            return Err(unexpected_token_after_statement());
+        }
+        Ok(())
+    }
+
     /// `table` or `table.index`, either part quoted or bare.
-    fn source(&mut self) -> Result<(String, Option<String>), RequestError> {
-        let table = self.identifier()?;
+    fn source(&mut self) -> Result<(String, Option<String>), RequestError> {        let table = self.identifier()?;
         let index = if self.accept(&Token::Dot) {
             Some(self.identifier()?)
         } else {
@@ -1020,7 +1125,10 @@ impl StatementParser<'_> {
                             match function {
                                 "begins_with" => Predicate::BeginsWith(path, operand),
                                 "contains" => Predicate::Contains(path, operand),
-                                _ => Predicate::AttributeType(path, operand),
+                                _ => {
+                                    check_statement_type_name(&operand)?;
+                                    Predicate::AttributeType(path, operand)
+                                }
                             }
                         }
                     };
@@ -1048,6 +1156,7 @@ impl StatementParser<'_> {
             let low = self.operand()?;
             self.expect_word("and")?;
             let high = self.operand()?;
+            check_scalar_operands("BETWEEN", [&left, &low, &high])?;
             let between = Predicate::Between(left, low, high);
             return Ok(if negated {
                 Predicate::Not(Box::new(between))
@@ -1085,6 +1194,7 @@ impl StatementParser<'_> {
         };
         self.at += 1;
         let right = self.operand()?;
+        check_relational_operands(operator, &left, &right)?;
         Ok(Predicate::Compare(left, operator, right))
     }
 
@@ -1152,7 +1262,7 @@ impl StatementParser<'_> {
         // A value a statement carries is held to the same rules a stored one is: the
         // documented nesting depth and this emulator's ceiling on a collection's
         // members.
-        check_attribute_value("Statement", &value)?;
+        check_statement_value("Statement", &value)?;
         Ok(value)
     }
 
@@ -1732,12 +1842,103 @@ fn invalid_next_token() -> RequestError {
 // Reading the stored items a SELECT reports
 // ===========================================================================
 
+/// The TOP-LEVEL attributes one predicate speaks about, in name order.
+///
+/// A predicate is judged against the item a source reports, so these are the attributes
+/// that source has to carry for the predicate to mean anything — which is what
+/// [`unprojected_filter_attributes`] holds an index's projection to. A path that reaches
+/// inside an attribute needs that attribute, so only its first step counts.
+pub fn predicate_attributes(predicate: &Predicate) -> BTreeSet<String> {
+    let mut named = BTreeSet::new();
+    collect_predicate_attributes(predicate, &mut named);
+    named
+}
+
+/// The walk behind [`predicate_attributes`], over the flat `And`/`Or` operand lists the
+/// parser builds.
+fn collect_predicate_attributes(predicate: &Predicate, named: &mut BTreeSet<String>) {
+    let operand = |operand: &PredicateOperand, named: &mut BTreeSet<String>| match operand {
+        PredicateOperand::Path(path) | PredicateOperand::Size(path) => {
+            named.insert(path.attribute().to_string());
+        }
+        PredicateOperand::Value(_) => {}
+    };
+    match predicate {
+        Predicate::All(operands) | Predicate::Any(operands) => {
+            for nested in operands {
+                collect_predicate_attributes(nested, named);
+            }
+        }
+        Predicate::Not(nested) => collect_predicate_attributes(nested, named),
+        Predicate::Compare(left, _, right) => {
+            operand(left, named);
+            operand(right, named);
+        }
+        Predicate::Between(value, low, high) => {
+            operand(value, named);
+            operand(low, named);
+            operand(high, named);
+        }
+        Predicate::In(value, candidates) => {
+            operand(value, named);
+            for candidate in candidates {
+                operand(candidate, named);
+            }
+        }
+        Predicate::IsNull(path, _)
+        | Predicate::IsMissing(path, _)
+        | Predicate::Exists(path, _) => {
+            named.insert(path.attribute().to_string());
+        }
+        Predicate::BeginsWith(path, operand_value)
+        | Predicate::Contains(path, operand_value)
+        | Predicate::AttributeType(path, operand_value) => {
+            named.insert(path.attribute().to_string());
+            operand(operand_value, named);
+        }
+    }
+}
+
+/// The attributes a statement's `WHERE` clause speaks about that the SOURCE it names
+/// does not report, when that source is an index.
+///
+/// An index holds "attributes that are copied (projected) from the table into the
+/// index" (`GlobalSecondaryIndex$Projection`), and a predicate is judged against what
+/// the source reports — so a filter on an attribute the index does not project could
+/// never be decided from the index. The statement surface refuses that rather than
+/// answering from the parent table, and the refusal names the index and the attributes.
+pub fn unprojected_filter_attributes(
+    table: &Table,
+    index: Option<&str>,
+    predicate: Option<&Predicate>,
+) -> Vec<String> {
+    let (Some(index), Some(predicate)) = (index, predicate) else {
+        return Vec::new();
+    };
+    let Some(projected) = projected_attributes(table, Some(index)) else {
+        return Vec::new();
+    };
+    predicate_attributes(predicate)
+        .into_iter()
+        .filter(|attribute| !attribute.is_empty() && !projected.contains(attribute))
+        .collect()
+}
+
+/// AWS's sentence for that refusal: the index the statement named and the filter
+/// attributes it does not project, in name order.
+pub fn unprojected_filter_refusal(index: &str, attributes: &[String]) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: Secondary index {index} does not project one \
+         or more filter attributes: [{}]",
+        attributes.join(", ")
+    ))
+}
+
 /// Which attributes of an item a source reports: every one for the table and for an
 /// `ALL` index, and the projected ones for any other index.
 ///
 /// Returns `None` when every attribute is reported.
-pub fn projected_attributes(table: &Table, index: Option<&str>) -> Option<BTreeSet<String>> {
-    let index = index?;
+pub fn projected_attributes(table: &Table, index: Option<&str>) -> Option<BTreeSet<String>> {    let index = index?;
     let (key_schema, projection) = index_shape(table, index)?;
     let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
     if projection_type == "ALL" {
@@ -1853,11 +2054,13 @@ pub fn singleton_key(table: &Table, predicate: &Predicate) -> Result<ItemKey, Re
     let mut key = Item::new();
     for element in &table.key_schema {
         let Some(value) = pinned.get(&element.attribute_name) else {
-            return Err(statement_refused(&format!(
-                "the WHERE clause of a statement that addresses one item must state an \
-                 equality on the key attribute {}",
-                element.attribute_name
-            )));
+            // AWS's own sentence for this fact, and the whole of it is fixed: the rule
+            // is about the clause as a whole — every key attribute pinned by equality —
+            // so the refusal names no one attribute.
+            return Err(RequestError::Validation(
+                "Where clause does not contain a mandatory equality on all key attributes"
+                    .to_string(),
+            ));
         };
         key.insert(element.attribute_name.clone(), value.clone());
     }

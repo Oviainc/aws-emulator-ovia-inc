@@ -292,8 +292,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
         let region = crate::state::request_region(ctx.parts());
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
         // A request that asks for no change is permanently invalid, whatever the
         // table's status, so it is refused before the table is even looked up: a
@@ -417,8 +417,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
         let declared = merged_definitions(table, &declared_definitions);
-        let indexes = resolve_indexes(table, &billing_mode, &declared, &index_updates, now)
-            .map_err(lift)?;
+        let indexes = resolve_indexes(
+            table,
+            &billing_mode,
+            &declared,
+            &declared_definitions,
+            &index_updates,
+            now,
+        )
+        .map_err(lift)?;
         // The table's vector indexes after the update, resolved against the STORED ones:
         // a `Delete` naming an index the table does not carry refuses the whole update
         // here, before anything is written.
@@ -681,6 +688,7 @@ fn requested_stream_change(
         match crate::state::stream_view_type(
             specification,
             crate::state::STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE,
+            crate::state::STREAM_VIEW_TYPE_FORBIDDEN_ON_UPDATE,
         )? {
             Some(view_type) => StreamRequest::Enable(view_type.to_string()),
             None => StreamRequest::Disable,
@@ -1172,6 +1180,40 @@ fn retained_definitions(
         .collect())
 }
 
+/// Every attribute an index this request CREATES keys on must be declared BY THIS
+/// REQUEST: "If you are adding a new global secondary index to the table,
+/// AttributeDefinitions must include the key element(s) of the new index"
+/// (`UpdateTable$AttributeDefinitions`).
+///
+/// The list the rule is about is the one the REQUEST carries, not the one the table
+/// already holds: the sentence is that `AttributeDefinitions` must include the new
+/// index's key elements, so an update that leaves the member out — or leaves one of the
+/// new key attributes out of it — has not declared the index's key, whatever the table
+/// happens to define already. AWS states it as a parameter-value sentence naming the
+/// INDEX whose definitions are missing, since an update addresses one index at a time,
+/// and the rest of the sentence is fixed.
+fn check_index_definitions(
+    index_name: &str,
+    key_schema: &[KeySchemaElement],
+    requested_definitions: &[AttributeDefinition],
+) -> Result<(), crate::state::RequestError> {
+    let declared = |name: &str| {
+        requested_definitions
+            .iter()
+            .any(|definition| definition.attribute_name == name)
+    };
+    if key_schema
+        .iter()
+        .all(|element| declared(&element.attribute_name))
+    {
+        return Ok(());
+    }
+    Err(crate::state::RequestError::Validation(format!(
+        "One or more parameter values were invalid: AttributeDefinitions is not specified for \
+         index: {index_name}"
+    )))
+}
+
 /// The table's global secondary indexes after the update.
 ///
 /// A `Create` adds one (reported `CREATING` until the clock makes it `ACTIVE`), a
@@ -1182,6 +1224,7 @@ fn resolve_indexes(
     table: &crate::state::Table,
     billing_mode: &str,
     definitions: &[AttributeDefinition],
+    requested_definitions: &[AttributeDefinition],
     updates: &[GlobalSecondaryIndexUpdate],
     now: ::std::time::SystemTime,
 ) -> Result<Vec<crate::state::GlobalSecondaryIndex>, crate::state::RequestError> {
@@ -1217,6 +1260,11 @@ fn resolve_indexes(
                     crate::state::MAX_GLOBAL_SECONDARY_INDEXES
                 )));
             }
+            check_index_definitions(
+                &create.index_name,
+                &create.key_schema,
+                requested_definitions,
+            )?;
             super::create_table::validated_index_key_schema(
                 &create.index_name,
                 &create.key_schema,

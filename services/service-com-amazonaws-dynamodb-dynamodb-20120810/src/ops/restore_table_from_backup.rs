@@ -211,8 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::check_backup_arn`]); the target table is NAMED, and the name is
         // held to the form every table name takes.
         crate::state::check_backup_arn(&input.backup_arn, &region).map_err(lift)?;
-        let target =
-            crate::state::resolve_table_name(&input.target_table_name).map_err(lift)?;
+        let target = crate::state::resolve_table_name_in(&input.target_table_name, &region)
+            .map_err(lift)?;
         // Every caller-sized list this request carries is clamped BEFORE anything walks
         // it, so the work below is bounded by constants rather than by the request body.
         clamped_overrides(&input).map_err(lift)?;

@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
         // "For UpdateItem, the valid values are: NONE ... ALL_OLD ... UPDATED_OLD ...
         // ALL_NEW ... UPDATED_NEW" (`UpdateItem$ReturnValues`) — every value the
@@ -328,6 +328,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
         );
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both: the whole of each side is
+        // named, and the check runs before either side is read.
+        crate::state::check_expression_parameter_mix(
+            &[
+                (
+                    "AttributeUpdates",
+                    input
+                        .attribute_updates
+                        .as_ref()
+                        .is_some_and(|map| !map.is_empty()),
+                ),
+                (
+                    "Expected",
+                    input.expected.as_ref().is_some_and(|map| !map.is_empty()),
+                ),
+                (
+                    "ConditionalOperator",
+                    input.conditional_operator.is_some(),
+                ),
+            ],
+            &[
+                ("UpdateExpression", input.update_expression.is_some()),
+                ("ConditionExpression", input.condition_expression.is_some()),
+            ],
+        )
+        .map_err(lift)?;
         // Every token the request DEFINES must be one an expression uses: an unused
         // entry of either substitution table makes the whole request invalid.
         substitutions
@@ -364,6 +391,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .filter(|updates| !updates.is_empty());
         let update = match (input.update_expression.as_deref(), legacy_updates) {
+            // Both generations at once has already been refused over the whole of each
+            // side ([`crate::state::check_expression_parameter_mix`]); the arm stays
+            // total rather than unreachable.
             (Some(_), Some(_)) => {
                 return Err(lift(crate::state::expression_conflict(
                     "AttributeUpdates",

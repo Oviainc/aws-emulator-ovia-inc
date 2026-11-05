@@ -11,6 +11,8 @@
 //! still names them `crate::state::…`.
 
 use super::*;
+mod operands;
+pub use operands::*;
 
 /// The most any one expression member may carry: "Maximum length of any expression
 /// string is 4 KB" ("Service, Account, and Table Quotas"), plus the ceilings on the
@@ -228,22 +230,43 @@ pub fn expression_syntax_error_at(member: &str, token: &str, near: &str) -> Requ
 }
 
 /// The same refusal for a CHARACTER the lexer cannot read: the character is the token,
-/// and the whitespace-delimited run it sits in is the text around it.
+/// and the text around it is the run it sits in together with the run before it.
+///
+/// That is the same WINDOW the parser's own refusals state ([`token_window`]) — the
+/// token before the offending one and the offending one itself — so one expression
+/// earns the same shape of message whether the lexer or the parser stopped on it, and a
+/// caller reading `near` sees where in the expression to look rather than one isolated
+/// run.
 pub fn lexical_syntax_error(member: &str, characters: &[char], at: usize) -> RequestError {
+    let at = at.min(characters.len());
     let token = characters
         .get(at)
         .map_or_else(|| END_OF_EXPRESSION_TOKEN.to_string(), |c| c.to_string());
-    let start = characters[..at.min(characters.len())]
+    let run_start = characters[..at]
         .iter()
         .rposition(|c| c.is_whitespace())
         .map_or(0, |index| index + 1);
     let end = characters
         .iter()
         .enumerate()
-        .skip(at.min(characters.len()))
+        .skip(at)
         .find(|(_, c)| c.is_whitespace())
         .map_or(characters.len(), |(index, _)| index);
-    let near: String = characters[start..end.max(start)].iter().collect();
+    let current: String = characters[run_start..end.max(run_start)].iter().collect();
+    let near = match characters[..run_start]
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+    {
+        Some(last) => {
+            let start = characters[..=last]
+                .iter()
+                .rposition(|c| c.is_whitespace())
+                .map_or(0, |index| index + 1);
+            let previous: String = characters[start..=last].iter().collect();
+            format!("{previous} {current}")
+        }
+        None => current,
+    };
     expression_syntax_error_at(member, &token, &near)
 }
 
@@ -420,11 +443,43 @@ pub fn tokenize_expression(
     member: &str,
     expression: &str,
 ) -> Result<Vec<ExprToken>, RequestError> {
+    tokenize_expression_spanned(member, expression).map(|read| read.tokens)
+}
+
+/// One expression as it was READ: its tokens, its characters, and where in those
+/// characters each token sits.
+///
+/// The spans are what lets a refusal quote the expression as the REQUEST spelled it
+/// ([`ExprParser::near_text`]) rather than re-rendering its tokens: `a == :v` and
+/// `a = = :v` are the same tokens and different text, and the text is what the caller
+/// sent and has to find the mistake in.
+pub struct TokenizedExpression {
+    pub tokens: Vec<ExprToken>,
+    characters: Vec<char>,
+    spans: Vec<(usize, usize)>,
+}
+
+impl TokenizedExpression {
+    /// The characters and token spans a parser quotes the source through.
+    fn source(&self) -> ExpressionSource<'_> {
+        ExpressionSource {
+            characters: &self.characters,
+            spans: &self.spans,
+        }
+    }
+}
+
+/// [`tokenize_expression`], keeping where each token sat in the expression's text.
+pub fn tokenize_expression_spanned(
+    member: &str,
+    expression: &str,
+) -> Result<TokenizedExpression, RequestError> {
     if expression.len() > MAX_EXPRESSION_BYTES {
         return Err(expression_size_exceeded(member));
     }
     let characters: Vec<char> = expression.chars().collect();
     let mut tokens = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut at = 0;
     while at < characters.len() {
         if tokens.len() >= MAX_EXPRESSION_TOKENS {
@@ -433,6 +488,8 @@ pub fn tokenize_expression(
             )));
         }
         let character = characters[at];
+        let opened = tokens.len();
+        let start = at;
         match character {
             c if c.is_whitespace() => at += 1,
             '(' => {
@@ -516,11 +573,25 @@ pub fn tokenize_expression(
             }
             _ => return Err(lexical_syntax_error(member, &characters, at)),
         }
+        // Exactly one token per pass, or none for a run of whitespace.
+        if tokens.len() > opened {
+            spans.push((start, at));
+        }
     }
     if tokens.is_empty() {
-        return Err(lexical_syntax_error(member, &characters, characters.len()));
+        // An expression member carrying nothing but whitespace states no expression at
+        // all, which is a different fact from one whose text the parser stopped inside:
+        // AWS says the member is empty rather than pointing at a token.
+        return Err(invalid_expression_member(
+            member,
+            "The expression can not be empty;",
+        ));
     }
-    Ok(tokens)
+    Ok(TokenizedExpression {
+        tokens,
+        characters,
+        spans,
+    })
 }
 
 /// The substitution tables an expression resolves its names and values through:
@@ -584,6 +655,7 @@ impl<'a> Substitutions<'a> {
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
+        self.check_tables_not_empty()?;
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut values: BTreeSet<String> = BTreeSet::new();
         for (member, expression) in expressions {
@@ -622,6 +694,49 @@ impl<'a> Substitutions<'a> {
         check_referenced("ExpressionAttributeNames", self.names, &names, enveloped)?;
         check_referenced("ExpressionAttributeValues", self.values, &values, enveloped)
     }
+
+    /// A substitution table the request SENT must define something, and every name it
+    /// defines must BE a name.
+    ///
+    /// Both members exist to be substituted into, so a table sent with no entries
+    /// states nothing an expression could use: it is a member whose value breaks the
+    /// rule for that member, which is what the validation envelope reports. A request
+    /// that sends no table at all is a different thing and is not refused here —
+    /// absence is how an expression that needs no substitution is spelled.
+    ///
+    /// An entry of the NAMES table whose value is empty names no attribute at all, so
+    /// the token could resolve to nothing: the table carries an invalid value, and the
+    /// refusal says which key it sits under.
+    fn check_tables_not_empty(&self) -> Result<(), RequestError> {
+        if self.names.is_some_and(HashMap::is_empty) {
+            return Err(empty_substitution_table("ExpressionAttributeNames"));
+        }
+        if self.values.is_some_and(HashMap::is_empty) {
+            return Err(empty_substitution_table("ExpressionAttributeValues"));
+        }
+        // One stable order over a map, so the same request earns the same message.
+        let mut empty: Vec<&str> = self
+            .names
+            .into_iter()
+            .flatten()
+            .filter(|(_, name)| name.is_empty())
+            .map(|(alias, _)| alias.as_str())
+            .collect();
+        empty.sort_unstable();
+        if let Some(alias) = empty.first() {
+            return Err(RequestError::Validation(format!(
+                "ExpressionAttributeNames contains invalid value: Empty attribute name for key \
+                 {alias}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The refusal for a substitution table sent with no entries: AWS's own clause, naming
+/// the member, inside the validation envelope every refusal of a member's VALUE carries.
+pub(super) fn empty_substitution_table(member: &str) -> RequestError {
+    refused(format!("{member} must not be empty"))
 }
 
 /// Refuse one substitution table that defines a key no expression referenced.
@@ -1048,14 +1163,21 @@ pub(super) fn incorrect_operand_type(
 
 /// The limits every attribute value this service stores — or compares a stored one
 /// against — is held to: the documented nesting depth, the documented 400 KB item size
-/// (no ONE value can be larger than the item that must hold it), and
-/// [`MAX_COLLECTION_MEMBERS`] over the sets, lists and maps the value carries.
+/// (no ONE value can be larger than the item that must hold it),
+/// [`MAX_COLLECTION_MEMBERS`] over the sets, lists and maps the value carries, and the
+/// documented rules for the value's own TYPE (the numeric domain and the set rules).
 ///
 /// Every term comes from the request, and every one bounds work done per request later
 /// (the walk over a value, the clone of it into the item, the set and list operations
 /// over its members), so every value is held to them at admission — on every write
 /// path, for every substituted expression value, AND for every value an update computes
 /// before it is written.
+///
+/// The TYPE rules are checked here as well, so they hold for every value a request
+/// carries and not only for the ones a write stores: a number outside the documented
+/// precision or exponent range, and a set that is empty or lists one value twice, are
+/// refused whether the value arrived in an item, in `ExpressionAttributeValues`, in a
+/// statement's `Parameters` or in a key.
 pub fn check_attribute_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
     if attribute_depth_exceeds(value, MAX_ATTRIBUTE_DEPTH) {
         return Err(nesting_levels_exceeded());
@@ -1071,7 +1193,64 @@ pub fn check_attribute_value(name: &str, value: &AttributeValue) -> Result<(), R
     if value_members(value) > MAX_COLLECTION_MEMBERS {
         return Err(too_many_members(name, value_members(value)));
     }
+    check_value_rules(value)?;
     Ok(())
+}
+
+/// The same limits for a value an expression of a READ binds — a `Scan`'s or a
+/// `Query`'s `ExpressionAttributeValues` entry — stated as its own sentence.
+///
+/// Which FORM a refusal takes follows the member the request states its intent through
+/// ([`envelopes_expression_refusals`]): the members a write states its intent through
+/// carry the `<N> validation error(s) detected: ` envelope, and the members a read
+/// narrows its result with do not. The rules themselves are the same
+/// ([`check_attribute_value`]).
+pub fn check_bare_attribute_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
+    check_attribute_value(name, value).map_err(without_envelope)
+}
+
+/// The same limits for a value a STATEMENT carries — a `?` parameter or a literal the
+/// statement spells — stated as its own sentence rather than inside the validation
+/// envelope.
+///
+/// The rules are the same ([`check_attribute_value`]); what differs is the FORM the
+/// service states them in, which follows the surface the value arrived through: the
+/// item API validates its members and reports clauses inside the
+/// `<N> validation error(s) detected: ` envelope, while the statement surface answers
+/// the clause on its own, the way it answers every other refusal about a statement, and
+/// states no separator for a value it has nothing to echo after it.
+pub fn check_statement_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
+    check_attribute_value(name, value)
+        .map_err(without_envelope)
+        .map_err(without_empty_echo)
+}
+
+/// A clause whose echoed value was empty, with the separator that would have introduced
+/// it dropped: the statement surface states the sentence alone rather than one ending in
+/// a dangling `: `.
+fn without_empty_echo(error: RequestError) -> RequestError {
+    match error {
+        RequestError::Validation(message) => RequestError::Validation(
+            message
+                .strip_suffix(": ")
+                .map_or(message.clone(), str::to_string),
+        ),
+        other => other,
+    }
+}
+
+/// One clause taken back out of the validation envelope [`validation_message`] put it
+/// in: the inverse of that rendering, for a surface that states its clauses bare.
+fn without_envelope(error: RequestError) -> RequestError {
+    const ONE_CLAUSE: &str = "1 validation error detected: ";
+    match error {
+        RequestError::Validation(message) => RequestError::Validation(
+            message
+                .strip_prefix(ONE_CLAUSE)
+                .map_or(message.clone(), str::to_string),
+        ),
+        other => other,
+    }
 }
 
 /// The TOTAL members every collection inside `value` carries, summed — the stricter of
@@ -1433,8 +1612,8 @@ impl ParsedCondition {
         expression: &str,
         substitutions: Substitutions<'_>,
     ) -> Result<Self, RequestError> {
-        let tokens = tokenize_expression(member, expression)?;
-        let mut parser = ExprParser::new(member, &tokens, substitutions);
+        let read = tokenize_expression_spanned(member, expression)?;
+        let mut parser = ExprParser::over(member, &read, substitutions);
         let node = parser.disjunction()?;
         if !parser.at_end() {
             return Err(parser.syntax());
@@ -1740,8 +1919,8 @@ impl ParsedUpdate {
         expression: &str,
         substitutions: Substitutions<'_>,
     ) -> Result<Self, RequestError> {
-        let tokens = tokenize_expression(member, expression)?;
-        let mut parser = ExprParser::new(member, &tokens, substitutions);
+        let read = tokenize_expression_spanned(member, expression)?;
+        let mut parser = ExprParser::over(member, &read, substitutions);
         let actions = parser.update_actions()?;
         Self::from_actions(member, actions)
     }
@@ -2119,6 +2298,14 @@ pub(super) fn evaluate_set_operand(
     }
 }
 
+/// One expression's own text, with the span of each token in it: what a refusal quotes
+/// the expression through.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExpressionSource<'a> {
+    characters: &'a [char],
+    spans: &'a [(usize, usize)],
+}
+
 /// Recursive-descent parser over the tokens of one expression.
 ///
 /// `depth` caps how far the rules that descend may: the nesting is caller-chosen, so
@@ -2130,6 +2317,10 @@ pub(super) struct ExprParser<'a> {
     pub(super) at: usize,
     pub(super) depth: usize,
     pub(super) substitutions: Substitutions<'a>,
+    /// The expression's own characters and the span of each token in them, when the
+    /// caller read the expression through [`tokenize_expression_spanned`]: what lets a
+    /// refusal quote the text the request sent.
+    source: Option<ExpressionSource<'a>>,
 }
 
 impl<'a> ExprParser<'a> {
@@ -2140,6 +2331,20 @@ impl<'a> ExprParser<'a> {
             at: 0,
             depth: 0,
             substitutions,
+            source: None,
+        }
+    }
+
+    /// The same parser over an expression that was read WITH its text, so its refusals
+    /// quote the expression as the request spelled it.
+    pub(super) fn over(
+        member: &'static str,
+        read: &'a TokenizedExpression,
+        substitutions: Substitutions<'a>,
+    ) -> Self {
+        Self {
+            source: Some(read.source()),
+            ..Self::new(member, &read.tokens, substitutions)
         }
     }
 
@@ -2156,9 +2361,27 @@ impl<'a> ExprParser<'a> {
     }
 
     /// The expression text around that token: the token before it, the token itself
-    /// (there is none past the end) and the token after, as the expression wrote them.
+    /// (there is none past the end) and the token after.
+    ///
+    /// Quoted from the expression's OWN TEXT where the caller kept it, so the spacing
+    /// is the request's: `a == :v` reads back as `== :v` rather than as the two `=`
+    /// tokens re-rendered with a space between them. Without the text the window is
+    /// rendered from the tokens ([`token_window`]).
     pub(super) fn near_text(&self) -> String {
-        token_window(self.tokens, self.at)
+        let Some(ExpressionSource { characters, spans }) = self.source else {
+            return token_window(self.tokens, self.at);
+        };
+        let Some(last_token) = spans.len().checked_sub(1) else {
+            return String::new();
+        };
+        let first = self.at.saturating_sub(1).min(last_token);
+        let last = (self.at + 1).min(last_token);
+        let start = spans.get(first).map_or(0, |span| span.0);
+        let end = spans.get(last).map_or(start, |span| span.1);
+        characters
+            .get(start..end.max(start))
+            .map(|window| window.iter().collect())
+            .unwrap_or_default()
     }
 
     /// The attribute name an `#alias` stands for, with an undefined alias refused by
@@ -2267,6 +2490,20 @@ impl<'a> ExprParser<'a> {
 
     /// One attribute name of a path, written out or behind an `#alias`.
     pub(super) fn path_name(&mut self) -> Result<String, RequestError> {
+        // A bare word in an expression is an attribute NAME, and a name does not begin
+        // with a digit: "the first character must be a-z, A-Z, or 0-9" bounds a stored
+        // attribute name, but an expression reaches one that cannot be written plainly
+        // through `ExpressionAttributeNames` instead ("To access an attribute whose name
+        // conflicts with a DynamoDB reserved word" — that member's doc). So a token that
+        // begins with a digit is a numeric LITERAL, which the expression language has no
+        // place for — every value it compares against is a `:placeholder` — and the
+        // expression stops at it as the syntax error it is, before the name is read.
+        if self
+            .peek()
+            .is_some_and(|token| matches!(token, ExprToken::Word(word) if starts_with_digit(word)))
+        {
+            return Err(self.syntax());
+        }
         match self.next_token()? {
             ExprToken::Word(word) => {
                 if is_reserved_word(&word) {
@@ -2367,12 +2604,16 @@ impl<'a> ExprParser<'a> {
             "attribute_type" => {
                 let path = self.path()?;
                 self.expect(&ExprToken::Comma)?;
-                ConditionNode::AttributeType(path, self.operand()?)
+                let wanted = self.operand()?;
+                check_attribute_type_name(self.member, &wanted)?;
+                ConditionNode::AttributeType(path, wanted)
             }
             "begins_with" => {
                 let value = self.operand()?;
                 self.expect(&ExprToken::Comma)?;
-                ConditionNode::BeginsWith(value, self.operand()?)
+                let prefix = self.operand()?;
+                check_begins_with_prefix(self.member, &prefix)?;
+                ConditionNode::BeginsWith(value, prefix)
             }
             "contains" => {
                 let haystack = self.operand()?;
@@ -2507,10 +2748,51 @@ impl<'a> ExprParser<'a> {
 /// envelope: it is not a constraint on one member's value but a contradiction between
 /// two of them, and AWS states it as its own sentence.
 pub fn expression_conflict(legacy: &str, expression: &str) -> RequestError {
+    expression_conflict_between(&[legacy], &[expression])
+}
+
+/// The same refusal over the WHOLE of each side: every non-expression member the request
+/// carried and every expression member it carried.
+///
+/// The rule is about the two generations of parameters, not about one pair of them: "This
+/// is a legacy parameter. Use <the expression member> instead" is said of each legacy
+/// member, so a request that mixes ANY of them with ANY expression member states its
+/// intent two ways at once and is refused — naming both whole sets, as AWS does, so a
+/// caller sees every member it has to drop rather than one pair at a time. Each side is
+/// listed in the order the model declares its members.
+pub fn expression_conflict_between(legacy: &[&str], expression: &[&str]) -> RequestError {
     RequestError::Validation(format!(
         "Can not use both expression and non-expression parameters in the same request: \
-         Non-expression parameters: {{{legacy}}} Expression parameters: {{{expression}}}"
+         Non-expression parameters: {{{}}} Expression parameters: {{{}}}",
+        legacy.join(", "),
+        expression.join(", ")
     ))
+}
+
+/// Hold a request's two generations of parameters apart: a request that carries at least
+/// one non-expression member AND at least one expression member is refused before either
+/// is read.
+///
+/// Each entry pairs a member's name with whether the request carried it, so the caller
+/// states the members its own operation declares — the legacy ones and the expression
+/// ones — and this states the rule once for all of them.
+pub fn check_expression_parameter_mix(
+    legacy: &[(&str, bool)],
+    expression: &[(&str, bool)],
+) -> Result<(), RequestError> {
+    fn carried<'m>(members: &[(&'m str, bool)]) -> Vec<&'m str> {
+        members
+            .iter()
+            .filter(|(_, sent)| *sent)
+            .map(|(member, _)| *member)
+            .collect()
+    }
+    let legacy = carried(legacy);
+    let expression = carried(expression);
+    if legacy.is_empty() || expression.is_empty() {
+        return Ok(());
+    }
+    Err(expression_conflict_between(&legacy, &expression))
 }
 
 /// Whether the condition a conditional write states is satisfied by the stored item.
@@ -2607,9 +2889,19 @@ pub(super) fn expected_entry_satisfied(
     if (comparison.is_some() || operands.is_some())
         && (condition.value.is_some() || condition.exists.is_some())
     {
-        return Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: Value and Exists can not be used with \
-             AttributeValueList and ComparisonOperator for attribute {name}"
+        // The two generations of this member are incompatible, and AWS names the pair
+        // the request stated its condition through twice: the EXISTENCE form is
+        // `Exists` beside `ComparisonOperator`, and the VALUE form is `Value` beside
+        // `AttributeValueList`, so the legacy member the request carried decides which
+        // pair the sentence names.
+        let (legacy, newer) = if condition.exists.is_some() {
+            ("Exists", "ComparisonOperator")
+        } else {
+            ("Value", "AttributeValueList")
+        };
+        return Err(refused(format!(
+            "One or more parameter values were invalid: {legacy} and {newer} cannot be used \
+             together for Attribute: {name}"
         )));
     }
     if let Some(operator) = comparison {
@@ -2623,16 +2915,23 @@ pub(super) fn expected_entry_satisfied(
         }
         // "Exists is false but you also provide a Value" is refused, as is an `Exists`
         // of true with nothing to check.
-        (Some(_), Some(false)) => Err(RequestError::Validation(format!(
+        (Some(_), Some(false)) => Err(refused(format!(
             "One or more parameter values were invalid: Value cannot be used when Exists is false \
-             for attribute {name}"
+             for Attribute: {name}"
         ))),
-        (None, Some(true)) => Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: Value must also be used when Exists is \
-             true for attribute {name}"
+        (None, Some(true)) => Err(refused(format!(
+            "One or more parameter values were invalid: Value must be provided when Exists is \
+             true for Attribute: {name}"
         ))),
         (None, Some(false)) => Ok(held.is_none()),
-        (None, None) => Ok(true),
+        // An entry that states NEITHER member expects nothing: `Exists` defaults to
+        // true — "If you supply a Value all by itself, DynamoDB assumes the attribute
+        // exists" — and an expectation that the attribute exists needs the value it is
+        // expected to hold. AWS names `Exists` as the member that was left out.
+        (None, None) => Err(refused(format!(
+            "One or more parameter values were invalid: Value must be provided when Exists is \
+             null for Attribute: {name}"
+        ))),
     }
 }
 

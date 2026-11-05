@@ -364,26 +364,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
-        // A request may not state its filter twice: the legacy `QueryFilter` and
-        // `ConditionalOperator` are what `FilterExpression` replaces ("This is a
-        // legacy parameter. Use FilterExpression instead"), so a request carrying
-        // both is refused the way the service refuses it, before either is read.
-        if input.filter_expression.is_some() {
-            if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
-                return Err(lift(crate::state::expression_conflict(
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both: the whole of each side is
+        // named, and the check runs before either side is read.
+        crate::state::check_expression_parameter_mix(
+            &[
+                (
+                    "AttributesToGet",
+                    input
+                        .attributes_to_get
+                        .as_ref()
+                        .is_some_and(|names| !names.is_empty()),
+                ),
+                (
+                    "KeyConditions",
+                    input
+                        .key_conditions
+                        .as_ref()
+                        .is_some_and(|map| !map.is_empty()),
+                ),
+                (
                     "QueryFilter",
-                    "FilterExpression",
-                )));
-            }
-            if input.conditional_operator.is_some() {
-                return Err(lift(crate::state::expression_conflict(
+                    input
+                        .query_filter
+                        .as_ref()
+                        .is_some_and(|map| !map.is_empty()),
+                ),
+                (
                     "ConditionalOperator",
-                    "FilterExpression",
-                )));
-            }
-        }
+                    input.conditional_operator.is_some(),
+                ),
+            ],
+            &[
+                (
+                    "KeyConditionExpression",
+                    input.key_condition_expression.is_some(),
+                ),
+                ("FilterExpression", input.filter_expression.is_some()),
+                (
+                    PROJECTION_EXPRESSION,
+                    input.projection_expression.is_some(),
+                ),
+            ],
+        )
+        .map_err(lift)?;
         // What each reported item carries is a fact of the REQUEST: the projection it
         // states — in either member — read into the document paths it names, and the
         // `Select` that narrowing has to agree with
@@ -444,6 +470,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ])
         .map_err(lift)?;
+        // A value a key condition or a filter compares against is held to the documented
+        // rules for its type, exactly as a value a write stores is: the rules belong to
+        // the value, not to the surface it arrived through.
+        for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
+            crate::state::check_bare_attribute_value(placeholder, value).map_err(lift)?;
+        }
         // The legacy `QueryFilter` is the one member of this operation that is not
         // served yet, and it is its own gap issue. The guard sits HERE, after every rule
         // above: a request whose defect the service states as a `ValidationException` is
@@ -1042,6 +1074,9 @@ fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::
         .as_ref()
         .filter(|conditions| !conditions.is_empty());
     match (input.key_condition_expression.as_deref(), legacy) {
+        // Both members at once is the two generations stated at once, which
+        // [`crate::state::check_expression_parameter_mix`] has already refused over the
+        // whole of each side; the arm stays total rather than unreachable.
         (Some(_), Some(_)) => Err(crate::state::expression_conflict(
             "KeyConditions",
             "KeyConditionExpression",

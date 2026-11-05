@@ -20,7 +20,7 @@
 //! re-exported up to `crate::state`, so every caller names it `crate::state::…`.
 
 use crate::state::{
-    check_paths_disjoint, merge_reported, path_skeleton, tokenize_expression, DocumentPath,
+    check_paths_disjoint, merge_reported, path_skeleton, tokenize_expression_spanned, DocumentPath,
     ExprParser, ExprToken, Item, PathStep, RequestError, Substitutions, MAX_EXPRESSION_TOKENS,
 };
 
@@ -76,8 +76,8 @@ pub fn projection_expression_paths(
     expression: &str,
     substitutions: Substitutions<'_>,
 ) -> Result<Vec<DocumentPath>, RequestError> {
-    let tokens = tokenize_expression(member, expression)?;
-    let mut parser = ExprParser::new(member, &tokens, substitutions);
+    let read = tokenize_expression_spanned(member, expression)?;
+    let mut parser = ExprParser::over(member, &read, substitutions);
     let mut paths = vec![parser.path()?];
     while parser.eat(&ExprToken::Comma) {
         paths.push(parser.path()?);

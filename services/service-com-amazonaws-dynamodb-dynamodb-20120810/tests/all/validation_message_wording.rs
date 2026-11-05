@@ -322,9 +322,7 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
             "a required member the request does not carry",
             "GetItem",
             json!({"Key": {"Artist": {"S": "Acme"}}}),
-            "1 validation error detected: Value null at 'TableName' failed to satisfy constraint: \
-             Member must not be null"
-                .to_string(),
+            "The parameter 'TableName' is required but was not present in the request".to_string(),
         ),
         (
             "a table name one below the documented 3-character minimum",

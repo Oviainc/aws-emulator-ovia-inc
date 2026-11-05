@@ -482,12 +482,29 @@ fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
 ///
 /// `None` declines the whole refusal — see [`requirement`].
 fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    // A required member the request did not carry at all is stated as its OWN sentence,
+    // naming the parameter as the model spells it. The envelope states clauses about
+    // VALUES a request carried, and an absent member carried none, so what the service
+    // reports is the parameter that is missing rather than a constraint some value
+    // failed. Several missing members have no recorded single sentence, so they keep the
+    // envelope's one-clause-per-member form.
+    if let [violation] = violations {
+        if matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+            return Some(missing_parameter(&wire_member_path(&violation.path)));
+        }
+    }
     let form = served_clause_form();
     let clauses: Vec<String> = violations
         .iter()
         .map(|violation| violation_clause(violation, form))
         .collect::<Option<Vec<_>>>()?;
     crate::state::validation_message(clauses)
+}
+
+/// AWS's sentence for a required parameter the request did not carry: the whole text is
+/// fixed around the member's own name, spelled as the model spells it on the wire.
+fn missing_parameter(member: &str) -> String {
+    format!("The parameter '{member}' is required but was not present in the request")
 }
 
 /// The service key `::emulator_server::service_from_target` reads out of a

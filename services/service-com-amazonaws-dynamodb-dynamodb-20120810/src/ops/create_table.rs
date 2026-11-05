@@ -281,7 +281,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let region = crate::state::request_region(ctx.parts());
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
         // Every list this request carries is clamped BEFORE anything walks it, so the
         // work that follows is bounded by constants rather than by the request body.
@@ -316,6 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(specification) => crate::state::stream_view_type(
                 specification,
                 crate::state::STREAM_VIEW_TYPE_REQUIRED,
+                crate::state::STREAM_VIEW_TYPE_FORBIDDEN_ON_CREATE,
             )
             .map_err(lift)?
             .map(str::to_string),
@@ -768,6 +770,37 @@ fn element_ordinal(position: usize) -> String {
         .map_or_else(|| (position + 1).to_string(), |word| (*word).to_string())
 }
 
+/// Refuse a key schema that names one attribute in more than one of its elements.
+///
+/// Each element of a key schema addresses a DIFFERENT attribute of the item: a key of
+/// one attribute is a partition key, and a composite key is "another KeySchemaElement
+/// for the sort key" (`CreateTable$KeySchema`) — so one attribute cannot be both, and a
+/// schema that uses it twice leaves one element with nothing of its own to key on.
+///
+/// DynamoDB states that fact with a fixed sentence per schema KIND, which is what
+/// `duplicated` carries: the recorded refusal for a TABLE's own primary key states the
+/// key-definition sentence ([`UNDEFINED_TABLE_KEY_MESSAGE`]) and the one for a secondary
+/// index names the two roles ([`DUPLICATE_INDEX_KEY_ATTRIBUTE_MESSAGE`]).
+fn check_distinct_key_attributes(
+    key_schema: &[KeySchemaElement],
+    duplicated: &str,
+) -> Result<(), crate::state::RequestError> {
+    let mut named: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+    for element in key_schema {
+        if !named.insert(element.attribute_name.as_str()) {
+            return Err(crate::state::RequestError::Validation(
+                duplicated.to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// AWS's fixed text for a SECONDARY INDEX key schema whose partition key and sort key
+/// are one attribute.
+pub(crate) const DUPLICATE_INDEX_KEY_ATTRIBUTE_MESSAGE: &str =
+    "Both the Hash Key and the Range Key element in the KeySchema have the same name";
+
 /// Refuse a key schema whose element at some position does not carry the key type that
 /// position requires, naming that element the way DynamoDB does.
 ///
@@ -838,6 +871,11 @@ fn validated_key_schema(
     // composite, "another KeySchemaElement for the sort key": position 1 holds the only
     // HASH element and position 2, when present, the only RANGE one.
     validated_key_type_order(None, &key_schema, crate::state::MAX_TABLE_PARTITION_KEYS)?;
+    // Each element of the key addresses a DIFFERENT attribute, which is settled over the
+    // SCHEMA before its elements are paired with their definitions: a schema that uses
+    // one attribute twice leaves an element with nothing of its own to key on, which is
+    // the fact DynamoDB states for a TABLE's own key with the sentence below.
+    check_distinct_key_attributes(&key_schema, UNDEFINED_TABLE_KEY_MESSAGE)?;
     for element in &key_schema {
         let name = element.attribute_name.as_str();
         let Some(definition) = definitions
@@ -1174,12 +1212,21 @@ pub(crate) fn validated_index_key_schema(
             )));
         }
     }
+    check_distinct_key_attributes(key_schema, DUPLICATE_INDEX_KEY_ATTRIBUTE_MESSAGE)?;
     Ok(())
 }
 
 /// One index's projection: `ProjectionType` must be a value the model's enum names,
-/// and `NonKeyAttributes` belongs to `INCLUDE` alone — "This limit only applies when
-/// you specify the ProjectionType of INCLUDE" (`Projection$NonKeyAttributes`).
+/// and `NonKeyAttributes` and `INCLUDE` require each other — "INCLUDE - Only the
+/// specified table attributes are projected into the index. The list of projected
+/// attributes is in NonKeyAttributes" and "This limit only applies when you specify the
+/// ProjectionType of INCLUDE" (`Projection$ProjectionType` /
+/// `Projection$NonKeyAttributes`).
+///
+/// So the member pair is checked BOTH ways: a projection that names non-key attributes
+/// under another type projects something no type projects, and an `INCLUDE` projection
+/// that names none states which attributes are projected nowhere. Either way the index
+/// cannot be built as asked for, so the request is refused before any of it is stored.
 pub(crate) fn validated_projection(
     index_name: &str,
     projection: &Projection,
@@ -1201,8 +1248,20 @@ pub(crate) fn validated_projection(
              with a ProjectionType of INCLUDE"
         )));
     }
+    if !non_key && projection_type == "INCLUDE" {
+        return Err(crate::state::RequestError::Validation(
+            INCLUDE_WITHOUT_NON_KEY_ATTRIBUTES_MESSAGE.to_string(),
+        ));
+    }
     Ok(())
 }
+
+/// AWS's fixed text for an `INCLUDE` projection that names no `NonKeyAttributes`: the
+/// whole sentence is fixed, naming the two members rather than the index — the pair is
+/// what contradicts itself, and it reads the same for every index of every table.
+pub(crate) const INCLUDE_WITHOUT_NON_KEY_ATTRIBUTES_MESSAGE: &str =
+    "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes \
+     is not specified";
 
 /// AWS's fixed text for a TABLE whose own `KeySchema` names an attribute
 /// `AttributeDefinitions` does not declare — "The attributes in KeySchema must also be

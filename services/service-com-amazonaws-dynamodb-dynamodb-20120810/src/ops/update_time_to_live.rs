@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored name. `Enabled` and `AttributeName` are both required and the name's
         // 1..255 length is the MODEL's own, so a request that omits or oversizes either
         // is already refused before this handler runs.
-        let name = crate::state::resolve_table_name(&input.table_name)
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region)
             .map_err(|error| lift(&input.table_name, error))?;
         let specification = input.time_to_live_specification.clone();
 

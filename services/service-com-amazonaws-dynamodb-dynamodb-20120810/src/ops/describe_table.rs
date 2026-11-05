@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
         // How much of the table's creation the clock still owes when this poll lands
         // ([`crate::state::Table::creation_settles_in`]). The store guard is dropped with

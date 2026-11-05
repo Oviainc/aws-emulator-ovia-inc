@@ -399,16 +399,15 @@ async fn a_stream_is_readable_only_once_the_table_behind_it_takes_writes() {
 #[tokio::test]
 async fn a_table_that_enables_no_stream_has_none() {
     // A create that says nothing about streams and one that explicitly turns them
-    // off are the same table: no stream, nothing reported, nothing to discover.
+    // off are the same table: no stream, nothing reported, nothing to discover. A
+    // specification that leaves the stream off and still names a view type is not one
+    // of them: it states a setting for a stream it is not asking for and is refused
+    // ([`crate::request_validation_refusals`]).
     for (case, specification) in [
         ("no StreamSpecification", None),
         (
             "StreamEnabled false",
             Some(json!({"StreamEnabled": false})),
-        ),
-        (
-            "StreamEnabled false with a view type",
-            Some(json!({"StreamEnabled": false, "StreamViewType": "NEW_IMAGE"})),
         ),
     ] {
         let router = emulator_with_streams();

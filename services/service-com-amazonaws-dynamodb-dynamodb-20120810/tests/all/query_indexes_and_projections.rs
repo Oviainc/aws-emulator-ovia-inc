@@ -601,14 +601,26 @@ async fn a_projection_reports_exactly_the_paths_it_names() {
         // narrowed item.
         let mut queried = Map::new();
         queried.insert("TableName".to_string(), json!(SOLO));
-        queried.insert(
-            "KeyConditionExpression".to_string(),
-            json!("pk = :p"),
-        );
-        queried.insert(
-            "ExpressionAttributeValues".to_string(),
-            json!({":p": {"S": "only"}}),
-        );
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both, so the row that projects
+        // through the legacy member states its key condition the legacy way too: the
+        // same one partition either way.
+        if case.projection.get("AttributesToGet").is_some() {
+            queried.insert(
+                "KeyConditions".to_string(),
+                json!({"pk": {"ComparisonOperator": "EQ",
+                              "AttributeValueList": [{"S": "only"}]}}),
+            );
+        } else {
+            queried.insert(
+                "KeyConditionExpression".to_string(),
+                json!("pk = :p"),
+            );
+            queried.insert(
+                "ExpressionAttributeValues".to_string(),
+                json!({":p": {"S": "only"}}),
+            );
+        }
         let mut scanned = Map::new();
         scanned.insert("TableName".to_string(), json!(SOLO));
         for (name, value) in case.projection.as_object().into_iter().flatten() {
@@ -677,8 +689,9 @@ async fn a_projection_is_bounded_in_the_number_of_attributes_it_names() {
         (
             "one past the bound on a query's legacy member",
             "Query",
-            json!({"TableName": SOLO, "KeyConditionExpression": "pk = :p",
-                   "ExpressionAttributeValues": {":p": {"S": "only"}},
+            json!({"TableName": SOLO,
+                   "KeyConditions": {"pk": {"ComparisonOperator": "EQ",
+                                            "AttributeValueList": [{"S": "only"}]}},
                    "AttributesToGet": names(MAX_PROJECTED_PATHS + 1)}),
         ),
     ] {
@@ -938,7 +951,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             ),
             message: "Can not use both expression and non-expression parameters in the same \
                       request: Non-expression parameters: {AttributesToGet} Expression \
-                      parameters: {ProjectionExpression}"
+                      parameters: {KeyConditionExpression, ProjectionExpression}"
                 .to_string(),
         },
     ]

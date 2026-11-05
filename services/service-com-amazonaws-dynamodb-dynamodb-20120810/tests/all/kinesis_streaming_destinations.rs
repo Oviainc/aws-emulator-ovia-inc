@@ -399,12 +399,9 @@ async fn an_update_applies_the_configuration_it_names() {
             Some(json!({"ApproximateCreationDateTimePrecision": "MICROSECOND"})),
             Some("MICROSECOND"),
         ),
-        (
-            "millisecond in force, re-stated",
-            Some("MILLISECOND"),
-            Some(json!({"ApproximateCreationDateTimePrecision": "MILLISECOND"})),
-            Some("MILLISECOND"),
-        ),
+        // A command that RE-STATES the precision already in force asks for no change at
+        // all and is refused rather than applied, so it is not a row of this table: it
+        // is asserted in `crate::request_validation_refusals`.
         (
             "microsecond in force, an empty configuration",
             Some("MICROSECOND"),

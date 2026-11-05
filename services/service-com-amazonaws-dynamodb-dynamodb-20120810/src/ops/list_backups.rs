@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = input
             .table_name
             .as_deref()
-            .map(crate::state::resolve_table_name)
+            .map(|named| crate::state::resolve_table_name_in(named, &region))
             .transpose()
             .map_err(lift)?;
         // "USER - On-demand backup created by you. (The default setting if no other
@@ -185,6 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .backup_type
             .as_deref()
             .unwrap_or(crate::state::DEFAULT_BACKUP_TYPE_FILTER);
+        // "Only backups created after this time are listed" / "before this time"
+        // (`ListBackups$TimeRangeLowerBound`/`$TimeRangeUpperBound`): the two members
+        // have to state a window, so a lower bound after the upper one is refused
+        // before any backup is read.
+        crate::state::check_time_range(
+            input.time_range_lower_bound.as_ref(),
+            input.time_range_upper_bound.as_ref(),
+        )
+        .map_err(lift)?;
 
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting; this is a

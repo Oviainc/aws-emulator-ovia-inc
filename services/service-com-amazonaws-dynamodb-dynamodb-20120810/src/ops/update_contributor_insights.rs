@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
         let index_name = input.index_name.as_deref();
         // Both members are modelled enums, so the request validator has already refused
         // every value outside their sets; the refusals below are what keeps that true of

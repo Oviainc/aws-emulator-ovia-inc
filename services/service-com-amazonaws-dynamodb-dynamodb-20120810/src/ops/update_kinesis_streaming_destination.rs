@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
         // A destination IS a Kinesis data stream, so a value that names no stream
         // addresses no destination of this table.
         crate::state::check_stream_arn(&input.stream_arn).map_err(lift)?;
@@ -202,6 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The refusal below is stated over the table's STORED name, so reading it cannot
         // overlap the borrow of the destination it is looked up for.
         let table_name = table.name.clone();
+        // The no-op refusal names the destination by the table's own id, which is also
+        // read before the record is borrowed.
+        let table_id = table.id.clone();
         // A configuration change addresses a destination RECORD of this table, so a
         // stream it holds no record for is the lookup miss; a record it does hold is
         // refused instead on the status the change requires, because a destination that
@@ -219,6 +222,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(lift(crate::state::kinesis_destination_not_active_to_update(
                 &table_name,
                 &input.stream_arn,
+            )));
+        }
+        // A command that asks for the precision the destination already replicates under
+        // asks for no change at all: the configuration is a VALUE, so re-stating the
+        // value in force is refused rather than answered as an update, which is what a
+        // caller that re-sends the same command depends on seeing.
+        if let Some(asked) =
+            precision.filter(|asked| destination.precision().as_deref() == Some(*asked))
+        {
+            return Err(lift(crate::state::kinesis_precision_unchanged(
+                &table_id,
+                &input.stream_arn,
+                asked,
             )));
         }
         destination.apply_update(precision, now);

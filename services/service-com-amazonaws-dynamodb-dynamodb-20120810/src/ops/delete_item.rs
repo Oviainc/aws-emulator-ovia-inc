@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
         if input.return_values_on_condition_check_failure.is_some()
             && !matches!(
@@ -308,6 +308,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
         );
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both.
+        crate::state::check_expression_parameter_mix(
+            &[
+                (
+                    "Expected",
+                    input.expected.as_ref().is_some_and(|map| !map.is_empty()),
+                ),
+                (
+                    "ConditionalOperator",
+                    input.conditional_operator.is_some(),
+                ),
+            ],
+            &[("ConditionExpression", input.condition_expression.is_some())],
+        )
+        .map_err(lift)?;
         // Every token the request DEFINES must be one an expression uses: an unused
         // entry of either substitution table makes the whole request invalid.
         substitutions

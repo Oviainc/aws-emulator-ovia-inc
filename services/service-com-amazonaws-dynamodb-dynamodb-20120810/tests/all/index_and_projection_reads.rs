@@ -893,12 +893,17 @@ async fn the_legacy_attribute_list_projects_what_the_expression_projects() {
         "case AttributesToGet on BatchGetItem: expected {expected}, got {batch}"
     );
 
+    // The legacy projection is stated beside the legacy key condition and the legacy
+    // filter: a request states its intent through one generation of parameters or the
+    // other, never both, so each row below spells the whole request in the generation
+    // `AttributesToGet` belongs to.
     let queried = ok(
         &router,
         "Query",
         json!({"TableName": TABLE, "AttributesToGet": ["note", "pk"],
-               "KeyConditionExpression": "pk = :p AND sk = :s",
-               "ExpressionAttributeValues": {":p": {"S": "p1"}, ":s": {"S": "a"}}}),
+               "KeyConditions": {
+                   "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "p1"}]},
+                   "sk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}}}),
     )
     .await;
     assert_eq!(
@@ -911,8 +916,8 @@ async fn the_legacy_attribute_list_projects_what_the_expression_projects() {
         &router,
         "Scan",
         json!({"TableName": TABLE, "AttributesToGet": ["note", "pk"],
-               "FilterExpression": "note = :note",
-               "ExpressionAttributeValues": {":note": {"S": "first"}}}),
+               "ScanFilter": {"note": {"ComparisonOperator": "EQ",
+                                       "AttributeValueList": [{"S": "first"}]}}}),
     )
     .await;
     assert_eq!(

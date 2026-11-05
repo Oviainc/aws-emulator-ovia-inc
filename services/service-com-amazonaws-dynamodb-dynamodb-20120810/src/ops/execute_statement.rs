@@ -290,12 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bound the work this request can ask for.
         let parameters = input.parameters.clone().unwrap_or_default();
         for (position, value) in parameters.iter().enumerate() {
-            crate::state::check_attribute_value(&format!("Parameters[{position}]"), value)
+            crate::state::check_statement_value(&format!("Parameters[{position}]"), value)
                 .map_err(lift)?;
         }
         let statement =
             crate::state::parse_statement(&input.statement, &parameters).map_err(lift)?;
-        let name = crate::state::resolve_table_name(statement.table()).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(statement.table(), &region).map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
@@ -393,6 +393,19 @@ fn select_items(
             return Err(crate::scaffolded::Scaffolded::validation(
                 "Strongly consistent read is not supported on Global Secondary Indexes",
             ));
+        }
+        // A predicate is judged against what the SOURCE reports, so a filter on an
+        // attribute the named index does not project could never be decided from it.
+        let unprojected = crate::state::unprojected_filter_attributes(
+            table,
+            Some(index),
+            select.filter.as_ref(),
+        );
+        if !unprojected.is_empty() {
+            return Err(lift(crate::state::unprojected_filter_refusal(
+                index,
+                &unprojected,
+            )));
         }
     }
     // Which low-level plan the statement is served by is decided HERE, from what its

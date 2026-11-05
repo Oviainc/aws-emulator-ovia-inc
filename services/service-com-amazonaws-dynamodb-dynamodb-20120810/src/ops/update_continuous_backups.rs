@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter" (`UpdateContinuousBackups$TableName`), so either form resolves to
         // the stored name. The `RecoveryPeriodInDays` range (1..=35) is the MODEL's own,
         // so a value outside it is already refused before this handler runs.
-        let name = crate::state::resolve_table_name(&input.table_name)
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region)
             .map_err(|error| lift(&input.table_name, error))?;
         let specification = &input.point_in_time_recovery_specification;
 

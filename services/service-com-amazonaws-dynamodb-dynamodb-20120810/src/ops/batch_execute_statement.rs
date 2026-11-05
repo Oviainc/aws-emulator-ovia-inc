@@ -338,7 +338,7 @@ fn parse_slot(
 ) -> Result<crate::state::PartiqlStatement, crate::state::RequestError> {
     let parameters = request.parameters.clone().unwrap_or_default();
     for (position, value) in parameters.iter().enumerate() {
-        crate::state::check_attribute_value(&format!("Parameters[{position}]"), value)?;
+        crate::state::check_statement_value(&format!("Parameters[{position}]"), value)?;
     }
     crate::state::parse_statement(&request.statement, &parameters)
 }
@@ -429,7 +429,7 @@ fn run_slot(
     statement: crate::state::PartiqlStatement,
     requested_capacity: Option<&str>,
 ) -> Result<SlotOutcome, SlotFailure> {
-    let name = crate::state::resolve_table_name(statement.table())?;
+    let name = crate::state::resolve_table_name_in(statement.table(), region)?;
     {
         // A table that is not there, and a table the policies in force do not let this
         // caller act on with this statement's own PartiQL action, are decided before the
@@ -500,7 +500,7 @@ fn check_distinct_write_targets(
     let mut addressed: ::std::collections::BTreeSet<(String, crate::state::ItemKey)> =
         ::std::collections::BTreeSet::new();
     for statement in parsed.iter().flatten() {
-        let Ok(name) = crate::state::resolve_table_name(statement.table()) else {
+        let Ok(name) = crate::state::resolve_table_name_in(statement.table(), region) else {
             continue;
         };
         let Ok(table) = store.active_table(region, &name, now) else {

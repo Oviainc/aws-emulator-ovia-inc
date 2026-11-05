@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can also provide the Amazon Resource Name (ARN) of the table in this
         // parameter" (`DescribeContributorInsights$TableName`), so either form resolves
         // to the stored name.
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
         let index_name = input.index_name.as_deref();
 
         let mut store = state.lock();

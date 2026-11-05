@@ -99,12 +99,18 @@ mod parallel_scan_segment_refusals;
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]
 mod partiql_transactions;
+#[path = "all/probe.rs"]
+mod probe;
+
 #[path = "all/provisioned_read_capacity.rs"]
 mod provisioned_read_capacity;
 #[path = "all/query_indexes_and_projections.rs"]
 mod query_indexes_and_projections;
 #[path = "all/refusal_contracts_and_expression_pre_images.rs"]
 mod refusal_contracts_and_expression_pre_images;
+
+#[path = "all/request_validation_refusals.rs"]
+mod request_validation_refusals;
 
 #[path = "all/region_from_the_request_endpoint.rs"]
 mod region_from_the_request_endpoint;

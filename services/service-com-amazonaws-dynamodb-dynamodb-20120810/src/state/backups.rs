@@ -104,6 +104,31 @@ pub fn within_time_range(
         && upper.is_none_or(|bound| instant < wire_millis(bound))
 }
 
+/// A time range a request names must be a range: its lower bound at or before its upper
+/// one.
+///
+/// A window whose bounds are the wrong way round selects nothing whatever is stored, so
+/// it states no window at all — the request contradicts itself and is refused before
+/// anything is listed, rather than answered with the empty page the inversion would
+/// produce. One bound on its own is a half-open window and bounds the other side of
+/// nothing, so it is a range.
+pub fn check_time_range(
+    lower: Option<&::aws_smithy_types::DateTime>,
+    upper: Option<&::aws_smithy_types::DateTime>,
+) -> Result<(), RequestError> {
+    let (Some(lower), Some(upper)) = (lower, upper) else {
+        return Ok(());
+    };
+    if wire_millis(lower) <= wire_millis(upper) {
+        return Ok(());
+    }
+    Err(RequestError::Validation(
+        "One or more parameter values were invalid: Time range lower bound must be less than or \
+         equal to upper bound"
+            .to_string(),
+    ))
+}
+
 /// How precise an instant this service reports and compares is: whole milliseconds, the
 /// precision an AWS timestamp carries on the wire — and the one DynamoDB's own backup
 /// identifier is built from, since a `BackupArn`'s last segment is the epoch millisecond
@@ -662,3 +687,4 @@ impl Export {
         }
     }
 }
+

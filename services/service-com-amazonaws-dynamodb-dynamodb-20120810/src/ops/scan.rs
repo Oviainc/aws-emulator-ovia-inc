@@ -372,12 +372,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
         // Everything that speaks only about the REQUEST is settled before any table is
         // looked up, so a request that cannot hold together is refused as the client
         // error it is whatever the store holds and whichever members it carries.
         //
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both: the whole of each side is
+        // named, and the check runs before either side is read.
+        crate::state::check_expression_parameter_mix(
+            &[
+                (
+                    "AttributesToGet",
+                    input
+                        .attributes_to_get
+                        .as_ref()
+                        .is_some_and(|names| !names.is_empty()),
+                ),
+                (
+                    "ScanFilter",
+                    input.scan_filter.as_ref().is_some_and(|map| !map.is_empty()),
+                ),
+                (
+                    "ConditionalOperator",
+                    input.conditional_operator.is_some(),
+                ),
+            ],
+            &[
+                ("FilterExpression", input.filter_expression.is_some()),
+                (
+                    "ProjectionExpression",
+                    input.projection_expression.is_some(),
+                ),
+            ],
+        )
+        .map_err(lift)?;
         // "A filter expression is applied after a Scan finishes but before the results
         // are returned" (`Scan$FilterExpression`), stated either in that language or
         // through the legacy map it replaced ([`Filter`]); it is read BEFORE the store
@@ -410,6 +440,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("ProjectionExpression", input.projection_expression.as_deref()),
         ])
         .map_err(lift)?;
+        // A value a filter compares against is held to the documented rules for its
+        // type, exactly as a value a write stores is: the rules belong to the value,
+        // not to the surface it arrived through.
+        for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
+            crate::state::check_bare_attribute_value(placeholder, value).map_err(lift)?;
+        }
         // Which member names the index is a fact of the request, so what each reported
         // item carries is decided here too: the defaults differ between a table scan
         // and an index scan ([`resolve_selection`]).
@@ -644,20 +680,14 @@ impl<'a> Filter<'a> {
         let legacy = input.scan_filter.as_ref().filter(|map| !map.is_empty());
         let conditional_operator = input.conditional_operator.as_deref();
         match (input.filter_expression.as_deref(), legacy) {
-            // A request may not state its filter twice: the legacy `ScanFilter` and
-            // `ConditionalOperator` are what `FilterExpression` replaces ("This is a
-            // legacy parameter. Use FilterExpression instead").
+            // Both generations at once has already been refused over the whole of each
+            // side ([`crate::state::check_expression_parameter_mix`]); the arms stay
+            // total rather than unreachable.
             (Some(_), Some(_)) => Err(crate::state::expression_conflict(
                 "ScanFilter",
                 "FilterExpression",
             )),
             (Some(expression), None) => {
-                if conditional_operator.is_some() {
-                    return Err(crate::state::expression_conflict(
-                        "ConditionalOperator",
-                        "FilterExpression",
-                    ));
-                }
                 Ok(Self::Expression(crate::state::ParsedCondition::parse(
                     "FilterExpression",
                     expression,

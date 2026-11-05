@@ -219,8 +219,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
 
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both.
+        crate::state::check_expression_parameter_mix(
+            &[(
+                "AttributesToGet",
+                input
+                    .attributes_to_get
+                    .as_ref()
+                    .is_some_and(|names| !names.is_empty()),
+            )],
+            &[(
+                "ProjectionExpression",
+                input.projection_expression.is_some(),
+            )],
+        )
+        .map_err(lift)?;
         // Every token the request DEFINES must be one an expression uses: an
         // `ExpressionAttributeNames` entry no projection references makes the whole
         // request invalid.

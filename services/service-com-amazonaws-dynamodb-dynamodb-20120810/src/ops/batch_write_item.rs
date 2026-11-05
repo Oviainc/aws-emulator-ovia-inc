@@ -315,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
         for (table_name, requests) in addressed {
-            let name = crate::state::resolve_table_name(table_name).map_err(lift)?;
+            let name = crate::state::resolve_table_name_in(table_name, &region).map_err(lift)?;
             // The table and the caller's authorization for it are decided BEFORE any of
             // its requests is read: a table that is not there, or that the policies in
             // force do not let this caller write, is answered with that rather than with

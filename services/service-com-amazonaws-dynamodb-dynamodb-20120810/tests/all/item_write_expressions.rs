@@ -778,21 +778,38 @@ async fn conditional_writes_gate_the_mutation_on_the_stored_item() {
             ":string": {"S": "S"},
         });
         let stated = serde_json::to_string(condition).expect("the row's members render");
-        let values: Map<String, Value> = vocabulary
-            .as_object()
-            .expect("the vocabulary is a map")
-            .iter()
-            .filter(|(token, _)| UPDATE.contains(token.as_str()) || stated.contains(token.as_str()))
-            .map(|(token, value)| (token.clone(), value.clone()))
-            .collect();
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both, so each row's update is
+        // spelled in the generation its own condition belongs to: the same write — the
+        // `name` attribute set to "touched" — either way.
+        let legacy_condition =
+            stated.contains("Expected") || stated.contains("ConditionalOperator");
         let body = request(
-            json!({
-                "TableName": "conditions",
-                "Key": key,
-                "UpdateExpression": UPDATE,
-                "ExpressionAttributeNames": {"#n": "name"},
-                "ExpressionAttributeValues": values,
-            }),
+            if legacy_condition {
+                json!({
+                    "TableName": "conditions",
+                    "Key": key,
+                    "AttributeUpdates": {"name": {"Action": "PUT",
+                                                  "Value": {"S": "touched"}}},
+                })
+            } else {
+                let values: Map<String, Value> = vocabulary
+                    .as_object()
+                    .expect("the vocabulary is a map")
+                    .iter()
+                    .filter(|(token, _)| {
+                        UPDATE.contains(token.as_str()) || stated.contains(token.as_str())
+                    })
+                    .map(|(token, value)| (token.clone(), value.clone()))
+                    .collect();
+                json!({
+                    "TableName": "conditions",
+                    "Key": key,
+                    "UpdateExpression": UPDATE,
+                    "ExpressionAttributeNames": {"#n": "name"},
+                    "ExpressionAttributeValues": values,
+                })
+            },
             condition.clone(),
         );
         let (status, parsed) = call(&router, "UpdateItem", body.clone()).await;

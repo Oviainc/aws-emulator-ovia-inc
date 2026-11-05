@@ -48,22 +48,43 @@ pub const STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE: &str =
     "One or more parameter values were invalid: If stream is being enabled then UpdateViewType \
      is required";
 
+/// AWS's sentence for the other half of the same pair: a specification that leaves the
+/// stream OFF and still names a view type to capture in.
+///
+/// There is nothing to capture, so the member states a setting for a stream the request
+/// is not asking for. AWS words it over the view-type member (`UpdateViewType`, the name
+/// its refusals use for it) and over what the request is doing to the table.
+pub const STREAM_VIEW_TYPE_FORBIDDEN_ON_CREATE: &str =
+    "One or more parameter values were invalid: Table is being created with a stream disabled, \
+     UpdateViewType should not be specified";
+
+/// The same fact for a request that CHANGES a table, worded over what that request is
+/// doing — the pairing the two `STREAM_VIEW_TYPE_REQUIRED*` sentences above follow.
+pub const STREAM_VIEW_TYPE_FORBIDDEN_ON_UPDATE: &str =
+    "One or more parameter values were invalid: Table is being updated with a stream disabled, \
+     UpdateViewType should not be specified";
+
 /// The `StreamViewType` the specification asks for, refused when the pair cannot
 /// hold together.
 ///
 /// `StreamViewType` "determines what information is written to the stream for this
-/// table" (`StreamSpecification$StreamViewType`), so a specification that turns the
-/// stream ON without naming one asks for a stream whose contents are undefined and
-/// is refused with `missing_view_type` — one of the two sentences above, whichever the
-/// calling operation states; a specification that turns it OFF names nothing to
-/// capture, so the member is not read at all.
+/// table" (`StreamSpecification$StreamViewType`), so the member and `StreamEnabled`
+/// require each other BOTH ways: a specification that turns the stream ON without naming
+/// one asks for a stream whose contents are undefined, and one that leaves it OFF while
+/// naming one states what to capture for a stream it is not asking for. Either way the
+/// specification contradicts itself and the request is refused — with whichever of the
+/// two sentences the calling operation states.
 pub fn stream_view_type<'s>(
     specification: &'s StreamSpecification,
     missing_view_type: &str,
+    forbidden_view_type: &str,
 ) -> Result<Option<&'s str>, RequestError> {
     use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
 
     if !specification.stream_enabled {
+        if specification.stream_view_type.is_some() {
+            return Err(RequestError::Validation(forbidden_view_type.to_string()));
+        }
         return Ok(None);
     }
     match specification.stream_view_type.as_deref() {

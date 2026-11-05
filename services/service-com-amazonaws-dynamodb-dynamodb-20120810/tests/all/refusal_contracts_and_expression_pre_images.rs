@@ -1019,13 +1019,11 @@ async fn a_table_is_addressed_by_its_arn_wherever_a_name_does() {
         );
     }
 
-    // A WELL-FORMED ARN that simply does not name a table of this service is no way of
-    // naming a table at all, so it is refused as the table NAME it would have to be.
-    for case in [
-        format!("arn:aws:kinesis:{REGION}:000000000000:stream/Addressed"),
-        format!("arn:aws:dynamodb:{REGION}:000000000000:backup/Addressed"),
-        format!("arn:aws:dynamodb:{REGION}:000000000000:table/Addressed/index/idx"),
-    ] {
+    // A WELL-FORMED ARN of ANOTHER service is no way of naming a table at all, so it is
+    // refused as the table NAME it would have to be.
+    for case in [format!(
+        "arn:aws:kinesis:{REGION}:000000000000:stream/Addressed"
+    )] {
         let stated = refusal(
             &router,
             &case,
@@ -1037,6 +1035,28 @@ async fn a_table_is_addressed_by_its_arn_wherever_a_name_does() {
         assert!(
             stated.contains("Member must satisfy regular expression pattern:"),
             "case {case:?}: expected the table-name pattern, got {stated:?}"
+        );
+    }
+
+    // An ARN of THIS service whose resource is not a table addresses some other kind of
+    // resource: what is wrong with it is the resource TYPE, which is what the refusal
+    // states, over the whole value.
+    for case in [
+        format!("arn:aws:dynamodb:{REGION}:000000000000:backup/Addressed"),
+        format!("arn:aws:dynamodb:{REGION}:000000000000:table/Addressed/index/idx"),
+    ] {
+        let stated = refusal(
+            &router,
+            &case,
+            "GetItem",
+            json!({"TableName": case, "Key": {"pk": {"S": "one"}}}),
+            "ValidationException",
+        )
+        .await;
+        assert_eq!(
+            stated,
+            format!("1 validation error detected: Invalid resource type in '{case}'"),
+            "case {case:?}: expected the resource-type sentence, got {stated:?}"
         );
     }
 }

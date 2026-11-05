@@ -237,8 +237,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         // The source table is addressed by NAME or by ARN, and the target is named; both
         // are held to the form every table name takes.
-        let source_name = resolved_source(&input).map_err(bad_request)?;
-        let target = crate::state::resolve_table_name(&input.target_table_name)
+        let source_name = resolved_source(&input, &region).map_err(bad_request)?;
+        let target = crate::state::resolve_table_name_in(&input.target_table_name, &region)
             .map_err(bad_request)?;
         // Every caller-sized list this request carries is clamped BEFORE anything walks
         // it, so the work below is bounded by constants rather than by the request body.
@@ -533,15 +533,18 @@ fn lift(source: &str, error: crate::state::RequestError) -> RestoreTableToPointI
 /// name no single table to restore.
 fn resolved_source(
     input: &RestoreTableToPointInTimeInput,
+    region: &str,
 ) -> Result<String, crate::state::RequestError> {
     match (
         input.source_table_name.as_deref(),
         input.source_table_arn.as_deref(),
     ) {
-        (Some(name), None) | (None, Some(name)) => crate::state::resolve_table_name(name),
+        (Some(name), None) | (None, Some(name)) => {
+            crate::state::resolve_table_name_in(name, region)
+        }
         (Some(name), Some(arn)) => {
-            let named = crate::state::resolve_table_name(name)?;
-            let addressed = crate::state::resolve_table_name(arn)?;
+            let named = crate::state::resolve_table_name_in(name, region)?;
+            let addressed = crate::state::resolve_table_name_in(arn, region)?;
             if named == addressed {
                 Ok(named)
             } else {

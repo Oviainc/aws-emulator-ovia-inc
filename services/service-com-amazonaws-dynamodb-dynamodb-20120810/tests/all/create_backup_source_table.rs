@@ -311,9 +311,8 @@ async fn a_source_table_the_request_does_not_name_is_refused() {
             "an ARN carrying no table resource at all",
             "arn:aws:dynamodb:us-east-1:000000000000:backup/Nope".to_string(),
             "ValidationException",
-            "1 validation error detected: Value 'arn:aws:dynamodb:us-east-1:000000000000:\
-             backup/Nope' at 'tableName' failed to satisfy constraint: Member must satisfy \
-             regular expression pattern: [a-zA-Z0-9_.-]+"
+            "1 validation error detected: Invalid resource type in \
+             'arn:aws:dynamodb:us-east-1:000000000000:backup/Nope'"
                 .to_string(),
         ),
         (

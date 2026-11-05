@@ -364,7 +364,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no table to decide, so it stays a request-level refusal and [`lift`]
             // answers it directly.
             let keying = |error| cancelled_by_element(at, elements, error);
-            let name = crate::state::resolve_table_name(action.table_name()).map_err(lift)?;
+            let name =
+                crate::state::resolve_table_name_in(action.table_name(), &region).map_err(lift)?;
             let substitutions = crate::state::Substitutions::new(
                 action.expression_attribute_names(),
                 action.expression_attribute_values(),

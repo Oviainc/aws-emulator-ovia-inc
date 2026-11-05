@@ -591,8 +591,8 @@ fn update_table() -> Vec<UpdateRow> {
         vec![("s", Some(json!({"S": "both"}))), ("gone", None)],
     );
     row(
-        "two assignments under one SET",
-        "UPDATE items SET s = 'two', n = 1 WHERE pk = 'u'",
+        "two assignments, one SET clause each",
+        "UPDATE items SET s = 'two' SET n = 1 WHERE pk = 'u'",
         Value::Null,
         vec![
             ("s", Some(json!({"S": "two"}))),

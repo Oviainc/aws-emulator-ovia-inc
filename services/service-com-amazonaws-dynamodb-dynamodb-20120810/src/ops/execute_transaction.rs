@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let parameters = entry.parameters.clone().unwrap_or_default();
             for (position, value) in parameters.iter().enumerate() {
-                crate::state::check_attribute_value(&format!("Parameters[{position}]"), value)
+                crate::state::check_statement_value(&format!("Parameters[{position}]"), value)
                     .map_err(lift)?;
             }
             parsed
@@ -448,7 +448,7 @@ fn read_transaction(
                 MIXED_TRANSACTION_MESSAGE,
             ));
         };
-        let name = crate::state::resolve_table_name(&select.table).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(&select.table, region).map_err(lift)?;
         let table = store.active_table(region, &name, now).map_err(lift)?;
         // A table the policies in force do not let this caller act on with this
         // statement's own action is not read at all. PartiQL has its own four actions,
@@ -572,7 +572,7 @@ fn write_transaction(
         // item, so it cancels the transaction. A refusal about the VALUE the request
         // carried needs no table to decide, so it stays a request-level refusal.
         let keying = |error| cancelled_by_element(at, elements, error);
-        let name = crate::state::resolve_table_name(statement.table()).map_err(lift)?;
+        let name = crate::state::resolve_table_name_in(statement.table(), region).map_err(lift)?;
         let returns_old_on_failure =
             entry.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
         {

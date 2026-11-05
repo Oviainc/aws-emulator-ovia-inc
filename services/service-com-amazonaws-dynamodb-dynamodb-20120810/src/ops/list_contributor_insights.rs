@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested = input
             .table_name
             .as_deref()
-            .map(crate::state::resolve_table_name)
+            .map(|named| crate::state::resolve_table_name_in(named, &region))
             .transpose()
             .map_err(lift)?;
 

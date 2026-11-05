@@ -253,7 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut per_table: std::collections::BTreeMap<String, f64> =
             std::collections::BTreeMap::new();
         for (requested, projected) in input.transact_items.iter().zip(&projections) {
-            let name = crate::state::resolve_table_name(&requested.get.table_name).map_err(lift)?;
+            let name = crate::state::resolve_table_name_in(&requested.get.table_name, &region)
+                .map_err(lift)?;
             for (attribute, value) in &requested.get.key {
                 crate::state::check_attribute_value(attribute, value).map_err(lift)?;
             }
