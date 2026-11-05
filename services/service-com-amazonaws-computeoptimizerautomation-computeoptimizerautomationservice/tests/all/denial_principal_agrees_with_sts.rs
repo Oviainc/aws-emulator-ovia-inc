@@ -76,6 +76,7 @@ fn session(
         tags: Vec::new(),
         transitive_tag_keys: Vec::new(),
         packed_policy_size: None,
+        policies: sts_state::SessionPolicies::default(),
         external_id: None,
         role_arn: Some(format!("arn:aws:iam::{account}:role/{role_name}")),
         revoked: false,

@@ -217,6 +217,7 @@ impl Credential {
                 tags: Vec::new(),
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
+                policies: sts::SessionPolicies::default(),
                 external_id: None,
                 role_arn: role,
                 revoked: false,

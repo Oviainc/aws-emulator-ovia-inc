@@ -318,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             caller_may_call, duplicate_tag_key, inherited_transitive_tags, long_term_identity,
             not_authorized_message, packed_policy_size, parse_role_arn, policy_document_error,
-            resolve_request_caller, sts_arn, Identity, NewSession, SessionKind,
+            resolve_request_caller, sts_arn, Identity, NewSession, SessionKind, SessionPolicies,
             ASSUME_ROLE_ACTION, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
             MAX_MANAGED_SESSION_POLICIES, MAX_SESSION_TAGS, ROLE_CHAINING_MAX_DURATION_SECONDS,
             SESSION_TOKEN_SIZE_LIMIT, SET_SOURCE_IDENTITY_ACTION, TAG_SESSION_ACTION,
@@ -705,6 +705,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags,
                 transitive_tag_keys,
                 packed_policy_size: Some(packed_policy),
+                // The session policies this mint passed scope what the credential it
+                // vends may do: "the resulting session's permissions are the intersection
+                // of the role's identity-based policies and the session policies"
+                // (`AssumeRoleRequest$Policy`), which the service deciding a request
+                // signed with it reads from the session (see `SessionPolicies`).
+                policies: SessionPolicies {
+                    inline: input.policy.clone(),
+                    managed_arns: named_policy_arns,
+                },
                 external_id: input.external_id.clone(),
                 role_arn: Some(role.arn.clone()),
                 ..NewSession::new(identity, SessionKind::AssumedRole, duration_seconds)

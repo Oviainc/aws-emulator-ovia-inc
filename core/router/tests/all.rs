@@ -397,6 +397,8 @@ mod connect_signing_name_routing;
 mod ddb_stream_lambda_esm_provisioning;
 #[path = "all/dynamodb_data_plane_authorization.rs"]
 mod dynamodb_data_plane_authorization;
+#[path = "all/dynamodb_session_policy_authorization.rs"]
+mod dynamodb_session_policy_authorization;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
 // tail is where every landing in the same window appends, so it is the contended region,

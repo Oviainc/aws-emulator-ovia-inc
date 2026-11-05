@@ -255,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             caller_may_call, duplicate_tag_key, long_term_identity, packed_policy_size,
             policy_document_error, resolve_request_caller, sts_arn, Identity, NewSession,
-            SessionKind, MAX_MANAGED_SESSION_POLICIES, SESSION_TOKEN_SIZE_LIMIT,
+            SessionKind, SessionPolicies, MAX_MANAGED_SESSION_POLICIES, SESSION_TOKEN_SIZE_LIMIT,
             VENDED_SESSION_DEFAULT_DURATION_SECONDS,
         };
 
@@ -380,6 +380,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             NewSession {
                 tags: crate::state::tag_pairs(input.tags.as_deref()),
                 packed_policy_size: Some(packed_policy),
+                // See `SessionPolicies`: the session policies this mint passed scope what
+                // the credential it vends may do.
+                policies: SessionPolicies {
+                    inline: input.policy.clone(),
+                    managed_arns: named_policy_arns,
+                },
                 ..NewSession::new(identity, SessionKind::FederationToken, duration_seconds)
             },
         );

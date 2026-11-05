@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             packed_policy_bytes, packed_policy_size, packed_policy_too_large_message,
             parse_role_arn, policy_document_error, sts_arn, Identity, NewSession, SessionKind,
-            ASSUME_ROLE_DEFAULT_DURATION_SECONDS, MAX_MANAGED_SESSION_POLICIES,
+            SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS, MAX_MANAGED_SESSION_POLICIES,
             SESSION_TOKEN_SIZE_LIMIT,
         };
 
@@ -479,6 +479,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
             NewSession {
                 packed_policy_size: Some(packed_policy),
+                // See `SessionPolicies`: the session policies this mint passed scope what
+                // the credential it vends may do.
+                policies: SessionPolicies {
+                    inline: input.policy.clone(),
+                    managed_arns: named_policy_arns,
+                },
                 role_arn: Some(role.arn.clone()),
                 ..NewSession::new(session_identity, SessionKind::AssumedRole, duration_seconds)
             },

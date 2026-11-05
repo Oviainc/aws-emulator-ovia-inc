@@ -801,6 +801,7 @@ mod tests {
                     tags: Vec::new(),
                     transitive_tag_keys: Vec::new(),
                     packed_policy_size: None,
+                    policies: crate::state::SessionPolicies::default(),
                     external_id: None,
                     role_arn: Some(format!("arn:aws:iam::{account}:role/demo")),
                     revoked: false,

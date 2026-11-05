@@ -61,6 +61,7 @@ fn assume_role(engine: &engine::InMemoryEngine, access_key_id: &str, role_name: 
             tags: Vec::new(),
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
+            policies: sts::SessionPolicies::default(),
             external_id: None,
             role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/{role_name}")),
             revoked: false,

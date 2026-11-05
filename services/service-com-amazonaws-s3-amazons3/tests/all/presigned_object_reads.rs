@@ -376,6 +376,11 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
         "case \"a path-style read\": expected the stored bytes, got {} bytes",
         path_style.body.len()
     );
+    // The boundary of the rule: in a virtual-hosted-style address "the bucket name is part
+    // of the domain name", so the HOST names the bucket whatever the path spells and the
+    // path is the key alone. A host whose first label is a bucket this emulator does not
+    // hold is therefore a read OF THAT BUCKET — `NoSuchBucket` — and not a path-style read
+    // of the bucket its first path segment happens to name.
     let absent_host_bucket = send_to_host(
         &router,
         "GET",

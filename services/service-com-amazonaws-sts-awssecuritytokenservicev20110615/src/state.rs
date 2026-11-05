@@ -127,6 +127,68 @@ pub enum SessionKind {
     FederationToken,
 }
 
+/// The session policies ONE mint passed, which scope the session's permissions down.
+///
+/// "Passing policies to this operation returns new temporary credentials. The resulting
+/// session's permissions are the intersection of the role's identity-based policies and the
+/// session policies" (`AssumeRoleRequest$Policy`, this service's model): what a request
+/// signed with the credential may do is what the identity's own policies allow AND what
+/// these documents allow, and an explicit `Deny` in any of them refuses whatever a grant
+/// says. They are kept on the session because the credential is the only thing the later
+/// request carries, so the service deciding that request reads them from here
+/// ([`Caller::session_policies`]).
+///
+/// The inline document is held exactly as the mint passed it. A managed session policy is
+/// held by ARN instead, because what it says is what its DEFAULT version says at the
+/// instant of the request — the version "that is in effect for the IAM users, groups, and
+/// roles to which the policy is attached" — which is read then
+/// ([`session_scoping_documents`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionPolicies {
+    /// The inline session policy document the mint passed, if any.
+    pub inline: Option<String>,
+    /// The managed session policies the mint named, by ARN, in the order it named them.
+    pub managed_arns: Vec<String>,
+}
+
+/// The session policy DOCUMENTS in force on a credential, read for one request.
+#[derive(Debug, Clone, Default)]
+pub struct ScopingPolicies {
+    /// Every scoping document that could be read, in the order the mint named them.
+    pub documents: Vec<String>,
+    /// Set when the mint named a managed session policy whose document this emulator does
+    /// not hold — an entry of AWS's catalog it does not carry — so the scope may allow
+    /// more than [`Self::documents`] shows.
+    pub unreadable: bool,
+}
+
+/// The documents the session policies `policies` stand for, as they read at the instant of
+/// the request: the inline document the mint passed, and the version of each managed
+/// session policy that is in force now ([`IamState::default_version_document`]).
+///
+/// The one resolution of "what scopes this session down", so every service that decides a
+/// request signed with such a credential reads the same documents. `iam` is the IAM store
+/// of the same engine, or `None` when the engine carries none — where a managed session
+/// policy names a document nothing here holds.
+#[must_use]
+pub fn session_scoping_documents(
+    iam: Option<&IamState>,
+    policies: &SessionPolicies,
+) -> ScopingPolicies {
+    let mut documents: Vec<String> = policies.inline.iter().cloned().collect();
+    let mut unreadable = false;
+    for policy_arn in &policies.managed_arns {
+        match iam.and_then(|iam| iam.default_version_document(policy_arn)) {
+            Some(document) => documents.push(document),
+            None => unreadable = true,
+        }
+    }
+    ScopingPolicies {
+        documents,
+        unreadable,
+    }
+}
+
 /// One minted session, keyed in [`ComAmazonawsStsAwssecuritytokenservicev20110615State::sessions`]
 /// by the access key id it was minted under.
 #[derive(Debug, Clone)]
@@ -145,6 +207,9 @@ pub struct Session {
     pub tags: Vec<(String, String)>,
     pub transitive_tag_keys: Vec<String>,
     pub packed_policy_size: Option<i32>,
+    /// The session policies the mint passed, which scope what this session may do; see
+    /// [`SessionPolicies`].
+    pub policies: SessionPolicies,
     pub external_id: Option<String>,
     /// The ARN of the role an `AssumeRole` session was minted for, exactly as IAM holds
     /// it — the spelling a trust policy names when this session chains into another
@@ -173,6 +238,8 @@ pub struct NewSession {
     pub tags: Vec<(String, String)>,
     pub transitive_tag_keys: Vec<String>,
     pub packed_policy_size: Option<i32>,
+    /// See [`Session::policies`].
+    pub policies: SessionPolicies,
     pub external_id: Option<String>,
     /// See [`Session::role_arn`].
     pub role_arn: Option<String>,
@@ -190,6 +257,7 @@ impl NewSession {
             tags: Vec::new(),
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
+            policies: SessionPolicies::default(),
             external_id: None,
             role_arn: None,
         }
@@ -927,6 +995,10 @@ pub struct Caller {
     pub transitive_tag_keys: Vec<String>,
     /// The role ARN of an assumed-role credential; see [`Session::role_arn`].
     pub role_arn: Option<String>,
+    /// The session policies the mint of this credential passed, which scope what a
+    /// request signed with it may do; see [`SessionPolicies`]. Empty for a long-term
+    /// access key, which no mint scoped.
+    pub session_policies: SessionPolicies,
 }
 
 impl Caller {
@@ -939,6 +1011,7 @@ impl Caller {
             tags: Vec::new(),
             transitive_tag_keys: Vec::new(),
             role_arn: None,
+            session_policies: SessionPolicies::default(),
         }
     }
 
@@ -986,6 +1059,7 @@ pub fn resolve_request_caller(
             tags: session.tags.clone(),
             transitive_tag_keys: session.transitive_tag_keys.clone(),
             role_arn: session.role_arn.clone(),
+            session_policies: session.policies.clone(),
         }),
         None => Ok(Caller::long_term(long_term)),
     }
@@ -2134,6 +2208,7 @@ pub fn mint_session<Eng: Send + Sync + 'static>(
         tags: request.tags,
         transitive_tag_keys: request.transitive_tag_keys,
         packed_policy_size: request.packed_policy_size,
+        policies: request.policies,
         external_id: request.external_id,
         role_arn: request.role_arn,
         revoked: false,

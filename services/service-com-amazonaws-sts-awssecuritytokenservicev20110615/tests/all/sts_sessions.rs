@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 use smithy_server_runtime::MultiServiceRouter;
-use sts::state::{ComAmazonawsStsAwssecuritytokenservicev20110615State as StsState, Identity, Session, SessionKind};
+use sts::state::{ComAmazonawsStsAwssecuritytokenservicev20110615State as StsState, Identity, Session, SessionKind, SessionPolicies};
 
 use super::packed_policy_budget::packed_token_bytes;
 
@@ -898,6 +898,7 @@ async fn an_expired_session_credential_is_refused_and_a_live_one_is_served() {
                 tags: Vec::new(),
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
+                policies: SessionPolicies::default(),
                 external_id: None,
                 role_arn: None,
                 revoked: false,
@@ -1003,6 +1004,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
                 tags: Vec::new(),
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
+                policies: SessionPolicies::default(),
                 external_id: None,
                 role_arn: None,
                 revoked: false,
@@ -1029,6 +1031,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
             tags: Vec::new(),
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
+            policies: SessionPolicies::default(),
             external_id: None,
             role_arn: None,
             revoked: false,
@@ -1080,6 +1083,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
             tags: Vec::new(),
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
+            policies: SessionPolicies::default(),
             external_id: None,
             role_arn: None,
             revoked: false,
@@ -1147,6 +1151,7 @@ async fn get_access_key_info_answers_from_the_session_registry() {
                 tags: Vec::new(),
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
+                policies: SessionPolicies::default(),
                 external_id: None,
                 role_arn: None,
                 revoked: false,
