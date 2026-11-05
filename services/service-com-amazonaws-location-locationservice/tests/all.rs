@@ -17,6 +17,8 @@ mod batch_item_error_messages;
 mod date_time_wire_form;
 #[path = "all/geofence_collections.rs"]
 mod geofence_collections;
+#[path = "all/geofences.rs"]
+mod geofences;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/route_calculators.rs"]

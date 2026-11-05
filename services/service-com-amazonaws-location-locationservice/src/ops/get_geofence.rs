@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGeofence
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGeofence`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGeofence::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the geofence stored under the named collection in
+//! [`crate::state::GeofenceCollection::geofences`] — the geometry it was put with,
+//! byte for byte in the format it was put in, its properties and its stored
+//! timestamps. An unknown collection, or a geofence the collection does not hold,
+//! is a `ResourceNotFoundException`. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGeofence` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGeofenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGeofence"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetGeofenceErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        let collection = store
+            .geofence_collections
+            .get(&input.collection_name)
+            .ok_or_else(|| {
+                GetGeofenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Resource of type \"GeofenceCollection\" with name \"{}\" cannot be found.",
+                        input.collection_name
+                    ),
+                })
+            })?;
+        // A geofence is a named resource of this API in its own right, so one the
+        // collection does not hold is refused in the same form as any other
+        // resource this service cannot resolve by name.
+        let geofence = collection.geofences.get(&input.geofence_id).ok_or_else(|| {
+            GetGeofenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "Resource of type \"Geofence\" with name \"{}\" cannot be found.",
+                    input.geofence_id
+                ),
+            })
+        })?;
+
+        Ok(GetGeofenceOutput {
+            geofence_id: geofence.geofence_id.clone(),
+            // "The returned geometry will always match the geometry format used
+            // when the geofence was created": the stored geometry is reported as
+            // it was put, never converted to another member.
+            geometry: geofence.geometry.clone(),
+            status: geofence.status.clone(),
+            create_time: crate::state::to_date_time(geofence.create_time),
+            update_time: crate::state::to_date_time(geofence.update_time),
+            geofence_properties: if geofence.properties.is_empty() {
+                // A geofence put without properties reports an absent member, not
+                // an empty map: the member is optional in the model.
+                None
+            } else {
+                Some(
+                    geofence
+                        .properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )
+            },
+        })
     }
 }

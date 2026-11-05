@@ -9,10 +9,12 @@
 //! by the state helper that does the insert, which is the contract a write uses: a
 //! handler reaches these containers through that helper rather than inserting itself.
 //!
-//! The device-position half is driven over HTTP by the other suites; the geofence and
-//! consumer halves are asserted against the state helpers directly, because the
-//! operations that will write them (`PutGeofence`, `BatchPutGeofence`,
-//! `AssociateTrackerConsumer`) are still scaffolded 501s and own their own stub issues.
+//! The device-position half is driven over HTTP by the other suites, and so is the
+//! geofence write path (`tests/all/geofences.rs` drives `BatchPutGeofence`); the
+//! BOUNDS themselves are asserted against the state helpers directly, because
+//! reaching one over the wire would take a thousand requests per bound. The consumer
+//! half has no implemented writer yet (`AssociateTrackerConsumer` is a scaffolded
+//! 501 owning its own stub issue), so it is asserted the same way.
 
 use service_com_amazonaws_location_locationservice::state::{
     Geofence, GeofenceCollection, Tracker, MAX_CONSUMERS_PER_TRACKER,

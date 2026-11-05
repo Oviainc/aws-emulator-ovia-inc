@@ -9,6 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The geometry checks a geofence write makes, kept beside this module rather than
+/// in one operation's file because every geofence write shares them.
+mod geofence_geometry;
+pub use geofence_geometry::validate_geofence_geometry;
+
 /// Epoch milliseconds. Amazon Location renders every timestamp in ISO 8601
 /// `YYYY-MM-DDThh:mm:ss.sssZ` (see the `CreateTime`/`SampleTime` member docs in the
 /// Smithy model), so millisecond resolution is the precision the wire carries.
@@ -178,10 +183,24 @@ pub const MAX_GEOFENCE_COLLECTIONS: usize = 1_000;
 /// its own quota; this cap exists so repeated writes cannot grow the in-memory store
 /// without limit, and is chosen large enough that a client never meets it in a
 /// normal session. [`GeofenceCollection::record_geofence`] is where it is applied,
-/// and is the contract a geofence write uses: `PutGeofence` and `BatchPutGeofence`
-/// are scaffolded 501s today, so the only way into this map goes through that
-/// helper.
+/// and is the contract a geofence write uses: every write into this map goes through
+/// that helper.
 pub const MAX_GEOFENCES_PER_COLLECTION: usize = 1_000;
+
+/// Largest `Entries` batch `BatchPutGeofence` accepts, which is the API's own
+/// maximum: the `BatchPutGeofenceRequestEntryList` shape is `len 1..10`. The handler
+/// enforces it itself as well as relying on the request boundary, so the amount of
+/// work one request can ask for is never chosen by the caller.
+pub const MAX_BATCH_PUT_GEOFENCE_ENTRIES: usize = 10;
+
+/// The `Status` a stored geofence reports: the `GetGeofenceResponse$Status` member's
+/// "`ACTIVE` — The geofence has been indexed by the system".
+///
+/// A geofence write is committed by the call that makes it — `BatchPutGeofence` and
+/// `PutGeofence` model no status member at all, and the geofence is readable in full
+/// the moment the write answers — so a stored geofence is an indexed one and the
+/// clock owes it no later transition out of `PENDING`.
+pub const GEOFENCE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// Emulator memory bound, NOT an AWS quota: consumer associations held per tracker.
 /// [`Tracker::associate_consumer`] reports no room past it rather than growing the
