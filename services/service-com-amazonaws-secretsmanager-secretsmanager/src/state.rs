@@ -1179,12 +1179,22 @@ pub struct Secret {
     pub created_date: SystemTime,
     pub last_changed_date: SystemTime,
     pub last_accessed_date: Option<SystemTime>,
-    /// The instant the secret is scheduled to be permanently deleted;
-    /// `Some(..)` means it is scheduled for deletion. This is the `DeletionDate`
-    /// the service reports, and for a `ForceDeleteWithoutRecovery` deletion —
-    /// which skips the recovery window — it is the instant of the delete call
-    /// itself.
+    /// The instant the deletion of this secret was REQUESTED; `Some(..)` means
+    /// it is scheduled for deletion. This is the `DeletedDate` the service
+    /// reports: "The date and time the deletion of the secret occurred. Not
+    /// present on active secrets. The secret can be recovered until the number
+    /// of days in the recovery window has passed"
+    /// (`SecretListEntry$DeletedDate`, this service's Smithy model), so the
+    /// recovery window runs FROM this instant rather than ending at it.
     pub deleted_date: Option<SystemTime>,
+    /// The instant the recovery window of the scheduled deletion elapses: "the
+    /// date and time after which this secret Secrets Manager can permanently
+    /// delete this secret, and it can no longer be restored"
+    /// (`DeleteSecretResponse$DeletionDate`, this service's Smithy model). It is
+    /// the deletion request plus the window for a windowed deletion, and the
+    /// request instant itself for a `ForceDeleteWithoutRecovery` one, which
+    /// skips the window.
+    pub deletion_date: Option<SystemTime>,
     /// The instant this store drops the secret for good, which [`expire_due`]
     /// materialises. It is the end of the recovery window for a windowed
     /// deletion, and a short span after the call for a
@@ -1251,6 +1261,7 @@ impl Secret {
             last_changed_date: at,
             last_accessed_date: None,
             deleted_date: None,
+            deletion_date: None,
             purge_at: None,
             rotation_enabled: false,
             rotation_lambda_arn: None,
@@ -1271,10 +1282,21 @@ impl Secret {
         self.deleted_date.is_some()
     }
 
-    /// Mark this secret for deletion: `at` is the `DeletionDate` the service
-    /// reports, and `purge_at` the instant the store owes its permanent removal.
-    pub fn schedule_deletion(&mut self, at: SystemTime, purge_at: SystemTime) {
-        self.deleted_date = Some(at);
+    /// Mark this secret for deletion: `requested_at` is the `DeletedDate` the
+    /// service reports — the instant the deletion was asked for — `deletion_date`
+    /// the end of the recovery window it reports as `DeletionDate`, and
+    /// `purge_at` the instant the store owes its permanent removal.
+    ///
+    /// Re-scheduling a secret that is already marked replaces all three, so a
+    /// second deletion request measures its window from itself.
+    pub fn schedule_deletion(
+        &mut self,
+        requested_at: SystemTime,
+        deletion_date: SystemTime,
+        purge_at: SystemTime,
+    ) {
+        self.deleted_date = Some(requested_at);
+        self.deletion_date = Some(deletion_date);
         self.purge_at = Some(purge_at);
     }
 
@@ -1287,7 +1309,7 @@ impl Secret {
     /// ahead. A deletion that skipped the recovery window stamps that instant at
     /// the call itself, so there is no span in which it can be cancelled.
     pub fn deletion_cancellable(&self, now: SystemTime) -> bool {
-        self.deleted_date.is_some_and(|at| at > now)
+        self.deletion_date.is_some_and(|at| at > now)
     }
 
     /// Cancel a scheduled deletion: drop the `DeletionDate` stamp and with it
@@ -1295,6 +1317,7 @@ impl Secret {
     /// staging labels and every other attribute as they were.
     pub fn cancel_deletion(&mut self, at: SystemTime) {
         self.deleted_date = None;
+        self.deletion_date = None;
         self.purge_at = None;
         self.last_changed_date = at;
     }

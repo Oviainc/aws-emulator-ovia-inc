@@ -21,6 +21,8 @@ mod secret_batch_get;
 mod secret_client_request_token;
 #[path = "all/secret_cross_account_resource_policy.rs"]
 mod secret_cross_account_resource_policy;
+#[path = "all/secret_deletion_window.rs"]
+mod secret_deletion_window;
 #[path = "all/secret_error_responses.rs"]
 mod secret_error_responses;
 #[path = "all/secret_kms_key_state.rs"]

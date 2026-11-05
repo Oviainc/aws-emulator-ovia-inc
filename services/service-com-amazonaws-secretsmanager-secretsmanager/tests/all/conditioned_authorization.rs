@@ -581,11 +581,16 @@ async fn a_conditioned_deny_refuses_only_the_request_values_it_names() {
             "case {case:?}: the describe the guardrail allows must be served, got {status} \
              {described}"
         );
-        assert_eq!(
-            described["DeletedDate"].as_f64(),
-            Some(scheduled),
-            "case {case:?}: expected the describe to report the scheduled deletion, got \
-             {described}"
+        let marked = described["DeletedDate"].as_f64().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the describe to report the deletion: {described}")
+        });
+        // DeletedDate is the instant the deletion was REQUESTED, so the window the
+        // guardrail permitted is the span from it to the reported DeletionDate.
+        let measured = (scheduled - marked) / SECONDS_PER_DAY;
+        assert!(
+            (days - 1.0..=days + 1.0).contains(&measured),
+            "case {case:?}: expected DeletionDate - DeletedDate to measure about {days} days, \
+             got {measured} days ({described})"
         );
     }
 }

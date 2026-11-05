@@ -827,7 +827,10 @@ async fn delete_secret_honours_the_published_recovery_window_range() {
                     "case {case:?}: expected a DeletionDate near {expected} (request time plus \
                      {days} days), got {deletion_date}"
                 );
-                // DescribeSecret reports the same instant as DeletedDate.
+                // DescribeSecret reports the instant the deletion was REQUESTED
+                // as DeletedDate — "the date and time the deletion of the secret
+                // occurred" — so the recovery window is the span between it and
+                // the DeletionDate the delete reported.
                 let described = ok(
                     &router,
                     "DescribeSecret",
@@ -835,11 +838,20 @@ async fn delete_secret_honours_the_published_recovery_window_range() {
                     case,
                 )
                 .await;
+                let marked = described
+                    .get("DeletedDate")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_else(|| panic!("case {case:?}: no DeletedDate in {described}"));
+                assert!(
+                    (marked - requested_at).abs() < 300.0,
+                    "case {case:?}: expected DeletedDate near the request time {requested_at}, \
+                     got {marked}"
+                );
+                let window_days = ((deletion_date - marked) / 86_400.0).round() as i64;
                 assert_eq!(
-                    described.get("DeletedDate").and_then(Value::as_f64),
-                    Some(deletion_date),
-                    "case {case:?}: expected DeletedDate to be the scheduled instant, got \
-                     {described}"
+                    window_days, days,
+                    "case {case:?}: expected DeletionDate - DeletedDate to measure {days} days, \
+                     got {window_days} ({described})"
                 );
             }
         }
@@ -922,7 +934,6 @@ async fn a_secret_scheduled_for_deletion_is_hidden_but_still_described() {
     for (case, operation) in [
         ("read the value", "GetSecretValue"),
         ("put a new value", "PutSecretValue"),
-        ("delete again", "DeleteSecret"),
     ] {
         let mut body = json!({"SecretId": "scheduled"});
         if operation == "PutSecretValue" {

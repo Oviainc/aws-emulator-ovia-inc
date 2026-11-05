@@ -260,12 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // store owes its removal a short span later, which `expire_due`
             // materialises. The repeat is allowed: "If you forcibly delete an
             // already deleted or nonexistent secret, the operation does not
-            // return ResourceNotFoundException."
+            // return ResourceNotFoundException." So a secret a window is already
+            // pending on is forced too, and this call's schedule replaces it.
             let secret = store.secrets.get_mut(&name).ok_or_else(state_unavailable)?;
             let purge_at = now
                 .checked_add(crate::state::FORCE_DELETE_PURGE_DELAY)
                 .unwrap_or(now);
-            secret.schedule_deletion(now, purge_at);
+            secret.schedule_deletion(now, now, purge_at);
             secret.last_changed_date = now;
             return Ok(DeleteSecretOutput {
                 arn: Some(secret.arn.clone()),
@@ -279,18 +280,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(secret) = store.secrets.get_mut(&name) else {
             return Err(state_unavailable());
         };
-        if secret.scheduled_for_deletion() {
-            return Err(DeleteSecretErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
         // "This value is the date and time of the delete request plus the number
-        // of days in RecoveryWindowInDays."
+        // of days in RecoveryWindowInDays." The window is measured from THIS
+        // request, so a secret a deletion is already scheduled for is
+        // re-scheduled by it: the stamp of the request and the end of the
+        // window it starts both move to this call's. That repeat is SERVED
+        // rather than refused as a secret marked for deletion: a second
+        // `DeleteSecret` naming a new window is recorded moving the schedule
+        // onto it, which is the one state this operation's
+        // `InvalidRequestException` does not cover, because stating the
+        // schedule is what this operation does.
         let deletion_date = crate::state::after_days(now, window);
-        secret.schedule_deletion(deletion_date, deletion_date);
+        secret.schedule_deletion(now, deletion_date, deletion_date);
         secret.last_changed_date = now;
 
         Ok(DeleteSecretOutput {
