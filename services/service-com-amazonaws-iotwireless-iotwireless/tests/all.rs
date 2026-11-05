@@ -17,6 +17,8 @@ mod destination_and_wireless_device_lifecycle;
 mod destination_update_and_not_found;
 #[path = "all/device_profile_lifecycle.rs"]
 mod device_profile_lifecycle;
+#[path = "all/fuota_task_device_association.rs"]
+mod fuota_task_device_association;
 #[path = "all/fuota_task_lifecycle.rs"]
 mod fuota_task_lifecycle;
 #[path = "all/multicast_group_lifecycle.rs"]

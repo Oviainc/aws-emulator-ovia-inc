@@ -146,13 +146,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(removed) = store.wireless_devices.remove(&input.id) else {
+            // The one body every operation that addresses a device by this id refuses a
+            // missing one with, so two refusals of the same condition cannot drift apart.
             return Err(
                 DeleteWirelessDeviceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("No wireless device with WirelessDeviceId {}", input.id)),
-                        resource_id: Some(input.id.clone()),
-                        resource_type: Some("WirelessDevice".to_string()),
-                    },
+                    crate::state::wireless_device_not_found(&input.id),
                 )
                 .into(),
             );

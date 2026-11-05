@@ -1186,8 +1186,8 @@ async fn list_filters_select_on_the_persisted_record() {
             query: "&destinationName=FilterA&deviceProfileId=dp-3",
             keep: &|_| false,
         },
-        // No device belongs to a FUOTA task or a multicast group until the (still
-        // scaffolded) associate operations put it in one, so these select nothing.
+        // No device in this case has been joined to a FUOTA task or a multicast group,
+        // so these select nothing.
         Filter {
             query: "&fuotaTaskId=ft-1",
             keep: &|_| false,

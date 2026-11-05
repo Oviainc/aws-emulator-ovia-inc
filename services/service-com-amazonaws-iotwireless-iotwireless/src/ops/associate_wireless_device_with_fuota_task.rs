@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateWirelessDeviceWithFuotaTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateWirelessDeviceWithFuotaTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateWirelessDeviceWithFuotaTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: joins one stored wireless device to one stored FUOTA task, so every
+//! reader that selects on that membership sees it. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +138,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateWirelessDeviceWithFuotaTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateWirelessDeviceWithFuotaTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateWirelessDeviceWithFuotaTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateWirelessDeviceWithFuotaTaskError::from(
+                AssociateWirelessDeviceWithFuotaTaskErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let mut store = state.lock();
+        // Both ends of the association are resolved against real state before anything
+        // is written, so a stored membership never names a resource the account does not
+        // hold.
+        if !store.fuota_tasks.contains_key(&input.id) {
+            return Err(
+                AssociateWirelessDeviceWithFuotaTaskErrorModeled::ResourceNotFoundException(
+                    crate::state::fuota_task_not_found(&input.id),
+                )
+                .into(),
+            );
+        }
+        let device = store
+            .wireless_devices
+            .get_mut(&input.wireless_device_id)
+            .ok_or_else(|| {
+                AssociateWirelessDeviceWithFuotaTaskError::from(
+                    AssociateWirelessDeviceWithFuotaTaskErrorModeled::ResourceNotFoundException(
+                        crate::state::wireless_device_not_found(&input.wireless_device_id),
+                    ),
+                )
+            })?;
+
+        match device.fuota_task_id.as_deref() {
+            // The membership this call asks for already holds, so there is nothing left
+            // to write and the same empty success is reported again.
+            Some(current) if current == input.id => {}
+            // A device's FUOTA membership is single-valued — one `FuotaTaskId` and one
+            // `FuotaDeviceStatus` per device — so joining it to a second task would
+            // silently drop it out of the first. That is the inconsistent state this
+            // operation's `ConflictException` names, so the request is refused and the
+            // membership already stored is left exactly as it stands.
+            Some(current) => {
+                let message = format!(
+                    "Wireless device {} is already associated with FUOTA task {current}",
+                    input.wireless_device_id
+                );
+                return Err(
+                    AssociateWirelessDeviceWithFuotaTaskErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(message),
+                            resource_id: Some(input.wireless_device_id.clone()),
+                            resource_type: Some("WirelessDevice".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            None => device.fuota_task_id = Some(input.id.clone()),
+        }
+        Ok(AssociateWirelessDeviceWithFuotaTaskOutput {})
     }
 }
+

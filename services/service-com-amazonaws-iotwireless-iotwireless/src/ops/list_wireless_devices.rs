@@ -240,9 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Whether a stored device satisfies every filter the request supplied.
 ///
 /// Each filter is answered from the device's own persisted record — including the FUOTA
-/// task and multicast group, which only the (still scaffolded)
-/// `Associate*WithFuotaTask` / `*WithMulticastGroup` operations set, so no stored device
-/// carries one today and those two filters select nothing until they do.
+/// task `AssociateWirelessDeviceWithFuotaTask` writes, and the multicast group the
+/// (still scaffolded) `Associate*WithMulticastGroup` operations will.
 fn matches(device: &crate::state::WirelessDevice, input: &ListWirelessDevicesInput) -> bool {
     if let Some(destination_name) = input.destination_name.as_deref() {
         if device.destination_name != destination_name {
@@ -312,9 +311,14 @@ fn statistics(device: &crate::state::WirelessDevice) -> WirelessDeviceStatistics
             status: sidewalk.status.clone(),
             positioning: sidewalk.positioning.clone(),
         }),
-        // A FUOTA / multicast status and group id exist only for a device that belongs
-        // to one, and nothing can join a device to either yet.
-        fuota_device_status: None,
+        // A FUOTA status exists only for a device that belongs to a task: one that has
+        // just joined is at the first modelled status, because no FUOTA session has
+        // reported anything for it. The multicast members stay unset while nothing can
+        // join a device to a group.
+        fuota_device_status: device
+            .fuota_task_id
+            .is_some()
+            .then(|| crate::state::FUOTA_DEVICE_STATUS_INITIAL.to_string()),
         multicast_device_status: None,
         mc_group_id: None,
         positioning: device.positioning.clone(),

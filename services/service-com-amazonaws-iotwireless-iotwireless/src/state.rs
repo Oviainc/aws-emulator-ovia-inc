@@ -353,8 +353,9 @@ pub struct WirelessDevice {
     pub thing_name: Option<String>,
     pub thing_arn: Option<String>,
     /// The FUOTA task this device belongs to, set by `AssociateWirelessDeviceWithFuotaTask`
-    /// and cleared by its disassociate — both still scaffolded, so a device created
-    /// today belongs to none. `ListWirelessDevices?fuotaTaskId=` selects on it.
+    /// and cleared by its disassociate (still scaffolded), so a device created today
+    /// belongs to none. `ListWirelessDevices?fuotaTaskId=` selects on it, and a device
+    /// that carries one reports a `FuotaDeviceStatus`.
     pub fuota_task_id: Option<String>,
     /// The multicast group this device belongs to, set by
     /// `AssociateWirelessDeviceWithMulticastGroup` and cleared by its disassociate —
@@ -479,6 +480,26 @@ pub struct FuotaTask {
 /// the task leaves it only when an operation moves it (the session operations are still
 /// scaffolded).
 pub const FUOTA_TASK_STATUS_PENDING: &str = "Pending";
+
+/// The `FuotaDeviceStatus` a wireless device carries the moment it joins a FUOTA task:
+/// it is a member, and no FUOTA session has sent it a fragment yet.
+///
+/// One of the modelled values [`crate::ops::types::FUOTA_DEVICE_STATUS_VALUES`] lists;
+/// the device leaves it only once a session reports progress for it.
+pub const FUOTA_DEVICE_STATUS_INITIAL: &str = "Initial";
+
+/// The `ResourceNotFoundException` body for a wireless device the account does not hold,
+/// addressed by its `WirelessDeviceId`.
+///
+/// One function, so every operation that addresses a device by that id refuses a missing
+/// one with the same body as `DeleteWirelessDevice` does.
+pub fn wireless_device_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("No wireless device with WirelessDeviceId {id}")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some("WirelessDevice".to_string()),
+    }
+}
 
 /// The `ResourceNotFoundException` body for a FUOTA task the account does not hold.
 ///
