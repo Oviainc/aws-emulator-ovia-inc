@@ -37,10 +37,17 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # authentication can name (`state::cognito_authentication`): the pool a `CognitoOptions`
 # container points at is resolved in the store `cognito-idp:CreateUserPool` writes.
 service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
-# `iam_authorization`: the shared evaluation of those documents against
+# `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL,
+# and `iam_authorization`: the shared evaluation of those documents against
 # (action, resource), so this service and every other one handed the same document
 # decide alike. Declared as a path dependency, the way the other consumers do.
 service-common = { path = "../common" }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the VPC and the Availability Zones a VPC endpoint
+# reports are DERIVED from its subnets, and a subnet is EC2's resource, so
+# `state::vpc_network` resolves what a request names against EC2. Only the generated
+# client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -15,8 +15,9 @@
 //!   that same record, over a table of seven grants differing in which member names
 //!   the principal (an account, a service), in the account id's length and digits, and
 //!   in the service options carried with it (absent, empty, one Region, several);
-//! * the principal type recorded is the one the model declares for the kind of
-//!   principal named, and the table covers every value `PrincipalType` declares;
+//! * the principal type reported is the one the service answers for the kind of
+//!   principal named — covered for both kinds, and pinned as a value in
+//!   [`super::authorized_principal_type`];
 //! * the principal IS the identity of an authorization: granting the same principal
 //!   again replaces its one record and leaves every other principal's alone;
 //! * a request that names no principal, or both kinds at once, is refused and the
@@ -236,14 +237,18 @@ fn assert_is_grant(entry: &Value, grant: &Grant, case: &str) {
         "case {case}: expected PrincipalType {:?}, got {entry:?}",
         grant.principal_type
     );
-    // Whatever type is reported is one the model declares, never a value of this
-    // emulator's own invention.
+    // The type reported for an ACCOUNT grantee is the value `PrincipalType` declares for
+    // it. A SERVICE grantee's is NOT one of that enum's values — the service answers it
+    // in words — so the modelled set is what an account's type is held to, and the value
+    // itself is pinned by [`super::authorized_principal_type`].
     let reported_type = entry["PrincipalType"].as_str().unwrap_or_default();
-    assert!(
-        PRINCIPAL_TYPE_VALUES.contains(&reported_type),
-        "case {case}: PrincipalType {reported_type:?} is outside the modelled values \
-         {PRINCIPAL_TYPE_VALUES:?}"
-    );
+    if grant.principal_type == PRINCIPAL_TYPE_AWS_ACCOUNT {
+        assert!(
+            PRINCIPAL_TYPE_VALUES.contains(&reported_type),
+            "case {case}: PrincipalType {reported_type:?} is outside the modelled values \
+             {PRINCIPAL_TYPE_VALUES:?}"
+        );
+    }
     match grant.service_options.as_ref() {
         Some(expected) => assert_eq!(
             entry.get("ServiceOptions"),
@@ -311,16 +316,30 @@ async fn a_grant_persists_the_principal_it_names_and_the_listing_reports_that_re
 }
 
 #[tokio::test]
-async fn every_principal_type_the_model_declares_is_recorded_by_some_grant() {
+async fn every_kind_of_principal_the_model_declares_is_recorded_by_some_grant() {
+    // The value the service ANSWERS for each kind `PrincipalType` declares: the enum's
+    // own spelling for an account, and the words the service answers for a service.
+    // Both are pinned as values by [`super::authorized_principal_type`]; here they only
+    // say which kind a row of the grant table covers.
+    let answered_for = |declared: &str| match declared {
+        "AWS_ACCOUNT" => PRINCIPAL_TYPE_AWS_ACCOUNT,
+        "AWS_SERVICE" => PRINCIPAL_TYPE_AWS_SERVICE,
+        other => panic!(
+            "PrincipalType declares the kind {other:?}, which no row of the grant table \
+             names a principal of"
+        ),
+    };
     let covered: Vec<&str> = grant_rows()
         .iter()
         .map(|grant| grant.principal_type)
         .collect();
     for principal_type in PRINCIPAL_TYPE_VALUES {
+        let answered = answered_for(principal_type);
         assert!(
-            covered.contains(principal_type),
-            "case PrincipalType({principal_type}): no row of the grant table records it, \
-             covered {covered:?}"
+            covered.contains(&answered),
+            "case PrincipalType({principal_type}): no row of the grant table records a \
+             principal of that kind, which the service answers {answered:?} for; covered \
+             {covered:?}"
         );
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_scope_listings.rs"]
 mod absent_scope_listings;
+#[path = "all/action_type_value_set_order.rs"]
+mod action_type_value_set_order;
 #[path = "all/application_create_refusals.rs"]
 mod application_create_refusals;
 #[path = "all/application_deletion.rs"]
@@ -25,6 +27,8 @@ mod application_plane_identity;
 mod application_updates;
 #[path = "all/applications.rs"]
 mod applications;
+#[path = "all/authorized_principal_type.rs"]
+mod authorized_principal_type;
 #[path = "all/change_progress.rs"]
 mod change_progress;
 #[path = "all/clock_owed_readiness.rs"]

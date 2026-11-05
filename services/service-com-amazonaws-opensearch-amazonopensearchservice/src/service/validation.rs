@@ -58,7 +58,9 @@
 //!   model's pattern as written — so only the quoting drops the pair;
 //! * an enumerated type's value set the walk reported is stated in lexicographic order
 //!   ([`::service_common::validation_message::in_sorted_enum_order`]), which is how this
-//!   service lists a set the MODEL declares in an order of its own. A set an OPERATION
+//!   service lists a set the MODEL declares in an order of its own — except for the sets
+//!   this service's own refusals are recorded stating in another order, which are listed
+//!   in [`STATED_VALUE_SET_ORDERS`] and stated in that order. A set an OPERATION
 //!   declares itself, for a member the model types as a plain string, is stated in the
 //!   order that operation states it: that order is part of what it states, and there is no
 //!   model order to normalise;
@@ -193,6 +195,66 @@ fn restated(violation: &Violation) -> Violation {
         },
         None => violation.clone(),
     }
+}
+
+// =============================================================================
+// The order an enumerated value set is stated in
+// =============================================================================
+
+/// The enumerated value sets this service states in an order neither the model's
+/// declaration order nor the sort gives, each written in the order its own refusals
+/// state it.
+///
+/// Source: the refusals recorded for this service. A set is recognised by the values it
+/// ADMITS and by nothing about the request, because the order belongs to the enumerated
+/// TYPE — one set, one order, whatever member or operation carried the value — so every
+/// member targeting that type states it the same way.
+///
+/// Every other set of this model takes the sorted order
+/// ([`::service_common::validation_message::in_sorted_enum_order`]), so this table holds
+/// only what that rule does not already produce.
+const STATED_VALUE_SET_ORDERS: &[&[&str]] = &[
+    // `com.amazonaws.opensearch#ActionType`, which the model declares
+    // `SERVICE_SOFTWARE_UPDATE, JVM_HEAP_SIZE_TUNING, JVM_YOUNG_GEN_TUNING`
+    // (`smithy_query(query="shape",shape="ActionType")`).
+    &[
+        "JVM_YOUNG_GEN_TUNING",
+        "SERVICE_SOFTWARE_UPDATE",
+        "JVM_HEAP_SIZE_TUNING",
+    ],
+];
+
+/// One violation with its enumerated value set in the order this service states it: the
+/// order [`STATED_VALUE_SET_ORDERS`] records for that set when it records one, else the
+/// sorted order. Everything else about the violation — the member path, the value
+/// echoed, every other requirement — is untouched.
+fn in_stated_value_order(violation: &Violation) -> Violation {
+    let sorted = in_sorted_enum_order(violation);
+    let ViolationKind::EnumValue(declared) = &sorted.kind else {
+        return sorted;
+    };
+    match stated_value_order(declared) {
+        Some(stated) => Violation {
+            kind: ViolationKind::EnumValue(stated),
+            ..sorted
+        },
+        None => sorted,
+    }
+}
+
+/// The order [`STATED_VALUE_SET_ORDERS`] states the set `declared` in, or `None` for a
+/// set it does not name — which is every set this service's refusals are not recorded
+/// stating out of sorted order.
+fn stated_value_order(declared: &[String]) -> Option<Vec<String>> {
+    STATED_VALUE_SET_ORDERS
+        .iter()
+        .find(|stated| {
+            stated.len() == declared.len()
+                && stated
+                    .iter()
+                    .all(|value| declared.iter().any(|admitted| admitted == value))
+        })
+        .map(|stated| stated.iter().map(|value| (*value).to_string()).collect())
 }
 
 // =============================================================================
@@ -752,9 +814,8 @@ pub(crate) fn stated_report(violations: &[Violation]) -> Option<Refused> {
 /// What the message states is decided in four steps, in this order: a request whose IAM
 /// role ARN cannot be read as one is answered with [`invalid_role_arn`] alone, because
 /// that step runs before the input's constraints are reported on; every enumerated type's
-/// value set the walk reported is stated in lexicographic order
-/// ([`::service_common::validation_message::in_sorted_enum_order`]), which is how this
-/// service lists a set the MODEL declares in an order of its own; every `@pattern` is
+/// value set the walk reported is stated in the order this service states it
+/// ([`in_stated_value_order`]); every `@pattern` is
 /// quoted as the service advertises it ([`restated`]); and every member [`STATED`] records
 /// a surface for states that surface instead of the model's. The clauses are then worded
 /// by [`worded`], the one wording every refusal of this service goes through.
@@ -774,7 +835,7 @@ pub(super) fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
     worded(
         violations
             .iter()
-            .map(in_sorted_enum_order)
+            .map(in_stated_value_order)
             .map(|violation| restated(&violation))
             .flat_map(|violation| stated_violations(&violation))
             .collect(),

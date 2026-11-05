@@ -15,6 +15,15 @@
 //! updates settle on exactly one winner's options instead of a merge of both. Once
 //! nothing is in flight the refused request succeeds unchanged.
 //!
+//! What a change cannot do is move the endpoint into another VPC: `VpcOptions` names
+//! subnets, and the VPC an endpoint reports (`VPCDerivedInfo$VPCId`) is derived from the
+//! subnets it was CREATED in, with no member any call sets. So a subnet the account's
+//! network places in another VPC is refused with the modelled `ValidationException` and
+//! the stored subnets and security groups stay as they were, while a subnet of the
+//! endpoint's own VPC is applied. Which VPC a subnet is in is the answer of the service
+//! that owns subnets ([`crate::state::vpc_network`]), so an emulator with no EC2 mounted
+//! resolves nothing and refuses nothing on that silence.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,7 +92,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{vpc_endpoint_being_modified, vpc_endpoint_not_found};
+use crate::state::vpc_network::{resolve_subnets, subnet_outside_vpc};
+use crate::state::{
+    request_region, subnet_outside_endpoint_vpc, vpc_endpoint_being_modified,
+    vpc_endpoint_not_found,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,9 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // The network the subnets this change names belong to, resolved against the
+        // service that OWNS subnets before the store is touched: an async hop cannot be
+        // made while the store is held, and the answer decides a refusal rather than
+        // anything written, so a refused call changes nothing. An emulator with no EC2 to
+        // ask resolves nothing, and nothing is what it refuses on.
+        let placements = match input.vpc_options.subnet_ids.as_deref() {
+            None => Vec::new(),
+            Some(subnet_ids) => {
+                resolve_subnets(ctx, &request_region(ctx.parts()), subnet_ids).await
+            }
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -195,7 +219,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        endpoint.begin_update(input.vpc_options, now);
+        // An endpoint's VPC is fixed at creation — `VPCDerivedInfo$VPCId` is derived
+        // from the subnets it was created in and no call sets it — so the subnets a
+        // change names have to be subnets of that VPC: one EC2 places in another VPC is
+        // refused with the operation's modelled `ValidationException` and the endpoint
+        // keeps the subnets and security groups it had.
+        if let Some(vpc_id) = endpoint.vpc_options.vpc_id.clone() {
+            if let Some(outside) = subnet_outside_vpc(&vpc_id, &placements) {
+                return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                    subnet_outside_endpoint_vpc(&outside.subnet_id, &vpc_id),
+                )
+                .into());
+            }
+        }
+
+        endpoint.begin_update(input.vpc_options, &placements, now);
 
         // Answered from the STORED record, through the projection every read path
         // reports an endpoint with: the slot the write went into IS the record.

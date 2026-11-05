@@ -853,5 +853,7 @@ mod cloudformation_updates_lambda_functions;
 // tail of this file is the contended region every other new suite lands in.
 #[path = "all/cloudformation_sam_http_api_definitions.rs"]
 mod cloudformation_sam_http_api_definitions;
+#[path = "all/opensearch_vpc_endpoint_vpc_membership.rs"]
+mod opensearch_vpc_endpoint_vpc_membership;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;

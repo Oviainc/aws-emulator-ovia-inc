@@ -12,6 +12,14 @@
 //! names none of the reasons on its own
 //! ([`crate::state::vpc_endpoint_domain_unavailable`]).
 //!
+//! The two members the model documents as DERIVED from the subnets —
+//! `VPCDerivedInfo$VPCId` ("Amazon VPC generates this value when you create a VPC") and
+//! `AvailabilityZones` ("the list of Availability Zones associated with the VPC
+//! subnets") — are read off the account's own network rather than invented here
+//! ([`crate::state::vpc_network`]), and that stored `VPCId` is what fixes the VPC the
+//! endpoint lives in for the rest of its life: see [`crate::ops::update_vpc_endpoint`].
+//! A subnet the account's network reports nothing for leaves both members unreported.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -84,8 +92,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::vpc_network::{placed_vpc_options, resolve_subnets};
 use crate::state::{
-    stored_vpc_options, vpc_endpoint_domain_unavailable, vpc_endpoint_host, OwedStatus,
+    request_region, vpc_endpoint_domain_unavailable, vpc_endpoint_host, OwedStatus,
     VpcEndpointRecord, PROVISIONING, VPC_ENDPOINT_QUOTA, VPC_ENDPOINT_STATUS_ACTIVE,
     VPC_ENDPOINT_STATUS_CREATING,
 };
@@ -163,9 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // The VPC and the Availability Zones this endpoint will report are DERIVED from
+        // the subnets the request names, and a subnet is the resource of the service that
+        // owns subnets: they are resolved there, before the store is touched, because an
+        // async hop cannot be made while the store is held. An emulator with no EC2 to
+        // ask resolves nothing, and then the endpoint reports neither member rather than
+        // one this service invented.
+        let placements = match input.vpc_options.subnet_ids.as_deref() {
+            None => Vec::new(),
+            Some(subnet_ids) => {
+                resolve_subnets(ctx, &request_region(ctx.parts()), subnet_ids).await
+            }
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -232,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The creator of the endpoint", which is the account this emulator serves.
             owner: ::engine::emulator_account_id().to_string(),
             domain_arn: input.domain_arn,
-            vpc_options: stored_vpc_options(input.vpc_options),
+            vpc_options: placed_vpc_options(input.vpc_options, &placements),
             // The endpoint is not up the instant the call returns: it is being
             // provisioned, and the clock owes it the status that provisioning leaves it
             // in once the span has passed.
