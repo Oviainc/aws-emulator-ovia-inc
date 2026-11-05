@@ -133,7 +133,7 @@ use std::sync::Arc;
 use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
-use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
+use aws_smithy_schema_server::constraints::{path, EnumTrait, Violation, ViolationKind};
 use aws_smithy_schema_server::protocol::{ProtocolError, ServerProtocol};
 use aws_smithy_schema_server::xml::XmlShapeDeserializer;
 use aws_smithy_schema_server::{xml_escape, HttpBindingDeserializer, RestXmlServerProtocol};
@@ -1127,6 +1127,216 @@ fn mode_headers_folded(request: &Request, input_schema: &Schema) -> Option<Vec<(
     changed.then_some(headers)
 }
 
+/// The INPUT member `input_schema` binds to the request header `name`, or `None` for a
+/// header this operation binds nothing from.
+///
+/// One lookup for every header rule below, so each is applied to a header the operation
+/// being served really binds — a header of that name on an operation that binds no such
+/// member is left exactly as it arrived.
+fn header_member<'s>(input_schema: &'s Schema, name: &str) -> Option<&'s Schema> {
+    input_schema
+        .members()
+        .iter()
+        .find(|member| {
+            member
+                .http_header()
+                .is_some_and(|header| header.value().eq_ignore_ascii_case(name))
+        })
+        .copied()
+}
+
+/// The value set `member` publishes, for a member the model constrains to one.
+///
+/// Read off the member's own trait map the way the validating walk reads it, so the set this
+/// module judges a header by is the very set the boundary would refuse it against — there is
+/// no second copy of it here.
+fn permitted_values(member: &Schema) -> Option<&'static [&'static str]> {
+    let published = member.traits()?.get(&EnumTrait::TRAIT_ID)?;
+    Some(published.as_any().downcast_ref::<EnumTrait>()?.values)
+}
+
+/// The TIMESTAMP format the framework's binding deserializer reads a value bound to a
+/// request header with: the one the member's own `@timestampFormat` names, and `date-time`
+/// for a member that names none.
+///
+/// Mirrors that reader exactly, because the rule below is about the values it would REFUSE:
+/// what this returns is the format the value has to be in by the time the codec sees it.
+fn bound_timestamp_format(member: &Schema) -> ::aws_smithy_types::date_time::Format {
+    match member.timestamp_format().map(|format| format.format()) {
+        Some(::aws_smithy_schema::traits::TimestampFormat::EpochSeconds) => {
+            ::aws_smithy_types::date_time::Format::EpochSeconds
+        }
+        Some(::aws_smithy_schema::traits::TimestampFormat::HttpDate) => {
+            ::aws_smithy_types::date_time::Format::HttpDate
+        }
+        Some(::aws_smithy_schema::traits::TimestampFormat::DateTime) | None => {
+            ::aws_smithy_types::date_time::Format::DateTime
+        }
+    }
+}
+
+/// `value` re-spelled in `format`, for a request header that carries an HTTP-date — or
+/// `None` when it is already a value that format reads, and when it is no HTTP-date either.
+///
+/// "An HTTP-date value represents time as an instance of Coordinated Universal Time (UTC)"
+/// and is the `IMF-fixdate` of RFC 9110, which is the format Smithy's HTTP bindings give a
+/// `timestamp` bound to a HEADER: every conditional header an SDK sends
+/// (`If-Unmodified-Since` and the `x-amz-copy-source-if-*` dates among them) is spelled that
+/// way, and the model's own members carry no `@timestampFormat` to say otherwise. Read
+/// through the ISO 8601 `date-time` parser instead, such a header is not a date at all and
+/// the whole request is refused for it — so a conditional read can never be evaluated.
+///
+/// The instant is what is preserved: the HTTP date is parsed and written back in the format
+/// the codec reads, which is the same instant to the second the header carries. A value that
+/// format already reads is left alone, so a member whose own format IS `http-date`, and a
+/// client that sends the format the member declares, are untouched.
+fn as_bound_timestamp(value: &str, format: ::aws_smithy_types::date_time::Format) -> Option<String> {
+    if DateTime::from_str(value, format).is_ok() {
+        return None;
+    }
+    let instant =
+        DateTime::from_str(value, ::aws_smithy_types::date_time::Format::HttpDate).ok()?;
+    instant.fmt(format).ok()
+}
+
+/// The request headers whose value the OPERATION judges rather than the boundary, each
+/// WITHHELD from the codec when it is outside the value set the model publishes for it.
+///
+/// `x-amz-acl` is the one such header. A canned ACL outside the published set is refused by
+/// S3 with its own `InvalidArgument` envelope — an empty `<Message>` and the
+/// `<ArgumentName>` / `<ArgumentValue>` pair naming the header and the value as sent
+/// ([`crate::scaffolded::Scaffolded::invalid_canned_acl`]) — and an envelope with members of
+/// its own is something only a handler can answer: the boundary's refusal carries the
+/// constraint clause the validating walk wrote, which names the Smithy member path and the
+/// model's value list instead.
+///
+/// So the value is kept from the codec, exactly as a website document the owning operation
+/// is the one to refuse is ([`crate::state::website_document_rejection`]), and every
+/// operation that binds this header answers the refusal itself from the request's own
+/// headers ([`rejected_canned_acl`]). The set is still enforced, in that one place: nothing
+/// outside it is ever stored.
+const HEADERS_JUDGED_BY_THE_HANDLER: [&str; 1] = [crate::state::CANNED_ACL_ARGUMENT];
+
+/// The `x-amz-acl` value `parts` carried that is outside the set `input_schema`'s own `ACL`
+/// member publishes, or `None` for a request carrying a published value or no such header at
+/// all.
+///
+/// The judgement the boundary would have made, made where the refusal can carry S3's own
+/// envelope — see [`HEADERS_JUDGED_BY_THE_HANDLER`], which is what withholds the value from
+/// the codec, and note that the set comes from the operation's OWN member, so a bucket's
+/// canned ACLs and an object's are each judged against their own published values.
+pub(crate) fn rejected_canned_acl<'p>(
+    parts: &'p ::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<&'p str> {
+    let value = parts
+        .headers
+        .get(crate::state::CANNED_ACL_ARGUMENT)
+        .and_then(|value| value.to_str().ok())?;
+    let permitted = permitted_values(header_member(
+        input_schema,
+        crate::state::CANNED_ACL_ARGUMENT,
+    )?)?;
+    (!permitted.contains(&value)).then_some(value)
+}
+
+/// The request headers a CONDITION arrives in as a date, and whose value a recipient is to
+/// IGNORE when it is not one.
+///
+/// "A recipient MUST ignore the If-Unmodified-Since header field if the received field value
+/// is not a valid HTTP-date" (RFC 9110, *If-Unmodified-Since*, and the same sentence for
+/// *If-Modified-Since*): a conditional date a server cannot read states no condition, so the
+/// request is served as if it carried none — refusing the whole request for it would make a
+/// header a client may send unparseable text in fatal, which HTTP says it is not.
+///
+/// The four are the conditional DATE members of this service's object reads and copies, as
+/// the model binds them (`smithy_query(query="operation",operation="GetObject,CopyObject")`
+/// reports `IfModifiedSince: {httpHeader: "If-Modified-Since"}`,
+/// `IfUnmodifiedSince: {httpHeader: "If-Unmodified-Since"}` and the two
+/// `x-amz-copy-source-if-*-since` headers, which are S3's prefixed spellings of the same two
+/// HTTP conditions). A timestamp header that is NOT a condition — the Object Lock
+/// retain-until date — is not here: it is a value the write stores rather than a condition it
+/// is judged by, so a value that is no date is refused rather than dropped.
+const CONDITIONAL_DATE_HEADERS: [&str; 4] = [
+    "If-Modified-Since",
+    "If-Unmodified-Since",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+];
+
+/// Whether `name` is one of [`CONDITIONAL_DATE_HEADERS`].
+fn states_a_date_condition(name: &str) -> bool {
+    CONDITIONAL_DATE_HEADERS
+        .iter()
+        .any(|header| header.eq_ignore_ascii_case(name))
+}
+
+/// `request`'s headers as the codec behind this protocol is given them, or `None` when
+/// nothing about them changes — which is every request that needs none of the rules below.
+///
+/// Each rule is driven off `input_schema`, so it applies only to a header the operation being
+/// served really binds, and each is about a value the framework's own codec would otherwise
+/// read as something the request did not say:
+///
+/// * a MODE value spelled in another case is folded to the model's spelling
+///   ([`mode_headers_folded`]);
+/// * an `x-amz-copy-source` is put into the form the member's pattern is applied to, its
+///   percent escapes decoded ([`crate::state::canonical_copy_source`]);
+/// * a timestamp bound to a header is re-spelled from the HTTP-date a client sends into the
+///   format the codec reads ([`as_bound_timestamp`]);
+/// * a CONDITION whose date is no date at all is dropped, the way HTTP says a recipient
+///   treats one ([`CONDITIONAL_DATE_HEADERS`]);
+/// * a value the OPERATION judges is withheld ([`HEADERS_JUDGED_BY_THE_HANDLER`]).
+///
+/// The rules are applied over ONE pass of the headers, in place, in that order, so a request
+/// that needs several is served and one that needs none allocates nothing beyond the pairs
+/// [`mode_headers_folded`] already reads.
+fn normalized_headers(request: &Request, input_schema: &Schema) -> Option<Vec<(String, String)>> {
+    let folded = mode_headers_folded(request, input_schema);
+    let mut changed = folded.is_some();
+    let mut headers = folded.unwrap_or_else(|| request_headers(request));
+    headers.retain_mut(|(name, value)| {
+        let Some(member) = header_member(input_schema, name) else {
+            return true;
+        };
+        if name.eq_ignore_ascii_case(crate::state::COPY_SOURCE_ARGUMENT) {
+            if let Some(canonical) = crate::state::canonical_copy_source(value) {
+                if canonical != *value {
+                    *value = canonical;
+                    changed = true;
+                }
+            }
+        } else if matches!(member.shape_type(), ShapeType::Timestamp) {
+            let format = bound_timestamp_format(member);
+            match as_bound_timestamp(value, format) {
+                Some(respelled) => {
+                    *value = respelled;
+                    changed = true;
+                }
+                // Neither the format the codec reads nor an HTTP-date: a condition stated in
+                // a value that is no date states no condition at all, so the header is
+                // dropped.
+                None if DateTime::from_str(value, format).is_err()
+                    && states_a_date_condition(name) =>
+                {
+                    changed = true;
+                    return false;
+                }
+                None => {}
+            }
+        } else if HEADERS_JUDGED_BY_THE_HANDLER
+            .iter()
+            .any(|judged| judged.eq_ignore_ascii_case(name))
+            && permitted_values(member).is_some_and(|permitted| !permitted.contains(&value.as_str()))
+        {
+            changed = true;
+            return false;
+        }
+        true
+    });
+    changed.then_some(headers)
+}
+
 /// A request's headers as `(name, value)` pairs, original case preserved and every value
 /// of a repeated header kept, which is what the binding deserializer needs to bind a
 /// list-typed or prefixed header.
@@ -1293,6 +1503,78 @@ fn with_accepted_status(response: Response, operation_name: &str, initiated: boo
     }
     with_status(response, ACCEPTED_STATUS)
 }
+
+/// The header S3's answer about a key whose CURRENT version is a delete marker carries:
+/// "`x-amz-delete-marker`: indicates whether the specified object is (true) or is not (false)
+/// a delete marker" (`GetObjectOutput$DeleteMarker`, bound to that header), beside the
+/// `x-amz-version-id` of the marker itself (`$VersionId`).
+///
+/// A read or a copy of such a key answers 404 — "if the current version is a delete marker,
+/// Amazon S3 behaves as if the object was deleted" — and the two headers are what say WHY it
+/// is not there and WHICH version to delete to bring it back; the error document itself
+/// carries no member for either. An operation that resolved the key to a marker records it
+/// ([`note_addressed_delete_marker`]) and the headers are written here, the way the status of
+/// an initiated restore is promoted here.
+const DELETE_MARKER_HEADER: &str = "x-amz-delete-marker";
+/// See [`DELETE_MARKER_HEADER`] — the value that header carries for such an answer.
+const DELETE_MARKER_HEADER_VALUE: &str = "true";
+
+::std::thread_local! {
+    /// The version id of the delete marker the operation serving this thread's request
+    /// resolved the addressed key to, or `None`.
+    ///
+    /// A request-scoped note, held under the same discipline as the restore note above: the
+    /// handler records it as the last thing it does before refusing, the serializer TAKES it
+    /// before anything that can fail, and every request this service deserializes clears
+    /// whatever this thread may still hold.
+    static ADDRESSED_DELETE_MARKER: ::std::cell::RefCell<Option<String>> =
+        const { ::std::cell::RefCell::new(None) };
+}
+
+/// Record that the key this request addressed resolves to a DELETE MARKER, whose version is
+/// `version_id` (`None` for the `null` version a bucket that was not versioning-enabled
+/// stored) — see [`DELETE_MARKER_HEADER`].
+pub fn note_addressed_delete_marker(version_id: Option<&str>) {
+    let recorded = version_id
+        .unwrap_or(crate::state::NULL_VERSION_ID)
+        .to_string();
+    ADDRESSED_DELETE_MARKER.with(|slot| slot.replace(Some(recorded)));
+}
+
+/// The note for the response now being serialized, TAKEN rather than read, so a note one
+/// response left behind can never name a later one.
+fn addressed_delete_marker() -> Option<String> {
+    ADDRESSED_DELETE_MARKER.with(|slot| slot.take())
+}
+
+/// Drop whatever note this thread may still hold, called at the START of every request this
+/// service deserializes.
+fn forget_any_unanswered_delete_marker() {
+    let _ = addressed_delete_marker();
+}
+
+/// `response` with the two headers S3's answer about a key whose current version is a delete
+/// marker carries — see [`DELETE_MARKER_HEADER`] — for a response whose request resolved to
+/// one, and unchanged for every other.
+fn with_delete_marker_headers(mut response: Response, marker: Option<String>) -> Response {
+    let Some(version_id) = marker else {
+        return response;
+    };
+    // A value a header map refuses is dropped rather than turning a served response into a
+    // transport failure; a version id never is.
+    let _ = response
+        .headers_mut()
+        .try_insert(DELETE_MARKER_HEADER, DELETE_MARKER_HEADER_VALUE);
+    let _ = response
+        .headers_mut()
+        .try_insert(VERSION_ID_RESPONSE_HEADER, version_id);
+    response
+}
+
+/// The header a response names the version it acted on in: `x-amz-version-id`, which every
+/// object operation's output binds its `VersionId` to
+/// (`smithy_query(query="operation",operation="GetObject")`).
+const VERSION_ID_RESPONSE_HEADER: &str = "x-amz-version-id";
 
 /// `response` re-sent with `status`, keeping every header the serializer wrote, or unchanged
 /// for a status no HTTP response can carry (neither of this module's two ever is) or a
@@ -1687,6 +1969,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // And whatever restore note it may hold, for the same reason: the note a response
         // reads has to be its own request's (see [`with_accepted_status`]).
         forget_any_unanswered_restore();
+        // And the delete-marker note, under the same discipline (see
+        // [`DELETE_MARKER_HEADER`]).
+        forget_any_unanswered_delete_marker();
         // The BUCKET this request addresses, recorded for the one thing that needs it once
         // the handler has returned: the `BucketName` a bucket-scoped error document names
         // the bucket by when the refusal did not name one itself
@@ -1761,11 +2046,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         let host_style_path = self
             .addressed_in_host(request)
             .map(|bucket| super::path_with_bucket(&bucket, request_path(request.uri())));
-        // The HEADERS the bound members are read from, with a MODE header the request spells
-        // in another case folded to the model's spelling ([`mode_headers_folded`]). `None`
-        // leaves the headers exactly as they arrived, which is every request that needs no
-        // fold.
-        let folded_headers = mode_headers_folded(request, input_schema);
+        // The HEADERS the bound members are read from, normalized where a value the request
+        // carried is not one the framework's codec reads as the request meant it — a MODE
+        // spelled in another case, a percent-encoded copy source, an HTTP-date, and the one
+        // value an OPERATION judges ([`normalized_headers`]). `None` leaves the headers
+        // exactly as they arrived, which is every request that needs no normalization.
+        let folded_headers = normalized_headers(request, input_schema);
         // Only a request whose BODY IS AN XML DOCUMENT can carry a member the framework's
         // codec cannot bind as the document spells it, and only a body that actually
         // spells one needs normalizing; everything else — every request whose body is not
@@ -1881,6 +2167,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // The same, for the note that decides which of the two statuses one operation's
         // success is answered with (see [`with_accepted_status`]).
         let accepted = restore_initiated();
+        // And for the delete-marker note, which a SUCCESS never carries: taking it here is
+        // what keeps a note an earlier refusal left from naming this response.
+        let _ = addressed_delete_marker();
         if UNWRAPPED_XML_OUTPUT_OPERATIONS.contains(&operation_name) {
             if let Some(body) =
                 unwrapped_document(output, output_schema).map_err(ProtocolError::Serde)?
@@ -1936,6 +2225,10 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         error_code: &str,
         http_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
+        // TAKEN before anything that can fail, the way the correlation pair is: the two
+        // headers an answer about a key whose current version is a delete marker carries
+        // (see [`DELETE_MARKER_HEADER`]).
+        let marker = addressed_delete_marker();
         // One refusal of this service carries NO error document: a request S3 rejects before
         // its API layer answers the bare status and an empty body, which is what an SDK
         // reports the status itself as the code it saw. The handler names it by
@@ -1945,7 +2238,10 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             let status = StatusCode::try_from(http_status).map_err(|_| {
                 ProtocolError::Malformed(format!("the unusable refusal status {http_status}"))
             })?;
-            return Ok(Response::new(status, SdkBody::empty()));
+            return Ok(with_delete_marker_headers(
+                Response::new(status, SdkBody::empty()),
+                marker,
+            ));
         }
         // The pair an error response names its request by. This model sets
         // `noErrorWrapping` ([`NO_ERROR_WRAPPING`]), so the inner serializer writes one
@@ -1954,12 +2250,15 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // shape S3's ids have. A refusal publishes no event notification and so records no
         // pair, so the pair is minted here and written over the one the envelope carries,
         // keeping the body and the headers in agreement.
-        Ok(with_envelope_request_correlation(self.inner.serialize_error(
-            error,
-            error_schema,
-            error_code,
-            http_status,
-        )?))
+        Ok(with_delete_marker_headers(
+            with_envelope_request_correlation(self.inner.serialize_error(
+                error,
+                error_schema,
+                error_code,
+                http_status,
+            )?),
+            marker,
+        ))
     }
 
     fn serialize_event_stream_message(

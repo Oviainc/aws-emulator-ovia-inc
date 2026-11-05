@@ -886,15 +886,15 @@ fn refused_write(
         // most 1,024 bytes long" (Amazon S3 User Guide). A longer key is `KeyTooLongError`,
         // the code a client branching on the limit reads, worded as every other write of this
         // service words it ([`crate::service::object_write`]); user-defined metadata past the
-        // published 2 KB is a header that is not valid for the request instead, which is what
-        // the modelled `InvalidRequest` reports.
+        // published 2 KB is answered with the code S3 publishes for that condition, naming
+        // the total and the ceiling ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
         crate::state::ObjectWrite::KeyTooLong { .. } => crate::scaffolded::Scaffolded::unmodeled(
             crate::service::object_write::KEY_TOO_LONG_CODE,
             crate::service::object_write::KEY_REFUSAL_STATUS,
             crate::service::object_write::KEY_TOO_LONG_MESSAGE,
         ),
-        crate::state::ObjectWrite::MetadataTooLarge { .. } => {
-            CompleteMultipartUploadErrorModeled::InvalidRequest(InvalidRequest {}).into()
+        crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
+            crate::scaffolded::Scaffolded::metadata_too_large(bytes)
         }
         crate::state::ObjectWrite::ObjectCountReached => {
             crate::scaffolded::Scaffolded::validation(format!(

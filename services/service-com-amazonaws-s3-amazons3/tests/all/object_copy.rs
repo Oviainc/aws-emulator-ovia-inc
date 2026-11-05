@@ -1044,8 +1044,13 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             destination_key: "copies/malformed-version.csv",
             copy_source: "copy-refusal-origin/source.csv?versionId=no-such-version",
             headers: Vec::new(),
+            // The version QUALIFIES the source reference rather than addressing the
+            // resource the request is about, so what S3 reports is that the request itself
+            // is not one it can serve — see
+            // `state::COPY_SOURCE_INVALID_VERSION_MESSAGE`, and
+            // `super::copy_source_header_envelopes` for the sentence.
             status: 400,
-            code: "InvalidArgument",
+            code: "InvalidRequest",
         },
         RefusalRow {
             case: "a copy source naming no bucket at all",

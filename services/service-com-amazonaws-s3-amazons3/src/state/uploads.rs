@@ -423,65 +423,157 @@ pub struct CopySource {
     pub version_id: Option<String>,
 }
 
+/// The `?versionId=` subresource split off a RAW `x-amz-copy-source` value: the path half
+/// and the version id half, or `None` for a value whose query names anything else.
+///
+/// The split is made on the value AS SENT, before any percent-decoding: the value "must be
+/// URL-encoded", so a `?` a KEY carries arrives as `%3F` and the only unescaped `?` left is
+/// the one that introduces the subresource — which is what makes `versionId` the only
+/// subresource such a value can carry. A value carrying no `?` at all names no version.
+fn copy_source_halves(value: &str) -> Option<(&str, Option<&str>)> {
+    match value.split_once('?') {
+        None => Some((value, None)),
+        Some((path, query)) => match query.strip_prefix("versionId=") {
+            Some(version_id) if !version_id.is_empty() => Some((path, Some(version_id))),
+            _ => None,
+        },
+    }
+}
+
+/// Why an `x-amz-copy-source` value names no source object — which decides the sentence S3
+/// refuses it with.
+///
+/// The value is read as a REFERENCE first and as an object key second, so the two faults are
+/// the two halves of that reading: a value that is not a `<bucket>/<key>` reference at all,
+/// and one that names a bucket and then no key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopySourceFault {
+    /// The value is not a reference: its escapes do not decode, its first segment is no
+    /// bucket name, or it carries a subresource that is not `versionId`.
+    Uri,
+    /// The value names a bucket and no object key after it.
+    ObjectKey,
+}
+
+impl CopySourceFault {
+    /// The `<Message>` S3 refuses this fault with — fixed text per fault, naming which half
+    /// of the reference is at fault and nothing of the value itself.
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::Uri => INVALID_COPY_SOURCE_URI_MESSAGE,
+            Self::ObjectKey => INVALID_COPY_SOURCE_KEY_MESSAGE,
+        }
+    }
+}
+
 /// Read an `x-amz-copy-source` value into the bucket, key and version it names, or report
-/// why it names none.
+/// why it names no source object at all.
 ///
 /// "Specify the name of the source bucket and the key of the source object, separated by a
 /// slash (/). For example, to copy the object `reports/january.pdf` from the general
 /// purpose bucket `awsexamplebucket`, use `awsexamplebucket/reports/january.pdf`. The
 /// value must be URL-encoded." A stored version is addressed by appending
 /// `?versionId=<version-id>` to that value
-/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`), and the
-/// member's own pattern (`^\/?.+\/.+$`) allows one leading slash, so the FIRST slash after
-/// it separates the bucket from the key — a key with slashes of its own keeps them.
+/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`).
+///
+/// So the value is DECODED first and read afterwards: the whole path half is percent-decoded
+/// in one pass and the bucket is then what stands before the FIRST slash of the decoded
+/// text, with the key — slashes of its own included — after it. A client that encodes the
+/// separator too (`bucket%2Fdir%2Ffile`, which every SDK produces for a key carrying a
+/// slash or a space) therefore names exactly the object a client that left it literal does,
+/// instead of naming no bucket-and-key pair. The member's own pattern (`^\/?.+\/.+$`) allows
+/// one leading slash, which is stripped before the split.
+///
+/// The bucket half has to be SHAPED like a bucket name
+/// ([`crate::service::bucket_name_shaped`]): a value whose first segment cannot be a bucket
+/// name — the scheme of a URI, say — addresses no object in any account, so it is a value
+/// this member cannot carry rather than a bucket that is missing
+/// ([`CopySourceFault::Uri`]). A value whose bucket half IS one and which names nothing
+/// after it carries no object key instead ([`CopySourceFault::ObjectKey`]).
 ///
 /// ONE place for the rule, so every operation that takes a copy source — the whole-object
 /// copy and the part copy, which document the member identically — addresses exactly the
 /// same objects and refuses exactly the same values.
-pub fn parse_copy_source(value: &str) -> Result<CopySource, String> {
-    let rejection = || {
-        format!(
-            "x-amz-copy-source must name the source bucket and the source object's key \
-             separated by a slash, URL-encoded, optionally followed by \
-             ?versionId=<version-id>, got {value:?}"
-        )
+pub fn parse_copy_source(value: &str) -> Result<CopySource, CopySourceFault> {
+    let Some((path, version_id)) = copy_source_halves(value) else {
+        return Err(CopySourceFault::Uri);
     };
-    // The value is URL-encoded, so a `?` in it is the query delimiter and a `?` in a key
-    // arrives as `%3F` — which is what makes the FIRST one the end of the key, and makes
-    // `versionId` the only subresource the value may carry.
-    let (path, version_id) = match value.split_once('?') {
-        None => (value, None),
-        Some((path, query)) => match query.strip_prefix("versionId=") {
-            Some(version_id) if !version_id.is_empty() => (path, Some(version_id)),
-            _ => return Err(rejection()),
-        },
+    let Some(path) = url_decoded(path) else {
+        return Err(CopySourceFault::Uri);
     };
-    let path = path.strip_prefix('/').unwrap_or(path);
-    let Some((bucket, key)) = path.split_once('/') else {
-        return Err(rejection());
+    let path = path.strip_prefix('/').unwrap_or(&path);
+    let (bucket, key) = match path.split_once('/') {
+        Some((bucket, key)) => (bucket, key),
+        // No separator at all: the whole value is the bucket half, so what is missing is
+        // the key — for a value that could be a bucket name. Anything else is no reference.
+        None => (path, ""),
     };
-    if bucket.is_empty() || key.is_empty() {
-        return Err(rejection());
+    if !crate::service::bucket_name_shaped(bucket) {
+        return Err(CopySourceFault::Uri);
     }
-    let Some(bucket) = url_decoded(bucket) else {
-        return Err(rejection());
-    };
-    let Some(key) = url_decoded(key) else {
-        return Err(rejection());
-    };
+    if key.is_empty() {
+        return Err(CopySourceFault::ObjectKey);
+    }
     let version_id = match version_id {
         None => None,
         Some(version_id) => match url_decoded(version_id) {
             Some(version_id) => Some(version_id),
-            None => return Err(rejection()),
+            None => return Err(CopySourceFault::Uri),
         },
     };
     Ok(CopySource {
-        bucket,
-        key,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
         version_id,
     })
 }
+
+/// The fault `value` carries as an `x-amz-copy-source`, or `None` for a value that names a
+/// source object.
+///
+/// The same reading as [`parse_copy_source`], for the one caller that has the value and not
+/// the request: the boundary refusal of a value the modelled pattern rejects, which is
+/// worded from the same two faults as a value that reaches a handler
+/// (`crate::service::published_refusal`).
+pub fn copy_source_fault(value: &str) -> Option<CopySourceFault> {
+    parse_copy_source(value).err()
+}
+
+/// One `x-amz-copy-source` value in the form the modelled member's own pattern is applied
+/// to: the path half percent-decoded, with the two characters that decoding gives a meaning
+/// of their own put back as escapes, and the `?versionId=` half left exactly as it arrived.
+///
+/// The member's pattern (`^\/?.+\/.+$`) is enforced against the value AS SENT, and a value
+/// whose separator is encoded (`bucket%2Fdir%2Ffile`) carries no literal slash to satisfy it
+/// — so the request would be refused for its syntax instead of being resolved against the
+/// source it names. Decoding the path half first is what S3 does
+/// ([`parse_copy_source`] states the rule), and this is where the request's own header is
+/// put into that form, so the pattern is applied to the DECODED reference.
+///
+/// `%` and `?` are re-escaped because the decoded text is read by [`parse_copy_source`]
+/// again: left literal, a `%` would be taken for the start of an escape and a `?` for the
+/// subresource delimiter, so a key carrying either would come out as a different key.
+/// Everything else is left decoded, which makes this form stable — a value already in it is
+/// returned unchanged.
+///
+/// `None` when the escapes do not decode to UTF-8, which no bucket name or object key this
+/// store holds is: such a value is left exactly as it arrived for the handler to refuse.
+pub fn canonical_copy_source(value: &str) -> Option<String> {
+    let (path, version_id) = copy_source_halves(value)?;
+    let decoded = url_decoded(path)?;
+    let decoded =
+        ::percent_encoding::utf8_percent_encode(&decoded, &COPY_SOURCE_RESERVED).to_string();
+    Some(match version_id {
+        None => decoded,
+        Some(version_id) => format!("{decoded}?versionId={version_id}"),
+    })
+}
+
+/// The two characters a DECODED copy source keeps as escapes — see
+/// [`canonical_copy_source`] for why each has to: they are the two that
+/// [`parse_copy_source`] reads as something other than themselves.
+const COPY_SOURCE_RESERVED: ::percent_encoding::AsciiSet =
+    ::percent_encoding::AsciiSet::EMPTY.add(b'%').add(b'?');
 
 /// One percent-encoded element of a copy source, decoded — or `None` when its escapes do
 /// not decode to UTF-8, which no bucket name or object key this store holds is.

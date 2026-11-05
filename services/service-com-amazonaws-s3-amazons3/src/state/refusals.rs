@@ -99,6 +99,87 @@ pub const VERSION_ID_ARGUMENT: &str = "versionId";
 /// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a `versionId` that is not
 /// shaped like a version id ([`version_id_is_well_formed`]).
 pub const INVALID_VERSION_ID_MESSAGE: &str = "Invalid version id specified";
+
+/// The request field a refused `x-amz-copy-source` is reported against — the header every
+/// operation that takes a copy source binds it from
+/// (`smithy_query(query="operation",operation="CopyObject,UploadPartCopy")` reports
+/// `CopySource: {httpHeader: "x-amz-copy-source"}`), which is how S3's `InvalidArgument`
+/// document names the argument it rejected.
+pub const COPY_SOURCE_ARGUMENT: &str = "x-amz-copy-source";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for an `x-amz-copy-source` value
+/// that is not a `<bucket>/<key>` reference at all ([`CopySourceFault::Uri`]).
+///
+/// Fixed text: it states that the REFERENCE is not one, and names neither the value nor the
+/// rule it broke — the field and the value travel in the `<ArgumentName>` /
+/// `<ArgumentValue>` pair of the same document instead
+/// ([`crate::scaffolded::Scaffolded::invalid_copy_source`]).
+pub const INVALID_COPY_SOURCE_URI_MESSAGE: &str = "Invalid copy source URI.";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for an `x-amz-copy-source` whose
+/// reference names a bucket and no object key after it
+/// ([`CopySourceFault::ObjectKey`]) — the other half of the same reading, and fixed text for
+/// the same reason.
+pub const INVALID_COPY_SOURCE_KEY_MESSAGE: &str = "Invalid copy source object key";
+
+/// The `<Message>` S3 sends with [`INVALID_REQUEST_CODE`] for a copy whose source names a
+/// version id that is not one: the request cannot be carried out as given, and the sentence
+/// states nothing but that.
+///
+/// Fixed text, with nothing of the request in it. It is not the malformed-argument refusal a
+/// `versionId` PARAMETER earns ([`INVALID_VERSION_ID_MESSAGE`]): the version here qualifies a
+/// copy SOURCE reference rather than addressing the resource the request is about, so what
+/// S3 reports is that the request itself is not one it can serve.
+pub const COPY_SOURCE_INVALID_VERSION_MESSAGE: &str = "Invalid Request";
+
+/// The `<Message>` S3 sends with [`INVALID_REQUEST_CODE`] for a copy whose source names a
+/// DELETE MARKER by version id.
+///
+/// Fixed text, naming the condition itself: a delete marker holds no bytes to copy, so the
+/// request cannot be served — and the sentence says which part of it is at fault, where the
+/// generic "method not allowed" S3 answers a READ of a marker with would tell the caller
+/// nothing about the version id it supplied.
+pub const COPY_SOURCE_IS_DELETE_MARKER_MESSAGE: &str =
+    "The source of a copy request may not specifically refer to a delete marker by version id.";
+
+/// The request field a refused canned ACL is reported against — the header every operation
+/// that takes one binds it from (`smithy_query(query="operation",
+/// operation="CopyObject,PutObject,CreateBucket,CreateMultipartUpload,PutBucketAcl,PutObjectAcl")`
+/// reports `ACL: {httpHeader: "x-amz-acl"}`).
+pub const CANNED_ACL_ARGUMENT: &str = "x-amz-acl";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a canned ACL outside the
+/// published set: NONE at all. The envelope's `<ArgumentName>` / `<ArgumentValue>` pair is
+/// the whole of what it says, naming [`CANNED_ACL_ARGUMENT`] and echoing the value as the
+/// request sent it.
+pub const INVALID_CANNED_ACL_MESSAGE: &str = "";
+
+/// The `<Message>` S3 sends with [`INVALID_REQUEST_CODE`] for a request that names an ACL in
+/// BOTH header forms at once: a canned ACL in `x-amz-acl` and explicit grants in the
+/// `x-amz-grant-*` headers.
+///
+/// Fixed text naming the two forms, with nothing of the request in it: "you can specify a
+/// canned ACL … or specify access permissions explicitly" (`PutObjectRequest$ACL`) is an
+/// either/or, and a request that does both describes two different ACLs for one resource.
+pub const BOTH_ACL_FORMS_MESSAGE: &str =
+    "Specifying both Canned ACLs and Header Grants is not allowed";
+
+/// The code S3 answers a write whose user-defined metadata is larger than one request may
+/// carry ([`MAX_OBJECT_METADATA_BYTES`]), with HTTP 400 (Amazon S3 "Error responses", list
+/// of error codes). Not a shape in this model, so it goes out through the unmodelled
+/// channel.
+pub const METADATA_TOO_LARGE_CODE: &str = "MetadataTooLarge";
+
+/// See [`METADATA_TOO_LARGE_CODE`] — the fixed text S3 publishes for that code. The two
+/// numbers a caller trims its metadata by are the `<Size>` / `<MaxSizeAllowed>` pair of the
+/// same document, not part of this sentence
+/// ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
+pub const METADATA_TOO_LARGE_MESSAGE: &str =
+    "Your metadata headers exceed the maximum allowed metadata size";
+
+/// The HTTP status [`METADATA_TOO_LARGE_CODE`] is rendered with: 400, from the same list.
+pub const METADATA_TOO_LARGE_STATUS: u16 = 400;
+
 /// The code S3 answers a `DeleteBucket` of a bucket that still holds something, with HTTP
 /// 409 Conflict: "All objects (including all object versions and delete markers) in the
 /// bucket must be deleted before the bucket itself can be deleted" (`DeleteBucket`'s own

@@ -334,6 +334,30 @@ impl SerializableStruct for Unmodeled {
     }
 }
 
+/// A rejection the BOUNDARY answers, with the DETAIL members its error class carries.
+///
+/// The refusal of a value the framework's own validating walk rejected is worded through
+/// [`smithy_server_runtime::Service::override_refusal`], which chooses the code and the
+/// message and nothing else — so a document that also names the argument it rejected is
+/// written from here instead, by the one renderer that can
+/// (`crate::service::EmulatedService::detailed_refusal`). The code and the status travel with
+/// that renderer, exactly as they do for [`Unmodeled`].
+#[derive(Debug, Clone)]
+pub struct UnmodeledWithDetail {
+    /// Why the request was refused.
+    pub message: String,
+    /// What the refusal is ABOUT, written after the message — the order S3's document
+    /// carries its members in.
+    pub detail: ErrorDetail,
+}
+
+impl SerializableStruct for UnmodeledWithDetail {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&UNMODELED_MESSAGE, self.message.as_str())?;
+        self.detail.serialize_into(s)
+    }
+}
+
 /// The `message` member written for a MODELED error whose own shape declares none.
 ///
 /// Same shape as the three synthetic members above — the member name Smithy uses
@@ -892,6 +916,36 @@ static UNIMPLEMENTED_QUERY_PARAMETER: Schema = Schema::new_member(
 )
 .with_xml_name("QueryParameter");
 
+/// The `<Size>` of an S3 error document: how large, in bytes, the thing a size refusal is
+/// about actually is — the total of the request's own user-defined metadata headers for
+/// [`crate::state::METADATA_TOO_LARGE_CODE`].
+static REFUSED_SIZE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedSize$size",
+        "smithy.framework",
+        "size",
+    ),
+    ShapeType::Long,
+    "size",
+    21,
+)
+.with_xml_name("Size");
+
+/// The `<MaxSizeAllowed>` of an S3 error document: the ceiling that size was judged against,
+/// written after [`REFUSED_SIZE`] — which is what makes the pair actionable, since the
+/// sentence names neither number.
+static MAX_SIZE_ALLOWED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedSize$maxSizeAllowed",
+        "smithy.framework",
+        "maxSizeAllowed",
+    ),
+    ShapeType::Long,
+    "maxSizeAllowed",
+    22,
+)
+.with_xml_name("MaxSizeAllowed");
+
 /// The `<Message>` S3 sends with [`crate::state::NOT_IMPLEMENTED_CODE`] when it is a QUERY
 /// PARAMETER that asked for functionality the service does not implement for the resource
 /// addressed: "NotImplemented — A query parameter you provided implies functionality that is
@@ -1061,6 +1115,16 @@ pub enum ErrorDetail {
     /// A precondition that did not hold, named by `<Condition>`: the conditional HEADER of
     /// the request that failed.
     Condition(String),
+    /// A value refused for its SIZE, named by the `<Size>` / `<MaxSizeAllowed>` pair: how
+    /// large the request's own value is and the ceiling it was judged against, which
+    /// together are what a caller trims it by — the sentence of such a refusal names
+    /// neither.
+    Size {
+        /// The size the request's own value has, in bytes.
+        size: i64,
+        /// The ceiling it was judged against, in bytes.
+        max_size_allowed: i64,
+    },
     /// A request asking for functionality the service does not implement for the resource it
     /// addressed, named by the `<Header>` or the `<QueryParameter>` that asked for it: the
     /// sentence of that class names only the KIND of thing that implied it, so the member is
@@ -1091,7 +1155,11 @@ impl UnimplementedBy {
 impl ErrorDetail {
     /// Write the member — or, for a group, the members — S3's error document carries for this
     /// class, in the order the document carries them in.
-    fn serialize_into(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+    ///
+    /// `pub(crate)`: a refusal the BOUNDARY answers carries its members through the one
+    /// renderer that can write them ([`UnmodeledWithDetail`]), so both channels write one
+    /// class's members the same way.
+    pub(crate) fn serialize_into(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         match self {
             Self::Bucket(name) => s.write_string(&BUCKET_NAME, name),
             Self::Annotation(name) => s.write_string(&ANNOTATION_NAME, name),
@@ -1167,6 +1235,13 @@ impl ErrorDetail {
                 s.write_long(&ACTUAL_OBJECT_SIZE, *actual_object_size)
             }
             Self::Condition(condition) => s.write_string(&UNMET_CONDITION, condition),
+            Self::Size {
+                size,
+                max_size_allowed,
+            } => {
+                s.write_long(&REFUSED_SIZE, *size)?;
+                s.write_long(&MAX_SIZE_ALLOWED, *max_size_allowed)
+            }
             Self::Unimplemented(UnimplementedBy::Header(header)) => {
                 s.write_string(&UNIMPLEMENTED_HEADER, header)
             }
@@ -1212,6 +1287,10 @@ impl ErrorDetail {
                 requested,
                 actual_object_size,
             } => format!("{requested} of {actual_object_size} bytes"),
+            Self::Size {
+                size,
+                max_size_allowed,
+            } => format!("{size} bytes of {max_size_allowed} allowed"),
         }
     }
 }
@@ -1525,6 +1604,86 @@ impl<E> Scaffolded<E> {
             Some(version_id),
             crate::state::INVALID_VERSION_ID_MESSAGE,
         )
+    }
+
+    /// The refusal every operation that takes an `x-amz-copy-source` answers a value that
+    /// names no source object with: the `InvalidArgument` above carrying the sentence the
+    /// fault publishes ([`crate::state::CopySourceFault::message`]), and the
+    /// `<ArgumentName>` / `<ArgumentValue>` pair naming the header the caller has to fix.
+    ///
+    /// Both halves of the pair are the HEADER: the refusal is about that field being
+    /// unreadable as a reference, and S3's document names the field in each — it does not
+    /// echo the text back, which for this class would be a value a caller may have written
+    /// anything into.
+    ///
+    /// One place, so a copy source that names nothing is refused identically wherever it
+    /// arrives.
+    pub fn invalid_copy_source(fault: crate::state::CopySourceFault) -> Self {
+        Self::invalid_argument(
+            crate::state::COPY_SOURCE_ARGUMENT,
+            Some(crate::state::COPY_SOURCE_ARGUMENT),
+            fault.message(),
+        )
+    }
+
+    /// The refusal every operation that takes a canned ACL answers a value outside the set
+    /// its `ACL` member publishes with: the `InvalidArgument` above with NO sentence at all
+    /// ([`crate::state::INVALID_CANNED_ACL_MESSAGE`]), naming the `x-amz-acl` header and
+    /// echoing the value as the request sent it.
+    ///
+    /// The pair is the whole of what this refusal says, which is why it is attached here
+    /// rather than left to the boundary's own clause: that clause names the Smithy member
+    /// path and the model's value list, neither of which is anything a client wrote on the
+    /// request.
+    ///
+    /// One place, so the six operations that take one refuse it identically.
+    pub fn invalid_canned_acl(value: &str) -> Self {
+        Self::invalid_argument(
+            crate::state::CANNED_ACL_ARGUMENT,
+            Some(value),
+            crate::state::INVALID_CANNED_ACL_MESSAGE,
+        )
+    }
+
+    /// The refusal every operation that takes a canned ACL answers a request naming an ACL
+    /// in BOTH header forms with: `InvalidRequest` at
+    /// [`crate::state::INVALID_REQUEST_STATUS`] carrying the sentence that names the two
+    /// forms ([`crate::state::BOTH_ACL_FORMS_MESSAGE`]).
+    ///
+    /// One place beside [`Self::invalid_canned_acl`], so the writes that take an ACL cannot
+    /// disagree about either refusal of it.
+    pub fn both_acl_forms() -> Self {
+        Self::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            crate::state::BOTH_ACL_FORMS_MESSAGE,
+        )
+    }
+
+    /// The refusal every write that carries user-defined metadata answers one whose metadata
+    /// is larger than the published ceiling with: [`crate::state::METADATA_TOO_LARGE_CODE`]
+    /// at [`crate::state::METADATA_TOO_LARGE_STATUS`] with that code's fixed sentence, plus
+    /// the `<Size>` / `<MaxSizeAllowed>` pair — the request's own total and the ceiling it
+    /// was judged against, which is what a caller trims its headers by.
+    ///
+    /// `size` is measured from the request ([`crate::state::Object::metadata_bytes`], the
+    /// one place this service measures it) and the ceiling is
+    /// [`crate::state::MAX_OBJECT_METADATA_BYTES`], so neither number is invented here.
+    ///
+    /// The ONE place this refusal is built, so every write that carries metadata — the
+    /// object put, the copy, the upload initiation and the upload completion — refuses the
+    /// same way.
+    pub fn metadata_too_large(size: usize) -> Self {
+        Self::unmodeled(
+            crate::state::METADATA_TOO_LARGE_CODE,
+            crate::state::METADATA_TOO_LARGE_STATUS,
+            crate::state::METADATA_TOO_LARGE_MESSAGE,
+        )
+        .naming(ErrorDetail::Size {
+            size: i64::try_from(size).unwrap_or(i64::MAX),
+            max_size_allowed: i64::try_from(crate::state::MAX_OBJECT_METADATA_BYTES)
+                .unwrap_or(i64::MAX),
+        })
     }
 
     /// The refusal every WRITE that carries `x-amz-object-lock-retain-until-date` answers a

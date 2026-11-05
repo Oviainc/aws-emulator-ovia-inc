@@ -328,8 +328,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // An initiation needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The canned ACL this initiation names has to be one the `ACL` member publishes. The
+        // value is judged HERE rather than at the boundary because the refusal carries
+        // members of its own — see [`crate::service::wire::rejected_canned_acl`], which is
+        // where the request's own header is read, and
+        // `crate::scaffolded::Scaffolded::invalid_canned_acl`, which is the envelope S3
+        // answers it with.
+        if let Some(value) = crate::service::wire::rejected_canned_acl(
+            ctx.parts(),
+            super::types::CREATE_MULTIPART_UPLOAD_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
 
         // What this emulator cannot carry out faithfully, refused rather than answered
         // with an upload id that would claim it. Each member decides something about the
@@ -659,18 +669,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // "Within the PUT request header, the user-defined metadata is limited to 2
             // KB in size" (Amazon S3 User Guide). Past it S3 answers `MetadataTooLarge`
-            // with HTTP 400 (same list of error codes), a code this model declares no
-            // shape for either.
+            // with HTTP 400 (same list of error codes), naming the request's own total and
+            // the ceiling ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
             crate::state::MultipartUploadCreation::MetadataTooLarge { bytes } => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    "MetadataTooLarge",
-                    400,
-                    format!(
-                        "Your metadata headers exceed the maximum allowed metadata size: \
-                         {bytes} bytes, past {}",
-                        crate::state::MAX_OBJECT_METADATA_BYTES
-                    ),
-                ));
+                return Err(crate::scaffolded::Scaffolded::metadata_too_large(bytes));
             }
             // The emulator's own ceilings, not AWS quotas (S3 bounds the number of
             // concurrent multipart uploads not at all), so no AWS error code describes

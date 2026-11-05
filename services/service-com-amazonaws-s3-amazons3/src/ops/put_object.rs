@@ -369,6 +369,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The canned ACL this write asks the object to be stored with has to be one the
+        // `ACL` member publishes. The value is judged HERE rather than at the boundary
+        // because the refusal carries members of its own — see
+        // [`crate::service::wire::rejected_canned_acl`], which is where the request's own
+        // header is read, and `crate::scaffolded::Scaffolded::invalid_canned_acl`, which is
+        // the envelope S3 answers it with.
+        if let Some(value) = crate::service::wire::rejected_canned_acl(
+            ctx.parts(),
+            super::types::PUT_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store the object cannot be recorded at all, and none of the
             // modelled errors says that, so the scaffold's 501 carries what is true:
@@ -911,12 +924,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             // "Within the PUT request header, the user-defined metadata is limited to 2 KB
-            // in size" (Amazon S3 User Guide). Past it the request carries a header that
-            // is not valid for this operation, which is what the modelled
-            // `InvalidRequest` reports; AWS's own `MetadataTooLarge` is not a shape in
-            // this model and so cannot be rendered.
-            crate::state::ObjectWrite::MetadataTooLarge { .. } => {
-                return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            // in size" (Amazon S3 User Guide). Past it S3 answers the code it publishes for
+            // exactly that condition, naming the request's own total and the ceiling
+            // ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
+            crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
+                return Err(crate::scaffolded::Scaffolded::metadata_too_large(bytes));
             }
             // The emulator's own ceilings, not AWS quotas (S3 bounds neither the number of
             // objects nor their total size), so no AWS error code describes them: they go
@@ -1093,7 +1105,12 @@ fn requested_acl(
     let headers_name_an_acl = grant_headers.iter().any(|(_, value, _)| value.is_some());
 
     if input.acl.is_some() && headers_name_an_acl {
-        return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        // An ACL arrives in ONE of the two header forms: "you can specify a canned ACL …
+        // or specify access permissions explicitly" (`PutObjectRequest$ACL`). A request
+        // doing both describes two different ACLs for one object, which S3 refuses with the
+        // sentence naming the two forms — the same refusal every write that takes an ACL
+        // answers it with ([`crate::scaffolded::Scaffolded::both_acl_forms`]).
+        return Err(crate::scaffolded::Scaffolded::both_acl_forms());
     }
 
     if headers_name_an_acl {

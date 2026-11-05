@@ -224,6 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The canned ACL this create names has to be one the `ACL` member publishes. The
+        // value is judged HERE rather than at the boundary because the refusal carries
+        // members of its own — see [`crate::service::wire::rejected_canned_acl`], which is
+        // where the request's own header is read, and
+        // `crate::scaffolded::Scaffolded::invalid_canned_acl`, which is the envelope S3
+        // answers it with.
+        if let Some(value) = crate::service::wire::rejected_canned_acl(
+            ctx.parts(),
+            super::types::CREATE_BUCKET_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine
             // that is not the shared `InMemoryEngine`; the emulator then cannot create

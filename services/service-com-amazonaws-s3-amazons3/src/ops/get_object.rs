@@ -484,6 +484,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let Some(object) = object else {
+            // "If the current version is a delete marker, Amazon S3 behaves as if the object
+            // was deleted": the key is not there, and the answer names the marker that makes
+            // it so in its two headers (see `crate::service::wire`'s delete-marker note), so
+            // a caller learns which version to delete to bring the object back.
+            if input.version_id.is_none() {
+                if let Some(marker) = bucket
+                    .current_version(&input.key)
+                    .and_then(crate::state::StoredVersion::as_delete_marker)
+                {
+                    crate::service::wire::note_addressed_delete_marker(
+                        marker.version_id.as_deref(),
+                    );
+                }
+            }
             return Err(GetObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
         };
 

@@ -460,6 +460,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `versionId` the bucket holds no version for is `NoSuchVersion` rather than
         // `NoSuchKey`, because the key itself may well be there.
         let Some(object) = object else {
+            // "If the current version is a delete marker, Amazon S3 behaves as if the object
+            // was deleted": the answer names the marker that makes it so in its two headers
+            // (see `crate::service::wire`'s delete-marker note), which on a HEAD — a
+            // response with no body at all — is the whole of what says why.
+            if input.version_id.is_none() {
+                if let Some(marker) = held.and_then(crate::state::StoredVersion::as_delete_marker) {
+                    crate::service::wire::note_addressed_delete_marker(
+                        marker.version_id.as_deref(),
+                    );
+                }
+            }
             let (code, message) = match (
                 store.bucket(&input.bucket).is_some(),
                 input.version_id.is_some(),

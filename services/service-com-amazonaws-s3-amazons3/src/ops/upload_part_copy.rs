@@ -349,19 +349,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // The bucket, key and version the copy source names, read by the one rule every copy
-        // in this service reads it by. The member's pattern (`^\/?.+\/.+$`) is already
-        // enforced at the boundary, so what reaches here is a value that satisfies it and
-        // still names no bucket-and-key pair: "the value of the parameter is not valid" is
-        // `InvalidArgument` (400), and the message names the member the caller has to fix.
+        // in this service reads it by ([`crate::state::parse_copy_source`]).
         let source = match crate::state::parse_copy_source(&input.copy_source) {
             Ok(source) => source,
-            Err(rejection) => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    rejection,
-                ))
-            }
+            // The value names no source object: it is not a `<bucket>/<key>` reference at
+            // all, or it names a bucket and no key. `CopyObject` refuses it identically.
+            Err(fault) => return Err(crate::scaffolded::Scaffolded::invalid_copy_source(fault)),
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -423,9 +416,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => source_bucket.object(&source.key).cloned(),
             Some(version_id) => {
                 // A `versionId` that is not SHAPED like one cannot name a version of
-                // anything, so it is a malformed argument rather than an absent version.
+                // anything, and here it qualifies the copy SOURCE reference rather than
+                // addressing the resource the request is about — so the request itself is
+                // not one S3 can serve, exactly as `CopyObject` answers the same value.
                 if !crate::state::version_id_is_well_formed(version_id) {
-                    return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        crate::state::COPY_SOURCE_INVALID_VERSION_MESSAGE,
+                    ));
                 }
                 let Some(held) = source_bucket.stored_version(&source.key, version_id) else {
                     // About the COPY SOURCE version, so it names that object itself rather
@@ -438,19 +437,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .naming_object(&source.key, Some(version_id)));
                 };
-                // A delete marker holds no bytes for a copy to read, and naming one
-                // explicitly is not something this method can do — the same 405 a read of one
-                // is answered with.
+                // A delete marker holds no bytes for a copy to read, so the request cannot
+                // be served, and what S3 states is the condition itself — the same refusal
+                // `CopyObject` answers a source that names a marker by version id with.
                 if held.as_delete_marker().is_some() {
-                    return Err(crate::scaffolded::Scaffolded::method_not_allowed(
-                        PART_COPY_METHOD,
-                        crate::state::DELETE_MARKER_RESOURCE_TYPE,
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        crate::state::COPY_SOURCE_IS_DELETE_MARKER_MESSAGE,
                     ));
                 }
                 held.as_object().cloned()
             }
         };
         let Some(source_object) = held else {
+            // "If the current version is a delete marker, Amazon S3 behaves as if the object
+            // was deleted": the answer names the marker that makes the source key absent in
+            // its two headers, the way `CopyObject` answers the same source.
+            if source.version_id.is_none() {
+                if let Some(marker) = source_bucket
+                    .current_version(&source.key)
+                    .and_then(crate::state::StoredVersion::as_delete_marker)
+                {
+                    crate::service::wire::note_addressed_delete_marker(
+                        marker.version_id.as_deref(),
+                    );
+                }
+            }
             // About the COPY SOURCE key, named for the same reason the source bucket is.
             return Err(crate::scaffolded::Scaffolded::Modeled(
                 UploadPartCopyErrorModeled::NoSuchKey(NoSuchKey {}),
@@ -640,12 +653,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// HTTP 400.
 const UNSUPPORTED_BYTE_RANGE_SOURCE_MESSAGE: &str =
     "The specified copy source is not supported as a byte-range copy source.";
-
-/// The HTTP method this operation is bound to — "PUT"
-/// (`smithy_query(query="operation",operation="UploadPartCopy")` reports
-/// `http {method: "PUT", uri: "/{Bucket}/{Key+}?x-id=UploadPartCopy"}`) — which is what a
-/// `MethodNotAllowed` document reports as the `<Method>` it refused.
-const PART_COPY_METHOD: &str = "PUT";
 
 /// The four copy-source conditional members this request carried, for the one rule every
 /// copy in this service judges them by

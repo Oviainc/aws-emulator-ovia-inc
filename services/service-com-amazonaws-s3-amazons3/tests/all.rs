@@ -115,6 +115,8 @@ mod bucket_website_refusals;
 mod checksum_mode_header_case;
 #[path = "all/cli_download_legs.rs"]
 mod cli_download_legs;
+#[path = "all/copy_source_header_envelopes.rs"]
+mod copy_source_header_envelopes;
 #[path = "all/directory_bucket_conditional_deletes.rs"]
 mod directory_bucket_conditional_deletes;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]

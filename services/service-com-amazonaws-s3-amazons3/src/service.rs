@@ -146,7 +146,11 @@ const BUCKET_NAME_CHARS: ::std::ops::RangeInclusive<usize> = 3..=63;
 /// A shape test, not a claim that any such bucket exists: it is what tells a host whose
 /// first label could be a bucket from one whose first label is an endpoint's own
 /// (`s3.us-east-1.amazonaws.com`, whose `s3` is two characters).
-fn bucket_name_shaped(label: &str) -> bool {
+///
+/// `pub(crate)`: the copy-source reader asks the same question of the bucket half of an
+/// `x-amz-copy-source` ([`crate::state::parse_copy_source`]), so one rule decides which
+/// text can be a bucket name wherever this service reads one out of a request.
+pub(crate) fn bucket_name_shaped(label: &str) -> bool {
     let allowed = |character: char| {
         character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '.' | '-')
     };
@@ -493,6 +497,20 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
             crate::state::INVALID_ARGUMENT_CODE,
             "Invalid attribute name specified.".to_string(),
         ),
+        // The `x-amz-copy-source` of the two copies. The value is put into the form the
+        // member's pattern is applied to before it is judged
+        // ([`crate::state::canonical_copy_source`]), so what is left for the pattern to
+        // refuse is a value naming no key at all — which is the same thing the operation's
+        // own reader refuses a value it cannot resolve for, so the sentence is the one that
+        // reader's fault publishes ([`crate::state::copy_source_fault`]) and the document
+        // carries the same argument pair beside it ([`refused_argument`]).
+        "copySource" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            crate::state::copy_source_fault(rejected)
+                .unwrap_or(crate::state::CopySourceFault::Uri)
+                .message()
+                .to_string(),
+        ),
         // `CreateBucket` echoes the header value it did not recognise.
         "objectOwnership" => (
             crate::state::INVALID_ARGUMENT_CODE,
@@ -713,6 +731,129 @@ fn submitted_value_wording(
     Some(s3_refusal(&restored))
 }
 
+/// The refusal this service words for a value the boundary rejected OUTSIDE the request
+/// document, or `None` for one it leaves to the layers behind the door.
+///
+/// Only a value whose document carries MEMBERS of its own is worded here
+/// ([`refused_argument`] decides which): those members can be written only by the renderer
+/// below ([`EmulatedService::detailed_refusal`]), which the front door is what routes such a
+/// refusal through — every other refused value keeps exactly the wording the walk behind the
+/// door gives it, through [`Service::override_refusal`].
+///
+/// The value half is restored from the door's own echo of the request first, because the
+/// sentence depends on it: which of the two copy-source faults a value carries is read off
+/// the value ([`crate::state::copy_source_fault`]).
+fn uri_value_wording(
+    refused: &[(Violation, ::service_common::validation::SubmittedEcho)],
+) -> Option<Refused> {
+    let (violation, echo) = refused.first()?;
+    let restored = ::service_common::validation_message::quoting_the_whole_submitted_value(
+        violation.clone(),
+        echo,
+    );
+    refused_argument(&restored).map(|_| s3_refusal(&restored))
+}
+
+/// The `<ArgumentName>` / `<ArgumentValue>` pair S3's document carries for the request field
+/// `violation` names, or `None` for a field whose refusal carries no member of its own.
+///
+/// S3's `InvalidArgument` document names the field it rejected and the value that field
+/// carried (Amazon S3 API Reference, *Error responses*), which for a HEADER is the header as
+/// the API publishes it and the value as the request sent it. The two copy DIRECTIVES are
+/// that case; `x-amz-copy-source` is the one where the refusal is about the value being
+/// unreadable AS a reference, so the document names the FIELD in both halves — there is no
+/// text to echo that is not the caller's own.
+///
+/// Only a field of an operation served behind the door is reached here ([`front_door`]),
+/// which is what the rows are: the value is put into the form the member's pattern is applied
+/// to before the pattern sees it ([`crate::state::canonical_copy_source`]), so what is left
+/// for the boundary to reject on the copies is one of these three headers.
+fn refused_argument(violation: &Violation) -> Option<crate::scaffolded::ErrorDetail> {
+    let member = violation.path.split('.').next()?;
+    let (name, value) = match member {
+        COPY_SOURCE_MEMBER => (
+            crate::state::COPY_SOURCE_ARGUMENT,
+            crate::state::COPY_SOURCE_ARGUMENT.to_string(),
+        ),
+        "metadataDirective" => (
+            METADATA_DIRECTIVE_HEADER,
+            violation.value.clone().unwrap_or_default(),
+        ),
+        "taggingDirective" => (
+            TAGGING_DIRECTIVE_HEADER,
+            violation.value.clone().unwrap_or_default(),
+        ),
+        _ => return None,
+    };
+    Some(crate::scaffolded::ErrorDetail::Argument {
+        name: name.to_string(),
+        value: Some(value),
+    })
+}
+
+/// The input member the two copies bind `x-amz-copy-source` from, as a violation path spells
+/// it (lowerCamel): `CopySource`
+/// (`smithy_query(query="operation",operation="CopyObject,UploadPartCopy")`).
+const COPY_SOURCE_MEMBER: &str = "copySource";
+
+/// The headers `CopyObject` binds its two directives from
+/// (`smithy_query(query="operation",operation="CopyObject")` reports
+/// `MetadataDirective: {httpHeader: "x-amz-metadata-directive"}` and
+/// `TaggingDirective: {httpHeader: "x-amz-tagging-directive"}`) — the names S3's document
+/// reports as the argument it rejected.
+const METADATA_DIRECTIVE_HEADER: &str = "x-amz-metadata-directive";
+/// See [`METADATA_DIRECTIVE_HEADER`].
+const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
+
+/// The operations served behind this service's FRONT DOOR, and why each is.
+///
+/// A door re-reads the request it is handed, finds the modelled constraints it breaks, and
+/// words the refusal through the service's own renderer — which is the only way a refusal
+/// the BOUNDARY makes can carry the members S3's document carries for it (the walk the
+/// framework runs behind the door renders its own refusal directly). Everything a door does
+/// not refuse is handed to the operation, which owns deserialize -> validate -> handle ->
+/// serialize exactly as before.
+///
+/// * `UpdateObjectEncryption` — the refusal of a KMS key ARN that is not one names WHY, a
+///   reason read off the submitted ARN, which the validating walk withholds because the
+///   model marks that member `@sensitive` ([`submitted_value_wording`]).
+/// * `CopyObject` and `UploadPartCopy` — the refusal of an `x-amz-copy-source` the modelled
+///   pattern rejects carries the sentence its fault publishes and the argument pair naming
+///   the header ([`uri_value_wording`]).
+fn front_door<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+) -> smithy_server_runtime::OperationRoutingTable {
+    use ::service_common::front_door::{FrontDoor, FrontDoorTable};
+    use smithy_server_runtime::Operation;
+
+    let mut door = FrontDoorTable::worded(submitted_value_wording);
+    door.serve(crate::ops::update_object_encryption::UpdateObjectEncryption::new(
+        Arc::clone(engine),
+    ));
+    let mut table = door.finish();
+    table.add_operation(
+        crate::ops::copy_object::CopyObject::<Eng>::NAME,
+        Box::new(
+            FrontDoor::worded(
+                crate::ops::copy_object::CopyObject::new(Arc::clone(engine)),
+                submitted_value_wording,
+            )
+            .wording_uri(uri_value_wording),
+        ),
+    );
+    table.add_operation(
+        crate::ops::upload_part_copy::UploadPartCopy::<Eng>::NAME,
+        Box::new(
+            FrontDoor::worded(
+                crate::ops::upload_part_copy::UploadPartCopy::new(Arc::clone(engine)),
+                submitted_value_wording,
+            )
+            .wording_uri(uri_value_wording),
+        ),
+    );
+    table
+}
+
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -731,14 +872,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// changes about the generated one: the output document of the operations the model
     /// marks `s3UnwrappedXmlOutput` carries no envelope.
     protocol: UnwrappedXmlRestXml,
-    /// `UpdateObjectEncryption`, served behind this service's front door so the refusal of
-    /// a KMS key ARN that is not one still names WHY ([`published_refusal`]): that reason is
-    /// read off the submitted ARN, and the validating walk withholds the value of that
-    /// member because the model marks it `@sensitive`, so the clause cannot be worded from
-    /// the violation alone. The door re-reads the request it is handed and restores that
-    /// value from its own echo; built from the SAME shared engine, so the wrapped operation
-    /// reads and writes the one store.
-    kms_arn_door: smithy_server_runtime::OperationRoutingTable,
+    /// The operations served behind this service's front door, each for the refusal only a
+    /// door can word — see [`front_door`] for the list and the reason. Built from the SAME
+    /// shared engine, so a wrapped operation reads and writes the one store.
+    door: smithy_server_runtime::OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -753,29 +890,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let buckets = Arc::clone(&engine);
         let holds_bucket: wire::BucketLookup =
             Arc::new(move |name: &str| holds_bucket_in(&*buckets, name));
-        let mut kms_arn_door = ::service_common::front_door::FrontDoorTable::worded(
-            submitted_value_wording,
-        );
-        kms_arn_door.serve(
-            crate::ops::update_object_encryption::UpdateObjectEncryption::new(Arc::clone(&engine)),
-        );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            door: front_door(&engine),
             engine,
             protocol: UnwrappedXmlRestXml::new().with_buckets(holds_bucket),
-            kms_arn_door: kms_arn_door.finish(),
         }
     }
 
-    /// The front-door entry for `req`, when the operation its address names is the one
-    /// served behind the door ([`Self::kms_arn_door`]), else `None` so the generated
-    /// routing table resolves the request exactly as it always did.
+    /// The front-door entry for `req`, when the operation its address names is one served
+    /// behind the door ([`front_door`]), else `None` so the generated routing table resolves
+    /// the request exactly as it always did.
     ///
     /// The key is the one the ENTRY's protocol resolves — the same key the generated table
     /// is read by — so this names no route of its own.
     fn front_door_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.kms_arn_door.get(key)
+        self.door.get(key)
     }
 
     /// Whether `name` is a bucket this emulator holds — the question an ADDRESS resolves
@@ -981,6 +1112,39 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 &crate::scaffolded::UNMODELED_SCHEMA,
                 refusal.code,
                 refusal.status,
+            )
+            .ok()
+    }
+
+    /// `refused` rendered with the DETAIL members S3's document carries for it
+    /// ([`refused_argument`]), in the same envelope and at the same status a constraint
+    /// refusal is rendered with: HTTP 400, the status every protocol answers a value outside
+    /// its declared constraints with.
+    ///
+    /// This is the one renderer a BOUNDARY refusal can carry members through: the wording
+    /// seam ([`Service::override_refusal`]) chooses the code and the message and nothing
+    /// else, so a document that also names the argument it rejected has to be written here.
+    /// An implemented handler's own refusal carries the same members through the same
+    /// serializer ([`crate::scaffolded::Scaffolded::naming`]).
+    ///
+    /// `None` on the serializer failure a fixed code, a fixed message and one named argument
+    /// cannot actually provoke, which leaves the entry's renderer to answer rather than
+    /// panicking in the request path.
+    fn detailed_refusal(
+        &self,
+        refused: &Refused,
+        detail: crate::scaffolded::ErrorDetail,
+    ) -> Option<RtResponse> {
+        let refusal = crate::scaffolded::UnmodeledWithDetail {
+            message: refused.message.clone(),
+            detail,
+        };
+        self.protocol
+            .serialize_error(
+                &refusal,
+                &crate::scaffolded::UNMODELED_SCHEMA,
+                &refused.code,
+                crate::state::INVALID_ARGUMENT_STATUS,
             )
             .ok()
     }
@@ -1254,6 +1418,20 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
         if matches!(error, ProtocolError::Unauthenticated { .. }) {
             if let Some(response) = self.authentication_refusal_response() {
                 return response;
+            }
+        }
+        // A refusal a FRONT DOOR worded ([`front_door`]) reaches this renderer with the
+        // violations it found, which is what lets the document also carry the members S3
+        // names the refused argument by ([`refused_argument`]); everything else keeps the
+        // entry's rendering of the code and message alone.
+        if let ProtocolError::Invalid(violations) = &error {
+            if let Some(violation) = violations.first() {
+                if let Some(detail) = refused_argument(violation) {
+                    let refused = chosen.clone().unwrap_or_else(|| s3_refusal(violation));
+                    if let Some(response) = self.detailed_refusal(&refused, detail) {
+                        return response;
+                    }
+                }
             }
         }
         self.entry.refusal_response(error, chosen, req)

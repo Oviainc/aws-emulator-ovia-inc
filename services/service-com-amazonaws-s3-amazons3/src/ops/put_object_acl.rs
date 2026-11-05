@@ -266,6 +266,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
         // body, which this handler never sees — the boundary has already parsed that body
         // into `AccessControlPolicy` — so they are left where `PutBucketAcl` leaves them.
 
+        // The canned ACL this write names has to be one the `ACL` member publishes. The
+        // value is judged HERE rather than at the boundary because the refusal carries
+        // members of its own — see [`crate::service::wire::rejected_canned_acl`], which is
+        // where the request's own header is read, and
+        // `crate::scaffolded::Scaffolded::invalid_canned_acl`, which is the envelope S3
+        // answers it with.
+        if let Some(value) = crate::service::wire::rejected_canned_acl(
+            ctx.parts(),
+            super::types::PUT_OBJECT_ACL_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
+
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" — `PutObjectAclRequest$ExpectedBucketOwner`, judged the way every other
@@ -511,9 +524,15 @@ fn requested_grants(
         .as_ref()
         .filter(|policy| policy.grants.is_some() || policy.owner.is_some());
 
-    if (policy.is_some() && (input.acl.is_some() || headers_name_an_acl))
-        || (input.acl.is_some() && headers_name_an_acl)
-    {
+    if input.acl.is_some() && headers_name_an_acl {
+        // An ACL arrives in ONE of the two header forms: "specify a canned ACL … or specify
+        // access permissions explicitly" (this operation's own documentation). A request
+        // doing both describes two different ACLs for one object, which S3 refuses with the
+        // sentence naming the two forms
+        // ([`crate::scaffolded::Scaffolded::both_acl_forms`]).
+        return Err(crate::scaffolded::Scaffolded::both_acl_forms());
+    }
+    if policy.is_some() && (input.acl.is_some() || headers_name_an_acl) {
         return Err(PutObjectAclErrorModeled::InvalidRequest(InvalidRequest {}).into());
     }
 

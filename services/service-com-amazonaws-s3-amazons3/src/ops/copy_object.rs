@@ -480,6 +480,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             ));
         }
 
+        // The canned ACL this copy asks the destination object to be stored with has to be
+        // one the `ACL` member publishes. The value is judged HERE rather than at the
+        // boundary because the refusal carries members of its own — see
+        // [`crate::service::wire::rejected_canned_acl`], which is where the request's own
+        // header is read, and `crate::scaffolded::Scaffolded::invalid_canned_acl`, which is
+        // the envelope S3 answers it with. Answered before anything about either bucket is
+        // read: the header is unusable whatever the copy would have done.
+        if let Some(value) = crate::service::wire::rejected_canned_acl(
+            ctx.parts(),
+            super::types::COPY_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
+
+        // An ACL arrives in ONE of the two header forms: "you can specify a canned ACL … or
+        // specify access permissions explicitly" (`CopyObjectRequest$ACL`). A request doing
+        // both describes two different ACLs for one object, which S3 refuses with the
+        // sentence naming the two forms ([`crate::state::BOTH_ACL_FORMS_MESSAGE`]) — judged
+        // on the request alone, so it is answered before anything about either bucket is
+        // read.
+        if input.acl.is_some() && names_grants(&input) {
+            return Err(crate::scaffolded::Scaffolded::both_acl_forms());
+        }
+
         // The second documented form of a copy source names the object "as accessed
         // through the access point" by ARN. This emulator holds no access points and no
         // Outposts, so there is no object such a value could address — and a 200 for it
@@ -491,18 +515,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         }
         let source = match crate::state::parse_copy_source(&input.copy_source) {
             Ok(source) => source,
-            // The member's pattern (`^\/?.+\/.+$`) is already enforced at the boundary,
-            // so what reaches here is a value that satisfies it and still names no
-            // bucket-and-key pair. "The value of the parameter is not valid" is
-            // `InvalidArgument` (400), the channel the encryption guards below answer
-            // through, and the message names the member the caller has to fix.
-            Err(rejection) => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    rejection,
-                ))
-            }
+            // The value names no source object: it is not a `<bucket>/<key>` reference at
+            // all, or it names a bucket and no key. Either way that is the HEADER being
+            // unreadable rather than a bucket or a key being missing, so S3 reports it
+            // against the argument itself, with the sentence the fault publishes — see
+            // [`crate::scaffolded::Scaffolded::invalid_copy_source`].
+            Err(fault) => return Err(crate::scaffolded::Scaffolded::invalid_copy_source(fault)),
         };
 
         // `ServerSideEncryption` is an enum member, so the boundary refuses a value
@@ -606,6 +624,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         } else {
             requested.clone()
         };
+        // The ACL this copy asks the DESTINATION object to be stored with is judged against
+        // that bucket's ownership exactly as `PutObject` judges its own: "buckets that use
+        // this setting only accept PUT requests that don't specify an ACL or PUT requests
+        // that specify bucket owner full control ACLs … PUT requests that contain other ACLs
+        // … fail and return a 400 error with the error code AccessControlListNotSupported"
+        // (`CopyObjectRequest$ACL`). A bucket whose ACLs are disabled therefore refuses a
+        // copy that names one, before anything is written, so a request S3 would not serve
+        // cannot leave an object behind here.
+        if destination.acls_disabled() && names_an_acl(&input) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACL_NOT_SUPPORTED_CODE,
+                crate::state::ACL_REFUSAL_STATUS,
+                crate::state::ACL_NOT_SUPPORTED_MESSAGE,
+            ));
+        }
+
         // A retention and a legal hold are the two halves of S3 Object Lock, which a bucket
         // has only once an Object Lock configuration is on it: the configuration's rule "will
         // be applied by default to every new object placed in the specified bucket"
@@ -698,10 +732,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             None => source_bucket.object(&source.key).cloned(),
             Some(version_id) => {
                 // A `versionId` that is not SHAPED like one cannot name a version of
-                // anything, so it is a malformed argument rather than an absent version —
-                // the way `GetObject` answers the same argument.
+                // anything — and here it QUALIFIES the copy source reference rather than
+                // addressing the resource the request is about, so what S3 reports is that
+                // the request itself is not one it can serve
+                // ([`crate::state::COPY_SOURCE_INVALID_VERSION_MESSAGE`]) rather than the
+                // malformed-argument refusal a `versionId` PARAMETER earns.
                 if !crate::state::version_id_is_well_formed(version_id) {
-                    return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        crate::state::COPY_SOURCE_INVALID_VERSION_MESSAGE,
+                    ));
                 }
                 // A `versionId` naming no version the source bucket holds is
                 // `NoSuchVersion`, which this model carries no shape for, so it goes out
@@ -719,19 +760,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                     )
                     .naming_object(&source.key, Some(version_id)));
                 };
-                // A delete marker holds no bytes for a copy to read, and naming one
-                // explicitly is not something this method can do — the same 405
-                // `GetObject` answers a read of one with.
+                // A delete marker holds no bytes for a copy to read, so the request cannot
+                // be served — and what S3 states is the condition itself: the version id
+                // the request supplied addresses a marker. That is a request it cannot
+                // carry out ([`crate::state::INVALID_REQUEST_CODE`]), not the "method not
+                // allowed" a READ of a marker earns, which would say nothing about the
+                // version id.
                 if held.as_delete_marker().is_some() {
-                    return Err(crate::scaffolded::Scaffolded::method_not_allowed(
-                        COPY_METHOD,
-                        crate::state::DELETE_MARKER_RESOURCE_TYPE,
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        crate::state::COPY_SOURCE_IS_DELETE_MARKER_MESSAGE,
                     ));
                 }
                 held.as_object().cloned()
             }
         };
         let Some(source_object) = held else {
+            // "If the current version is a delete marker, Amazon S3 behaves as if the object
+            // was deleted": the source key is not there, and the answer names the marker
+            // that makes it so in its two headers (see `crate::service::wire`'s
+            // delete-marker note), the way a READ of the same key answers.
+            if source.version_id.is_none() {
+                if let Some(marker) = source_bucket
+                    .current_version(&source.key)
+                    .and_then(crate::state::StoredVersion::as_delete_marker)
+                {
+                    crate::service::wire::note_addressed_delete_marker(
+                        marker.version_id.as_deref(),
+                    );
+                }
+            }
             // About the COPY SOURCE key, named for the same reason the source bucket is.
             return Err(
                 crate::scaffolded::Scaffolded::Modeled(CopyObjectErrorModeled::NoSuchKey(
@@ -960,9 +1019,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             // An over-long destination key is refused above, on the key's bytes alone, with
             // the `KeyTooLongError` S3 answers it with; the store's ceiling is the same one,
             // so this arm carries the same answer rather than a different code. User-defined
-            // metadata past the published 2 KB is a header that is not valid for the
-            // request, which is what the modelled `InvalidRequest` reports (AWS's own
-            // `MetadataTooLarge` is not a shape in this model).
+            // metadata past the published 2 KB is refused with the code S3 publishes for
+            // exactly that condition, naming the request's own total and the ceiling
+            // ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
             crate::state::ObjectWrite::KeyTooLong { .. } => {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::service::object_write::KEY_TOO_LONG_CODE,
@@ -970,8 +1029,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                     crate::service::object_write::KEY_TOO_LONG_MESSAGE,
                 ));
             }
-            crate::state::ObjectWrite::MetadataTooLarge { .. } => {
-                return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
+                return Err(crate::scaffolded::Scaffolded::metadata_too_large(bytes));
             }
             // The emulator's own ceilings, not AWS quotas, so no AWS error code describes
             // them: they go out through the framework's 400 `ValidationException` channel,
@@ -1127,11 +1186,66 @@ const DIRECTIVE_REPLACE: &str = "REPLACE";
 /// the copy carries over.
 const DIRECTIVE_EXCLUDE: &str = "EXCLUDE";
 
-/// The HTTP method this operation is bound to — "PUT"
-/// (`smithy_query(query="operation",operation="CopyObject")` reports
-/// `http {method: "PUT", uri: "/{Bucket}/{Key+}?x-id=CopyObject"}`) — which is what a
-/// `MethodNotAllowed` document reports as the `<Method>` it refused.
-const COPY_METHOD: &str = "PUT";
+/// Whether this copy names an access control list the DESTINATION object would carry beyond
+/// the one its owner already has.
+///
+/// "Buckets that use [the bucket-owner-enforced] setting only accept PUT requests that don't
+/// specify an ACL or PUT requests that specify bucket owner full control ACLs"
+/// (`CopyObjectRequest$ACL`), so what decides it is the ACL the request DESCRIBES rather
+/// than the spelling it used: the canned value is expanded through the one expansion every
+/// object ACL in this service is read by ([`crate::state::object_canned_acl_grants`]) and the
+/// explicit grant headers are parsed through the one parse every grant header is read by
+/// ([`crate::state::acl_grants_from_header`]), and the result is compared with the owner's
+/// own ACL ([`crate::state::default_acl_grants`]) — which is the ACL the object already has,
+/// and the one `PutObject` judges its own write by.
+fn names_an_acl(input: &CopyObjectInput) -> bool {
+    requested_acl_grants(input).is_some_and(|grants| grants != crate::state::default_acl_grants())
+}
+
+/// The grants this copy describes for the destination object, or `None` when it names no ACL
+/// at all.
+///
+/// A canned ACL and the explicit grant headers are the two forms of one member
+/// (`CopyObjectRequest$ACL` against the four `x-amz-grant-*` headers the operation binds),
+/// and a request naming both is refused before this is read. A grant header whose value is
+/// no grantee contributes nothing: the request names an ACL either way, and WHICH grants it
+/// names is only asked of a bucket that accepts none.
+fn requested_acl_grants(input: &CopyObjectInput) -> Option<Vec<crate::state::AclGrant>> {
+    if let Some(canned) = input.acl.as_deref() {
+        return crate::state::object_canned_acl_grants(canned);
+    }
+    let mut grants: Vec<crate::state::AclGrant> = Vec::new();
+    for (value, permission) in [
+        (
+            input.grant_full_control.as_deref(),
+            crate::state::PERMISSION_FULL_CONTROL,
+        ),
+        (input.grant_read.as_deref(), crate::state::PERMISSION_READ),
+        (
+            input.grant_read_acp.as_deref(),
+            crate::state::PERMISSION_READ_ACP,
+        ),
+        (
+            input.grant_write_acp.as_deref(),
+            crate::state::PERMISSION_WRITE_ACP,
+        ),
+    ] {
+        let Some(value) = value else { continue };
+        grants.extend(
+            crate::state::acl_grants_from_header(value, permission).unwrap_or_default(),
+        );
+    }
+    (!grants.is_empty()).then_some(grants)
+}
+
+/// Whether this copy names explicit GRANTS for the object it writes — any of the four grant
+/// headers [`requested_acl_grants`] reads.
+fn names_grants(input: &CopyObjectInput) -> bool {
+    input.grant_full_control.is_some()
+        || input.grant_read.is_some()
+        || input.grant_read_acp.is_some()
+        || input.grant_write_acp.is_some()
+}
 
 /// The code and status S3 answers a copy its authorization refuses with, whichever half of
 /// the copy the refusal is about: the read of the source, or the write of the destination.
