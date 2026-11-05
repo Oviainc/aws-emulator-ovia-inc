@@ -319,14 +319,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
-        // The same boundary from the other end of the link: a `RedriveAllowPolicy` listing a
-        // source queue of another region admits a queue no redrive could ever come from, so
-        // no queue is created carrying it.
-        if let Some(why) = supplied
+        // The same boundary from the other end of the link, and the rest of the permission
+        // document's own shape: no queue is created carrying a `RedriveAllowPolicy` AWS would
+        // not take.
+        if let Some(refusal) = supplied
             .get(state::REDRIVE_ALLOW_POLICY)
             .and_then(|value| state::redrive_allow_policy_document_refusal(&region, value))
         {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+            return Err(match refusal {
+                state::RedriveAllowPolicyRefusal::Document(why) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(why)
+                }
+                state::RedriveAllowPolicyRefusal::Permission(error) => {
+                    CreateQueueErrorModeled::InvalidAttributeValue(error).into()
+                }
+            });
         }
 
         let store = state::service_state(&*self.engine).ok_or_else(|| {

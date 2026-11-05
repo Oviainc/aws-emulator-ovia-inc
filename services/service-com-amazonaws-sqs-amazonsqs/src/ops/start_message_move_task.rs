@@ -362,6 +362,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sqs::SAME_SOURCE_AND_DESTINATION,
             ));
         }
+        // A move hands the source queue's messages to the destination queue as they are, so
+        // the two have to be the same KIND of queue: a FIFO queue's messages carry the group
+        // and deduplication members only a FIFO queue holds, and a standard queue's carry
+        // none of what a FIFO queue requires. The pair is judged before any task exists, so
+        // a move across the two kinds is never started.
+        let source_is_fifo = state
+            .queue(&region, &source_name)
+            .is_some_and(sqs::Queue::is_fifo);
+        let destination_is_fifo = state
+            .queue(&region, &destination_name)
+            .is_some_and(sqs::Queue::is_fifo);
+        if source_is_fifo != destination_is_fifo {
+            return Err(Scaffolded::invalid_parameter_value(
+                sqs::SAME_QUEUE_TYPE_REQUIRED,
+            ));
+        }
 
         // "Only one active message movement task is supported per queue at any given
         // time." A source whose task is still running is a PARAMETER this call cannot be

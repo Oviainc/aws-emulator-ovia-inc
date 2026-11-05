@@ -47,12 +47,16 @@ mod message_attribute_rules;
 mod message_lifecycle;
 #[path = "all/message_move_task.rs"]
 mod message_move_task;
+#[path = "all/message_move_task_queue_type.rs"]
+mod message_move_task_queue_type;
 #[path = "all/message_plane.rs"]
 mod message_plane;
 #[path = "all/message_visibility_changes.rs"]
 mod message_visibility_changes;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/policy_statement_limit.rs"]
+mod policy_statement_limit;
 #[path = "all/purge_queue.rs"]
 mod purge_queue;
 #[path = "all/queue_configuration.rs"]
@@ -87,6 +91,8 @@ mod receive_message_attribute_names;
 mod recreate_and_tag_rules;
 #[path = "all/redrive_allow_policy.rs"]
 mod redrive_allow_policy;
+#[path = "all/redrive_allow_policy_document_rules.rs"]
+mod redrive_allow_policy_document_rules;
 #[path = "all/redrive_dlq_type_reason.rs"]
 mod redrive_dlq_type_reason;
 #[path = "all/redrive_policy_document.rs"]
@@ -115,5 +121,7 @@ mod state_roundtrip;
 mod support;
 #[path = "all/time_driven_queue_semantics.rs"]
 mod time_driven_queue_semantics;
+#[path = "all/unknown_attribute_names.rs"]
+mod unknown_attribute_names;
 #[path = "all/visibility_change.rs"]
 mod visibility_change;

@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
     DEAD_LETTER_TARGET_MISSING_REASON, DEAD_LETTER_TARGET_OWNER_REASON,
     DEAD_LETTER_TARGET_REGION_REASON, DEAD_LETTER_TARGET_TYPE_REASON, REDRIVE_ALLOW_POLICY_REASON,
-    REDRIVE_ALLOW_POLICY_REGION_REASON,
+    REDRIVE_ALLOW_POLICY_REGION_REASON, SOURCE_QUEUE_ARNS_REQUIRED_REASON,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -279,11 +279,11 @@ async fn a_refused_dead_letter_target_reports_the_rule_that_arn_broke() {
 }
 
 /// One row of the permission table: the ARNs a `RedriveAllowPolicy` lists as source queues,
-/// and whether the document is refused.
+/// and the `Reason` the refusal must state (or `None` for a document the rules admit).
 struct AllowRow {
     case: String,
     source_arns: Vec<String>,
-    refused: bool,
+    reason: Option<String>,
 }
 
 /// The permission rows for a dead-letter queue living in `home`: one source of its own
@@ -299,34 +299,36 @@ fn allow_rows(home: &str) -> Vec<AllowRow> {
         AllowRow {
             case: format!("one source of the queue's own region {home}"),
             source_arns: vec![here.clone()],
-            refused: false,
+            reason: None,
         },
         AllowRow {
+            // The permission that admits exactly the queues its list names has to name one,
+            // so this document is refused for its ARITY rather than for any ARN's region.
             case: "a list naming no source queue at all".to_string(),
             source_arns: Vec::new(),
-            refused: false,
+            reason: Some(SOURCE_QUEUE_ARNS_REQUIRED_REASON.to_string()),
         },
         AllowRow {
             case: format!("two sources of the queue's own region {home}"),
             source_arns: vec![here.clone(), expected_arn_in(home, "allow-second")],
-            refused: false,
+            reason: None,
         },
         AllowRow {
             case: "every listed source in a far region".to_string(),
             source_arns: far_arns.clone(),
-            refused: true,
+            reason: Some(ALLOW_POLICY_REGION_REASON.to_string()),
         },
     ];
     for far in FAR_REGIONS {
         rows.push(AllowRow {
             case: format!("one source of {far} for a queue of {home}"),
             source_arns: vec![expected_arn_in(far, "allow-source")],
-            refused: true,
+            reason: Some(ALLOW_POLICY_REGION_REASON.to_string()),
         });
         rows.push(AllowRow {
             case: format!("a source of {home} listed beside one of {far}"),
             source_arns: vec![here.clone(), expected_arn_in(far, "allow-source")],
-            refused: true,
+            reason: Some(ALLOW_POLICY_REGION_REASON.to_string()),
         });
     }
     rows
@@ -342,12 +344,12 @@ async fn a_refused_redrive_allow_policy_reports_the_source_arn_region_rule() {
             let AllowRow {
                 case,
                 source_arns,
-                refused,
+                reason,
             } = row;
             let router = emulator();
             let document = allow_policy(&source_arns);
-            let expected = refused
-                .then(|| refusal(&document, REDRIVE_ALLOW_POLICY, ALLOW_POLICY_REGION_REASON));
+            let expected =
+                reason.map(|reason| refusal(&document, REDRIVE_ALLOW_POLICY, &reason));
 
             // 1. The SetQueueAttributes path, onto a queue carrying no permission at all.
             let name = format!("allow-dlq-{index}");
@@ -374,7 +376,7 @@ async fn a_refused_redrive_allow_policy_reports_the_source_arn_region_rule() {
                         (status, error_code(&parsed).as_str(), message_of(&parsed)),
                         (400, INVALID_PARAMETER_VALUE, message.clone()),
                         "case {case} on SetQueueAttributes: expected the refusal to state the \
-                         source-ARN region rule, got {status} with {parsed}"
+                         rule the list broke, got {status} with {parsed}"
                     );
                     assert_eq!(
                         stored, None,
@@ -403,8 +405,8 @@ async fn a_refused_redrive_allow_policy_reports_the_source_arn_region_rule() {
                     assert_eq!(
                         (status, error_code(&parsed).as_str(), message_of(&parsed)),
                         (400, INVALID_PARAMETER_VALUE, message.clone()),
-                        "case {case} on CreateQueue: expected the refusal to state the source-ARN \
-                         region rule, got {status} with {parsed}"
+                        "case {case} on CreateQueue: expected the refusal to state the rule the \
+                         list broke, got {status} with {parsed}"
                     );
                     let (status, parsed) =
                         call_in(&router, home, "GetQueueUrl", &json!({"QueueName": created})).await;

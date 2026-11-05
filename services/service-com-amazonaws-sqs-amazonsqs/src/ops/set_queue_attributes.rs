@@ -280,15 +280,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
-        // The same boundary from the other end of the link: a `RedriveAllowPolicy` listing a
-        // source queue of another region admits a queue no redrive could ever come from, so
-        // the attribute is left as it was rather than stored.
-        if let Some(why) = input
+        // The same boundary from the other end of the link, and the rest of the permission
+        // document's own shape: a `RedriveAllowPolicy` AWS would not take admits whatever the
+        // malformed document degrades to, so the attribute is left as it was rather than
+        // stored.
+        if let Some(refusal) = input
             .attributes
             .get(state::REDRIVE_ALLOW_POLICY)
             .and_then(|value| state::redrive_allow_policy_document_refusal(&region, value))
         {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+            return Err(match refusal {
+                state::RedriveAllowPolicyRefusal::Document(why) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(why)
+                }
+                state::RedriveAllowPolicyRefusal::Permission(error) => {
+                    SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into()
+                }
+            });
         }
         // A redrive moves a message from this queue to the dead-letter queue the policy
         // names, so that queue has to be there and has to be of this queue's own type:
