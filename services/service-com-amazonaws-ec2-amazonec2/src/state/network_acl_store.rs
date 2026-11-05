@@ -259,6 +259,56 @@ impl ComAmazonawsEc2Amazonec2State {
         self.associate_subnet_with_network_acl(subnet_id, &network_acl_id)
     }
 
+    /// The association `association_id` names, whichever stored ACL holds it, as it is
+    /// reported — or `None` when no stored ACL holds one with that id.
+    ///
+    /// A READ, and the ONE resolver of a `NetworkAclAssociationId`, so every operation that
+    /// names an association by id resolves the same record
+    /// [`Self::associate_subnet_with_network_acl`] wrote.
+    pub fn network_acl_association(&self, association_id: &str) -> Option<NetworkAclAssociation> {
+        self.network_acls
+            .values()
+            .flat_map(|network_acl| network_acl.associations.as_deref().unwrap_or_default())
+            .find(|association| {
+                association.network_acl_association_id.as_deref() == Some(association_id)
+            })
+            .cloned()
+    }
+
+    /// Put the network ACL `network_acl_id` in the place of the one the association
+    /// `association_id` names, and answer the `NetworkAclAssociationId` of the association
+    /// that replaces it.
+    ///
+    /// The subnet of the displaced association keeps being associated with exactly one ACL
+    /// — the old record goes and a new one takes its place on the named ACL — so the
+    /// invariant [`Self::insert_subnet`] establishes still holds afterwards. The new record
+    /// is written through [`Self::associate_subnet_with_network_acl`], the one writer of an
+    /// ACL's `Associations`, so its id comes from the store's own counter like every other.
+    ///
+    /// `None`, with nothing written, when no stored ACL holds that association or the store
+    /// holds no ACL with that id.
+    pub fn replace_network_acl_association(
+        &mut self,
+        association_id: &str,
+        network_acl_id: &str,
+    ) -> Option<String> {
+        let subnet_id = self
+            .network_acl_association(association_id)?
+            .subnet_id
+            .clone()?;
+        if !self.network_acls.contains_key(network_acl_id) {
+            return None;
+        }
+        for network_acl in self.network_acls.values_mut() {
+            if let Some(associations) = network_acl.associations.as_mut() {
+                associations.retain(|association| {
+                    association.network_acl_association_id.as_deref() != Some(association_id)
+                });
+            }
+        }
+        self.associate_subnet_with_network_acl(&subnet_id, network_acl_id)
+    }
+
     /// Remove the network ACL `network_acl_id` names and answer it as it was last reported,
     /// or `None` when the store holds no such ACL.
     ///

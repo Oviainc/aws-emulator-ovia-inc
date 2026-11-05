@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// Which network ACL a subnet is associated with, changed by `ReplaceNetworkAclAssociation`
+// and read back through `DescribeNetworkAcls`: the one association the moved subnet is left
+// with, the new association id the call answers and the next move names, the cross-VPC
+// pairing it refuses, and the ids and dry run that move nothing. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
+// of this file are where every new ec2 suite inserts its lines.
+#[path = "all/replace_network_acl_association.rs"]
+mod replace_network_acl_association;
 // What `CreateDefaultVpc` creates and what it refuses: the default VPC of the Region the
 // request is signed for — the /16, a default subnet in every Availability Zone of that Region
 // and the VPC's default security group — and the `DefaultVpcAlreadyExists` refusal a Region

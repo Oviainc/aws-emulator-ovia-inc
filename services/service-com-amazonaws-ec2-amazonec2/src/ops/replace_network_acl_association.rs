@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplaceNetworkAclAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplaceNetworkAclAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplaceNetworkAclAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the subnet of one stored network ACL association onto the network ACL the request
+//! names: the association the request names goes, a new one naming the same subnet takes
+//! its place on that ACL, and the new association's id is answered. The move is written
+//! through the store's own writer of an ACL's `Associations`
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::replace_network_acl_association`]), so
+//! `DescribeNetworkAcls` reports the subnet against exactly one ACL before and after.
+//!
+//! A subnet can only be associated with an ACL of the VPC it is in, so a request pairing
+//! the two across VPCs is refused rather than written.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +140,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplaceNetworkAclAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplaceNetworkAclAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplaceNetworkAclAssociation"))
+        use crate::state;
+
+        // A network ACL and its associations carry no Region or ARN member — the modelled
+        // `NetworkAcl` and `NetworkAclAssociation` have neither — and both sides of the
+        // association are named by id, so nothing here depends on request metadata. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the new network ACL to associate with the subnet" (`$NetworkAclId`):
+        // the id's FORM first, before the store is read — a value that is not a network ACL
+        // id at all names nothing that could exist in any account. `ReplaceNetworkAclEntry`
+        // and `DeleteNetworkAclEntry` read it in the same order, so the three cannot
+        // disagree about which refusal a request with two faults gets.
+        let network_acl_id = input.network_acl_id.as_str();
+        state::require_well_formed_id(
+            state::NETWORK_ACL_ID_PREFIX,
+            network_acl_id,
+            state::INVALID_NETWORK_ACL_ID_MALFORMED,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owed is applied before the store is read, so the subnet
+        // the named association holds is resolved as it stands now.
+        store.materialize_due_transitions();
+
+        // "The ID of the current association between the original network ACL and the
+        // subnet" (`$AssociationId`): the association is what this operation replaces, so an
+        // id no stored ACL holds an association for is a refusal rather than an association
+        // made out of nothing.
+        let Some(association) = store.network_acl_association(&input.association_id) else {
+            return Err(state::invalid_association_id_not_found(&input.association_id));
+        };
+        let subnet_id = association.subnet_id.clone().unwrap_or_default();
+
+        // The new ACL itself, now that the store can be asked: a subnet cannot be associated
+        // with an ACL the account does not hold.
+        let Some(network_acl) = store.network_acls.get(network_acl_id) else {
+            return Err(state::invalid_network_acl_id_not_found(network_acl_id));
+        };
+        let network_acl_vpc_id = network_acl.vpc_id.clone();
+
+        // "Changes which network ACL a subnet is associated with": a network ACL controls
+        // the traffic of ONE VPC (`NetworkAcl$VpcId`), so a subnet can only be associated
+        // with an ACL of the VPC the subnet is in — the rules would otherwise govern a
+        // network the subnet is not part of. `AssociateRouteTable` refuses the same
+        // cross-VPC pairing for a route table, in the same words.
+        let subnet_vpc_id = store
+            .subnets
+            .get(&subnet_id)
+            .and_then(|subnet| subnet.vpc_id.clone());
+        if subnet_vpc_id != network_acl_vpc_id {
+            return Err(state::invalid_parameter_value(format!(
+                "network acl {network_acl_id} and subnet {subnet_id} \
+                 belong to different networks"
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The subnet moves onto the named ACL: the association the request named goes, and
+        // one naming the same subnet takes its place on that ACL — written by the store's
+        // own writer of an ACL's `Associations`, so the subnet is left associated with
+        // exactly one ACL and `DescribeNetworkAcls` reads the move off the same records.
+        // Applying the request again leaves the subnet on that same ACL and still with one
+        // association, which is the state this operation is idempotent about.
+        let Some(new_association_id) =
+            store.replace_network_acl_association(&input.association_id, network_acl_id)
+        else {
+            // Both sides were resolved under this same lock, so this cannot happen — and if
+            // it ever did, the request must not answer 200 with nothing moved.
+            return Err(state::internal_error(
+                "the network ACL association checked a moment ago could not be replaced",
+            ));
+        };
+
+        // "The ID of the new association" (`$NewAssociationId`): the id the store minted for
+        // the record it just wrote, and nothing built beside it.
+        Ok(ReplaceNetworkAclAssociationOutput {
+            new_association_id: Some(new_association_id),
+        })
     }
 }
