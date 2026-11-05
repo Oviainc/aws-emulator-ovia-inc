@@ -20,8 +20,9 @@ aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 # `time` on top of the workspace features: the event source mapping poller
 # (`state::event_source_poller`) waits between passes with `tokio::time::sleep` rather
-# than parking a worker thread.
-tokio = { workspace = true, features = ["time"] }
+# than parking a worker thread, and `sync` for the run slots an invocation takes one of
+# (`state::execution`).
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -48,17 +49,82 @@ uuid = { version = "1", features = ["v4"] }
 # so the SDK's own HTTPS stack is left out.
 aws-sdk-kinesis = { version = "1", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
-# The CloudWatch store Lambda publishes its own metrics to (the `AWS/Lambda` namespace,
-# `state::metrics`). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
+# A function whose environment variables are encrypted with a customer managed key can
+# only be invoked while that key can decrypt them, and the key's state belongs to the key
+# service: it is asked over the same in-process callback
+# (`state::execution::environment_key`).
+aws-sdk-kms = { version = "1", default-features = false }
+# The CloudWatch store Lambda publishes its own metrics to (the `AWS/Lambda` namespace,# `state::metrics`). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
 # namespace, so a service's own metrics never travel over that API; this writes the very
 # store `ListMetrics`/`GetMetricStatistics` read.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# The EXECUTION substrate: what runs a function's own deployment package.
+#
+# `Invoke` answers with whatever the caller's handler returned, so the handler has to
+# run. These crates are an in-process execution substrate — they interpret
+# caller-supplied code — and every one of them is taken with the host-reaching surface
+# switched OFF at compile time, so the capability class is "run the caller's Python in
+# this process, with no host access at all":
+#
+# * `rustpython-vm` with `default-features = false` leaves `host_env`, `stdio` and
+#   `threading` out of the build, so the VM registers no `ctypes` host loader, writes
+#   nothing to this process's stdio and starts no interpreter thread; `compiler` is the
+#   bytecode compiler for the package's own sources and `freeze-stdlib` takes the Python
+#   standard library from `rustpython-pylib`'s frozen copy rather than from any host
+#   path.
+# * `rustpython-stdlib` with `default-features = false` is the native-module pool. The
+#   crate is NOT registered wholesale: `crate::execution::python` filters
+#   `stdlib_module_defs` through its own allow-list, so `_socket`, `_ssl`, `select`,
+#   `_posixsubprocess`, `mmap`, `_ctypes`, `_thread` and `posix` are never reachable from
+#   guest code, and the modules the guest does expect (`os`, `_thread`) are this crate's
+#   own replacements.
+# * `rustpython-ruff_*` are RustPython's own forks of the Python parser's AST crates.
+#   They are PINNED exactly: `rustpython-codegen` 0.6 is built against the 0.16.5 AST,
+#   and 0.16.10 renamed fields it uses, so an unpinned resolution picks a newer 0.16.x
+#   and fails to compile.
+# * `nix` (`resource` only) and `memory-stats` read this process's own resource usage —
+#   the run thread's faulted pages and the process resident size — which is how a run is
+#   bounded in memory: RustPython exposes no allocator seam, so the bound is sampled from
+#   outside the guest. `nix` is the only one of these that compiles no C; `memory-stats`
+#   reads `/proc/self/statm` on Linux.
+#
+# Native and unsafe surface accepted here: the RustPython tree uses `unsafe` for its
+# object model and its frozen-module tables, and its `malachite`/`num` arithmetic
+# dependencies compile Rust only. No crate in this set compiles a C toolchain
+# dependency, loads a shared library, or opens a socket, a process or a host file.
+# Advisories considered: RUSTSEC-2026-0394 (RustPython up to 0.5, fixed in 0.6 — the line
+# taken here) and the `atty` advisory that the 0.3/0.4 lines pull in (not reachable from
+# 0.6).
+rustpython-vm = { version = "0.6", default-features = false, features = [
+    "compiler",
+] }
+rustpython-stdlib = { version = "0.6", default-features = false }
+rustpython-pylib = { version = "0.6", features = ["freeze-stdlib"] }
+rustpython-ruff_python_ast = "=0.16.5"
+rustpython-ruff_python_parser = "=0.16.5"
+rustpython-ruff_python_trivia = "=0.16.5"
+rustpython-ruff_source_file = "=0.16.5"
+rustpython-ruff_text_size = "=0.16.5"
+nix = { version = "0.31", default-features = false, features = ["resource"] }
+memory-stats = "1"
+# A deployment package is a .zip archive, and the handler's module is one entry in it.
+# Read with `deflate` alone — no other compression method is linked in — and never
+# extracted to a host path.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# `InvokeWithResponseStream`'s `PayloadChunk` carries its blob as the FRAME's own payload
+# (`@eventPayload`), which the framework's event serializer does not express: that one
+# frame is written with the event-stream encoder itself.
+aws-smithy-eventstream = "0.60"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# A deployment package the invoke tests upload is a .zip archive they write in memory.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # `time` on top of the workspace features: the data-plane tests wait out the state-settle
 # span and the poller's passes with `tokio::time::sleep`.
 tokio = { workspace = true, features = ["time"] }

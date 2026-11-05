@@ -108,6 +108,14 @@ const STOPPED_STATUS: u16 = 400;
 /// See [`STOPPED_STATUS`].
 const STOPPED_CODE: &str = "RecursiveInvocationException";
 
+/// The status a synchronous invocation the guardrail ADMITTED is answered with here.
+///
+/// The invocation reaches the run, and this suite's deployment package is 64 bytes that are
+/// not a readable archive — "Lambda could not unzip the deployment package", the modelled
+/// `InvalidZipFileException` at HTTP 502. What this suite asserts with it is that the
+/// guardrail let the invocation through to the run at all.
+const RUN_REACHED_STATUS: u16 = 502;
+
 /// Lambda and CloudWatch on one engine: the series Lambda publishes is CloudWatch's, so it
 /// is read in-process through CloudWatch's own surface — the shape `core/router/src/lib.rs`
 /// mounts them in.
@@ -457,10 +465,11 @@ async fn the_guardrail_stops_a_looping_chain_and_meters_every_invocation_it_drop
                 (true, _) => STOPPED_STATUS,
                 (false, EVENT) => ACCEPTED,
                 (false, DRY_RUN) => DRY_RUN_STATUS,
-                // A synchronous invocation nothing stopped reaches the run itself, which
-                // this emulator has no runtime for and answers 501 for rather than
-                // inventing a payload.
-                (false, _) => 501,
+                // A synchronous invocation nothing stopped reaches the run itself. This
+                // suite's package is not a readable archive, so the run is refused with
+                // the modelled 502 rather than answered with an invented payload — what
+                // matters here is that the guardrail let it through.
+                (false, _) => RUN_REACHED_STATUS,
             };
             assert_eq!(
                 answer.status,
@@ -758,7 +767,7 @@ async fn a_chain_idle_past_the_longest_invocation_is_counted_as_a_new_one() {
     )
     .await;
     assert_eq!(
-        answer.status, 501,
+        answer.status, RUN_REACHED_STATUS,
         "case {case:?}: the invocation must reach the run rather than be stopped, got {} {}",
         answer.status,
         String::from_utf8_lossy(&answer.body)

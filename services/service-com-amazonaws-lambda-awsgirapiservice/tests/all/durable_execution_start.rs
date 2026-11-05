@@ -677,11 +677,11 @@ fn no_start_cases() -> Vec<NoStartCase> {
             status: 204,
         },
         NoStartCase {
-            case: "a synchronous invocation, which this emulator cannot run",
+            case: "a synchronous invocation, whose package this suite stores unreadable",
             durable: true,
             invocation_type: "RequestResponse",
             requested_name: Some("synchronous-execution"),
-            status: 501,
+            status: 502,
         },
     ]
 }

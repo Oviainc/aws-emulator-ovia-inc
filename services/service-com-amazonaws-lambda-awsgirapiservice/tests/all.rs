@@ -229,6 +229,8 @@ mod signing_name_routing;
 mod state_roundtrip;
 #[path = "all/stream_mapping_iterator_age_series.rs"]
 mod stream_mapping_iterator_age_series;
+#[path = "all/synchronous_invoke_run.rs"]
+mod synchronous_invoke_run;
 #[path = "all/tag_resource_arn_constraint.rs"]
 mod tag_resource_arn_constraint;
 #[path = "all/untrusted_name_parsing.rs"]

@@ -42,3 +42,21 @@ pub struct InvokeWithResponseStreamOutput {
     pub executed_version: Option<String>,
     pub response_stream_content_type: Option<String>,
 }
+
+/// One `PayloadChunk` event: "A chunk of the streamed response payload", whose `Payload`
+/// is "Data returned by your Lambda function".
+#[smithy_macros::smithy(shape = "com.amazonaws.lambda#InvokeResponseStreamUpdate")]
+#[derive(Debug, Clone, Default)]
+pub struct InvokeResponseStreamUpdate {
+    pub payload: Option<Vec<u8>>,
+}
+
+/// The terminating `InvokeComplete` event: "An object that's returned when the stream has
+/// ended and all the payload chunks have been returned."
+#[smithy_macros::smithy(shape = "com.amazonaws.lambda#InvokeWithResponseStreamCompleteEvent")]
+#[derive(Debug, Clone, Default)]
+pub struct InvokeWithResponseStreamCompleteEvent {
+    pub error_code: Option<String>,
+    pub error_details: Option<String>,
+    pub log_result: Option<String>,
+}

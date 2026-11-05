@@ -332,13 +332,13 @@ async fn the_response_streaming_entry_names_the_class_of_its_fault() {
             class: USER_FAULT,
         },
         StreamCase {
-            // Running the deployment package is the one path this emulator cannot serve,
-            // and a failure inside the service names the other class.
-            name: "the run of a deployment package this emulator has no runtime for",
+            // The run itself: this suite's deployment package is not a readable archive,
+            // which is a failure inside the service and names the other class.
+            name: "the run of a deployment package that cannot be read",
             reference: function.to_string(),
             payload: b"{}",
             invocation_type: Some("RequestResponse"),
-            status: 501,
+            status: 502,
             class: SERVICE_FAULT,
         },
     ];

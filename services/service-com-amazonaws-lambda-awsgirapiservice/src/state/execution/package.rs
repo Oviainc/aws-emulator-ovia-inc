@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The MODULES a .zip deployment package holds, read out of the bytes the store keeps.
+//!
+//! A `Zip` function's code is "a .zip file archive" whose entries are the files the
+//! handler's module is imported from, so running one starts by reading those entries. The
+//! archive is read ENTIRELY in memory: no entry is written to a host path, and nothing
+//! outside this process's memory is opened for it.
+//!
+//! Three bounds are applied while reading, all of them on what this process holds rather
+//! than on what the archive DECLARES, because the declared sizes are the caller's:
+//!
+//! * [`MAX_PACKAGE_ENTRIES`] entries are read at most, so an archive with a very large
+//!   directory cannot make a very large read;
+//! * [`MAX_UNZIPPED_BYTES`] of INFLATED bytes are read across the whole archive, counted
+//!   as they are produced and capped per entry by what is left of it, so a small archive
+//!   that inflates to a large one stops at the cap rather than filling memory;
+//! * [`MAX_MODULE_BYTES`] of one entry, for the same reason at the level of a single file.
+//!
+//! Only entries that are Python SOURCE — a `.py` suffix and valid UTF-8 — are kept, because
+//! a source file is the only thing this emulator's in-process interpreter can import: a
+//! compiled artefact or a native extension shipped in the package is NOT loaded (nothing
+//! here loads a host library), so a handler that needs one fails to import exactly as it
+//! would if the file were absent, and nothing is reported as having run.
+
+/// One module of a deployment package: the archive-relative path it was stored under and
+/// its source text.
+#[derive(Debug, Clone)]
+pub struct PackageModule {
+    /// The entry's path inside the archive, with `\` normalised to `/` and any leading
+    /// `./` removed, so `import` resolves the same name a real runtime would resolve.
+    pub path: String,
+    /// The entry's source text.
+    pub source: String,
+}
+
+/// Why a deployment package yields no modules to run.
+#[derive(Debug, Clone)]
+pub enum PackageFault {
+    /// This emulator holds no bytes for the package (an S3 object or a container image it
+    /// does not resolve), so there is nothing to read.
+    NotHeld,
+    /// The bytes this emulator holds are not a readable .zip archive.
+    Unreadable(String),
+}
+
+/// How many entries of one archive are read.
+pub const MAX_PACKAGE_ENTRIES: usize = 4_096;
+
+/// How many INFLATED bytes are read across one archive.
+pub const MAX_UNZIPPED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many INFLATED bytes of ONE entry are read.
+pub const MAX_MODULE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The suffix of an entry this interpreter can import.
+const PYTHON_SUFFIX: &str = ".py";
+
+/// Every Python module `zip_bytes` holds, in the archive's own order.
+///
+/// `Ok(vec![])` is a readable archive with no importable module in it, which is a package
+/// whose handler cannot be imported — not a failure of the read.
+pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, PackageFault> {
+    let Some(zip_bytes) = zip_bytes else {
+        return Err(PackageFault::NotHeld);
+    };
+    let mut archive = ::zip::ZipArchive::new(::std::io::Cursor::new(zip_bytes))
+        .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
+    let mut modules = Vec::new();
+    let mut inflated: u64 = 0;
+    let entries = archive.len().min(MAX_PACKAGE_ENTRIES);
+    for index in 0..entries {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let path = normalized_path(name.as_ref());
+        if !path.ends_with(PYTHON_SUFFIX) {
+            continue;
+        }
+        // The read is capped by what is LEFT of the whole-archive budget and by the
+        // per-entry one, never by the size the archive declares for the entry.
+        let room = MAX_UNZIPPED_BYTES.saturating_sub(inflated).min(MAX_MODULE_BYTES);
+        if room == 0 {
+            break;
+        }
+        let mut bytes = Vec::new();
+        ::std::io::Read::read_to_end(&mut ::std::io::Read::take(&mut entry, room), &mut bytes)
+            .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
+        inflated = inflated.saturating_add(bytes.len() as u64);
+        // A module that is not UTF-8 is not source this interpreter can compile; it is
+        // left out rather than lossily decoded into something the caller never wrote.
+        if let Ok(source) = String::from_utf8(bytes) {
+            modules.push(PackageModule { path, source });
+        }
+    }
+    Ok(modules)
+}
+
+/// The archive-relative path an entry is imported under: separators as `/`, and no leading
+/// `./` or `/`, so an entry stored either way names the same module.
+fn normalized_path(name: &str) -> String {
+    let replaced = name.replace('\\', "/");
+    let trimmed = replaced.trim_start_matches("./").trim_start_matches('/');
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bytes of a .zip archive holding `entries`, written in memory.
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buffer = ::std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = ::zip::ZipWriter::new(&mut buffer);
+            let options: ::zip::write::FileOptions<'_, '_, ()> =
+                ::zip::write::FileOptions::default();
+            for (name, bytes) in entries {
+                writer.start_file(*name, options).expect("a new entry");
+                ::std::io::Write::write_all(&mut writer, bytes).expect("the entry's bytes");
+            }
+            writer.finish().expect("a finished archive");
+        }
+        buffer.into_inner()
+    }
+
+    /// One row per kind of entry a package can hold: a module at the root, a module in a
+    /// package directory, a path spelled with a leading `./` and with `\` separators, and
+    /// the entries that are not importable source at all.
+    #[test]
+    fn only_the_python_sources_of_an_archive_are_read() {
+        let cases: &[(&str, &[u8], Option<&str>)] = &[
+            ("lambda_function.py", b"def handler(e, c):\n    return 1\n", Some("lambda_function.py")),
+            ("pkg/__init__.py", b"", Some("pkg/__init__.py")),
+            ("./nested/mod.py", b"x = 1\n", Some("nested/mod.py")),
+            ("win\\mod.py", b"y = 2\n", Some("win/mod.py")),
+            ("data.json", b"{}", None),
+            ("native.so", b"\x7fELF", None),
+            ("binary.py", b"\xff\xfe\x00", None),
+        ];
+        for (name, bytes, expected) in cases {
+            let held = archive(&[(name, bytes)]);
+            let modules = python_modules(Some(&held)).expect("a readable archive");
+            let actual: Vec<&str> = modules.iter().map(|module| module.path.as_str()).collect();
+            let wanted: Vec<&str> = expected.iter().copied().collect();
+            assert_eq!(
+                actual, wanted,
+                "case {name:?}: expected the modules {wanted:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The source read back is the source stored, for an entry of each size class up to
+    /// the per-entry cap.
+    #[test]
+    fn a_modules_source_is_the_source_the_package_holds() {
+        for size in [0_usize, 1, 1_024, 64 * 1024] {
+            let source = "#".repeat(size);
+            let held = archive(&[("m.py", source.as_bytes())]);
+            let modules = python_modules(Some(&held)).expect("a readable archive");
+            let actual = modules.first().map(|module| module.source.len());
+            assert_eq!(
+                actual,
+                Some(size),
+                "case {size} bytes: expected the stored source back, got {actual:?}"
+            );
+        }
+    }
+
+    /// At most [`MAX_PACKAGE_ENTRIES`] entries are read, whatever the archive holds.
+    #[test]
+    fn no_more_than_the_entry_cap_is_read() {
+        let names: Vec<String> = (0..MAX_PACKAGE_ENTRIES + 16)
+            .map(|index| format!("m{index}.py"))
+            .collect();
+        let entries: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|name| (name.as_str(), b"x = 1\n" as &[u8]))
+            .collect();
+        let held = archive(&entries);
+        let modules = python_modules(Some(&held)).expect("a readable archive");
+        assert_eq!(
+            modules.len(),
+            MAX_PACKAGE_ENTRIES,
+            "expected at most {MAX_PACKAGE_ENTRIES} entries, got {}",
+            modules.len()
+        );
+    }
+
+    /// Bytes that are not an archive, and a package this emulator holds no bytes for, are
+    /// each reported as the fault they are rather than as an empty package.
+    #[test]
+    fn unreadable_bytes_and_an_unheld_package_are_reported() {
+        let cases: &[(&str, Option<&[u8]>, bool)] = &[
+            ("no bytes held", None, false),
+            ("not an archive", Some(b"not a zip at all"), true),
+            ("empty bytes", Some(b""), true),
+        ];
+        for (case, bytes, unreadable) in cases {
+            let read = python_modules(*bytes);
+            let fault = match read {
+                Ok(modules) => panic!("case {case:?}: expected a fault, got {} modules", modules.len()),
+                Err(fault) => fault,
+            };
+            let is_unreadable = matches!(fault, PackageFault::Unreadable(_));
+            assert_eq!(
+                is_unreadable, *unreadable,
+                "case {case:?}: expected unreadable {unreadable}, got {fault:?}"
+            );
+        }
+    }
+}

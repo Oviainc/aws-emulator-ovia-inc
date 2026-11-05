@@ -275,14 +275,17 @@ fn dry_run_cases() -> Vec<DryRunCase> {
             name: "an alias, addressed by the function: prefix form",
             reference: |name| format!("function:{name}:live"),
             qualifier: None,
-            executed_version: "live",
+            // `ExecutedVersion` is "the version of the function that executed. When you
+            // invoke a function with an alias, this indicates which version the alias
+            // resolved to", so an alias reports that version and not its own name.
+            executed_version: "1",
             payload: r#""a json string is a json document too""#,
         },
         DryRunCase {
             name: "an alias, named in the Qualifier parameter",
             reference: |name| name.to_string(),
             qualifier: Some("live"),
-            executed_version: "live",
+            executed_version: "1",
             payload: "{}",
         },
     ]
@@ -508,15 +511,19 @@ async fn a_request_the_function_cannot_take_is_refused_on_its_own_terms() {
     }
 }
 
+/// A package this emulator cannot READ is refused with the modelled failure for it, never
+/// answered with a stream the function did not produce.
+///
+/// The function this suite creates carries 64 bytes that are not a .zip archive at all, so
+/// there is no handler to run: "Lambda could not unzip the deployment package"
+/// (`InvalidZipFileException`, `@httpError(502)`) is what that is. The two rows are the
+/// same path, because the default invocation type is the synchronous one.
 #[tokio::test]
-async fn running_the_deployment_package_says_it_is_not_implemented() {
+async fn a_package_that_cannot_be_read_is_refused_rather_than_streamed() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
     create_active_function(&router, "stream-run").await;
 
-    // The default invocation type is the synchronous one, so the two rows are the same
-    // path: it is the one this emulator cannot serve, and it says so rather than streaming
-    // anything the function did not produce.
     for (label, invocation_type) in [
         ("the default invocation type", None),
         ("RequestResponse stated explicitly", Some("RequestResponse")),
@@ -525,18 +532,18 @@ async fn running_the_deployment_package_says_it_is_not_implemented() {
             invoke_with_response_stream(&router, "stream-run", None, invocation_type, b"{}").await;
         assert_eq!(
             answer.status,
-            501,
-            "case {label:?}: expected the unimplemented signal, got {} {}",
+            502,
+            "case {label:?}: expected the modelled 502, got {} {}",
             answer.status,
             answer.text()
         );
         assert!(
-            answer.message().contains("stream-run"),
-            "case {label:?}: the answer names the function it resolved, got {:?}",
-            answer.message()
+            answer.error_code().contains("InvalidZipFileException"),
+            "case {label:?}: expected InvalidZipFileException, got {}",
+            answer.error_code()
         );
         assert!(
-            !answer.body.is_empty() && answer.json().get("message").is_some(),
+            !answer.body.is_empty() && answer.json().get("Message").is_some(),
             "case {label:?}: the refusal is rendered in this service's own error envelope, \
              got {:?}",
             answer.text()

@@ -347,8 +347,7 @@ async fn a_confirmation_invokes_the_pools_post_confirmation_function() {
             // function the pool named — both taken from the request's own pool and from
             // what Lambda answered. An INVOCATION's not-found refusal names the ARN it
             // resolved, qualifier included, and the trigger names no qualifier, so the
-            // unpublished version is the one it resolved
-            // (`lambda::state::addressed_function_arn`).
+            // unpublished version is the one it resolved.
             assert_eq!(
                 message(&answer),
                 format!(

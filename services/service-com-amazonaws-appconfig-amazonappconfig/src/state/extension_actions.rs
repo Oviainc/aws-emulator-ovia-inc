@@ -453,6 +453,24 @@ pub struct Failure {
 /// delivery reads).
 const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
 
+/// The error codes a target's own service answers when the target COULD NOT BE RUN at all,
+/// one per modelled failure that says so rather than reporting what the target decided.
+///
+/// Lambda answers each of these before the function's code runs — "Lambda could not unzip
+/// the deployment package", a runtime it cannot run, a function not ready, or environment
+/// variables it could not decrypt — so nothing is known about what the target would have
+/// answered, exactly as for an operation this emulator has not implemented.
+const NOT_RUN_CODES: &[&str] = &[
+    NOT_IMPLEMENTED_CODE,
+    "InvalidZipFileException",
+    "InvalidRuntimeException",
+    "ResourceNotReadyException",
+    "KMSAccessDeniedException",
+    "KMSDisabledException",
+    "KMSInvalidStateException",
+    "KMSNotFoundException",
+];
+
 impl Failure {
     /// The failure one refused call amounts to: the target service's own error code, the
     /// message it gave, and the request id its answer carried.
@@ -470,12 +488,12 @@ impl Failure {
     /// Whether this failure refuses the call the action point gated.
     ///
     /// A target that REFUSED the action does: that is the veto the action point exists
-    /// for. A call this emulator has not implemented does NOT — nothing is known about
-    /// what the target would have answered, so refusing a call the real service serves
-    /// would report a veto no extension gave. The invocation is recorded as the failure
-    /// it was either way.
+    /// for. A call that did not reach the target's own code does NOT ([`NOT_RUN_CODES`]) —
+    /// nothing is known about what the target would have answered, so refusing a call the
+    /// real service serves would report a veto no extension gave. The invocation is
+    /// recorded as the failure it was either way.
     pub fn refuses_the_call(&self) -> bool {
-        self.code != NOT_IMPLEMENTED_CODE
+        !NOT_RUN_CODES.contains(&self.code.as_str())
     }
 }
 

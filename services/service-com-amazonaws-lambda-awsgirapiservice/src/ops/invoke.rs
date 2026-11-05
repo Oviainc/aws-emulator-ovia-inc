@@ -36,13 +36,14 @@
 //! function is being invoked at all. The dry run is metered by neither series, because it
 //! invokes nothing.
 //!
-//! Running the deployment package is NOT implemented: this emulator has no in-process
-//! runtime for a Lambda zip archive or container image, so `RequestResponse` answers
-//! HTTP 501 rather than a payload no function produced, and a queued asynchronous
-//! event settles into the outcome that records it never ran. Everything around the run
-//! — resolving the name in each of its documented forms, the version or alias, the
-//! function's lifecycle state, the payload limits and the JSON check — is real, and
-//! happens before that.
+//! A `RequestResponse` invocation RUNS the function: the deployment package the store
+//! holds for the resolved version is read, its handler is imported and called with the
+//! event and the context, and what the handler produced is the answer — its returned value
+//! as the response payload, or the error document and the `Unhandled` function-error signal
+//! for an exception it raised, with the log tail when `LogType=Tail` asked for one. The run
+//! happens in this process, in the interpreter `crate::state::execution` builds for the
+//! function's runtime, bounded and contained there; a package this emulator embeds no
+//! engine for is the modelled failure for it rather than a payload no function produced.
 //!
 //! ## Shape of an operation
 //!
@@ -406,6 +407,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
+        // "Set to Tail to include the execution log in the response. Applies to
+        // synchronously invoked functions only."
+        let log_type = input.log_type.clone();
+        // "Up to 3,583 bytes of base64-encoded data about the invoking client to pass to
+        // the function in the context object": the handler is given the DECODED document,
+        // which is what `context.client_context` is on the real runtime. A value that is
+        // not base64 is refused rather than passed on as itself.
+        let client_context = match input.client_context.as_deref() {
+            None => None,
+            Some(encoded) => match ::base64::Engine::decode(
+                &::base64::engine::general_purpose::STANDARD,
+                encoded,
+            )
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
+                Some(decoded) => Some(decoded),
+                None => {
+                    return Err(InvokeErrorModeled::InvalidRequestContentException(
+                        InvalidRequestContentException {
+                            r#type: None,
+                            message: Some(
+                                "ClientContext is not valid base64-encoded data.".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
         // The resource an INVOCATION addresses is a function AT a version, so the refusal
         // for a pair that resolves to nothing names that QUALIFIED resource — the ARN this
         // invocation resolved, built from the request by the one construction every
@@ -415,7 +446,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.function_name,
             input.qualifier.as_deref(),
         );
-        let mut store = state.lock();
+        // The store guard lives in THIS block and no longer: everything the run needs is
+        // copied out of the record here, and the run below happens with no guard held, so
+        // one caller's handler cannot stall another caller's request.
+        let (invocation, function_name, resource, kms_key_arn) = {
+            let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
             &input.function_name,
@@ -464,25 +499,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let payload = input.payload.clone().unwrap_or_default();
 
-        // "For synchronous invocations, the maximum payload size is 6 MB. For
-        // asynchronous invocations, the maximum payload size is 1 MB."
-        let payload_limit = if invocation_type == INVOCATION_TYPE_EVENT {
-            MAX_ASYNCHRONOUS_PAYLOAD_BYTES
-        } else {
-            MAX_SYNCHRONOUS_PAYLOAD_BYTES
-        };
-        if payload.len() > payload_limit {
-            return Err(InvokeErrorModeled::RequestTooLargeException(
-                RequestTooLargeException {
-                    r#type: None,
-                    message: Some(format!(
-                        "Request must be smaller than {payload_limit} bytes for the \
-                         {invocation_type} invocation type"
-                    )),
-                },
-            )
-            .into());
-        }
+        // The payload QUOTA — "the maximum payload size is 6 MB for synchronous
+        // invocations and 1 MB for asynchronous invocations" — is checked on the request's
+        // own body before it is read as an input at all, and answered in the envelope AWS
+        // answers it in (`crate::service::request_quota`), so there is no second check
+        // here.
 
         // "The JSON that you want to provide to your Lambda function as input": a body
         // that is not JSON is refused with the modelled 400, and an absent or empty one
@@ -498,12 +519,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let executed_version = version.clone();
+        // `ExecutedVersion` is "the version of the function that executed. When you invoke
+        // a function with an alias, this indicates which version the alias resolved to" —
+        // so it is the version the qualifier RESOLVES to (a number, or `$LATEST`), never
+        // the alias name the call addressed.
+        let executed_version = record
+            .resolved_version(&version)
+            .unwrap_or_else(|| version.clone());
         let function_arn = record.versioned_arn(&version);
-        let runtime = record
+        // The configuration the invocation RESOLVED — a published version's frozen one, or
+        // the unpublished version's — which is what the run is performed under.
+        let resolved_config = record
             .config_of(&version)
-            .and_then(|config| config.runtime.clone())
-            .unwrap_or_else(|| record.config.package_type.clone());
+            .cloned()
+            .unwrap_or_else(|| record.config.clone());
 
         if invocation_type == INVOCATION_TYPE_DRY_RUN {
             // "DryRun – Validate parameter values and verify that the user or role has
@@ -643,25 +672,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The invocation is admitted to the function at this point, so it is metered before
         // the run is attempted: the datapoint counts this invocation request, and reports
         // nothing about what the execution produced.
+        //
+        // Everything the RUN needs is copied out of the record first, because the run
+        // happens with no store guard held: one caller's handler cannot stall another
+        // caller's request.
+        let zip_bytes = record.code_of(&version).zip_bytes.clone();
+        let kms_key_arn = resolved_config.kms_key_arn.clone();
         drop(store);
+        let invocation = crate::state::Invocation {
+            function_name: function_name.clone(),
+            executed_version: executed_version.clone(),
+            invoked_function_arn: function_arn.clone(),
+            region: region.clone(),
+            runtime: resolved_config.runtime.clone(),
+            handler: resolved_config.handler.clone(),
+            variables: resolved_config.environment.clone(),
+            memory_size: resolved_config.memory_size,
+            timeout: resolved_config.timeout,
+            zip_bytes,
+            payload,
+            client_context: client_context.clone(),
+            tenant_id: input.tenant_id.clone(),
+            request_id: crate::state::mint_request_id(),
+        };
+            (invocation, function_name, resource, kms_key_arn)
+        };
+        let executed_version = invocation.executed_version.clone();
         crate::state::publish_invocation(&*self.engine, &function_name, &resource);
 
-        // RequestResponse means "run the deployment package and answer with what it
-        // returned". This emulator has no in-process runtime that can, and a response
-        // body, a FunctionError or a log tail invented for a run that never happened
-        // would be indistinguishable from a real one — so the run is refused, naming the
-        // function and version it resolved so the control-plane half is still useful.
-        Err(crate::scaffolded::Scaffolded::NotImplemented(
-            crate::scaffolded::NotImplemented {
-                message: format!(
-                    "Invoke resolved {function_arn} at version {executed_version}, but running \
-                     its {runtime} deployment package is not implemented in this emulator: \
-                     there is no in-process runtime for it, and no response payload is \
-                     returned that the function did not produce. InvocationType=DryRun \
-                     validates an invocation without running the function."
-                ),
+        // A function whose environment variables are encrypted with a customer managed key
+        // is only invoked while that key can decrypt them: the invocation begins with that
+        // decrypt, and each way it can fail is one of the KMS failures this operation binds
+        // at 502 (`crate::state::execution::environment_key`). Nothing has run at this
+        // point, and nothing will if the key cannot be used.
+        if let Some(fault) = crate::state::environment_key_fault(
+            ctx,
+            &invocation.region,
+            kms_key_arn.as_deref(),
+            &invocation.variables,
+        )
+        .await
+        {
+            return Err(environment_key_refusal(fault));
+        }
+
+        // "RequestResponse (default) – Invoke the function synchronously. Keep the
+        // connection open until the function returns a response or times out. The API
+        // response includes the function response and additional data." So the handler is
+        // RUN, and what it produced is the answer: its value as the payload, or — "An
+        // unhandled error is still HTTP 200" — the error document and the `FunctionError`
+        // signal for an exception it raised. "The status code in the API response doesn't
+        // reflect function errors."
+        let invoked = crate::state::run_invocation(invocation)
+            .await
+            .map_err(unrunnable)?;
+        Ok(InvokeOutput {
+            status_code: REQUEST_RESPONSE_STATUS,
+            executed_version: Some(executed_version),
+            function_error: invoked.function_error.clone(),
+            // "Set to Tail to include the execution log in the response. Applies to
+            // synchronously invoked functions only."
+            log_result: match log_type.as_deref() {
+                Some(LOG_TYPE_TAIL) => Some(invoked.log_tail()),
+                _ => None,
             },
-        ))
+            payload: Some(invoked.payload),
+            ..InvokeOutput::default()
+        })
+    }
+}
+
+/// How a key that cannot decrypt a function's environment variables is answered: the
+/// modelled 502 for the fault the key service reported.
+fn environment_key_refusal(fault: crate::state::EnvironmentKeyFault) -> InvokeError {
+    match fault {
+        crate::state::EnvironmentKeyFault::Disabled(message) => {
+            InvokeErrorModeled::KMSDisabledException(KMSDisabledException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::InvalidState(message) => {
+            InvokeErrorModeled::KMSInvalidStateException(KMSInvalidStateException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::NotFound(message) => {
+            InvokeErrorModeled::KMSNotFoundException(KMSNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::AccessDenied(message) => {
+            InvokeErrorModeled::KMSAccessDeniedException(KMSAccessDeniedException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// How an invocation that ran NOTHING is answered: one modelled failure per reason, so a
+/// client is never told a function ran when none did.
+fn unrunnable(why: crate::state::Unrunnable) -> InvokeError {
+    match why {
+        // "The runtime or runtime version specified is not supported" — this emulator
+        // embeds an interpreter for the Python runtimes and for no other, and a container
+        // image is a package it cannot run at all.
+        crate::state::Unrunnable::NoEngine { runtime } => {
+            InvokeErrorModeled::InvalidRuntimeException(InvalidRuntimeException {
+                r#type: None,
+                message: Some(format!(
+                    "The runtime {runtime} is not supported by this emulator, which runs the \
+                     Python runtimes."
+                )),
+            })
+            .into()
+        }
+        crate::state::Unrunnable::NoHandler => {
+            InvokeErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+                r#type: None,
+                message: Some(
+                    "The function configuration names no Handler to run.".to_string(),
+                ),
+            })
+            .into()
+        }
+        // "Lambda could not unzip the deployment package": the bytes this emulator holds
+        // for the package are not a package it can read, or it holds none at all (an S3
+        // object or an image it does not resolve).
+        crate::state::Unrunnable::PackageNotHeld => {
+            InvokeErrorModeled::InvalidZipFileException(InvalidZipFileException {
+                r#type: None,
+                message: Some(
+                    "The deployment package of this function is not held by this emulator, so \
+                     there is nothing to run."
+                        .to_string(),
+                ),
+            })
+            .into()
+        }
+        crate::state::Unrunnable::PackageUnreadable(why) => {
+            InvokeErrorModeled::InvalidZipFileException(InvalidZipFileException {
+                r#type: None,
+                message: Some(format!("The deployment package could not be read: {why}")),
+            })
+            .into()
+        }
+        // "The request throughput limit was exceeded": more handlers are already running
+        // than this emulator runs at once.
+        crate::state::Unrunnable::Overloaded(message) => {
+            InvokeErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                r#type: None,
+                message: Some(message),
+                reason: None,
+                retry_after_seconds: None,
+            })
+            .into()
+        }
+        crate::state::Unrunnable::Internal(message) => {
+            InvokeErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }
 
@@ -777,10 +954,11 @@ const DRY_RUN_STATUS: i32 = 204;
 /// is 202."
 const ACCEPTED_STATUS: i32 = 202;
 
-/// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
-/// `Invoke` documentation).
-const MAX_SYNCHRONOUS_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
+/// The `StatusCode` a `RequestResponse` invocation answers with, which the model's own
+/// `StatusCode` documentation states: "For the RequestResponse invocation type, this
+/// status code is 200."
+const REQUEST_RESPONSE_STATUS: i32 = 200;
 
-/// "For asynchronous invocations, the maximum payload size is 1 MB" (the model's own
-/// `Invoke` documentation).
-const MAX_ASYNCHRONOUS_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// The `LogType` value that asks for the log tail, from the model's `LogType` enum
+/// (`None | Tail`): "Set to Tail to include the execution log in the response."
+const LOG_TYPE_TAIL: &str = "Tail";

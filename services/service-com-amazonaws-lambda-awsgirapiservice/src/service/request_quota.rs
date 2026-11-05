@@ -41,7 +41,7 @@
 //! carries it in. The class of the fault is named on it by
 //! [`crate::service::fault_class`], as it is on every other error body of this service.
 
-use aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
 
 /// The error code a request past its operation's quota is refused as on the WIRE, and so
@@ -93,10 +93,14 @@ fn too_large_message(operation: &str, max_bytes: usize) -> String {
     format!("Request must be smaller than {max_bytes} bytes for the {operation} operation")
 }
 
-/// How this service refuses a request to `operation` whose body is `body_bytes` long, or
-/// `None` when that body is within the quota published for it — which includes every
-/// operation this emulator knows no request quota for.
-pub(super) fn refusing_body(operation: &str, body_bytes: usize) -> Option<RtResponse> {
+/// How this service refuses a request to `operation` whose body is past the quota
+/// published for it, or `None` when it is within it — which includes every operation this
+/// emulator knows no request quota for.
+pub(super) fn refusing_body(operation: &str, req: &RtRequest) -> Option<RtResponse> {
+    let body_bytes = req.body().bytes().map_or(0, <[u8]>::len);
+    if let Some(refusal) = refusing_payload(operation, req, body_bytes) {
+        return Some(refusal);
+    }
     let quota = BODY_QUOTAS
         .iter()
         .find(|quota| quota.operation == operation)?;
@@ -107,6 +111,59 @@ pub(super) fn refusing_body(operation: &str, body_bytes: usize) -> Option<RtResp
         operation,
         quota.max_bytes,
     )))
+}
+
+/// The operation whose request body IS the event payload a function is invoked with, and
+/// whose quota is therefore the INVOCATION TYPE's rather than the operation's.
+const INVOKE: &str = "Invoke";
+
+/// The header `Invoke` binds its `InvocationType` to
+/// (`smithy_query(query="operation",operation="Invoke")`).
+const INVOCATION_TYPE_HEADER: &str = "x-amz-invocation-type";
+
+/// The `InvocationType` whose payload quota is the asynchronous one.
+const INVOCATION_TYPE_EVENT: &str = "Event";
+
+/// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
+/// `Invoke` documentation).
+const MAX_SYNCHRONOUS_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
+
+/// "For asynchronous invocations, the maximum payload size is 1 MB" (the model's own
+/// `Invoke` documentation).
+const MAX_ASYNCHRONOUS_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// How an INVOCATION whose payload is past the quota for its invocation type is refused.
+///
+/// The quota is the invocation TYPE's — "The maximum payload size is 6 MB for synchronous
+/// invocations and 1 MB for asynchronous invocations" — so which one applies is read off
+/// the request's own `InvocationType` header, and each is refused in the sentence AWS
+/// gives it: the asynchronous one names the payload's own size against the limit, and the
+/// synchronous one names the limit and the action.
+fn refusing_payload(operation: &str, req: &RtRequest, body_bytes: usize) -> Option<RtResponse> {
+    if operation != INVOKE {
+        return None;
+    }
+    let asynchronous = req
+        .headers()
+        .get(INVOCATION_TYPE_HEADER)
+        .is_some_and(|invocation_type| invocation_type == INVOCATION_TYPE_EVENT);
+    let limit = if asynchronous {
+        MAX_ASYNCHRONOUS_PAYLOAD_BYTES
+    } else {
+        MAX_SYNCHRONOUS_PAYLOAD_BYTES
+    };
+    if body_bytes <= limit {
+        return None;
+    }
+    let message = if asynchronous {
+        format!(
+            "{body_bytes} byte payload is too large for the {INVOCATION_TYPE_EVENT} invocation \
+             type (limit {limit} bytes)"
+        )
+    } else {
+        format!("Request must be smaller than {limit} bytes for the InvokeFunction operation")
+    };
+    Some(too_large_response(&message))
 }
 
 /// The refusal itself: this service's JSON error envelope, at the status the error shape
@@ -138,6 +195,17 @@ fn too_large_response(message: &str) -> RtResponse {
 mod tests {
     use super::*;
 
+    /// A request to `operation` with a body of `body_bytes` and, where it is an
+    /// invocation, the `InvocationType` header it carries.
+    fn request(body_bytes: usize, invocation_type: Option<&str>) -> RtRequest {
+        let mut req = RtRequest::new(SdkBody::from(vec![b'x'; body_bytes]));
+        if let Some(invocation_type) = invocation_type {
+            req.headers_mut()
+                .insert(INVOCATION_TYPE_HEADER, invocation_type.to_string());
+        }
+        req
+    }
+
     /// The decoded body of a refusal.
     fn decoded(response: &RtResponse) -> ::serde_json::Value {
         ::serde_json::from_slice(response.body().bytes().expect("an in-memory body"))
@@ -157,7 +225,7 @@ mod tests {
                 ("far over the quota", quota.max_bytes * 4, true),
             ];
             for (case, body_bytes, refused) in cases {
-                let stated = refusing_body(quota.operation, *body_bytes);
+                let stated = refusing_body(quota.operation, &request(*body_bytes, None));
                 assert_eq!(
                     stated.is_some(),
                     *refused,
@@ -169,12 +237,102 @@ mod tests {
         }
     }
 
+    /// An INVOCATION's payload is held to the quota of its invocation TYPE, and each is
+    /// refused in the sentence AWS gives it: one row per invocation type, at and around
+    /// each quota.
+    #[test]
+    fn an_invocation_payload_is_held_to_the_quota_of_its_type() {
+        let cases: &[(&str, Option<&str>, usize, Option<&str>)] = &[
+            ("no type, under the synchronous quota", None, 16, None),
+            (
+                "no type, exactly the synchronous quota",
+                None,
+                MAX_SYNCHRONOUS_PAYLOAD_BYTES,
+                None,
+            ),
+            (
+                "no type, one byte over the synchronous quota",
+                None,
+                MAX_SYNCHRONOUS_PAYLOAD_BYTES + 1,
+                Some("Request must be smaller than 6291456 bytes for the InvokeFunction operation"),
+            ),
+            (
+                "RequestResponse over the synchronous quota",
+                Some("RequestResponse"),
+                MAX_SYNCHRONOUS_PAYLOAD_BYTES + 1,
+                Some("Request must be smaller than 6291456 bytes for the InvokeFunction operation"),
+            ),
+            (
+                "DryRun over the synchronous quota",
+                Some("DryRun"),
+                MAX_SYNCHRONOUS_PAYLOAD_BYTES + 2,
+                Some("Request must be smaller than 6291456 bytes for the InvokeFunction operation"),
+            ),
+            (
+                "Event under its own quota",
+                Some("Event"),
+                MAX_ASYNCHRONOUS_PAYLOAD_BYTES,
+                None,
+            ),
+            (
+                "Event one byte over its own quota",
+                Some("Event"),
+                MAX_ASYNCHRONOUS_PAYLOAD_BYTES + 1,
+                Some(
+                    "1048577 byte payload is too large for the Event invocation type (limit \
+                     1048576 bytes)",
+                ),
+            ),
+            (
+                "Event far over its own quota",
+                Some("Event"),
+                MAX_ASYNCHRONOUS_PAYLOAD_BYTES + 9,
+                Some(
+                    "1048585 byte payload is too large for the Event invocation type (limit \
+                     1048576 bytes)",
+                ),
+            ),
+        ];
+        for (case, invocation_type, body_bytes, expected) in cases {
+            let stated = refusing_body(INVOKE, &request(*body_bytes, *invocation_type));
+            match (stated, expected) {
+                (None, None) => {}
+                (Some(response), Some(expected)) => {
+                    assert_eq!(
+                        response.status().as_u16(),
+                        REQUEST_TOO_LARGE_STATUS,
+                        "case {case:?}: expected the status the model declares, got {}",
+                        response.status().as_u16()
+                    );
+                    assert_eq!(
+                        response.headers().get("x-amzn-errortype"),
+                        Some(REQUEST_TOO_LARGE),
+                        "case {case:?}: expected the error code AWS answers, got {:?}",
+                        response.headers().get("x-amzn-errortype")
+                    );
+                    let document = decoded(&response);
+                    assert_eq!(
+                        document
+                            .get(MESSAGE_MEMBER)
+                            .and_then(::serde_json::Value::as_str),
+                        Some(*expected),
+                        "case {case:?}: expected {expected:?}, got {document}"
+                    );
+                }
+                (stated, expected) => panic!(
+                    "case {case:?}: expected {expected:?}, got {:?}",
+                    stated.map(|response| response.status().as_u16())
+                ),
+            }
+        }
+    }
+
     /// The refusal names the status, the error shape and the quota of the operation it
     /// refused — the whole wire answer, so a caller can tell it from the policy-size one.
     #[test]
     fn the_refusal_names_the_shape_the_quota_and_the_operation() {
         for quota in BODY_QUOTAS {
-            let response = refusing_body(quota.operation, quota.max_bytes + 1)
+            let response = refusing_body(quota.operation, &request(quota.max_bytes + 1, None))
                 .unwrap_or_else(|| panic!("case {}: expected a refusal", quota.operation));
             assert_eq!(
                 response.status().as_u16(),
@@ -210,8 +368,8 @@ mod tests {
     /// size, however large the body.
     #[test]
     fn an_operation_with_no_quota_is_never_refused_here() {
-        for case in ["GetPolicy", "PutResourcePolicy", "Invoke", ""] {
-            let stated = refusing_body(case, 10 * 1_024 * 1_024);
+        for case in ["GetPolicy", "PutResourcePolicy", "InvokeAsync", ""] {
+            let stated = refusing_body(case, &request(10 * 1_024 * 1_024, None));
             assert!(
                 stated.is_none(),
                 "case {case:?}: expected no size refusal, got {:?}",

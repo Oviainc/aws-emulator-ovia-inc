@@ -1,0 +1,790 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! RUNNING a function: what an invocation of a stored deployment package comes to.
+//!
+//! An invocation's answer is the handler's: "For synchronous invocation, details about the
+//! function response, including errors, are included in the response body and headers"
+//! (`Invoke`). So this module runs the handler — the package's modules are compiled and
+//! executed in this process by the interpreter in [`python`], with the event the caller
+//! sent and the context the runtime reports — and reports back exactly what the run
+//! produced: the value the handler returned, serialized by that interpreter; the error
+//! document and `Unhandled` signal of an exception it raised; and the log the run wrote.
+//! Nothing here is synthesised: a payload, a log line, an error type or a duration is the
+//! one the run produced, and a package no engine here can run is reported as the modelled
+//! failure for it rather than as a result.
+//!
+//! # Which packages run
+//!
+//! A `Zip` package whose `Runtime` is one of the Python runtimes ([`runs_python`]), out of
+//! the bytes the store holds for the version the invocation resolved. Every other package
+//! — a container image, a runtime this emulator embeds no interpreter for — is
+//! [`Unrunnable::NoEngine`], which the calling operation answers as the modelled
+//! `InvalidRuntimeException`: no response payload is returned that no function produced.
+//!
+//! # What bounds a run
+//!
+//! Two ceilings, for two different things:
+//!
+//! * the RUN's own budget, which the interpreter spends and the guest cannot reach
+//!   ([`python::Budget`]): the function's own `Timeout`, clamped to the range the model
+//!   allows for it, plus the step, memory, log and response bounds;
+//! * how long the CALLER waits, which is this module's ([`HOST_WAIT_CEILING`]) and is
+//!   never the guest's to set: a run still going when the caller's wait is spent is
+//!   ABANDONED — its slot goes back to the pool at once, it counts against
+//!   [`MAX_ABANDONED_RUNS`] for as long as its thread lasts, and past that cap an
+//!   invocation is refused with the modelled throttle rather than adding another thread.
+//!
+//! At most [`MAX_CONCURRENT_RUNS`] handlers run at once, so the memory and CPU the
+//! interpreters can hold is bounded however many invocations arrive; a call that waits
+//! [`PERMIT_WAIT`] for a slot is answered with the modelled throttle. Every run happens on
+//! a thread of its own with no state guard of this service held, so one caller's handler
+//! cannot stall another caller's request.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime};
+
+/// The modules of a .zip deployment package, read out of the bytes the store holds.
+pub mod package;
+
+/// The Python interpreter one invocation runs in, and everything that bounds and contains
+/// it.
+pub mod python;
+
+/// The runtime the handler runs under, in the language the handler is written in.
+mod bootstrap;
+
+/// The `posix` module a run's Python is built on: this emulator's own, with no host call
+/// in it.
+mod host_posix;
+
+/// Whether the key a function's environment variables are encrypted with can decrypt them
+/// — the check every invocation of such a function begins with.
+pub mod environment_key;
+pub use environment_key::{environment_key_fault, EnvironmentKeyFault};
+
+/// How many handlers run at once.
+pub const MAX_CONCURRENT_RUNS: usize = 4;
+
+/// How long an invocation waits for one of those slots before it is throttled.
+pub const PERMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The longest a CALLER waits for a run, whatever the function's own timeout says.
+///
+/// This is the HOST's ceiling, not the function's: a `Timeout` of up to 900 seconds would
+/// otherwise hold a request open for a quarter of an hour. The run's own deadline is the
+/// function's clamped `Timeout` ([`run_budget`]); this is only how long the answer is
+/// waited for.
+pub const HOST_WAIT_CEILING: Duration = Duration::from_secs(30);
+
+/// How long after its budget is spent a run is still waited for before it is abandoned.
+pub const ABANDON_GRACE: Duration = Duration::from_secs(2);
+
+/// How many abandoned runs may be outstanding before an invocation is throttled instead of
+/// starting another.
+pub const MAX_ABANDONED_RUNS: usize = 8;
+
+/// The stack one run's thread is given. Well above the interpreter's clamped recursion
+/// limit, so deep guest recursion ends that run with the interpreter's own
+/// `RecursionError` rather than touching the thread's guard page.
+pub(crate) const RUN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// The smallest `Timeout` the model allows (`smithy_query(query="shape",
+/// shape="Timeout")`: `@range(min: 1)`), which a stored value is clamped up to before it
+/// bounds a run.
+const MIN_TIMEOUT_SECONDS: i64 = 1;
+
+/// The largest `Timeout` the model allows for a function (AWS publishes 900 seconds, which
+/// is the maximum `CreateFunction` accepts), which a stored value is clamped down to.
+const MAX_TIMEOUT_SECONDS: i64 = 900;
+
+/// The REQUEST ID one invocation is identified by, in the log it writes and in the error
+/// document it answers with: a fresh UUID per invocation, which is what `aws_request_id`
+/// is on the real runtime.
+#[must_use]
+pub fn mint_request_id() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
+/// How many traced events one run may execute. Large enough for any handler a test or a
+/// client runs, small enough that a loop with no exit ends inside the caller's wait.
+const MAX_RUN_STEPS: u64 = 20_000_000;
+
+/// How much memory one run may add to this process.
+const MAX_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How deep one run may recurse.
+///
+/// The interpreter's own default is far LOWER than Python's (256 against CPython's 1000),
+/// and the standard library's own import chain needs more than that, so this is the limit
+/// a run is given rather than a reduction: it is set before any guest code runs and the
+/// call that would raise it is taken away, so it is the ceiling for the whole run.
+const MAX_RUN_RECURSION: usize = 2_000;
+
+/// How much of a run's output is kept. The model reports "The last 4 KB of the execution
+/// log" on `LogResult`, so what is kept is a multiple of that rather than unbounded.
+const MAX_RUN_LOG_BYTES: usize = 256 * 1024;
+
+/// How large a handler's response may be. "The maximum payload size is 6 MB for
+/// synchronous invocations" (the model's own `Invoke` documentation) bounds the REQUEST;
+/// the response Lambda publishes the same quota for.
+const MAX_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
+
+/// The bytes of a run's log the model reports on `LogResult`: "The last 4 KB of the
+/// execution log, which is base64-encoded."
+pub const LOG_TAIL_BYTES: usize = 4 * 1024;
+
+/// The `FunctionError` an invocation whose handler raised reports: "If present, indicates
+/// that an error occurred during function execution." AWS reports the error of a handler
+/// that raised as `Unhandled`.
+pub const FUNCTION_ERROR_UNHANDLED: &str = "Unhandled";
+
+/// The `Runtime` values this emulator embeds an interpreter for: the Python ones.
+///
+/// Matched by prefix because the identifiers are versioned (`python3.12`,
+/// `python3.13`, …) and the interpreter runs the language rather than one of its point
+/// releases (source for the value set: `smithy_query(query="shape", shape="Runtime")`).
+const PYTHON_RUNTIME_PREFIX: &str = "python";
+
+/// Whether `runtime` names a runtime this emulator can run a package for.
+#[must_use]
+pub fn runs_python(runtime: Option<&str>) -> bool {
+    runtime.is_some_and(|runtime| runtime.starts_with(PYTHON_RUNTIME_PREFIX))
+}
+
+/// Everything one invocation of a stored function needs to run.
+#[derive(Debug, Clone)]
+pub struct Invocation {
+    /// The function's name.
+    pub function_name: String,
+    /// The version the invocation resolved to — what `ExecutedVersion` reports.
+    pub executed_version: String,
+    /// The ARN the invocation addressed, as `context.invoked_function_arn`.
+    pub invoked_function_arn: String,
+    /// The Region the invocation was addressed to.
+    pub region: String,
+    /// The `Runtime` of the resolved configuration.
+    pub runtime: Option<String>,
+    /// The `Handler` of the resolved configuration.
+    pub handler: Option<String>,
+    /// The function's own environment variables.
+    pub variables: BTreeMap<String, String>,
+    /// The function's `MemorySize`, in MB.
+    pub memory_size: i32,
+    /// The function's `Timeout`, in seconds.
+    pub timeout: i32,
+    /// The deployment package bytes of the resolved version, when this emulator holds
+    /// them.
+    pub zip_bytes: Option<Vec<u8>>,
+    /// The event payload the caller sent.
+    pub payload: Vec<u8>,
+    /// The `ClientContext` the caller sent, already decoded from base64 to its JSON text.
+    pub client_context: Option<String>,
+    /// The `TenantId` the caller sent.
+    pub tenant_id: Option<String>,
+    /// This invocation's request id.
+    pub request_id: String,
+}
+
+/// Why an invocation ran nothing at all.
+///
+/// Each of these is a condition the CALLING operation answers as one of its own modelled
+/// errors: nothing here is reported as a result of a run that did not happen.
+#[derive(Debug, Clone)]
+pub enum Unrunnable {
+    /// This emulator embeds no engine for the function's runtime or package type.
+    NoEngine {
+        /// What the function's code is, as the configuration names it.
+        runtime: String,
+    },
+    /// The function's configuration names no handler to run.
+    NoHandler,
+    /// This emulator holds no bytes for the resolved version's package.
+    PackageNotHeld,
+    /// The bytes it holds are not a readable archive.
+    PackageUnreadable(String),
+    /// Too many handlers are already running, or too many runs have been abandoned.
+    Overloaded(String),
+    /// The run could not be started or driven at all. Never a guest failure.
+    Internal(String),
+}
+
+/// What one invocation came to.
+#[derive(Debug, Clone)]
+pub struct Invoked {
+    /// The response payload: what the handler returned, or the error document for the
+    /// failure it came to.
+    pub payload: Vec<u8>,
+    /// The `FunctionError` to report, when the run failed.
+    pub function_error: Option<String>,
+    /// The whole log of the run.
+    pub log: String,
+    /// How long the run took.
+    pub duration: Duration,
+}
+
+impl Invoked {
+    /// The `LogResult` for this run: "The last 4 KB of the execution log, which is
+    /// base64-encoded."
+    #[must_use]
+    pub fn log_tail(&self) -> String {
+        let bytes = self.log.as_bytes();
+        let from = bytes.len().saturating_sub(LOG_TAIL_BYTES);
+        // Start the tail on a character boundary, so what is reported is still text.
+        let mut start = from;
+        while start < bytes.len() && !self.log.is_char_boundary(start) {
+            start += 1;
+        }
+        ::base64::Engine::encode(
+            &::base64::engine::general_purpose::STANDARD,
+            &bytes[start..],
+        )
+    }
+}
+
+/// Run `invocation`'s handler and report what it came to.
+///
+/// The run happens on a thread of its own, holding one of this module's run slots and no
+/// state guard of this service, and the caller's wait for it is bounded by
+/// [`HOST_WAIT_CEILING`] however long the function's own timeout is.
+pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnable> {
+    if !runs_python(invocation.runtime.as_deref()) {
+        return Err(Unrunnable::NoEngine {
+            runtime: invocation
+                .runtime
+                .clone()
+                .unwrap_or_else(|| "an image package".to_string()),
+        });
+    }
+    let Some(handler) = invocation.handler.clone() else {
+        return Err(Unrunnable::NoHandler);
+    };
+    let modules = match package::python_modules(invocation.zip_bytes.as_deref()) {
+        Ok(modules) => modules,
+        Err(package::PackageFault::NotHeld) => return Err(Unrunnable::PackageNotHeld),
+        Err(package::PackageFault::Unreadable(why)) => {
+            return Err(Unrunnable::PackageUnreadable(why))
+        }
+    };
+
+    if abandoned_runs() >= MAX_ABANDONED_RUNS {
+        return Err(Unrunnable::Overloaded(format!(
+            "{MAX_ABANDONED_RUNS} invocations of this emulator are still running past their \
+             budget. Retry the request."
+        )));
+    }
+    // One of the run slots, waited for only as long as [`PERMIT_WAIT`]: past that the
+    // caller is throttled rather than queueing behind other callers' handlers. Held until
+    // this invocation is answered, including when its run is abandoned — which is what
+    // puts the slot back at once.
+    let permit = ::tokio::time::timeout(PERMIT_WAIT, Arc::clone(run_slots()).acquire_owned())
+        .await
+        .map_err(|_| {
+            Unrunnable::Overloaded(
+                "Too many invocations are running in this emulator. Retry the request."
+                    .to_string(),
+            )
+        })?
+        .map_err(|error| Unrunnable::Internal(format!("the run slots are gone: {error}")))?;
+
+    let budget = run_budget(invocation.timeout);
+    let started = SystemTime::now();
+    let request_id = invocation.request_id.clone();
+    let reported = invocation.clone();
+    let (sender, receiver) = ::tokio::sync::oneshot::channel();
+    let lifecycle = Arc::new(AtomicU8::new(RUN_RUNNING));
+    let thread_lifecycle = Arc::clone(&lifecycle);
+    let environment = runtime_environment(&invocation, started);
+    let spawned = ::std::thread::Builder::new()
+        .name("lambda-invocation".to_string())
+        .stack_size(RUN_STACK_BYTES)
+        .spawn(move || {
+            // The lifecycle is marked by a GUARD, so the mark and the release of an
+            // abandoned run's count happen on every exit of this thread — including an
+            // unwind out of the interpreter, which would otherwise leave the count
+            // claimed for a thread that is no longer there.
+            let _mark = ThreadLifecycle {
+                lifecycle: thread_lifecycle,
+            };
+            let finished = python::run(&python::Run {
+                modules: &modules,
+                handler: &handler,
+                environment: &environment,
+                event: event_text(&invocation.payload).as_deref(),
+                request_id: &invocation.request_id,
+                invoked_function_arn: &invocation.invoked_function_arn,
+                client_context: invocation.client_context.as_deref(),
+                tenant_id: invocation.tenant_id.as_deref(),
+                budget,
+            });
+            let _ = sender.send(finished);
+        });
+    if let Err(error) = spawned {
+        return Err(Unrunnable::Internal(format!(
+            "the invocation thread could not be started: {error}"
+        )));
+    }
+
+    let wait = budget.wall_clock.saturating_add(ABANDON_GRACE).min(
+        HOST_WAIT_CEILING.saturating_add(ABANDON_GRACE),
+    );
+    // The accounting of a run that outlives the caller is a GUARD rather than a branch, so
+    // it happens however this invocation ends: the wait running out, the caller's request
+    // being cancelled while it is suspended (which drops this future at the await below),
+    // or the answer arriving. Without it a cancelled invocation would hand its slot back
+    // and leave an uncounted thread running, which is no cap at all.
+    let accounting = RunAccounting {
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    let waited = ::tokio::time::timeout(wait, receiver).await;
+    drop(accounting);
+    drop(permit);
+    let finished = match waited {
+        Ok(Ok(finished)) => finished,
+        Ok(Err(_)) => {
+            return Err(Unrunnable::Internal(
+                "the invocation thread ended without reporting".to_string(),
+            ))
+        }
+        Err(_) => {
+            // The run is still going after its budget and the grace on top of it. It has
+            // been given up on: the slot goes back to the pool and the guard above counted
+            // the run as abandoned until its thread ends.
+            return Err(Unrunnable::Internal(format!(
+                "the invocation was given up on after {} seconds",
+                wait.as_secs()
+            )));
+        }
+    };
+
+    Ok(answered(finished, &request_id, &reported, budget))
+}
+
+/// Marks a run's thread as FINISHED on every exit of that thread, including an unwind out
+/// of the interpreter, and gives back the count of a run the caller had already given up
+/// on.
+///
+/// Whichever of this guard and [`RunAccounting`] marks the lifecycle first decides the
+/// accounting, so an abandoned run is counted once and released once.
+struct ThreadLifecycle {
+    /// The run's lifecycle, shared with the task that waits for it.
+    lifecycle: Arc<AtomicU8>,
+}
+
+impl Drop for ThreadLifecycle {
+    fn drop(&mut self) {
+        if self.lifecycle.swap(RUN_FINISHED, Ordering::SeqCst) == RUN_ABANDONED {
+            release_abandoned_run();
+        }
+    }
+}
+
+/// Counts a run that is still going when the caller stops waiting for it, on EVERY way of
+/// stopping: the wait running out, and the invocation's future being dropped where it waits
+/// (a cancelled request).
+///
+/// A run whose thread has already ended is not abandoned, and the thread's own mark is what
+/// says so — exactly one of the two marks the lifecycle, so an abandoned run is counted once
+/// and released once ([`release_abandoned_run`]).
+struct RunAccounting {
+    /// The run's lifecycle, shared with its thread.
+    lifecycle: Arc<AtomicU8>,
+}
+
+impl Drop for RunAccounting {
+    fn drop(&mut self) {
+        // Counted FIRST and then released if the thread got there first, so the count is
+        // never observed low while a claim is in flight: the thread's own release can only
+        // run after this claim, whichever of the two marks the lifecycle first.
+        claim_abandoned_run();
+        if self.lifecycle.swap(RUN_ABANDONED, Ordering::SeqCst) == RUN_FINISHED {
+            // The thread ended on its own, so there is nothing outstanding to count. Its
+            // mark stands and the claim above is given back.
+            self.lifecycle.store(RUN_FINISHED, Ordering::SeqCst);
+            release_abandoned_run();
+        }
+    }
+}
+
+/// How a finished run is reported.
+fn answered(
+    finished: python::Finished,
+    request_id: &str,
+    invocation: &Invocation,
+    budget: python::Budget,
+) -> Invoked {
+    let (payload, function_error) = match &finished.completion {
+        python::Completion::Returned(payload) => (payload.clone().into_bytes(), None),
+        python::Completion::Raised {
+            error_type,
+            error_message,
+            stack_trace,
+        } => (
+            error_document(error_message, Some(error_type), request_id, stack_trace),
+            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
+        python::Completion::Stopped(python::Stop::Deadline) => (
+            error_document(
+                &format!(
+                    "{request_id} Task timed out after {:.2} seconds",
+                    budget.wall_clock.as_secs_f64()
+                ),
+                None,
+                request_id,
+                &[],
+            ),
+            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
+        python::Completion::Stopped(stop) => (
+            error_document(stop.reason(), Some("Runtime.ExitError"), request_id, &[]),
+            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
+        python::Completion::Internal(why) => (
+            error_document(why, Some("Runtime.InternalError"), request_id, &[]),
+            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
+    };
+    let log = run_log(
+        request_id,
+        &invocation.executed_version,
+        invocation.memory_size,
+        &finished,
+    );
+    Invoked {
+        payload,
+        function_error,
+        log,
+        duration: finished.elapsed,
+    }
+}
+
+/// The error payload an invocation that failed answers with: the members AWS's Python
+/// runtime reports for a handler that raised.
+fn error_document(
+    message: &str,
+    error_type: Option<&str>,
+    request_id: &str,
+    stack_trace: &[String],
+) -> Vec<u8> {
+    let mut document = ::serde_json::Map::new();
+    document.insert(
+        "errorMessage".to_string(),
+        ::serde_json::Value::String(message.to_string()),
+    );
+    if let Some(error_type) = error_type {
+        document.insert(
+            "errorType".to_string(),
+            ::serde_json::Value::String(error_type.to_string()),
+        );
+    }
+    document.insert(
+        "requestId".to_string(),
+        ::serde_json::Value::String(request_id.to_string()),
+    );
+    document.insert(
+        "stackTrace".to_string(),
+        ::serde_json::Value::Array(
+            stack_trace
+                .iter()
+                .map(|frame| ::serde_json::Value::String(frame.clone()))
+                .collect(),
+        ),
+    );
+    ::serde_json::Value::Object(document).to_string().into_bytes()
+}
+
+/// The LOG of one run, as Lambda writes it: the invocation's start and end lines around
+/// what the handler wrote, and the report line that states what the run spent.
+///
+/// Every number in it is measured: the duration is the run's own, and the memory is what
+/// the run added to this process (see [`python`]).
+fn run_log(
+    request_id: &str,
+    version: &str,
+    memory_size: i32,
+    finished: &python::Finished,
+) -> String {
+    let duration_ms = finished.elapsed.as_secs_f64() * 1_000.0;
+    let billed_ms = duration_ms.ceil().max(1.0);
+    let mut log = format!("START RequestId: {request_id} Version: {version}\n");
+    log.push_str(&finished.log);
+    if !finished.log.is_empty() && !finished.log.ends_with('\n') {
+        log.push('\n');
+    }
+    log.push_str(&format!("END RequestId: {request_id}\n"));
+    log.push_str(&format!(
+        "REPORT RequestId: {request_id}\tDuration: {duration_ms:.2} ms\tBilled Duration: \
+         {billed_ms:.0} ms\tMemory Size: {memory_size} MB\n"
+    ));
+    log
+}
+
+/// The event text the handler is called with, or `None` for an invocation that carried no
+/// payload at all.
+fn event_text(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return None;
+    }
+    String::from_utf8(payload.to_vec()).ok()
+}
+
+/// What one run may spend: the function's own `Timeout`, clamped to the range the model
+/// allows for it and to this module's ceiling, plus the bounds that are this emulator's.
+#[must_use]
+pub fn run_budget(timeout_seconds: i32) -> python::Budget {
+    let clamped = i64::from(timeout_seconds).clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
+    let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1)).min(HOST_WAIT_CEILING);
+    python::Budget {
+        wall_clock,
+        steps: MAX_RUN_STEPS,
+        memory_bytes: MAX_RUN_MEMORY_BYTES,
+        log_bytes: MAX_RUN_LOG_BYTES,
+        response_bytes: MAX_RESPONSE_BYTES,
+        recursion_limit: MAX_RUN_RECURSION,
+    }
+}
+
+/// The ENVIRONMENT one run sees: the function's own variables, plus the ones the runtime
+/// sets for a handler to read its own identity out of.
+///
+/// This is the whole environment: no host environment variable is in it, and no credential
+/// of this emulator is either.
+fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap<String, String> {
+    let mut environment = invocation.variables.clone();
+    let reserved: &[(&str, String)] = &[
+        ("AWS_LAMBDA_FUNCTION_NAME", invocation.function_name.clone()),
+        (
+            "AWS_LAMBDA_FUNCTION_VERSION",
+            invocation.executed_version.clone(),
+        ),
+        (
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+            invocation.memory_size.to_string(),
+        ),
+        (
+            "AWS_LAMBDA_LOG_GROUP_NAME",
+            format!("/aws/lambda/{}", invocation.function_name),
+        ),
+        (
+            "AWS_LAMBDA_LOG_STREAM_NAME",
+            log_stream_name(&invocation.executed_version, &invocation.request_id, started),
+        ),
+        ("AWS_REGION", invocation.region.clone()),
+        ("AWS_DEFAULT_REGION", invocation.region.clone()),
+        ("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand".to_string()),
+        ("LAMBDA_TASK_ROOT", "/var/task".to_string()),
+        ("LAMBDA_RUNTIME_DIR", "/var/runtime".to_string()),
+        ("TZ", ":UTC".to_string()),
+        (
+            "_HANDLER",
+            invocation.handler.clone().unwrap_or_default(),
+        ),
+        (
+            "AWS_EXECUTION_ENV",
+            format!(
+                "AWS_Lambda_{}",
+                invocation.runtime.clone().unwrap_or_default()
+            ),
+        ),
+    ];
+    for (name, value) in reserved {
+        environment.insert((*name).to_string(), value.clone());
+    }
+    environment
+}
+
+/// The log stream one run writes to: the date the run started, the version it ran, and the
+/// invocation's own id — the form a CloudWatch Logs stream of a Lambda function has.
+///
+/// The date is the `YYYY/MM/DD` of the instant the run started, taken from the one
+/// timestamp rendering this crate already has ([`super::iso8601`], whose calendar
+/// arithmetic is `aws_smithy_types`'s) rather than computed here.
+fn log_stream_name(version: &str, request_id: &str, started: SystemTime) -> String {
+    let rendered = super::iso8601(started);
+    let date = rendered.split('T').next().unwrap_or_default().replace('-', "/");
+    format!(
+        "{date}/[{version}]{}",
+        request_id.replace('-', "")
+    )
+}
+
+/// A run that is still going.
+const RUN_RUNNING: u8 = 0;
+/// A run whose thread has ended.
+const RUN_FINISHED: u8 = 1;
+/// A run the caller gave up on.
+const RUN_ABANDONED: u8 = 2;
+
+/// The run slots, shared by every invocation this process serves.
+fn run_slots() -> &'static Arc<::tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<::tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS)))
+}
+
+/// How many abandoned runs are outstanding.
+fn abandoned() -> &'static AtomicUsize {
+    static ABANDONED: AtomicUsize = AtomicUsize::new(0);
+    &ABANDONED
+}
+
+/// How many runs are outstanding past their budget.
+#[must_use]
+pub fn abandoned_runs() -> usize {
+    abandoned().load(Ordering::SeqCst)
+}
+
+/// Count one run as abandoned, for as long as its thread lasts.
+fn claim_abandoned_run() {
+    abandoned().fetch_add(1, Ordering::SeqCst);
+}
+
+/// Release the count of one abandoned run, when its thread finally ends.
+fn release_abandoned_run() {
+    let mut held = abandoned_runs();
+    while held > 0 {
+        match abandoned().compare_exchange(held, held - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(seen) => held = seen,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtimes this emulator can run a package for, one row per class of `Runtime`
+    /// value the model declares (source: `smithy_query(query="shape", shape="Runtime")`).
+    #[test]
+    fn only_a_python_runtime_has_an_engine_here() {
+        let cases: &[(Option<&str>, bool)] = &[
+            (Some("python3.12"), true),
+            (Some("python3.13"), true),
+            (Some("python3.9"), true),
+            (Some("nodejs22.x"), false),
+            (Some("java21"), false),
+            (Some("dotnet8"), false),
+            (Some("ruby3.3"), false),
+            (Some("provided.al2023"), false),
+            (Some("Image"), false),
+            (None, false),
+        ];
+        for (runtime, expected) in cases {
+            let actual = runs_python(*runtime);
+            assert_eq!(
+                actual, *expected,
+                "case {runtime:?}: expected an engine {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// A stored `Timeout` is clamped into the range the model allows before it bounds a
+    /// run, and never past this module's own ceiling — one row per bound and one past each.
+    #[test]
+    fn a_stored_timeout_is_clamped_before_it_bounds_a_run() {
+        let cases: &[(i32, u64)] = &[
+            (0, 1),
+            (-7, 1),
+            (1, 1),
+            (3, 3),
+            (29, 29),
+            (900, HOST_WAIT_CEILING.as_secs()),
+            (100_000, HOST_WAIT_CEILING.as_secs()),
+        ];
+        for (configured, expected) in cases {
+            let actual = run_budget(*configured).wall_clock.as_secs();
+            assert_eq!(
+                actual, *expected,
+                "case {configured} s configured: expected a {expected} s run budget, got {actual}"
+            );
+        }
+    }
+
+    /// The log tail is the LAST 4 KB of the log, base64-encoded — one row per size class
+    /// around that bound.
+    #[test]
+    fn the_log_tail_is_the_last_four_kilobytes() {
+        for size in [0_usize, 1, LOG_TAIL_BYTES - 1, LOG_TAIL_BYTES, LOG_TAIL_BYTES + 1, 64 * 1024]
+        {
+            let invoked = Invoked {
+                payload: Vec::new(),
+                function_error: None,
+                log: "L".repeat(size),
+                duration: Duration::ZERO,
+            };
+            let decoded = ::base64::Engine::decode(
+                &::base64::engine::general_purpose::STANDARD,
+                invoked.log_tail(),
+            )
+            .expect("the tail is base64");
+            let expected = size.min(LOG_TAIL_BYTES);
+            assert_eq!(
+                decoded.len(),
+                expected,
+                "case a {size}-byte log: expected a {expected}-byte tail, got {}",
+                decoded.len()
+            );
+        }
+    }
+
+    /// The environment a run sees carries the function's own variables and the ones the
+    /// runtime sets, and nothing of the host.
+    #[test]
+    fn the_run_environment_is_the_functions_own_plus_the_runtimes() {
+        let mut variables = BTreeMap::new();
+        variables.insert("SECRET".to_string(), "value".to_string());
+        let invocation = Invocation {
+            function_name: "probe".to_string(),
+            executed_version: "7".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe:7"
+                .to_string(),
+            region: "us-west-2".to_string(),
+            runtime: Some("python3.12".to_string()),
+            handler: Some("lambda_function.lambda_handler".to_string()),
+            variables,
+            memory_size: 256,
+            timeout: 3,
+            zip_bytes: None,
+            payload: Vec::new(),
+            client_context: None,
+            tenant_id: None,
+            request_id: "11111111-2222-3333-4444-555555555555".to_string(),
+        };
+        let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
+        let cases: &[(&str, &str)] = &[
+            ("SECRET", "value"),
+            ("AWS_LAMBDA_FUNCTION_NAME", "probe"),
+            ("AWS_LAMBDA_FUNCTION_VERSION", "7"),
+            ("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "256"),
+            ("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/probe"),
+            ("AWS_REGION", "us-west-2"),
+            ("LAMBDA_TASK_ROOT", "/var/task"),
+            ("_HANDLER", "lambda_function.lambda_handler"),
+            ("AWS_EXECUTION_ENV", "AWS_Lambda_python3.12"),
+        ];
+        for (name, expected) in cases {
+            let actual = environment.get(*name).map(String::as_str);
+            assert_eq!(
+                actual,
+                Some(*expected),
+                "case {name}: expected {expected:?}, got {actual:?}"
+            );
+        }
+        for absent in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "PATH", "HOME"] {
+            assert!(
+                !environment.contains_key(absent),
+                "case {absent}: no host or credential variable reaches a run, got {:?}",
+                environment.get(absent)
+            );
+        }
+        let stream = environment
+            .get("AWS_LAMBDA_LOG_STREAM_NAME")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            stream, "1970/01/01/[7]11111111222233334444555555555555",
+            "expected the stream to name the date, the version and the invocation, got {stream:?}"
+        );
+    }
+}

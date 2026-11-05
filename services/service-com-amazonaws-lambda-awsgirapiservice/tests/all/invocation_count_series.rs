@@ -96,13 +96,15 @@ const REQUEST_RESPONSE: &str = "RequestResponse";
 const DRY_RUN: &str = "DryRun";
 
 /// The statuses an invocation answers: "For the Event invocation type, this status code is
-/// 202", "For the DryRun invocation type, the status code is 204", and the 501 this emulator
-/// answers for a run it has no in-process runtime for.
+/// 202", "For the DryRun invocation type, the status code is 204", and the modelled 502 a
+/// run of THIS suite's package is refused with — its 64 bytes are not a readable archive
+/// ("Lambda could not unzip the deployment package"), which is past the point the
+/// invocation is metered at.
 const ACCEPTED: u16 = 202;
 /// See [`ACCEPTED`].
 const DRY_RUN_STATUS: u16 = 204;
 /// See [`ACCEPTED`].
-const RUN_NOT_IMPLEMENTED: u16 = 501;
+const RUN_NOT_IMPLEMENTED: u16 = 502;
 
 /// Lambda and CloudWatch on one engine: the series Lambda publishes is CloudWatch's, so it is
 /// read in-process through CloudWatch's own surface — the shape `core/router/src/lib.rs`

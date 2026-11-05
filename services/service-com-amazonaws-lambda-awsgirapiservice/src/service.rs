@@ -99,6 +99,11 @@ use std::sync::Arc;
 /// Applied to every response [`StatedPerOperation`] answers; see the module's own header.
 pub mod fault_class;
 
+/// The media type an INVOCATION's response announces, which is the media type of the
+/// document the function produced rather than of the binding it travels in; see the
+/// module's own header.
+mod invoke_media_type;
+
 /// The members of this model whose broken constraint is stated as AWS's own fixed sentence
 /// rather than as the constraint envelope, because AWS keeps the value opaque; see the
 /// module's own header.
@@ -499,9 +504,7 @@ where
             // refused on its size alone, before it is read as an input at all: that is
             // what makes the refusal a 413 about the request rather than a 400 about what
             // the request would have stored (see [`request_quota`]).
-            if let Some(refusal) =
-                request_quota::refusing_body(O::NAME, req.body().bytes().map_or(0, <[u8]>::len))
-            {
+            if let Some(refusal) = request_quota::refusing_body(O::NAME, req) {
                 return fault_class::with_fault_class(O::NAME, refusal);
             }
             // The definition is read, used and dropped inside this statement:
@@ -528,6 +531,9 @@ where
                 O::NAME,
                 self.operation.run(svc, req, ctx).await,
             );
+            // An INVOCATION's response body is the document the function produced, which
+            // is announced as the JSON it is (see [`invoke_media_type`]).
+            let answered = invoke_media_type::announced(O::NAME, answered);
             fault_class::with_fault_class(O::NAME, answered)
         })
     }

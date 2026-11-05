@@ -1380,9 +1380,10 @@ async fn invoke_resolves_the_function_and_runs_nothing_it_cannot() {
         within_sync_limit.status
     );
 
-    // Running the deployment package is not implemented, so the SYNCHRONOUS invocation
-    // type, whose answer IS what the function returned, answers 501 rather than a
-    // payload no function produced.
+    // The SYNCHRONOUS invocation type reaches the RUN, and this function's deployment
+    // package is not a readable archive — "Lambda could not unzip the deployment package",
+    // the modelled `InvalidZipFileException` at 502 — so the invocation is refused rather
+    // than answered with a payload no function produced.
     for invocation_type in [None, Some("RequestResponse")] {
         let answer = invoke(
             "invokable".to_string(),
@@ -1393,15 +1394,15 @@ async fn invoke_resolves_the_function_and_runs_nothing_it_cannot() {
         .await;
         assert_eq!(
             answer.status,
-            501,
-            "case {invocation_type:?}: expected 501 while no runtime can run the \
-             package, got {} {}",
+            502,
+            "case {invocation_type:?}: expected the modelled 502 for a package that cannot \
+             be read, got {} {}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
         assert!(
-            answer.error_code().contains("NotImplemented"),
-            "case {invocation_type:?}: expected NotImplemented, got {}",
+            answer.error_code().contains("InvalidZipFileException"),
+            "case {invocation_type:?}: expected InvalidZipFileException, got {}",
             answer.error_code()
         );
     }

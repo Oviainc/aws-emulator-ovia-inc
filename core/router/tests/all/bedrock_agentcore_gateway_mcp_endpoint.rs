@@ -15,11 +15,9 @@
 //! 2. `tools/call` on that endpoint is TRANSLATED into an invocation of the target's own
 //!    `lambdaArn`, through the in-process callback into this same emulator — so what the
 //!    tool reports is what Lambda answered for that function, and two different states of
-//!    the function give two different answers. Running a deployment package is not
-//!    implemented in this emulator's Lambda
-//!    (`issues/things-that-do-not-work/20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`),
-//!    so no tool call here can return a result — which is the point: the answer carries
-//!    Lambda's own refusal rather than a result nothing produced.
+//!    the function give two different answers. The function this suite creates holds no
+//!    readable deployment package, so no tool call here can return a result — which is the
+//!    point: the answer carries Lambda's own refusal rather than a result nothing produced.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -406,12 +404,12 @@ async fn a_tool_call_is_translated_into_an_invocation_of_the_target_function() {
     let present = text(&called["result"]["content"][0], "text");
     assert_eq!(
         called["result"]["isError"], json!(true),
-        "case \"tools/call on a function that exists\": this emulator's Lambda runs no \
-         deployment package, so no result may be reported, got {}",
+        "case \"tools/call on a function that exists\": this target's function holds no \
+         readable deployment package, so no result may be reported, got {}",
         called["result"]
     );
     assert!(
-        present.contains("NotImplemented"),
+        present.contains("InvalidZipFileException"),
         "case \"tools/call on a function that exists\": the tool error must carry what Lambda \
          answered for the invocation, got {present:?}"
     );

@@ -38,20 +38,18 @@
 //! type, this status code is 204."
 //!
 //! `InvocationType=RequestResponse` means "run the deployment package and stream what its
-//! handler writes". Whether that invocation happens at all is decided first by Lambda's
+//! handler returned". Whether that invocation happens at all is decided first by Lambda's
 //! recursive-loop guardrail: one arriving as part of a request chain that has already come
 //! back round into this function is stopped when the function's recursive loop detection
 //! configuration is `Terminate`, which is the modelled `RecursiveInvocationException` and
 //! one `RecursiveInvocationsDropped` datapoint for the function
 //! (`crate::state::recursion`). An invocation nothing stopped is one Lambda admitted to the
 //! function, metered as one `Invocations` datapoint of the function and of the resource this
-//! call addressed (`crate::state::metrics`). This emulator has no in-process runtime that can run a deployment
-//! package (the same gap `crate::ops::invoke` states for the same reason), and a chunk
-//! sequence, a trailer error code or a log tail invented for a handler that never ran would
-//! be indistinguishable from a real one — so that path is refused, naming the function and
-//! version it resolved. The event-stream framing a real run would need is
-//! `service_common::event_stream`, which is where this operation will reach for it; nothing
-//! is framed for work nothing performed.
+//! call addressed (`crate::state::metrics`). The handler then RUNS, in the interpreter
+//! `crate::state::execution` builds for the function's runtime, and what it produced is
+//! framed as this operation's event stream (`service_common::event_stream`): the response
+//! as a `PayloadChunk`, then the `InvokeComplete` that ends the stream, carrying the error
+//! of a handler that raised and the log tail when one was asked for.
 //!
 //! ## Modeled contract for `InvokeWithResponseStream`
 //!
@@ -81,7 +79,9 @@ use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
-use service_common::event_stream::{error_response, EventStreamOperation};
+use service_common::event_stream::{
+    error_response, event_stream_response, frame_event, EventStreamOperation,
+};
 use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -196,7 +196,7 @@ impl<Eng: Send + Sync + 'static> EventStreamOperation for ResponseStreamEntry<En
             let protocol = svc
                 .override_protocol()
                 .unwrap_or_else(|| svc.definition().protocol());
-            self.op.serve_request(protocol, req, ctx)
+            self.op.serve_request(protocol, req, ctx).await
         })
     }
 }
@@ -220,7 +220,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
     /// for the rest of the surface serves only operations the generated routing table holds,
     /// which this `@streaming`-output one is not. A success (a dry run, an event stream)
     /// reports no failure and is answered untouched.
-    fn serve_request(
+    async fn serve_request(
         &self,
         protocol: &dyn ServerHttpProtocol,
         req: &RtRequest,
@@ -228,7 +228,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
     ) -> RtResponse {
         let response = crate::service::fault_class::with_fault_class(
             OPERATION_NAME,
-            match self.invoke(protocol, req, ctx) {
+            match self.invoke(protocol, req, ctx).await {
                 Ok(response) => response,
                 Err(error) => error_response(protocol, &error),
             },
@@ -245,7 +245,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
 
     /// The invocation itself: read the request through the model's bindings, resolve the
     /// function out of the store, and answer what this emulator can compute.
-    fn invoke(
+    async fn invoke(
         &self,
         protocol: &dyn ServerHttpProtocol,
         req: &RtRequest,
@@ -298,7 +298,10 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         let addressed_arn =
             crate::state::addressed_arn_of(&region, &reference, input.qualifier.as_deref());
 
-        let mut store = state.lock();
+        // The store guard lives in THIS block and no longer: everything the run needs is
+        // copied out of the record here, and the run below happens with no guard held.
+        let (invocation, function_name, resource, kms_key_arn, stopped) = {
+            let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
             &input.function_name,
@@ -325,6 +328,26 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         }
 
         let payload = input.payload.as_deref().unwrap_or_default();
+        // "Up to 3,583 bytes of base64-encoded data about the invoking client to pass to
+        // the function in the context object": the handler is given the DECODED document,
+        // and a value that is not base64 is refused rather than passed on as itself.
+        let client_context = match input.client_context.as_deref() {
+            None => None,
+            Some(encoded) => match ::base64::Engine::decode(
+                &::base64::engine::general_purpose::STANDARD,
+                encoded,
+            )
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
+                Some(decoded) => Some(decoded),
+                None => {
+                    return Err(invalid_request_content(
+                        "ClientContext is not valid base64-encoded data.".to_string(),
+                    ))
+                }
+            },
+        };
         // "For synchronous invocations, the maximum payload size is 6 MB" (`Invoke`): a
         // response-streaming invocation is a synchronous one, and the request half of it
         // is bounded the same way.
@@ -345,10 +368,16 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         }
 
         let function_arn = record.versioned_arn(&version);
-        let runtime = record
+        // `ExecutedVersion` is the version the qualifier RESOLVES to, never the alias name
+        // the call addressed.
+        let executed_version = record
+            .resolved_version(&version)
+            .unwrap_or_else(|| version.clone());
+        // The configuration the invocation RESOLVED, which is what the run happens under.
+        let resolved_config = record
             .config_of(&version)
-            .and_then(|config| config.runtime.clone())
-            .unwrap_or_else(|| record.config.package_type.clone());
+            .cloned()
+            .unwrap_or_else(|| record.config.clone());
 
         if invocation_type == INVOCATION_TYPE_DRY_RUN {
             // "DryRun – Validate parameter values and verify that the user or role has
@@ -356,7 +385,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             // real service, so the validation above IS the operation, and the model's own
             // `StatusCode` documentation states the status it answers. It invokes nothing,
             // so it is no hop of any request chain either.
-            return Ok(dry_run_response(&version));
+            return Ok(dry_run_response(&executed_version));
         }
 
         // Lambda's recursive-loop guardrail decides whether this invocation happens at
@@ -371,7 +400,28 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             == crate::state::Guardrail::Stopped;
         let function_name = record.config.name.clone();
         let resource = crate::state::invoked_resource(&function_name, &version);
-        drop(store);
+        // Everything the RUN needs is copied out of the record here, because the run
+        // happens with no store guard held.
+        let invocation = crate::state::Invocation {
+            function_name: function_name.clone(),
+            executed_version: executed_version.clone(),
+            invoked_function_arn: function_arn.clone(),
+            region: region.clone(),
+            runtime: resolved_config.runtime.clone(),
+            handler: resolved_config.handler.clone(),
+            variables: resolved_config.environment.clone(),
+            memory_size: resolved_config.memory_size,
+            timeout: resolved_config.timeout,
+            zip_bytes: record.code_of(&version).zip_bytes.clone(),
+            payload: payload.to_vec(),
+            client_context,
+            tenant_id: input.tenant_id.clone(),
+            request_id: crate::state::mint_request_id(),
+        };
+        let kms_key_arn = resolved_config.kms_key_arn.clone();
+            (invocation, function_name, resource, kms_key_arn, stopped)
+        };
+        let executed_version = invocation.executed_version.clone();
         if stopped {
             crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
             return Err(recursive_invocation());
@@ -383,20 +433,212 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         // produced.
         crate::state::publish_invocation(&*self.engine, &function_name, &resource);
 
-        // Running the deployment package is what this path means, and this emulator has no
-        // in-process runtime for one; see the module docs.
-        Err(crate::scaffolded::Scaffolded::NotImplemented(
-            crate::scaffolded::NotImplemented {
-                message: format!(
-                    "InvokeWithResponseStream resolved {function_arn} at version {version}, but \
-                     running its {runtime} deployment package is not implemented in this \
-                     emulator: there is no in-process runtime for it, so no response chunk, \
-                     trailer error code or log tail is streamed that the function did not \
-                     produce. InvocationType=DryRun validates an invocation without running \
-                     the function."
-                ),
-            },
+        // A function whose environment variables are encrypted with a customer managed key
+        // is only invoked while that key can decrypt them, exactly as on `Invoke`.
+        if let Some(fault) = crate::state::environment_key_fault(
+            ctx,
+            &region,
+            kms_key_arn.as_deref(),
+            &invocation.variables,
+        )
+        .await
+        {
+            return Err(environment_key_refusal(fault));
+        }
+
+        // "InvocationType=RequestResponse" here means "run the deployment package and
+        // stream what its handler returned": the handler is RUN, its response travels as
+        // the `PayloadChunk` events, and the stream ends with the `InvokeComplete` event
+        // that "is returned when the stream has ended and all the payload chunks have been
+        // returned" — carrying the error of a handler that raised, and the log tail when
+        // the caller asked for one.
+        let invoked = crate::state::run_invocation(invocation)
+            .await
+            .map_err(unrunnable)?;
+        streamed_response(
+            protocol,
+            &executed_version,
+            &invoked,
+            input.log_type.as_deref() == Some(LOG_TYPE_TAIL),
+        )
+    }
+}
+
+/// The event-stream answer to a run: the handler's response as one `PayloadChunk`, then
+/// the terminating `InvokeComplete`.
+///
+/// A handler that RAISED still streams what it produced — "the details of any returned
+/// error" are the complete event's, which is where a streaming client reads them, so the
+/// error document travels as the chunk and the completion names the error. A chunk is
+/// written only when there is payload to write.
+fn streamed_response(
+    protocol: &dyn ServerHttpProtocol,
+    executed_version: &str,
+    invoked: &crate::state::Invoked,
+    tail_requested: bool,
+) -> Result<RtResponse, InvokeWithResponseStreamError> {
+    let mut frames = Vec::new();
+    if !invoked.payload.is_empty() {
+        frames.extend(framed_payload_chunk(&invoked.payload).map_err(|error| {
+            service_error(&format!("the payload chunk could not be framed: {error}"))
+        })?);
+    }
+    let complete = InvokeWithResponseStreamCompleteEvent {
+        error_code: invoked.function_error.clone(),
+        error_details: invoked
+            .function_error
+            .as_ref()
+            .map(|_| String::from_utf8_lossy(&invoked.payload).to_string()),
+        log_result: if tail_requested {
+            Some(invoked.log_tail())
+        } else {
+            None
+        },
+    };
+    frames.extend(
+        frame_event(
+            protocol,
+            INVOKE_COMPLETE_EVENT,
+            false,
+            &complete,
+            &InvokeWithResponseStreamCompleteEvent::SCHEMA,
+        )
+        .map_err(|error| {
+            service_error(&format!("the completion event could not be framed: {error}"))
+        })?,
+    );
+    let headers = InvokeWithResponseStreamOutput {
+        status_code: REQUEST_RESPONSE_STATUS,
+        executed_version: Some(executed_version.to_string()),
+        // "The type of data the function returned": the response of a run that returned a
+        // JSON document, which is what the runtime serialized it to.
+        response_stream_content_type: Some(RESPONSE_CONTENT_TYPE.to_string()),
+    };
+    event_stream_response(
+        protocol,
+        OPERATION_NAME,
+        &headers,
+        &InvokeWithResponseStreamOutput::SCHEMA,
+        frames,
+    )
+    .map_err(|error| service_error(&format!("the event stream could not be rendered: {error}")))
+}
+
+/// One `PayloadChunk` frame carrying `payload` as the frame's OWN body.
+///
+/// `InvokeResponseStreamUpdate$Payload` is the event's `@eventPayload` and a blob, so the
+/// bytes the handler produced ARE the frame's payload — not a member of a JSON object
+/// inside it — and the frame announces them as the opaque bytes they are. That binding is
+/// what the framework's event serializer does not express (it renders the whole event
+/// structure as JSON, which would base64-encode the blob into a member), so this frame is
+/// written here, through the same event-stream encoder.
+fn framed_payload_chunk(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let message = ::aws_smithy_types::event_stream::Message::new(payload.to_vec())
+        .add_header(::aws_smithy_types::event_stream::Header::new(
+            ":message-type",
+            ::aws_smithy_types::event_stream::HeaderValue::String("event".into()),
         ))
+        .add_header(::aws_smithy_types::event_stream::Header::new(
+            ":event-type",
+            ::aws_smithy_types::event_stream::HeaderValue::String(PAYLOAD_CHUNK_EVENT.into()),
+        ))
+        .add_header(::aws_smithy_types::event_stream::Header::new(
+            ":content-type",
+            ::aws_smithy_types::event_stream::HeaderValue::String(
+                PAYLOAD_CHUNK_CONTENT_TYPE.into(),
+            ),
+        ));
+    let mut framed = Vec::new();
+    ::aws_smithy_eventstream::frame::write_message_to(&message, &mut framed)
+        .map_err(|error| error.to_string())?;
+    Ok(framed)
+}
+
+/// How a key that cannot decrypt a function's environment variables is answered: the
+/// modelled 502 for the fault the key service reported.
+fn environment_key_refusal(
+    fault: crate::state::EnvironmentKeyFault,
+) -> InvokeWithResponseStreamError {
+    match fault {
+        crate::state::EnvironmentKeyFault::Disabled(message) => {
+            InvokeWithResponseStreamErrorModeled::KMSDisabledException(KMSDisabledException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::InvalidState(message) => {
+            InvokeWithResponseStreamErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::EnvironmentKeyFault::NotFound(message) => {
+            InvokeWithResponseStreamErrorModeled::KMSNotFoundException(KMSNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::AccessDenied(message) => {
+            InvokeWithResponseStreamErrorModeled::KMSAccessDeniedException(
+                KMSAccessDeniedException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
+}
+
+/// How an invocation that ran NOTHING is answered: one modelled failure per reason, so a
+/// client is never told a function ran when none did.
+fn unrunnable(why: crate::state::Unrunnable) -> InvokeWithResponseStreamError {
+    match why {
+        crate::state::Unrunnable::NoEngine { runtime } => {
+            InvokeWithResponseStreamErrorModeled::InvalidRuntimeException(InvalidRuntimeException {
+                r#type: None,
+                message: Some(format!(
+                    "The runtime {runtime} is not supported by this emulator, which runs the \
+                     Python runtimes."
+                )),
+            })
+            .into()
+        }
+        crate::state::Unrunnable::NoHandler => invalid_parameter(
+            "The function configuration names no Handler to run.".to_string(),
+        ),
+        crate::state::Unrunnable::PackageNotHeld => {
+            InvokeWithResponseStreamErrorModeled::InvalidZipFileException(InvalidZipFileException {
+                r#type: None,
+                message: Some(
+                    "The deployment package of this function is not held by this emulator, so \
+                     there is nothing to run."
+                        .to_string(),
+                ),
+            })
+            .into()
+        }
+        crate::state::Unrunnable::PackageUnreadable(why) => {
+            InvokeWithResponseStreamErrorModeled::InvalidZipFileException(InvalidZipFileException {
+                r#type: None,
+                message: Some(format!("The deployment package could not be read: {why}")),
+            })
+            .into()
+        }
+        crate::state::Unrunnable::Overloaded(message) => {
+            InvokeWithResponseStreamErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    r#type: None,
+                    message: Some(message),
+                    reason: None,
+                    retry_after_seconds: None,
+                },
+            )
+            .into()
+        }
+        crate::state::Unrunnable::Internal(message) => service_error(&message),
     }
 }
 
@@ -449,6 +691,28 @@ const INVOCATION_TYPE_DRY_RUN: &str = "DryRun";
 /// The `StatusCode` a `DryRun` invocation answers with, which the model's own `StatusCode`
 /// documentation states: "For the DryRun invocation type, this status code is 204."
 const DRY_RUN_STATUS: u16 = 204;
+
+/// The `StatusCode` a `RequestResponse` invocation answers with: "For the
+/// `RequestResponse` invocation type, this status code is 200."
+const REQUEST_RESPONSE_STATUS: i32 = 200;
+
+/// The `LogType` value that asks for the log tail (`None | Tail`).
+const LOG_TYPE_TAIL: &str = "Tail";
+
+/// The `@streaming` union member one chunk of the response travels as (source:
+/// `smithy_query(query="shape", shape="InvokeWithResponseStreamResponseEvent")`).
+const PAYLOAD_CHUNK_EVENT: &str = "PayloadChunk";
+
+/// The `@streaming` union member that terminates the stream; see [`PAYLOAD_CHUNK_EVENT`].
+const INVOKE_COMPLETE_EVENT: &str = "InvokeComplete";
+
+/// `ResponseStreamContentType` for a run whose handler returned a value: the runtime
+/// serialized that value to JSON, so that is what the stream carries.
+const RESPONSE_CONTENT_TYPE: &str = "application/json";
+
+/// The media type ONE `PayloadChunk` frame announces for its own body: the bytes the
+/// handler produced, carried as the event's `@eventPayload` blob.
+const PAYLOAD_CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
 /// `Invoke` documentation).

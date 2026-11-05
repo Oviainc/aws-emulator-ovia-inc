@@ -266,6 +266,17 @@ pub use recursion::{
     RECURSIVE_LOOP_ALLOW, RECURSIVE_LOOP_TERMINATE,
 };
 
+/// RUNNING a function — what an invocation of the deployment package this store holds comes
+/// to, and everything that bounds and contains that run — lives in [`execution`], beside the
+/// record the package is read off. It is re-exported here for the same reason as
+/// [`capacity_provider`]: the record it reads, and the store that holds it, stay in this
+/// module.
+pub mod execution;
+pub use execution::{
+    environment_key_fault, mint_request_id, run_invocation, runs_python, EnvironmentKeyFault,
+    Invocation, Invoked, Unrunnable,
+};
+
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
 pub const DEFAULT_REGION: &str = "us-east-1";
