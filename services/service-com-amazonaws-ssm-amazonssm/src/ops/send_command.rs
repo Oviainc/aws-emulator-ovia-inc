@@ -556,9 +556,7 @@ const SNS_TOPIC: ::service_common::arn::Requirement = ::service_common::arn::Req
     label: "an Amazon Simple Notification Service topic",
 };
 
-/// `value` when the request set it to something, and `None` when it set it to nothing: an
-/// optional member sent EMPTY names no role, no topic and no document version, the same
-/// way an omitted one does.
-fn non_empty(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !value.is_empty())
-}
+// `non_empty` reads an optional member the request set to nothing the same way as one it
+// omitted: an EMPTY `ServiceRoleArn`, `NotificationArn` or `DocumentVersion` names no role,
+// no topic and no document version. The one reading of that lives in `crate::state`.
+use crate::state::non_empty;

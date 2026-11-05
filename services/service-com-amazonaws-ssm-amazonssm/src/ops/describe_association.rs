@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one State Manager association as this service's store holds it
+//! ([`crate::state::associations::AssociationRecord`]), so what `CreateAssociation`
+//! persisted is what this reads back. A REPORT: it resolves the association and projects
+//! it, and writes nothing.
+//!
+//! An association is resolved by the id its create minted — "If you created the
+//! association by using the Targets parameter, then you must retrieve the association by
+//! using the association ID" — or, for one created for a node through the deprecated
+//! `InstanceId` member, by the document name and that node id. Either way the association
+//! is reached through the endpoint it was created at: the Region comes from the request's
+//! own credential scope, so an id created in another Region names nothing here.
+//!
+//! `AssociationVersion` selects which of the association's versions is reported
+//! ([`crate::state::associations::AssociationRecord::select`]); a request that names none
+//! is served the latest.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +169,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssociation"))
+        // `AssociationId`'s, `AssociationVersion`'s, `Name`'s and `InstanceId`'s patterns
+        // are MODELLED constraints the centralized walk has already refused anything
+        // outside of. What is read here is which association the request resolves to.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAssociationErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        let does_not_exist = || {
+            DescribeAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
+                message: Some(crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string()),
+            })
+        };
+        // An association id names ONE association; the document name and the node id of a
+        // create that named an `InstanceId` name the one association that pairs them, so
+        // both halves of the pair are needed. A request that identifies no association
+        // either way is a malformed request rather than a miss.
+        let association_id = non_empty(input.association_id.as_deref());
+        let name = non_empty(input.name.as_deref());
+        let instance_id = non_empty(input.instance_id.as_deref());
+        let held = match (association_id, name, instance_id) {
+            (Some(id), _, _) => store.association(&region, id).ok_or_else(does_not_exist)?,
+            // The pairing form: the association of that document on that node. The node ids
+            // an association TARGETS are criteria resolved when it is dispatched rather than
+            // an identity it is held under, so only the node a create named resolves here.
+            (None, Some(name), Some(instance_id)) => store
+                .association_of_node(&region, name, instance_id)
+                .ok_or_else(does_not_exist)?,
+            (None, _, _) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Either AssociationId or both Name and InstanceId must be specified",
+                ))
+            }
+        };
+
+        // "Specify the association version to retrieve. To view the latest version, either
+        // specify $LATEST for this parameter, or omit this parameter"; a version the
+        // association does not hold is what `InvalidAssociationVersion` reports.
+        let selector = non_empty(input.association_version.as_deref())
+            .unwrap_or(crate::state::associations::ASSOCIATION_VERSION_LATEST);
+        let Some(description) = held.description_of(selector, now) else {
+            return Err(DescribeAssociationErrorModeled::InvalidAssociationVersion(
+                InvalidAssociationVersion {
+                    message: Some(
+                        crate::state::associations::INVALID_ASSOCIATION_VERSION.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeAssociationOutput {
+            association_description: Some(description),
+        })
     }
 }
+
+// `non_empty` reads an optional member the request set to nothing the same way as one it
+// omitted: an EMPTY `AssociationId`, `Name`, `InstanceId` or `AssociationVersion` names no
+// association, no document, no node and no version. The one reading of that lives in
+// `crate::state`.
+use crate::state::non_empty;

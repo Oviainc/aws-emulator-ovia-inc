@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a State Manager association: the document an account wants applied to a set of
+//! managed nodes, the schedule it is applied on and the parameters it is applied with. The
+//! association is persisted in this service's store
+//! ([`crate::state::associations::AssociationRecord`]), keyed by the Region the request
+//! was signed for and the id this call minted, so `DescribeAssociation` reports the
+//! association that was created rather than the request that created it.
+//!
+//! The document and the document version are RESOLVED against the store before anything is
+//! persisted — through the one lookup every document read of this service uses, so the
+//! documents Systems Manager publishes resolve as well as the ones a caller created — and
+//! the parameter values are held to the parameters that document version declares, by the
+//! same reading `SendCommand` holds a command's to
+//! ([`crate::state::commands::parameter_rejection`]).
+//!
+//! The targets are CRITERIA rather than identities ("an array of search criteria that
+//! targets managed nodes", `Target`), and State Manager "applies the configuration when new
+//! managed nodes are added to the group", so criteria naming no registered node create the
+//! association rather than refusing it: the nodes an association runs on are resolved when
+//! it is dispatched, which is the SSM Agent's own poll and happens on no node here.
 //!
 //! ## Shape of an operation
 //!
@@ -306,18 +317,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssociation"))
+        // `Name`'s presence and pattern, `DocumentVersion`'s and `InstanceId`'s patterns,
+        // `MaxErrors`'s and `MaxConcurrency`'s patterns, the `ComplianceSeverity` and
+        // `SyncCompliance` enums, `ScheduleOffset`'s and `Duration`'s ranges and the list
+        // lengths are MODELLED constraints, so the centralized walk has already refused
+        // anything outside them. What is read here is what the model cannot say: which
+        // document, which version, which parameters and which schedule the request
+        // actually resolves to.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssociationErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "You can specify Amazon Web Services-predefined documents, documents you
+        // created, or a document that is shared with you from another Amazon Web Services
+        // account… you must specify the complete SSM document ARN" (`Name`), so either
+        // spelling names the same document. The resolve also materialises what the clock
+        // already owes before anything resolves against the store.
+        let Some(document) = store.resolve_document_for_request(&input.name, &region, now) else {
+            return Err(
+                CreateAssociationErrorModeled::InvalidDocument(InvalidDocument {
+                    message: Some(format!("Document {} doesn't exist", input.name)),
+                })
+                .into(),
+            );
+        };
+        // "The document version you want to associate with the targets. Can be a specific
+        // version or the default version" (`DocumentVersion`): each names one of the
+        // versions the document holds, and a number it does not hold names none. A request
+        // that names none associates the document's default version.
+        let requested_version = non_empty(input.document_version.as_deref())
+            .unwrap_or(crate::state::DOCUMENT_VERSION_DEFAULT);
+        let Some(version) = document.select(requested_version) else {
+            return Err(CreateAssociationErrorModeled::InvalidDocumentVersion(
+                InvalidDocumentVersion {
+                    message: Some(format!(
+                        "Document {} has no version '{requested_version}'",
+                        document.name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "You must specify values for all required parameters in the Amazon Web Services
+        // Systems Manager document (SSM document). You can only supply values to
+        // parameters defined in the SSM document" (`InvalidParameters`) — the one reading
+        // of a document's parameters this service has.
+        let parameters: ::std::collections::BTreeMap<String, Vec<String>> = input
+            .parameters
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(why) = crate::state::commands::parameter_rejection(
+            &document.name,
+            &version.parsed.parameters,
+            &parameters,
+        ) {
+            return Err(
+                CreateAssociationErrorModeled::InvalidParameters(InvalidParameters {
+                    message: Some(why),
+                })
+                .into(),
+            );
+        }
+
+        // "A cron expression when the association will be applied to the targets"
+        // (`ScheduleExpression`): a value in neither of the two forms such an expression is
+        // written in names no schedule at all.
+        if let Some(expression) = non_empty(input.schedule_expression.as_deref()) {
+            if let Some(why) = crate::state::associations::schedule_rejection(expression) {
+                return Err(CreateAssociationErrorModeled::InvalidSchedule(InvalidSchedule {
+                    message: Some(why.to_string()),
+                })
+                .into());
+            }
+        }
+        // "An Amazon Simple Storage Service (Amazon S3) bucket where you want to store the
+        // output details of the request" (`OutputLocation`): a location that names no
+        // bucket is no output location. The modelled error carries no message member, so
+        // the refusal is the error code alone.
+        if crate::state::associations::names_no_output_bucket(input.output_location.as_ref()) {
+            return Err(CreateAssociationErrorModeled::InvalidOutputLocation(
+                InvalidOutputLocation {},
+            )
+            .into());
+        }
+        // "Both Targets and TargetMaps can't be specified together" (`TargetMaps`).
+        let targets: Vec<Target> = input.targets.clone().unwrap_or_default();
+        let target_maps = input.target_maps.clone().unwrap_or_default();
+        if !targets.is_empty() && !target_maps.is_empty() {
+            return Err(CreateAssociationErrorModeled::InvalidTargetMaps(
+                InvalidTargetMaps {
+                    message: Some(
+                        crate::state::associations::TARGETS_AND_TARGET_MAPS.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The specified association already exists" (`AssociationAlreadyExists`): a node
+        // named through the deprecated `InstanceId` member carries the association of one
+        // document once, so a second create of the same pair names the association that is
+        // already there. The modelled error carries no message member, so the refusal is
+        // the error code alone.
+        if let Some(instance_id) = non_empty(input.instance_id.as_deref()) {
+            if store
+                .association_of_node(&region, &document.name, instance_id)
+                .is_some()
+            {
+                return Err(CreateAssociationErrorModeled::AssociationAlreadyExists(
+                    AssociationAlreadyExists {},
+                )
+                .into());
+            }
+        }
+        // "You can have at most 2,000 active associations" (`AssociationLimitExceeded`),
+        // measured over the Region the request was signed for. That error carries no
+        // message member either.
+        if store.associations_in_region_count(&region)
+            >= crate::state::associations::MAX_ASSOCIATIONS_PER_REGION
+        {
+            return Err(CreateAssociationErrorModeled::AssociationLimitExceeded(
+                AssociationLimitExceeded {},
+            )
+            .into());
+        }
+        // What keeps this process finite past that per-Region limit: the store's own total
+        // guard, because the Region comes from the request's credential scope.
+        if !store.can_hold_another_association() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "This emulator holds at most {} associations across every Region",
+                crate::state::associations::MAX_ASSOCIATIONS_TOTAL
+            )));
+        }
+
+        let first = crate::state::associations::AssociationVersionRecord {
+            version: crate::state::associations::FIRST_ASSOCIATION_VERSION,
+            created_at: now,
+            document_version: input.document_version.clone(),
+            parameters,
+            targets,
+            schedule_expression: input.schedule_expression.clone(),
+            output_location: input.output_location.clone(),
+            association_name: input.association_name.clone(),
+            automation_target_parameter_name: input.automation_target_parameter_name.clone(),
+            max_errors: input.max_errors.clone(),
+            max_concurrency: input.max_concurrency.clone(),
+            compliance_severity: input.compliance_severity.clone(),
+            sync_compliance: input.sync_compliance.clone(),
+            apply_only_at_cron_interval: input.apply_only_at_cron_interval,
+            calendar_names: input.calendar_names.clone().unwrap_or_default(),
+            target_locations: input.target_locations.clone().unwrap_or_default(),
+            schedule_offset: input.schedule_offset,
+            duration: input.duration,
+            target_maps,
+            alarm_configuration: input.alarm_configuration.clone(),
+            association_dispatch_assume_role: input.association_dispatch_assume_role.clone(),
+        };
+        let record = crate::state::associations::AssociationRecord::new(
+            crate::state::new_uuid(),
+            region,
+            // `AssociationDescription$Name` is "the name of the SSM document", so the name
+            // the document is held under is reported whichever spelling named it.
+            document.name.clone(),
+            non_empty(input.instance_id.as_deref()).map(str::to_string),
+            now,
+            first,
+            crate::state::to_btree_map(input.tags),
+        );
+        let description = record.latest_description(now);
+        store.insert_association(record);
+
+        Ok(CreateAssociationOutput {
+            association_description: description,
+        })
     }
 }
+
+// `non_empty` reads an optional member the request set to nothing the same way as one it
+// omitted: an EMPTY `DocumentVersion`, `ScheduleExpression` or `InstanceId` names no
+// version, no schedule and no node. The one reading of that lives in `crate::state`.
+use crate::state::non_empty;

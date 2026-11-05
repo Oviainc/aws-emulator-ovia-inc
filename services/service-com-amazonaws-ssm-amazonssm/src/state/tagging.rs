@@ -6,8 +6,8 @@
 //! Tagging is a single rule that spans resource types. A request names a resource by
 //! `(ResourceType, ResourceId)` — "Use the ID of the resource", which for `Document` and
 //! `Parameter` is "the name of the resource", for `ManagedInstance` is the `mi-ID_number`
-//! node id (`AddTagsToResourceRequest$ResourceId`) and for an `OpsItem` or a
-//! `CloudConnector` is the id its create minted — and that pair
+//! node id (`AddTagsToResourceRequest$ResourceId`) and for an `OpsItem`, a
+//! `CloudConnector` or an `Association` is the id its create minted — and that pair
 //! resolves to the ONE record the Region holds for it. Each such record owns its tag
 //! set, so a tag written through `AddTagsToResource` is the tag `ListTagsForResource`
 //! reports and the tag `RemoveTagsFromResource` drops, and a resource's tags live with
@@ -42,6 +42,13 @@ pub const TAGGING_TYPE_OPS_ITEM: &str = "OpsItem";
 /// The `ResourceTypeForTagging` value whose id is a cloud connector's minted id
 /// (`super::cloud_connectors::CLOUD_CONNECTOR_RESOURCE_TYPE`, from the same enum).
 pub const TAGGING_TYPE_CLOUD_CONNECTOR: &str = super::cloud_connectors::CLOUD_CONNECTOR_RESOURCE_TYPE;
+
+/// The `ResourceTypeForTagging` value whose id is a State Manager association's minted id
+/// (`super::associations::TAGGING_TYPE_ASSOCIATION`, from the same enum): "Adds or
+/// overwrites one or more tags for a State Manager association"
+/// (`CreateAssociationRequest$Tags`), so the tag set a create wrote is the one the tag
+/// operations read and rewrite.
+pub const TAGGING_TYPE_ASSOCIATION: &str = super::associations::TAGGING_TYPE_ASSOCIATION;
 
 /// How many tags one resource may carry: "Most resources can have a maximum of 50 tags"
 /// (`AddTagsToResource`'s own doc). The same doc states one exception — "Automations can
@@ -115,6 +122,9 @@ impl ComAmazonawsSsmAmazonssmState {
             TAGGING_TYPE_CLOUD_CONNECTOR => self
                 .cloud_connector(region, resource_id)
                 .map(|held| &held.tags),
+            TAGGING_TYPE_ASSOCIATION => {
+                self.association(region, resource_id).map(|held| &held.tags)
+            }
             _ => None,
         }
     }
@@ -142,6 +152,9 @@ impl ComAmazonawsSsmAmazonssmState {
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_CLOUD_CONNECTOR => self
                 .cloud_connector_mut(region, resource_id)
+                .map(|held| &mut held.tags),
+            TAGGING_TYPE_ASSOCIATION => self
+                .association_mut(region, resource_id)
                 .map(|held| &mut held.tags),
             _ => None,
         }

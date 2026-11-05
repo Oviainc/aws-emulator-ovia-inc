@@ -118,9 +118,10 @@ pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
      and permissions and try again.";
 
 /// Whether IAM ANSWERED that `operator_role_arn` is a role this service cannot manage a
-/// provider's compute as: this account's IAM holds no role under the name the ARN carries,
-/// or the trust policy of the role it does hold does not let this service assume it — the
-/// create is then refused with [`OPERATOR_ROLE_INVALID_MESSAGE`] and nothing is stored.
+/// provider's compute as: this account's IAM holds NO role under the name the ARN carries,
+/// or the role it does hold carries a trust policy that does not let this service assume it
+/// — the create is then refused with [`OPERATOR_ROLE_INVALID_MESSAGE`] and nothing is
+/// stored.
 ///
 /// It is the reading of the ONE shared question (`service_common::iam_role`) that the
 /// cross-service suite `core/router/tests/all/lambda_capacity_provider_operator_role.rs`

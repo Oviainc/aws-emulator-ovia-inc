@@ -73,5 +73,7 @@ mod secure_string_decryption;
 mod secure_string_encryption_at_rest;
 #[path = "all/service_settings.rs"]
 mod service_settings;
+#[path = "all/state_manager_associations.rs"]
+mod state_manager_associations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

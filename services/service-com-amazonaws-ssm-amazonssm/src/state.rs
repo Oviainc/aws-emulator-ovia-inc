@@ -135,6 +135,10 @@ pub mod secure_string;
 /// those nodes holds of it.
 pub mod commands;
 
+/// The State Manager associations this service holds, each with the versions a create and
+/// its updates wrote.
+pub mod associations;
+
 /// The resource policies attached to this account's Systems Manager resources, and the
 /// hash that keeps two writers from overwriting each other's.
 pub mod resource_policies;
@@ -3017,10 +3021,11 @@ pub struct ComAmazonawsSsmAmazonssmState {
     ///
     /// Nothing registers a node yet: registration is the SSM Agent's own call, which
     /// this service's model does not expose — `CreateActivation` mints the activation an
-    /// agent registers WITH, not the node — and the operations that would admit one
-    /// another way (`CreateAssociation`, `PutInventory`) are still scaffolds. A describe
-    /// therefore reports the empty set for a fresh emulator — what the store holds —
-    /// rather than nodes nobody registered.
+    /// agent registers WITH, not the node — and the operation that would admit one
+    /// another way (`PutInventory`) is still a scaffold. A describe therefore reports the
+    /// empty set for a fresh emulator — what the store holds — rather than nodes nobody
+    /// registered. An association names the nodes it targets without registering any of
+    /// them, so creating one adds no node here either.
     pub managed_nodes: BTreeMap<(String, String), ManagedNodeRecord>,
 
     /// Every hybrid activation, keyed by `(region, activation id)`: an activation is
@@ -3089,6 +3094,12 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// `DeleteResourcePolicy` removes from.
     pub resource_policies: resource_policies::ResourcePolicyStore,
 
+    /// Every State Manager association, keyed by `(region, association id)`: an
+    /// association is created through one Region's endpoint and is reached there by the id
+    /// the create minted. A `BTreeMap` so a listing walks a stable, total order. See
+    /// [`associations`].
+    pub associations: BTreeMap<(String, String), associations::AssociationRecord>,
+
     /// Every patch baseline the account created, keyed by `(region, baseline id)`: a
     /// baseline is reached through the endpoint of the Region it was created in and is
     /// identified there by the id the create minted
@@ -3140,6 +3151,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),
+            associations: BTreeMap::new(),
             patch_baselines: BTreeMap::new(),
             patch_baseline_sequence: 0,
             default_patch_baselines: BTreeMap::new(),
@@ -3523,6 +3535,14 @@ impl ComAmazonawsSsmAmazonssmState {
         self.managed_nodes.insert((region.to_string(), id), node);
         true
     }
+}
+
+/// `value` when a request set the member to something, and `None` when it set it to
+/// nothing: an optional member sent EMPTY names no document version, no schedule, no node
+/// and no association, the same way an omitted one does. The one reading of that across
+/// this service's handlers.
+pub fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
 }
 
 /// A modelled `TagList` as the store holds it: ordered, so two reads of one record
