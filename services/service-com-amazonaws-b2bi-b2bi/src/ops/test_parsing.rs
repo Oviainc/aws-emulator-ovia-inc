@@ -347,8 +347,11 @@ pub(crate) const IEA_ELEMENTS: &[&str] =
 
 /// The element names of the functional group header (GS), in positional order, in the
 /// same canonical naming as [`ISA_ELEMENTS`]: `GS_01_FunctionalIdentifierCode` through
-/// `GS_08_Version`, the version/release/industry identifier code shortened to `Version`
-/// the way the recorded canonical documents key it.
+/// `GS_08_Version`, the version/release/industry identifier code shortened to `Version`.
+///
+/// Both ends of that range — GS01 and GS08 — are read off a recorded canonical document,
+/// as [`ISA_ELEMENTS`] records for the interchange header's four; the six between them are
+/// the same short-form rule applied to the remaining elements.
 pub(crate) const GS_ELEMENTS: &[&str] = &[
     "FunctionalIdentifierCode",
     "ApplicationSenderCode",
