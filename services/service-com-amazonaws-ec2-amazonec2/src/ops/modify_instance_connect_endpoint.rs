@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceConnectEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceConnectEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceConnectEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces, on the EC2 Instance Connect Endpoint the request names in
+//! [`crate::state`], exactly the members the request carries — its `IpAddressType`, its
+//! `PreserveClientIp` and its security-group set — each validated against the endpoint's own
+//! subnet and VPC the way `CreateInstanceConnectEndpoint` validates them, so
+//! `DescribeInstanceConnectEndpoints` reads the modified endpoint back. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceConnectEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceConnectEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceConnectEndpoint"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+        use ::std::time::Instant;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // endpoint is named by id, and every member this call can change is checked against
+        // the endpoint's own subnet and VPC, both of which the store already holds. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let endpoints = state::require_service_state(&*self.engine)?;
+        let mut store = endpoints.lock();
+        let now = Instant::now();
+        let endpoint_id = input.instance_connect_endpoint_id.as_str();
+
+        // "The ID of the EC2 Instance Connect Endpoint to modify"
+        // (`ModifyInstanceConnectEndpointRequest$InstanceConnectEndpointId`): the id is read
+        // for its SYNTAX first and only then looked up, through the crate's ONE reader of
+        // that pair, so this operation refuses an id exactly as the delete and the describe
+        // do — malformed before unknown, and never as a silent no-op.
+        state::require_known_instance_connect_endpoint(&store, endpoint_id)?;
+        let Some(record) = store.instance_connect_endpoints.get(endpoint_id).cloned() else {
+            return Err(Scaffolded::internal_error(format!(
+                "the EC2 Instance Connect Endpoint '{endpoint_id}' checked a moment ago \
+                 could not be read"
+            )));
+        };
+
+        // An endpoint whose deletion has been asked for is being torn down, so it has no
+        // configuration left to change: EC2 refuses a request the resource's state does not
+        // admit with `IncorrectState`, naming the state it IS in. The state is derived from
+        // the clock on every read ([`crate::state::InstanceConnectEndpointRecord::state_at`]),
+        // so this reads the state the caller would see at this instant.
+        if record.delete_complete_at.is_some() {
+            return Err(state::incorrect_state_of(
+                "Instance Connect Endpoint",
+                endpoint_id,
+                record.state_at(now),
+            ));
+        }
+
+        // Which address families the endpoint can be reached over is a fact of the SUBNET it
+        // lives in, so it is read off the stored subnet rather than taken from the request —
+        // the same source `CreateInstanceConnectEndpoint` resolves the address type from.
+        let Some(subnet_id) = record.view.subnet_id.clone() else {
+            return Err(Scaffolded::internal_error(format!(
+                "the EC2 Instance Connect Endpoint '{endpoint_id}' is in no subnet"
+            )));
+        };
+        let Some(subnet) = store.subnets.get(&subnet_id).cloned() else {
+            return Err(Scaffolded::internal_error(format!(
+                "the subnet '{subnet_id}' of the EC2 Instance Connect Endpoint \
+                 '{endpoint_id}' is not stored"
+            )));
+        };
+
+        // "The new IP address type for the EC2 Instance Connect Endpoint"
+        // (`ModifyInstanceConnectEndpointRequest$IpAddressType`) — a member the request does
+        // not carry is not a change, so the endpoint keeps the type it has, and a type the
+        // subnet carries no CIDR block for is unservable and refused rather than stored.
+        let ip_address_type = match input.ip_address_type.as_deref() {
+            Some(requested) if !state::subnet_serves_ip_address_type(&subnet, requested) => {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "Invalid value '{requested}' for ipAddressType. The subnet \
+                     '{subnet_id}' has no CIDR block for it"
+                )));
+            }
+            Some(requested) => requested.to_string(),
+            None => match record.view.ip_address_type.clone() {
+                Some(stored) => stored,
+                None => {
+                    return Err(Scaffolded::internal_error(format!(
+                        "the EC2 Instance Connect Endpoint '{endpoint_id}' has no \
+                         ipAddressType"
+                    )));
+                }
+            },
+        };
+
+        // "`PreserveClientIp` is only supported on IPv4 EC2 Instance Connect Endpoints. To
+        // use `PreserveClientIp`, the value for `IpAddressType` must be `ipv4`"
+        // (`ModifyInstanceConnectEndpointRequest$IpAddressType`). The rule is checked against
+        // the address type the endpoint ends up with and the flag it ends up with, so neither
+        // changing the type nor changing the flag can leave the endpoint in the combination
+        // the service does not support.
+        let preserve_client_ip = input
+            .preserve_client_ip
+            .or(record.view.preserve_client_ip)
+            .unwrap_or(false);
+        if preserve_client_ip && ip_address_type != state::IP_ADDRESS_TYPE_IPV4 {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "preserveClientIp is supported on {ipv4} EC2 Instance Connect Endpoints \
+                 only, not on a {ip_address_type} endpoint",
+                ipv4 = state::IP_ADDRESS_TYPE_IPV4,
+            )));
+        }
+
+        // "Changes the security groups for the EC2 Instance Connect Endpoint. The new set of
+        // groups you specify replaces the current set. You must specify at least one group …
+        // You must specify the ID of the security group, not the name"
+        // (`ModifyInstanceConnectEndpointRequest$SecurityGroupIds`). A group is associated
+        // with the endpoint's network, so one of another VPC is refused; the modelled
+        // `@length` of at most 16 has already been enforced at the boundary.
+        let security_group_ids = match input.security_group_ids.as_deref() {
+            None => None,
+            Some(requested) => {
+                // The modelled `@length` admits an empty list, so the documented floor of one
+                // group is the handler's to enforce: an endpoint with no security group at
+                // all is not a configuration the service accepts.
+                if requested.is_empty() {
+                    return Err(Scaffolded::missing_parameter(
+                        "securityGroupIds must name at least one security group",
+                    ));
+                }
+                let requested = state::deduplicate_ids(requested);
+                for group_id in &requested {
+                    if !state::security_group_id_is_well_formed(group_id) {
+                        return Err(Scaffolded::invalid_id(group_id));
+                    }
+                    let Some(group) = store.security_groups.get(group_id) else {
+                        return Err(state::invalid_group_not_found(group_id));
+                    };
+                    if group.vpc_id != record.view.vpc_id {
+                        return Err(Scaffolded::invalid_parameter_value(format!(
+                            "The security group '{group_id}' and the subnet '{subnet_id}' \
+                             belong to different networks"
+                        )));
+                    }
+                }
+                Some(requested)
+            }
+        };
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves the endpoint exactly as it was.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(stored) = store.instance_connect_endpoints.get_mut(endpoint_id) else {
+            return Err(Scaffolded::internal_error(format!(
+                "the EC2 Instance Connect Endpoint '{endpoint_id}' checked a moment ago \
+                 could not be modified"
+            )));
+        };
+        // Only the members the request carries move; the id, the ARN, the account, the DNS
+        // names, the subnet, the VPC, the zone and the create time are facts of the create
+        // and are left alone, and the creation's clock-owed move keeps the instant it was
+        // given, so a modify neither restarts nor completes it.
+        stored.view.ip_address_type = Some(ip_address_type);
+        stored.view.preserve_client_ip = Some(preserve_client_ip);
+        if let Some(group_ids) = security_group_ids {
+            stored.view.security_group_ids = Some(group_ids);
+        }
+
+        // "Is true if the request succeeds and an error otherwise"
+        // (`ModifyInstanceConnectEndpointResult$Return`) — every way this request does not
+        // succeed is one of the refusals above, so reaching here is the success it reports.
+        Ok(ModifyInstanceConnectEndpointOutput {
+            r#return: Some(true),
+        })
     }
 }

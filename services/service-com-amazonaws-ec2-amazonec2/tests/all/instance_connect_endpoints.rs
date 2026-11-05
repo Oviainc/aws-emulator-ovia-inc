@@ -25,7 +25,12 @@
 //! 6. `DeleteInstanceConnectEndpoint` STARTS A CLOCK-OWED DELETION of the endpoint the
 //!    request names: it answers that endpoint `delete-in-progress`, the describe reports the
 //!    same endpoint, the CLOCK moves it to `delete-complete`, and an id the account holds no
-//!    endpoint for is refused rather than treated as already gone.
+//!    endpoint for is refused rather than treated as already gone;
+//! 7. `ModifyInstanceConnectEndpoint` REPLACES EXACTLY THE MEMBERS THE REQUEST CARRIES on
+//!    the endpoint it names — its `IpAddressType`, its `PreserveClientIp` and its
+//!    security-group set — each validated against that endpoint's own subnet and VPC, every
+//!    other member and every other endpoint left as it was, and the change read back through
+//!    the describe.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which address
 //! family the subnet has, which address type the request asks for, which filter, how many
@@ -49,7 +54,9 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, error_code, error_message, filters, indexed};
+use super::ec2_query::{
+    call, element, error_code, error_message, filters, indexed, member as envelope_member,
+};
 // The XML readers every suite in this crate shares, rather than a fourth copy of them.
 use super::wire::{child, child_text, document};
 
@@ -1800,5 +1807,841 @@ async fn a_dry_run_delete_starts_no_deletion() {
     assert_eq!(
         deleted.state, STATE_DELETE_IN_PROGRESS,
         "the delete a dry run reported as workable must work, got {deleted:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 7: a modify replaces exactly the members the request carries
+// ---------------------------------------------------------------------------
+
+async fn modify(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    call(router, REGION, "ModifyInstanceConnectEndpoint", params).await
+}
+
+/// A modify that must succeed: HTTP 200 whose envelope reports `return` true — "Is true if
+/// the request succeeds and an error otherwise"
+/// (`ModifyInstanceConnectEndpointResult$Return`) is the whole of what the operation answers.
+async fn modify_endpoint(router: &MultiServiceRouter, case: &str, params: &[(String, String)]) {
+    let (status, body) = modify(router, params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from ModifyInstanceConnectEndpoint, \
+         got {status} with body {body}"
+    );
+    assert_eq!(
+        envelope_member(&body, "return").as_deref(),
+        Some("true"),
+        "case {case:?}: expected the envelope to report return=true, got {body}"
+    );
+}
+
+/// `row` with its security-group ids sorted: `SecurityGroupIds` names a SET of associations,
+/// so a comparison reads it as one rather than as the order a request happened to name.
+fn normalized(row: &EndpointRow) -> EndpointRow {
+    let mut row = row.clone();
+    row.security_group_ids.sort();
+    row
+}
+
+/// One row of the member-replacement table: `(the case, what the modify carries beside the
+/// id, and the address type, the client-IP flag and the security groups the endpoint must
+/// then report)`.
+type ModifiedRow = (
+    &'static str,
+    Params,
+    &'static str,
+    &'static str,
+    Vec<String>,
+);
+
+/// One row of the client-IP table: `(the case, the subnet's families, what the create
+/// carried, what the modify carries, and the (address type, client-IP flag) the endpoint
+/// must then report — `None` when the modify must be refused)`.
+type ClientIpRow = (
+    &'static str,
+    &'static str,
+    Params,
+    Params,
+    Option<(&'static str, &'static str)>,
+);
+
+/// The fixture subnet the `families` label of a table row names.
+fn subnet_of(fixture: &Fixture, families: &str) -> String {
+    match families {
+        "ipv4" => fixture.ipv4_subnet.clone(),
+        "dual" => fixture.dual_subnet.clone(),
+        _ => fixture.ipv6_subnet.clone(),
+    }
+}
+
+/// RULE 7: a modify replaces exactly the members the request carries and leaves every other
+/// member of that endpoint — and every other endpoint — as it was, and the change is read
+/// back through `DescribeInstanceConnectEndpoints`.
+///
+/// The rows differ along what the rule generalises over: which of the three modifiable
+/// members the request carries, how many values a list member carries, whether it repeats
+/// one, and a request carrying none of them at all.
+#[tokio::test]
+async fn a_modify_replaces_exactly_the_members_the_request_carries() {
+    let fixture = fixture();
+    let mut both_groups = vec![
+        fixture.default_group.clone(),
+        fixture.extra_group.clone(),
+    ];
+    both_groups.sort();
+    // (the case, what the modify carries beside the id, and the address type, the client-IP
+    //  flag and the security groups the endpoint must then report)
+    let rows: Vec<ModifiedRow> = vec![
+        (
+            "a request carrying no modifiable member at all",
+            Vec::new(),
+            IP_ADDRESS_TYPE_IPV4,
+            "false",
+            vec![fixture.default_group.clone()],
+        ),
+        (
+            "the address type alone",
+            vec![p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK)],
+            IP_ADDRESS_TYPE_DUALSTACK,
+            "false",
+            vec![fixture.default_group.clone()],
+        ),
+        (
+            "the client-IP flag alone",
+            vec![p("PreserveClientIp", "true")],
+            IP_ADDRESS_TYPE_IPV4,
+            "true",
+            vec![fixture.default_group.clone()],
+        ),
+        (
+            "one security group replacing the current set",
+            indexed("SecurityGroupId", &[fixture.extra_group.as_str()]),
+            IP_ADDRESS_TYPE_IPV4,
+            "false",
+            vec![fixture.extra_group.clone()],
+        ),
+        (
+            "two security groups replacing one",
+            indexed(
+                "SecurityGroupId",
+                &[fixture.extra_group.as_str(), fixture.default_group.as_str()],
+            ),
+            IP_ADDRESS_TYPE_IPV4,
+            "false",
+            both_groups.clone(),
+        ),
+        (
+            "the same security group named twice",
+            indexed(
+                "SecurityGroupId",
+                &[fixture.extra_group.as_str(), fixture.extra_group.as_str()],
+            ),
+            IP_ADDRESS_TYPE_IPV4,
+            "false",
+            vec![fixture.extra_group.clone()],
+        ),
+        (
+            "every modifiable member at once",
+            {
+                let mut params = vec![
+                    p("IpAddressType", IP_ADDRESS_TYPE_IPV6),
+                    p("PreserveClientIp", "false"),
+                ];
+                params.extend(indexed("SecurityGroupId", &[fixture.extra_group.as_str()]));
+                params
+            },
+            IP_ADDRESS_TYPE_IPV6,
+            "false",
+            vec![fixture.extra_group.clone()],
+        ),
+    ];
+
+    // The baseline every row starts from: an endpoint of the dual-stack subnet created
+    // `ipv4`, without the client-IP flag and holding the VPC's default security group, so a
+    // row can move each of the three modifiable members in either direction.
+    let baseline = || -> Params {
+        let mut params = vec![
+            p("SubnetId", fixture.dual_subnet.clone()),
+            p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+        ];
+        params.extend(tag_params(&[("Name", "modifiable")]));
+        params
+    };
+    // One endpoint per row, all created before a single wait: each row then compares a
+    // `create-complete` endpoint before and after its OWN modify, so what the table observes
+    // is the modify and not the clock.
+    let mut endpoints = Vec::new();
+    for (case, ..) in &rows {
+        let created = create_endpoint(&fixture.router, case, &baseline()).await;
+        endpoints.push(created.id);
+    }
+    // An endpoint no row names, so each row also shows that a modify touches only the
+    // endpoint it names.
+    let bystander = create_endpoint(&fixture.router, "the endpoint no row modifies", &baseline())
+        .await
+        .id;
+    past_the_transition().await;
+    let bystander_before =
+        described_row(&fixture.router, "the endpoint no row modifies", &bystander).await;
+
+    for ((case, extra, ip_address_type, preserve_client_ip, group_ids), endpoint_id) in
+        rows.iter().zip(&endpoints)
+    {
+        let before = normalized(&described_row(&fixture.router, case, endpoint_id).await);
+        let mut params = vec![p("InstanceConnectEndpointId", endpoint_id.clone())];
+        params.extend(extra.clone());
+        modify_endpoint(&fixture.router, case, &params).await;
+
+        // Exactly the three modifiable members move: the id, the ARN, the account, the DNS
+        // names, the VPC, the subnet, the zone, the create time, the tags and the state are
+        // all still what they were before the call.
+        let mut expected_groups = group_ids.clone();
+        expected_groups.sort();
+        let expected = EndpointRow {
+            ip_address_type: (*ip_address_type).to_string(),
+            preserve_client_ip: (*preserve_client_ip).to_string(),
+            security_group_ids: expected_groups,
+            ..before
+        };
+        let after = normalized(&described_row(&fixture.router, case, endpoint_id).await);
+        assert_eq!(
+            after, expected,
+            "case {case:?}: expected the endpoint to report {expected:?}, got {after:?}"
+        );
+
+        let bystander_now = described_row(&fixture.router, case, &bystander).await;
+        assert_eq!(
+            bystander_now, bystander_before,
+            "case {case:?}: a modify must touch only the endpoint it names, \
+             got {bystander_now:?}"
+        );
+    }
+    assert_eq!(
+        fixture.stored_endpoints(),
+        rows.len() + 1,
+        "a modify stores no endpoint of its own"
+    );
+}
+
+/// RULE 7: "The new IP address type for the EC2 Instance Connect Endpoint"
+/// (`ModifyInstanceConnectEndpointRequest$IpAddressType`) has to be one the endpoint's own
+/// SUBNET has a CIDR block for — the same fact that determines the type a create resolves —
+/// so a type the subnet cannot serve is refused and the endpoint keeps the type it had.
+///
+/// The rows are the subnet's address families crossed with every value of the modelled
+/// `IpAddressType` enum (`smithy_query(query="shape",shape="IpAddressType")`), so no value
+/// of that catalog is left untested.
+#[tokio::test]
+async fn the_new_address_type_must_be_served_by_the_endpoints_subnet() {
+    let fixture = fixture();
+    // (the endpoint's subnet families, the type the modify asks for, the type the endpoint
+    //  must then report — None when the request must be refused)
+    let rows: Vec<(&str, &str, Option<&str>)> = vec![
+        ("ipv4", IP_ADDRESS_TYPE_IPV4, Some(IP_ADDRESS_TYPE_IPV4)),
+        ("ipv4", IP_ADDRESS_TYPE_DUALSTACK, None),
+        ("ipv4", IP_ADDRESS_TYPE_IPV6, None),
+        ("dual", IP_ADDRESS_TYPE_IPV4, Some(IP_ADDRESS_TYPE_IPV4)),
+        (
+            "dual",
+            IP_ADDRESS_TYPE_DUALSTACK,
+            Some(IP_ADDRESS_TYPE_DUALSTACK),
+        ),
+        ("dual", IP_ADDRESS_TYPE_IPV6, Some(IP_ADDRESS_TYPE_IPV6)),
+        ("ipv6", IP_ADDRESS_TYPE_IPV4, None),
+        ("ipv6", IP_ADDRESS_TYPE_DUALSTACK, None),
+        ("ipv6", IP_ADDRESS_TYPE_IPV6, Some(IP_ADDRESS_TYPE_IPV6)),
+    ];
+
+    for (families, requested, expected) in rows {
+        let subnet_id = subnet_of(&fixture, families);
+        let case = format!("a {families} endpoint asked for {requested}");
+        let created =
+            create_endpoint(&fixture.router, &case, &[p("SubnetId", subnet_id.clone())]).await;
+        let (status, body) = modify(
+            &fixture.router,
+            &[
+                p("InstanceConnectEndpointId", created.id.clone()),
+                p("IpAddressType", requested),
+            ],
+        )
+        .await;
+        let row = match expected {
+            Some(reported) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected HTTP 200, got {status} with body {body}"
+                );
+                let row = described_row(&fixture.router, &case, &created.id).await;
+                assert_eq!(
+                    row.ip_address_type, reported,
+                    "case {case:?}: expected ipAddressType {reported}, got {row:?}"
+                );
+                row
+            }
+            None => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidParameterCombination",
+                    "case {case:?}: expected InvalidParameterCombination, got {body}"
+                );
+                let message = error_message(&body);
+                assert!(
+                    message.contains(requested) && message.contains(subnet_id.as_str()),
+                    "case {case:?}: the refusal must name the type asked for and the \
+                     endpoint's subnet, got {message:?}"
+                );
+                let row = described_row(&fixture.router, &case, &created.id).await;
+                assert_eq!(
+                    row.ip_address_type, created.ip_address_type,
+                    "case {case:?}: a refused modify must change nothing, got {row:?}"
+                );
+                row
+            }
+        };
+        // Whatever the answer, the members the request never named are untouched.
+        assert_eq!(
+            (
+                row.subnet_id.as_str(),
+                row.security_group_ids.as_slice(),
+                row.preserve_client_ip.as_str()
+            ),
+            (
+                created.subnet_id.as_str(),
+                created.security_group_ids.as_slice(),
+                created.preserve_client_ip.as_str()
+            ),
+            "case {case:?}: a modify naming only the address type must move only it, \
+             got {row:?}"
+        );
+    }
+}
+
+/// RULE 7: "`PreserveClientIp` is only supported on IPv4 EC2 Instance Connect Endpoints. To
+/// use `PreserveClientIp`, the value for `IpAddressType` must be `ipv4`"
+/// (`ModifyInstanceConnectEndpointRequest$IpAddressType`) — the combination the endpoint
+/// would END UP in is what the rule holds for, so neither changing the address type nor
+/// changing the flag can leave the endpoint preserving the client IP on an endpoint that is
+/// not `ipv4`, whichever of the two the request moves.
+#[tokio::test]
+async fn the_client_ip_flag_and_the_address_type_are_checked_together() {
+    let fixture = fixture();
+    // (the case, the endpoint's subnet families, what its create carried, what the modify
+    //  carries, and the (address type, client-IP flag) the endpoint must then report — None
+    //  when the modify must be refused)
+    let rows: Vec<ClientIpRow> = vec![
+        (
+            "turning the flag on for an ipv4 endpoint",
+            "ipv4",
+            Vec::new(),
+            vec![p("PreserveClientIp", "true")],
+            Some((IP_ADDRESS_TYPE_IPV4, "true")),
+        ),
+        (
+            "turning the flag back off",
+            "ipv4",
+            vec![p("PreserveClientIp", "true")],
+            vec![p("PreserveClientIp", "false")],
+            Some((IP_ADDRESS_TYPE_IPV4, "false")),
+        ),
+        (
+            "moving an endpoint that preserves the client IP to dualstack",
+            "dual",
+            vec![
+                p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+                p("PreserveClientIp", "true"),
+            ],
+            vec![p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK)],
+            None,
+        ),
+        (
+            "moving it to dualstack and dropping the flag in one request",
+            "dual",
+            vec![
+                p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+                p("PreserveClientIp", "true"),
+            ],
+            vec![
+                p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK),
+                p("PreserveClientIp", "false"),
+            ],
+            Some((IP_ADDRESS_TYPE_DUALSTACK, "false")),
+        ),
+        (
+            "turning the flag on for a dualstack endpoint",
+            "dual",
+            Vec::new(),
+            vec![p("PreserveClientIp", "true")],
+            None,
+        ),
+        (
+            "turning the flag on while moving to ipv4",
+            "dual",
+            Vec::new(),
+            vec![
+                p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+                p("PreserveClientIp", "true"),
+            ],
+            Some((IP_ADDRESS_TYPE_IPV4, "true")),
+        ),
+        (
+            "turning the flag on for an ipv6 endpoint",
+            "ipv6",
+            Vec::new(),
+            vec![p("PreserveClientIp", "true")],
+            None,
+        ),
+    ];
+
+    for (case, families, created_with, modified_with, expected) in rows {
+        let mut create_params = vec![p("SubnetId", subnet_of(&fixture, families))];
+        create_params.extend(created_with);
+        let created = create_endpoint(&fixture.router, case, &create_params).await;
+        let mut params = vec![p("InstanceConnectEndpointId", created.id.clone())];
+        params.extend(modified_with);
+        let (status, body) = modify(&fixture.router, &params).await;
+        match expected {
+            Some((ip_address_type, preserve_client_ip)) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected HTTP 200, got {status} with body {body}"
+                );
+                let row = described_row(&fixture.router, case, &created.id).await;
+                assert_eq!(
+                    (
+                        row.ip_address_type.as_str(),
+                        row.preserve_client_ip.as_str()
+                    ),
+                    (ip_address_type, preserve_client_ip),
+                    "case {case:?}: expected ({ip_address_type}, {preserve_client_ip}), \
+                     got {row:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidParameterCombination",
+                    "case {case:?}: expected InvalidParameterCombination, got {body}"
+                );
+                let message = error_message(&body);
+                assert!(
+                    message.contains("preserveClientIp"),
+                    "case {case:?}: the refusal must name the member it is about, \
+                     got {message:?}"
+                );
+                let row = described_row(&fixture.router, case, &created.id).await;
+                assert_eq!(
+                    (
+                        row.ip_address_type.as_str(),
+                        row.preserve_client_ip.as_str()
+                    ),
+                    (
+                        created.ip_address_type.as_str(),
+                        created.preserve_client_ip.as_str()
+                    ),
+                    "case {case:?}: a refused modify must change nothing, got {row:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE 7: a modify that cannot resolve what the request names is REFUSED — the endpoint id
+/// malformed before unknown, in the wording EC2 uses for the class, and a security group the
+/// endpoint's network cannot hold — and the endpoint it named is left exactly as it was.
+///
+/// The rows differ along why the request cannot be served: the shape of the id text, the
+/// length of its suffix, the resource its prefix names, a well-formed id of each id era the
+/// account holds no endpoint for, and a group that is not an id, is not stored, or belongs
+/// to another VPC.
+#[tokio::test]
+async fn a_modify_that_cannot_resolve_what_it_names_is_refused() {
+    let fixture = fixture();
+    let endpoint = create_endpoint(
+        &fixture.router,
+        "the endpoint every refusal row leaves alone",
+        &[p("SubnetId", fixture.dual_subnet.clone())],
+    )
+    .await;
+
+    let rows: Vec<RefusalRow> = vec![
+        (
+            "an id that is not shaped like an endpoint id",
+            vec![p("InstanceConnectEndpointId", "not-an-endpoint")],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "an id whose prefix names another resource",
+            vec![p("InstanceConnectEndpointId", "subnet-0123456789abcdef0")],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "an endpoint id whose suffix is of no id era",
+            vec![p(
+                "InstanceConnectEndpointId",
+                format!("{INSTANCE_CONNECT_ENDPOINT_ID_PREFIX}0123456"),
+            )],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "a well-formed short id the account holds no endpoint for",
+            vec![p(
+                "InstanceConnectEndpointId",
+                format!("{INSTANCE_CONNECT_ENDPOINT_ID_PREFIX}0123abcd"),
+            )],
+            "InvalidInstanceConnectEndpointId.NotFound",
+        ),
+        (
+            "a well-formed long id the account holds no endpoint for",
+            vec![p(
+                "InstanceConnectEndpointId",
+                format!("{INSTANCE_CONNECT_ENDPOINT_ID_PREFIX}0123456789abcdef0"),
+            )],
+            "InvalidInstanceConnectEndpointId.NotFound",
+        ),
+        (
+            "a security group id that is not an id at all",
+            vec![
+                p("InstanceConnectEndpointId", endpoint.id.clone()),
+                p("SecurityGroupId.1", "not-a-group"),
+            ],
+            "InvalidID",
+        ),
+        (
+            "a security group the account does not hold",
+            vec![
+                p("InstanceConnectEndpointId", endpoint.id.clone()),
+                p("SecurityGroupId.1", "sg-0123456789abcdef0"),
+            ],
+            "InvalidGroup.NotFound",
+        ),
+        (
+            "a security group of another VPC",
+            vec![
+                p("InstanceConnectEndpointId", endpoint.id.clone()),
+                p("SecurityGroupId.1", fixture.foreign_group.clone()),
+            ],
+            "InvalidParameterValue",
+        ),
+    ];
+
+    for (case, params, expected_code) in rows {
+        let (status, body) = modify(&fixture.router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+        // The refusal must name the value it could not resolve: the group when the row is
+        // about a group, otherwise the endpoint id.
+        let named = ["SecurityGroupId.1", "InstanceConnectEndpointId"]
+            .into_iter()
+            .find_map(|key| {
+                params
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            })
+            .unwrap_or_default();
+        let message = error_message(&body);
+        assert!(
+            message.contains(&named),
+            "case {case:?}: the refusal must name what it could not resolve ({named}), \
+             got {message:?}"
+        );
+        let row = described_row(&fixture.router, case, &endpoint.id).await;
+        assert_eq!(
+            normalized(&row),
+            normalized(&endpoint),
+            "case {case:?}: a refused modify must leave the endpoint as it was, got {row:?}"
+        );
+    }
+}
+
+/// RULE 7 under `DryRun`: the flag asks whether the modify WOULD have succeeded — HTTP 412
+/// `DryRunOperation` — and the endpoint keeps every member it had, so nothing was written;
+/// the modify the dry run stood for then works.
+#[tokio::test]
+async fn a_dry_run_modify_writes_nothing() {
+    let fixture = fixture();
+    let created = create_endpoint(
+        &fixture.router,
+        "the endpoint the dry run names",
+        &[
+            p("SubnetId", fixture.dual_subnet.clone()),
+            p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+        ],
+    )
+    .await;
+    let change = vec![
+        p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK),
+        p("SecurityGroupId.1", fixture.extra_group.clone()),
+    ];
+
+    let mut dry = vec![
+        p("InstanceConnectEndpointId", created.id.clone()),
+        p("DryRun", "true"),
+    ];
+    dry.extend(change.clone());
+    let (status, body) = modify(&fixture.router, &dry).await;
+    assert_eq!(
+        status, 412,
+        "expected HTTP 412 from a dry-run modify, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "DryRunOperation",
+        "expected DryRunOperation, got {body}"
+    );
+    let row = described_row(&fixture.router, "after the dry run", &created.id).await;
+    assert_eq!(
+        normalized(&row),
+        normalized(&created),
+        "a dry run must write nothing, got {row:?}"
+    );
+
+    // A dry run of a request that would have been REFUSED is refused with that reason
+    // instead of with `DryRunOperation`.
+    let (status, body) = modify(
+        &fixture.router,
+        &[
+            p("InstanceConnectEndpointId", created.id.clone()),
+            p("DryRun", "true"),
+            p("SecurityGroupId.1", fixture.foreign_group.clone()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidParameterValue"),
+        "a dry run of a request that would have been refused must carry that reason, \
+         got {status} with body {body}"
+    );
+
+    let mut real = vec![p("InstanceConnectEndpointId", created.id.clone())];
+    real.extend(change);
+    modify_endpoint(
+        &fixture.router,
+        "the modify the dry run stood for",
+        &real,
+    )
+    .await;
+    let row = described_row(&fixture.router, "after the real modify", &created.id).await;
+    assert_eq!(
+        (
+            row.ip_address_type.as_str(),
+            row.security_group_ids.as_slice()
+        ),
+        (
+            IP_ADDRESS_TYPE_DUALSTACK,
+            [fixture.extra_group.clone()].as_slice()
+        ),
+        "the modify a dry run reported as workable must work, got {row:?}"
+    );
+}
+
+/// RULE 7: an endpoint whose deletion has been asked for is being torn down, so it has no
+/// configuration left to change: the modify is refused `IncorrectState` naming the state the
+/// endpoint IS in, in either delete state, and writes nothing.
+#[tokio::test]
+async fn a_modify_of_an_endpoint_being_deleted_is_refused() {
+    let fixture = fixture();
+    let created = create_endpoint(
+        &fixture.router,
+        "the endpoint the delete names",
+        &[
+            p("SubnetId", fixture.dual_subnet.clone()),
+            p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+        ],
+    )
+    .await;
+    delete_endpoint(
+        &fixture.router,
+        "the delete that starts the teardown",
+        &[p("InstanceConnectEndpointId", created.id.clone())],
+    )
+    .await;
+
+    for (case, wait_first, expected_state) in [
+        (
+            "a modify inside the endpoint's delete span",
+            false,
+            STATE_DELETE_IN_PROGRESS,
+        ),
+        (
+            "a modify once the endpoint is delete-complete",
+            true,
+            STATE_DELETE_COMPLETE,
+        ),
+    ] {
+        if wait_first {
+            past_the_transition().await;
+        }
+        let before = described_row(&fixture.router, case, &created.id).await;
+        assert_eq!(
+            before.state, expected_state,
+            "case {case:?}: expected the endpoint to be {expected_state}, got {before:?}"
+        );
+        let (status, body) = modify(
+            &fixture.router,
+            &[
+                p("InstanceConnectEndpointId", created.id.clone()),
+                p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "IncorrectState",
+            "case {case:?}: expected IncorrectState, got {body}"
+        );
+        let message = error_message(&body);
+        assert!(
+            message.contains(&created.id) && message.contains(expected_state),
+            "case {case:?}: the refusal must name the endpoint and the state it is in, \
+             got {message:?}"
+        );
+        let after = described_row(&fixture.router, case, &created.id).await;
+        assert_eq!(
+            after.ip_address_type, before.ip_address_type,
+            "case {case:?}: a refused modify must write nothing, got {after:?}"
+        );
+    }
+}
+
+/// RULE 7 end to end over the operations a CLIENT uses, with nothing seeded into the store:
+/// the VPC, the subnet and the security group are all minted through the service's own
+/// operations, the endpoint is created in them, the clock completes it, the modify moves the
+/// members it names, and the describe reads the modified endpoint back.
+#[tokio::test]
+async fn a_modify_works_end_to_end_over_a_network_the_operations_created() {
+    let (router, _engine) = super::ec2_query::emulator();
+    /// One call that must succeed, as its response body.
+    async fn ok(router: &MultiServiceRouter, action: &str, params: &[(String, String)]) -> String {
+        let (status, body) = call(router, REGION, action, params).await;
+        assert_eq!(
+            status, 200,
+            "expected HTTP 200 from {action}, got {status} with body {body}"
+        );
+        body
+    }
+    /// The one `name` element of a response, or a panic naming the action it came from.
+    fn minted(action: &str, body: &str, name: &str) -> String {
+        element(body, name)
+            .unwrap_or_else(|| panic!("expected a <{name}> in the {action} response: {body}"))
+    }
+
+    let body = ok(&router, "CreateVpc", &[p("CidrBlock", "10.9.0.0/16")]).await;
+    let vpc_id = minted("CreateVpc", &body, "vpcId");
+    let body = ok(
+        &router,
+        "CreateSubnet",
+        &[p("VpcId", vpc_id.clone()), p("CidrBlock", "10.9.1.0/24")],
+    )
+    .await;
+    let subnet_id = minted("CreateSubnet", &body, "subnetId");
+    let body = ok(
+        &router,
+        "CreateSecurityGroup",
+        &[
+            p("VpcId", vpc_id.clone()),
+            p("GroupName", "endpoint-access"),
+            p("GroupDescription", "the group the modify associates"),
+        ],
+    )
+    .await;
+    let group_id = minted("CreateSecurityGroup", &body, "groupId");
+
+    let created = create_endpoint(
+        &router,
+        "the endpoint of the created network",
+        &[p("SubnetId", subnet_id.clone())],
+    )
+    .await;
+    assert_eq!(
+        (created.state.as_str(), created.vpc_id.as_str()),
+        (STATE_CREATE_IN_PROGRESS, vpc_id.as_str()),
+        "a fresh endpoint of the created subnet must be create-in-progress in that VPC, \
+         got {created:?}"
+    );
+    // The default group of the VPC the operations created, since the create named none.
+    assert_ne!(
+        created.security_group_ids,
+        vec![group_id.clone()],
+        "the create named no group, so it must not have picked the one made for the modify"
+    );
+    past_the_transition().await;
+    let completed = described_row(&router, "the completed endpoint", &created.id).await;
+    assert_eq!(
+        completed.state, STATE_CREATE_COMPLETE,
+        "the clock must complete the creation, got {completed:?}"
+    );
+
+    modify_endpoint(
+        &router,
+        "the modify of the created endpoint",
+        &[
+            p("InstanceConnectEndpointId", created.id.clone()),
+            p("PreserveClientIp", "true"),
+            p("SecurityGroupId.1", group_id.clone()),
+        ],
+    )
+    .await;
+    let modified = described_row(&router, "the modified endpoint", &created.id).await;
+    assert_eq!(
+        (
+            modified.preserve_client_ip.as_str(),
+            modified.security_group_ids.as_slice(),
+            modified.ip_address_type.as_str(),
+            modified.state.as_str(),
+        ),
+        (
+            "true",
+            [group_id.clone()].as_slice(),
+            IP_ADDRESS_TYPE_IPV4,
+            STATE_CREATE_COMPLETE,
+        ),
+        "the modify must replace the members it named and leave the rest, got {modified:?}"
+    );
+
+    // The endpoint the modify associated the group with is the one the delete tears down,
+    // and a modify of it afterwards is refused rather than written.
+    let deleted = delete_endpoint(
+        &router,
+        "the delete after the modify",
+        &[p("InstanceConnectEndpointId", created.id.clone())],
+    )
+    .await;
+    assert_eq!(
+        deleted.state, STATE_DELETE_IN_PROGRESS,
+        "the delete must start the teardown of the modified endpoint, got {deleted:?}"
+    );
+    let (status, body) = modify(
+        &router,
+        &[
+            p("InstanceConnectEndpointId", created.id.clone()),
+            p("PreserveClientIp", "false"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "IncorrectState"),
+        "a modify of an endpoint being deleted must be refused, got {status} with body {body}"
     );
 }
