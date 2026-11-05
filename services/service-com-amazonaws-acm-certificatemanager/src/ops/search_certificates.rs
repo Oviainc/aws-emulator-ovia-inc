@@ -338,11 +338,52 @@ fn validation_exception(message: impl Into<String>) -> SearchCertificatesError {
     .into()
 }
 
-/// The member path of the X.509 leaf filters, as a refusal names them.
-const X509_PATH: &str = "FilterStatement.Filter.X509AttributeFilter";
+/// The input member a search request's filter statement arrives on
+/// (`SearchCertificatesRequest$FilterStatement`), as the model spells it — the root of
+/// every leaf-filter path a refusal names.
+const FILTER_STATEMENT_MEMBER: &str = "FilterStatement";
 
-/// The member path of the ACM-metadata leaf filters, as a refusal names them.
-const METADATA_PATH: &str = "FilterStatement.Filter.AcmCertificateMetadataFilter";
+/// The `CertificateFilterStatement` union member one leaf filter sits on, as the model
+/// spells it (`smithy_query(query="shape",
+/// shape="com.amazonaws.acm#CertificateFilterStatement")`).
+const FILTER_MEMBER: &str = "Filter";
+
+/// The `CertificateFilter` union member the X.509 leaf filters sit on, as the model
+/// spells it.
+const X509_FILTER_MEMBER: &str = "X509AttributeFilter";
+
+/// The `CertificateFilter` union member the ACM-metadata leaf filters sit on, as the
+/// model spells it.
+const METADATA_FILTER_MEMBER: &str = "AcmCertificateMetadataFilter";
+
+/// The path of one leaf filter member, as a refusal names it: the WIRE spelling of
+/// every step from the input root down to the member, dot-joined.
+///
+/// A clause names the member path the request itself spells — the lowerCamel path the
+/// framework's own validating walk writes ([`crate::service::lower_camel`], the one
+/// source for that spelling in this crate) — so the position a boundary refusal names
+/// and the position this handler names read alike, and a client mapping a path back to
+/// the member it sent finds the member it sent.
+///
+/// `container` is the union member the leaf sits on and `member` the leaf itself, both
+/// as the model spells them.
+fn filter_member_path(container: &str, member: &str) -> String {
+    [FILTER_STATEMENT_MEMBER, FILTER_MEMBER, container, member]
+        .iter()
+        .map(|step| crate::service::lower_camel(step))
+        .collect::<Vec<String>>()
+        .join(".")
+}
+
+/// The path of one X.509 leaf filter member ([`filter_member_path`]).
+fn x509_path(member: &str) -> String {
+    filter_member_path(X509_FILTER_MEMBER, member)
+}
+
+/// The path of one ACM-metadata leaf filter member ([`filter_member_path`]).
+fn metadata_path(member: &str) -> String {
+    filter_member_path(METADATA_FILTER_MEMBER, member)
+}
 
 /// The deepest nesting of `And`/`Or`/`Not` one `FilterStatement` may carry, counting
 /// the leaf filter as a level.
@@ -394,18 +435,15 @@ pub(crate) fn statement_nodes_message() -> String {
 ///   value outside the set is not a value of the type, so there is nothing to compare
 ///   a certificate against. The modelled value sets ARE in the model, and the boundary
 ///   validator enforces them for a value sitting on a STRUCTURE member — a
-///   `ComparisonOperator`, say, is already refused with `Value 'NOPE' at
+///   `ComparisonOperator`, say, is already refused with `Value of the input at
 ///   'filterStatement.filter.x509AttributeFilter.subject.commonName.comparisonOperator'
 ///   failed to satisfy constraint: Member must satisfy enum value set: [CONTAINS,
 ///   EQUALS]` — but NOT for one sitting directly on a UNION member, which its walk
 ///   does not descend into. Those are the values checked here, through the same
 ///   message builder ([`crate::service::enum_value_refusal`]) and the same 400
 ///   `ValidationException`, so the two refusals read as one sentence: the same
-///   envelope, the same subject, the same requirement, and the same choice of
-///   whether the value is stated. The two list the value SET in the order their own generated
-///   source gives (the schema's trait keeps the model's declaration order, this
-///   crate's wire-value lists are alphabetical), which is no part of the
-///   requirement.
+///   envelope, the same subject (the position alone, never the value submitted
+///   there), the same requirement, and the same stated order of the value set.
 fn validate_statement(
     statement: &CertificateFilterStatement,
 ) -> Result<(), SearchCertificatesError> {
@@ -457,57 +495,43 @@ fn validate_filter(filter: &CertificateFilter) -> Result<(), SearchCertificatesE
                 SubjectAlternativeNameFilter::DnsName(_),
             ) => Ok(()),
             X509AttributeFilter::ExtendedKeyUsage(name) => validate_enum(
-                &format!("{X509_PATH}.ExtendedKeyUsage"),
+                &x509_path("ExtendedKeyUsage"),
                 name,
                 EXTENDED_KEY_USAGE_NAME_VALUES,
             ),
-            X509AttributeFilter::KeyUsage(name) => validate_enum(
-                &format!("{X509_PATH}.KeyUsage"),
-                name,
-                KEY_USAGE_NAME_VALUES,
-            ),
-            X509AttributeFilter::KeyAlgorithm(algorithm) => validate_enum(
-                &format!("{X509_PATH}.KeyAlgorithm"),
-                algorithm,
-                KEY_ALGORITHM_VALUES,
-            ),
+            X509AttributeFilter::KeyUsage(name) => {
+                validate_enum(&x509_path("KeyUsage"), name, KEY_USAGE_NAME_VALUES)
+            }
+            X509AttributeFilter::KeyAlgorithm(algorithm) => {
+                validate_enum(&x509_path("KeyAlgorithm"), algorithm, KEY_ALGORITHM_VALUES)
+            }
             X509AttributeFilter::SerialNumber(_) => Ok(()),
             X509AttributeFilter::NotAfter(range) => validate_range("NotAfter", range),
             X509AttributeFilter::NotBefore(range) => validate_range("NotBefore", range),
         },
         CertificateFilter::AcmCertificateMetadataFilter(filter) => match filter {
-            AcmCertificateMetadataFilter::Status(status) => validate_enum(
-                &format!("{METADATA_PATH}.Status"),
-                status,
-                CERTIFICATE_STATUS_VALUES,
-            ),
-            AcmCertificateMetadataFilter::RenewalStatus(status) => validate_enum(
-                &format!("{METADATA_PATH}.RenewalStatus"),
-                status,
-                RENEWAL_STATUS_VALUES,
-            ),
-            AcmCertificateMetadataFilter::Type(cert_type) => validate_enum(
-                &format!("{METADATA_PATH}.Type"),
-                cert_type,
-                CERTIFICATE_TYPE_VALUES,
-            ),
-            AcmCertificateMetadataFilter::ExportOption(option) => validate_enum(
-                &format!("{METADATA_PATH}.ExportOption"),
-                option,
-                CERTIFICATE_EXPORT_VALUES,
-            ),
+            AcmCertificateMetadataFilter::Status(status) => {
+                validate_enum(&metadata_path("Status"), status, CERTIFICATE_STATUS_VALUES)
+            }
+            AcmCertificateMetadataFilter::RenewalStatus(status) => {
+                validate_enum(&metadata_path("RenewalStatus"), status, RENEWAL_STATUS_VALUES)
+            }
+            AcmCertificateMetadataFilter::Type(cert_type) => {
+                validate_enum(&metadata_path("Type"), cert_type, CERTIFICATE_TYPE_VALUES)
+            }
+            AcmCertificateMetadataFilter::ExportOption(option) => {
+                validate_enum(&metadata_path("ExportOption"), option, CERTIFICATE_EXPORT_VALUES)
+            }
             AcmCertificateMetadataFilter::ManagedBy(manager) => validate_enum(
-                &format!("{METADATA_PATH}.ManagedBy"),
+                &metadata_path("ManagedBy"),
                 manager,
                 CERTIFICATE_MANAGED_BY_VALUES,
             ),
-            AcmCertificateMetadataFilter::ValidationMethod(method) => validate_enum(
-                &format!("{METADATA_PATH}.ValidationMethod"),
-                method,
-                VALIDATION_METHOD_VALUES,
-            ),
+            AcmCertificateMetadataFilter::ValidationMethod(method) => {
+                validate_enum(&metadata_path("ValidationMethod"), method, VALIDATION_METHOD_VALUES)
+            }
             AcmCertificateMetadataFilter::CertificateKeyPairOrigin(origin) => validate_enum(
-                &format!("{METADATA_PATH}.CertificateKeyPairOrigin"),
+                &metadata_path("CertificateKeyPairOrigin"),
                 origin,
                 CERTIFICATE_KEY_PAIR_ORIGIN_VALUES,
             ),
@@ -528,10 +552,11 @@ fn validate_filter(filter: &CertificateFilter) -> Result<(), SearchCertificatesE
 /// very set the boundary validator checks a structure member against.
 ///
 /// The message is the one this service states for any constraint violation
-/// ([`crate::service::enum_value_refusal`]): the AWS envelope over a clause naming
-/// the value submitted, the member it sat on and the set it had to be in — the same
-/// envelope, subject and requirement the boundary refusal renders, so one violation
-/// class reads as one sentence at either seam.
+/// ([`crate::service::enum_value_refusal`]): the AWS envelope over a clause naming the
+/// member the value sat on and the set it had to be in — the same envelope, subject and
+/// requirement the boundary refusal renders, so one violation class reads as one
+/// sentence at either seam. The value itself is no part of it: ACM states the position
+/// that failed and never what was submitted there.
 fn validate_enum(
     path: &str,
     value: &str,
@@ -541,19 +566,24 @@ fn validate_enum(
         return Ok(());
     }
     Err(validation_exception(crate::service::enum_value_refusal(
-        path, value, allowed,
+        path, allowed,
     )))
 }
 
-/// Refuse a `TimestampRange` that selects no instant, naming the member it came from.
+/// Refuse a `TimestampRange` that selects no instant, naming the member it came from —
+/// the leaf filter's wire path ([`x509_path`]), as every refusal of this operation names
+/// a position. The two bounds are named as the model and its docs spell them (`Start`,
+/// `End`), which is prose about the range rather than a path into the request.
 fn validate_range(member: &str, range: &TimestampRange) -> Result<(), SearchCertificatesError> {
     match (range.start.as_ref(), range.end.as_ref()) {
         (None, None) => Err(validation_exception(format!(
-            "{X509_PATH}.{member} must specify Start, End or both"
+            "{} must specify Start, End or both",
+            x509_path(member)
         ))),
         (Some(start), Some(end)) if epoch_pair(start) > epoch_pair(end) => {
             Err(validation_exception(format!(
-                "{X509_PATH}.{member}.Start must not be after End"
+                "{} Start must not be after End",
+                x509_path(member)
             )))
         }
         _ => Ok(()),

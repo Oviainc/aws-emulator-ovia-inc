@@ -127,6 +127,8 @@ mod resource_tag_input_constraints;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stated_enum_value_sets.rs"]
+mod stated_enum_value_sets;
 #[path = "all/tag_surface_refusal_subject.rs"]
 mod tag_surface_refusal_subject;
 #[path = "all/validation_domain_superdomain.rs"]

@@ -9,16 +9,15 @@
 //! 1. ACM states every member-constraint failure as
 //!    `<subject> failed to satisfy constraint: <modelled requirement>`, joined into
 //!    the AWS envelope (`N validation error(s) detected: `). The subject names the
-//!    input POSITION that failed and the value submitted there
-//!    (`Value '<value>' at '<member path>'`), EXCEPT at a position whose value ACM
-//!    withholds — a resource identifier (`…Arn`), a request token (`…Token`), a
-//!    position on the TAG surface, a
-//!    value the validating walk holds no submitted text for (a collection's element
-//!    count, a value past its echo cap), and a clause collapsed onto a COLLECTION
-//!    member, whose submitted scalar is an element rather than the position named —
-//!    which read `Value of the input at '<member path>'`; an ABSENT member, having no
-//!    submitted value at all, reads `Value null at '<path>'`. A `@pattern` requirement
-//!    reports the expression without the model's `^` / `$` anchoring, and a failure of
+//!    input POSITION that failed and NOTHING the request submitted there
+//!    (`Value of the input at '<member path>'`): the member path is the only part of a
+//!    clause that comes from the request, so no caller-supplied text is reflected back
+//!    — at any position, of any constraint class, at any depth. A member the request
+//!    never sent has no value to withhold and reads `Value null at '<path>'` instead.
+//!    A `@pattern` requirement
+//!    reports the expression without the model's `^` / `$` anchoring, an enum's value
+//!    set is listed in the order this service states that enum's values in, and a
+//!    failure of
 //!    a collection's ELEMENT is reported against the collection member with the WHOLE
 //!    set of constraints the element shape declares nested — so an element that fails
 //!    two of them is still one clause and one error.
@@ -42,28 +41,31 @@ use serde_json::{json, Value};
 
 use crate::certificate_lifecycle::{call, describe, error_code, router, ACCOUNT, REGION};
 
-/// How ACM names the subject of a constraint clause at a position whose value it
-/// WITHHOLDS: the input position, never the submitted value.
+/// How ACM names the subject of a constraint clause: the input position, never the
+/// submitted value.
 const WITHHOLDING_SUBJECT: &str = "Value of the input at";
+
+/// How the subject reads for a member the request never sent, which has no submitted
+/// value to withhold (`services/common/src/validation.rs` states the cross-service
+/// rule).
+const ABSENT_SUBJECT: &str = "Value null at";
 
 /// Which of the two subjects a row's clauses open with.
 #[derive(Clone, Copy)]
-enum Subject<'a> {
-    /// The value as submitted, which is what every position states but the few ACM
-    /// withholds.
-    Echoed(&'a str),
-    /// The withholding form, for a resource identifier, a request token, a position
-    /// on the tag surface, or a value the validating walk holds no submitted text
-    /// for.
+enum Subject {
+    /// The position alone, which is what EVERY position a request submitted a value at
+    /// states.
     Withheld,
+    /// The absent-member form, for a member the request never sent.
+    Absent,
 }
 
-impl Subject<'_> {
+impl Subject {
     /// The subject as it is rendered in front of a clause about `path`.
     fn rendered(self, path: &str) -> String {
         match self {
-            Subject::Echoed(value) => format!("Value '{value}' at '{path}'"),
             Subject::Withheld => format!("{WITHHOLDING_SUBJECT} '{path}'"),
+            Subject::Absent => format!("{ABSENT_SUBJECT} '{path}'"),
         }
     }
 }
@@ -103,32 +105,20 @@ const SORT_ORDERS: &[&str] = &["ASCENDING", "DESCENDING"];
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#SortBy")`).
 const SORT_BYS: &[&str] = &["CREATED_AT"];
 
-/// Every `CertificateStatus` the model declares, in the order it declares them
-/// (`smithy_query(query="shape", shape="com.amazonaws.acm#CertificateStatus")`).
-/// This is the order the framework's schema trait — and so a boundary refusal —
-/// lists the set in.
-const CERTIFICATE_STATUSES: &[&str] = &[
-    "PENDING_VALIDATION",
-    "ISSUED",
-    "INACTIVE",
-    "EXPIRED",
+/// The order ACM STATES `CertificateStatus`'s value set in, whichever seam built the
+/// clause: the order recorded for ACM's own refusal of a status outside the set, which
+/// is neither the order the model declares the enum in nor a sort of its values
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#CertificateStatus")` declares
+/// `PENDING_VALIDATION, ISSUED, INACTIVE, EXPIRED, VALIDATION_TIMED_OUT, REVOKED,
+/// FAILED`). [`crate::stated_enum_value_sets`] is that rule's own suite.
+const STATED_CERTIFICATE_STATUSES: &[&str] = &[
     "VALIDATION_TIMED_OUT",
-    "REVOKED",
-    "FAILED",
-];
-
-/// The same values in the order the crate's generated wire-value list declares
-/// them (`CERTIFICATE_STATUS_VALUES` in `src/ops/types/shared_types.rs`), which is
-/// the set a handler checks a union-member value against. A value SET is unordered,
-/// so each seam lists it in the order its own generated source gives.
-const CERTIFICATE_STATUS_VALUES: &[&str] = &[
+    "PENDING_VALIDATION",
     "EXPIRED",
-    "FAILED",
     "INACTIVE",
     "ISSUED",
-    "PENDING_VALIDATION",
+    "FAILED",
     "REVOKED",
-    "VALIDATION_TIMED_OUT",
 ];
 
 /// One constraint-rendering row: what it exercises, the operation to call, the
@@ -139,7 +129,7 @@ struct Case<'a> {
     what: &'a str,
     operation: &'a str,
     body: Value,
-    subject: Subject<'a>,
+    subject: Subject,
     clauses: Vec<(&'a str, String)>,
     withheld: Vec<&'a str>,
 }
@@ -192,7 +182,7 @@ fn certificate_status_constraints() -> Vec<String> {
     vec![
         format!(
             "Member must satisfy enum value set: [{}]",
-            CERTIFICATE_STATUSES.join(", ")
+            STATED_CERTIFICATE_STATUSES.join(", ")
         ),
         ELEMENT_NOT_NULL.to_string(),
     ]
@@ -210,7 +200,7 @@ fn unanchored(modelled: &str) -> &str {
 
 /// The full message the clauses must compose into: the AWS envelope over one clause
 /// per violation, in order.
-fn envelope(subject: Subject<'_>, clauses: &[(&str, String)]) -> String {
+fn envelope(subject: Subject, clauses: &[(&str, String)]) -> String {
     let rendered: Vec<String> = clauses
         .iter()
         .map(|(path, requirement)| {
@@ -328,22 +318,32 @@ fn cases() -> Vec<Case<'static>> {
             what: "an integer member below its @range minimum",
             operation: "ListCertificates",
             body: json!({ "MaxItems": 0 }),
-            subject: Subject::Echoed("0"),
+            subject: Subject::Withheld,
             clauses: vec![(
                 "maxItems",
                 "Member must have value greater than or equal to 1".to_string(),
             )],
-            withheld: vec![],
+            withheld: vec!["0"],
         },
         Case {
             what: "an integer member above its @range maximum",
             operation: "ListCertificates",
             body: json!({ "MaxItems": 1001 }),
-            subject: Subject::Echoed("1001"),
+            subject: Subject::Withheld,
             clauses: vec![(
                 "maxItems",
                 "Member must have value less than or equal to 1000".to_string(),
             )],
+            withheld: vec!["1001"],
+        },
+        // An ABSENT required member: the one subject that is not the withholding form,
+        // since there is no submitted value to withhold.
+        Case {
+            what: "an absent @required member",
+            operation: "ListTagsForResource",
+            body: json!({}),
+            subject: Subject::Absent,
+            clauses: vec![("resourceArn", "Member must not be null".to_string())],
             withheld: vec![],
         },
         Case {
@@ -430,7 +430,8 @@ fn cases() -> Vec<Case<'static>> {
         },
         // The same rule at the OTHER seam: a value sitting directly on a UNION
         // member, which the framework's validating walk does not descend into, so
-        // the handler refuses it itself.
+        // the handler refuses it itself — same subject, same stated value set, and the
+        // same wire member path.
         Case {
             what: "an enum on a union member, refused by the handler rather than the walk",
             operation: "SearchCertificates",
@@ -439,15 +440,15 @@ fn cases() -> Vec<Case<'static>> {
                     "Filter": { "AcmCertificateMetadataFilter": { "Status": "NOT_A_STATUS" } },
                 },
             }),
-            subject: Subject::Echoed("NOT_A_STATUS"),
+            subject: Subject::Withheld,
             clauses: vec![(
-                "FilterStatement.Filter.AcmCertificateMetadataFilter.Status",
+                "filterStatement.filter.acmCertificateMetadataFilter.status",
                 format!(
                     "Member must satisfy enum value set: [{}]",
-                    CERTIFICATE_STATUS_VALUES.join(", ")
+                    STATED_CERTIFICATE_STATUSES.join(", ")
                 ),
             )],
-            withheld: vec![],
+            withheld: vec!["NOT_A_STATUS"],
         },
     ]
 }
@@ -505,8 +506,8 @@ async fn a_whole_envelope_is_pinned_as_a_literal() {
             json!({ "CertificateStatuses": ["NOT_A_STATUS"] }),
             "1 validation error detected: Value of the input at 'certificateStatuses' failed to \
              satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value \
-             set: [PENDING_VALIDATION, ISSUED, INACTIVE, EXPIRED, VALIDATION_TIMED_OUT, REVOKED, \
-             FAILED], Member must not be null]",
+             set: [VALIDATION_TIMED_OUT, PENDING_VALIDATION, EXPIRED, INACTIVE, ISSUED, FAILED, \
+             REVOKED], Member must not be null]",
         ),
     ];
 
@@ -525,9 +526,10 @@ async fn a_whole_envelope_is_pinned_as_a_literal() {
 }
 
 /// RULE: ACM states every member-constraint failure against the input POSITION that
-/// failed, the requirement the model declares there and the value submitted there — one
-/// clause per violation in the AWS envelope, with the value withheld only at the
-/// positions ACM withholds it at and a `@pattern` reported without the model's anchors.
+/// failed and the requirement the model declares there — one clause per violation in the
+/// AWS envelope, with nothing the caller submitted echoed into it, an enum's value set
+/// in the order the service states it, and a `@pattern` reported without the model's
+/// anchors.
 #[tokio::test]
 async fn every_constraint_failure_is_stated_against_the_input_position() {
     let router = router();

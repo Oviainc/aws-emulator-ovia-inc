@@ -6,15 +6,13 @@
 //! Three rules, each asserted over a TABLE rather than the one request a trace
 //! happened to record:
 //!
-//! 1. A constraint clause STATES THE VALUE the request submitted at the failing
-//!    position — `Value '<value>' at '<member path>' failed to satisfy constraint:
-//!    <requirement>` — except at a position whose value ACM withholds, which reads
-//!    `Value of the input at '<member path>'`: a resource identifier (a `…Arn`
-//!    member), a request token (a `…Token` member), a value the validating walk
-//!    holds no submitted text for (a collection, whose only rendering is its element
-//!    count, and a value past the walk's own echo cap), and a clause collapsed onto a
-//!    collection member, where the submitted scalar is an element inside the position
-//!    named rather than its value. The rows span both subjects,
+//! 1. A constraint clause names THE POSITION in the input that failed and nothing the
+//!    request submitted there — `Value of the input at '<member path>' failed to satisfy
+//!    constraint: <requirement>` — at every position: a resource identifier (a `…Arn`
+//!    member), a request token (a `…Token` member), a plain scalar, a value the
+//!    validating walk holds no submitted text for (a collection, whose only rendering is
+//!    its element count, and a value past the walk's own echo cap), and a clause
+//!    collapsed onto a collection member. The rows span
 //!    the constraint kinds (`@length` minimum and maximum, `@pattern`, `@range`), the
 //!    member depth (a top-level member, a member of a structure under a UNION member, a
 //!    collection element) and the value forms (empty, short, at a bound, past a bound,
@@ -72,15 +70,15 @@ const WITHHOLDING_SUBJECT: &str = "Value of the input at";
 const WALK_RENDERINGS: [&str; 2] = [" items", " bytes]"];
 
 /// One subject row: what it exercises, the operation, the request body, the member path
-/// the clause names, the requirements it states in order, and the value the clauses must
-/// quote — `None` where ACM withholds it.
+/// the clause names, the requirements it states in order, and the text the request
+/// submitted there — which no clause may quote.
 struct SubjectCase<'a> {
     what: &'a str,
     operation: &'a str,
     body: Value,
     path: &'a str,
     requirements: Vec<String>,
-    echoed: Option<String>,
+    submitted: Option<String>,
 }
 
 /// A syntactically well-formed ACM certificate ARN, for a row whose subject is some
@@ -131,15 +129,14 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
     vec![
         // The position the issue recorded: a plain string member of a structure under a
         // UNION member, submitted EMPTY, which trips both of its constraints — so the
-        // row also pins that the value is stated in EVERY clause of a many-clause
-        // envelope.
+        // row also pins that no clause of a many-clause envelope quotes the value.
         SubjectCase {
             what: "an empty hostedZoneId, under its minimum length and outside its pattern",
             operation: "CreateAcmeDomainValidation",
             body: prevalidation_body(endpoint, "empty.example.com", json!({ "HostedZoneId": "" })),
             path: "prevalidationOptions.dnsPrevalidation.hostedZoneId",
             requirements: vec![min_length(1), pattern(HOSTED_ZONE_ID_PATTERN)],
-            echoed: Some(String::new()),
+            submitted: None,
         },
         SubjectCase {
             what: "a hostedZoneId of a legal length but outside its pattern",
@@ -151,7 +148,7 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
             ),
             path: "prevalidationOptions.dnsPrevalidation.hostedZoneId",
             requirements: vec![pattern(HOSTED_ZONE_ID_PATTERN)],
-            echoed: Some("zone-1".to_string()),
+            submitted: Some("zone-1".to_string()),
         },
         SubjectCase {
             what: "a hostedZoneId one character past its maximum length",
@@ -163,7 +160,7 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
             ),
             path: "prevalidationOptions.dnsPrevalidation.hostedZoneId",
             requirements: vec![max_length(HOSTED_ZONE_ID_MAX as i64)],
-            echoed: Some(too_long_zone),
+            submitted: Some(too_long_zone),
         },
         // A different operation, a different constraint kind: an integer member.
         SubjectCase {
@@ -172,12 +169,10 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
             body: json!({ "MaxItems": 0 }),
             path: "maxItems",
             requirements: vec!["Member must have value greater than or equal to 1".to_string()],
-            echoed: Some("0".to_string()),
+            submitted: Some("0".to_string()),
         },
-        // A collection ELEMENT: the clause is reported at the COLLECTION, so the value
-        // it would state is one element inside the position it names rather than the
-        // value submitted there — ACM withholds it, and states the element shape's
-        // whole constraint set instead (the recorded `tagKeys` envelope in
+        // A collection ELEMENT: the clause is reported at the COLLECTION, and states the
+        // element shape's whole constraint set (the recorded `tagKeys` envelope in
         // [`crate::pending_validation_and_tag_envelopes`]).
         SubjectCase {
             what: "a list element outside its own pattern",
@@ -189,10 +184,10 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
                                 equal to 1, Member must satisfy regular expression pattern: \
                                 ([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*), Member must not be null]"
                 .to_string()],
-            echoed: None,
+            submitted: Some("{nope}".to_string()),
         },
-        // A resource identifier: withheld, on a THIRD ARN shape beside the `Arn` and
-        // `PcaArn` the other suite covers.
+        // A resource identifier, on a THIRD ARN shape beside the `Arn` and `PcaArn` the
+        // other suite covers.
         SubjectCase {
             what: "a malformed acmeEndpointArn",
             operation: "CreateAcmeDomainValidation",
@@ -205,28 +200,27 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
             requirements: vec![pattern(
                 "arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:acme-endpoint/[a-zA-Z0-9-]+",
             )],
-            echoed: None,
+            submitted: None,
         },
-        // A request token: withheld.
+        // A request token.
         SubjectCase {
             what: "an idempotencyToken outside its pattern",
             operation: "PutAccountConfiguration",
             body: json!({ "IdempotencyToken": "token-with-dashes" }),
             path: "idempotencyToken",
             requirements: vec![pattern("\\w+")],
-            echoed: None,
+            submitted: Some("token-with-dashes".to_string()),
         },
-        // A COLLECTION, whose only rendering is its element count: withheld.
+        // A COLLECTION, whose only rendering is its element count.
         SubjectCase {
             what: "an empty list, under the collection's own minimum length",
             operation: "UntagResource",
             body: json!({ "ResourceArn": certificate_arn, "TagKeys": [] }),
             path: "tagKeys",
             requirements: vec![min_length(1)],
-            echoed: None,
+            submitted: None,
         },
-        // A value far past the walk's echo cap, which holds only an elision of it:
-        // withheld, rather than quoting text the caller never sent.
+        // A value far past the walk's echo cap, which holds only an elision of it.
         SubjectCase {
             what: "a domain name far past the walk's echo cap",
             operation: "CreateAcmeDomainValidation",
@@ -237,17 +231,16 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
             ),
             path: "domainName",
             requirements: vec![max_length(DOMAIN_NAME_MAX as i64)],
-            echoed: None,
+            submitted: Some(huge_domain),
         },
     ]
 }
 
-/// RULE: a constraint clause states the value the request submitted at the failing
-/// position, except at a position whose value ACM withholds — a resource identifier, a
-/// request token, or a value the validating walk holds no submitted text for — which
-/// names the position alone.
+/// RULE: a constraint clause names the position that failed and the requirement it
+/// failed, and never the value the request submitted there — nor any rendering the
+/// validating walk holds in its place.
 #[tokio::test]
-async fn a_clause_states_the_submitted_value_unless_the_position_withholds_it() {
+async fn a_clause_names_the_position_and_never_the_submitted_value() {
     let router = router();
     let endpoint = create_endpoint(&router, "the subject rule").await;
 
@@ -258,7 +251,7 @@ async fn a_clause_states_the_submitted_value_unless_the_position_withholds_it() 
             body,
             path,
             requirements,
-            echoed,
+            submitted,
         } = case;
         let (status, response) = call(&router, operation, &body).await;
         assert_eq!(
@@ -268,25 +261,27 @@ async fn a_clause_states_the_submitted_value_unless_the_position_withholds_it() 
              {response}"
         );
         let stated = error_message(&response);
-        let subject = match &echoed {
-            Some(value) => format!("Value '{value}' at '{path}'"),
-            None => format!("{WITHHOLDING_SUBJECT} '{path}'"),
-        };
         assert_eq!(
             stated,
-            envelope(&subject, &requirements),
+            envelope(&format!("{WITHHOLDING_SUBJECT} '{path}'"), &requirements),
             "case {what:?} ({operation}): expected the ACM constraint envelope, got {stated:?}"
         );
-        // A withholding clause states no rendering of the value at all: not the
-        // walk's count summary, and not its elision marker.
-        if echoed.is_none() {
-            for rendering in WALK_RENDERINGS {
-                assert!(
-                    !stated.contains(rendering),
-                    "case {what:?} ({operation}): a withheld value must not be stated as the \
-                     walk's own rendering {rendering:?}, got {stated:?}"
-                );
-            }
+        // The clause states no rendering of the value at all: not the text submitted
+        // (where there is any to confuse it with), not the walk's count summary, and
+        // not its elision marker.
+        if let Some(submitted) = submitted.filter(|text| !text.is_empty()) {
+            assert!(
+                !stated.contains(&submitted),
+                "case {what:?} ({operation}): the submitted value {submitted:?} must not be \
+                 stated, got {stated:?}"
+            );
+        }
+        for rendering in WALK_RENDERINGS {
+            assert!(
+                !stated.contains(rendering),
+                "case {what:?} ({operation}): a withheld value must not be stated as the \
+                 walk's own rendering {rendering:?}, got {stated:?}"
+            );
         }
     }
 }

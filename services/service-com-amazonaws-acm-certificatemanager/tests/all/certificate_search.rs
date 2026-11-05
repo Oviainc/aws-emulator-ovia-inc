@@ -1020,10 +1020,9 @@ async fn an_unsatisfiable_request_is_refused() {
 }
 
 /// RULE: a refusal says what was wrong with the request — the member the offending
-/// value sat on, the requirement it failed, and the value submitted there — so the
-/// caller can fix the request from the message alone (the service's constraint wording
-/// withholds the value only at the positions it withholds; see
-/// `crate::validation_message_rendering`).
+/// value sat on and the requirement it failed — so the caller can fix the request from
+/// the message alone, and it states the member in the WIRE spelling of its path while
+/// withholding the text submitted there (see `crate::validation_message_rendering`).
 #[tokio::test]
 async fn a_refusal_names_the_member_and_its_requirement() {
     let router = router();
@@ -1036,13 +1035,12 @@ async fn a_refusal_names_the_member_and_its_requirement() {
             "a Status outside its enum, refused by this handler",
             json!({ "FilterStatement": { "Filter": { "AcmCertificateMetadataFilter": { "Status": "NOT_A_STATUS" } } } }),
             vec![
-                "FilterStatement.Filter.AcmCertificateMetadataFilter.Status",
+                "filterStatement.filter.acmCertificateMetadataFilter.status",
                 "PENDING_VALIDATION",
-                // The value as submitted: a plain enum member is not one of the
-                // positions ACM withholds.
-                "Value 'NOT_A_STATUS' at",
+                // The position alone: ACM names what failed, not what was sent.
+                "Value of the input at",
             ],
-            vec![],
+            vec!["NOT_A_STATUS"],
         ),
         (
             "a ComparisonOperator outside its enum, refused by the boundary validator",
@@ -1050,21 +1048,21 @@ async fn a_refusal_names_the_member_and_its_requirement() {
             vec![
                 "filterStatement.filter.x509AttributeFilter.subject.commonName.comparisonOperator",
                 "CONTAINS, EQUALS",
-                "Value 'STARTS_WITH' at",
+                "Value of the input at",
             ],
-            vec![],
+            vec!["STARTS_WITH"],
         ),
         (
             "a range bounding nothing",
             json!({ "FilterStatement": { "Filter": { "X509AttributeFilter": { "NotAfter": {} } } } }),
-            vec!["FilterStatement.Filter.X509AttributeFilter.NotAfter", "Start"],
+            vec!["filterStatement.filter.x509AttributeFilter.notAfter", "Start"],
             vec![],
         ),
         (
             "a range that can contain no instant",
             json!({ "FilterStatement": { "Filter": { "X509AttributeFilter": { "NotBefore": { "Start": now + DAY, "End": now } } } } }),
             vec![
-                "FilterStatement.Filter.X509AttributeFilter.NotBefore",
+                "filterStatement.filter.x509AttributeFilter.notBefore",
                 "must not be after End",
             ],
             vec![],

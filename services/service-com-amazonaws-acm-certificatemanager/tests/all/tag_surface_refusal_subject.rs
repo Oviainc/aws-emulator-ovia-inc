@@ -7,9 +7,9 @@
 //! collection, or anything reached through one: a pair's key, a pair's value, an entry of
 //! a key list — names that position and NOT the text submitted there
 //! (`Value of the input at '<member path>' failed to satisfy constraint: <requirement>`),
-//! the same withholding subject ACM states a resource identifier and a request token
-//! with, while a position off that surface keeps the value as submitted
-//! (`Value '<value>' at '<member path>'`).
+//! which is the subject ACM states EVERY position with: a position off the tag surface
+//! reads the same way, so no caller-supplied text reaches a message wherever it came
+//! from.
 //!
 //! The tables below span what the rule generalises over rather than the one request a
 //! trace recorded:
@@ -28,8 +28,8 @@
 //! * the text classes the `@pattern` excludes, including one that is not renderable at
 //!   all (an emoji, Unicode category `So`) and a control character — the values whose
 //!   echo would land in a log;
-//! * the contrast rows that keep the rule no wider: a scalar OFF the tag surface still
-//!   states the value as submitted.
+//! * the rows OFF the tag surface, which state the position alike — an integer member
+//!   and a string member of a nested structure.
 //!
 //! The envelope itself (`N validation error(s) detected: `), the unanchored `@pattern`
 //! rendering and the absent-member subject have their own suite in
@@ -76,17 +76,9 @@ fn out_of_charset_texts() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// What a row expects the clause's subject to be.
-enum Subject {
-    /// The withholding form: the position alone.
-    Withheld,
-    /// The value as submitted, then the position.
-    Echoed,
-}
-
 /// One row: what it exercises, the operation, the request body, the member path the
-/// clause names, the requirement it states, the text the request submitted at that
-/// position, and which subject the clause must open with.
+/// clause names, the requirement it states, and the text the request submitted at that
+/// position — which the clause must NOT carry.
 struct Row {
     what: String,
     operation: &'static str,
@@ -94,7 +86,6 @@ struct Row {
     path: &'static str,
     requirement: String,
     submitted: String,
-    subject: Subject,
 }
 
 /// The requirement a `@pattern` violation states.
@@ -109,13 +100,9 @@ fn max_length_requirement(max: usize) -> String {
 
 /// The whole single-clause envelope a row must answer with.
 fn expected_message(row: &Row) -> String {
-    let subject = match row.subject {
-        Subject::Withheld => format!("{WITHHOLDING_SUBJECT} '{}'", row.path),
-        Subject::Echoed => format!("Value '{}' at '{}'", row.submitted, row.path),
-    };
     format!(
-        "1 validation error detected: {subject} failed to satisfy constraint: {}",
-        row.requirement
+        "1 validation error detected: {WITHHOLDING_SUBJECT} '{}' failed to satisfy constraint: {}",
+        row.path, row.requirement
     )
 }
 
@@ -157,7 +144,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.value",
             requirement: pattern_requirement(),
             submitted: "prod#1".to_string(),
-            subject: Subject::Withheld,
         },
         Row {
             what: "a tag key outside the shared pattern on TagResource".to_string(),
@@ -169,7 +155,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.key",
             requirement: pattern_requirement(),
             submitted: "env#1".to_string(),
-            subject: Subject::Withheld,
         },
         Row {
             what: "a tag value one character past TagValue's maximum".to_string(),
@@ -181,7 +166,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.value",
             requirement: max_length_requirement(TAG_VALUE_MAX),
             submitted: long_value,
-            subject: Subject::Withheld,
         },
         Row {
             what: "a tag key one character past TagKey's maximum".to_string(),
@@ -193,7 +177,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.key",
             requirement: max_length_requirement(TAG_KEY_MAX),
             submitted: long_key,
-            subject: Subject::Withheld,
         },
         Row {
             what: "one pair past TagList's maximum, a clause about the collection"
@@ -208,7 +191,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             // The walk has no text for a collection, so what it would state is its own
             // count summary rather than anything submitted.
             submitted: format!("{} items", TAG_LIST_MAX + 1),
-            subject: Subject::Withheld,
         },
         // A key list's entry, whose clause is collapsed onto the collection with the
         // element shape's whole constraint set.
@@ -224,7 +206,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
                 pattern_requirement(),
             ),
             submitted: "env#1".to_string(),
-            subject: Subject::Withheld,
         },
         // The certificate pair, which addresses its resource by a different member.
         Row {
@@ -237,7 +218,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.value",
             requirement: pattern_requirement(),
             submitted: "prod%1".to_string(),
-            subject: Subject::Withheld,
         },
         Row {
             what: "a tag key outside the shared pattern on RemoveTagsFromCertificate"
@@ -250,7 +230,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.key",
             requirement: pattern_requirement(),
             submitted: "env{1}".to_string(),
-            subject: Subject::Withheld,
         },
         // The creates that carry a `TagList`, including the QUALIFIED tag member.
         Row {
@@ -264,7 +243,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.value",
             requirement: pattern_requirement(),
             submitted: "prod&1".to_string(),
-            subject: Subject::Withheld,
         },
         Row {
             what: "a tag key outside the shared pattern on CreateAcmeEndpoint".to_string(),
@@ -273,7 +251,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.key",
             requirement: pattern_requirement(),
             submitted: "env*1".to_string(),
-            subject: Subject::Withheld,
         },
         Row {
             what: "a value of the qualified tag member certificateTags".to_string(),
@@ -285,10 +262,9 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "certificateTags.1.member.value",
             requirement: pattern_requirement(),
             submitted: "prod|1".to_string(),
-            subject: Subject::Withheld,
         },
-        // The contrast rows: a scalar OFF the tag surface keeps the value as submitted,
-        // so the rule above is about the tag surface and not a global flip.
+        // The rows OFF the tag surface: they state the position the same way, so the
+        // rule above is the service's one subject rather than the tag surface's own.
         Row {
             what: "an integer member off the tag surface, below its range minimum".to_string(),
             operation: "ListCertificates",
@@ -296,20 +272,18 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "maxItems",
             requirement: "Member must have value greater than or equal to 1".to_string(),
             submitted: "0".to_string(),
-            subject: Subject::Echoed,
         },
         Row {
             what: "a string member off the tag surface, outside its pattern".to_string(),
             operation: "CreateAcmeDomainValidation",
             body: json!({
                 "AcmeEndpointArn": endpoint,
-                "DomainName": "echoed.example.com",
+                "DomainName": "withheld.example.com",
                 "PrevalidationOptions": { "DnsPrevalidation": { "HostedZoneId": "zone-1" } },
             }),
             path: "prevalidationOptions.dnsPrevalidation.hostedZoneId",
             requirement: "Member must satisfy regular expression pattern: Z[A-Z0-9]+".to_string(),
             submitted: "zone-1".to_string(),
-            subject: Subject::Echoed,
         },
     ];
 
@@ -327,7 +301,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.value",
             requirement: pattern_requirement(),
             submitted: text.clone(),
-            subject: Subject::Withheld,
         });
         rows.push(Row {
             what: format!("{class} in a tag key on TagResource"),
@@ -339,7 +312,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.key",
             requirement: pattern_requirement(),
             submitted: text.clone(),
-            subject: Subject::Withheld,
         });
         rows.push(Row {
             what: format!("{class} in a tag value on AddTagsToCertificate"),
@@ -351,7 +323,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             path: "tags.1.member.value",
             requirement: pattern_requirement(),
             submitted: text,
-            subject: Subject::Withheld,
         });
     }
 
@@ -359,8 +330,7 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
 }
 
 /// RULE: a clause about a position on ACM's tag surface names the position and withholds
-/// the text submitted there, while a position off that surface states the value as
-/// submitted.
+/// the text submitted there — as a clause about a position off that surface does too.
 #[tokio::test]
 async fn a_tag_surface_clause_names_the_position_and_withholds_the_text() {
     let router = router();
@@ -398,16 +368,14 @@ async fn a_tag_surface_clause_names_the_position_and_withholds_the_text() {
             row.what,
             row.operation
         );
-        if matches!(row.subject, Subject::Withheld) {
-            assert!(
-                !stated.contains(&row.submitted),
-                "case {:?} ({}): the submitted text {:?} must not appear in the message, \
-                 got {stated:?}",
-                row.what,
-                row.operation,
-                row.submitted
-            );
-        }
+        assert!(
+            !stated.contains(&row.submitted),
+            "case {:?} ({}): the submitted text {:?} must not appear in the message, \
+             got {stated:?}",
+            row.what,
+            row.operation,
+            row.submitted
+        );
     }
 
     // Every refused call above left the stored map exactly as the one legal pair left

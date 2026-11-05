@@ -77,6 +77,7 @@
 pub mod acme_http;
 pub mod acme_jws;
 pub mod authorization;
+mod enum_value_sets;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -94,13 +95,18 @@ use ::aws_smithy_schema_server::constraints::{
 /// and a message without its matching code is worse than leaving both alone.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// How ACM names the subject of a constraint clause at a position whose submitted
-/// value it WITHHOLDS: the position in the input that failed, and NOT the value.
+/// How ACM names the subject of a constraint clause: the POSITION in the input that
+/// failed, and never the value submitted there.
 ///
-/// Reserved for the positions [`withholds_value`] names — a resource identifier, a
-/// request token, a position on the TAG surface, and a value the validating walk
-/// holds no submitted text for. Every other position states the value as submitted
-/// ([`echoed_subject`]).
+/// The phrase is FIXED text — the member path is the only part of a clause that comes
+/// from the request — so a refusal reflects no request content back at a caller or into
+/// its logs. It is the subject of every recorded refusal of this class, at every
+/// position: a malformed resource identifier, a request token outside its pattern, a tag
+/// key or value outside its charset, a collection past its own bound, a list element
+/// outside its element constraint set, and a filter value outside its enum. The one
+/// position that reads differently is a member the request never sent
+/// ([`ABSENT_SUBJECT`]), where there is no submitted value to withhold in the first
+/// place.
 const SUBJECT: &str = "Value of the input at";
 
 /// How the subject reads when the member was ABSENT, which is the cross-service
@@ -117,10 +123,9 @@ const ABSENT_SUBJECT: &str = "Value null at";
 /// "Still to migrate here (staged, not yet wired)" section): that module is
 /// declared, but it owns only which value a clause echoes, not these, so they are
 /// inlined here as they are in the other service crates that word their own
-/// refusals. The migration that moves them there owns this copy too. (A value
-/// longer than the walk's own echo cap is stated as the position alone here — see
-/// [`withholds_value`] — rather than restored, which would need the built input the
-/// refusal seam is not handed.)
+/// refusals. The migration that moves them there owns this copy too. (Which value a
+/// clause echoes is not a question this service has: it echoes none — see
+/// [`SUBJECT`].)
 ///
 /// Returns `None` for a violation class this service has no wording for, which
 /// lets [`constraint_envelope`] decline the whole refusal and keep the
@@ -151,18 +156,29 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
             unanchored(pattern)
         ),
         // A "value set" is just that: the requirement is WHICH values the model
-        // allows, and the order they are listed in carries no information. They
-        // are listed in the order the model declares them, which is the only
-        // order this emulator has a source for.
+        // allows. The ORDER they are listed in is the service's own rather than
+        // the model's — see [`enum_value_set`].
         ViolationKind::EnumValue(allowed) => enum_value_set(allowed),
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     })
 }
 
-/// The requirement an enum violation states: WHICH values the model allows.
+/// The requirement an enum violation states: WHICH values the model allows, listed in
+/// the order ACM states that enum's set in.
+///
+/// That order is a property of the SERVICE and not of the model — it is neither the
+/// model's declaration order nor a sort of the values — so an enum this service
+/// publishes an order for ([`enum_value_sets::published_order`]) is stated in it,
+/// whichever member carried the value and whichever seam built the clause. A set no
+/// order is published for is stated as it was presented, which is the only order the
+/// emulator has a source for.
 fn enum_value_set<S: AsRef<str>>(allowed: &[S]) -> String {
-    let values: Vec<&str> = allowed.iter().map(AsRef::as_ref).collect();
+    let presented: Vec<&str> = allowed.iter().map(AsRef::as_ref).collect();
+    let values: &[&str] = match enum_value_sets::published_order(&presented) {
+        Some(published) => published,
+        None => &presented,
+    };
     format!("Member must satisfy enum value set: [{}]", values.join(", "))
 }
 
@@ -172,12 +188,16 @@ fn enum_value_set<S: AsRef<str>>(allowed: &[S]) -> String {
 ///
 /// Built from the same subject, the same requirement and the same envelope as a
 /// refusal the framework raised, so one violation class reads as one message
-/// whichever of the two refused the request — including which positions state the
-/// submitted value and which withhold it ([`withholds_value`]).
-pub(crate) fn enum_value_refusal(path: &str, submitted: &str, allowed: &[&str]) -> String {
+/// whichever of the two refused the request: the position alone ([`SUBJECT`]), and the
+/// value set in the order this service states it in ([`enum_value_set`]).
+///
+/// `path` is the member path of the position that failed, in the wire spelling a clause
+/// names it with ([`lower_camel`] per step, dot-joined from the input root), which is
+/// the spelling the framework's own walk writes.
+pub(crate) fn enum_value_refusal(path: &str, allowed: &[&str]) -> String {
     one_error_envelope(&format!(
         "{} failed to satisfy constraint: {}",
-        clause_subject(path, Some(submitted)),
+        clause_subject(path, true),
         enum_value_set(allowed)
     ))
 }
@@ -196,161 +216,24 @@ pub(crate) fn cross_account_arn_refusal() -> String {
     "Invalid ARN in request: Same account ARN expected but got cross-account ARN".to_string()
 }
 
-/// The member-name suffixes whose value ACM does not reflect back into a refusal.
+/// The subject a clause about `path` opens with: the position that failed
+/// ([`SUBJECT`]) when the request submitted a value there, and the absent-member form
+/// ([`ABSENT_SUBJECT`]) when it sent none.
 ///
-/// A member named `…Arn` targets a resource identifier (the `Arn` / `PcaArn` /
-/// `AcmeEndpointArn` shapes, whose `@pattern` admits nothing else) and one named
-/// `…Token` a request token (`IdempotencyToken`, and the opaque `NextToken` a list
-/// operation issues): both carry a caller's account- and request-identifying data
-/// rather than a value a caller re-reads to correct its request. The suffix is how
-/// every AWS model spells those two classes, so the rule holds for a member added
-/// later without a list of names to extend.
-const WITHHELD_CLASSES: [&str; 2] = ["Arn", "Token"];
-
-/// The word a model spells the input member a request's TAGS arrive in with, which is
-/// what [`names_tag_surface`] recognises a step of a path by.
-///
-/// Every tag member of this service's inputs is named for the tags it carries —
-/// `Tags`, `TagKeys`, and `CertificateTags`, the tag collection
-/// `CreateAcmeEndpoint` passes on to the certificates an endpoint issues
-/// (`smithy_query(query="operation", operation="CreateAcmeEndpoint")`) — so the word
-/// holds for a tag member added later without a list of names to extend.
-const TAG_WORD: &str = "tag";
-
-/// The units the validating walk renders a value it has no TEXT for in: the element
-/// count of a list, the entry count of a map, the byte count of a blob
-/// (`aws_smithy_schema_server::constraints`, whose collection-length check renders a
-/// list as `<n> items` and a map as `<n> entries`).
-const SUMMARY_UNITS: [&str; 3] = ["items", "entries", "bytes"];
-
-/// How the walk renders a `document` member, which has no text form either.
-const DOCUMENT_SUMMARY: &str = "<document>";
-
-/// Whether ACM withholds the value submitted at `path`, where `stored` is the echo the
-/// validating walk recorded for it.
-///
-/// Four classes are withheld, and nothing else:
-///
-/// * a resource identifier or a request token ([`WITHHELD_CLASSES`]);
-/// * a position on the TAG surface ([`names_tag_surface`]), whose text is metadata the
-///   caller attaches to a resource and which ACM reports the position of rather than
-///   reflecting back — both halves of a pair and a key list's entries alike;
-/// * a value the walk has only a SUMMARY of — a collection's element or entry count, a
-///   blob's byte count, a document — since there is no submitted scalar to quote and
-///   the count is the walk's own text rather than the caller's;
-/// * a value the walk ELIDED because the caller controls its length, whose stored text
-///   is a bounded prefix plus a marker and so is not what was submitted either.
-///
-/// The last two are read off the stored rendering because [`ViolationKind`] carries the
-/// constraint that was broken and not the KIND of shape that broke it, and
-/// `vendor/` is read-only here — the same signal, and the same accepted collision (a
-/// string member whose own value IS one of those renderings), that
-/// `services/common/src/validation_message.rs` reads a map's entry count from.
-fn withholds_value(path: &str, stored: &str) -> bool {
-    names_withheld_class(leaf_member(path))
-        || names_tag_surface(path)
-        || is_summary(stored)
-        || is_elided(stored)
-}
-
-/// Whether `path` addresses a position on the TAG surface: the tag collection itself, or
-/// anything reached THROUGH it — a pair's key, a pair's value, an entry of a key list.
-///
-/// Resolved from the path rather than from the leaf member, because the leaf of a pair's
-/// half is named for the half (`key`, `value`) and only the step above it says the pair
-/// is a tag: `tags.<position>.member.value` is tag metadata, while a member named `value`
-/// elsewhere in an input is not.
-fn names_tag_surface(path: &str) -> bool {
-    path.split('.').any(names_tags)
-}
-
-/// How a QUALIFIED tag member's name ends, lowercased: a collection of the tags
-/// themselves or of their keys. A member named for the tags alone opens with
-/// [`TAG_WORD`] instead, which is what the walk's lowerCamel spelling makes of `Tags`
-/// and `TagKeys`.
-const TAG_MEMBER_SUFFIXES: [&str; 2] = ["tags", "tagkeys"];
-
-/// Whether `member` names a collection of tags, in the lowerCamel spelling the walk
-/// names a member with: `tags` and `tagKeys` open with [`TAG_WORD`], and a qualified
-/// name such as `certificateTags` closes with one of [`TAG_MEMBER_SUFFIXES`].
-fn names_tags(member: &str) -> bool {
-    let lowered = member.to_ascii_lowercase();
-    lowered.starts_with(TAG_WORD)
-        || TAG_MEMBER_SUFFIXES
-            .iter()
-            .any(|suffix| lowered.ends_with(suffix))
-}
-
-/// The member a path's value belongs to: its last segment, in the spelling the walk
-/// named it with.
-fn leaf_member(path: &str) -> &str {
-    path.rsplit_once('.').map_or(path, |(_, leaf)| leaf)
-}
-
-/// Whether `member` names one of the classes ACM withholds ([`WITHHELD_CLASSES`]) —
-/// either as the suffix of a compound name (`certificateArn`, `idempotencyToken`) or
-/// as the whole name, which the walk spells in lowerCamel (`arn`, `token`).
-fn names_withheld_class(member: &str) -> bool {
-    WITHHELD_CLASSES
-        .iter()
-        .any(|class| member.ends_with(class) || member.eq_ignore_ascii_case(class))
-}
-
-/// Whether `stored` is the walk's SUMMARY of a value rather than the value.
-fn is_summary(stored: &str) -> bool {
-    stored == DOCUMENT_SUMMARY
-        || SUMMARY_UNITS.iter().any(|unit| {
-            stored
-                .strip_suffix(unit)
-                .and_then(|head| head.strip_suffix(' '))
-                .is_some_and(is_count)
-        })
-}
-
-/// Whether `stored` is the walk's ELISION of a long value: a prefix of it, then
-/// `... [<n> bytes]`.
-fn is_elided(stored: &str) -> bool {
-    stored
-        .strip_suffix(" bytes]")
-        .and_then(|head| head.rsplit_once("... ["))
-        .is_some_and(|(_, count)| is_count(count))
-}
-
-/// Whether `text` is a decimal count, which is what both renderings above state a size
-/// as.
-fn is_count(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-/// The subject a clause about `path` opens with, given the echo `stored` the walk
-/// recorded there: the absent-member form for a member the request never sent, the
-/// withholding form at a position ACM withholds, else the value AS SUBMITTED.
-fn clause_subject(path: &str, stored: Option<&str>) -> String {
-    match stored {
-        None => format!("{ABSENT_SUBJECT} '{path}'"),
-        Some(stored) if withholds_value(path, stored) => format!("{SUBJECT} '{path}'"),
-        Some(submitted) => echoed_subject(path, submitted),
+/// What the caller submitted is NOT part of the subject either way, so the walk's echo
+/// of it is read for its presence alone — which is the one thing the two subjects
+/// differ on.
+fn clause_subject(path: &str, submitted: bool) -> String {
+    if submitted {
+        format!("{SUBJECT} '{path}'")
+    } else {
+        format!("{ABSENT_SUBJECT} '{path}'")
     }
 }
 
-/// How ACM names the subject of a constraint clause at a position whose value it
-/// STATES: the value the request submitted there, then the position.
-///
-/// This is the framework's own clause opening
-/// (`aws_smithy_schema_server::Violation::message`), restated here because the clause
-/// around it is this service's — the path of a collection element is collapsed onto its
-/// collection and a `@pattern` is quoted unanchored.
-fn echoed_subject(path: &str, submitted: &str) -> String {
-    format!("Value '{submitted}' at '{path}'")
-}
-
-/// Render one constraint violation the way this service states it: the value as
-/// submitted, the input position and the violated constraint — except at a position
-/// whose value ACM withholds ([`withholds_value`]), which names the position alone.
-///
-/// A failure of a collection's ELEMENT is one of those positions: the clause names the
-/// COLLECTION member rather than the index inside it, so the element's own text is not
-/// the value submitted at the position being named and the position is stated alone.
+/// Render one constraint violation the way this service states it: the input position
+/// that failed and the requirement it failed, and never the value submitted there
+/// ([`clause_subject`]).
 fn constraint_clause(violation: &Violation) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
     // A failure of the collection's own ELEMENT is reported against the
@@ -363,19 +246,14 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
     // keeps the single violated requirement, which is never wrong.
     let (subject, requirement) = match collection_element(&violation.path) {
         Some(collection) => (
-            match violation.value {
-                // An element the request left null states that, as an absent member
-                // does: there is no value to withhold.
-                None => format!("{ABSENT_SUBJECT} '{collection}'"),
-                Some(_) => format!("{SUBJECT} '{collection}'"),
-            },
+            clause_subject(collection, violation.value.is_some()),
             format!(
                 "Member must satisfy constraint: [{}]",
                 element_constraint_set(collection).unwrap_or(requirement)
             ),
         ),
         None => (
-            clause_subject(&violation.path, violation.value.as_deref()),
+            clause_subject(&violation.path, violation.value.is_some()),
             requirement,
         ),
     };
@@ -491,7 +369,11 @@ fn bound(value: f64) -> String {
 
 /// A member's name as a message path spells it, which is the spelling the validating
 /// walk writes into a violation's path (`aws_smithy_schema_server::constraints::path`).
-fn lower_camel(member_name: &str) -> String {
+///
+/// The one source of that spelling for this crate: a refusal a HANDLER words names its
+/// position through here too, so a path a clause states is the WIRE path of the member
+/// whichever seam refused the request, rather than the model's own casing.
+pub(crate) fn lower_camel(member_name: &str) -> String {
     ::aws_smithy_schema_server::constraints::path::member(member_name)
 }
 
@@ -699,15 +581,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service reword it.
         //
         // ACM states a member-constraint failure against the INPUT POSITION that
-        // failed, the constraint it failed, and the value submitted there — except
-        // at the positions it withholds the value of ([`withholds_value`]: a
-        // resource identifier, a request token, a position on the tag surface, and
-        // a value the walk holds no submitted text for), which name the position
-        // alone. A `@pattern`
+        // failed and the constraint it failed, and never against the value
+        // submitted there ([`SUBJECT`]) — a member the request did not send reads
+        // as absent instead ([`ABSENT_SUBJECT`]). A `@pattern`
         // requirement names the expression without the model's `^` / `$`
-        // anchoring. The code stays the modeled `ValidationException` (HTTP 400),
-        // which is what the framework would have answered; only the wording
-        // changes.
+        // anchoring, and an enum's value set is listed in the order this service
+        // states that enum's values in. The code stays the modeled
+        // `ValidationException` (HTTP 400), which is what the framework would have
+        // answered; only the wording changes.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.

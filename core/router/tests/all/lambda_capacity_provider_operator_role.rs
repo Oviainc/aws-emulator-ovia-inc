@@ -253,7 +253,8 @@ fn rows() -> Vec<Row> {
             // `crate::state::capacity_provider::operator_role_is_unassumable` implements
             // (the shared `service_common::iam_role::role_is_unassumable`), and what
             // separates it from a function's EXECUTION role, which is routinely provisioned
-            // out of band and so serves such a create.
+            // out of band and so serves such a create. A fix for another issue must not
+            // flip it: if this row fails in a gate, the change under review is what to fix.
             case: "a role this account's IAM holds none of",
             role: Role::AbsentFromIam,
             accepted: false,
