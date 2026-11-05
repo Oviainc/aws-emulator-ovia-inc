@@ -42,6 +42,12 @@ aws-smithy-checksums = "0.65"
 # The three `XXHASH` checksum algorithms the model's `ChecksumAlgorithm` also names, which
 # no other crate in this workspace implements (`state::checksum_digest`).
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+# Renders an instant as the calendar date S3's `<ArgumentValue>` reports a refused
+# timestamp as (`state::refused_timestamp_text`), weekday and month names included.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The zone that rendering names: a real zone, so the abbreviation is the one the instant
+# falls in rather than a fixed offset spelled by hand.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # `encoding-type=url` asks a listing to percent-encode the key-name elements of its
 # response ("non-ASCII characters that are used in an object's key name will be
 # percent-encoded according to UTF-8 code values" — the `EncodingType` enum's own

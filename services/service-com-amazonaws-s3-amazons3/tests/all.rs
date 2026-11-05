@@ -277,6 +277,8 @@ mod refused_argument_envelope;
 mod reserved_tag_key_prefix;
 #[path = "all/scratch_probe.rs"]
 mod scratch_probe;
+#[path = "all/served_envelope_values.rs"]
+mod served_envelope_values;
 #[path = "all/signature_refusal_wording.rs"]
 mod signature_refusal_wording;
 #[path = "all/state_roundtrip.rs"]

@@ -256,6 +256,14 @@ fn reported<T>(
 /// member is the `FilterRules` list
 /// (`smithy_query(query="shape",shape="NotificationConfigurationFilter")`), so the rules
 /// the put recorded are reported in that nesting and in the order they were applied.
+///
+/// Each rule's `Name` is reported in the CANONICAL spelling of its rule kind
+/// ([`crate::state::canonical_filter_rule_name`]) whatever spelling the store holds:
+/// `FilterRuleName`'s enum values are the REQUEST vocabulary (`prefix`, `suffix`), while
+/// the name S3 reports to every reader of a bucket's notification document is the
+/// capitalised one — so a client matching on the reported spelling reads the prefix and
+/// suffix rules the configuration really carries. A name that is no `FilterRuleName` is
+/// reported as it is held, because there is no canonical spelling of it to report.
 fn reported_filter(
     target: &crate::state::NotificationTarget,
 ) -> Option<NotificationConfigurationFilter> {
@@ -266,7 +274,10 @@ fn reported_filter(
                 rules
                     .iter()
                     .map(|rule| FilterRule {
-                        name: rule.name.clone(),
+                        name: rule.name.as_deref().map(|name| {
+                            crate::state::canonical_filter_rule_name(name)
+                                .map_or_else(|| name.to_string(), str::to_string)
+                        }),
                         value: rule.value.clone(),
                     })
                     .collect(),

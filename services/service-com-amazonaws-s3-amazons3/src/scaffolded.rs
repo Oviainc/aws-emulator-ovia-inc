@@ -843,6 +843,21 @@ static UNMET_CONDITION: Schema = Schema::new_member(
 )
 .with_xml_name("Condition");
 
+/// The `<TagValue>` of an S3 error document: the member a refusal about one tag's VALUE
+/// names that value by, written after [`TAG_KEY`] — the order S3's document carries the two
+/// members of a tag in. See [`BUCKET_NAME`].
+static TAG_VALUE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$tagValue",
+        "smithy.framework",
+        "tagValue",
+    ),
+    ShapeType::String,
+    "tagValue",
+    18,
+)
+.with_xml_name("TagValue");
+
 /// The wire error codes whose document is about one multipart UPLOAD, and so names the
 /// `uploadId` the request addressed.
 ///
@@ -915,9 +930,15 @@ pub enum ErrorDetail {
     /// An annotation-scoped refusal, named by `<AnnotationName>`: the annotation name the
     /// request addressed.
     Annotation(String),
-    /// A refusal about one TAG of a tag set, named by `<TagKey>`: the key the request
-    /// carried.
-    TagKey(String),
+    /// A refusal about one TAG of a tag set, named by `<TagKey>` and — for a refusal about
+    /// that tag's VALUE — `<TagValue>`: the pair the request carried, which is what says
+    /// WHICH tag of the set the caller must change.
+    Tag {
+        /// The key of the tag the refusal is about.
+        key: String,
+        /// Its value, for a refusal about the value rather than about the key.
+        value: Option<String>,
+    },
     /// A refusal about one OBJECT, named by `<Key>` and — for a refusal about one stored
     /// version — `<VersionId>`: the object the refusal is ABOUT, which is NOT always the
     /// one the request addressed. A copy's SOURCE is the case this exists for; every
@@ -1001,7 +1022,13 @@ impl ErrorDetail {
         match self {
             Self::Bucket(name) => s.write_string(&BUCKET_NAME, name),
             Self::Annotation(name) => s.write_string(&ANNOTATION_NAME, name),
-            Self::TagKey(key) => s.write_string(&TAG_KEY, key),
+            Self::Tag { key, value } => {
+                s.write_string(&TAG_KEY, key)?;
+                match value.as_deref() {
+                    Some(value) => s.write_string(&TAG_VALUE, value),
+                    None => Ok(()),
+                }
+            }
             Self::Object { key, version_id } => {
                 s.write_string(&OBJECT_KEY, key)?;
                 match version_id.as_deref() {
@@ -1078,7 +1105,7 @@ impl ErrorDetail {
         match self {
             Self::Bucket(name)
             | Self::Annotation(name)
-            | Self::TagKey(name)
+            | Self::Tag { key: name, .. }
             | Self::Object { key: name, .. }
             | Self::Argument { name, .. }
             | Self::Upload(name)
@@ -1382,27 +1409,29 @@ impl<E> Scaffolded<E> {
 
     /// The refusal every WRITE that carries `x-amz-object-lock-retain-until-date` answers a
     /// date that does not end in the future with: the `InvalidArgument` above, naming that
-    /// header and echoing the date it rejected as the request spelled it in that header
-    /// ([`crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`] is the sentence, shared
-    /// with the retention write that is refused the same value in its document).
-    pub fn retain_until_date_not_in_future(
-        spelled: Option<&str>,
-        date: Option<&::aws_smithy_types::DateTime>,
-    ) -> Self {
+    /// header and rendering the date it rejected the way the service renders a refused
+    /// timestamp ([`crate::state::refused_timestamp_text`]; the sentence,
+    /// [`crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`], is shared with the
+    /// retention write that is refused the same value in its document).
+    pub fn retain_until_date_not_in_future(date: Option<&::aws_smithy_types::DateTime>) -> Self {
         Self::invalid_argument(
             crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
-            Some(&crate::state::echoed_retain_until_date(spelled, date)),
+            Some(
+                &date
+                    .map(crate::state::refused_timestamp_text)
+                    .unwrap_or_default(),
+            ),
             crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
         )
     }
 
     /// The refusal S3 answers a tag set that breaks one of the published restrictions with:
     /// the rejection's own wire code and sentence at [`crate::state::TAG_REJECTION_STATUS`],
-    /// plus the `<TagKey>` member when the refusal is about one tag's key.
+    /// plus the `<TagKey>` / `<TagValue>` members naming the tag it is about.
     ///
     /// The ONE place a tag-set rejection becomes a wire refusal, so the several operations
     /// that write a tag set — the two tagging puts and every object write carrying an
-    /// `x-amz-tagging` header — cannot disagree about the status, the code or the member
+    /// `x-amz-tagging` header — cannot disagree about the status, the code or the members
     /// the envelope carries.
     pub fn tag_set(rejection: &crate::state::TagSetRejection) -> Self {
         let refusal = Self::unmodeled(
@@ -1411,7 +1440,10 @@ impl<E> Scaffolded<E> {
             rejection.to_string(),
         );
         match rejection.tag_key() {
-            Some(key) => refusal.naming(ErrorDetail::TagKey(key.to_string())),
+            Some(key) => refusal.naming(ErrorDetail::Tag {
+                key: key.to_string(),
+                value: rejection.tag_value().map(str::to_string),
+            }),
             None => refusal,
         }
     }

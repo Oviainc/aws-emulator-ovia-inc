@@ -448,10 +448,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(requested) => requested,
             Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
                 return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
-                    crate::state::header_text(
-                        ctx.parts(),
-                        crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
-                    ),
                     input.object_lock_retain_until_date.as_ref(),
                 ))
             }

@@ -5,9 +5,11 @@
 //! The rule under test: a tag set carrying a key that begins with `aws:` — the prefix the
 //! published tag restrictions reserve for AWS-generated tags, which a caller may therefore
 //! neither add nor edit — is refused with HTTP 400, the error code `InvalidTag` and the
-//! sentence S3 states for that reservation, with the offending key in the `<TagKey>` member
-//! of the error document, and the resource keeps the tag set it already had. The prefix
-//! itself comes from the shared tag-set rule
+//! sentence S3 states for that reservation on the tag set's OWNER's tagging path, with the
+//! offending key in the `<TagKey>` member of the error document, and the resource keeps the
+//! tag set it already had. The two paths word that one refusal differently: a BUCKET tag set
+//! is refused as a write of a system tag, an OBJECT tag set as a key carrying the reserved
+//! prefix. The prefix itself comes from the shared tag-set rule
 //! (`service_com_amazonaws_s3_amazons3::state::RESERVED_TAG_KEY_PREFIX`), so a row is built
 //! from the published prefix rather than from a literal spelled here twice.
 //!
@@ -36,8 +38,13 @@ use super::object_tagging::{get_object_tagging, object, put_object_tagging};
 /// The code S3 refuses a tag that does not pass input validation with.
 const INVALID_TAG: &str = "InvalidTag";
 
-/// The fixed text S3 states for a key carrying the reserved prefix.
+/// The fixed text S3's OBJECT tagging path states for a key carrying the reserved prefix.
 const RESERVED_PREFIX_MESSAGE: &str = "Your TagKey cannot be prefixed with aws:";
+
+/// The fixed text S3's BUCKET tagging path states for that same key: the other wording of
+/// the one refusal, about the system TAGS a requester may not write rather than about the
+/// key's spelling.
+const SYSTEM_TAGS_MESSAGE: &str = "System tags cannot be added/updated by requester";
 
 /// The status a served `PutBucketTagging` answers: the 204 its model states for it.
 const BUCKET_TAGGING_SERVED: u16 = 204;
@@ -188,10 +195,25 @@ async fn a_tag_key_carrying_the_reserved_prefix_is_refused_on_every_path_a_tag_s
         )
         .await;
 
-        for (call, answer, served) in [
-            ("PutObjectTagging", &object_tagging, OBJECT_TAGGING_SERVED),
-            ("PutBucketTagging", &bucket_tagging, BUCKET_TAGGING_SERVED),
-            ("PutObject with x-amz-tagging", &on_write, OBJECT_TAGGING_SERVED),
+        for (call, answer, served, message) in [
+            (
+                "PutObjectTagging",
+                &object_tagging,
+                OBJECT_TAGGING_SERVED,
+                RESERVED_PREFIX_MESSAGE,
+            ),
+            (
+                "PutBucketTagging",
+                &bucket_tagging,
+                BUCKET_TAGGING_SERVED,
+                SYSTEM_TAGS_MESSAGE,
+            ),
+            (
+                "PutObject with x-amz-tagging",
+                &on_write,
+                OBJECT_TAGGING_SERVED,
+                RESERVED_PREFIX_MESSAGE,
+            ),
         ] {
             match offending {
                 None => {
@@ -219,9 +241,8 @@ async fn a_tag_key_carrying_the_reserved_prefix_is_refused_on_every_path_a_tag_s
                     );
                     assert_eq!(
                         answer.error_message(),
-                        RESERVED_PREFIX_MESSAGE,
-                        "case {case:?}/{call}: expected the message \
-                         {RESERVED_PREFIX_MESSAGE:?}, got {:?}",
+                        message,
+                        "case {case:?}/{call}: expected the message {message:?}, got {:?}",
                         answer.error_message()
                     );
                     assert_eq!(

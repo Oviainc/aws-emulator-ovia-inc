@@ -10,8 +10,9 @@
 //! broke — the same sentence for every value that breaks it — so the pair is the only part of
 //! the refusal that says WHICH field the caller must change and what it sent; an SDK error
 //! object surfaces them as `ArgumentName` / `ArgumentValue`. The name is the field as the API
-//! publishes it, and the value is what the request spelled, not a re-rendering of what the
-//! codec parsed.
+//! publishes it, and the value is the one the request carried — a string as the request
+//! spelled it, and a TIMESTAMP as the service renders a date (see
+//! [`super::served_envelope_values`]).
 //!
 //! Beside it, the same envelope rule for an object-scoped NOT-FOUND: the document names the
 //! `<Key>` the request addressed, and the `<VersionId>` when the request named one, because
@@ -27,7 +28,8 @@
 //! * the retention table over WHERE the rejected date arrived — the `Retention` document of
 //!   `PutObjectRetention` and the `x-amz-object-lock-retain-until-date` header of the three
 //!   writes that carry one — and over the SPELLING the request used for it, which the
-//!   envelope has to echo rather than re-render;
+//!   envelope renders as the service renders a date rather than echoing back; the table of
+//!   instants and renderings that rule spans is [`super::served_envelope_values`]'s;
 //! * the not-found table over whether the request named a version at all, and over a key
 //!   carrying XML metacharacters — which the envelope has to escape, so a caller-chosen key
 //!   cannot break the document it is reported in — and over a COPY, whose refusal is about
@@ -203,7 +205,7 @@ async fn a_malformed_version_id_is_refused_by_name_wherever_it_arrives() {
 }
 
 #[tokio::test]
-async fn a_retention_date_that_has_passed_is_refused_by_name_and_echoed_as_spelled() {
+async fn a_retention_date_that_has_passed_is_refused_by_name_and_rendered_as_a_date() {
     let router = router();
     let name = "argument-envelope-retention";
     lock_enabled_bucket(&router, name).await;
@@ -215,11 +217,12 @@ async fn a_retention_date_that_has_passed_is_refused_by_name_and_echoed_as_spell
         text(&written)
     );
 
-    // (case, the text the request spells the date in). Every row is an instant that has gone
-    // by, spelled the way a client may send it: the canonical ISO 8601 date-time, one with a
-    // fraction of a second, and one whose fraction is explicitly zero — which a re-rendering
-    // of the parsed instant would drop, so the row pins that the echo is the request's own
-    // text.
+    // (case, the text the request spells the date in). Every row is the SAME instant that
+    // has gone by, spelled the way a client may send it: the canonical ISO 8601 date-time,
+    // one with a fraction of a second, and one whose fraction is explicitly zero. The
+    // envelope renders the INSTANT rather than echoing the text, so every row — and every
+    // call it arrives on — must carry one and the same value; which rendering that is, over
+    // a table of instants, is pinned by [`super::served_envelope_values`].
     let a_day_ago = now_seconds() - 24 * 3_600;
     let spellings: Vec<(&str, String)> = vec![
         ("the canonical date-time", iso8601(a_day_ago)),
@@ -233,6 +236,7 @@ async fn a_retention_date_that_has_passed_is_refused_by_name_and_echoed_as_spell
         ),
     ];
 
+    let mut rendered: Option<String> = None;
     for (case, spelled) in &spellings {
         // In the `Retention` DOCUMENT of the retention write.
         let payload = format!(
@@ -241,16 +245,24 @@ async fn a_retention_date_that_has_passed_is_refused_by_name_and_echoed_as_spell
              <RetainUntilDate>{spelled}</RetainUntilDate></Retention>"
         );
         let refused = put_object_retention(&router, name, KEY, "", &[], &payload).await;
+        let echoed = refused.element("ArgumentValue").unwrap_or_default();
+        assert_ne!(
+            echoed, *spelled,
+            "case {case:?}/PutObjectRetention: the envelope must render the rejected \
+             instant, not echo the request's own text, got {echoed:?} in {:?}",
+            text(&refused)
+        );
+        let expected = rendered.get_or_insert_with(|| echoed.clone()).clone();
         assert_names_argument(
             &refused,
             &format!("{case}/PutObjectRetention"),
             "RetainUntilDate",
-            spelled,
+            &expected,
             RETAIN_UNTIL_MESSAGE,
         );
 
         // And in the `x-amz-object-lock-retain-until-date` HEADER of the writes that carry
-        // one: the field is that header, and the value is the text it carried.
+        // one: the field is that header, and the value is that same rendering.
         let headers = vec![
             ("x-amz-object-lock-mode", GOVERNANCE_RETENTION_MODE),
             ("x-amz-object-lock-retain-until-date", spelled.as_str()),
@@ -276,7 +288,7 @@ async fn a_retention_date_that_has_passed_is_refused_by_name_and_echoed_as_spell
                 &answer,
                 &format!("{case}/{call}"),
                 "x-amz-object-lock-retain-until-date",
-                spelled,
+                &expected,
                 RETAIN_UNTIL_MESSAGE,
             );
         }

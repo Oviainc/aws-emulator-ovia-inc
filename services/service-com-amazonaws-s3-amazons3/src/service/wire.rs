@@ -1399,6 +1399,53 @@ fn with_request_correlation(
     response
 }
 
+/// `response` — an ERROR envelope — named by a freshly minted correlation pair
+/// ([`crate::state::request_ids`]) in both its `<RequestId>` / `<HostId>` elements and its
+/// two headers.
+///
+/// A refusal's envelope carries the same pair of ids a served response does: an
+/// `x-amz-request-id` is "a value created by Amazon S3 that uniquely identifies the
+/// request" and an `x-amz-id-2` "a special token that helps Amazon Web Services
+/// troubleshoot problems" (Amazon S3 API Reference, *Common Response Headers*), and the
+/// REST-XML error document mirrors them in `<RequestId>` and `<HostId>`. What a client, a
+/// log correlator or a support request reads is the id's SHAPE — the one every S3 response
+/// of this emulator is named by, minted in one draw so the two ids name the same request —
+/// and not whatever a generic serializer happened to generate, so the ids the inner
+/// serializer wrote are replaced wherever it wrote them. The `content-length` it set is
+/// corrected rather than left stale, the way [`with_served_root_element`] corrects it.
+fn with_envelope_request_correlation(mut response: Response) -> Response {
+    let minted = crate::state::request_ids::RequestCorrelation::mint();
+    // The ids the inner serializer chose, read back off the headers it wrote them to: they
+    // are opaque tokens, so finding them in the document is what locates the two elements
+    // carrying them without re-parsing the document.
+    let written: Vec<(String, String)> = [
+        (REQUEST_ID_HEADER, &minted.request_id),
+        (EXTENDED_REQUEST_ID_HEADER, &minted.extended_request_id),
+    ]
+    .into_iter()
+    .filter_map(|(header, replacement)| {
+        let written = response.headers().get(header)?;
+        // An empty pattern would be found between every pair of characters in the body;
+        // the serializer writes neither id empty, and this is what keeps that true.
+        (!written.is_empty()).then(|| (written.to_string(), replacement.to_string()))
+    })
+    .collect();
+    if let Some(body) = response.body().bytes() {
+        let mut document = String::from_utf8_lossy(body).into_owned();
+        for (chosen, minted) in &written {
+            document = document.replace(chosen.as_str(), minted.as_str());
+        }
+        let length = document.len();
+        *response.body_mut() = SdkBody::from(document);
+        if response.headers().get("content-length").is_some() {
+            response
+                .headers_mut()
+                .insert("content-length", length.to_string());
+        }
+    }
+    with_request_correlation(response, minted)
+}
+
 /// `response` with its document's ROOT element named the way the service names it, or
 /// `response` unchanged for an operation whose root the model already names correctly (see
 /// [`SERVED_OUTPUT_ROOT_ELEMENTS`]).
@@ -1900,16 +1947,19 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             })?;
             return Ok(Response::new(status, SdkBody::empty()));
         }
-        // The error envelope's correlation pair is NOT this service's to choose. This
-        // model sets `noErrorWrapping` ([`NO_ERROR_WRAPPING`]), so the inner serializer
-        // writes ONE pair into both the `<RequestId>` / `<HostId>` elements of the body and
-        // the matching response headers — and the two have to agree, because a client reads
-        // the id from the body and an operator reads it from the header. A refusal
-        // publishes no event notification and so records no pair of its own, which is why
-        // there is nothing here to stamp over it with: the ONE value an error response
-        // names its request by is the one the envelope itself carries.
-        self.inner
-            .serialize_error(error, error_schema, error_code, http_status)
+        // The pair an error response names its request by. This model sets
+        // `noErrorWrapping` ([`NO_ERROR_WRAPPING`]), so the inner serializer writes one
+        // pair of its own into both the `<RequestId>` / `<HostId>` elements of the body and
+        // the matching response headers — in a shape of its own choosing, which is not the
+        // shape S3's ids have. A refusal publishes no event notification and so records no
+        // pair, so the pair is minted here and written over the one the envelope carries,
+        // keeping the body and the headers in agreement.
+        Ok(with_envelope_request_correlation(self.inner.serialize_error(
+            error,
+            error_schema,
+            error_code,
+            http_status,
+        )?))
     }
 
     fn serialize_event_stream_message(
