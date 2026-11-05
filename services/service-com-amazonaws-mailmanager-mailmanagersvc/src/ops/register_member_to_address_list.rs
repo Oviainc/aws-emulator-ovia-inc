@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterMemberToAddressList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterMemberToAddressList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterMemberToAddressList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the address as a member of the named address list, under the key
+//! the whole service reads an address by (`crate::state::member_address_key`: the domain
+//! folded to lower case, the local part kept as spelled). `@idempotent`, so registering an
+//! address that is already a member changes nothing — not even the instant it was first
+//! added — and an address list nothing created is refused with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterMemberToAddressList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterMemberToAddressListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterMemberToAddressList"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(RegisterMemberToAddressListErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `Address` is modelled only as a 3..320 string, so the boundary validator admits
+        // any text of that length and this is the enforcement point for its FORM: a value
+        // that is neither an email address nor a domain name names nothing an address list
+        // can hold, so it is a parameter violation rather than a member to store.
+        if !crate::state::is_registrable_address(&input.address) {
+            return Err(RegisterMemberToAddressListErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::ADDRESS_NOT_AN_ADDRESS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // A member is a member OF a list, so the list has to exist: the modelled
+        // `ResourceNotFoundException` ("Occurs when a requested resource is not found") is
+        // what says the named one does not.
+        let Some(record) = store.address_lists.get_mut(&input.address_list_id) else {
+            return Err(
+                RegisterMemberToAddressListErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Address list {} not found.",
+                            input.address_list_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let address = crate::state::member_address_key(&input.address);
+
+        // `@idempotent`: the call asks for the address to BE a member, so one that already
+        // is leaves the membership exactly as it stands — including the instant it was
+        // first added, which a `CreatedTimestamp` a caller has already read must not move.
+        // Resolved before the quota, so a repeat is never refused by a ceiling it does not
+        // consume.
+        if record.members.contains_key(&address) {
+            return Ok(RegisterMemberToAddressListOutput {});
+        }
+
+        // The per-list membership quota, checked BEFORE the insert, so a refused register
+        // stores nothing.
+        if record.members.len() >= crate::state::MAX_ADDRESS_LIST_MEMBERS {
+            return Err(
+                RegisterMemberToAddressListErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The maximum number of members ({}) of address list {} has been \
+                             reached. Deregister a member before registering another.",
+                            crate::state::MAX_ADDRESS_LIST_MEMBERS, input.address_list_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The list's own `LastUpdatedTimestamp` describes the address list itself — its
+        // name and its tags — and is left where it stands: what changed is the membership,
+        // which the member reads report, and nothing in the model ties the two together.
+        record.members.insert(address, now);
+
+        Ok(RegisterMemberToAddressListOutput {})
     }
 }

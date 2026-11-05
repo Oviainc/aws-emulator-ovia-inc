@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMembersOfAddressList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMembersOfAddressList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMembersOfAddressList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the members of an address list in one stable order (the stored
+//! address, ascending), a page at a time, optionally scoped to the members whose stored
+//! address starts with `Filter.AddressPrefix`. `NextToken` is this store's own opaque,
+//! authenticated token naming the address to resume at, so every member is reported
+//! exactly once across a walk; a token this store did not mint is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +113,27 @@ impl From<ListMembersOfAddressListErrorModeled> for ListMembersOfAddressListErro
     }
 }
 
+/// The page size `ListMembersOfAddressList` uses when the caller names none: the maximum
+/// the model's `PageSize` range allows
+/// (`smithy_query(query="operation",operation="ListMembersOfAddressList")` reports
+/// `range {min: 1, max: 1000}`), which is how every paginated read of this service answers
+/// a request that states no size.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The walk a continuation token belongs to: the address list being listed and the filter
+/// it is being listed under, ahead of the position itself.
+///
+/// The prefix travels behind its own LENGTH, so the boundary between the scope and the
+/// position is unambiguous for every `AddressPrefix` — that member is unconstrained caller
+/// text, so it may carry the separator itself, and two different walks must never produce
+/// one scope that the other's cursor strips cleanly under.
+fn page_scope(address_list_id: &str, address_prefix: &str) -> String {
+    format!(
+        "{address_list_id}\u{1f}{}\u{1f}{address_prefix}\u{1f}",
+        address_prefix.len()
+    )
+}
+
 /// The `ListMembersOfAddressList` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +170,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMembersOfAddressList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMembersOfAddressListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMembersOfAddressList"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(ListMembersOfAddressListErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `PageSize` is modelled `range(1..1000)`, so the boundary validator is the
+        // enforcement point and has already refused anything outside it; the modelled
+        // maximum stands in when the caller names none. The clamp is belt-and-braces for
+        // that unreachable case, so a page can never be zero-sized (an empty page carrying
+        // a `NextToken` would make a paging caller loop forever).
+        let requested = input
+            .page_size
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let page_size = usize::try_from(requested).unwrap_or(1);
+
+        // `@readonly`: this handler only reports what is stored, and a membership has no
+        // state the clock owes a transition to.
+        let store = state.lock();
+
+        let Some(record) = store.address_lists.get(&input.address_list_id) else {
+            return Err(ListMembersOfAddressListErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Address list {} not found.",
+                        input.address_list_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Filter to limit the results to addresses having the provided prefix"
+        // (`AddressFilter$AddressPrefix`): a prefix of the address as it is STORED, which
+        // is the value these pages report. An absent filter is the empty prefix, which
+        // every address has.
+        let prefix = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.address_prefix.clone())
+            .unwrap_or_default();
+
+        // A `NextToken` continues ONE walk, so the position it carries travels with the
+        // walk it was issued for — this address list and this filter. A token presented to
+        // a different walk names no position in it and is refused rather than answered
+        // with a plausible page that walk never offered.
+        let scope = page_scope(&input.address_list_id, &prefix);
+
+        // A `NextToken` is this operation's own output, so only a value THIS store minted
+        // for THIS walk names a position in it. Anything else — a token from another
+        // emulator run, one issued for another walk, one a caller built — is refused with
+        // the modelled `ValidationException`. The token itself is not echoed: the position
+        // it carries is an `Address`, which is `@sensitive`.
+        let resume_from = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => {
+                let Some(resume) = crate::state::decode_page_token(&store.page_token_key, token)
+                    .and_then(|cursor| cursor.strip_prefix(&scope).map(str::to_string))
+                else {
+                    return Err(ListMembersOfAddressListErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a valid pagination token.".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                resume
+            }
+        };
+
+        // The members are keyed by their stored address in a `BTreeMap`, so this walk is
+        // in one stable order and the position a token carries is simply the address to
+        // resume at — the range starts directly at that key rather than rescanning from
+        // the front. Every address carrying the prefix sorts at or after the prefix
+        // itself, so the walk starts at whichever of the two is later and stops at the
+        // first address that no longer carries it: each member is reported exactly once
+        // across a walk, and none twice. One extra member is taken to decide whether a
+        // further page exists, and is not reported.
+        let start = resume_from.max(prefix.clone());
+        let mut page: Vec<(&String, &i64)> = record
+            .members
+            .range(start..)
+            .take_while(|(address, _)| address.starts_with(&prefix))
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = page.get(page_size).map(|(address, _)| {
+            crate::state::encode_page_token(&store.page_token_key, &format!("{scope}{address}"))
+        });
+        page.truncate(page_size);
+
+        Ok(ListMembersOfAddressListOutput {
+            addresses: page
+                .into_iter()
+                .map(|(address, created_at_millis)| SavedAddress {
+                    address: address.clone(),
+                    created_timestamp: crate::state::timestamp(*created_at_millis),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

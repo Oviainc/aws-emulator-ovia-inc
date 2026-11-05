@@ -93,9 +93,11 @@ pub struct ArchiveRecord {
 /// Ingress endpoints and Rules for email management" (the model's `AddressList` doc).
 ///
 /// The single source of truth for every address-list operation: `CreateAddressList` writes
-/// it and `GetAddressList` reads it back. The model declares no status member for an
-/// address list, so a created one is immediately usable — there is no transition for the
-/// clock to owe.
+/// it and `GetAddressList` reads it back, and the member operations
+/// (`RegisterMemberToAddressList`, `GetMemberOfAddressList`, `ListMembersOfAddressList`)
+/// read and write [`Self::members`]. The model declares no status member for an address
+/// list, so a created one is immediately usable — there is no transition for the clock to
+/// owe.
 #[derive(Debug, Clone)]
 pub struct AddressListRecord {
     pub address_list_id: String,
@@ -104,7 +106,61 @@ pub struct AddressListRecord {
     pub created_at_millis: i64,
     pub last_updated_at_millis: i64,
     pub tags: Vec<Tag>,
+    /// The addresses that are members of this list: each stored address
+    /// ([`member_address_key`]) against the instant it was added, which is the
+    /// `CreatedTimestamp` a member read reports.
+    ///
+    /// A `BTreeMap`, so one address is one member however often it is registered,
+    /// `ListMembersOfAddressList` walks the members in one stable order, and a continuation
+    /// token can name the address to resume at. Bounded by [`MAX_ADDRESS_LIST_MEMBERS`].
+    /// The membership lives INSIDE the list record, so deleting the list takes it along.
+    pub members: BTreeMap<String, i64>,
 }
+
+/// The most members this emulator keeps in one address list, i.e. its per-list membership
+/// quota.
+///
+/// `RegisterMemberToAddressList` models `ServiceQuotaExceededException` ("Occurs when an
+/// operation exceeds a predefined service quota or limit") precisely because the real
+/// service caps a list's membership. The model does not state the number, so this value is
+/// CHOSEN on the same reasoning as [`MAX_ADDRESS_LISTS`]: an `Address` is at most 320
+/// bytes, so [`MAX_ADDRESS_LISTS`] lists of this many members bound the addresses this
+/// process holds to tens of megabytes, while leaving ordinary use far from the ceiling.
+pub const MAX_ADDRESS_LIST_MEMBERS: usize = 1_000;
+
+/// The key an address-list member is stored and looked up under: the address with its
+/// DOMAIN folded to lower case and its local part left exactly as the caller spelled it.
+///
+/// A domain is a DNS name, which is compared without regard to case, while the local part
+/// of an address is not — so `user@Example.COM` and `user@example.com` name ONE member,
+/// while `User@example.com` and `user@example.com` name two. A value that is a bare domain
+/// has no local part at all, so it folds whole.
+///
+/// The reading is the workspace's one (`::service_common::ses_identities::identity_key`),
+/// which the SES surfaces key their email identities by: these are the same mail addresses
+/// under the same rule, so there is one answer here to what folds and what does not.
+pub fn member_address_key(address: &str) -> String {
+    ::service_common::ses_identities::identity_key(address)
+}
+
+/// Whether `address` is a value an address list can hold.
+///
+/// `SavedAddress$Address` is "The email or domain that constitutes the address", so either
+/// an email address or a bare domain name; the form of each is the workspace's one reading
+/// (`::service_common::email_address`). `Address` is modelled only as a 3..320 string, so
+/// the boundary validator admits any text of that length and reading the form is the
+/// handler's job: a value that is neither names no mailbox and no domain.
+pub fn is_registrable_address(address: &str) -> bool {
+    ::service_common::email_address::is_email_address(address)
+        || ::service_common::email_address::is_domain_name(address)
+}
+
+/// What a member operation reports for an `Address` that is neither an email address nor a
+/// domain name ([`is_registrable_address`]).
+///
+/// `Address` is `@sensitive`, so the refusal names the member and the requirement and
+/// states no value — the same half a boundary refusal drops for such a member.
+pub const ADDRESS_NOT_AN_ADDRESS: &str = "Address must be an email address or a domain name.";
 
 /// The `ImportJobStatus` a created address-list import job carries.
 ///
@@ -219,6 +275,9 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_import_job_id`]; see
     /// [`Self::archive_sequence`].
     pub import_job_sequence: u64,
+    /// The secret THIS store's pagination tokens are authenticated under; see
+    /// [`encode_page_token`].
+    pub page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsMailmanagerMailmanagersvcState {
@@ -291,6 +350,35 @@ fn mint_id(sequence: u64, now_millis: i64) -> String {
     let high = splitmix64((now_millis as u64) ^ sequence.rotate_left(32));
     let low = splitmix64(sequence);
     format!("{high:016x}{low:016x}")
+}
+
+/// The secret this service's page tokens are authenticated under — the shared one every
+/// paginated read of this emulator uses, so no two services disagree about what makes a
+/// continuation token one the service ISSUED.
+///
+/// A continuation token carries the position itself (there is no page kept on the side to
+/// look up), so only the authenticator over that position tells a token this store minted
+/// from one a caller wrote: a paginated read can then refuse a value it did not issue
+/// instead of serving a page from a position the caller chose. A token minted under another
+/// store's key — another emulator process, a restarted one — names no position here either.
+pub use ::service_common::page_tokens::PageTokenKey;
+
+/// Encode `cursor` as an opaque `NextToken` this store can later recognise as its own: the
+/// authenticated bytes of the cursor, hex-encoded.
+///
+/// Hex is this service's spelling for an opaque token — it is what makes the value one a
+/// caller round-trips rather than constructs. The widest cursor is an `Address` (320 bytes
+/// at most), so the token is at most 704 characters, inside `PaginationToken`'s modelled
+/// 1..2048 length.
+pub fn encode_page_token(key: &PageTokenKey, cursor: &str) -> String {
+    ::hex::encode(key.mint(cursor))
+}
+
+/// The cursor a `NextToken` carries, or `None` for any token THIS store did not mint — one
+/// that is not hex, one too short to carry an authenticator, one whose authenticator does
+/// not match the cursor it travels with, and one whose cursor is not UTF-8.
+pub fn decode_page_token(key: &PageTokenKey, token: &str) -> Option<String> {
+    key.cursor_of(&::hex::decode(token).ok()?)
 }
 
 /// The message a handler reports when the shared store cannot be reached.

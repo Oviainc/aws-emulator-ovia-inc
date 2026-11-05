@@ -22,13 +22,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Renders an authenticated `ListMembersOfAddressList` continuation token as the opaque
+# string that travels on the wire, and reads one back.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

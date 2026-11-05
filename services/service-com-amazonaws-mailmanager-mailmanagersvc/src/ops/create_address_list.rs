@@ -228,6 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `LastUpdatedTimestamp` is its creation instant.
             last_updated_at_millis: now,
             tags: input.tags.unwrap_or_default(),
+            // A created address list holds no addresses yet; `RegisterMemberToAddressList`
+            // is what puts one in it.
+            members: ::std::collections::BTreeMap::new(),
         };
 
         store

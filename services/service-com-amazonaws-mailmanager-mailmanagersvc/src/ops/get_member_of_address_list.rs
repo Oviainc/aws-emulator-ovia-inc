@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMemberOfAddressList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMemberOfAddressList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMemberOfAddressList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored member of an address list — the address as it is
+//! stored (`crate::state::member_address_key`) and the instant it was added. The lookup is
+//! by that same stored key, so an address whose DOMAIN differs only in letter case names
+//! the same member and one whose LOCAL PART does names another; a member the list does not
+//! hold is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMemberOfAddressList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMemberOfAddressListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMemberOfAddressList"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(GetMemberOfAddressListErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The form of `Address` is this handler's to read for the same reason it is
+        // `RegisterMemberToAddressList`'s: the model bounds only its length, and a value
+        // that is no address names no member of any list.
+        if !crate::state::is_registrable_address(&input.address) {
+            return Err(GetMemberOfAddressListErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::ADDRESS_NOT_AN_ADDRESS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `@readonly`: this handler only reports what is stored, and a membership has no
+        // state the clock owes a transition to.
+        let store = state.lock();
+
+        let Some(record) = store.address_lists.get(&input.address_list_id) else {
+            return Err(GetMemberOfAddressListErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Address list {} not found.",
+                        input.address_list_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let address = crate::state::member_address_key(&input.address);
+        let Some(created_at_millis) = record.members.get(&address) else {
+            // The membership is what is missing, not the list: the refusal names the
+            // member that was looked for and the list it was looked for in. `Address` is
+            // `@sensitive`, so it states no address at all — neither the value it was
+            // handed nor the key that value folds to.
+            return Err(GetMemberOfAddressListErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Could not find Address in AddressList {}",
+                        input.address_list_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetMemberOfAddressListOutput {
+            // The address as it is STORED, not as this request spelled it: that is the
+            // value every read of this member reports and the one a caller can present
+            // back.
+            address,
+            created_timestamp: crate::state::timestamp(*created_at_millis),
+        })
     }
 }
