@@ -17,6 +17,15 @@
 //! Sharing with a principal outside the owning account's organization also stores an
 //! **invitation**, keyed by its own ARN, beside the share: the invited account joins
 //! the share only once it answers, so what is pending for it is a record of its own.
+//!
+//! Managed permissions are kept in one map too, and a fresh store already holds the
+//! AWS managed permissions RAM ships ([`aws_managed_permissions`]): those exist before
+//! any caller creates anything, so the permissions one account created and the ones
+//! Amazon Web Services maintains are read back through the same lookup.
+
+mod aws_managed_permissions;
+
+pub use aws_managed_permissions::*;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -304,9 +313,10 @@ pub const PERMISSION_ARN_RESOURCE_PREFIX: &str = "permission/";
 /// The `PermissionType` of a permission `CreatePermission` minted.
 ///
 /// From `ResourceSharePermissionSummary$permissionType`: `CUSTOMER_MANAGED` is the
-/// one "you, or another principal in your account created"; `AWS_MANAGED` is one
-/// "Amazon Web Services created and manages", which no operation in this crate can
-/// produce.
+/// one "you, or another principal in your account created"; `AWS_MANAGED`
+/// ([`PERMISSION_TYPE_AWS_MANAGED`]) is one "Amazon Web Services created and
+/// manages", which no operation in this crate can produce — those are the catalog
+/// entries the store is seeded with.
 pub const PERMISSION_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
 
 /// The `PermissionFeatureSet` of a permission created through the RAM API: the one
@@ -338,11 +348,12 @@ pub const POLICY_TEMPLATE_ACTION_ELEMENT: &str = "Action";
 /// The optional `Condition` element of a policy template.
 pub const POLICY_TEMPLATE_CONDITION_ELEMENT: &str = "Condition";
 
-/// The most managed permissions this emulator's store holds. Emulator resource
-/// guard, worded as RAM's own refusal: a create past the cap answers
+/// The most managed permissions one account may CREATE in this emulator's store.
+/// Emulator resource guard, worded as RAM's own refusal: a create past the cap answers
 /// `PermissionLimitExceededException`, which RAM raises when a create "would exceed
 /// the maximum number of permissions you can create in each Amazon Web Services
-/// Region".
+/// Region". It counts the customer managed permissions only — the AWS managed catalog
+/// the store is seeded with is not something a caller created.
 pub const MAX_PERMISSIONS: usize = 500;
 
 /// The longest policy template this emulator reads and stores. Emulator resource
@@ -376,6 +387,7 @@ pub struct ResourceTypeEntry {
 /// resources there are shared only through the permissions Amazon Web Services
 /// manages for them.
 pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
+    resource_type_entry("apigateway:Domainnames", false),
     resource_type_entry("appmesh:Mesh", true),
     resource_type_entry("cloudtrail:EventDataStore", true),
     resource_type_entry("codebuild:Project", true),
@@ -802,7 +814,7 @@ pub struct ClientTokenRecord {
 
 /// Per-service state for com-amazonaws-ram-amazonresourcesharing. A handler reaches
 /// it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsRamAmazonresourcesharingState {
     /// Every resource share, live or tombstoned, keyed by its ARN.
     pub resource_shares: BTreeMap<String, ShareRecord>,
@@ -812,9 +824,11 @@ pub struct ComAmazonawsRamAmazonresourcesharingState {
     /// created only beside a principal association, dropped with its share, and
     /// capped per share by [`MAX_INVITATIONS_PER_SHARE`].
     pub invitations: BTreeMap<String, InvitationRecord>,
-    /// Every managed permission this account has created, keyed by its ARN. A
-    /// permission's name is unique within a Region and its ARN carries that name, so
-    /// one name in one Region is one entry here.
+    /// Every managed permission this service holds, keyed by its ARN: the ones this
+    /// account created and the AWS managed catalog RAM ships, which a fresh store
+    /// already carries ([`aws_managed_permissions::catalog_records`]). A permission's
+    /// name is unique within a Region and its ARN carries that name, so one name in
+    /// one Region is one entry here.
     pub permissions: BTreeMap<String, PermissionRecord>,
     /// `(operation, clientToken)` -> what that token already did.
     client_tokens: HashMap<(String, String), ClientTokenRecord>,
@@ -825,6 +839,24 @@ pub struct ComAmazonawsRamAmazonresourcesharingState {
     id_counter: u64,
     /// The last instant handed out by [`Self::tick`].
     clock: i64,
+}
+
+impl Default for ComAmazonawsRamAmazonresourcesharingState {
+    /// A fresh store holds no share, association or invitation — and the whole AWS
+    /// managed permission catalog, because those permissions are RAM's own and are
+    /// there to be read and attached before any caller has created anything.
+    fn default() -> Self {
+        Self {
+            resource_shares: BTreeMap::new(),
+            associations: BTreeMap::new(),
+            invitations: BTreeMap::new(),
+            permissions: aws_managed_permissions::catalog_records(now_millis()),
+            client_tokens: HashMap::new(),
+            client_token_order: VecDeque::new(),
+            id_counter: 0,
+            clock: 0,
+        }
+    }
 }
 
 impl ComAmazonawsRamAmazonresourcesharingState {
@@ -919,6 +951,17 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     pub fn insert_permission(&mut self, permission: PermissionRecord) {
         self.permissions
             .insert(permission.arn.clone(), permission);
+    }
+
+    /// How many managed permissions this account has CREATED, which is what the
+    /// create cap counts: the AWS managed catalog the store is seeded with was created
+    /// by Amazon Web Services, not by a caller, so it does not count against what a
+    /// caller may create.
+    pub fn customer_managed_permission_count(&self) -> usize {
+        self.permissions
+            .values()
+            .filter(|permission| permission.permission_type == PERMISSION_TYPE_CUSTOMER_MANAGED)
+            .count()
     }
 
     /// How many associations the share `arn` holds, which the per-share cap counts.

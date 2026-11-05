@@ -3,7 +3,10 @@
 //! @op GetPermission
 //! Reports one version of the managed permission [`crate::state`] holds under the ARN
 //! the request names — the version it asked for, or the permission's default version
-//! when it asked for none.
+//! when it asked for none. The store holds both kinds: the customer managed
+//! permissions this account created and the AWS managed permissions RAM ships, whose
+//! ARNs name no Region and no account (`arn:aws:ram::aws:permission/<PermissionName>`),
+//! so either resolves through the same lookup.
 //!
 //! A pure read: it writes nothing, so what a create stored is what this reports.
 //!

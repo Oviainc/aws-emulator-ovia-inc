@@ -322,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The store is finite: a create that would take it past its cap is refused
         // rather than growing it, the way RAM refuses one past its quota.
-        if store.permissions.len() >= crate::state::MAX_PERMISSIONS {
+        if store.customer_managed_permission_count() >= crate::state::MAX_PERMISSIONS {
             return Err(
                 CreatePermissionErrorModeled::PermissionLimitExceededException(
                     PermissionLimitExceededException {
