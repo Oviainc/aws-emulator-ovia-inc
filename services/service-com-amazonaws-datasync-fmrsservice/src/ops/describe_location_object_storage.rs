@@ -184,13 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another kind of location are both refused, worded in `crate::state`.
         let (location, object_storage) = store
             .object_storage_location(&input.location_arn)
-            .map_err(|message| {
+            .map_err(|refusal| {
                 DescribeLocationObjectStorageErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(message),
-                        error_code: None,
-                        datasync_error_code: None,
-                    },
+                    refusal.into_invalid_request(),
                 )
             })?;
 

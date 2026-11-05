@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the transfer location a `CreateLocation*` stored in [`crate::state`], so no
+//! later read of its ARN resolves it again.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +130,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLocation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteLocationErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        // The service holds a location only because a create stored it, so an ARN that
+        // resolves to nothing is refused and nothing is removed — worded and classified
+        // in `crate::state`, the same way every operation that resolves a `LocationArn`
+        // reports a location the account does not hold. A location of any kind is
+        // removed by the one ARN that addresses it, so no kind is named here.
+        store
+            .remove_location(&input.location_arn)
+            .map_err(|refusal| {
+                DeleteLocationErrorModeled::InvalidRequestException(refusal.into_invalid_request())
+            })?;
+        drop(store);
+
+        Ok(DeleteLocationOutput {})
     }
 }

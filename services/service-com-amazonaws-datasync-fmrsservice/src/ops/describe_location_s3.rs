@@ -167,15 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(::std::time::SystemTime::now());
         // An ARN addresses one location of one kind: an unknown ARN and an ARN naming
         // another kind of location are both refused, worded in `crate::state`.
-        let (location, s3) = store
-            .s3_location(&input.location_arn)
-            .map_err(|message| {
-                DescribeLocationS3ErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some(message),
-                    error_code: None,
-                    datasync_error_code: None,
-                })
-            })?;
+        let (location, s3) = store.s3_location(&input.location_arn).map_err(|refusal| {
+            DescribeLocationS3ErrorModeled::InvalidRequestException(refusal.into_invalid_request())
+        })?;
 
         Ok(DescribeLocationS3Output {
             location_arn: Some(location.arn.clone()),

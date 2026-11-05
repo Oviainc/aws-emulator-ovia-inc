@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 location.agent_arns.is_empty(),
                 object_storage.secret.clone(),
             ),
-            Err(message) => return Err(invalid_request(message)),
+            Err(refusal) => return Err(refused(refusal)),
         };
 
         // A location created without an agent is agentless for life: an agentless
@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let location = match store.object_storage_location_mut(&input.location_arn) {
             Ok(location) => location,
-            Err(message) => return Err(invalid_request(message)),
+            Err(refusal) => return Err(refused(refusal)),
         };
 
         // Every member the request names replaces what the location held; the rest
@@ -300,4 +300,11 @@ fn invalid_request(message: String) -> UpdateLocationObjectStorageError {
         datasync_error_code: None,
     })
     .into()
+}
+
+/// A refusal this request earned from resolving its `LocationArn`, reported through the
+/// modelled client error with the class discriminator `crate::state` gave it.
+fn refused(refusal: crate::state::LocationRefusal) -> UpdateLocationObjectStorageError {
+    UpdateLocationObjectStorageErrorModeled::InvalidRequestException(refusal.into_invalid_request())
+        .into()
 }

@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CmkSecretConfig, CustomSecretConfig, Ec2Config, FilterRule, ManifestConfig, Options, S3Config,
-    TagListEntry, TaskReportConfig, TaskSchedule,
+    CmkSecretConfig, CustomSecretConfig, Ec2Config, FilterRule, InvalidRequestException,
+    ManifestConfig, Options, S3Config, TagListEntry, TaskReportConfig, TaskSchedule,
 };
 
 /// How long each clock-owed transition takes.
@@ -63,7 +63,7 @@ pub const LIST_TASKS_DEFAULT_PAGE_SIZE: usize = 100;
 
 /// A RESOURCE GUARD, not an AWS-published quota: every create call appends one record to
 /// one of this service's stores, which live in memory for the lifetime of the process and
-/// never expire (only `DeleteTask` removes anything), so each store needs a ceiling of its
+/// never expire (only a `Delete*` call removes anything), so each store needs a ceiling of its
 /// own. A create that would take a store past its ceiling is refused with the modelled
 /// client error — see [`ResourceStore`] and
 /// [`ComAmazonawsDatasyncFmrsserviceState::at_capacity`] — rather than growing the map.
@@ -615,7 +615,10 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     }
 
     /// The Amazon S3 location stored under `arn`, with its S3 configuration.
-    pub fn s3_location(&self, arn: &str) -> Result<(&Location, &S3LocationConfig), String> {
+    pub fn s3_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &S3LocationConfig), LocationRefusal> {
         self.located(arn, LocationKind::S3, LocationConfig::as_s3)
     }
 
@@ -623,12 +626,15 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     pub fn azure_blob_location(
         &self,
         arn: &str,
-    ) -> Result<(&Location, &AzureBlobLocationConfig), String> {
+    ) -> Result<(&Location, &AzureBlobLocationConfig), LocationRefusal> {
         self.located(arn, LocationKind::AzureBlob, LocationConfig::as_azure_blob)
     }
 
     /// The Amazon EFS location stored under `arn`, with its EFS configuration.
-    pub fn efs_location(&self, arn: &str) -> Result<(&Location, &EfsLocationConfig), String> {
+    pub fn efs_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &EfsLocationConfig), LocationRefusal> {
         self.located(arn, LocationKind::Efs, LocationConfig::as_efs)
     }
 
@@ -637,7 +643,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     pub fn object_storage_location(
         &self,
         arn: &str,
-    ) -> Result<(&Location, &ObjectStorageLocationConfig), String> {
+    ) -> Result<(&Location, &ObjectStorageLocationConfig), LocationRefusal> {
         self.located(
             arn,
             LocationKind::ObjectStorage,
@@ -651,7 +657,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     pub fn object_storage_location_mut(
         &mut self,
         arn: &str,
-    ) -> Result<ObjectStorageLocationMut<'_>, String> {
+    ) -> Result<ObjectStorageLocationMut<'_>, LocationRefusal> {
         let Location {
             location_uri,
             subdirectory,
@@ -661,9 +667,9 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         } = self
             .locations
             .get_mut(arn)
-            .ok_or_else(|| location_not_found_message(arn))?;
+            .ok_or_else(|| LocationRefusal::not_found(arn))?;
         let config = config.as_object_storage_mut().ok_or_else(|| {
-            location_kind_mismatch_message(arn, LocationKind::ObjectStorage)
+            LocationRefusal::kind_mismatch(arn, LocationKind::ObjectStorage)
         })?;
         Ok(ObjectStorageLocationMut {
             location_uri,
@@ -728,14 +734,25 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         arn: &str,
         kind: LocationKind,
         pick: fn(&'a LocationConfig) -> Option<&'a C>,
-    ) -> Result<(&'a Location, &'a C), String> {
+    ) -> Result<(&'a Location, &'a C), LocationRefusal> {
         let location = self
             .locations
             .get(arn)
-            .ok_or_else(|| location_not_found_message(arn))?;
+            .ok_or_else(|| LocationRefusal::not_found(arn))?;
         let config =
-            pick(&location.config).ok_or_else(|| location_kind_mismatch_message(arn, kind))?;
+            pick(&location.config).ok_or_else(|| LocationRefusal::kind_mismatch(arn, kind))?;
         Ok((location, config))
+    }
+
+    /// Remove the location stored under `arn`, as `DeleteLocation` does.
+    ///
+    /// `Err` is the refusal an ARN naming no location this account holds earns: the
+    /// service holds a location only because a create stored it, so a delete of an ARN
+    /// that resolves to nothing is a client error and nothing is removed.
+    pub fn remove_location(&mut self, arn: &str) -> Result<Location, LocationRefusal> {
+        self.locations
+            .remove(arn)
+            .ok_or_else(|| LocationRefusal::not_found(arn))
     }
 
     /// Tasks in creation order — the order `ListTasks` pages over.
@@ -813,21 +830,59 @@ pub fn default_server_port(server_protocol: &str) -> i32 {
     }
 }
 
-/// DataSync's not-found refusal text for a location.
+/// The class discriminator DataSync reports for a request that names a location the
+/// account does not hold.
 ///
-/// One wording for every operation that resolves a `LocationArn`, so a read, an
-/// update and a task create all report a missing location the same way.
-pub fn location_not_found_message(location_arn: &str) -> String {
-    format!("Location {location_arn} is not found.")
+/// Every client failure of every DataSync operation is the one modelled client error,
+/// so the refusal CLASS is carried by the two code members of that error rather than by
+/// a distinct exception shape — and a caller branching on "the location is gone" reads
+/// it there.
+pub const LOCATION_NOT_FOUND_CODE: &str = "LocationNotFound";
+
+/// Why resolving a `LocationArn` against this service's state refused the request.
+///
+/// Carries what the modelled client error reports: the message, and the class
+/// discriminator when the refusal class has one. One refusal type for every operation
+/// that resolves a location, so a read, an update and a delete word and classify a
+/// missing location the same way.
+#[derive(Debug, Clone)]
+pub struct LocationRefusal {
+    pub message: String,
+    /// The value BOTH `errorCode` and `datasyncErrorCode` carry, when this refusal
+    /// class has a published discriminator.
+    pub error_code: Option<String>,
 }
 
-/// The refusal text for an ARN that names a location of another kind than the one the
-/// asking operation reports on.
-pub fn location_kind_mismatch_message(location_arn: &str, expected: LocationKind) -> String {
-    format!(
-        "Location {location_arn} is not {described} location.",
-        described = expected.described()
-    )
+impl LocationRefusal {
+    /// The refusal an ARN that names no location this account holds earns.
+    pub fn not_found(location_arn: &str) -> Self {
+        Self {
+            message: format!("Location {location_arn} is not found."),
+            error_code: Some(LOCATION_NOT_FOUND_CODE.to_string()),
+        }
+    }
+
+    /// The refusal an ARN that names a location of another kind than the one the asking
+    /// operation reports on earns.
+    pub fn kind_mismatch(location_arn: &str, expected: LocationKind) -> Self {
+        Self {
+            message: format!(
+                "Location {location_arn} is not {described} location.",
+                described = expected.described()
+            ),
+            error_code: None,
+        }
+    }
+
+    /// This refusal as the modelled client error every location operation reports it
+    /// through: one discriminator fills both code members.
+    pub fn into_invalid_request(self) -> InvalidRequestException {
+        InvalidRequestException {
+            message: Some(self.message),
+            error_code: self.error_code.clone(),
+            datasync_error_code: self.error_code,
+        }
+    }
 }
 
 /// An object storage location borrowed for an update: the members every location has

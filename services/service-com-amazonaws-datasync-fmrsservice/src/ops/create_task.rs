@@ -214,11 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("DestinationLocationArn", &input.destination_location_arn),
         ] {
             if !store.locations.contains_key(arn) {
+                // The class discriminator for a missing location is the same wherever a
+                // `LocationArn` fails to resolve; only this operation's own wording of
+                // which member carried it is local.
+                let code = Some(crate::state::LOCATION_NOT_FOUND_CODE.to_string());
                 return Err(CreateTaskErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         message: Some(format!("{member} {arn} is not found.")),
-                        error_code: None,
-                        datasync_error_code: None,
+                        error_code: code.clone(),
+                        datasync_error_code: code,
                     },
                 )
                 .into());

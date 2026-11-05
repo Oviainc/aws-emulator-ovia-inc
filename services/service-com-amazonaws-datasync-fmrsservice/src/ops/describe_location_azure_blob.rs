@@ -185,13 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An ARN addresses one location of one kind: an unknown ARN and an ARN naming
         // another kind of location are both refused, worded in `crate::state`.
         let (location, azure_blob) = store.azure_blob_location(&input.location_arn).map_err(
-            |message| {
+            |refusal| {
                 DescribeLocationAzureBlobErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(message),
-                        error_code: None,
-                        datasync_error_code: None,
-                    },
+                    refusal.into_invalid_request(),
                 )
             },
         )?;
