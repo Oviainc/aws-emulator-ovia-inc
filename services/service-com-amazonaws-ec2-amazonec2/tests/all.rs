@@ -1309,12 +1309,13 @@ mod unmonitor_instances;
 // it refuses, and the minting outcome the clock owes an AFI it is read through. Declared beside
 #[path = "all/describe_fpga_images.rs"]
 mod describe_fpga_images;
-// file is where every new ec2 suite inserts its lines. What `DeleteTransitGatewayRouteTable`
-// removes — the transit gateway route table the request names with the propagations and prefix
-// list references stored in it — the state it answers that table with, and the ids, default
-// roles, standing associations and dry run it refuses without removing anything.
-#[path = "all/delete_transit_gateway_route_table.rs"]
-mod delete_transit_gateway_route_table;
+// What `DeleteInternetGateway` takes out of the internet gateway store: the one gateway the
+// request names, the gateway it leaves where it was, and the attachment, the unresolvable id
+// and the dry run it refuses without removing anything — beside the `DetachInternetGateway`
+// its doc requires first, which frees the VPC and blackholes the routes that pointed at the
+// gateway.
+#[path = "all/delete_internet_gateway.rs"]
+mod delete_internet_gateway;
 // What `ModifyManagedPrefixList` revises on one managed prefix list of the account: the entry
 // set it computes from the one the list holds, the version a revision of that set mints while a
 // rename leaves it alone, the entries the superseded version keeps, the state the clock settles
@@ -1322,3 +1323,9 @@ mod delete_transit_gateway_route_table;
 // position, for the reason the note at the top of this file gives.
 #[path = "all/modify_managed_prefix_list.rs"]
 mod modify_managed_prefix_list;
+// file is where every new ec2 suite inserts its lines. What `DeleteTransitGatewayRouteTable`
+// removes — the transit gateway route table the request names with the propagations and prefix
+// list references stored in it — the state it answers that table with, and the ids, default
+// roles, standing associations and dry run it refuses without removing anything.
+#[path = "all/delete_transit_gateway_route_table.rs"]
+mod delete_transit_gateway_route_table;

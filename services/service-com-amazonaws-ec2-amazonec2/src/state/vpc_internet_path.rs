@@ -94,6 +94,11 @@ pub const INVALID_GATEWAY_ID_NOT_FOUND: &str = "InvalidGatewayID.NotFound";
 /// `RouteTableLimitExceeded`).
 pub const ROUTE_TABLE_LIMIT_EXCEEDED: &str = "RouteTableLimitExceeded";
 
+/// EC2's error code for a detach of a gateway and a network that are not attached to each
+/// other (EC2 API "Error codes": `Gateway.NotAttached` — "the specified internet gateway is
+/// not attached to the specified VPC").
+pub const GATEWAY_NOT_ATTACHED: &str = "Gateway.NotAttached";
+
 /// Refuse a request that named a route table id this account holds no table for: HTTP 400
 /// [`INVALID_ROUTE_TABLE_ID_NOT_FOUND`], worded the same way.
 pub fn invalid_route_table_id_not_found<E>(route_table_id: &str) -> Scaffolded<E> {
@@ -157,6 +162,18 @@ pub fn resource_already_attached<E>(internet_gateway_id: &str, vpc_id: &str) -> 
         super::RESOURCE_ALREADY_ASSOCIATED,
         400,
         format!("resource {internet_gateway_id} is already attached to network {vpc_id}"),
+    )
+}
+
+/// Refuse a detach of a pair that is not attached: HTTP 400 [`GATEWAY_NOT_ATTACHED`], the
+/// mirror of [`resource_already_attached`] — a detach of a gateway this network does not have
+/// cannot answer as though it had removed an attachment, and the message names the pair the
+/// request sent, whichever side of it is not the one that holds.
+pub fn resource_not_attached<E>(internet_gateway_id: &str, vpc_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        GATEWAY_NOT_ATTACHED,
+        400,
+        format!("resource {internet_gateway_id} is not attached to network {vpc_id}"),
     )
 }
 
@@ -433,6 +450,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// minted — so there is nothing to charge against the byte budget, and the gateway's own
     /// charge stays exactly what [`Self::insert_internet_gateway`] took.
     ///
+    /// A route of that VPC already pointing at the gateway becomes reachable again with it
+    /// ([`Self::restate_routes_to_gateway`]): `Route$State` is `blackhole` exactly while "the
+    /// specified gateway isn't attached to the VPC", so an attachment is what makes such a
+    /// route `active`, and the detach below is what takes it back.
+    ///
     /// `false`, with nothing written, for a gateway the store does not hold.
     pub fn attach_internet_gateway(&mut self, internet_gateway_id: &str, vpc_id: &str) -> bool {
         let Some(internet_gateway) = self.internet_gateways.get_mut(internet_gateway_id) else {
@@ -445,6 +467,65 @@ impl ComAmazonawsEc2Amazonec2State {
                 state: Some(INTERNET_GATEWAY_ATTACHMENT_STATE_AVAILABLE.to_string()),
                 vpc_id: Some(vpc_id.to_string()),
             });
+        self.restate_routes_to_gateway(internet_gateway_id, vpc_id, ROUTE_STATE_ACTIVE);
+        true
+    }
+
+    /// Write `state` into every route of the VPC `vpc_id` whose target is the internet
+    /// gateway `internet_gateway_id`.
+    ///
+    /// The ONE place a route's state follows its gateway's attachment, so the attach and the
+    /// detach cannot report one route two ways: a route's state is STORED rather than
+    /// recomputed on read ([`RouteSpec::into_route`]), and the two writers of an attachment
+    /// are what move it — [`ROUTE_STATE_ACTIVE`] while the gateway attaches the VPC the table
+    /// routes for, [`ROUTE_STATE_BLACKHOLE`] while it does not.
+    fn restate_routes_to_gateway(&mut self, internet_gateway_id: &str, vpc_id: &str, state: &str) {
+        for route_table in self.route_tables.values_mut() {
+            if route_table.vpc_id.as_deref() != Some(vpc_id) {
+                continue;
+            }
+            for route in route_table.routes.iter_mut().flatten() {
+                if route.gateway_id.as_deref() == Some(internet_gateway_id) {
+                    route.state = Some(state.to_string());
+                }
+            }
+        }
+    }
+
+    /// Take the attachment between the internet gateway `internet_gateway_id` and the VPC
+    /// `vpc_id` away, and answer whether one was there to take.
+    ///
+    /// The one REMOVER of an `InternetGateway$Attachments` entry, the mirror of
+    /// [`Self::attach_internet_gateway`]: the attachment is the pair, so what goes is the
+    /// entry that names this VPC and nothing else. "For an internet gateway, the state is
+    /// `available` when attached to a VPC; otherwise, this value is not returned"
+    /// ([`INTERNET_GATEWAY_ATTACHMENT_STATE_AVAILABLE`]), so a gateway left with no
+    /// attachment keeps the present and EMPTY attachment set a gateway attached to nothing is
+    /// reported with.
+    ///
+    /// A route of that VPC pointing at the gateway goes to [`ROUTE_STATE_BLACKHOLE`] with it
+    /// ([`Self::restate_routes_to_gateway`], which the attach above calls the other way):
+    /// that is what `Route$State` means by `blackhole` — "the specified gateway isn't
+    /// attached to the VPC" — so the detach is what makes the route's target unavailable, and
+    /// no reader has to recompute it.
+    ///
+    /// `false`, with nothing written, for a gateway the store does not hold or one this VPC
+    /// is not attached to.
+    pub fn detach_internet_gateway(&mut self, internet_gateway_id: &str, vpc_id: &str) -> bool {
+        let Some(internet_gateway) = self.internet_gateways.get_mut(internet_gateway_id) else {
+            return false;
+        };
+        let Some(attachments) = internet_gateway.attachments.as_mut() else {
+            // A gateway holding no attachment set at all attaches nothing, so there is
+            // nothing to take and nothing to write.
+            return false;
+        };
+        let held = attachments.len();
+        attachments.retain(|attachment| attachment.vpc_id.as_deref() != Some(vpc_id));
+        if attachments.len() == held {
+            return false;
+        }
+        self.restate_routes_to_gateway(internet_gateway_id, vpc_id, ROUTE_STATE_BLACKHOLE);
         true
     }
 

@@ -133,4 +133,22 @@ impl ComAmazonawsEc2Amazonec2State {
             .insert(internet_gateway_id.clone(), internet_gateway);
         Some(internet_gateway_id)
     }
+
+    /// Remove the internet gateway `internet_gateway_id` names and answer it as it was last
+    /// reported, or `None` when the store holds no such gateway.
+    ///
+    /// The answer is the record the removal took OUT of the store, on the contract
+    /// [`Self::remove_network_acl`] has: what a delete reports is what the readers reported,
+    /// never a second copy built beside it. The bytes the record holds go back to the store's
+    /// budget on exactly the terms [`Self::insert_internet_gateway`] took them on, read off
+    /// the tags the record holds NOW — `CreateTags` and `DeleteTags` reach a gateway's tags
+    /// too, so the charge the store is carrying for this record is the one its current tags
+    /// define, not the one its create happened to take.
+    pub fn remove_internet_gateway(&mut self, internet_gateway_id: &str) -> Option<InternetGateway> {
+        let internet_gateway = self.internet_gateways.remove(internet_gateway_id)?;
+        self.release_stored_bytes(internet_gateway_payload_bytes(
+            internet_gateway.tags.as_deref().unwrap_or_default(),
+        ));
+        Some(internet_gateway)
+    }
 }

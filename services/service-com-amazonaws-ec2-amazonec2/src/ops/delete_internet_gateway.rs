@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInternetGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInternetGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInternetGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the internet gateway the request names from [`crate::state`], so
+//! every read of it afterwards answers the not-found refusal for its id, and refuses a
+//! gateway still attached to a VPC. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInternetGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInternetGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInternetGateway"))
+        use crate::state;
+
+        // An internet gateway carries no Region or ARN member, and the ambient default
+        // network of a Region holds no gateway, so nothing this delete reads or writes is a
+        // fact of the Region the request was signed for. The store is reached through the
+        // engine held on `self`, the way `AttachInternetGateway` reaches it.
+        let _ = ctx;
+
+        // No clock-owed transition is materialised here, unlike `DetachInternetGateway`,
+        // whose refusal reads an instance's state: nothing this delete reads moves with the
+        // clock — a gateway has one state, and its attachment is written only by the attach
+        // and the detach.
+
+        let internet_gateway_id = input.internet_gateway_id.as_str();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "The ID of the internet gateway" (`$InternetGatewayId`): a delete that removed
+        // nothing must never answer as though it had. `InternetGatewayId` publishes no
+        // pattern, so an id of ANY form that names no gateway of the account is the one
+        // refusal `AttachInternetGateway` and `DescribeInternetGateways` answer for it.
+        if !store.internet_gateways.contains_key(internet_gateway_id) {
+            return Err(state::invalid_internet_gateway_id_not_found(
+                internet_gateway_id,
+            ));
+        }
+
+        // "You must detach the internet gateway from the VPC before you can delete it"
+        // (this operation's own doc): the attachment is the gateway's dependency, and it is
+        // cleared by `DetachInternetGateway`, never by this delete.
+        if store
+            .internet_gateway_attached_vpc(internet_gateway_id)
+            .is_some()
+        {
+            return Err(state::dependency_violation(format!(
+                "The internetGateway '{internet_gateway_id}' has dependencies and cannot be \
+                 deleted."
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Removing is also what RESOLVES the id a second time, so the record that left the
+        // store is the record the checks above were made against — and the removal gives the
+        // bytes the gateway held back to the store's budget.
+        if store.remove_internet_gateway(internet_gateway_id).is_none() {
+            // The gateway was resolved a moment ago and the store is locked throughout, so
+            // this cannot happen — and if it ever did, the request must not answer 200 for a
+            // removal that removed nothing.
+            return Err(state::internal_error(
+                "the internet gateway checked a moment ago could not be removed",
+            ));
+        }
+
+        // The operation's modelled output is `Unit`, so there is nothing to project.
+        Ok(DeleteInternetGatewayOutput)
     }
 }

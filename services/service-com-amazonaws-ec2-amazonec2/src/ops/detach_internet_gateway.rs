@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachInternetGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachInternetGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachInternetGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the attachment between the internet gateway and the VPC the request
+//! names out of [`crate::state`], so the gateway reads back attached to nothing and a route
+//! of that VPC pointing at it reads back as a blackhole. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachInternetGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachInternetGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachInternetGateway"))
+        use crate::state;
+
+        // An internet gateway carries no Region or ARN member, and both sides of the pair
+        // this call acts on are named by id, so nothing here is a fact of the Region the
+        // request was signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let internet_gateway_id = input.internet_gateway_id.as_str();
+        let vpc_id = input.vpc_id.as_str();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed transitions this call is allowed to apply before it reads, on the
+        // terms `AttachInternetGateway` applies them: they were already owed at this instant
+        // whether or not anybody called, and an instance's state decides the refusal below.
+        store.materialize_due_transitions();
+
+        // "The ID of the internet gateway" and "the ID of the VPC": an id this account holds
+        // no resource for is a refusal, not a detachment of nothing. The gateway is resolved
+        // first, it being the resource the operation acts on, exactly as the attach resolves
+        // the pair.
+        if !store.internet_gateways.contains_key(internet_gateway_id) {
+            return Err(state::invalid_internet_gateway_id_not_found(
+                internet_gateway_id,
+            ));
+        }
+        if !store.vpcs.contains_key(vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(vpc_id));
+        }
+
+        // A pair that is not attached has nothing to detach: answering 200 for it would
+        // report a removal that removed nothing.
+        if store
+            .internet_gateway_attached_vpc(internet_gateway_id)
+            .as_deref()
+            != Some(vpc_id)
+        {
+            return Err(state::resource_not_attached(internet_gateway_id, vpc_id));
+        }
+
+        // "The VPC must not contain any running instances with Elastic IP addresses or public
+        // IPv4 addresses" (this operation's own doc): such an instance reaches the internet
+        // THROUGH this gateway, so it is the dependency that holds the attachment — and it is
+        // cleared by releasing the address or terminating the instance, never by this detach.
+        // An instance's public address is the one member either kind of address is reported
+        // in (`Instance$PublicIpAddress`), so one reading covers both.
+        if store.instances.values().any(|instance| {
+            instance.state == state::InstanceStateName::Running
+                && instance.public_ip.is_some()
+                && store.instance_is_in_vpc(instance, vpc_id)
+        }) {
+            return Err(state::dependency_violation(format!(
+                "Network {vpc_id} has some mapped public address(es). Please unmap those \
+                 public address(es) before detaching the gateway."
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if !store.detach_internet_gateway(internet_gateway_id, vpc_id) {
+            // The attachment was read a moment ago and the store is locked throughout, so
+            // this cannot happen — and if it ever did, the request must not answer 200 with
+            // the attachment still in place.
+            return Err(state::internal_error(
+                "the internet gateway attachment checked a moment ago could not be removed",
+            ));
+        }
+
+        // The operation's modelled output is `Unit`, so there is nothing to project.
+        Ok(DetachInternetGatewayOutput)
     }
 }
