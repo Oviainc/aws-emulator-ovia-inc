@@ -200,6 +200,7 @@ use super::StoredResource;
 
 mod ec2_vpc_network;
 mod lambda_function;
+mod lambda_layer_version;
 mod lambda_permission;
 
 /// The awsJson media types the services this module calls speak, named once here because
@@ -521,6 +522,8 @@ pub(super) enum Owner {
     Builtin(Provisioner),
     /// `AWS::Lambda::Function`, whose arms are [`lambda_function`]'s.
     LambdaFunction,
+    /// `AWS::Lambda::LayerVersion`, whose arms are [`lambda_layer_version`]'s.
+    LambdaLayerVersion,
     /// `AWS::Lambda::Permission`, whose arms are [`lambda_permission`]'s.
     LambdaPermission,
     /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
@@ -535,6 +538,9 @@ pub(super) enum Owner {
 pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     if resource_type == lambda_function::LAMBDA_FUNCTION {
         return Some(Owner::LambdaFunction);
+    }
+    if resource_type == lambda_layer_version::LAMBDA_LAYER_VERSION {
+        return Some(Owner::LambdaLayerVersion);
     }
     if resource_type == lambda_permission::LAMBDA_PERMISSION {
         return Some(Owner::LambdaPermission);
@@ -562,6 +568,11 @@ impl Owner {
             Self::LambdaFunction => {
                 lambda_function::create(ctx, region, resource, propagated).await
             }
+            // A layer version takes no tags: Lambda's tagging calls address FUNCTIONS, so
+            // there is no call that could carry a tag to one.
+            Self::LambdaLayerVersion => {
+                lambda_layer_version::create(ctx, region, resource).await
+            }
             // A policy statement carries no tags of its own: it is not a resource, so
             // CloudFormation propagates none to it.
             Self::LambdaPermission => lambda_permission::create(ctx, region, resource).await,
@@ -584,6 +595,9 @@ impl Owner {
                 provisioner.readiness(ctx, region, physical_resource_id).await
             }
             Self::LambdaFunction => Ok(lambda_function::readiness()),
+            // The version exists, and a function may name it, the moment
+            // `PublishLayerVersion` answers.
+            Self::LambdaLayerVersion => Ok(Readiness::Ready),
             // The statement is in force the moment `AddPermission` answers.
             Self::LambdaPermission => Ok(Readiness::Ready),
             // Each of these resources EXISTS from the moment its create answers: the table
@@ -612,9 +626,11 @@ impl Owner {
                     .await
             }
             // A function's `Arn` is the one its create answered with, so a resource this
-            // owner created has every attribute it publishes already, and a policy
-            // statement publishes none at all.
-            Self::LambdaFunction | Self::LambdaPermission => Ok(BTreeMap::new()),
+            // owner created has every attribute it publishes already, and neither a layer
+            // version nor a policy statement publishes one at all.
+            Self::LambdaFunction | Self::LambdaLayerVersion | Self::LambdaPermission => {
+                Ok(BTreeMap::new())
+            }
             // Each of these types publishes its own identifier and nothing else, and the
             // create answered it, so there is nothing to read once the resource is up.
             Self::Ec2VpcNetwork(_) => Ok(BTreeMap::new()),
@@ -636,6 +652,8 @@ impl Owner {
             Self::LambdaFunction => {
                 lambda_function::removal(ctx, region, physical_resource_id).await
             }
+            // `DeleteLayerVersion` takes the version away, so there is nothing to wait for.
+            Self::LambdaLayerVersion => Ok(Removal::Gone),
             // `RemovePermission` takes the statement away, so there is nothing to wait for.
             Self::LambdaPermission => Ok(Removal::Gone),
             // Each of these deletes takes the resource away as it answers — Amazon EC2
@@ -661,6 +679,10 @@ impl Owner {
             Self::LambdaFunction => lambda_function::update(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // A published layer version cannot be CHANGED: Lambda publishes no call that
+            // edits one, so a changed declaration is reported as not applied rather than as
+            // a success that dropped the caller's change.
+            Self::LambdaLayerVersion => Ok(None),
             // A statement of a policy cannot be CHANGED in place: `AddPermission` adds one
             // and `RemovePermission` removes one, so a changed declaration is reported as
             // not applied rather than as a success that dropped the caller's change.
@@ -694,8 +716,9 @@ impl Owner {
             Self::LambdaFunction => {
                 lambda_function::retag(ctx, region, resource, declared, propagated).await
             }
-            // A policy statement is not taggable, so nothing is asked about its tags.
-            Self::LambdaPermission => Ok(()),
+            // Neither a layer version nor a policy statement is taggable, so nothing is
+            // asked about their tags.
+            Self::LambdaLayerVersion | Self::LambdaPermission => Ok(()),
             // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
             // here yet — as for every other type of that service ([`Provisioner::retag`]'s
             // own default) — so nothing is asked about them.
@@ -722,6 +745,10 @@ impl Owner {
             // there is no such call, so a `Snapshot` deletion policy on this type deletes
             // the function with no snapshot invented for it.
             Self::LambdaFunction => lambda_function::delete(ctx, region, resource).await,
+            // `DeleteLayerVersion` takes no snapshot of a version on the way out either.
+            Self::LambdaLayerVersion => {
+                lambda_layer_version::delete(ctx, region, resource).await
+            }
             Self::LambdaPermission => lambda_permission::delete(ctx, region, resource).await,
             // Amazon EC2 takes no snapshot of any of these on the way out: there is no such
             // call, so a `Snapshot` deletion policy on one of them deletes the resource with
@@ -753,9 +780,12 @@ impl Owner {
                 )
                 .await
             }
-            // The policy a statement belongs to is read by the function's own drift read,
-            // so a statement reports no configuration of its own to compare.
-            Self::LambdaPermission => Ok(None),
+            // A published layer version is immutable — every property of the type requires
+            // the resource to be replaced, and Lambda publishes no call that edits one — so
+            // nothing of it can have drifted from its declaration; and the policy a
+            // statement belongs to is read by the function's own drift read, so a statement
+            // reports no configuration of its own to compare either.
+            Self::LambdaLayerVersion | Self::LambdaPermission => Ok(None),
             // These three report no configuration of their own to compare either: every
             // property each one has is part of its identity or of the call that made it, so
             // there is no member a later read could find changed.
@@ -769,7 +799,9 @@ impl Owner {
         match self {
             Self::Builtin(provisioner) => provisioner.handler_message(class, message),
             // AWS Lambda's resource provider reports the service's own message as it came.
-            Self::LambdaFunction | Self::LambdaPermission => message.to_string(),
+            Self::LambdaFunction | Self::LambdaLayerVersion | Self::LambdaPermission => {
+                message.to_string()
+            }
             // Amazon EC2's does the same.
             Self::Ec2VpcNetwork(_) => message.to_string(),
         }

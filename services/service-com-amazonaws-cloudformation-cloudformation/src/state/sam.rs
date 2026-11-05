@@ -57,6 +57,12 @@
 //! the same reason: a layer version cannot be updated in place. Both are derived through the
 //! crate's one digest derivation ([`super::template::content_digest`]).
 //!
+//! An expansion that RENAMES a declaration re-points every reference to it
+//! ([`rename_references`]): CloudFormation plans and deploys the macro's OUTPUT, so a `Ref`,
+//! an `Fn::GetAtt`, an `Fn::Sub` variable or a `DependsOn` naming the declaration's own
+//! logical id has to name the expanded one, in every section of the processed template.
+//! Nothing else is renamed, so every other reference reads exactly as the template wrote it.
+//!
 //! ## What is left as declared
 //!
 //! An `AWS::Serverless::Application` resolves its template from the AWS Serverless
@@ -78,6 +84,8 @@
 //! one recursive walk here ([`canonical`], over a value being hashed) carries its own depth
 //! bound. The documented per-template resource quota is applied to the EXPANDED template,
 //! which is the one CloudFormation validates.
+
+use std::collections::BTreeMap;
 
 use ::serde_json::{json, Map, Value};
 
@@ -121,6 +129,21 @@ const HTTP_DEFAULT_STAGE_SUFFIX: &str = "ApiGatewayDefaultStage";
 /// How many hex characters of the definition's digest a deployment's (or a layer version's)
 /// logical id carries.
 const DIGEST_CHARS: usize = 10;
+
+/// `AWS::Serverless::LayerVersion$RetentionPolicy`: "specifies whether old versions of your
+/// layer version are retained or deleted after an update", whose values are the
+/// `DeletionPolicy` attribute's own `Retain` and `Delete` and whose default is to RETAIN —
+/// which is what the expansion states on the generated layer version, since the hashed
+/// logical id above makes every content a resource of its own and so makes every content
+/// change a REMOVAL of the resource the stack had.
+const RETENTION_POLICY_PROPERTY: &str = "RetentionPolicy";
+
+/// The resource attributes a reference walk reads: the ways a template names another
+/// resource ([`rename_references`]).
+const REF: &str = "Ref";
+const FN_SUB: &str = "Fn::Sub";
+const DEPENDS_ON: &str = "DependsOn";
+const DELETION_POLICY: &str = "DeletionPolicy";
 
 /// What the content hash below is derived under, so it cannot be the same digits as another
 /// identifier this crate derives from the same text (see
@@ -280,20 +303,37 @@ pub fn expand(document: &mut Value) -> bool {
         return false;
     };
     let globals = document.get("Globals").cloned().unwrap_or(Value::Null);
-    let expanded = expanded_resources(&resources, &globals);
-    if expanded == resources {
+    let expansion = expanded_resources(&resources, &globals);
+    if expansion.resources == resources && expansion.renamed.is_empty() {
         return false;
     }
     match document.as_object_mut() {
         Some(sections) => {
-            sections.insert("Resources".to_string(), Value::Object(expanded));
+            sections.insert("Resources".to_string(), Value::Object(expansion.resources));
             // `Globals` is the macro's own section, and the expansion resolved it into
             // every resource it applies to: the processed template no longer carries it.
             sections.remove("Globals");
+            // A declaration the expansion RENAMED is named by its own logical id wherever
+            // the template refers to it, and the template CloudFormation goes on to plan
+            // and deploy is this one: every such reference is re-pointed at the id the
+            // expansion gave the resource, in every section that carries one.
+            for section in sections.values_mut() {
+                rename_references(section, &expansion.renamed, 0);
+            }
             true
         }
         None => false,
     }
+}
+
+/// What the transform made of a template's `Resources` section.
+#[derive(Debug, Default)]
+struct Expansion {
+    /// The `Resources` section the expansion produced.
+    resources: Map<String, Value>,
+    /// Each declaration whose logical id the expansion CHANGED, against the id its
+    /// resource now carries — what [`rename_references`] re-points the references to.
+    renamed: BTreeMap<String, String>,
 }
 
 /// Whether the `Transform` section names the SAM macro, in any of the spellings the section
@@ -306,8 +346,9 @@ fn declares_the_transform(document: &Value) -> bool {
         .any(|name| name == TRANSFORM)
 }
 
-/// The `Resources` section the transform produces from the one the template declares.
-fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Map<String, Value> {
+/// The `Resources` section the transform produces from the one the template declares, with
+/// the logical ids it renamed on the way.
+fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Expansion {
     // The functions' properties, resolved against `Globals` once: the API events are read
     // off them, and so is each function's own expansion.
     let functions: Vec<(String, Value)> = resources
@@ -330,6 +371,7 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Map<St
     // `or_insert` below does.
     let mut primary: Map<String, Value> = Map::new();
     let mut added: Map<String, Value> = Map::new();
+    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
     for (logical_id, declaration) in resources {
         let condition = declaration.get("Condition");
         match resource_type(declaration) {
@@ -379,12 +421,16 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Map<St
                 let properties = object(declaration.get("Properties"));
                 let expanded = expanded_layer_version(&properties);
                 // "AWS SAM … appends a hash to the logical ID": a layer version cannot be
-                // updated in place, so each content is its own resource.
-                let logical_id = format!("{logical_id}{}", digest(&Value::Object(expanded.clone())));
-                primary.insert(
-                    logical_id,
-                    carried_over(declaration, "AWS::Lambda::LayerVersion", expanded),
-                );
+                // updated in place, so each content is its own resource — and every
+                // reference to the declaration is re-pointed at the id that gives it
+                // ([`rename_references`]).
+                let hashed = format!("{logical_id}{}", digest(&Value::Object(expanded.clone())));
+                let mut layer = carried_over(declaration, "AWS::Lambda::LayerVersion", expanded);
+                retained(&mut layer, &properties);
+                primary.insert(hashed.clone(), layer);
+                if &hashed != logical_id {
+                    renamed.insert(logical_id.clone(), hashed);
+                }
             }
             Some(STATE_MACHINE) => {
                 let properties = object(declaration.get("Properties"));
@@ -415,7 +461,10 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Map<St
     for (logical_id, resource) in added {
         out.entry(logical_id).or_insert(resource);
     }
-    out
+    Expansion {
+        resources: out,
+        renamed,
+    }
 }
 
 /// One API event a function declares: what it contributes to its API's definition, and the
@@ -688,14 +737,7 @@ fn function_code(properties: &Value) -> Option<Value> {
     if let Some(code) = properties.get("InlineCode") {
         return Some(json!({ "ZipFile": code }));
     }
-    let (bucket, key, version) = s3_parts(properties.get("CodeUri")?)?;
-    let mut code = Map::new();
-    code.insert("S3Bucket".to_string(), bucket);
-    code.insert("S3Key".to_string(), key);
-    if let Some(version) = version {
-        code.insert("S3ObjectVersion".to_string(), version);
-    }
-    Some(Value::Object(code))
+    lambda_s3_location(properties.get("CodeUri")?)
 }
 
 /// The execution role the transform creates for a function that names none: the role Lambda
@@ -1259,7 +1301,11 @@ fn attribute_type(declared: &str) -> &str {
 /// Expand one `AWS::Serverless::LayerVersion` into the Lambda layer version it declares.
 fn expanded_layer_version(properties: &Map<String, Value>) -> Map<String, Value> {
     let mut layer = Map::new();
-    if let Some(content) = properties.get("ContentUri").and_then(s3_location) {
+    // `AWS::Lambda::LayerVersion$Content` is the deployment package, whose members AWS
+    // Lambda spells the way `PublishLayerVersion`'s own `Content` spells them
+    // ([`lambda_s3_location`]) — not the `Bucket`/`Key`/`Version` of the `S3Location` an
+    // API definition carries.
+    if let Some(content) = properties.get("ContentUri").and_then(lambda_s3_location) {
         layer.insert("Content".to_string(), content);
     }
     copy_through(
@@ -1276,6 +1322,185 @@ fn expanded_layer_version(properties: &Map<String, Value>) -> Map<String, Value>
         layer.insert("LayerName".to_string(), name.clone());
     }
     layer
+}
+
+/// State the generated layer version's `DeletionPolicy` from the declaration's
+/// [`RETENTION_POLICY_PROPERTY`], whose default is to retain the version.
+///
+/// The hashed logical id above makes each content a resource of its own, so a changed
+/// content REMOVES the resource the stack had — the event `DeletionPolicy` governs — and
+/// retaining the old version is exactly what the declaration's retention policy asks for.
+/// A policy the declaration states itself wins: [`carried_over`] has already put it on the
+/// resource, and this states one only where the declaration left the attribute out.
+fn retained(layer: &mut Value, properties: &Map<String, Value>) {
+    let Some(members) = layer.as_object_mut() else {
+        return;
+    };
+    if members.contains_key(DELETION_POLICY) {
+        return;
+    }
+    let policy = match properties
+        .get(RETENTION_POLICY_PROPERTY)
+        .and_then(Value::as_str)
+    {
+        Some(stated) if stated.eq_ignore_ascii_case(super::deletion_policy::DELETE) => {
+            super::deletion_policy::DELETE
+        }
+        _ => super::deletion_policy::RETAIN,
+    };
+    members.insert(DELETION_POLICY.to_string(), json!(policy));
+}
+
+/// Re-point every reference to a logical id the expansion RENAMED at the id that resource
+/// now carries.
+///
+/// A macro may rename what it expands — a layer version's logical id carries a content hash
+/// — and CloudFormation plans and deploys the macro's OUTPUT, so it is the OUTPUT's
+/// references that have to resolve: a `Ref` to the declaration's own id would otherwise name
+/// a resource the processed template no longer declares. Each of the four ways a template
+/// names a resource is re-pointed: `Ref`, `Fn::GetAtt` (both spellings), an `Fn::Sub`
+/// variable and the `DependsOn` attribute. A name no expansion renamed is left exactly as
+/// the template wrote it.
+///
+/// Bounded by [`MAX_TEMPLATE_DEPTH`], like every other walk over a caller-supplied document.
+fn rename_references(node: &mut Value, renamed: &BTreeMap<String, String>, depth: usize) {
+    if renamed.is_empty() || depth > MAX_TEMPLATE_DEPTH {
+        return;
+    }
+    match node {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                rename_references(item, renamed, depth + 1);
+            }
+        }
+        Value::Object(members) => {
+            for (key, member) in members.iter_mut() {
+                match key.as_str() {
+                    // "Ref returns the value of the specified … resource", and "DependsOn
+                    // … specif[ies] that the creation of a specific resource follows
+                    // another": both name a resource by its logical id alone.
+                    REF | DEPENDS_ON => rename_named(member, renamed),
+                    // "Fn::GetAtt returns the value of an attribute from a resource in the
+                    // template": the resource is the first argument, or everything before
+                    // the first dot of the short form.
+                    super::template::FN_GET_ATT => rename_attribute(member, renamed),
+                    // "Fn::Sub substitutes variables in an input string": a `${Name}` names
+                    // what a `Ref` names and a `${Name.Attribute}` what an `Fn::GetAtt`
+                    // does.
+                    FN_SUB => rename_substitution(member, renamed),
+                    _ => {}
+                }
+                rename_references(member, renamed, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Re-point a reference that names a resource by its logical id alone — one name, or a list
+/// of them, which is the form `DependsOn` also takes.
+fn rename_named(member: &mut Value, renamed: &BTreeMap<String, String>) {
+    match member {
+        Value::String(name) => {
+            if let Some(expanded) = renamed.get(name.as_str()) {
+                *name = expanded.clone();
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                rename_named(item, renamed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Re-point the resource an `Fn::GetAtt` reads its attribute off, in both spellings the
+/// function takes: `[logicalId, attribute]` and `logicalId.attribute`.
+fn rename_attribute(member: &mut Value, renamed: &BTreeMap<String, String>) {
+    match member {
+        Value::Array(parts) => {
+            if let Some(Value::String(name)) = parts.first_mut() {
+                if let Some(expanded) = renamed.get(name.as_str()) {
+                    *name = expanded.clone();
+                }
+            }
+        }
+        Value::String(path) => {
+            // The resource is read the way the crate's one reader of the short form reads
+            // it, so the two can never disagree about which resource a path names.
+            let resource = super::template::resource_of(path).to_string();
+            if let Some(expanded) = renamed.get(resource.as_str()) {
+                let repointed = format!("{expanded}{}", &path[resource.len()..]);
+                *path = repointed;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Re-point the `${Name}` and `${Name.Attribute}` variables of an `Fn::Sub`, in both forms
+/// the function takes: the source string on its own, or `[ String, { Name: Value, … } ]`.
+fn rename_substitution(member: &mut Value, renamed: &BTreeMap<String, String>) {
+    // A variable the substitution supplies ITSELF is not a reference to a resource at all,
+    // so a name the map carries is left exactly as written.
+    let supplied: Vec<String> = match &*member {
+        Value::Array(parts) => parts
+            .get(1)
+            .and_then(Value::as_object)
+            .map(|variables| variables.keys().cloned().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let source = match member {
+        Value::String(source) => source,
+        Value::Array(parts) => match parts.first_mut() {
+            Some(Value::String(source)) => source,
+            _ => return,
+        },
+        _ => return,
+    };
+    let repointed = renamed_substitution(source, renamed, &supplied);
+    *source = repointed;
+}
+
+/// One `Fn::Sub` source string with every variable naming a renamed resource re-pointed.
+///
+/// The variables are read the way the crate's one reader of them reads them
+/// ([`super::template::substitution_names`]): everything between `${` and the next `}`, the
+/// name being what precedes the first dot. A `${!Literal}` is the function's own escape and
+/// names nothing, so it never matches a renamed id; every other run of the string is copied
+/// through byte for byte.
+fn renamed_substitution(
+    source: &str,
+    renamed: &BTreeMap<String, String>,
+    supplied: &[String],
+) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start + 2]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(after);
+            return out;
+        };
+        let variable = &after[..end];
+        let trimmed = variable.trim();
+        let name = trimmed.split('.').next().unwrap_or(trimmed);
+        match renamed.get(name) {
+            Some(expanded) if !supplied.iter().any(|variable| variable == name) => {
+                // The attribute path the variable read the name off is kept as it was.
+                out.push_str(expanded);
+                out.push_str(&trimmed[name.len()..]);
+            }
+            _ => out.push_str(variable),
+        }
+        out.push('}');
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Expand one `AWS::Serverless::StateMachine` into the state machine it declares, and the
@@ -1429,6 +1654,21 @@ fn s3_location(value: &Value) -> Option<Value> {
     location.insert("Key".to_string(), key);
     if let Some(version) = version {
         location.insert("Version".to_string(), version);
+    }
+    Some(Value::Object(location))
+}
+
+/// The Amazon S3 location a LAMBDA package property states: a function's `Code` and a layer
+/// version's `Content`, whose members AWS Lambda's own calls spell `S3Bucket`, `S3Key` and
+/// `S3ObjectVersion` — against the `Bucket`, `Key` and `Version` of the `S3Location` an API
+/// definition and a state machine definition carry ([`s3_location`]).
+fn lambda_s3_location(value: &Value) -> Option<Value> {
+    let (bucket, key, version) = s3_parts(value)?;
+    let mut location = Map::new();
+    location.insert("S3Bucket".to_string(), bucket);
+    location.insert("S3Key".to_string(), key);
+    if let Some(version) = version {
+        location.insert("S3ObjectVersion".to_string(), version);
     }
     Some(Value::Object(location))
 }

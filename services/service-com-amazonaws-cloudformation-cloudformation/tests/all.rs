@@ -247,6 +247,8 @@ mod s3vectors_resource_types;
 mod resolved_properties;
 #[path = "all/sam_deployed_resources.rs"]
 mod sam_deployed_resources;
+#[path = "all/sam_layer_version_references.rs"]
+mod sam_layer_version_references;
 #[path = "all/sam_policies_shorthand.rs"]
 mod sam_policies_shorthand;
 #[path = "all/sam_transform.rs"]
