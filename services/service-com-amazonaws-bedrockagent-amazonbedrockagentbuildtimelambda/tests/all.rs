@@ -31,6 +31,8 @@ mod flow_version_minting;
 mod immutable_configuration_members;
 #[path = "all/ingestion_job_lifecycle.rs"]
 mod ingestion_job_lifecycle;
+#[path = "all/knowledge_base_document_listing.rs"]
+mod knowledge_base_document_listing;
 #[path = "all/knowledge_base_documents.rs"]
 mod knowledge_base_documents;
 #[path = "all/knowledge_base_lifecycle.rs"]

@@ -1717,6 +1717,17 @@ pub const DOCUMENT_INDEXING_SPAN: Duration = INGESTION_JOB_RUN_SPAN;
 /// "NOT_FOUND – The document wasn't found."
 pub const DOCUMENT_STATUS_NOT_FOUND: &str = "NOT_FOUND";
 
+/// The most documents one `ListKnowledgeBaseDocuments` page reports when the
+/// request names no `maxResults`.
+///
+/// CHOSEN, not documented: AWS publishes no default page size for the listing.
+/// It is the upper bound of the modelled `maxResults` range (1..1000,
+/// `smithy_query(query="operation",operation="ListKnowledgeBaseDocuments")`), so
+/// `maxResults` alone decides how short a page is, and it matches
+/// [`DOCUMENT_QUOTA`]: a data source holds no more documents than one default
+/// page can carry.
+pub const MAX_DOCUMENTS_PER_PAGE: usize = DOCUMENT_QUOTA;
+
 /// The `ContentDataSourceType` of a document pushed into a custom data source.
 pub const CUSTOM_CONTENT_TYPE: &str = "CUSTOM";
 
@@ -1866,6 +1877,20 @@ impl DocumentKey {
         }
     }
 
+    /// The sort key one data source's documents are listed in: the kind of data
+    /// source the document belongs to, ties broken by the document's own id
+    /// within that kind.
+    ///
+    /// A document's identity never changes, so this is a total order over the
+    /// documents of one data source that no status transition disturbs — which
+    /// is what lets a page resume exactly after the one before it.
+    fn sort_key(&self) -> (&'static str, &str) {
+        match self {
+            Self::Custom(id) => (CUSTOM_CONTENT_TYPE, id.as_str()),
+            Self::S3(uri) => (S3_CONTENT_TYPE, uri.as_str()),
+        }
+    }
+
     /// This identity as the modelled `DocumentIdentifier` shape, which is what
     /// every document detail reports it as.
     pub fn to_identifier(&self) -> DocumentIdentifier {
@@ -1966,6 +1991,54 @@ pub fn not_found_document_detail(
         identifier: key.to_identifier(),
         status_reason: None,
         updated_at: None,
+    }
+}
+
+/// A `ListKnowledgeBaseDocuments` resume cursor: how many of one data source's
+/// documents the listing has already reported, in the order
+/// [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::page_of_documents`]
+/// lists them.
+///
+/// The token names a POSITION in that order rather than a document: a custom
+/// document's id and an S3 document's URI are each modelled up to 2048
+/// characters, the whole of the modelled `NextToken` length bound, so a token
+/// carrying one could be too long to send back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentPageCursor {
+    reported: usize,
+}
+
+impl DocumentPageCursor {
+    /// Decode a `nextToken` a previous page handed out. `None` when the token is
+    /// not one [`Self::token`] renders: a position is a plain decimal count of
+    /// the documents already reported, so nothing else names a position in this
+    /// listing.
+    pub fn parse(token: &str) -> Option<Self> {
+        if token.is_empty()
+            || token.starts_with('0')
+            || !token.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        token.parse().ok().map(|reported| Self { reported })
+    }
+
+    /// The cursor that resumes after `reported` documents, or `None` when no
+    /// document has been reported yet — the position a listing starts at, which
+    /// is what an absent `nextToken` already names.
+    fn after(reported: usize) -> Option<Self> {
+        (reported > 0).then_some(Self { reported })
+    }
+
+    /// This position as the opaque `nextToken` a page hands out.
+    pub fn token(self) -> String {
+        self.reported.to_string()
+    }
+
+    /// How many documents the listing had already reported when it handed this
+    /// cursor out.
+    fn reported(self) -> usize {
+        self.reported
     }
 }
 
@@ -2604,6 +2677,50 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .flatten();
         (
             page.iter().map(|(_, summary)| summary.clone()).collect(),
+            next_token,
+        )
+    }
+
+    /// One `ListKnowledgeBaseDocuments` page: the documents this data source
+    /// holds, in document order and from the position `cursor` names, at most
+    /// `page_size` of them, plus the token to resume from when more remain.
+    ///
+    /// Every document of the data source is reported, whatever its ingestion
+    /// status, and no other data source's: a document is identified within the
+    /// data source it was ingested into. A data source holding none reports an
+    /// empty listing — an unknown one has nothing to enumerate, which the caller
+    /// refuses as a missing resource before asking.
+    pub fn page_of_documents(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+        cursor: Option<DocumentPageCursor>,
+        page_size: usize,
+    ) -> (Vec<KnowledgeBaseDocumentDetail>, Option<String>) {
+        let mut ordered: Vec<&DocumentRecord> = self
+            .documents
+            .values()
+            .filter(|record| {
+                record.knowledge_base_id == knowledge_base_id
+                    && record.data_source_id == data_source_id
+            })
+            .collect();
+        ordered.sort_by(|left, right| left.key.sort_key().cmp(&right.key.sort_key()));
+
+        let reported = cursor.map_or(0, DocumentPageCursor::reported);
+        let remaining = ordered.len().saturating_sub(reported);
+        let page: Vec<&DocumentRecord> = ordered
+            .into_iter()
+            .skip(reported)
+            .take(page_size.max(1))
+            .collect();
+        let next_token = (remaining > page.len())
+            .then(|| DocumentPageCursor::after(reported + page.len()).map(DocumentPageCursor::token))
+            .flatten();
+        (
+            page.iter()
+                .map(|record| DocumentRecord::to_detail(record))
+                .collect(),
             next_token,
         )
     }

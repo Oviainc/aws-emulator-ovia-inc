@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKnowledgeBaseDocuments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKnowledgeBaseDocuments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKnowledgeBaseDocuments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every document this service holds for the data source the URI names,
+//! in document order and in pages: each detail comes from the stored document
+//! record, so a listing reports whatever status the clock has made due and
+//! nothing the request carried. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +163,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKnowledgeBaseDocuments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKnowledgeBaseDocumentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKnowledgeBaseDocuments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListKnowledgeBaseDocumentsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the bedrock-agent store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A token this service did not hand out names no position in the
+        // listing.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::DocumentPageCursor::parse(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(
+                        ListKnowledgeBaseDocumentsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    "nextToken is not a pagination token this service issued"
+                                        .to_string(),
+                                ),
+                                field_list: Some(vec![ValidationExceptionField {
+                                    name: "nextToken".to_string(),
+                                    message: "not a pagination token this service issued"
+                                        .to_string(),
+                                }]),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // `maxResults` truncates the page; a request naming none takes the
+        // default page, which is also the widest a page ever is.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_DOCUMENTS_PER_PAGE, |requested| {
+                usize::try_from(requested).unwrap_or(crate::state::MAX_DOCUMENTS_PER_PAGE)
+            })
+            .clamp(1, crate::state::MAX_DOCUMENTS_PER_PAGE);
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The ONE write a report may perform: a status the clock had already
+        // made due, which was owed at this instant whether or not anyone asked
+        // for the documents.
+        state.materialise_due_transitions(now);
+
+        // The documents belong to one data source of one knowledge base, so
+        // both have to exist and neither may be on its way out of the store: a
+        // data source is identified by the pair, which makes an id of another
+        // knowledge base's data source as absent here as one nothing holds.
+        if state.live_knowledge_base(&input.knowledge_base_id).is_none() {
+            return Err(
+                ListKnowledgeBaseDocumentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::knowledge_base_not_found_message(
+                            &input.knowledge_base_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state
+            .live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            .is_none()
+        {
+            return Err(
+                ListKnowledgeBaseDocumentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_source_not_found_message(
+                            &input.data_source_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The page is the stored documents of that data source, from the
+        // position the token names.
+        let (document_details, next_token) = state.page_of_documents(
+            &input.knowledge_base_id,
+            &input.data_source_id,
+            cursor,
+            page_size,
+        );
+
+        Ok(ListKnowledgeBaseDocumentsOutput {
+            document_details,
+            next_token,
+        })
     }
 }
