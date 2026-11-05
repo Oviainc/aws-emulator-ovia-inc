@@ -68,6 +68,13 @@ serde_json_path = "0.7"
 # Not a pure-Rust elliptic-curve stack, whose `crypto-bigint` this repository's dependency
 # audit blocks (RUSTSEC-2026-0387).
 ring = "0.17"
+# `in_process_sigv4`: the SigV4 signer a service signs an in-process call to another
+# emulated service with — the SDK's own signer, which is what the emulator's verifier
+# re-signs with, rather than a second implementation of the signature.
+aws-sigv4 = { workspace = true }
+# The signing identity `aws-sigv4` takes, built from the credential the framework hands
+# every handler.
+aws-credential-types = { workspace = true }
 # `jsonata`: the JSONata interpreter the services whose API carries a caller-written
 # JSONata expression evaluate it with — the Amazon States Language's JSONata mode
 # today, and the B2BI mapping template once its own containment of the same engine

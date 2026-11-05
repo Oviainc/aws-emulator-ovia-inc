@@ -37,7 +37,8 @@
 //!    `X-Cache: Hit from cloudfront` without touching the origin, and everything else
 //!    goes to the origin and is answered `X-Cache: Miss from cloudfront`;
 //! 6. only then is the ORIGIN the behaviour's `TargetOriginId` names fetched, in process,
-//!    through the emulator this service is running within.
+//!    through the emulator this service is running within — as the distribution's own origin
+//!    access control says that origin is to be addressed (see below).
 //!
 //! # What the origin fetch is, and what it is not
 //!
@@ -69,10 +70,15 @@
 //! ([`HEADERS_NEVER_FORWARDED`]) — every other viewer header travels exactly as the
 //! behaviour's origin request policy says.
 //!
-//! The SigV4 signing an `OriginAccessControl` asks for (`SigningBehavior` `always`) is
-//! not performed on the origin request: the origin request carries the headers the
-//! behaviour's policies name and nothing else. That leg belongs to the origin-access
-//! control issue rather than to this one.
+//! An origin fetch is made ON BEHALF OF the distribution that configured it. The
+//! `OriginAccessControl` the origin's `OriginAccessControlId` names decides whether that
+//! fetch is SIGNED — `SigningBehavior` `always` "signs all origin requests" — and the
+//! ORIGIN's own resource policy decides whether it is signed FOR: a grant to the
+//! `cloudfront.amazonaws.com` service principal, scoped by `aws:SourceArn` to this
+//! distribution. Both live in [`super::origin_access`], which this module calls once while
+//! planning the fetch and once while making it; a fetch the origin's document does not grant
+//! travels unsigned, so the origin answers it as it answers any caller presenting no
+//! credential, and whatever it answers is what the edge serves.
 //!
 //! # Addressing
 //!
@@ -102,6 +108,7 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, OperationContext};
 use std::time::{Duration, SystemTime};
 
+use super::origin_access::{self, OriginAccess};
 use crate::ops::types::{AllowedMethods, CacheBehavior, DefaultCacheBehavior, Origin};
 use crate::state::{
     managed_cache_policy, managed_origin_request_policy, matches_path_pattern, same_domain,
@@ -739,6 +746,9 @@ struct OriginFetch {
     distribution_id: String,
     /// The absolute URI of the origin request.
     uri: String,
+    /// What the origin's ORIGIN ACCESS CONTROL makes of this fetch, or `None` for an origin
+    /// whose configuration signs no request (see [`origin_access`]).
+    access: Option<OriginAccess>,
     /// The headers the origin request carries beside its body's own.
     headers: Vec<(String, String)>,
     /// How long the edge waits for the origin, from `OriginReadTimeout`.
@@ -895,9 +905,23 @@ fn plan_request(
             detail: NO_ORIGIN_DETAIL,
         };
     }
+    // The ORIGIN ACCESS CONTROL this origin carries, read from the same stored
+    // configuration: what it says about this fetch is decided after the lock is released
+    // (see [`origin_access`]), because the origin's own resource policy is read from the
+    // origin's own service.
+    let uri = origin_uri(origin, &viewer_path, addressed.query);
+    let access = origin_access::of_fetch(
+        store,
+        resolved.distribution,
+        origin,
+        &method,
+        path_of(&uri),
+        req.headers().get("authorization").is_some(),
+    );
     let fetch = OriginFetch {
         distribution_id,
-        uri: origin_uri(origin, &viewer_path, addressed.query),
+        uri,
+        access,
         headers,
         read_timeout: origin_read_timeout(origin),
         cache: cacheable.map(|ttl| CacheDirective {
@@ -1202,10 +1226,41 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
     for (name, value) in &fetch.headers {
         builder = builder.header(name, value);
     }
-    let built = builder
-        .body(SdkBody::from(::bytes::Bytes::from(body)))
-        .map_err(|error| error.to_string())
-        .and_then(|request| RtRequest::try_from(request).map_err(|error| error.to_string()));
+    let built = builder.body(body).map_err(|error| error.to_string());
+    let mut request = match built {
+        Ok(request) => request,
+        Err(error) => {
+            ::tracing::warn!(
+                uri = %fetch.uri,
+                %error,
+                "the configured origin does not render an HTTP request, so no origin \
+                 request was made"
+            );
+            return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id);
+        }
+    };
+    // The ORIGIN ACCESS CONTROL's own half of the fetch: a request the origin's resource
+    // policy grants this distribution is SIGNED, which is what such an origin serves a
+    // request for at all; one it does not grant travels as it would with no control, so the
+    // origin answers it itself (see [`origin_access`]).
+    if let Some(access) = &fetch.access {
+        if origin_access::grants_origin_request(ctx, access, fetch.read_timeout).await {
+            if let Err(error) = origin_access::sign(&mut request, access, ctx).await {
+                ::tracing::warn!(
+                    uri = %fetch.uri,
+                    %error,
+                    "the origin request could not be signed for this origin access control, \
+                     so it is made as a request carrying no credential"
+                );
+            }
+        }
+    }
+    let (parts, body) = request.into_parts();
+    let built = RtRequest::try_from(::http::Request::from_parts(
+        parts,
+        SdkBody::from(::bytes::Bytes::from(body)),
+    ))
+    .map_err(|error| error.to_string());
     let request = match built {
         Ok(request) => request,
         Err(error) => {

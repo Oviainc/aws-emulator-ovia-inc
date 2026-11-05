@@ -309,6 +309,9 @@ pub mod iam_authorization;
 /// service claims — so no performer of such a call maps the transport's own refusal as if
 /// it were the addressed service's answer.
 pub mod in_process_refusal;
+/// The ONE SigV4 signature a service puts on an in-process call it makes to another
+/// emulated service, computed with the settings the emulator's own verifier re-signs with.
+pub mod in_process_sigv4;
 /// The ONE construction of the in-process IAM client a service resolves a caller-supplied
 /// IAM entity through, so that hop is configured once rather than per service.
 pub mod iam_client;

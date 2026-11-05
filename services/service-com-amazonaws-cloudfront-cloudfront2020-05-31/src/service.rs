@@ -79,6 +79,7 @@
 
 pub mod edge;
 pub mod envelope;
+pub mod origin_access;
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,

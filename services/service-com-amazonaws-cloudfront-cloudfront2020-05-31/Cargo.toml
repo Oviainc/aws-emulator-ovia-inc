@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `iam_authorization`: the ONE evaluation of the resource policy an origin states its grant
+# to the CloudFront service principal in; `in_process_sigv4`: the ONE signature an
+# in-process call to another emulated service carries; `s3_bucket_name`: whether a host
+# label names a bucket; `arn`: the account an ARN belongs to.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

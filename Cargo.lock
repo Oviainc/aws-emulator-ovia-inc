@@ -8728,6 +8728,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -17773,11 +17774,13 @@ dependencies = [
 name = "service-common"
 version = "0.1.0"
 dependencies = [
+ "aws-credential-types",
  "aws-emulator-server",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-iam",
  "aws-sdk-kinesis",
+ "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
