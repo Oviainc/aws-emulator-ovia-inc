@@ -458,12 +458,18 @@ async fn a_cast_or_a_literal_types_the_column_it_computes() {
             Some(json!(type_name)),
             "case {expression}: expected typeName {type_name}, got {selected}"
         );
-        // A computed column is in no table, so the schema says nothing about
-        // whether it can be NULL.
+        // A computed column is in no table, so no declaration forbids a NULL in
+        // it: it is reported as a column that accepts one, and as stored in no
+        // table.
         assert_eq!(
             metadata.first().map_or(-1, |column| number(column, "nullable")),
-            2,
-            "case {expression}: a computed column's nullability is unknown, got {selected}"
+            1,
+            "case {expression}: a computed column accepts a NULL, got {selected}"
+        );
+        assert_eq!(
+            metadata.first().map(|column| column["tableName"].clone()),
+            Some(json!("")),
+            "case {expression}: a computed column is stored in no table, got {selected}"
         );
     }
 

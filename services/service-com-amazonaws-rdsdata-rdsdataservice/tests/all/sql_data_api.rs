@@ -1563,6 +1563,59 @@ async fn an_endless_statement_is_aborted_at_its_deadline() {
     );
 }
 
+/// RULE: EVERY call answers, with a modelled response, inside the budget one
+/// request has — whatever else the data plane is doing. A statement that cannot
+/// finish is aborted at its own deadline, and a call that has to WAIT for a data
+/// plane another call is holding is answered at the outer one, so no request is
+/// ever left open.
+///
+/// The rows differ along how many calls contend for the data plane at once: one
+/// that only has to outrun its own deadline, and several that have to wait for
+/// the ones in front of them as well.
+#[tokio::test]
+async fn every_call_answers_inside_the_request_budget() {
+    // Counting an endless recursion returns no row until it finishes, so nothing
+    // but a deadline ends it, and it holds the data plane while it runs.
+    const ENDLESS: &str = "WITH RECURSIVE forever(x) AS \
+                           (SELECT 1 UNION ALL SELECT x + 1 FROM forever) \
+                           SELECT count(*) FROM forever";
+    const REQUEST_BUDGET: std::time::Duration =
+        service_com_amazonaws_rdsdata_rdsdataservice::state::REQUEST_TIME_BUDGET;
+
+    for contending in [1_usize, 3] {
+        let api = Arc::new(DataApi::new());
+        let started = std::time::Instant::now();
+        let calls = (0..contending)
+            .map(|_| {
+                let api = Arc::clone(&api);
+                tokio::spawn(async move { api.execute(json!({"sql": ENDLESS})).await })
+            })
+            .collect::<Vec<_>>();
+        for call in calls {
+            let (status, answered) = call
+                .await
+                .unwrap_or_else(|joined| panic!("case {contending} calls: {joined}"));
+            assert_eq!(
+                status, 400,
+                "case {contending} calls: expected a modelled refusal, got {status} {answered}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                "StatementTimeoutException",
+                "case {contending} calls: expected the modelled timeout, got {answered}"
+            );
+        }
+        // Each call is bounded by the request budget, so the whole set is bounded
+        // by the budget of the one that waited for all the others.
+        let bound = REQUEST_BUDGET * u32::try_from(contending).expect("a small count");
+        assert!(
+            started.elapsed() < bound,
+            "case {contending} calls: expected every call answered within {bound:?}, took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
 /// RULE: a `typeHint` on a `stringValue` names the type that string is sent as,
 /// so the request is checked against that type's accepted format — the documented
 /// form is accepted and stored, anything else is refused with HTTP 400 — and a

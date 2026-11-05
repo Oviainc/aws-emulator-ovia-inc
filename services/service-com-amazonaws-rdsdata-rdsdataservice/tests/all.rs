@@ -17,3 +17,5 @@ mod probe;
 mod sql_data_api;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/statement_names.rs"]
+mod statement_names;

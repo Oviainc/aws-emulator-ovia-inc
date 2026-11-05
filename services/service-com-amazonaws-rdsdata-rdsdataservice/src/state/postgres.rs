@@ -50,6 +50,9 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 
 use super::{MAX_DECLARED_ARGUMENT, SqlError};
 
+/// How a name the caller wrote is rendered for the engine.
+mod names;
+
 /// The precision a type with no length limit reports: the largest length the
 /// member can carry, which is what a client reads as "unlimited".
 const UNLIMITED_LENGTH: i32 = i32::MAX;
@@ -395,6 +398,11 @@ pub fn plan(sql: &str) -> Result<Plan, SqlError> {
     // PostgreSQL target type with the engine type that holds its values.
     let result_types = result_types(&statement);
     normalise(&mut statement);
+    // The names the statement uses are rendered as delimited identifiers, so a
+    // word PostgreSQL admits as a name is one the engine's grammar reads as that
+    // name too. Done AFTER the rewrites above, so the expressions they build are
+    // rendered the same way as the ones the caller wrote.
+    names::quote_identifiers(&mut statement);
     let (sequence_columns, mut follow_on) = plan_sequences(&mut statement);
     let (sql, emptied) = rendered(&statement);
     follow_on.extend(emptied);

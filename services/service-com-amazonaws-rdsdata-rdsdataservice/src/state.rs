@@ -422,10 +422,11 @@ where
 /// `java.sql.ResultSetMetaData.columnNoNulls` — the column rejects NULL.
 const COLUMN_NO_NULLS: i32 = 0;
 /// `java.sql.ResultSetMetaData.columnNullable` — the column accepts NULL.
+///
+/// What a result column reports unless a declaration FORBIDS a NULL in it: a
+/// column no declaration constrains — a computed one, or one whose declaration
+/// the schema cannot settle — can carry a NULL, which is what this says.
 const COLUMN_NULLABLE: i32 = 1;
-/// `java.sql.ResultSetMetaData.columnNullableUnknown` — the result column is not a
-/// stored column (an expression, say), so the schema says nothing about NULLs.
-const COLUMN_NULLABLE_UNKNOWN: i32 = 2;
 
 /// Per-service state for com-amazonaws-rdsdata-rdsdataservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -633,6 +634,16 @@ impl Database {
         for (config, enabled) in [
             (DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
             (DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
+            // A double-quoted word is an IDENTIFIER and nothing else, in a
+            // statement and in a declaration alike. The engine's default is to
+            // fall back to reading one it cannot resolve as a string literal,
+            // which PostgreSQL never does — and which would quietly turn a
+            // misspelled column into a string value, now that every name this
+            // service renders is delimited (see `postgres::names`). With the
+            // fallback off, a name that resolves to nothing is the error it is in
+            // PostgreSQL.
+            (DbConfig::SQLITE_DBCONFIG_DQS_DML, false),
+            (DbConfig::SQLITE_DBCONFIG_DQS_DDL, false),
         ] {
             conn.set_db_config(config, enabled)
                 .map_err(SqlError::unavailable)?;
@@ -890,8 +901,7 @@ impl Database {
                     // nullability flag says about the column it stores it in.
                     nullable: match &declared {
                         Some(column) if column.not_null || column.primary_key => COLUMN_NO_NULLS,
-                        Some(_) => COLUMN_NULLABLE,
-                        None => COLUMN_NULLABLE_UNKNOWN,
+                        _ => COLUMN_NULLABLE,
                     },
                     // A `serial` declaration carries a sequence, and the engine
                     // also assigns the value of an integer primary key an INSERT
@@ -928,8 +938,8 @@ impl Database {
     /// but not which table it came from, so the schema is searched for the
     /// declaration: the table name is reported only when exactly one table declares
     /// such a column, and the declaration itself only when every table that
-    /// declares it agrees — otherwise the answer is `None`, which the caller
-    /// reports as nullability `columnNullableUnknown` rather than a guess.
+    /// declares it agrees — otherwise the answer is `None`, and the caller reports
+    /// the column as one a NULL is not forbidden in rather than making a guess.
     fn declared_column(
         &self,
         label: &str,
@@ -1179,16 +1189,17 @@ impl ColumnInfo {
     /// `type` is the type's `java.sql.Types` code, `typeName` its catalog name,
     /// `precision` and `scale` the digits it carries, `isSigned` whether it is a
     /// signed number and `isCaseSensitive` whether its values compare as text.
-    /// `schemaName` is the schema the column is in, which is empty here because
-    /// the database name alone selects the state a statement runs against — the
-    /// model's own `schema` member "isn't supported".
     fn metadata(&self) -> ColumnMetadata {
         ColumnMetadata {
             name: Some(self.label.clone()),
             label: Some(self.label.clone()),
             type_name: Some(self.pg.name.clone()),
             r#type: self.pg.jdbc_type,
-            table_name: self.table_name.clone(),
+            // Both names are always reported, EMPTY where there is nothing to
+            // report: a computed column is stored in no table, and a column is in
+            // no schema beyond the database that holds it (the model's own
+            // `schema` member "isn't supported").
+            table_name: Some(self.table_name.clone().unwrap_or_default()),
             schema_name: Some(String::new()),
             nullable: self.nullable,
             precision: self.pg.precision,
