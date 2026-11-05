@@ -14,8 +14,8 @@
 
 use super::{
     ALL_IPV4_ADDRESSES, ALL_IP_PROTOCOLS, CidrProblem, ComAmazonawsEc2Amazonec2State,
-    DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, MAX_PORT, MAX_PROTOCOL_NUMBER, RULE_ACTION_DENY,
-    canonical_ipv4_cidr, canonical_ipv6_cidr, invalid_parameter_combination,
+    DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, MAX_ICMP_TYPE, MAX_PORT, MAX_PROTOCOL_NUMBER,
+    RULE_ACTION_DENY, canonical_ipv4_cidr, canonical_ipv6_cidr, invalid_parameter_combination,
     invalid_parameter_value, missing_parameter,
 };
 use crate::ops::types::{IcmpTypeCode, NetworkAclEntry, PortRange};
@@ -73,6 +73,15 @@ pub const NETWORK_ACL_PROTOCOL_UDP: i32 = 17;
 /// ICMP type and code for: "Required if specifying protocol 1 (ICMP) or protocol 58 (ICMPv6)
 /// with an IPv6 CIDR block" (`CreateNetworkAclEntryRequest$IcmpTypeCode`).
 pub const NETWORK_ACL_PROTOCOL_ICMP: i32 = 1;
+
+/// The ICMP type and code numbers a network ACL entry may carry: one byte each, since ICMP
+/// carries both the type and the code in one byte of its header (RFC 792) — the bound
+/// [`MAX_ICMP_TYPE`] already states for this crate — and `-1` beside them, which is the only
+/// other value either member documents: "The ICMP type. A value of -1 means all types"
+/// (`IcmpTypeCode$Type`) and "The ICMP code. A value of -1 means all codes for the specified
+/// ICMP type" (`$Code`,
+/// `smithy_query(query="shape",shape="IcmpTypeCode")`).
+pub const NETWORK_ACL_ICMP_NUMBERS: ::std::ops::RangeInclusive<i32> = -1..=MAX_ICMP_TYPE;
 
 /// The protocol number of ICMPv6, which needs a type and code only "with an IPv6 CIDR
 /// block": "If you specify protocol 58 (ICMPv6) and specify an IPv4 CIDR block, traffic for
@@ -378,6 +387,28 @@ pub fn validated_network_acl_entry<E>(
         return Err(missing_parameter(format!(
             "The request must contain the parameter icmpTypeCode for protocol {protocol}"
         )));
+    }
+    // A type and code that ARE given have to be an ICMP type and code, whatever the
+    // protocol, the way a port range that is given has to be a range of ports: each is one
+    // byte of the ICMP header, or the `-1` that stands for all of them
+    // ([`NETWORK_ACL_ICMP_NUMBERS`]). Read here rather than in either handler, so the two
+    // writers of a rule hold the member to one bound.
+    if let Some(icmp_type_code) = requested.icmp_type_code.as_ref() {
+        for (member, value) in [
+            ("type", icmp_type_code.r#type),
+            ("code", icmp_type_code.code),
+        ] {
+            if let Some(value) = value {
+                if !NETWORK_ACL_ICMP_NUMBERS.contains(&value) {
+                    return Err(invalid_parameter_value(format!(
+                        "Value ({value}) for parameter icmpTypeCode.{member} is invalid. An \
+                         ICMP {member} is between 0 and {max}, or {all} for all of them",
+                        max = MAX_ICMP_TYPE,
+                        all = NETWORK_ACL_ICMP_NUMBERS.start(),
+                    )));
+                }
+            }
+        }
     }
 
     // The entry the request describes, built out of the validated members so nothing the

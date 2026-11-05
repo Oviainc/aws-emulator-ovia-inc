@@ -24,7 +24,8 @@
 //! 3. A rule a caller may create is exactly a rule that may replace one: the published rule
 //!    number range, the protocol number, the one address family and the ports or ICMP
 //!    numbers a protocol needs are held to the same bounds `CreateNetworkAclEntry` holds
-//!    them to, with nothing written for a refused request.
+//!    them to, with nothing written for a refused request — including the ICMP type and code,
+//!    each of which is one byte of the ICMP header or the `-1` that stands for all of them.
 //! 4. A `DryRun` answers `DryRunOperation` and leaves the stored rule exactly as it was.
 //! 5. A request with two faults is refused for the one read first: the ACL id's FORM before
 //!    any other member, the request's own members before the ACL is looked up, and the ACL
@@ -35,8 +36,9 @@
 //! action and the port or ICMP numbers — so no single recorded request is the specification.
 
 use ec2::state::{
-    ALL_IPV4_ADDRESSES, ALL_IP_PROTOCOLS, DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
-    MAX_PROTOCOL_NUMBER, NETWORK_ACL_ENTRY_RULE_NUMBERS, RULE_ACTION_ALLOW, RULE_ACTION_DENY,
+    ALL_IPV4_ADDRESSES, ALL_IP_PROTOCOLS, DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, MAX_ICMP_TYPE,
+    MAX_PROTOCOL_NUMBER, NETWORK_ACL_ENTRY_RULE_NUMBERS, NETWORK_ACL_ICMP_NUMBERS,
+    RULE_ACTION_ALLOW, RULE_ACTION_DENY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -725,6 +727,31 @@ async fn a_replacement_is_held_to_what_a_rule_may_be() {
             "MissingParameter",
         ),
         (
+            "an ICMP type one past the last one a byte holds",
+            held.rule_number,
+            vec![
+                param("Protocol", "1"),
+                param("CidrBlock", ALL_IPV4_ADDRESSES),
+                param("Icmp.Type", &(MAX_ICMP_TYPE + 1).to_string()),
+                param("Icmp.Code", "0"),
+            ],
+            "InvalidParameterValue",
+        ),
+        (
+            "an ICMP code one below the all-codes value",
+            held.rule_number,
+            vec![
+                param("Protocol", "1"),
+                param("CidrBlock", ALL_IPV4_ADDRESSES),
+                param("Icmp.Type", "8"),
+                param(
+                    "Icmp.Code",
+                    &(NETWORK_ACL_ICMP_NUMBERS.start() - 1).to_string(),
+                ),
+            ],
+            "InvalidParameterValue",
+        ),
+        (
             "a range that is not CIDR notation",
             held.rule_number,
             vec![
@@ -799,6 +826,64 @@ async fn a_replacement_is_held_to_what_a_rule_may_be() {
             stored,
             vec![expected_entry(&after)],
             "case {case:?}: expected the replacement at that bound, got {stored:?}"
+        );
+    }
+}
+
+/// An ICMP rule's type and code are held to the numbers the member publishes: each published
+/// bound of the one-byte field is accepted and stored as given, the `-1` that stands for all
+/// types or all codes is accepted, and a value past either end is refused — which is what the
+/// refusal rows above check from the other side.
+///
+/// The catalogue is the members' own: "The ICMP type. A value of -1 means all types"
+/// (`IcmpTypeCode$Type`) and "The ICMP code. A value of -1 means all codes for the specified
+/// ICMP type" (`$Code`), over the byte an ICMP header carries each in, named here through
+/// `NETWORK_ACL_ICMP_NUMBERS` and `MAX_ICMP_TYPE`.
+#[tokio::test]
+async fn an_icmp_rule_carries_the_numbers_the_member_publishes() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let acl_id = vpc_and_acl(&router, "10.6.0.0/16").await;
+
+    let all = *NETWORK_ACL_ICMP_NUMBERS.start();
+    // (case, the type and code the replacement carries) — each published bound of the pair,
+    // the all-types/all-codes value on each half alone, and a type and code inside the range
+    // that no other row names.
+    let cases: [(&str, (i32, i32)); 5] = [
+        ("the lowest type and code a byte holds", (0, 0)),
+        ("the highest type and code a byte holds", (MAX_ICMP_TYPE, MAX_ICMP_TYPE)),
+        ("all types and all codes", (all, all)),
+        ("one type, all of its codes", (8, all)),
+        ("all types, one code", (all, 3)),
+    ];
+
+    let before = Rule {
+        case: "the ICMP rule each row replaces",
+        rule_number: 140,
+        egress: false,
+        rule_action: RULE_ACTION_ALLOW,
+        protocol: "1",
+        requested_cidr: "0.0.0.0/0",
+        ipv6: false,
+        reported_cidr: "0.0.0.0/0",
+        port_range: None,
+        icmp_type_code: Some((8, 0)),
+    };
+    given_rule(&router, &acl_id, &before).await;
+
+    for (case, icmp_type_code) in cases {
+        let mut after = before.clone();
+        after.case = case;
+        after.icmp_type_code = Some(icmp_type_code);
+        let (status, body) = replace_entry(&router, &rule_params(&acl_id, &after)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        let stored = entries_at(&router, case, &acl_id, after.rule_number, after.egress).await;
+        assert_eq!(
+            stored,
+            vec![expected_entry(&after)],
+            "case {case:?}: expected the type and code the request named, got {stored:?}"
         );
     }
 }
