@@ -2435,6 +2435,16 @@ pub struct Deployment {
     /// this deployment's application, environment or configuration profile at that instant.
     pub applied_extensions: Vec<AppliedExtension>,
     pub started_at: SystemTime,
+    /// The instant this deployment COMPLETED — "the time the deployment completed", the
+    /// one thing the model's `Deployment$CompletedAt` reports — and `None` for a
+    /// deployment that has not completed.
+    ///
+    /// Only the transition into `COMPLETE` sets it, so it is the member that separates a
+    /// rollout that finished from one that was aborted: a deployment a stop rolled back,
+    /// or one whose rollback the clock finished, never completed and so reports no
+    /// completion instant however it reached its terminal state. A later REVERT of a
+    /// completed deployment keeps the instant that deployment completed at — the revert is
+    /// an event of its own, not a second completion.
     pub completed_at: Option<SystemTime>,
     /// The instant the rollback a caller's stop started falls due to finish, set only
     /// while this deployment is `ROLLING_BACK` and `None` for one nobody stopped. Stored
@@ -2607,7 +2617,8 @@ impl Deployment {
             // Nothing is due: the rollback is over when the stop answers, so no reader is
             // owed a transition and the deployment has no stage left to tick through.
             self.rollback_completion_due = None;
-            self.completed_at = Some(now);
+            // `CompletedAt` is left ABSENT: see the field's own note — this deployment was
+            // aborted, so it never completed and reports no completion instant.
             self.next_tick_due = None;
             self.event_log.push(deployment_event(
                 EVENT_ROLLBACK_COMPLETED,
@@ -2780,7 +2791,8 @@ impl Deployment {
             };
             if now >= due {
                 self.state = DEPLOYMENT_ROLLED_BACK.to_string();
-                self.completed_at = Some(due);
+                // `CompletedAt` stays absent: the rollback finishing is not the
+                // deployment completing. See the field's own note.
                 self.event_log.push(deployment_event(
                     EVENT_ROLLBACK_COMPLETED,
                     TRIGGERED_BY_APPCONFIG,

@@ -417,21 +417,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `LatestDeploymentNumber` is the caller's assertion about the state it is
-        // deploying from: "use this value to ensure that the deployment starts from the
-        // expected state and to prevent conflicting updates".
-        if let Some(expected) = input.latest_deployment_number {
-            let latest = environment.latest_deployment_number();
-            if expected != latest {
-                return Err(StartDeploymentErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "LatestDeploymentNumber {expected} does not match the latest deployment \
-                         number {latest} of this environment."
-                    )),
-                })
-                .into());
-            }
-        }
+        // `LatestDeploymentNumber` is the caller's own note about the state it believes it
+        // is deploying from. It is ADVISORY: the member is optional, carries no default
+        // the service acts on, and is echoed by no output shape of this service, so
+        // AppConfig stores nothing from it and refuses nothing over it — a value naming
+        // any other deployment number, including one no environment ever issued, starts a
+        // deployment exactly as a request that omitted the member does. Read and dropped
+        // here, deliberately, rather than compared against
+        // `Environment::latest_deployment_number`: a precondition on it would refuse a
+        // caller whose cached number has merely drifted.
+        let _ = input.latest_deployment_number;
 
         // "StartDeployment synchronously invokes the action bound at
         // PRE_START_DEPLOYMENT before creating the deployment": the actions are

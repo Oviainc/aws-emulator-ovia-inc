@@ -308,9 +308,9 @@ async fn a_stop_settles_a_deployment_whose_environment_was_deleted() {
             member(&stop_body, "State")
         );
         assert!(
-            !member(&stop_body, "CompletedAt").is_null(),
-            "case {case:?}: a rolled-back deployment carries the instant its rollback finished, \
-             got {}",
+            member(&stop_body, "CompletedAt").is_null(),
+            "case {case:?}: a rolled-back deployment never completed, so it reports no \
+             completion instant, got {}",
             member(&stop_body, "CompletedAt")
         );
         let log = event_types(&event_log(case, "StopDeployment", &stop_body));
@@ -719,9 +719,9 @@ fn a_deployment_without_its_environment_is_owed_nothing_by_the_clock_and_rolls_b
             deployment.state
         );
         assert_eq!(
-            deployment.completed_at,
-            Some(stopped_at),
-            "case {case:?}: the record finished when its rollback did, got {:?}",
+            deployment.completed_at, None,
+            "case {case:?}: a deployment the stop rolled back never completed, so it holds no \
+             completion instant, got {:?}",
             deployment.completed_at
         );
         assert_eq!(
@@ -838,9 +838,9 @@ fn the_clock_still_finishes_a_rollback_started_before_the_environment_was_delete
             deployment.state
         );
         assert_eq!(
-            deployment.completed_at,
-            Some(due),
-            "case {case:?}: the record finished when its rollback did, got {:?}",
+            deployment.completed_at, None,
+            "case {case:?}: a rolled-back deployment never completed, so it holds no completion \
+             instant, got {:?}",
             deployment.completed_at
         );
         let log = stored_event_types(deployment);

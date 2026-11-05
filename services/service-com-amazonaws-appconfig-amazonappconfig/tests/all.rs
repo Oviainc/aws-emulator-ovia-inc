@@ -25,6 +25,8 @@ mod application_name_uniqueness;
 mod aws_authored_extensions;
 #[path = "all/configuration_profile_deletion_protection.rs"]
 mod configuration_profile_deletion_protection;
+#[path = "all/configuration_profile_immutable_type.rs"]
+mod configuration_profile_immutable_type;
 #[path = "all/configuration_profile_lookup_subject.rs"]
 mod configuration_profile_lookup_subject;
 #[path = "all/configuration_profile_type.rs"]
@@ -125,6 +127,10 @@ mod request_derived_refusal_templates;
 mod resource_deletes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/rolled_back_deployment_completion_time.rs"]
+mod rolled_back_deployment_completion_time;
+#[path = "all/start_deployment_latest_deployment_number.rs"]
+mod start_deployment_latest_deployment_number;
 #[path = "all/start_experiment_run.rs"]
 mod start_experiment_run;
 #[path = "all/state_roundtrip.rs"]

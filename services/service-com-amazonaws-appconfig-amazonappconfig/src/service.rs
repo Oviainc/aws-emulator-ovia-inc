@@ -40,6 +40,8 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod immutable_profile_type;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
@@ -455,7 +457,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             untag_resource::UntagResource,
             update_account_settings::UpdateAccountSettings,
             update_application::UpdateApplication,
-            update_configuration_profile::UpdateConfigurationProfile,
             update_deployment_strategy::UpdateDeploymentStrategy,
             update_environment::UpdateEnvironment,
             update_experiment_definition::UpdateExperimentDefinition,
@@ -464,6 +465,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_extension_association::UpdateExtensionAssociation,
             validate_configuration::ValidateConfiguration,
         );
+        // `UpdateConfigurationProfile` is served through the same dialect as every
+        // operation above, behind the one guard a handler cannot apply itself: a request
+        // asking the profile to become a different `Type` names a member the model does
+        // not declare, which is dropped before any handler sees it. See
+        // [`immutable_profile_type`].
+        immutable_profile_type::served(&mut in_service_dialect, Arc::clone(&engine));
         Self {
             entry: crate::ServiceDefinition::new(engine),
             in_service_dialect,

@@ -295,9 +295,9 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
             member(&stop_body, "State")
         );
         assert!(
-            !member(&stop_body, "CompletedAt").is_null(),
-            "case {case:?}: a rolled-back deployment carries the instant its rollback \
-             finished, got {}",
+            member(&stop_body, "CompletedAt").is_null(),
+            "case {case:?}: a rolled-back deployment never completed, so it reports no \
+             completion instant, got {}",
             member(&stop_body, "CompletedAt")
         );
         let stop_events = event_log(case, "StopDeployment", &stop_body);
@@ -654,9 +654,9 @@ fn a_stop_settles_the_rollback_it_performs() {
             deployment.state
         );
         assert_eq!(
-            deployment.completed_at,
-            Some(stopped_at),
-            "case {case:?}: the record finished when its rollback did, got {:?}",
+            deployment.completed_at, None,
+            "case {case:?}: a deployment the stop rolled back never completed, so it holds \
+             no completion instant, got {:?}",
             deployment.completed_at
         );
         assert_eq!(
@@ -805,9 +805,9 @@ fn the_clock_finishes_the_rollback_appconfig_starts() {
             deployment.state
         );
         assert_eq!(
-            deployment.completed_at,
-            Some(due),
-            "case {case:?}: a rolled-back deployment finished when its rollback did, got {:?}",
+            deployment.completed_at, None,
+            "case {case:?}: a rolled-back deployment never completed, so it holds no \
+             completion instant, got {:?}",
             deployment.completed_at
         );
         let log = stored_event_types(&deployment);

@@ -2,7 +2,9 @@
 
 //! `UpdateConfigurationProfile` as a PATCH: the members a request carries are written to
 //! the stored profile, every member it omits keeps the value the profile already holds,
-//! and the members the request cannot carry (`LocationUri`, `Type`) cannot change at all.
+//! and `LocationUri` — which the request cannot carry — cannot change at all. A body that
+//! names the profile's `Type` is refused outright, which
+//! `tests/all/configuration_profile_immutable_type.rs` owns.
 //!
 //! The suite drives real HTTP requests through the router and reads every update back
 //! through `GetConfigurationProfile`, so an update that answered a value it never
@@ -234,10 +236,16 @@ async fn an_update_writes_the_members_it_carries_and_leaves_the_others_alone() {
     }
 }
 
-/// `LocationUri` and `Type` are not members of this request, so no update can change
-/// them: whatever the profile was created with is what it keeps reporting.
+/// `LocationUri` is not a member of this request, so no update can change it: whatever
+/// the profile was created with is what it keeps reporting, and the members the request
+/// does carry are still applied.
+///
+/// A body that names the profile's `Type` is a different rule and lives in
+/// `tests/all/configuration_profile_immutable_type.rs`: the kind a profile is cannot
+/// change, and a request asking it to is refused outright. The patch below therefore
+/// names the kind the profile already is, which asks for no change.
 #[tokio::test]
-async fn an_update_cannot_change_where_a_configuration_lives_or_what_type_it_is() {
+async fn an_update_cannot_change_where_a_configuration_lives() {
     let router = router();
     let application = create_application(&router, "immutable-members").await;
 
@@ -272,13 +280,14 @@ async fn an_update_cannot_change_where_a_configuration_lives_or_what_type_it_is(
             .string("Id")
             .unwrap_or_else(|| panic!("case {case:?}: no Id in {}", created.json()));
 
-        // The patch names them anyway. They are not members of the request shape, so the
-        // update applies the members it does carry and leaves these two as they were —
-        // it never adopts a value the operation cannot accept.
+        // The patch names the location anyway, and restates the kind the profile already
+        // is. `LocationUri` is not a member of the request shape, so the update applies
+        // the members it does carry and leaves the location as it was — it never adopts a
+        // value the operation cannot accept.
         let patch = json!({
             "Name": "renamed-but-not-relocated",
             "LocationUri": "hosted",
-            "Type": "AWS.AppConfig.FeatureFlags",
+            "Type": profile_type.unwrap_or("AWS.Freeform"),
         });
         let updated = update_profile(&router, &application, &id, &patch).await;
         assert_eq!(

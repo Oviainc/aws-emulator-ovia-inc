@@ -144,8 +144,9 @@ async fn a_stop_answers_the_deployment_in_its_terminal_rolled_back_state() {
             member(&stop_body, "State")
         );
         assert!(
-            !member(&stop_body, "CompletedAt").is_null(),
-            "case {case:?}: a settled rollback carries the instant it finished, got {}",
+            member(&stop_body, "CompletedAt").is_null(),
+            "case {case:?}: a settled rollback never completed the deployment, so it reports \
+             no completion instant, got {}",
             member(&stop_body, "CompletedAt")
         );
 
