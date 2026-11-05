@@ -223,49 +223,40 @@ fn assert_summary(case: &str, expected: &Value, observed: &Value) {
 /// collaboration holding none is reported as an empty list, not refused: the operation
 /// models no not-found error for a collaboration.
 ///
-/// The rows differ along why the collaboration holds nothing: the store is empty, the
-/// store holds models of other collaborations only, and the store holds this
-/// collaboration's models in another region only.
+/// The rows differ along why the collaboration holds nothing, and each row is a distinct
+/// input: an empty store, a store holding other collaborations' models only, and a store
+/// holding that collaboration's own models in another region only.
 #[tokio::test]
 async fn a_collaboration_holding_no_trained_models_reports_an_empty_list() {
     let (router, engine) = emulator();
-    let asked_about = uuid(1);
 
-    let answer = list(&router, REGION, &asked_about, "").await;
-    assert_eq!(
-        answer.status, 200,
-        "case \"empty store\": expected HTTP 200, got {} with {:?}",
-        answer.status, answer.body
-    );
-    assert!(
-        summaries(&answer).is_empty(),
-        "case \"empty store\": expected no summaries, got {:?}",
-        answer.body
-    );
-    assert_eq!(
-        answer.at("nextToken"),
-        Value::Null,
-        "case \"empty store\": a page that ends the list carries no nextToken, got {:?}",
-        answer.body
-    );
+    // (case, the collaboration asked about, what the store holds that it must not report)
+    let cases: &[(&str, u32)] = &[
+        ("empty store", 1),
+        ("only other collaborations hold trained models", 2),
+        ("this collaboration's trained models are in another region", 3),
+    ];
 
-    // Models of two OTHER collaborations, in the region being asked.
-    for other in [2_u32, 3] {
-        seed(
-            &engine,
-            trained_model(&uuid(other), &uuid(other), REGION, &format!("m{other}")),
-        );
-    }
-    // And this collaboration's own model, in another region.
-    seed(
-        &engine,
-        trained_model(&asked_about, &uuid(4), OTHER_REGION, "elsewhere"),
-    );
+    for (case, index) in cases.iter().copied() {
+        let asked_about = uuid(index);
+        match case {
+            "only other collaborations hold trained models" => {
+                for other in [index + 100, index + 200] {
+                    seed(
+                        &engine,
+                        trained_model(&uuid(other), &uuid(other), REGION, &format!("m{other}")),
+                    );
+                }
+            }
+            "this collaboration's trained models are in another region" => {
+                seed(
+                    &engine,
+                    trained_model(&asked_about, &uuid(index + 300), OTHER_REGION, "elsewhere"),
+                );
+            }
+            _ => {}
+        }
 
-    for case in [
-        "only other collaborations hold trained models",
-        "this collaboration's trained models are in another region",
-    ] {
         let answer = list(&router, REGION, &asked_about, "").await;
         assert_eq!(
             answer.status, 200,
@@ -275,6 +266,12 @@ async fn a_collaboration_holding_no_trained_models_reports_an_empty_list() {
         assert!(
             summaries(&answer).is_empty(),
             "case {case:?}: expected no summaries, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.at("nextToken"),
+            Value::Null,
+            "case {case:?}: a page that ends the list carries no nextToken, got {:?}",
             answer.body
         );
     }

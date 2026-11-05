@@ -180,51 +180,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `maxResults` is modelled `@range(min: 1, max: 100)` and the boundary validator
-        // refused anything outside it before this handler ran, so the only case left is
-        // an absent value: serve the largest page the model allows. The `clamp` states
-        // that invariant rather than correcting a caller — a value reaching here outside
-        // the range is a validator bug, which the debug assertion surfaces instead of
-        // silently repairing.
-        let requested = input
-            .max_results
-            .unwrap_or(crate::state::TRAINED_MODEL_PAGE_LIMIT);
-        debug_assert!(
-            (1..=crate::state::TRAINED_MODEL_PAGE_LIMIT).contains(&requested),
-            "maxResults {requested} should have been refused at the boundary"
+        // `maxResults` is modelled `@range(min: 1, max: 100)`; `page_bound` is the one
+        // place this service resolves a bound the request may not carry.
+        let page_size = crate::state::page_bound(
+            input.max_results,
+            crate::state::TRAINED_MODEL_PAGE_LIMIT,
         );
-        let page_size = usize::try_from(requested.clamp(1, crate::state::TRAINED_MODEL_PAGE_LIMIT))
-            .expect("a page size clamped into 1..=100 fits in usize");
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let mut collaboration_trained_models = Vec::with_capacity(page_size);
-        let mut next_token = None;
-        for model in store.trained_models.values_mut() {
-            // Resume at the first ARN at or after the token, so a page is still served
-            // when the model the token named was deleted meanwhile.
-            if input
-                .next_token
-                .as_deref()
-                .is_some_and(|token| model.arn.as_str() < token)
-            {
-                continue;
-            }
-            // A regional endpoint reports its own region's resources and no others, and
-            // this call reports one collaboration's models and no others.
-            if model.region != region
-                || model.collaboration_identifier != input.collaboration_identifier
-            {
-                continue;
-            }
-            if collaboration_trained_models.len() == page_size {
-                next_token = Some(model.arn.clone());
-                break;
-            }
-            // The status a reported model carries is the one the clock owes it now.
-            model.settle(now);
-            collaboration_trained_models.push(model.to_collaboration_summary());
-        }
+        // The walk — resume at the token, report one collaboration's records in the one
+        // stable order its ARN keys give, settle what the clock owes each one — is
+        // `crate::state::collaboration_page`, shared with the sibling
+        // collaboration-scoped list rather than copied beside it.
+        let (collaboration_trained_models, next_token) = crate::state::collaboration_page(
+            store.trained_models.values_mut(),
+            &input.collaboration_identifier,
+            &region,
+            page_size,
+            input.next_token.as_deref(),
+            now,
+        );
 
         Ok(ListCollaborationTrainedModelsOutput {
             next_token,

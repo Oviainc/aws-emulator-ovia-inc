@@ -321,6 +321,133 @@ impl TrainedModel {
     }
 }
 
+/// A record one of this service's collaboration-scoped lists pages over.
+///
+/// `ListCollaborationMLInputChannels` and `ListCollaborationTrainedModels` serve
+/// the same rule over different resources — report the records of one
+/// collaboration that the endpoint's own region holds, ARN order, one page at a
+/// time — so the walk lives once in [`collaboration_page`] and each record says
+/// here what that walk needs of it.
+pub trait CollaborationScoped {
+    /// The summary projection that list returns, one per reported record.
+    type Summary;
+
+    /// The ARN this record is keyed by, which is the pagination token.
+    fn page_key(&self) -> &str;
+    /// The region the record was created in.
+    fn scope_region(&self) -> &str;
+    /// The collaboration the record is reported through.
+    fn scope_collaboration(&self) -> &str;
+    /// Materialise the status change the clock owes this record, if any is due.
+    fn settle_now(&mut self, now: SystemTime);
+    /// The summary projection of this record.
+    fn summary(&self) -> Self::Summary;
+}
+
+impl CollaborationScoped for MlInputChannel {
+    type Summary = CollaborationMLInputChannelSummary;
+
+    fn page_key(&self) -> &str {
+        &self.arn
+    }
+
+    fn scope_region(&self) -> &str {
+        &self.region
+    }
+
+    fn scope_collaboration(&self) -> &str {
+        &self.collaboration_identifier
+    }
+
+    fn settle_now(&mut self, now: SystemTime) {
+        self.settle(now);
+    }
+
+    fn summary(&self) -> Self::Summary {
+        self.to_collaboration_summary()
+    }
+}
+
+impl CollaborationScoped for TrainedModel {
+    type Summary = CollaborationTrainedModelSummary;
+
+    fn page_key(&self) -> &str {
+        &self.arn
+    }
+
+    fn scope_region(&self) -> &str {
+        &self.region
+    }
+
+    fn scope_collaboration(&self) -> &str {
+        &self.collaboration_identifier
+    }
+
+    fn settle_now(&mut self, now: SystemTime) {
+        self.settle(now);
+    }
+
+    fn summary(&self) -> Self::Summary {
+        self.to_collaboration_summary()
+    }
+}
+
+/// The page size a list serves for the `maxResults` the request carried, where
+/// `limit` is the maximum that member's `@range` admits and the page served when
+/// the request names none.
+///
+/// The centralised walk refuses anything outside that range before a handler
+/// runs, so the only case left here is an absent value. The `clamp` states that
+/// invariant rather than correcting a caller — a value reaching here outside the
+/// range is a validator bug, which the debug assertion surfaces instead of
+/// silently repairing.
+pub fn page_bound(max_results: Option<i32>, limit: i32) -> usize {
+    let requested = max_results.unwrap_or(limit);
+    debug_assert!(
+        (1..=limit).contains(&requested),
+        "maxResults {requested} should have been refused at the boundary"
+    );
+    usize::try_from(requested.clamp(1, limit)).expect("a page size clamped into 1..=limit fits")
+}
+
+/// One page of the collaboration-scoped `records`, and the token the next page
+/// resumes at when the collaboration holds more.
+///
+/// `records` is iterated in the store's ARN order, which is the one stable total
+/// order the token indexes into. `resume_at` is the token the request carried:
+/// the page starts at the first ARN at or after it, so a page is still served
+/// when the record that token named was deleted meanwhile. A record is reported
+/// only through its own collaboration and its own region's endpoint, carrying the
+/// status the clock owes it at `now`.
+pub fn collaboration_page<'a, Record: CollaborationScoped + 'a>(
+    records: impl Iterator<Item = &'a mut Record>,
+    collaboration_identifier: &str,
+    region: &str,
+    page_size: usize,
+    resume_at: Option<&str>,
+    now: SystemTime,
+) -> (Vec<Record::Summary>, Option<String>) {
+    let mut page = Vec::with_capacity(page_size);
+    let mut next_token = None;
+    for record in records {
+        if resume_at.is_some_and(|token| record.page_key() < token) {
+            continue;
+        }
+        if record.scope_region() != region
+            || record.scope_collaboration() != collaboration_identifier
+        {
+            continue;
+        }
+        if page.len() == page_size {
+            next_token = Some(record.page_key().to_string());
+            break;
+        }
+        record.settle_now(now);
+        page.push(record.summary());
+    }
+    (page, next_token)
+}
+
 /// One Clean Rooms ML configured model algorithm, as this emulator persists it.
 ///
 /// The resource is container configuration plus the role that reads the
