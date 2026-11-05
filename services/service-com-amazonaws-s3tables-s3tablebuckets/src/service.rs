@@ -35,6 +35,14 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is the one this service DOES take: every timestamp
+//! member of this model declares `@timestampFormat("date-time")`
+//! (`smithy_query(query="shape",
+//! shape="TableSummary,TableBucketSummary,NamespaceSummary,GetTableResponse")` reports it on
+//! each), so this service serves the model's `restJson1` codec with every timestamp in that
+//! form — `service_common::date_time_json`, which is where the whole workspace's rendering
+//! of such a member lives.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -163,6 +171,9 @@ fn constraint_refusal(violations: &[Violation]) -> Option<Refused> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: service_common::date_time_json::DateTimeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -172,6 +183,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: service_common::date_time_json::DateTimeRestJson::new(),
         }
     }
 }
@@ -249,5 +261,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every timestamp member of this model declares
+        // `@timestampFormat("date-time")` — a table's and a table bucket's
+        // `createdAt`/`modifiedAt`, a namespace's `createdAt`, a maintenance or
+        // expiration job's `lastRunTimestamp`, a replicated update's `timestamp` — so
+        // every instant this service reports is an RFC 3339 string rather than the
+        // protocol's default epoch-seconds number. The codec that applies it is
+        // otherwise the model's own `restJson1`.
+        Some(&self.protocol)
     }
 }

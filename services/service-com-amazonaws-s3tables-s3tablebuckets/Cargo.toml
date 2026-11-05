@@ -21,9 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Digest + hex encoding for the server-generated, opaque `tableBucketId`.
+# Digest + hex encoding for the opaque continuation token a list operation pages with,
+# and the entropy behind every server-generated identifier this service mints.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Lays those digest bytes out as the canonical hyphenated UUID this service's ids are,
+# and writes the version and variant nibbles such a UUID carries.
+uuid = "1"
+# `date_time_json`: the workspace's ONE rendering of a `restJson1` timestamp whose model
+# declares the `date-time` form, which every timestamp member of this model does.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

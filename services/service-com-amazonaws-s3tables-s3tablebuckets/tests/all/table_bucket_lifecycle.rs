@@ -183,8 +183,10 @@ fn expected_arn(region: &str, name: &str) -> String {
     format!("arn:aws:s3tables:{region}:{ACCOUNT}:bucket/{name}")
 }
 
-/// `createdAt` as epoch seconds, accepting either wire form a timestamp can
-/// take (the model marks it `date-time`, so a string is what is expected).
+/// `createdAt` as epoch seconds, read from the ONE wire form the model declares
+/// for it: `@timestampFormat("date-time")`, so an RFC 3339 string. The
+/// epoch-seconds number the protocol defaults to is the defect, not an accepted
+/// alternative.
 fn created_at_seconds(body: &Value, case: &str) -> f64 {
     match body.get("createdAt") {
         Some(Value::String(text)) => DateTime::from_str(text, Format::DateTime)
@@ -192,10 +194,9 @@ fn created_at_seconds(body: &Value, case: &str) -> f64 {
                 panic!("case {case:?}: createdAt {text:?} is not a date-time: {error}")
             })
             .as_secs_f64(),
-        Some(Value::Number(number)) => number.as_f64().unwrap_or_else(|| {
-            panic!("case {case:?}: createdAt {number} is not representable as seconds")
-        }),
-        other => panic!("case {case:?}: createdAt is missing or not a timestamp: {other:?}"),
+        actual => panic!(
+            "case {case:?}: expected createdAt to be an RFC 3339 date-time string, got {actual:?}"
+        ),
     }
 }
 

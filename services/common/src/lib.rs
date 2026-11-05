@@ -228,6 +228,11 @@
 //! reads take their window in the query string — the generated schema carries no
 //! member-level `@timestampFormat`, so without it the framework reads such a member as
 //! RFC-3339 only and refuses the form every SDK sends.
+//!
+//! [`date_time_json`] is the BODY half of that same dropped trait: the `restJson1` codec
+//! with a timestamp whose model declares `date-time` read and written as the RFC 3339
+//! string every SDK bound to such a member parses, rather than as the protocol's default
+//! epoch-seconds number.
 
 pub mod rds_cluster_parameters;
 
@@ -280,6 +285,10 @@ pub mod db_data_sources;
 /// a host names a service at all — for every service that serves one, so the planes cannot
 /// drift on which requests they claim.
 pub mod data_plane_addressing;
+/// The ONE rendering of a `restJson1` timestamp whose model declares the `date-time` form,
+/// for every service of that class — which the generated member schemas drop, so without it
+/// such a member goes on the wire as the protocol's default epoch-seconds NUMBER.
+pub mod date_time_json;
 /// The ONE free-text search over a stored document's text — the terms a query names, which
 /// of them a text carries, the window of that text to report with the matches inside it, and
 /// the match of one whole document — for every service whose API answers a caller's query

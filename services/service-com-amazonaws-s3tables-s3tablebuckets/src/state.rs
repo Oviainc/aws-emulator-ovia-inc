@@ -339,13 +339,18 @@ pub struct ComAmazonawsS3tablesS3tablebucketsState {
 }
 
 impl ComAmazonawsS3tablesS3tablebucketsState {
-    /// A fresh server-generated id: 32 lowercase hex characters.
+    /// A fresh server-generated id, in the canonical hyphenated UUID form every
+    /// identifier this service mints carries (`tableBucketId`, `namespaceId`, the
+    /// id segment of a `tableARN`, a `versionToken`, a table's metadata file id).
     ///
-    /// The id is a digest of the instant it is minted, this store's mint counter
-    /// and `domain` (which kind of id it is), so it is opaque: it carries nothing
-    /// from the request, two mints never collide (the counter separates them
-    /// inside one clock tick), and two emulator runs do not repeat each other's
-    /// ids.
+    /// The 16 bytes behind it are a digest of the instant it is minted, this
+    /// store's mint counter and `domain` (which kind of id it is), so the id is
+    /// opaque: it carries nothing from the request, two mints never collide (the
+    /// counter separates them inside one clock tick), and two emulator runs do
+    /// not repeat each other's ids. Those bytes are then handed to the `uuid`
+    /// crate, which owns both remaining rules — the version and variant nibbles a
+    /// random-bytes UUID carries, and the canonical lowercase hyphenated
+    /// rendering — so neither is restated here to drift from the library's.
     fn mint_id(&mut self, domain: &str) -> String {
         use ::sha2::{Digest, Sha256};
         self.minted_ids = self.minted_ids.wrapping_add(1);
@@ -356,7 +361,12 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         let digest = Sha256::digest(
             format!("s3tables-{domain}:{since_epoch}:{}", self.minted_ids).as_bytes(),
         );
-        ::hex::encode(&digest[..16])
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        ::uuid::Builder::from_random_bytes(bytes)
+            .into_uuid()
+            .hyphenated()
+            .to_string()
     }
 
     /// A fresh `tableBucketId`, retried against the store so an id is never

@@ -25,3 +25,5 @@ mod table_bucket_encryption;
 mod table_bucket_lifecycle;
 #[path = "all/table_bucket_metrics_configuration.rs"]
 mod table_bucket_metrics_configuration;
+#[path = "all/wire_forms.rs"]
+mod wire_forms;

@@ -371,8 +371,10 @@ pub fn expected_bucket_arn(region: &str, name: &str) -> String {
     format!("arn:aws:s3tables:{region}:{ACCOUNT}:bucket/{name}")
 }
 
-/// A timestamp member as epoch seconds, accepting either wire form a timestamp
-/// can take (the model marks these `date-time`, so a string is what is expected).
+/// A timestamp member as epoch seconds, read from the ONE wire form the model
+/// declares for it: `@timestampFormat("date-time")`, so an RFC 3339 string. Any
+/// other form — the epoch-seconds number the protocol defaults to — is the defect,
+/// not an accepted alternative.
 pub fn timestamp_seconds(body: &Value, member: &str, case: &str) -> f64 {
     match body.get(member) {
         Some(Value::String(text)) => DateTime::from_str(text, Format::DateTime)
@@ -380,10 +382,9 @@ pub fn timestamp_seconds(body: &Value, member: &str, case: &str) -> f64 {
                 panic!("case {case:?}: {member} {text:?} is not a date-time: {error}")
             })
             .as_secs_f64(),
-        Some(Value::Number(number)) => number.as_f64().unwrap_or_else(|| {
-            panic!("case {case:?}: {member} {number} is not representable as seconds")
-        }),
-        other => panic!("case {case:?}: {member} is missing or not a timestamp: {other:?}"),
+        actual => panic!(
+            "case {case:?}: expected {member} to be an RFC 3339 date-time string, got {actual:?}"
+        ),
     }
 }
 
