@@ -171,26 +171,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(application) = store.application(&input.application_id) else {
+        // The resource this operation reports is the configuration profile, so the whole
+        // path is resolved as one lookup and a path that resolves no profile is refused as
+        // that profile — whichever of the two identifiers is the unresolvable one. The
+        // refusal does not disclose which of them it was.
+        let Some(profile) = store.configuration_profile(
+            &input.application_id,
+            &input.configuration_profile_id,
+        ) else {
             return Err(GetConfigurationProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::application_not_found(
-                        &input.application_id,
-                    )),
-                    resource_name: Some(input.application_id),
-                },
-            )
-            .into());
-        };
-        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
-            return Err(GetConfigurationProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::configuration_profile_not_found(
-                        &input.application_id,
-                        &input.configuration_profile_id,
-                    )),
-                    resource_name: Some(input.configuration_profile_id),
-                },
+                crate::state::configuration_profile_not_found_exception(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                ),
             )
             .into());
         };

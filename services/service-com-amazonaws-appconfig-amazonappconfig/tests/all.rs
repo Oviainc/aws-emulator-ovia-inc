@@ -25,6 +25,8 @@ mod application_name_uniqueness;
 mod aws_authored_extensions;
 #[path = "all/configuration_profile_deletion_protection.rs"]
 mod configuration_profile_deletion_protection;
+#[path = "all/configuration_profile_lookup_subject.rs"]
+mod configuration_profile_lookup_subject;
 #[path = "all/configuration_profile_type.rs"]
 mod configuration_profile_type;
 #[path = "all/configuration_profile_validators.rs"]
@@ -81,6 +83,8 @@ mod feature_flag_metadata;
 mod feature_flags_extension_association;
 #[path = "all/get_configuration.rs"]
 mod get_configuration;
+#[path = "all/hosted_configuration_version_content_reuse.rs"]
+mod hosted_configuration_version_content_reuse;
 #[path = "all/json_schema_validator_gate.rs"]
 mod json_schema_validator_gate;
 #[path = "all/list_applications.rs"]

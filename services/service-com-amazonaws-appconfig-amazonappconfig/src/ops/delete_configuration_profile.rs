@@ -193,28 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal belongs here.
         let _requested_check = input.deletion_protection_check;
 
-        // A configuration profile only exists under an application, so the parent is
-        // resolved first and whichever level is missing is the resource the 404 names —
-        // the same order `GetConfigurationProfile` and `UpdateConfigurationProfile`
-        // resolve this path in.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // The resource this delete acts on is the configuration profile, so the whole path
+        // is resolved as one lookup and a path that resolves no profile is refused as that
+        // profile — whichever of the two identifiers is the unresolvable one, the same
+        // refusal `GetConfigurationProfile` and `UpdateConfigurationProfile` answer.
+        let Some(profile) =
+            store.configuration_profile(&input.application_id, &input.configuration_profile_id)
+        else {
             return Err(DeleteConfigurationProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::application_not_found(&input.application_id)),
-                    resource_name: Some(input.application_id),
-                },
-            )
-            .into());
-        };
-        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
-            return Err(DeleteConfigurationProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::configuration_profile_not_found(
-                        &input.application_id,
-                        &input.configuration_profile_id,
-                    )),
-                    resource_name: Some(input.configuration_profile_id),
-                },
+                crate::state::configuration_profile_not_found_exception(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                ),
             )
             .into());
         };
@@ -260,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hosted-content budget is freed here and no other resource is touched: the
         // deployments an environment holds are that environment's records, and they keep
         // reporting the configuration they were started with.
-        application.profiles.remove(&input.configuration_profile_id);
+        store.remove_configuration_profile(&input.application_id, &input.configuration_profile_id);
 
         // An attribution record for the removal, so the one call that takes a stored
         // resource out of this service's state is observable beside its refusals.

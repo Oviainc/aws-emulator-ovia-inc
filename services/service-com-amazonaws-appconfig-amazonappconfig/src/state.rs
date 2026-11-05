@@ -34,7 +34,8 @@ use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use crate::ops::types::{
     Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent,
     ExperimentDefinitionSnapshot, ExperimentRunEvent, ExperimentRunResult, Monitor, Parameter,
-    Treatment, TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
+    ResourceNotFoundException, Treatment, TreatmentInput, TreatmentOverrides, Validator,
+    VendedMetricsSettings,
 };
 
 pub mod extension_actions;
@@ -1975,6 +1976,14 @@ impl ConfigurationProfile {
         self.next_version_number - 1
     }
 
+    /// The NEWEST hosted configuration version this profile holds — the one a write
+    /// compares its bytes against and the one a feature-flag document carries stamps over
+    /// from — or `None` before the first write. The map is keyed by version number, so
+    /// its last entry is the newest.
+    pub fn latest_hosted_version(&self) -> Option<&HostedConfigurationVersion> {
+        self.hosted_versions.values().next_back()
+    }
+
     /// The hosted configuration version `identifier` names, by version number or by
     /// version label.
     ///
@@ -2991,6 +3000,27 @@ pub fn configuration_profile_not_found(
     )
 }
 
+/// The whole `ResourceNotFoundException` an operation that ADDRESSES a configuration
+/// profile answers when the path it was addressed by resolves no profile.
+///
+/// One refusal for the whole path: the resource such an operation acts on is the profile,
+/// so the profile is the subject whichever of the two identifiers is the unresolvable one —
+/// a caller learns that the profile it addressed is not there, and not which identifier
+/// failed to resolve. Built here rather than in each handler so every operation addressing
+/// a profile answers the same refusal, `ResourceName` included.
+pub fn configuration_profile_not_found_exception(
+    application_id: &str,
+    configuration_profile_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(configuration_profile_not_found(
+            application_id,
+            configuration_profile_id,
+        )),
+        resource_name: Some(configuration_profile_id.to_string()),
+    }
+}
+
 /// `Message` for an experiment definition the named application does not hold.
 ///
 /// The experiment operations address both resources by an `Identifier` member — the
@@ -3755,6 +3785,46 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// record or one nested under it.
     pub fn application_mut(&mut self, application_id: &str) -> Option<&mut Application> {
         self.applications.get_mut(application_id)
+    }
+
+    /// The configuration profile the pair `(application_id, configuration_profile_id)`
+    /// addresses, or `None` when this account holds no such profile — because it holds no
+    /// such application, or because the application it does hold holds no such profile.
+    ///
+    /// ONE lookup for the whole path, so an operation that acts on the profile cannot
+    /// report the two levels differently: see
+    /// [`configuration_profile_not_found_exception`] for the single refusal that answers a
+    /// miss here.
+    pub fn configuration_profile(
+        &self,
+        application_id: &str,
+        configuration_profile_id: &str,
+    ) -> Option<&ConfigurationProfile> {
+        self.application(application_id)
+            .and_then(|application| application.profiles.get(configuration_profile_id))
+    }
+
+    /// [`Self::configuration_profile`], for a caller that goes on to mutate the profile.
+    pub fn configuration_profile_mut(
+        &mut self,
+        application_id: &str,
+        configuration_profile_id: &str,
+    ) -> Option<&mut ConfigurationProfile> {
+        self.application_mut(application_id)
+            .and_then(|application| application.profiles.get_mut(configuration_profile_id))
+    }
+
+    /// Forget the configuration profile the pair addresses, answering the record that was
+    /// removed, or `None` when this account holds no such profile. `DeleteConfigurationProfile`
+    /// is the caller this exists for, and removing the record is what makes every reader of
+    /// the profile miss on it afterwards.
+    pub fn remove_configuration_profile(
+        &mut self,
+        application_id: &str,
+        configuration_profile_id: &str,
+    ) -> Option<ConfigurationProfile> {
+        self.application_mut(application_id)
+            .and_then(|application| application.profiles.remove(configuration_profile_id))
     }
 
     /// Every application this account holds, in no particular order — a listing orders

@@ -187,28 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // A profile is addressed under its application, so the parent is resolved first:
-        // an update naming an application this service does not hold is not found.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // The resource this update acts on is the configuration profile, so the whole path
+        // is resolved as one lookup and a path that resolves no profile is refused as that
+        // profile — whichever of the two identifiers is the unresolvable one.
+        let Some(profile) = store.configuration_profile_mut(
+            &input.application_id,
+            &input.configuration_profile_id,
+        ) else {
             return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::application_not_found(
-                        &input.application_id,
-                    )),
-                    resource_name: Some(input.application_id),
-                },
-            )
-            .into());
-        };
-        let Some(profile) = application.profiles.get_mut(&input.configuration_profile_id) else {
-            return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::configuration_profile_not_found(
-                        &input.application_id,
-                        &input.configuration_profile_id,
-                    )),
-                    resource_name: Some(input.configuration_profile_id),
-                },
+                crate::state::configuration_profile_not_found_exception(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                ),
             )
             .into());
         };

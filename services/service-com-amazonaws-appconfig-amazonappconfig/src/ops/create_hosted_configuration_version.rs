@@ -341,9 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // instants a previous version recorded are carried over rather than reset by
             // a write that did not touch that entry.
             let previous = profile
-                .hosted_versions
-                .values()
-                .next_back()
+                .latest_hosted_version()
                 .map(|version| version.content.as_slice());
             let Some(stamped) = crate::state::feature_flags::stamped_feature_flags_content(
                 &content,
@@ -389,7 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // event carries the bytes this write is about to store and, from the second
         // version on, the bytes the previously STORED version holds.
         let version_number = profile.next_version_number;
-        let previous = profile.hosted_versions.values().next_back().map(|version| {
+        let previous = profile.latest_hosted_version().map(|version| {
             crate::state::extension_actions::previous_content(
                 &version.content_type,
                 version.version_number,
@@ -403,9 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to carry a previous version's stamps over; kept here because a replacement
         // `Content` an action answers goes through that helper too.
         let previously_stored = profile
-            .hosted_versions
-            .values()
-            .next_back()
+            .latest_hosted_version()
             .map(|version| version.content.clone());
         let scope = crate::state::extension_actions::Scope {
             application_id: &input.application_id,
@@ -569,6 +565,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Byte-identical content REUSES the version the profile already holds: a write
+        // whose stored bytes equal those of the profile's newest stored version is answered
+        // with THAT version — its number, its bytes and its metadata — and allocates
+        // nothing, stores nothing and reserves nothing, so re-posting a configuration the
+        // profile already holds leaves the version history and the per-profile version
+        // quota exactly where they were. The bytes compared are the ones this call would
+        // STORE, after the feature-flags helper stamped them and after any replacement the
+        // action point answered, because those are the bytes the new version would hold.
+        // That ordering is deliberate: the action bound at
+        // PRE_CREATE_HOSTED_CONFIGURATION_VERSION decides what WOULD be stored, so it is
+        // consulted — and may refuse the write — before this comparison, exactly as it is
+        // for a write that does allocate a version.
+        // Content differing by even one byte is a version of its own, allocated below.
+        if let Some(identical) = profile
+            .latest_hosted_version()
+            .filter(|latest| latest.content == content)
+        {
+            return Ok(CreateHostedConfigurationVersionOutput {
+                application_id: Some(profile.application_id.clone()),
+                configuration_profile_id: Some(profile.id.clone()),
+                version_number: identical.version_number,
+                description: identical.description.clone(),
+                content: Some(identical.content.clone()),
+                content_type: Some(identical.content_type.clone()),
+                version_label: identical.version_label.clone(),
+                kms_key_arn: None,
+            });
+        }
 
         // Both the number of versions a profile keeps and the total content this
         // service holds are bounded, so a loop of writes cannot grow the emulator's

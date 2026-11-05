@@ -748,16 +748,20 @@ async fn latest_version_number_locks_a_hosted_configuration_write() {
         ("two versions, no claim", None, 201),
     ];
 
-    for (case, claim, expected) in cases {
+    for (row, (case, claim, expected)) in cases.into_iter().enumerate() {
         let headers: Vec<(&str, String)> = claim
             .map(|claim| vec![("Latest-Version-Number", claim.to_string())])
             .unwrap_or_default();
+        // Content of its own per row: content byte-identical to the version a profile
+        // already holds REUSES that version rather than allocating one, so rows that are
+        // meant to move the lock's latest version forward write different bytes.
+        let content = format!(r#"{{"enabled":false,"row":{row}}}"#).into_bytes();
         let answer = send(
             &router,
             "POST",
             &uri,
             "application/json",
-            br#"{"enabled":false}"#.to_vec(),
+            content,
             &headers,
         )
         .await;
@@ -1311,7 +1315,9 @@ async fn writes_past_a_bound_are_refused_with_the_modelled_quota_error() {
             "POST",
             &uri,
             "application/json",
-            br#"{"enabled":true}"#.to_vec(),
+            // Content of its own per write: bytes identical to the profile's newest
+            // version reuse it instead of filling another slot of the bound.
+            format!(r#"{{"enabled":true,"version":{index}}}"#).into_bytes(),
             &[],
         )
         .await;
@@ -1328,7 +1334,7 @@ async fn writes_past_a_bound_are_refused_with_the_modelled_quota_error() {
         "POST",
         &uri,
         "application/json",
-        br#"{"enabled":true}"#.to_vec(),
+        br#"{"enabled":true,"version":"past the bound"}"#.to_vec(),
         &[],
     )
     .await;
