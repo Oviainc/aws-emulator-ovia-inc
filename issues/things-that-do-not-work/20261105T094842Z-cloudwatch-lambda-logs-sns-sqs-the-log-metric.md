@@ -1,0 +1,35 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__lambda__logs__sns__sqs.alarm-log-metric-chain-removed-subscription-stops-chain-at-sqs
+Issue-Key: cloudwatch__lambda__logs__sns__sqs.alarm-log-metric-chain-removed-subscription-stops-chain-at-sqs|_invoke#14|Timeout|return body["printed"]
+Issue-Commit: 30d5092aa3ebb101aaddada2a4fffe08f2e86509
+
+# cloudwatch__lambda__logs__sns__sqs: the log-metric-filter → alarm → SNS → SQS chain never settles, so the removed-subscription arm is never reached
+
+> _Note: this issue was identified against the code base at commit `30d5092aa3ebb101aaddada2a4fffe08f2e86509`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+Invoke
+
+## Description
+This issue carries 1 net-new root cause. It must be closed before submitting.
+
+Cause 1 of 1: an invoked function's printed output never reaches its own `/aws/lambda/<function-name>` log group, so no metric filter on that group can emit a datapoint; the metric stays empty, the alarm never transitions to ALARM, its SNS action never fires, and the check that grades "removing one SQS subscription stops the chain exactly at delivery" exhausts its whole budget before reaching that arm.
+
+AWS: the Lambda runtime writes every invocation's output to `/aws/lambda/<function-name>` — the group is created on the first invocation when the execution role allows logs:CreateLogGroup / logs:CreateLogStream / logs:PutLogEvents, a stream is opened per execution environment, and the invocation contributes a `START RequestId: <id> Version: <version>` line, every line the handler printed to stdout, an `END RequestId: <id>` line and a `REPORT RequestId: <id>\tDuration: … ms\tBilled Duration: … ms\tMemory Size: … MB\tMax Memory Used: … MB` line. The `START`/`END`/`REPORT RequestId:` prefixes and the `Duration`/`Billed Duration`/`Memory Size`/`Max Memory Used` field names are fixed text; the ids, durations and sizes are per-invocation values. Those events are readable through FilterLogEvents/GetLogEvents within seconds, each metric filter on the group counts the matching lines into its CloudWatch metric, GetMetricStatistics/GetMetricData then returns Sum == the number of matching lines, and an alarm on that metric transitions to ALARM and executes its AlarmActions, publishing to the SNS topic, which fans out to every CURRENT subscription. Recorded behavior for this check: the handler prints one JSON line per invocation (the handler uses only `json` and `print` — no SDK import), 5 such lines drive the alarm to ALARM, the alarm's history records a non-failed Action against the topic, the still-subscribed queue receives the ALARM notification whose Trigger.MetricName is the filter's metric, and the UNSUBSCRIBED queue receives nothing (ApproximateNumberOfMessages and ApproximateNumberOfMessagesNotVisible both "0").
+
+Emulator: nothing downstream of the log group ever happens. The invocations succeed but the printed lines never appear in `/aws/lambda/<function-name>`, so the metric filter emits no datapoint, the alarm never leaves INSUFFICIENT_DATA/OK, no SNS publish is made by the alarm action, and the check never gets past the warm-up barrier: it is terminated with `Check timed out after 60.0s`. The direct `sns.publish` probe and the `Unsubscribe`/`GetSubscriptionAttributes` NotFound assertions earlier in the check are not what fails — the chain stalls at the log write-through.
+
+Why: a client relying on AWS's behavior loses the whole log-observability chain: `aws logs tail`, log-driven metric filters, log-based alarms and the notification paths built on them all read an empty group. An operator cannot distinguish a function that logged nothing from one whose logs were dropped, and a negative assertion like "the unsubscribed queue receives nothing" is vacuously satisfied because the alarm never publishes to anyone.
+
+Fix: the Lambda Invoke execution path's log emission — services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs together with the execution state that already captures the run's output — must write that log through to the CloudWatch Logs state store under `/aws/lambda/<function-name>`, creating the group and stream and emitting the START/END/REPORT framing around the handler's own stdout, so metric filters on the group see the events and the CloudWatch alarm → SNS → SQS chain behind them is exercised.
+
+Traces: cloudwatch__lambda__logs__sns__sqs.alarm-log-metric-chain-removed-subscription-stops-chain-at-sqs. The open issue 20261105T081727Z-cloudwatch-lambda-logs-sns-sqs-a-lambda-invocation.md describes the same log write-through cause and even lists this check in its Issue-Trace-Ids, but it does NOT carry this check's current replay key (the run now terminates with `Check timed out after 60.0s` rather than the `_poll_until` Timeout it recorded), so this failure is not gated by it; close them together if the same fix covers both.
+
+## Evidence
+Expected (AWS): after the 5 invocations, FilterLogEvents on /aws/lambda/<function-name> returns the handler's printed `ERROR …<marker>` lines (plus the START/END/REPORT framing); the metric filter's metric reports Sum == 5; the alarm goes to ALARM and its history records a non-failed Action naming the topic ARN; the still-subscribed queue receives the ALARM notification with Trigger.MetricName == the filter's metric; and the unsubscribed queue receives nothing — GetQueueAttributes returns {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0"}.
+Actual (emulator): cloudwatch__lambda__logs__sns__sqs.alarm-log-metric-chain-removed-subscription-stops-chain-at-sqs — Error: Check timed out after 60.0s. The printed lines never reach the log group, so no datapoint, no alarm transition, no SNS action and no delivery to the still-subscribed queue ever occur, and the removed-subscription assertion is never reached.
+
+## Steps to Reproduce
+CreateFunction (Runtime=python3.12) whose handler only `print`s a JSON line containing a unique marker and returns; PutMetricFilter on /aws/lambda/<function-name> with a pattern matching that marker and a metricTransformation into a test namespace; CreateTopic and subscribe two SQS queues; PutMetricAlarm on the transformation's metric with the topic as AlarmActions; Unsubscribe one of the two queues; Invoke the function 5 times. Then: FilterLogEvents on the group (AWS: the 5 printed lines; emulator: nothing), GetMetricStatistics on the metric (AWS: Sum == 5; emulator: no datapoints), DescribeAlarmHistory (AWS: an Action entry naming the topic; emulator: none), ReceiveMessage on the still-subscribed queue (AWS: the ALARM notification; emulator: nothing) and GetQueueAttributes on the unsubscribed queue (both counters "0"). Replay cloudwatch__lambda__logs__sns__sqs.alarm-log-metric-chain-removed-subscription-stops-chain-at-sqs.
