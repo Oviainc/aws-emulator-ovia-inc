@@ -7,8 +7,8 @@
 //! text content whichever spelling it arrives in, so one written as an entity reference
 //! (`&amp;`) or as a numeric character reference (`&#120;`, `&#x78;`) bills as the one
 //! character it stands for, exactly as a literal one does. `RequestCharacters` reports
-//! that count and every value the emulator derives from it (the length of the stream it
-//! returns) follows it, and the documented billed-character limit is measured on it.
+//! that count, the documented billed-character limit is measured on it, and a document
+//! whose text content is spoken comes back with audio of that speech.
 //!
 //! The tests check that over a TABLE whose rows differ along the spelling (literal,
 //! predefined entity, decimal reference, hexadecimal reference, CDATA, a reference for a
@@ -20,7 +20,7 @@
 //! independent of the SSML reader under test.
 
 use service_com_amazonaws_polly_parrot_v1::ops::synthesize_speech::{
-    audio::MIN_DURATION_MS, MAX_BILLED_CHARACTERS, MAX_TOTAL_CHARACTERS,
+    MAX_BILLED_CHARACTERS, MAX_TOTAL_CHARACTERS,
 };
 
 use crate::lexicons_and_speech::{error_code, header, json, Polly};
@@ -146,14 +146,22 @@ async fn synthesize(polly: &Polly, text: &str, text_type: &str) -> http::Respons
 }
 
 /// RULE: `RequestCharacters` is the count of the document's text content, whichever
-/// spelling each character arrives in, and the stream the request returns is derived
-/// from that same count.
+/// spelling each character arrives in, and a document whose text content is spoken comes
+/// back with the audio of that speech.
 #[tokio::test]
 async fn references_bill_as_the_characters_they_stand_for() {
     let polly = Polly::new();
-    // 20 ms of 16 kHz signed 16-bit mono silence: the shortest stream any request
-    // returns, which is what a request billed zero characters comes back with.
-    let floor_bytes = usize::try_from(MIN_DURATION_MS).expect("the floor fits a usize") * 16 * 2;
+    // Every stream ends in a short silence, so even a document with nothing to say
+    // carries a few bytes; what distinguishes a spoken document is that it carries much
+    // more than that.
+    let empty = synthesize(&polly, "<speak></speak>", "ssml").await;
+    assert_eq!(
+        empty.status().as_u16(),
+        200,
+        "an empty document is still synthesized, got {:?}",
+        json(&empty)
+    );
+    let floor_bytes = empty.body().len();
     for row in rows() {
         let ssml = format!("<speak>{}</speak>", row.inner);
         let case = row.case;
@@ -171,8 +179,7 @@ async fn references_bill_as_the_characters_they_stand_for() {
             row.billed
         );
 
-        // The same characters as plain text bill the same, and the stream derived from
-        // the count is therefore byte-for-byte the same length.
+        // The same characters as plain text bill the same.
         let as_plain = synthesize(&polly, &row.plain, "text").await;
         assert_eq!(
             (
@@ -184,29 +191,30 @@ async fn references_bill_as_the_characters_they_stand_for() {
             row.plain,
             row.billed
         );
-        assert_eq!(
-            response.body().len(),
-            as_plain.body().len(),
-            "case {case:?}: the stream must follow the billed count, not the spelling: \
-             {} bytes for the SSML form against {} for the plain-text form",
-            response.body().len(),
-            as_plain.body().len()
-        );
-        // A document that bills characters carries more than the minimum frame; one
-        // that bills none is exactly the floor.
+        // A document whose text content carries words comes back with their speech; one
+        // whose text content is nothing, or carries no word at all, has nothing to say
+        // and stays at the closing silence. Which characters are BILLED and which are
+        // SPOKEN are different questions: punctuation bills and says nothing.
         let body = response.body().len();
-        if row.billed == 0 {
-            assert_eq!(
-                body, floor_bytes,
-                "case {case:?}: a document with no text content is the {floor_bytes}-byte \
-                 floor, got {body}"
-            );
-        } else if row.billed > 1 {
+        let speakable = row.plain.chars().any(char::is_alphanumeric);
+        let silent_markup = row.inner.chars().all(|ch| ch != '<');
+        if speakable {
             assert!(
                 body > floor_bytes,
-                "case {case:?}: {} billed characters must carry more than the \
+                "case {case:?}: the words of {:?} must carry more than the \
                  {floor_bytes}-byte floor, got {body}",
-                row.billed
+                row.plain
+            );
+            assert!(
+                body % 2 == 0,
+                "case {case:?}: pcm carries whole 16-bit samples, got {body} bytes"
+            );
+        } else if silent_markup {
+            assert_eq!(
+                body, floor_bytes,
+                "case {case:?}: {:?} carries no word to speak, so it is the \
+                 {floor_bytes}-byte floor, got {body}",
+                row.plain
             );
         }
     }

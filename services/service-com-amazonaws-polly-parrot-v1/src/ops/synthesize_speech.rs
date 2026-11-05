@@ -4,18 +4,20 @@
 //! Serves one synthesis request: resolves the lexicons it names, settles the output
 //! encoding and returns an audio stream in it.
 //!
-//! ## What is real, and what the emulator cannot do
+//! ## How the speech is produced
 //!
-//! THE EMULATOR PERFORMS NO TEXT-TO-SPEECH. There is no speech synthesiser in this
-//! process and none it may reach, so it does not pretend to have produced speech: the
-//! `AudioStream` it returns is a SILENT signal, encoded in the format the request
-//! asked for and lasting as long as the emulator's timeline model
-//! ([`CHARACTERS_PER_SECOND`]) says that text takes to speak. Nothing is echoed back,
-//! no bytes are matched against the input, and no output is dressed up to look like
-//! speech.
+//! The `AudioStream` is RENDERED from the text, in this process. The text is read into
+//! phonemes by English spelling rules ([`phonemes`]), the lexicons the request names and
+//! the SSML it carries are applied to that reading ([`plan`]), and the resulting timed
+//! sequence of phonemes is produced by a formant synthesiser — a glottal source and the
+//! resonances of the vocal tract ([`render`]) — then written in the encoding
+//! `OutputFormat` asked for ([`audio`]). Nothing is echoed back, no bytes are matched
+//! against the input and no stored audio exists: the waveform follows from what the
+//! request says, so changing the text, a lexicon, the markup or the voice changes the
+//! samples.
 //!
-//! Everything AROUND the synthesis is the service's real behaviour, computed from the
-//! request and from state:
+//! Everything AROUND the synthesis is computed from the request and from state the same
+//! way:
 //!
 //! * every name in `LexiconNames` is resolved in the lexicon store of the Region the
 //!   request was signed for, and a name that Region does not store is
@@ -42,19 +44,18 @@
 //!   accepted only when it is one of those spellings exactly, and defaults per format
 //!   and engine the same way;
 //! * the text limits (6000 total / 3000 billed characters) are enforced;
-//! * `json` output is a real speech-mark stream: the sentence and word marks are
-//!   computed from the text itself — their `start`/`end` offsets and `value` come
-//!   straight out of `Text`, while each `time` is an estimate off the emulator's own
-//!   chosen timeline ([`CHARACTERS_PER_SECOND`]) rather than a measured one — and a
-//!   request naming no mark type gets an empty stream, for every `TextType`, rather
-//!   than a refusal Amazon Polly does not declare;
+//! * `json` output is the speech-mark stream of the same utterance, in all four modelled
+//!   types: `sentence` and `word` carry the byte offsets and the text they cover in
+//!   `Text`, `viseme` carries the mouth shape of each phoneme as it is spoken and `ssml`
+//!   carries each `<mark>` the document placed, each at the time the renderer produces
+//!   it; a request naming no mark type gets an empty stream, for every `TextType`,
+//!   rather than a refusal Amazon Polly does not declare.
 //!
-//! What it cannot compute faithfully it refuses rather than invents: `viseme` marks
-//! need the phoneme timeline a synthesiser produces, `ssml` marks need SSML `<mark>`
-//! resolution, a sentence or word mark asked for over `ssml` input would need
-//! text-content offsets that skip the markup, and `ogg_vorbis` needs a Vorbis encoder's codebooks (there is no pure-Rust
-//! Vorbis encoder and no external process available), so all four answer the
-//! scaffold's 501 rather than a response that looks like success.
+//! Two formats are not rendered: `mp3` needs an MPEG Layer III encoder, whose only
+//! published Rust binding is under a licence this project cannot take, and `ogg_opus`
+//! needs an Opus encoder, which no binding available to this image can build. Each
+//! carries its own real framing around silence, lasting as long as the speech does — see
+//! [`legacy_audio`], where that is stated rather than dressed up.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +194,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The synthesiser's parts. Each declaration carries an explicit `#[path]`: `ops/mod.rs`
+// reaches this file through `include!`, so a bare `mod x;` here resolves against
+// `src/ops/` rather than against this file's own directory — the same reason the
+// generated declaration of this module carries one.
+#[path = "synthesize_speech/audio.rs"]
+pub mod audio;
+#[path = "synthesize_speech/lexicon.rs"]
+pub mod lexicon;
+#[path = "synthesize_speech/phonemes.rs"]
+pub mod phonemes;
+#[path = "synthesize_speech/plan.rs"]
+pub mod plan;
+#[path = "synthesize_speech/render.rs"]
+pub mod render;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -246,20 +262,6 @@ pub const MAX_TOTAL_CHARACTERS: usize = 6000;
 
 /// The billed characters `Text` may carry — the same documented sentence.
 pub const MAX_BILLED_CHARACTERS: usize = 3000;
-
-/// How fast the emulator's timeline model reads text, in characters per second.
-///
-/// CHOSEN, not an AWS-documented rate: Amazon Polly documents no speaking rate, and
-/// this emulator does not synthesise speech at all. The constant exists so that the
-/// silent stream it returns, and the speech-mark timeline it computes, are
-/// deterministic and proportional to the text rather than a fixed-size blob.
-///
-/// It is also what bounds the response, together with [`MAX_TOTAL_CHARACTERS`]: the
-/// longest stream any request can ask for is 6000 / 15 = 400 seconds, which is at
-/// most 400 s × 16000 Hz × 2 bytes ≈ 12.8 MB for `pcm` (its highest valid rate),
-/// ≈ 3.2 MB for `mp3` at 64 kb/s, ≈ 3.2 MB for the companded formats at 8 kHz and a
-/// few tens of kilobytes for `ogg_opus`. Each is built once, per request.
-pub const CHARACTERS_PER_SECOND: u64 = 15;
 
 /// The media type the response carries for `output_format`.
 ///
@@ -808,346 +810,104 @@ fn check_ssml_element(
     ssml::check_element(&name, element)
 }
 
-/// How long the emulator's timeline model says `billed` characters take to speak, in
-/// milliseconds. Never zero, so even a one-character request carries a frame of audio.
-pub fn spoken_duration_ms(billed: usize) -> u64 {
-    let exact = (billed as u64).saturating_mul(1000) / CHARACTERS_PER_SECOND;
-    exact.max(audio::MIN_DURATION_MS)
+// ---------------------------------------------------------------------------
+// The synthesiser's parts
+// ---------------------------------------------------------------------------
+
+/// The two `OutputFormat` values whose streams are silence rather than the rendered
+/// waveform, and why.
+#[path = "synthesize_speech/legacy_audio.rs"]
+pub mod legacy_audio;
+#[path = "synthesize_speech/marks.rs"]
+mod marks;
+pub use marks::*;
+
+// ---------------------------------------------------------------------------
+// The synthesis itself
+// ---------------------------------------------------------------------------
+
+/// How long one request's synthesis may take.
+///
+/// CHOSEN. The pass is bounded in SIZE by [`plan::MAX_UTTERANCE_MS`] and
+/// [`render::max_samples`], so this is the second half of the same bound: the caller's
+/// wait. A `spawn_blocking` task cannot be aborted, so the budget bounds how long a
+/// request waits for one, not the task itself.
+pub const SYNTHESIS_TIME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_secs(20);
+
+/// Why a synthesis produced nothing.
+pub enum SynthesisFailure {
+    /// The `ssml` document could not be read as XML at all — the same failure
+    /// [`billed_characters`] reports.
+    InvalidSsml,
+    /// The encoder refused the stream, which is this emulator's own fault rather than
+    /// the request's.
+    Encoding,
+    /// An `OutputFormat` outside the model's values reached the encoders.
+    Format(String),
 }
 
-// ---------------------------------------------------------------------------
-// The silent audio encoders
-// ---------------------------------------------------------------------------
-
-/// Deterministic SILENT streams in the encodings `OutputFormat` names.
+/// One synthesis, owned so it can run on the blocking pool.
 ///
-/// None of this is speech and none of it claims to be: each function emits the
-/// encoding's real framing around a signal of zero amplitude. `pcm`, `mulaw` and
-/// `alaw` are exact — silence has an exact representation in all three. `mp3` is a
-/// run of conformant MPEG Layer III frames (the header is computed for the requested
-/// sample rate) whose main data is zero. `ogg_opus` is a conformant Ogg stream of
-/// `OpusHead`/`OpusTags` plus one-byte DTX packets, which RFC 6716 defines as
-/// "no transmission" and a decoder renders as silence; the Ogg framing (pages,
-/// lacing, checksum) comes from the `ogg` crate.
-///
-/// `ogg_vorbis` is NOT here. A conformant Vorbis stream needs a *setup* header of
-/// encoder-generated codebooks, and this emulator has no Vorbis encoder to generate
-/// them (no pure-Rust Vorbis encoder is published, and a container or external
-/// process is not available to a generated emulator). Rather than answer 200 with a
-/// stream no decoder accepts, `SynthesizeSpeech` answers that format with the
-/// scaffold's 501.
-pub mod audio {
-    /// The shortest stream any request produces: one 20 ms frame.
-    pub const MIN_DURATION_MS: u64 = 20;
+/// Both operations that answer with audio build one of these, so a stream's chunk and a
+/// single request's body for the same text are the same bytes.
+pub struct Synthesis {
+    /// What to speak.
+    pub text: String,
+    /// How to read it: `text` or `ssml`.
+    pub text_type: String,
+    /// The encoding to write.
+    pub output_format: String,
+    /// The frequency to render at; `None` only for `json`, which carries marks.
+    pub sample_rate: Option<u32>,
+    /// The speech-mark types the request named.
+    pub marks: Vec<String>,
+    /// The lexemes to apply, in the order the request named their lexicons.
+    pub lexicons: lexicon::Lexicons,
+    /// The timbre of the voice the request named.
+    pub timbre: render::Timbre,
+}
 
-    /// Signed 16-bit mono little-endian silence — the representation
-    /// `SynthesizeSpeechInput$OutputFormat` documents for `pcm` ("a signed 16-bit, 1
-    /// channel (mono), little-endian format"). Zero is silence in it.
-    pub fn pcm_silence(sample_rate: u32, duration_ms: u64) -> Vec<u8> {
-        vec![0u8; samples(sample_rate, duration_ms) * 2]
-    }
-
-    /// ITU-T G.711 μ-law silence. Zero amplitude encodes to `0xFF` in μ-law.
-    pub fn mulaw_silence(sample_rate: u32, duration_ms: u64) -> Vec<u8> {
-        vec![0xFFu8; samples(sample_rate, duration_ms)]
-    }
-
-    /// ITU-T G.711 A-law silence. Zero amplitude encodes to `0xD5` in A-law.
-    pub fn alaw_silence(sample_rate: u32, duration_ms: u64) -> Vec<u8> {
-        vec![0xD5u8; samples(sample_rate, duration_ms)]
-    }
-
-    /// How many samples `duration_ms` is at `sample_rate`.
-    fn samples(sample_rate: u32, duration_ms: u64) -> usize {
-        let count = u64::from(sample_rate).saturating_mul(duration_ms) / 1000;
-        usize::try_from(count).unwrap_or(usize::MAX)
-    }
-
-    /// A run of conformant MPEG Layer III frames whose main data is zero.
+impl Synthesis {
+    /// The response body: the speech-mark stream for `json`, and the rendered waveform in
+    /// its own encoding for every audio format.
     ///
-    /// The frame header is built per ISO/IEC 11172-3 (MPEG-1) and 13818-3 (MPEG-2),
-    /// plus the MPEG-2.5 extension for 8 kHz: 11 sync bits, the version and layer,
-    /// the bitrate and sample-rate indexes, and single-channel mode. `None` for a
-    /// sample rate MPEG Layer III cannot carry, which the caller has already refused
-    /// as an invalid sample rate.
-    pub fn mp3_silence(sample_rate: u32, duration_ms: u64) -> Option<Vec<u8>> {
-        // (version bits, sample-rate index, samples per frame, frame-size
-        // coefficient, bitrate index for 64 kb/s). MPEG-1 = 0b11, MPEG-2 = 0b10,
-        // MPEG-2.5 = 0b00; Layer III carries 1152 samples per MPEG-1 frame and 576
-        // per MPEG-2/2.5 frame.
-        let (version, rate_index, samples_per_frame, coefficient, bitrate_index) = match sample_rate
-        {
-            44100 => (0b11u8, 0u8, 1152u64, 144u64, 5u8),
-            48000 => (0b11, 1, 1152, 144, 5),
-            32000 => (0b11, 2, 1152, 144, 5),
-            22050 => (0b10, 0, 576, 72, 8),
-            24000 => (0b10, 1, 576, 72, 8),
-            16000 => (0b10, 2, 576, 72, 8),
-            8000 => (0b00, 2, 576, 72, 8),
-            _ => return None,
+    /// Synchronous and CPU-bound by nature, so every caller runs it on the blocking pool.
+    pub fn produce(&self) -> Result<Vec<u8>, SynthesisFailure> {
+        let utterance = plan::plan(&self.text, &self.text_type, &self.lexicons)
+            .map_err(|_| SynthesisFailure::InvalidSsml)?;
+        // `json` IS the speech-mark stream: the marks the request asked for, off the same
+        // timeline the audio formats carry. A request that names no mark type asks for no
+        // marks, so the stream is empty — Amazon Polly declares no error for an empty one.
+        let Some(rate) = self.sample_rate else {
+            return Ok(audio::speech_marks_stream(
+                &utterance.marks_of_types(&self.marks),
+            ));
         };
-        const BITRATE: u64 = 64_000;
-        // Layer III frame length is `coefficient * bitrate / sample_rate`, which is
-        // rarely a whole number; the header's padding bit is what carries the
-        // remainder, so a constant-bitrate stream alternates padded and unpadded
-        // frames. Tracking the remainder frame by frame keeps the stream's real
-        // bitrate equal to the one its header declares.
-        let numerator = coefficient.saturating_mul(BITRATE);
-        let divisor = u64::from(sample_rate);
-        let base_bytes = usize::try_from(numerator / divisor).unwrap_or(usize::MAX);
-        let remainder = numerator % divisor;
-        let frames = usize::try_from(
-            (u64::from(sample_rate).saturating_mul(duration_ms) / 1000)
-                .div_ceil(samples_per_frame)
-                .max(1),
-        )
-        .unwrap_or(usize::MAX);
-
-        let mut out: Vec<u8> = Vec::with_capacity(frames.saturating_mul(base_bytes + 1));
-        let mut carry = 0u64;
-        for _ in 0..frames {
-            carry += remainder;
-            let padded = carry >= divisor;
-            if padded {
-                carry -= divisor;
-            }
-            let header = [
-                0xFF,
-                // sync (3 more bits) | version | Layer III (0b01) | no CRC (1)
-                0xE0 | (version << 3) | (0b01 << 1) | 0x01,
-                (bitrate_index << 4) | (rate_index << 2) | if padded { 0x02 } else { 0x00 },
-                // single channel, no mode extension, no copyright/original, no
-                // emphasis
-                0xC0,
-            ];
-            out.extend_from_slice(&header);
-            // The rest of the frame is main data, and zero main data is silence.
-            let main_data = base_bytes.saturating_sub(header.len()) + usize::from(padded);
-            out.resize(out.len() + main_data, 0);
-        }
-        Some(out)
+        // Every audio format carries the SAME rendered waveform, encoded its own way, so
+        // one text is one utterance whichever format asks for it. The renderer produces at
+        // most [`render::max_samples`] of them, so this buffer is bounded before it is
+        // filled.
+        let samples = render::render(&utterance, rate, self.timbre);
+        let encoded = match self.output_format.as_str() {
+            "pcm" => Some(audio::pcm(&samples)),
+            "mulaw" => Some(audio::mulaw(&samples)),
+            "alaw" => Some(audio::alaw(&samples)),
+            "ogg_vorbis" => audio::ogg_vorbis(&samples, rate),
+            // The two formats whose samples are not written: see [`legacy_audio`]. Their
+            // streams still last as long as the speech.
+            "ogg_opus" => audio::ogg_opus_silence_for(&samples, rate),
+            "mp3" => audio::mp3_silence_for(&samples, rate),
+            // `content_type_for` has already narrowed `OutputFormat` to the model's seven
+            // values, so this is the exhaustiveness of the match rather than a path a
+            // request takes.
+            other => return Err(SynthesisFailure::Format(other.to_string())),
+        };
+        // The rate was settled against this format's own documented value set, and every
+        // one of those values is one these encoders carry, so a `None` here is this
+        // emulator failing to encode a rate it admitted — never a second refusal of a
+        // member the request was already told was acceptable.
+        encoded.ok_or(SynthesisFailure::Encoding)
     }
-
-    /// A conformant Ogg Opus stream of silence (RFC 7845 headers, RFC 6716 packets).
-    ///
-    /// The Ogg layer — pages, lacing and the page checksum — is the `ogg` crate's;
-    /// only the two codec headers and the packet payloads are built here, because
-    /// those are Opus, not Ogg. `None` only if the in-memory writer fails, which the
-    /// caller answers with the modelled server error rather than a panic.
-    pub fn ogg_opus_silence(input_sample_rate: u32, duration_ms: u64) -> Option<Vec<u8>> {
-        use ogg::writing::{PacketWriteEndInfo, PacketWriter};
-
-        /// Every Opus frame this emits is 20 ms long.
-        const FRAME_MS: u64 = 20;
-        /// An Opus granule position counts 48 kHz samples, whatever the input rate.
-        const FRAME_GRANULES: u64 = 960;
-        /// Frames per audio page, so a long stream is paged rather than one huge page.
-        const FRAMES_PER_PAGE: u64 = 50;
-        /// A one-byte packet is a TOC byte with a zero-length frame: RFC 6716's
-        /// "no transmission" (DTX) packet, which a decoder renders as silence. The
-        /// TOC selects SILK narrowband, 20 ms, mono, one frame per packet.
-        const DTX_PACKET: [u8; 1] = [0x08];
-        /// The Ogg logical-stream serial number this service uses. Fixed, because one
-        /// response is always exactly one logical stream.
-        const OGG_SERIAL: u32 = 0x506f_6c6c;
-
-        let mut buffer: Vec<u8> = Vec::new();
-        {
-            let mut writer = PacketWriter::new(&mut buffer);
-            // RFC 7845 §3: the identification and comment headers each occupy their
-            // own page, and the audio packets follow.
-            writer
-                .write_packet(
-                    opus_head(input_sample_rate),
-                    OGG_SERIAL,
-                    PacketWriteEndInfo::EndPage,
-                    0,
-                )
-                .ok()?;
-            writer
-                .write_packet(opus_tags(), OGG_SERIAL, PacketWriteEndInfo::EndPage, 0)
-                .ok()?;
-
-            let frames = duration_ms.div_ceil(FRAME_MS).max(1);
-            for frame in 1..=frames {
-                let end = if frame == frames {
-                    PacketWriteEndInfo::EndStream
-                } else if frame % FRAMES_PER_PAGE == 0 {
-                    PacketWriteEndInfo::EndPage
-                } else {
-                    PacketWriteEndInfo::NormalPacket
-                };
-                writer
-                    .write_packet(
-                        DTX_PACKET.to_vec(),
-                        OGG_SERIAL,
-                        end,
-                        frame.saturating_mul(FRAME_GRANULES),
-                    )
-                    .ok()?;
-            }
-        }
-        Some(buffer)
-    }
-
-    /// RFC 7845 §5.1 `OpusHead`: mono, no pre-skip, no output gain, mapping family 0.
-    fn opus_head(input_sample_rate: u32) -> Vec<u8> {
-        let mut head = Vec::with_capacity(19);
-        head.extend_from_slice(b"OpusHead");
-        head.push(1); // version
-        head.push(1); // channel count
-        head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
-        head.extend_from_slice(&input_sample_rate.to_le_bytes());
-        head.extend_from_slice(&0i16.to_le_bytes()); // output gain
-        head.push(0); // channel mapping family
-        head
-    }
-
-    /// RFC 7845 §5.2 `OpusTags`: a vendor string and no user comments. The vendor
-    /// string names the producer honestly — this stream comes from an emulator, not
-    /// from Amazon Polly.
-    fn opus_tags() -> Vec<u8> {
-        const VENDOR: &[u8] = b"aws-emulator polly";
-        let mut tags = Vec::new();
-        tags.extend_from_slice(b"OpusTags");
-        tags.extend_from_slice(&u32::try_from(VENDOR.len()).unwrap_or(0).to_le_bytes());
-        tags.extend_from_slice(VENDOR);
-        tags.extend_from_slice(&0u32.to_le_bytes()); // user comment count
-        tags
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Speech marks (`OutputFormat: json`)
-// ---------------------------------------------------------------------------
-
-/// A speech mark, as Amazon Polly's `application/x-json-stream` carries it: one JSON
-/// object per line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpeechMark {
-    /// Milliseconds from the start of the stream.
-    pub time: u64,
-    /// `"sentence"` or `"word"`.
-    pub mark_type: &'static str,
-    /// Byte offset of the mark's text in `Text`.
-    pub start: usize,
-    /// Byte offset just past the mark's text in `Text`.
-    pub end: usize,
-    /// The text the mark covers.
-    pub value: String,
-}
-
-/// The sentence and word marks of `text`, in stream order.
-///
-/// Both are computed from the text: a word is a run of alphanumeric characters
-/// (apostrophes and hyphens included, so "don't" and "well-known" are one word each),
-/// a sentence runs to and includes its terminating `.`, `!` or `?`, and each mark's
-/// `time` is where its first character falls on the [`CHARACTERS_PER_SECOND`]
-/// timeline. `start`/`end` are byte offsets into `text`, which is what Amazon Polly
-/// reports.
-pub fn speech_marks(text: &str, want_sentences: bool, want_words: bool) -> Vec<SpeechMark> {
-    let mut marks: Vec<SpeechMark> = Vec::new();
-    if want_sentences {
-        marks.extend(spans(text, Grouping::Sentence).into_iter().map(
-            |(start, end, chars)| SpeechMark {
-                time: mark_time(chars),
-                mark_type: "sentence",
-                start,
-                end,
-                value: text[start..end].to_string(),
-            },
-        ));
-    }
-    if want_words {
-        marks.extend(spans(text, Grouping::Word).into_iter().map(
-            |(start, end, chars)| SpeechMark {
-                time: mark_time(chars),
-                mark_type: "word",
-                start,
-                end,
-                value: text[start..end].to_string(),
-            },
-        ));
-    }
-    // A sentence mark precedes the words it contains, which is the order Amazon Polly
-    // streams them in.
-    marks.sort_by_key(|mark| (mark.time, mark.start, mark.mark_type != "sentence"));
-    marks
-}
-
-/// Render speech marks as the `application/x-json-stream` body: one JSON object per
-/// line, newline-terminated.
-pub fn speech_marks_stream(marks: &[SpeechMark]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for mark in marks {
-        let line = ::serde_json::json!({
-            "time": mark.time,
-            "type": mark.mark_type,
-            "start": mark.start,
-            "end": mark.end,
-            "value": mark.value,
-        });
-        out.extend_from_slice(line.to_string().as_bytes());
-        out.push(b'\n');
-    }
-    out
-}
-
-/// Which kind of span [`spans`] collects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Grouping {
-    /// A run of word characters.
-    Word,
-    /// Text up to and including a sentence terminator.
-    Sentence,
-}
-
-/// The `(byte start, byte end, character index of the start)` of every span of
-/// `grouping` in `text`.
-fn spans(text: &str, grouping: Grouping) -> Vec<(usize, usize, usize)> {
-    let mut found = Vec::new();
-    let mut open: Option<(usize, usize)> = None;
-    for (char_index, (byte_index, ch)) in text.char_indices().enumerate() {
-        let end = byte_index + ch.len_utf8();
-        match grouping {
-            Grouping::Word => {
-                if is_word_character(ch) {
-                    let (start, start_char) = open.unwrap_or((byte_index, char_index));
-                    open = Some((start, start_char));
-                    if text[end..].chars().next().is_none_or(|next| !is_word_character(next)) {
-                        found.push((start, end, start_char));
-                        open = None;
-                    }
-                }
-            }
-            Grouping::Sentence => {
-                if ch.is_whitespace() && open.is_none() {
-                    continue;
-                }
-                let (start, start_char) = open.unwrap_or((byte_index, char_index));
-                open = Some((start, start_char));
-                if matches!(ch, '.' | '!' | '?') {
-                    found.push((start, end, start_char));
-                    open = None;
-                }
-            }
-        }
-    }
-    if let Some((start, start_char)) = open {
-        found.push((start, text.len(), start_char));
-    }
-    found
-}
-
-/// Whether `ch` belongs to a word. Apostrophes and hyphens are inside words, so
-/// "don't" and "well-known" each come back as one word mark.
-fn is_word_character(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '\'' || ch == '\u{2019}' || ch == '-'
-}
-
-/// Where the character at `char_index` falls on the timeline, in milliseconds.
-fn mark_time(char_index: usize) -> u64 {
-    (char_index as u64).saturating_mul(1000) / CHARACTERS_PER_SECOND
 }
 
 /// The `SynthesizeSpeech` operation.
@@ -1266,17 +1026,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::service::errors::service_failure(),
             )
         })?;
+        // The lexemes of those lexicons, in the order the request named them, are what
+        // synthesis applies to the text: a grapheme one of them defines is spoken as
+        // that lexeme's replacement.
+        let mut lexicons = lexicon::Lexicons::default();
         if let Some(names) = input.lexicon_names.as_ref() {
             let region = crate::state::request_region(ctx.parts());
             let guard = state.lock();
-            if names
-                .iter()
-                .any(|name| guard.lexicon(&region, name).is_none())
-            {
-                return Err(SynthesizeSpeechErrorModeled::LexiconNotFoundException(
-                    crate::service::errors::lexicon_not_found(),
-                )
-                .into());
+            for name in names {
+                let Some(stored) = guard.lexicon(&region, name) else {
+                    return Err(SynthesizeSpeechErrorModeled::LexiconNotFoundException(
+                        crate::service::errors::lexicon_not_found(),
+                    )
+                    .into());
+                };
+                lexicons.add(&stored.content);
             }
         }
 
@@ -1321,76 +1085,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let duration_ms = spoken_duration_ms(billed);
-        // Every arm below is matched by name: `content_type_for` has already narrowed
-        // `output_format` to the model's seven values, and the final arm refuses
-        // anything else rather than letting a future format fall into a neighbour's
-        // encoding.
-        let audio_stream = match (output_format, sample_rate) {
-            // `json`: a real speech-mark stream for the mark types this emulator can
-            // compute from the text. `viseme` needs a phoneme timeline and `ssml`
-            // needs SSML `<mark>` resolution, so neither is answered with invented
-            // marks — they are still unimplemented.
-            ("json", _) => {
-                for mark in &marks {
-                    if mark != "sentence" && mark != "word" {
-                        return Err(crate::scaffolded::Scaffolded::not_implemented(
-                            "SynthesizeSpeech speech marks of type other than sentence and word",
-                        ));
-                    }
-                }
-                let want_sentences = marks.iter().any(|mark| mark == "sentence");
-                let want_words = marks.iter().any(|mark| mark == "word");
-                // A mark's `start`/`end` are offsets into `Text` and its `value` is
-                // the text it covers, so marks over SSML would have to be computed
-                // from the document's text content with offsets that skip the markup.
-                // That is not implemented, and answering with marks whose values are
-                // tag names would be a wrong answer dressed as success, so SSML input
-                // is refused rather than mis-answered — but ONLY when a mark the
-                // request named has to be computed. A request that names no mark type
-                // needs no offsets at all, so there is nothing about it this emulator
-                // cannot serve and `TextType` does not change that.
-                if text_type == "ssml" && (want_sentences || want_words) {
-                    return Err(crate::scaffolded::Scaffolded::not_implemented(
-                        "SynthesizeSpeech speech marks over ssml input",
-                    ));
-                }
-                let computed = speech_marks(&input.text, want_sentences, want_words);
-                // A request that names no mark type asks for no marks, so the stream
-                // is empty. `json` output IS the speech-mark stream, and Amazon Polly
-                // declares no error for an empty one, so an empty stream is the
-                // honest answer rather than a refusal it never sends.
-                speech_marks_stream(&computed)
-            }
-            ("pcm", Some(rate)) => audio::pcm_silence(rate, duration_ms),
-            ("mulaw", Some(rate)) => audio::mulaw_silence(rate, duration_ms),
-            ("alaw", Some(rate)) => audio::alaw_silence(rate, duration_ms),
-            ("mp3", Some(rate)) => audio::mp3_silence(rate, duration_ms).ok_or_else(|| {
-                SynthesizeSpeechErrorModeled::InvalidSampleRateException(
-                    crate::service::errors::invalid_sample_rate(),
+        // The voice the request named decides the timbre of the speech, read off the
+        // same catalog row its engine and language were checked against.
+        let timbre = render::Timbre::for_gender(
+            state
+                .lock()
+                .voices
+                .iter()
+                .find(|voice| voice.id == input.voice_id)
+                .map(|voice| voice.gender),
+        );
+        // Reading the document, reading it into phonemes, producing the waveform and
+        // encoding it is synchronous, CPU-bound work with no await of its own, so it goes
+        // to the BLOCKING pool and the worker serving this request is released while it
+        // runs. The `spawn_blocking(..).await` is a real await point, so the health
+        // endpoint, a cancellation and a graceful shutdown keep working while a long
+        // utterance is produced, and the wait is bounded by [`SYNTHESIS_TIME_BUDGET`].
+        let job = Synthesis {
+            text: input.text.clone(),
+            text_type: text_type.to_string(),
+            output_format: output_format.to_string(),
+            sample_rate,
+            marks,
+            lexicons,
+            timbre,
+        };
+        let audio_stream = match ::tokio::time::timeout(
+            SYNTHESIS_TIME_BUDGET,
+            ::tokio::task::spawn_blocking(move || job.produce()),
+        )
+        .await
+        {
+            Ok(Ok(Ok(body))) => body,
+            Ok(Ok(Err(SynthesisFailure::InvalidSsml))) => {
+                return Err(SynthesizeSpeechErrorModeled::InvalidSsmlException(
+                    crate::service::errors::invalid_ssml(),
                 )
-            })?,
-            ("ogg_opus", Some(rate)) => {
-                audio::ogg_opus_silence(rate, duration_ms).ok_or_else(|| {
-                    SynthesizeSpeechErrorModeled::ServiceFailureException(
-                        crate::service::errors::service_failure(),
-                    )
-                })?
+                .into())
             }
-            // `ogg_vorbis` is NOT served: a conformant Vorbis stream needs a setup
-            // header of encoder-generated codebooks, and there is no Vorbis encoder
-            // available in-process. Answering 200 with a stream no decoder accepts
-            // would be absence dressed as success, so it stays a 501.
-            ("ogg_vorbis", _) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "SynthesizeSpeech with OutputFormat ogg_vorbis",
-                ))
-            }
-            (other, _) => {
+            Ok(Ok(Err(SynthesisFailure::Format(format)))) => {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "OutputFormat must be one of {}; got {other}",
+                    "OutputFormat must be one of {}; got {format}",
                     OUTPUT_FORMAT_VALUES.join(", ")
                 )))
+            }
+            // The encoder refused a rate this format documents, the pass did not finish
+            // inside the budget, or it did not run at all: in each case nothing was
+            // synthesized, so the modelled server error is the answer rather than a
+            // stream that stands for no speech.
+            Ok(Ok(Err(SynthesisFailure::Encoding))) | Ok(Err(_)) | Err(_) => {
+                return Err(SynthesizeSpeechErrorModeled::ServiceFailureException(
+                    crate::service::errors::service_failure(),
+                )
+                .into())
             }
         };
 
@@ -1436,81 +1183,6 @@ mod tests {
     }
 
     #[test]
-    fn mp3_frames_carry_a_valid_header_for_every_documented_rate() {
-        for spelling in valid_sample_rates("mp3") {
-            let rate = resolve_sample_rate("mp3", spelling)
-                .unwrap_or_else(|| panic!("rate {spelling:?} is one of mp3's documented values"));
-            let bytes = audio::mp3_silence(rate, 1_000).expect("mp3 supports this rate");
-            assert!(
-                !bytes.is_empty(),
-                "rate {rate}: expected frames, got an empty stream"
-            );
-            assert_eq!(
-                bytes[0], 0xFF,
-                "rate {rate}: the frame must start with the MPEG sync byte, got {:#04x}",
-                bytes[0]
-            );
-            assert_eq!(
-                bytes[1] & 0xE0,
-                0xE0,
-                "rate {rate}: the remaining sync bits are missing, got {:#04x}",
-                bytes[1]
-            );
-            // Layer III is 0b01 in bits 2..1 of the second header byte.
-            assert_eq!(
-                (bytes[1] >> 1) & 0b11,
-                0b01,
-                "rate {rate}: the frame does not declare Layer III"
-            );
-            // One second at the declared 64 kb/s is 8000 bytes; the stream rounds up
-            // to a whole frame, so it must land within one frame of that. A stream
-            // that ignored the padding bit would drift away from its own header.
-            assert!(
-                (7_600..=8_600).contains(&bytes.len()),
-                "rate {rate}: one second at 64 kb/s is ~8000 bytes, got {}",
-                bytes.len()
-            );
-        }
-    }
-
-    #[test]
-    fn silence_is_exact_for_the_uncompanded_and_companded_formats() {
-        assert!(
-            audio::pcm_silence(16000, 1_000).iter().all(|b| *b == 0x00),
-            "pcm silence must be zero samples"
-        );
-        assert!(
-            audio::mulaw_silence(8000, 1_000).iter().all(|b| *b == 0xFF),
-            "mu-law silence must be 0xFF"
-        );
-        assert!(
-            audio::alaw_silence(8000, 1_000).iter().all(|b| *b == 0xD5),
-            "a-law silence must be 0xD5"
-        );
-    }
-
-    #[test]
-    fn the_opus_stream_is_ogg_framed_and_names_its_codec() {
-        let opus = audio::ogg_opus_silence(48000, 200).expect("the in-memory writer cannot fail");
-        assert_eq!(&opus[..4], b"OggS", "an Ogg page starts with OggS");
-        assert!(
-            opus.windows(8).any(|w| w == b"OpusHead"),
-            "the Opus stream must carry an OpusHead header"
-        );
-        assert!(
-            opus.windows(8).any(|w| w == b"OpusTags"),
-            "the Opus stream must carry an OpusTags header"
-        );
-        let longer = audio::ogg_opus_silence(48000, 2_000).expect("writer cannot fail");
-        assert!(
-            longer.len() > opus.len(),
-            "a longer duration must carry more packets: {} vs {}",
-            longer.len(),
-            opus.len()
-        );
-    }
-
-    #[test]
     fn ssml_tags_are_not_billed() {
         let plain = billed_characters("hello world", "text").expect("plain text is never invalid");
         assert_eq!(plain, 11, "plain text bills every character");
@@ -1541,15 +1213,22 @@ mod tests {
         );
     }
 
+    /// RULE: the sentence and word marks of the utterance report the text they cover
+    /// and the byte offsets of it in `Text`.
     #[test]
     fn speech_marks_are_computed_from_the_text() {
-        let marks = speech_marks("Hi there. Go!", true, true);
-        let rendered: Vec<(&str, usize, usize, &str)> = marks
+        let utterance = plan::plan("Hi there. Go!", "text", &lexicon::Lexicons::default())
+            .expect("plain text plans");
+        let covering: Vec<(&str, usize, usize, &str)> = utterance
+            .marks
             .iter()
-            .map(|m| (m.mark_type, m.start, m.end, m.value.as_str()))
+            .filter_map(|mark| {
+                mark.span
+                    .map(|(start, end)| (mark.mark_type, start, end, mark.value.as_str()))
+            })
             .collect();
         assert_eq!(
-            rendered,
+            covering,
             vec![
                 ("sentence", 0, 9, "Hi there."),
                 ("word", 0, 2, "Hi"),
@@ -1559,10 +1238,10 @@ mod tests {
             ],
             "marks must track the text's sentences and words"
         );
-        let stream = speech_marks_stream(&marks);
+        let stream = audio::speech_marks_stream(&utterance.marks);
         assert_eq!(
             stream.iter().filter(|b| **b == b'\n').count(),
-            marks.len(),
+            utterance.marks.len(),
             "the stream is one newline-terminated JSON object per mark"
         );
     }

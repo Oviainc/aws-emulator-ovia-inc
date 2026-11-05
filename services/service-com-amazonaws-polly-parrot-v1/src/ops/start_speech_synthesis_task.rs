@@ -20,13 +20,13 @@
 //!
 //! ## What is real, and what the emulator cannot do
 //!
-//! THE EMULATOR PERFORMS NO TEXT-TO-SPEECH, and no object is written to the output
-//! bucket: this operation's contribution is the TASK — its identifier, its status
-//! timeline, the request it records and the output location it reports — and the
-//! object that location names is not uploaded here. That upload is the one recorded
-//! behaviour of this operation still outstanding, tracked by its own issue
-//! (`20261022T175007Z-polly-startspeechsynthesistask-stub.md`), so nothing here
-//! pretends the bytes are there. Everything the task record reports is computed from
+//! NO OBJECT IS WRITTEN TO THE OUTPUT BUCKET: this operation's contribution is the
+//! TASK — its identifier, its status timeline, the request it records and the output
+//! location it reports — and the object that location names is not uploaded here. The
+//! speech itself is rendered where it is served ([`super::synthesize_speech`]); this
+//! upload is the one recorded behaviour of this operation still outstanding, tracked by
+//! its own issue (`20261022T175007Z-polly-startspeechsynthesistask-stub.md`), so nothing
+//! here pretends the bytes are there. Everything the task record reports is computed from
 //! the request and from state: the billed character count, the resolved output
 //! location, the lexicons resolved in the request's Region, and the voice's engine and
 //! language, all read through the same helpers `SynthesizeSpeech` uses so the

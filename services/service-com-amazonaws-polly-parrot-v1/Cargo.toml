@@ -33,6 +33,16 @@ hex = { workspace = true }
 quick-xml = "0.41"
 # Ogg bitstream framing (pages, lacing, CRC) for the ogg_opus output format.
 ogg = "0.9"
+# The Vorbis encoder behind the ogg_vorbis output format: a conformant Vorbis stream
+# needs the codebooks of a real encoder's setup header, which this builds, so the
+# emulator does not hand-roll a bitstream no decoder accepts. Pinned to a released
+# version. It is a NATIVE component: its `-sys` crates compile the bundled aoTuV/libogg C
+# sources with `cc` at build time (as `aws-lc-sys` and `libsqlite3-sys` already do here),
+# and it is a library computing over samples in-process — it opens no listener, starts no
+# process, reads no file and makes no outbound connection. `default-features = false`
+# drops its random stream-serial generator, because one response is exactly one logical
+# stream with a fixed serial.
+vorbis_rs = { version = "0.5", default-features = false }
 # `TaskId`s are UUIDs: mint and recognise them with a real UUID implementation
 # rather than scanning the text by hand. `v5` is for the deterministic task ids
 # the test fixtures derive from a label.

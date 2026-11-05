@@ -17,7 +17,7 @@
 //! which quotes that member's documentation.
 
 use service_com_amazonaws_polly_parrot_v1::ops::synthesize_speech::{
-    resolve_sample_rate, spoken_duration_ms, valid_sample_rates,
+    resolve_sample_rate, valid_sample_rates,
 };
 use service_com_amazonaws_polly_parrot_v1::service::errors;
 
@@ -25,14 +25,12 @@ use crate::lexicons_and_speech::{error_code, header, json, Polly};
 use crate::support::message_slot;
 
 /// The audio formats whose streams this emulator encodes, so a documented rate for one
-/// of them reaches a 200. `json` carries speech marks rather than audio and documents
-/// no rate, and `ogg_vorbis` answers 501 for a rate it accepts (there is no Vorbis
-/// encoder in-process), so neither has an accepted-rate row here.
-const ENCODED_FORMATS: [&str; 5] = ["mp3", "pcm", "ogg_opus", "mulaw", "alaw"];
+/// of them reaches a 200. `json` carries speech marks rather than audio and documents no
+/// rate, so it has no accepted-rate row here.
+const ENCODED_FORMATS: [&str; 6] = ["mp3", "ogg_vorbis", "pcm", "ogg_opus", "mulaw", "alaw"];
 
-/// Every audio format, including the one whose encoder is missing: a refusal of the
-/// `SampleRate` is settled before the output encoding is, so `ogg_vorbis` must refuse a
-/// bad spelling with the same 400 as the rest instead of its 501.
+/// Every audio format: a `SampleRate` is settled before the output encoding is, so each
+/// format refuses a bad spelling with the same 400.
 const AUDIO_FORMATS: [&str; 6] = ["mp3", "ogg_vorbis", "pcm", "ogg_opus", "mulaw", "alaw"];
 
 /// The text every request below synthesises, and its billed character count.
@@ -78,6 +76,8 @@ fn respellings(value: &str) -> Vec<(&'static str, String)> {
 #[tokio::test]
 async fn every_documented_spelling_is_accepted_at_its_own_frequency() {
     let polly = Polly::new();
+    // The `pcm` streams, by the frequency each was asked for.
+    let mut pcm_lengths: Vec<(u32, usize)> = Vec::new();
     for format in ENCODED_FORMATS {
         let documented = valid_sample_rates(format);
         assert!(
@@ -108,20 +108,33 @@ async fn every_documented_spelling_is_accepted_at_its_own_frequency() {
 
             // `pcm` is signed 16-bit mono, so its byte count fixes the frequency the
             // handler resolved: a spelling must be read as the value it IS, not as some
-            // neighbouring rate.
+            // neighbouring rate. The utterance is the same one at every rate, so the
+            // stream's length is the frequency times that duration — which is what the
+            // ratio between two rates pins, whatever the duration happens to be.
             if format == "pcm" {
-                let hz = u64::from(
-                    resolve_sample_rate(format, spelling)
-                        .unwrap_or_else(|| panic!("case {case:?}: documented value not resolved")),
-                );
-                let expected = (hz * spoken_duration_ms(TEXT.len()) / 1000) as usize * 2;
-                assert_eq!(
-                    response.body().len(),
-                    expected,
-                    "case {case:?}: expected a {hz} Hz stream of {expected} bytes"
-                );
+                let hz = resolve_sample_rate(format, spelling)
+                    .unwrap_or_else(|| panic!("case {case:?}: documented value not resolved"));
+                pcm_lengths.push((hz, response.body().len()));
             }
         }
+    }
+    // Every pcm rate rendered the same text, so the byte counts stand in the ratio of
+    // the frequencies: a rate read as a neighbouring value would break it.
+    let (base_hz, base_len) = pcm_lengths
+        .first()
+        .copied()
+        .expect("pcm has documented rates");
+    for (hz, len) in &pcm_lengths {
+        let expected = (base_len as f64) * f64::from(*hz) / f64::from(base_hz);
+        assert!(
+            ((*len as f64) - expected).abs() <= expected * 0.01 + 8.0,
+            "rate {hz} Hz: a {base_hz} Hz stream of {base_len} bytes makes about {expected} \
+             bytes here, got {len}"
+        );
+        assert!(
+            *len > 0 && len % 2 == 0,
+            "rate {hz} Hz: pcm carries whole 16-bit samples, got {len} bytes"
+        );
     }
 }
 

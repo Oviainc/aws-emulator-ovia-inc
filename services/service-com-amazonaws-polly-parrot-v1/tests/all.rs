@@ -39,6 +39,8 @@ mod pls_phoneme_alphabet;
 mod pls_replacement_measurement;
 #[path = "all/pls_replacement_whitespace.rs"]
 mod pls_replacement_whitespace;
+#[path = "all/rendered_speech.rs"]
+mod rendered_speech;
 #[path = "all/sample_rate_spelling.rs"]
 mod sample_rate_spelling;
 // The shared PLS document fixture, driven through the path the suites that share it

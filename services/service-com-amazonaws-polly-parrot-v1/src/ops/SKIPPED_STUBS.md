@@ -26,11 +26,12 @@ so it is no longer unwired: it has its own file in `src/ops/`, its shapes are in
 `Service::override_operation` — which the router consults BEFORE the generated
 routing table, whose shim for a `@streaming`-output operation declines the request.
 
-What it does NOT do is synthesise speech: there is no speech synthesiser in this
-process, so each `AudioEvent` carries a SILENT signal in the requested encoding
-lasting as long as this emulator's timeline model says the text takes to speak —
-the same answer `SynthesizeSpeech` gives. Everything around the synthesis is real:
-the engine and voice rules, the lexicon resolution, the sample-rate domain, the
-billed character count and the modelled refusals.
+Each `AudioEvent` carries speech RENDERED from the text it covers, by the same
+synthesiser `SynthesizeSpeech` uses: the text is read into phonemes, the named lexicons
+and the SSML of each `TextEvent` are applied, and a formant synthesiser produces the
+waveform, which is then encoded in the requested format. Everything around the synthesis
+is real too: the engine and voice rules, the lexicon resolution, the sample-rate domain,
+the billed character count and the modelled refusals. The one exception is `mp3`, whose
+encoder is unavailable — see `src/ops/synthesize_speech/legacy_audio.rs`.
 
 // HAND-AUTHORED: StartSpeechSynthesisStream — src/ops/start_speech_synthesis_stream.rs

@@ -17,8 +17,9 @@ use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_polly_parrot_v1::ops::start_speech_synthesis_stream::{
-    MAX_ACTION_EVENTS, MAX_STREAM_CHARACTERS, STREAMING_ENGINE,
+    MAX_ACTION_EVENTS, MAX_STREAM_CHARACTERS, MAX_STREAM_SECONDS, STREAMING_ENGINE,
 };
+use service_com_amazonaws_polly_parrot_v1::ops::synthesize_speech::plan::MAX_UTTERANCE_MS;
 
 use crate::lexicons_and_speech::{error_code, header, json as json_body, pls, Polly};
 
@@ -1069,56 +1070,96 @@ async fn a_stream_past_this_emulators_capacity_is_refused() {
             );
         }
     }
+
+    // The session's AUDIO bound is the other half, and the two bounds have to leave room
+    // for each other: a flush refuses a run whose worst case (one whole utterance) would
+    // pass what the session may still produce, so a session must be able to carry several
+    // whole utterances or an ordinary multi-event stream would be refused for its last
+    // word. This pins that relationship, which is what a change to either constant would
+    // break.
+    assert!(
+        (MAX_STREAM_SECONDS as f32) * 1000.0 >= 3.0 * MAX_UTTERANCE_MS,
+        "the session bound ({MAX_STREAM_SECONDS} s) must carry several whole utterances \
+         of {MAX_UTTERANCE_MS} ms each"
+    );
+    // And an ordinary stream — several events, well inside both bounds — is served.
+    let ordinary = stream(
+        &polly,
+        &headers,
+        &[
+            text_event("One sentence of a few words. ", None, Some(true)),
+            text_event("A second one, flushed on its own. ", None, Some(true)),
+            text_event("And a third.", None, None),
+            close_stream_event(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        ordinary.status().as_u16(),
+        200,
+        "an ordinary multi-event stream is well inside both bounds, got {} {:?}",
+        ordinary.status(),
+        String::from_utf8_lossy(ordinary.body())
+    );
+    assert_eq!(
+        audio_chunks(&decode_frames("ordinary", ordinary.body())).len(),
+        3,
+        "each flush point still writes its own AudioEvent"
+    );
 }
 
-/// RULE: a format this emulator has no encoder for is not answered with a stream no
-/// decoder accepts — it answers the same unimplemented signal `SynthesizeSpeech`
-/// answers for that format, so the two operations agree about what is served.
+/// RULE: every `OutputFormat` that carries audio is streamed, and the audio a stream
+/// answers for a text is the audio `SynthesizeSpeech` answers for it — so the two
+/// operations agree about every format, `ogg_vorbis` included.
 #[tokio::test]
-async fn the_format_with_no_encoder_is_not_served_as_a_stream_either() {
+async fn the_ogg_vorbis_format_is_streamed_like_the_single_request() {
     let polly = Polly::new();
     let headers = stream_headers(&[("x-amzn-OutputFormat", "ogg_vorbis")]);
-    // Whether a format can be encoded at all is a property of the format, so the
-    // answer may not depend on what the stream then carried: both a stream with text
-    // and one with none are refused alike.
-    let rows: [(&str, Vec<Vec<u8>>); 2] = [
-        (
-            "with text",
-            vec![
-                text_event("No encoder for this.", None, None),
-                close_stream_event(),
-            ],
-        ),
-        ("with no action event at all", vec![]),
-    ];
-    let mut answered: Vec<(u16, String)> = Vec::new();
-    for (case, events) in rows {
-        let response = stream(&polly, &headers, &events).await;
-        assert_eq!(
-            response.status().as_u16(),
-            501,
-            "case {case:?}: ogg_vorbis has no in-process encoder, so the stream is not served, \
-             got {} {:?}",
-            response.status(),
-            String::from_utf8_lossy(response.body())
-        );
-        answered.push((response.status().as_u16(), error_code(&response)));
-    }
+    const TEXT: &str = "Vorbis carries this one.";
+    let events = [text_event(TEXT, None, None), close_stream_event()];
+    let response = stream(&polly, &headers, &events).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "a vorbis stream is served, got {} {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    let frames = decode_frames("ogg_vorbis", response.body());
+    let chunks = audio_chunks(&frames);
+    assert_eq!(
+        chunks.len(),
+        1,
+        "one flush point, so one AudioEvent, got {}",
+        chunks.len()
+    );
+    assert_eq!(
+        &chunks[0].payload[..4],
+        b"OggS",
+        "the chunk must be an Ogg stream"
+    );
+    let reference = synthesized(&polly, "ogg_vorbis", "ogg_vorbis", None, TEXT, None).await;
+    assert_eq!(
+        chunks[0].payload,
+        reference,
+        "the streamed audio must be the audio SynthesizeSpeech answers for the same text \
+         ({} bytes streamed, {} bytes for one request)",
+        chunks[0].payload.len(),
+        reference.len()
+    );
 
-    let single = polly
-        .synthesize(&json!({
-            "Engine": STREAMING_ENGINE,
-            "OutputFormat": "ogg_vorbis",
-            "VoiceId": STREAMING_VOICE,
-            "Text": "No encoder for this.",
-        }))
-        .await;
-    let reference = (single.status().as_u16(), error_code(&single));
-    for answer in &answered {
-        assert_eq!(
-            *answer, reference,
-            "the stream and the single request must answer this format alike, got {answer:?} \
-             and {reference:?}"
-        );
-    }
+    // A stream that carries no action event has nothing to say, so it closes with no
+    // audio rather than with an empty one.
+    let empty = stream(&polly, &headers, &[]).await;
+    assert_eq!(
+        empty.status().as_u16(),
+        200,
+        "a stream with no action event is still served, got {} {:?}",
+        empty.status(),
+        String::from_utf8_lossy(empty.body())
+    );
+    assert!(
+        audio_chunks(&decode_frames("no events", empty.body())).is_empty(),
+        "a stream with no text writes no AudioEvent"
+    );
 }

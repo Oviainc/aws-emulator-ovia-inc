@@ -8,16 +8,14 @@
 //! request body, and answers with the modelled `AudioEvent` frames for the text it
 //! was sent followed by the `StreamClosedEvent` that closes the stream.
 //!
-//! ## What is real, and what the emulator cannot do
+//! ## How the speech is produced
 //!
-//! THE EMULATOR PERFORMS NO TEXT-TO-SPEECH — the same statement
-//! [`super::synthesize_speech`] makes, and for the same reason: there is no speech
-//! synthesiser in this process and none it may reach. So each `AudioEvent` carries
-//! a SILENT signal, encoded in the format the request asked for and lasting as long
-//! as this emulator's timeline model
-//! ([`super::synthesize_speech::CHARACTERS_PER_SECOND`]) says the text it covers
-//! takes to speak. Nothing is echoed back and no bytes are matched against the
-//! input.
+//! Each `AudioEvent` carries speech RENDERED from the text it covers, by the same
+//! synthesiser [`super::synthesize_speech`] uses and from the same parts: the text is
+//! read into phonemes, the lexicons the request names and the SSML each `TextEvent`
+//! carries are applied, and the result is produced by a formant synthesiser and encoded
+//! in the format the request asked for. So one stream's audio for a text is the audio
+//! the single-shot operation answers for that same text, and nothing is echoed back.
 //!
 //! Everything around the synthesis is computed from the request and from state, and
 //! is the same rule the single-shot sibling applies, so the two operations cannot
@@ -34,7 +32,8 @@
 //!   format enumerates ([`super::synthesize_speech::valid_sample_rates`]), and
 //!   defaults per format and engine the same way;
 //! * every name in `LexiconNames` is resolved in the lexicon store of the Region
-//!   the request was signed for;
+//!   the request was signed for, and its lexemes are applied to the text that is
+//!   spoken;
 //! * `LanguageCode` has to be a language the voice speaks;
 //! * each `TextEvent` is billed the way Amazon Polly bills characters — every
 //!   character of plain text, and for `ssml` the text content only — and `ssml`
@@ -44,10 +43,9 @@
 //! * `StreamClosedEvent$RequestCharacters` is "the total number of characters
 //!   synthesized during the streaming session" — the sum of those billed counts.
 //!
-//! One format is not served: `ogg_vorbis` needs a Vorbis encoder's
-//! encoder-generated codebooks, which no pure-Rust encoder publishes and no
-//! external process here can supply, so it answers the scaffold's 501 exactly as
-//! `SynthesizeSpeech` does for it rather than a stream no decoder accepts.
+//! `mp3` is the one format whose chunks carry silence rather than the rendered
+//! waveform, for the encoder-licence reason [`super::synthesize_speech::legacy_audio`]
+//! states; its chunks still last as long as the speech does.
 //!
 //! ## Where the audio events fall
 //!
@@ -113,8 +111,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use super::synthesize_speech::{
-    audio, billed_characters, default_sample_rate, resolve_sample_rate, spoken_duration_ms,
-    valid_sample_rates, DEFAULT_TEXT_TYPE,
+    audio, billed_characters, default_sample_rate, lexicon, plan, render, resolve_sample_rate,
+    valid_sample_rates, DEFAULT_TEXT_TYPE, SYNTHESIS_TIME_BUDGET,
 };
 use aws_smithy_eventstream::frame::{read_message_from, write_message_to};
 use aws_smithy_runtime_api::http::{Request, Response};
@@ -158,6 +156,13 @@ pub const MAX_ACTION_EVENTS: usize = 1024;
 /// `SynthesizeSpeech` documents for ONE request, so a stream's buffered answer is
 /// the same order of size as that operation's and the two cost the same memory.
 pub const MAX_STREAM_CHARACTERS: usize = super::synthesize_speech::MAX_TOTAL_CHARACTERS;
+
+/// The most characters ONE `TextEvent` carries.
+///
+/// The same bound one `SynthesizeSpeech` request's `Text` has, applied per event and to
+/// the RAW text: the billed count excludes SSML markup, so this is what keeps a single
+/// event from carrying unbounded markup. It is checked before the event is planned.
+pub const MAX_EVENT_CHARACTERS: usize = super::synthesize_speech::MAX_TOTAL_CHARACTERS;
 
 /// How many action events are handled between yields to the runtime.
 ///
@@ -282,13 +287,6 @@ fn audio_output_formats() -> Vec<&'static str> {
 /// The `OutputFormat` that carries speech marks rather than audio.
 const SPEECH_MARK_OUTPUT_FORMAT: &str = "json";
 
-/// The one `OutputFormat` this emulator has no encoder for.
-///
-/// A conformant Vorbis stream needs a setup header of encoder-generated codebooks,
-/// and no pure-Rust Vorbis encoder is published, so there is nothing to frame for it
-/// — the same gap `SynthesizeSpeech` answers the scaffold's 501 for.
-const UNENCODABLE_OUTPUT_FORMAT: &str = "ogg_vorbis";
-
 /// One decoded member of `StartSpeechSynthesisStreamActionStream`.
 #[derive(Debug, Clone)]
 enum ActionEvent {
@@ -361,15 +359,6 @@ impl<Eng: Send + Sync + 'static> StartSpeechSynthesisStream<Eng> {
                 ),
             ));
         }
-        if output_format == UNENCODABLE_OUTPUT_FORMAT {
-            // Decided HERE, with the other parameter rules, rather than when audio is
-            // first built: whether a format can be encoded at all is a property of
-            // the format, so the answer may not depend on whether the stream then
-            // carried any text.
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "StartSpeechSynthesisStream with OutputFormat ogg_vorbis",
-            ));
-        }
         let sample_rate = match settings.sample_rate.as_deref() {
             Some(requested) => resolve_sample_rate(output_format, requested).ok_or_else(|| {
                 field_refusal(
@@ -389,13 +378,20 @@ impl<Eng: Send + Sync + 'static> StartSpeechSynthesisStream<Eng> {
         // which language it may ask for — read off the catalog `DescribeVoices`
         // serves, so the two operations cannot disagree about a voice.
         let state = crate::state::service_state(&*self.engine).ok_or_else(service_failure)?;
+        let mut lexicons = lexicon::Lexicons::default();
         if let Some(names) = settings.lexicon_names.as_ref() {
             let region = crate::state::request_region(ctx.parts());
             let guard = state.lock();
-            let missing = names
-                .iter()
-                .find(|name| guard.lexicon(&region, name).is_none())
-                .cloned();
+            let mut missing: Option<String> = None;
+            for name in names {
+                match guard.lexicon(&region, name) {
+                    Some(stored) => lexicons.add(&stored.content),
+                    None => {
+                        missing = Some(name.clone());
+                        break;
+                    }
+                }
+            }
             drop(guard);
             if let Some(missing) = missing {
                 return Err(field_refusal(
@@ -445,7 +441,18 @@ impl<Eng: Send + Sync + 'static> StartSpeechSynthesisStream<Eng> {
         }
 
         let events = decode_action_stream(protocol, req).await?;
-        frame_stream(protocol, output_format, sample_rate, &events).await
+        // The voice the request named decides the timbre of the speech, read off the
+        // same catalog row its engine and language were checked against.
+        let timbre = render::Timbre::for_gender(Some(voice.gender));
+        frame_stream(
+            protocol,
+            output_format,
+            sample_rate,
+            timbre,
+            &lexicons,
+            &events,
+        )
+        .await
     }
 }
 
@@ -456,12 +463,17 @@ async fn frame_stream(
     protocol: &dyn ServerHttpProtocol,
     output_format: &str,
     sample_rate: u32,
+    timbre: render::Timbre,
+    lexicons: &lexicon::Lexicons,
     events: &[ActionEvent],
 ) -> Result<Response, StartSpeechSynthesisStreamError> {
     let mut frames: Vec<u8> = Vec::new();
-    // The characters billed since the last flush, and over the whole session.
-    let mut buffered = 0usize;
+    // The text buffered since the last flush, each piece with the `TextType` it came
+    // in, and the characters billed over the whole session.
+    let mut buffered: Vec<(String, String)> = Vec::new();
     let mut synthesized = 0usize;
+    // How many samples the session has produced, which is what the audio bound is on.
+    let mut rendered = 0usize;
     for (index, event) in events.iter().enumerate() {
         if index % EVENTS_PER_YIELD == EVENTS_PER_YIELD - 1 {
             tokio::task::yield_now().await;
@@ -474,6 +486,15 @@ async fn frame_stream(
             ActionEvent::CloseStream => break,
         };
         let text_type = text_event.text_type.as_deref().unwrap_or(DEFAULT_TEXT_TYPE);
+        // One event's text is bounded the way one `SynthesizeSpeech` request's is, BEFORE
+        // anything is planned from it: the billed count below excludes SSML markup, so
+        // the raw length is what bounds the markup a single event can carry.
+        if text_event.text.chars().count() > MAX_EVENT_CHARACTERS {
+            return Err(capacity_refusal(format!(
+                "a TextEvent carries more than the {MAX_EVENT_CHARACTERS} characters this \
+                 emulator synthesizes in one event"
+            )));
+        }
         // `ssml` text is read as a real XML document against the published SSML
         // vocabulary, and what is billed is its text content; plain text bills every
         // character. The same rule, and the same reader, `SynthesizeSpeech` applies.
@@ -481,26 +502,50 @@ async fn frame_stream(
             .map_err(|_| inbound_event_refusal(crate::service::errors::INVALID_SSML.to_string()))?;
         synthesized = synthesized.saturating_add(billed);
         if synthesized > MAX_STREAM_CHARACTERS {
-            // Checked BEFORE any audio is built, so every allocation below is sized
-            // from a count this bound already dominates rather than from the text
-            // the caller sent.
+            // One of the two bounds on the work a session can ask for. It bounds the
+            // TEXT; because SSML markup is not billed, how long that text takes to speak
+            // is bounded separately, by the sample budget handed to each flush below.
             return Err(capacity_refusal(format!(
                 "the input stream carries more than the {MAX_STREAM_CHARACTERS} characters this \
                  emulator synthesizes in one stream"
             )));
         }
-        buffered = buffered.saturating_add(billed);
+        // A `TextEvent` carrying no text buffers nothing: there is no audio to return
+        // for text that was never sent.
+        if !text_event.text.is_empty() {
+            buffered.push((text_event.text.clone(), text_type.to_string()));
+        }
         let forced = text_event
             .flush_stream_configuration
             .as_ref()
             .is_some_and(|flush| flush.force);
         if forced {
-            flush(&mut frames, output_format, sample_rate, &mut buffered)?;
+            rendered = rendered.saturating_add(
+                flush(
+                    &mut frames,
+                    output_format,
+                    sample_rate,
+                    timbre,
+                    lexicons,
+                    &mut buffered,
+                    max_samples(sample_rate).saturating_sub(rendered),
+                )
+                .await?,
+            );
         }
     }
     // The input stream ends with the request body, so whatever is still buffered is
     // written out before the stream closes.
-    flush(&mut frames, output_format, sample_rate, &mut buffered)?;
+    flush(
+        &mut frames,
+        output_format,
+        sample_rate,
+        timbre,
+        lexicons,
+        &mut buffered,
+        max_samples(sample_rate).saturating_sub(rendered),
+    )
+    .await?;
 
     let closed = StreamClosedEvent {
         request_characters: i32::try_from(synthesized).unwrap_or(i32::MAX),
@@ -519,20 +564,84 @@ async fn frame_stream(
     Ok(event_stream_only_response(frames))
 }
 
-/// Write the audio of the buffered characters as one `AudioEvent`, and empty the
-/// buffer. A flush with nothing buffered writes no frame: there is no audio to
-/// return for text that was never sent.
-fn flush(
+/// Write the audio of the buffered text as one `AudioEvent`, and empty the buffer. A
+/// flush with nothing buffered writes no frame: there is no audio to return for text
+/// that was never sent. Answers how many samples it produced.
+///
+/// The text buffered between two flush points is spoken as ONE utterance, so a stream
+/// that forces no flush answers the audio `SynthesizeSpeech` answers for its whole text.
+/// A run of pieces that arrived with different `TextType`s cannot be one document, so
+/// each run of one type is spoken on its own and the audio is joined.
+///
+/// `budget` is how many samples the session may still produce. It is consulted BEFORE
+/// each run is planned, so no buffer here grows past what the session is allowed; a run
+/// that would pass it is the capacity refusal rather than an allocation. Planning,
+/// rendering AND encoding are synchronous CPU-bound work with no await of their own, so
+/// all three go to the BLOCKING pool in ONE task and the worker serving this request is
+/// released while it runs: `spawn_blocking(..).await` is a real await point, so the health
+/// endpoint, a cancellation and a graceful shutdown keep working, and the wait is bounded
+/// by [`SYNTHESIS_TIME_BUDGET`].
+#[allow(clippy::too_many_arguments)]
+async fn flush(
     frames: &mut Vec<u8>,
     output_format: &str,
     sample_rate: u32,
-    buffered: &mut usize,
-) -> Result<(), StartSpeechSynthesisStreamError> {
-    let billed = std::mem::take(buffered);
-    if billed == 0 {
-        return Ok(());
+    timbre: render::Timbre,
+    lexicons: &lexicon::Lexicons,
+    buffered: &mut Vec<(String, String)>,
+    budget: usize,
+) -> Result<usize, StartSpeechSynthesisStreamError> {
+    let pieces = std::mem::take(buffered);
+    if pieces.is_empty() {
+        return Ok(0);
     }
-    let chunk = synthesized_chunk(output_format, sample_rate, billed)?;
+    // What one run of a single `TextType` is: its text, joined.
+    let mut runs: Vec<(String, String)> = Vec::new();
+    let mut index = 0usize;
+    while index < pieces.len() {
+        let text_type = pieces[index].1.clone();
+        let mut joined = String::new();
+        while index < pieces.len() && pieces[index].1 == text_type {
+            joined.push_str(&pieces[index].0);
+            index += 1;
+        }
+        runs.push((joined, text_type));
+    }
+
+    let owned_lexicons = lexicons.clone();
+    let owned_format = output_format.to_string();
+    let produced = match ::tokio::time::timeout(
+        SYNTHESIS_TIME_BUDGET,
+        ::tokio::task::spawn_blocking(move || {
+            chunk_of_runs(&runs, &owned_format, sample_rate, timbre, &owned_lexicons, budget)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(produced))) => produced,
+        Ok(Ok(Err(ChunkFailure::Capacity))) => {
+            return Err(capacity_refusal(format!(
+                "the input stream asks for more than the {MAX_STREAM_SECONDS} seconds of audio \
+                 this emulator synthesizes in one stream"
+            )))
+        }
+        // The document was read when the event arrived, so a failure here is the same one
+        // that reader reports.
+        Ok(Ok(Err(ChunkFailure::InvalidSsml))) => {
+            return Err(inbound_event_refusal(
+                crate::service::errors::INVALID_SSML.to_string(),
+            ))
+        }
+        // The encoder refused a rate this format documents, the synthesis did not finish
+        // inside the budget, or it did not run at all: nothing was synthesized, so this is
+        // a server fault rather than a chunk that stands for no speech.
+        Ok(Ok(Err(ChunkFailure::Encoding))) | Ok(Err(_)) | Err(_) => {
+            return Err(service_failure())
+        }
+    };
+    let Some((chunk, samples)) = produced else {
+        return Ok(0);
+    };
     // `AudioEvent$AudioChunk` is the event's `@eventPayload`, so the frame payload
     // IS the chunk — which is why this one frame is written here rather than through
     // the protocol's generic event serializer, whose JSON object would carry the
@@ -551,41 +660,100 @@ fn flush(
             HeaderValue::String(FRAME_CONTENT_TYPE_BINARY.into()),
         ));
     write_message_to(&message, frames).map_err(|_| service_failure())?;
-    Ok(())
+    Ok(samples)
 }
 
-/// The audio for `billed` characters, in the encoding the request settled.
+/// Why one flush produced no chunk.
+enum ChunkFailure {
+    /// The session cannot carry the next run's audio.
+    Capacity,
+    /// A document could not be read as XML at all.
+    InvalidSsml,
+    /// The encoder refused the stream.
+    Encoding,
+}
+
+/// The one `AudioEvent` chunk of `runs`, and how many samples it carries, or `None` when
+/// they say nothing.
 ///
-/// Every byte of it is silence — see the module note — and every encoder is the one
-/// `SynthesizeSpeech` answers that format with, so one request's audio and one
-/// stream's audio for the same text are the same bytes.
-fn synthesized_chunk(
+/// Synchronous and CPU-bound from end to end — planning, rendering and encoding — so the
+/// caller runs it on the blocking pool. `budget` is checked before each run is planned, so
+/// the sample buffer is bounded before it is filled and `render::max_samples` bounds each
+/// run's contribution to it.
+fn chunk_of_runs(
+    runs: &[(String, String)],
     output_format: &str,
     sample_rate: u32,
-    billed: usize,
-) -> Result<Vec<u8>, StartSpeechSynthesisStreamError> {
-    let duration_ms = spoken_duration_ms(billed);
+    timbre: render::Timbre,
+    lexicons: &lexicon::Lexicons,
+    budget: usize,
+) -> Result<Option<(Vec<u8>, usize)>, ChunkFailure> {
+    let mut samples: Vec<f32> = Vec::new();
+    for (joined, text_type) in runs {
+        // The next run cannot be planned, let alone rendered, unless the session can
+        // still carry a whole utterance of it: `render::max_samples` is the most one
+        // utterance produces, so this is what makes the bound dominate every allocation
+        // below rather than follow it.
+        if samples
+            .len()
+            .saturating_add(render::max_samples(sample_rate))
+            > budget
+        {
+            return Err(ChunkFailure::Capacity);
+        }
+        let utterance =
+            plan::plan(joined, text_type, lexicons).map_err(|_| ChunkFailure::InvalidSsml)?;
+        samples.extend(render::render(&utterance, sample_rate, timbre));
+    }
+    if samples.is_empty() {
+        return Ok(None);
+    }
+    let chunk =
+        encoded_chunk(output_format, sample_rate, &samples).ok_or(ChunkFailure::Encoding)?;
+    Ok(Some((chunk, samples.len())))
+}
+
+/// The most seconds of audio one stream produces.
+///
+/// CHOSEN, and it is what bounds the SIZE of the answer: the character bound above limits
+/// the text, but SSML markup is not billed and stretches how long that text takes to
+/// speak (a slow `<prosody rate>` multiplies every segment and each `<break>` adds up to
+/// ten seconds), so the audio a session carries is bounded here as well. It is several
+/// times the bound one utterance has ([`plan::MAX_UTTERANCE_MS`]), so a stream still
+/// carries the speech of its whole text while a session that asks for hours of pauses is
+/// refused before the samples are produced — and small enough that the samples one flush
+/// holds stay in the tens of megabytes at the highest rate any format documents.
+pub const MAX_STREAM_SECONDS: u64 = 600;
+
+/// The sample count [`MAX_STREAM_SECONDS`] is at `sample_rate`.
+fn max_samples(sample_rate: u32) -> usize {
+    usize::try_from(MAX_STREAM_SECONDS.saturating_mul(u64::from(sample_rate))).unwrap_or(usize::MAX)
+}
+
+/// The audio of the rendered samples, in the encoding the request settled.
+///
+/// Every encoder is the one `SynthesizeSpeech` answers that format with, so one
+/// request's audio and one stream's audio for the same text are the same bytes. `None`
+/// when the encoder refuses the stream, which the caller answers with the modelled server
+/// error: the rate was settled against the format's own documented value set before the
+/// stream was accepted, and every one of those values is a rate these encoders carry, so
+/// that is this emulator failing to encode a rate it admitted — never a second refusal of
+/// a member the request was already told was acceptable.
+fn encoded_chunk(output_format: &str, sample_rate: u32, samples: &[f32]) -> Option<Vec<u8>> {
     match output_format {
-        "pcm" => Ok(audio::pcm_silence(sample_rate, duration_ms)),
-        "mulaw" => Ok(audio::mulaw_silence(sample_rate, duration_ms)),
-        "alaw" => Ok(audio::alaw_silence(sample_rate, duration_ms)),
-        // The rate was settled against the format's own documented value set before
-        // the stream was accepted, and every one of those values is a rate these
-        // encoders carry, so a `None` here is this emulator failing to encode a rate
-        // it admitted — a server fault, never a second refusal of a member the
-        // request was already told was acceptable.
-        "mp3" => audio::mp3_silence(sample_rate, duration_ms).ok_or_else(service_failure),
-        "ogg_opus" => audio::ogg_opus_silence(sample_rate, duration_ms).ok_or_else(service_failure),
-        // Refused with the other parameter rules in `respond`, so this arm is the
-        // exhaustiveness of the match rather than the path a request takes.
-        UNENCODABLE_OUTPUT_FORMAT => Err(crate::scaffolded::Scaffolded::not_implemented(
-            "StartSpeechSynthesisStream with OutputFormat ogg_vorbis",
-        )),
-        // `respond` has already narrowed `OutputFormat` to the formats this
-        // operation serves, so reaching here would be this emulator failing to
-        // encode a format it admitted — a server fault, like the two arms above,
-        // never a second refusal of a member the request was told was acceptable.
-        _ => Err(service_failure()),
+        "pcm" => Some(audio::pcm(samples)),
+        "mulaw" => Some(audio::mulaw(samples)),
+        "alaw" => Some(audio::alaw(samples)),
+        "ogg_vorbis" => audio::ogg_vorbis(samples, sample_rate),
+        // The two formats whose samples are not written: see
+        // [`super::synthesize_speech::legacy_audio`]. Their chunks still last as long as
+        // the speech they stand for.
+        "ogg_opus" => audio::ogg_opus_silence_for(samples, sample_rate),
+        "mp3" => audio::mp3_silence_for(samples, sample_rate),
+        // `respond` has already narrowed `OutputFormat` to the formats this operation
+        // serves, so reaching here would be this emulator failing to encode a format it
+        // admitted.
+        _ => None,
     }
 }
 

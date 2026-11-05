@@ -317,9 +317,11 @@ async fn every_error_document_carries_its_message_member() {
     }
 }
 
-/// RULE, for the two documents the framework itself renders: a refusal and the
-/// scaffold channel's 501 carry a `message` member too — theirs is always a non-empty
-/// string, because both are built from the request or name the operation.
+/// RULE, for the document the framework itself renders: a refusal carries a `message`
+/// member too, and it is always a non-empty string, because it is built from the request.
+///
+/// The scaffold channel's 501 has no row here any more: every operation this service
+/// models is implemented, so no request reaches it.
 #[tokio::test]
 async fn the_framework_documents_carry_a_string_message_member() {
     let polly = Polly::new();
@@ -336,19 +338,20 @@ async fn the_framework_documents_carry_a_string_message_member() {
         ));
     }
 
-    // `SynthesizeSpeech` with the one output format this emulator cannot encode is the
-    // scaffold channel's 501, whose message names what is not implemented.
+    // A voice that does not support the engine the request names is the other document
+    // the framework renders: a refusal whose message names the engine.
     rows.push((
-        "SynthesizeSpeech ogg_vorbis".to_string(),
+        "SynthesizeSpeech with an engine the voice does not support".to_string(),
         polly
             .synthesize(&serde_json::json!({
                 "Text": "hello world",
                 "VoiceId": "Joanna",
-                "OutputFormat": "ogg_vorbis",
+                "Engine": "long-form",
+                "OutputFormat": "pcm",
             }))
             .await,
-        501,
-        "NotImplemented",
+        400,
+        "ValidationException",
     ));
 
     for (case, response, status, code) in &rows {

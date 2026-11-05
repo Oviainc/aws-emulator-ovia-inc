@@ -4,19 +4,18 @@
 //! stream and when it is refused.
 //!
 //! RULE: `OutputFormat: json` IS the speech-mark stream, so the mark types the request
-//! NAMES decide which marks have to be computed: naming none asks for no marks, which
-//! needs no text offsets at all, so the answer is a 200 carrying an empty stream for
-//! every `TextType`; only a mark type the emulator cannot compute for the input it was
-//! given is refused.
+//! NAMES decide which marks it carries: naming none asks for no marks, so the answer is a
+//! 200 carrying an empty stream for every `TextType`, and naming a type is answered with
+//! exactly that type's marks — for plain text and for `ssml` alike.
 //!
 //! The tests check that over a TABLE whose rows differ along `TextType` (absent, `text`,
 //! `ssml`), how the mark list is spelled (member absent, present but empty), the shape of
 //! the input (plain text, an SSML document of text only, one with an empty element, one
 //! with nested elements, one whose markup carries attribute text) and which mark types
-//! are named (none, `sentence`, `word`, both) — so the refusal is pinned to follow the
-//! request rather than the `TextType` alone.
+//! are named (none, `sentence`, `word`, `viseme`, `ssml`, several at once) — so the answer
+//! is pinned to follow the request rather than the `TextType` alone.
 
-use crate::lexicons_and_speech::{error_code, header, Polly};
+use crate::lexicons_and_speech::{header, Polly};
 
 /// The media type `json` output carries, which is also what a refusal must NOT answer
 /// with.
@@ -159,14 +158,13 @@ async fn naming_no_mark_type_is_an_empty_stream_for_every_text_type() {
     }
 }
 
-/// RULE: naming a `sentence` or `word` mark DOES ask for offsets into the text, so plain
-/// text is answered with exactly the mark types the request named, while `ssml` input —
-/// whose offsets would have to skip the markup — is refused. The refusal follows the mark
-/// types the request carries, not `TextType` on its own.
+/// RULE: naming a mark type is answered with exactly that type's marks, for plain text
+/// and for `ssml` input alike — the stream carries every type the request named and no
+/// other.
 #[tokio::test]
-async fn naming_a_mark_type_is_answered_for_text_and_refused_for_ssml() {
+async fn naming_a_mark_type_is_answered_for_every_text_type() {
     let polly = Polly::new();
-    let table: [(&str, &str, &str, &[&str]); 6] = [
+    let table: [(&str, &str, &str, &[&str]); 10] = [
         // (case, Text, TextType, SpeechMarkTypes)
         ("word over text", "Hi there. Go!", "text", &["word"]),
         ("sentence over text", "Hi there. Go!", "text", &["sentence"]),
@@ -176,6 +174,7 @@ async fn naming_a_mark_type_is_answered_for_text_and_refused_for_ssml() {
             "text",
             &["sentence", "word"],
         ),
+        ("viseme over text", "Hi there. Go!", "text", &["viseme"]),
         (
             "word over ssml",
             "<speak>Hi there. Go!</speak>",
@@ -194,21 +193,29 @@ async fn naming_a_mark_type_is_answered_for_text_and_refused_for_ssml() {
             "ssml",
             &["sentence", "word"],
         ),
+        (
+            "viseme over ssml",
+            "<speak>Hi there. Go!</speak>",
+            "ssml",
+            &["viseme"],
+        ),
+        (
+            "ssml marks over ssml",
+            "<speak>one <mark name=\"here\"/> two</speak>",
+            "ssml",
+            &["ssml"],
+        ),
+        (
+            "every type at once",
+            "<speak>one <mark name=\"here\"/> two</speak>",
+            "ssml",
+            &["sentence", "word", "viseme", "ssml"],
+        ),
     ];
     for (case, text, text_type, mark_types) in table {
         let response = polly
             .synthesize(&request(text, Some(text_type), Some(mark_types)))
             .await;
-        if text_type == "ssml" {
-            let actual = (response.status().as_u16(), error_code(&response));
-            assert_eq!(
-                actual,
-                (501, "NotImplemented".to_string()),
-                "case {case:?}: expected a 501 NotImplemented, got {actual:?} with body {:?}",
-                String::from_utf8_lossy(response.body())
-            );
-            continue;
-        }
         assert_eq!(
             response.status().as_u16(),
             200,

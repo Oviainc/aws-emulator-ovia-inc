@@ -571,9 +571,10 @@ async fn synthesize_speech_answers_every_output_format() {
     let text = "Hello world, this is a sentence.";
     // The mapping is `SynthesizeSpeechOutput$ContentType`'s own documentation; the
     // signature is the format's real framing.
-    let table: [(&str, &str, Option<&[u8]>); 5] = [
+    let table: [(&str, &str, Option<&[u8]>); 6] = [
         ("mp3", "audio/mpeg", Some(&[0xFF])),
         ("ogg_opus", "audio/ogg", Some(b"OggS")),
+        ("ogg_vorbis", "audio/ogg", Some(b"OggS")),
         ("pcm", "audio/pcm", None),
         ("mulaw", "audio/mulaw", None),
         ("alaw", "audio/alaw", None),
@@ -616,31 +617,64 @@ async fn synthesize_speech_answers_every_output_format() {
     }
 }
 
-/// RULE: a format the emulator cannot encode conformantly is answered with the
-/// scaffold's 501, never with a 200 carrying a stream no decoder accepts. `ogg_vorbis`
-/// needs a Vorbis encoder's codebooks, which no in-process encoder can produce.
+/// RULE: every modelled `OutputFormat` is SERVED — none of them answers an error the
+/// operation does not model — and the Ogg formats carry a real stream of the encoding
+/// they name, whichever documented sample rate is asked for.
 #[tokio::test]
-async fn an_unencodable_output_format_is_not_dressed_up_as_success() {
+async fn every_modelled_output_format_is_served() {
     let polly = Polly::new();
-    let requests = [
-        serde_json::json!({
-            "Text": "hello world",
-            "VoiceId": "Joanna",
-            "OutputFormat": "ogg_vorbis",
-        }),
-        serde_json::json!({
-            "Text": "hello world",
-            "VoiceId": "Joanna",
-            "OutputFormat": "ogg_vorbis",
-            "SampleRate": "22050",
-        }),
+    // (format, the codec name its stream carries, the rates it documents that this row
+    // drives). `ogg_vorbis` documents six rates and `ogg_opus` one.
+    let table: [(&str, &[u8], &[&str]); 2] = [
+        ("ogg_vorbis", b"vorbis", &["8000", "22050", "48000"]),
+        ("ogg_opus", b"OpusHead", &["48000"]),
     ];
-    for request in requests {
-        let response = polly.synthesize(&request).await;
+    for (format, codec, rates) in table {
+        for rate in rates {
+            let request = serde_json::json!({
+                "Text": "Testing output format content types.",
+                "VoiceId": "Joanna",
+                "OutputFormat": format,
+                "SampleRate": rate,
+            });
+            let response = polly.synthesize(&request).await;
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "request {request:?}: expected audio, got body {:?}",
+                String::from_utf8_lossy(response.body())
+            );
+            assert_eq!(
+                header(&response, "content-type"),
+                "audio/ogg",
+                "request {request:?}: wrong Content-Type"
+            );
+            let body = response.body();
+            assert_eq!(
+                &body[..4],
+                b"OggS",
+                "request {request:?}: the stream must be Ogg-framed"
+            );
+            assert!(
+                body.windows(codec.len()).any(|window| window == codec),
+                "request {request:?}: the stream must name its codec ({:?})",
+                String::from_utf8_lossy(codec)
+            );
+        }
+    }
+    // A request that names no rate at all is served too, at the format's default.
+    for format in ["ogg_vorbis", "ogg_opus"] {
+        let response = polly
+            .synthesize(&serde_json::json!({
+                "Text": "hello world",
+                "VoiceId": "Joanna",
+                "OutputFormat": format,
+            }))
+            .await;
         assert_eq!(
-            (response.status().as_u16(), error_code(&response)),
-            (501, "NotImplemented".to_string()),
-            "request {request:?}: ogg_vorbis must answer 501, body {:?}",
+            response.status().as_u16(),
+            200,
+            "format {format:?} with no SampleRate: body {:?}",
             String::from_utf8_lossy(response.body())
         );
     }
@@ -653,7 +687,7 @@ async fn a_longer_text_yields_a_longer_stream() {
     let polly = Polly::new();
     let short = "Hi.";
     let long = "Hi. ".repeat(100);
-    for format in ["mp3", "ogg_opus", "pcm", "mulaw", "alaw"] {
+    for format in ["mp3", "ogg_opus", "ogg_vorbis", "pcm", "mulaw", "alaw"] {
         let mut lengths = Vec::new();
         for text in [short, long.as_str()] {
             let response = polly
@@ -942,17 +976,17 @@ async fn speech_marks_are_json_only_and_computed_from_the_text() {
         String::from_utf8_lossy(no_types.body())
     );
 
-    // Marks over SSML input would need offsets into the document's text content that
-    // skip the markup; that is not implemented, so it is refused rather than answered
-    // with marks whose values are tag names.
+    // Marks over SSML input report offsets into the text the caller sent — the markup
+    // included, because that is the string the offsets index into.
     for mark_types in [
         serde_json::json!(["word"]),
         serde_json::json!(["sentence"]),
         serde_json::json!(["sentence", "word"]),
     ] {
+        const SSML: &str = "<speak>one <break time=\"1s\"/>two</speak>";
         let response = polly
             .synthesize(&serde_json::json!({
-                "Text": "<speak>one <break time=\"1s\"/>two</speak>",
+                "Text": SSML,
                 "TextType": "ssml",
                 "VoiceId": "Joanna",
                 "OutputFormat": "json",
@@ -960,11 +994,39 @@ async fn speech_marks_are_json_only_and_computed_from_the_text() {
             }))
             .await;
         assert_eq!(
-            (response.status().as_u16(), error_code(&response)),
-            (501, "NotImplemented".to_string()),
-            "mark types {mark_types:?} over ssml input: expected a 501, body {:?}",
+            response.status().as_u16(),
+            200,
+            "mark types {mark_types:?} over ssml input: expected marks, body {:?}",
             String::from_utf8_lossy(response.body())
         );
+        let marks: Vec<serde_json::Value> = String::from_utf8_lossy(response.body())
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is a JSON object"))
+            .collect();
+        assert!(
+            !marks.is_empty(),
+            "mark types {mark_types:?} over ssml input: expected at least one mark"
+        );
+        for mark in &marks {
+            let start = mark["start"].as_u64().unwrap_or_default() as usize;
+            let end = mark["end"].as_u64().unwrap_or_default() as usize;
+            let value = mark["value"].as_str().unwrap_or_default();
+            assert!(
+                end <= SSML.len() && start < end,
+                "mark {mark} must span a stretch of the text it was sent"
+            );
+            assert_eq!(
+                value,
+                SSML[start..end].trim(),
+                "mark {mark} must carry the text its offsets cover"
+            );
+            if mark["type"].as_str() == Some("word") {
+                assert!(
+                    !value.contains('<') && !value.contains('>'),
+                    "word mark {mark} must cover a word of the text content, not markup"
+                );
+            }
+        }
     }
 
     // One mark type at a time yields only that type.
