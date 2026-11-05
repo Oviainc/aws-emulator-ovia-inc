@@ -1111,6 +1111,76 @@ async fn an_update_changes_the_sources_within_one_source_type() {
     }
 }
 
+/// The name a create carries is the sync's key, held VERBATIM: `ResourceDataSyncName`
+/// carries a length bound and no pattern, so names differing only in case, in punctuation
+/// or in script are different syncs, each reported back exactly as it was created — and a
+/// listing walks them in ascending name order whatever order they were created in.
+#[tokio::test]
+async fn a_name_is_held_verbatim_and_a_listing_walks_them_in_order() {
+    let router = router();
+    // One name per form the modelled shape admits (`length 1..64`, no pattern):
+    // `smithy_query(query="shape", shape="ResourceDataSyncName")`.
+    let held: Vec<&str> = vec![
+        "Inventory",
+        "inventory",
+        "inventory.2",
+        "inventory-2",
+        "inventory_2",
+        "inventory 2",
+        "Inventário",
+        "0",
+    ];
+    // Created in reverse, so the order a listing reports cannot be the order of creation.
+    for name in held.iter().rev() {
+        create_ok(
+            &router,
+            name,
+            &json!({
+                "SyncName": name,
+                "S3Destination": s3_destination("inventory-bucket", false),
+            }),
+        )
+        .await;
+    }
+
+    let reported = names(&router, "every name form", Some(TO_DESTINATION)).await;
+    let mut expected: Vec<String> = held.iter().map(|name| (*name).to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        reported, expected,
+        "case every name form: a listing walks the syncs in ascending name order, got \
+         {reported:?}"
+    );
+
+    // Each one is addressed, and deleted, by the name it was created under — not by a
+    // normalised form of it.
+    for name in &held {
+        let item = item_named(&router, name, Some(TO_DESTINATION), name)
+            .await
+            .unwrap_or_else(|| panic!("case {name}: the sync is reported under its own name"));
+        assert_eq!(
+            item["SyncName"].as_str(),
+            Some(*name),
+            "case {name}: the name is reported verbatim, got {item}"
+        );
+        let (status, response) = call(
+            &router,
+            "DeleteResourceDataSync",
+            &json!({ "SyncName": name }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name}: the sync deletes under its own name, got {status} {response}"
+        );
+    }
+    let left = names(&router, "after deleting every name", Some(TO_DESTINATION)).await;
+    assert!(
+        left.is_empty(),
+        "case after deleting every name: the Region holds no sync, got {left:?}"
+    );
+}
+
 /// A listing pages by sync name: each page holds at most `MaxResults` syncs, the token it
 /// hands out is where the next page starts, and the pages together are every sync the
 /// Region holds, each exactly once, in ascending name order — whatever page size the
