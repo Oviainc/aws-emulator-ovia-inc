@@ -43,6 +43,12 @@
 //! `CreateStarterMappingTemplate` generates a mapping template for, so a template written
 //! against a starter template addresses the document this operation answers with.
 //!
+//! The element NAMES are the canonical document's own, which are the short form of the
+//! ASC X12 element titles (`ISA_06_SenderId`, `ISA_15_TestIndicator`, `GS_08_Version` —
+//! see [`ISA_ELEMENTS`]); a transaction set whose detail table repeats carries that
+//! repetition as ONE entry of `segments`, keyed `<SEGMENT>-8000_loop` and holding one
+//! object per occurrence (see [`DETAIL_LOOPS`] and [`transaction_body_member`]).
+//!
 //! The delimiters are the interchange's OWN: the element separator is the character that
 //! follows `ISA`, the component separator is ISA16 and the segment terminator is the
 //! character after it, exactly as the ASC X12 envelope declares them — so a document
@@ -288,51 +294,65 @@ const REQUIREMENT_MANDATORY: &str = "MANDATORY";
 
 /// The element names of the interchange control header (ISA), in positional order.
 ///
-/// Source: the element table of the ASC X12 interchange control header. Position 11 is
-/// release-dependent — see [`isa_element_names`]. These are the same envelope element
-/// names `CreateStarterMappingTemplate` keys a starter template's elements by, so a
-/// parsed document and a starter template describe the same tree with the same keys; that
-/// operation's table is private to its own file, which this change does not edit.
+/// These are B2BI's OWN names for the elements of the canonicalized EDI-as-JSON
+/// document, which are the short form of each element's ASC X12 title rather than the
+/// title itself: the interchange sender id is `SenderId` and not
+/// `InterchangeSenderId`, the usage indicator is `TestIndicator`, and the authorization
+/// and security qualifiers drop the `Information` the X12 table carries
+/// (`ISA_01_AuthorizationQualifier`, `ISA_06_SenderId`, `ISA_13_InterchangeControlNumber`,
+/// `ISA_15_TestIndicator` as the recorded canonical documents key them). A name is how a
+/// caller's mapping expression addresses the element, so these are a wire requirement,
+/// not a label.
+///
+/// Position 11 is release-dependent — see [`isa_element_names`]. These are the same
+/// envelope element names `CreateStarterMappingTemplate` keys a starter template's
+/// elements by, so a parsed document and a starter template describe the same tree with
+/// the same keys.
 pub(crate) const ISA_ELEMENTS: &[&str] = &[
-    "AuthorizationInformationQualifier",
+    "AuthorizationQualifier",
     "AuthorizationInformation",
-    "SecurityInformationQualifier",
+    "SecurityQualifier",
     "SecurityInformation",
-    "InterchangeIdQualifier",
-    "InterchangeSenderId",
-    "InterchangeIdQualifier",
-    "InterchangeReceiverId",
-    "InterchangeDate",
-    "InterchangeTime",
+    // ISA05 and ISA07 are both the X12 "Interchange ID Qualifier"; the canonical
+    // document tells them apart by the side of the interchange each one qualifies.
+    "SenderQualifier",
+    "SenderId",
+    "ReceiverQualifier",
+    "ReceiverId",
+    "Date",
+    "Time",
     // Position 11, replaced per release by `isa_element_names`.
     "RepetitionSeparator",
-    "InterchangeControlVersionNumber",
+    "Version",
     "InterchangeControlNumber",
     "AcknowledgmentRequested",
-    "UsageIndicator",
-    "ComponentElementSeparator",
+    "TestIndicator",
+    "ComponentSeparator",
 ];
 
 /// Element 11 of the interchange control header from X12 release 004020 on.
 const ISA11_FROM_4020: &str = "RepetitionSeparator";
 
 /// Element 11 of the interchange control header before X12 release 004020.
-const ISA11_PRE_4020: &str = "InterchangeControlStandardsIdentifier";
+const ISA11_PRE_4020: &str = "InterchangeControlStandardsId";
 
 /// The element names of the interchange control trailer (IEA), in positional order.
 pub(crate) const IEA_ELEMENTS: &[&str] =
     &["NumberOfIncludedFunctionalGroups", "InterchangeControlNumber"];
 
-/// The element names of the functional group header (GS), in positional order.
+/// The element names of the functional group header (GS), in positional order, in the
+/// same canonical naming as [`ISA_ELEMENTS`]: `GS_01_FunctionalIdentifierCode` through
+/// `GS_08_Version`, the version/release/industry identifier code shortened to `Version`
+/// the way the recorded canonical documents key it.
 pub(crate) const GS_ELEMENTS: &[&str] = &[
     "FunctionalIdentifierCode",
-    "ApplicationSendersCode",
-    "ApplicationReceiversCode",
+    "ApplicationSenderCode",
+    "ApplicationReceiverCode",
     "Date",
     "Time",
     "GroupControlNumber",
     "ResponsibleAgencyCode",
-    "VersionReleaseIndustryIdentifierCode",
+    "Version",
 ];
 
 /// The element names of the functional group trailer (GE), in positional order.
@@ -373,6 +393,82 @@ pub(crate) const TRANSACTION_ITEM: &str = "transaction";
 /// …and for the body segments of a transaction set.
 pub(crate) const SEGMENTS_KEY: &str = "segments";
 pub(crate) const SEGMENT_ITEM: &str = "segment";
+
+/// The segment that opens the DETAIL table of an X12 transaction set, by the transaction
+/// set code its ST01 carries — the segment the canonical document groups into a LOOP.
+///
+/// Source: the detail table of each named transaction set in the ASC X12 standard, whose
+/// first segment is the one that repeats once per line item, shipment, line adjustment or
+/// acknowledged transaction set. A transaction set that is not listed has its body
+/// segments reported FLAT, because this emulator does not carry that transaction set's
+/// loop structure; the HIPAA implementation guides (270, 271, 276, 277, 278, 834, 835,
+/// 837) are deliberately absent for the same reason — their loops are named by the guide's
+/// own loop ids rather than by the standard's detail table.
+const DETAIL_LOOPS: &[(&str, &str)] = &[
+    // 850 Purchase Order / 855 Purchase Order Acknowledgment: the baseline item segment.
+    ("850", "PO1"),
+    ("855", "PO1"),
+    // 860 / 865 Purchase Order Change: the line item change segment.
+    ("860", "POC"),
+    ("865", "POC"),
+    // 810 Invoice: the baseline item data segment.
+    ("810", "IT1"),
+    // 856 Ship Notice/Manifest: the hierarchical level segment.
+    ("856", "HL"),
+    // 846 Inventory Inquiry/Advice, 852 Product Activity Data, 867 Product Transfer and
+    // Resale Report: the item identification segment.
+    ("846", "LIN"),
+    ("852", "LIN"),
+    ("867", "LIN"),
+    // 864 Text Message: the message identification segment.
+    ("864", "MIT"),
+    // 820 Payment Order/Remittance Advice: the entity segment.
+    ("820", "ENT"),
+    // 824 Application Advice: the original transaction identification segment.
+    ("824", "OTI"),
+    // 214 Transportation Carrier Shipment Status, 940 Warehouse Shipping Order, 945
+    // Warehouse Shipping Advice: the assigned number segment.
+    ("214", "LX"),
+    ("940", "LX"),
+    ("945", "LX"),
+    // 997 Functional Acknowledgment / 999 Implementation Acknowledgment: the transaction
+    // set response header.
+    ("997", "AK2"),
+    ("999", "AK2"),
+];
+
+/// The position number the canonical document gives a transaction set's detail-table loop,
+/// and the suffix that marks a member as a loop: a loop's member name is its opening
+/// segment, that position and `_loop` — `PO1-8000_loop`, which is how the recorded
+/// canonical document of a purchase order keys its item loop.
+///
+/// One position for every transaction set: the number is the loop's place in the
+/// transaction set's own segment table, and the detail table opens at the same place in
+/// each of them, after the heading table. The recorded purchase order is where this
+/// emulator takes it from.
+const DETAIL_LOOP_POSITION: u32 = 8000;
+const LOOP_KEY_SUFFIX: &str = "_loop";
+
+/// The segment [`DETAIL_LOOPS`] names for the transaction set `transaction_set` opens its
+/// detail table with, if this emulator carries one for it.
+fn detail_loop_segment(transaction_set: &str) -> Option<&'static str> {
+    DETAIL_LOOPS
+        .iter()
+        .find(|(code, _)| *code == transaction_set)
+        .map(|(_, segment)| *segment)
+}
+
+/// The member name a loop opened by `segment` sits under.
+fn detail_loop_key(segment: &str) -> String {
+    format!("{segment}-{DETAIL_LOOP_POSITION}{LOOP_KEY_SUFFIX}")
+}
+
+/// The segments that END a transaction set's detail table: the totals the ASC X12 standard
+/// places in the SUMMARY table — transaction totals, the total monetary value summary and
+/// the functional group response trailer. A segment from here on belongs to the transaction
+/// set as a whole and not to the detail loop it follows, so it is reported beside that
+/// loop rather than inside its last occurrence.
+const SUMMARY_SEGMENTS: &[&str] = &["CTT", "TDS", "AK9"];
 
 /// [`ISA_ELEMENTS`] with position 11 named for `release`.
 pub(crate) fn isa_element_names(release: u32) -> Vec<&'static str> {
@@ -936,13 +1032,105 @@ impl Scope {
 /// One transaction set: its ST elements, the segments of its body, then its SE elements.
 fn transaction_node(transaction: &Transaction, delimiters: &Delimiters) -> Node {
     let mut members = envelope_members(&transaction.st, ST_ELEMENTS);
-    members.extend(body_segments_member(
-        SEGMENTS_KEY,
-        &transaction.body,
-        delimiters,
-    ));
+    members.extend(transaction_body_member(transaction, delimiters));
     members.extend(envelope_members(&transaction.se, SE_ELEMENTS));
     Node::Map(members)
+}
+
+/// The `segments` of a transaction set's body, with the DETAIL LOOP of its transaction set
+/// grouped the way the canonical document groups it.
+///
+/// A transaction set whose detail table repeats ([`DETAIL_LOOPS`]) carries that loop as ONE
+/// entry of `segments`, at the place its first occurrence sits in the document, keyed
+/// [`detail_loop_key`] and holding one object per OCCURRENCE — so a mapping addresses the
+/// second line item as the second entry of the loop rather than having to count segments.
+/// An occurrence carries its opening segment's elements and, in its own `segments` list,
+/// the segments between it and the next occurrence — up to the first segment of the
+/// transaction set's summary table ([`SUMMARY_SEGMENTS`]), which ends the detail table.
+/// Which of the remaining segments the transaction set's X12 schema places in the loop is
+/// not something this emulator carries, and a segment that follows a repeating detail
+/// segment belongs to that occurrence under the standard's own loop semantics.
+///
+/// A transaction set whose detail loop this emulator does not carry reports its body
+/// segments flat, in document order.
+fn transaction_body_member(
+    transaction: &Transaction,
+    delimiters: &Delimiters,
+) -> Option<(String, Node)> {
+    let transaction_set = transaction
+        .st
+        .elements
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    let Some(opening) = detail_loop_segment(transaction_set) else {
+        return body_segments_member(SEGMENTS_KEY, &transaction.body, delimiters);
+    };
+    if transaction.body.is_empty() {
+        return None;
+    }
+
+    // One entry per segment outside the loop, plus one for the loop itself where its first
+    // occurrence sits; every occurrence of the opening segment opens a new one, and the
+    // summary table closes the last.
+    let mut items: Vec<Node> = Vec::new();
+    let mut occurrences: Vec<(&Segment, Vec<&Segment>)> = Vec::new();
+    let mut loop_at: Option<usize> = None;
+    let mut in_summary = false;
+    for segment in &transaction.body {
+        in_summary = in_summary || SUMMARY_SEGMENTS.contains(&segment.id.as_str());
+        if !in_summary && segment.id == opening {
+            if loop_at.is_none() {
+                loop_at = Some(items.len());
+                items.push(Node::Map(Vec::new()));
+            }
+            occurrences.push((segment, Vec::new()));
+            continue;
+        }
+        match occurrences.last_mut().filter(|_| !in_summary) {
+            Some((_, inside)) => inside.push(segment),
+            None => items.push(body_segment_node(segment, delimiters)),
+        }
+    }
+    // The loop's own entry, written into the slot its first occurrence reserved.
+    if let Some(slot) = loop_at.and_then(|at| items.get_mut(at)) {
+        *slot = Node::Map(vec![(
+            detail_loop_key(opening),
+            Node::List {
+                item: SEGMENT_ITEM.to_string(),
+                items: occurrences
+                    .iter()
+                    .map(|(segment, inside)| occurrence_node(segment, inside, delimiters))
+                    .collect(),
+            },
+        )]);
+    }
+    Some((
+        SEGMENTS_KEY.to_string(),
+        Node::List {
+            item: SEGMENT_ITEM.to_string(),
+            items,
+        },
+    ))
+}
+
+/// One occurrence of a detail loop: the opening segment's own members, and the segments
+/// that follow it inside that occurrence as its own `segments` list.
+fn occurrence_node(segment: &Segment, inside: &[&Segment], delimiters: &Delimiters) -> Node {
+    let mut occurrence = body_segment_node(segment, delimiters);
+    if let (Node::Map(members), false) = (&mut occurrence, inside.is_empty()) {
+        members.push((
+            SEGMENTS_KEY.to_string(),
+            Node::List {
+                item: SEGMENT_ITEM.to_string(),
+                items: inside
+                    .iter()
+                    .map(|child| body_segment_node(child, delimiters))
+                    .collect(),
+            },
+        ));
+    }
+    occurrence
 }
 
 /// One functional group holding `transactions`: its GS elements, the segments that sit

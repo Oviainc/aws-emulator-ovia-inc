@@ -43,7 +43,9 @@
 //! the segment's id under `segment_id` and its elements keyed `<SEGMENT>_<position>`
 //! (`BEG_01`) — the very shape this service's X12 reader builds for a parsed document
 //! ([`super::test_parsing::parse_x12`]), because a mapping written against this template
-//! is evaluated into a document that reader's own output is compared with.
+//! is evaluated into a document that reader's own output is compared with. A template
+//! DERIVED FROM A SAMPLE therefore also carries that reader's detail-table loops
+//! (`PO1-8000_loop`), one entry per occurrence in the sample.
 //!
 //! ## Shape of an operation
 //!
@@ -912,7 +914,7 @@ fn write_xml_node(
 pub const SAMPLE_PLACEHOLDER_PREFIX: &str = "PLACEHOLDER: ";
 
 /// Whether `key` names an element of a segment INSIDE the transaction (`BEG_01`) rather
-/// than an envelope element (`ISA_01_AuthorizationInformationQualifier`).
+/// than an envelope element (`ISA_01_AuthorizationQualifier`).
 ///
 /// The two keyings are what tell the two kinds of field apart: an envelope element's key
 /// carries the element's name after its position, a transaction-set element's key does

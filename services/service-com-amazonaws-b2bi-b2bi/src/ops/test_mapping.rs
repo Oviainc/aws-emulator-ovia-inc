@@ -62,7 +62,8 @@
 //!   still be declined here — with the 501 that names the ceiling
 //!   ([`ceiling_not_implemented`]), since the service would have mapped it; the answered
 //!   document ([`MAX_MAPPED_FILE_BYTES`]) is capped on the VALUE, before it is
-//!   serialized.
+//!   serialized, and the member that carries its text is that text escaped, so at most
+//!   twice the capped document plus its two quotes.
 //!
 //! There is no host escape to disable: JSONata's function set is fixed by the
 //! interpreter, and its whole list (`jsonata-rs`'s `bind_native!` bindings: `$abs` …
@@ -144,8 +145,11 @@
 //!   the document; nothing else about that path is asserted here;
 //! * `mappedFileContent` is modelled as a plain `String` and carries the mapped DOCUMENT,
 //!   so it is that document rendered to TEXT: pretty-printed with two-space indentation
-//!   (see [`mapped_document_text`]), with every object's members in SORTED key order. That
-//!   last part is a known divergence, not a rule: the real service writes a mapped object's
+//!   (see [`mapped_document_text`]) and then JSON-string-encoded into the member
+//!   ([`mapped_file_member`]), so a caller parses the member once for the mapped file's
+//!   text and parses that text for the document. Every object's members are in SORTED key
+//!   order. That last part is a known divergence, not a rule: the real service writes a
+//!   mapped object's
 //!   members in the order its mapping constructed them, and nothing here can reproduce that
 //!   order — the interpreter holds an object's members in a hash map, so its own order
 //!   varies between evaluations, and it exposes no typed view of the parsed template to
@@ -334,6 +338,9 @@ pub(crate) async fn evaluate_mapping_template(
     template: String,
     document: String,
 ) -> Result<String, String> {
+    // The mapped DOCUMENT's text, which is what a job writes to its output file: the
+    // JSON-string encoding the response member carries ([`mapped_file_member`]) belongs to
+    // the answer `TestMapping` gives its caller and not to the mapped file.
     map_document(TestMappingInput {
         mapping_template: template,
         input_file_content: document,
@@ -342,7 +349,6 @@ pub(crate) async fn evaluate_mapping_template(
         file_format: FILE_FORMAT_JSON.to_string(),
     })
     .await
-    .map(|mapped| mapped.mapped_file_content)
     .map_err(|failure| failure.to_string())
 }
 
@@ -781,6 +787,10 @@ fn ceiling_not_implemented(detail: String) -> TestMappingError {
 /// with its own generator, is recorded with a space on BOTH sides of that colon instead,
 /// so the two layouts are kept apart in [`crate::state::documents::to_document_text`].)
 ///
+/// This is the document's own text; what the response MEMBER carries is that text
+/// JSON-string-encoded — see [`mapped_file_member`], which is the last step before the
+/// answer, so the text itself is what a transformer job writes to its output file.
+///
 /// Every object's members are written in sorted key order. That is NOT the order the real
 /// service answers — it writes the members in the order the mapping constructed them — and
 /// this emulator cannot reproduce that order: the interpreter holds an object's members in
@@ -801,6 +811,23 @@ fn mapped_document_text(serialized: String) -> String {
         }
         Err(_) => serialized,
     }
+}
+
+/// The required `mappedFileContent` member for a mapped document whose text is `document`:
+/// that text as a JSON STRING LITERAL.
+///
+/// The mapped file travels as text inside a `String` member, and the recorded answers
+/// carry that text JSON-string-encoded — a caller reads the member, parses it once to
+/// obtain the mapped file's text and parses that text to obtain the document — so the
+/// encoding is applied here, on the member, and nowhere else: a mapped document that is
+/// itself a JSON scalar (`"PO-10042"`, `42`) is then still a value the caller recovers by
+/// the same two steps as a mapped object, rather than one that is or is not readable
+/// depending on the result's JSON type.
+///
+/// Escaping a string cannot fail, so the encoding is written through `Value`'s own
+/// `Display`, which needs no fallback.
+fn mapped_file_member(document: String) -> String {
+    ::serde_json::Value::String(document).to_string()
 }
 
 /// `value` with every object's members in sorted key order.
@@ -1306,7 +1333,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let template_bytes = input.mapping_template.len();
         let document_bytes = input.input_file_content.len();
-        let answered = map_document(input).await;
+        // The mapped document's TEXT, encoded into the member the answer carries it in as
+        // the last step before the answer: see [`mapped_file_member`].
+        let answered = map_document(input).await.map(mapped_file_member);
 
         // One access record per request, whatever the outcome: the sizes and the answer,
         // never the caller's template or document, which are the request's own data.
@@ -1315,7 +1344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 operation = Self::NAME,
                 template_bytes,
                 document_bytes,
-                mapped_bytes = mapped.mapped_file_content.len(),
+                mapped_bytes = mapped.len(),
                 outcome = "mapped",
                 "evaluated a mapping template"
             ),
@@ -1328,13 +1357,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "refused a mapping request"
             ),
         }
-        answered
+        answered.map(|mapped_file_content| TestMappingOutput {
+            mapped_file_content,
+        })
     }
 }
 
-/// The operation's body, so [`TestMapping::handle`] can record one access event for
-/// every answer it gives without that record being repeated at each refusal.
-async fn map_document(mut input: TestMappingInput) -> Result<TestMappingOutput, TestMappingError> {
+/// The operation's body — the mapped document's TEXT — so [`TestMapping::handle`] can
+/// record one access event for every answer it gives without that record being repeated at
+/// each refusal, and so the other operation of this service that evaluates a mapping
+/// ([`evaluate_mapping_template`]) shares this one with it.
+async fn map_document(mut input: TestMappingInput) -> Result<String, TestMappingError> {
     // The engine is chosen by the template's own language, not by `fileFormat`.
     let language = template_language(&input.mapping_template);
     if language != TemplateLanguage::Jsonata {
@@ -1469,9 +1502,7 @@ async fn map_document(mut input: TestMappingInput) -> Result<TestMappingOutput, 
     }
 
     match ::tokio::time::timeout(EVALUATION_DEADLINE, receiver).await {
-        Ok(Ok(mapped)) => Ok(TestMappingOutput {
-            mapped_file_content: mapped?,
-        }),
+        Ok(Ok(mapped)) => mapped,
         // The thread ended without sending: the evaluation panicked. That says nothing
         // about the template, so it is a server fault, and the arena it was allocating
         // into is freed by the unwind.

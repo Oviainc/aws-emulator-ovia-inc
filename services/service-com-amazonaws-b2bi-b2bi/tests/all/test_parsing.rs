@@ -311,6 +311,38 @@ fn xml_elements(case: &str, xml: &str) -> Vec<(String, String)> {
     elements
 }
 
+/// The body segments of a transaction, in document order, with every detail LOOP entry
+/// flattened back into the segments it holds.
+///
+/// The canonical document groups a transaction set's repeating detail segment into ONE
+/// `<SEGMENT>-8000_loop` entry holding one object per occurrence, each occurrence carrying
+/// the segments inside it in its own `segments` list. Flattening is what lets a row below
+/// state the segments it expects in document order whatever the grouping; the grouping
+/// itself is asserted by `detail_loops` in `edi_parsing.rs`.
+pub(crate) fn body_segments_in_order(segments: &[Value]) -> Vec<Value> {
+    let mut flat: Vec<Value> = Vec::new();
+    for entry in segments {
+        let occurrences = entry.as_object().filter(|members| members.len() == 1).and_then(
+            |members| {
+                let (key, value) = members.iter().next()?;
+                key.ends_with("_loop").then(|| value.as_array())?
+            },
+        );
+        match occurrences {
+            Some(items) => {
+                for occurrence in items {
+                    flat.push(occurrence.clone());
+                    if let Some(inside) = occurrence.get("segments").and_then(Value::as_array) {
+                        flat.extend(body_segments_in_order(inside));
+                    }
+                }
+            }
+            None => flat.push(entry.clone()),
+        }
+    }
+    flat
+}
+
 #[tokio::test]
 async fn a_parsed_document_carries_every_envelope_and_segment_the_interchange_holds() {
     let router = parsing_router();
@@ -416,12 +448,12 @@ async fn a_parsed_document_carries_every_envelope_and_segment_the_interchange_ho
         );
         let first = &interchanges[0];
         assert_eq!(
-            first["ISA_06_InterchangeSenderId"].as_str(),
+            first["ISA_06_SenderId"].as_str(),
             Some(sender),
             "case {case:?}: ISA06 must be the interchange's sender, got {first}"
         );
         assert_eq!(
-            first["ISA_08_InterchangeReceiverId"].as_str(),
+            first["ISA_08_ReceiverId"].as_str(),
             Some(receiver),
             "case {case:?}: ISA08 must be the interchange's receiver, got {first}"
         );
@@ -483,9 +515,11 @@ async fn a_parsed_document_carries_every_envelope_and_segment_the_interchange_ho
                     "case {case:?}: SE02 must close the transaction set it opened, got \
                      {parsed_transaction}"
                 );
-                let body_segments = parsed_transaction["segments"].as_array().unwrap_or_else(|| {
-                    panic!("case {case:?}: expected the transaction's segments, got {parsed_transaction}")
-                });
+                let body_segments = body_segments_in_order(
+                    parsed_transaction["segments"].as_array().unwrap_or_else(|| {
+                        panic!("case {case:?}: expected the transaction's segments, got {parsed_transaction}")
+                    }),
+                );
                 assert_eq!(
                     body_segments.len(),
                     transaction.body.len(),
@@ -554,7 +588,7 @@ async fn both_document_formats_report_the_same_interchange() {
             STANDARD,
             "VERSION_4010",
             "00401",
-            "ISA_11_InterchangeControlStandardsIdentifier",
+            "ISA_11_InterchangeControlStandardsId",
         ),
         (
             "release 5010",
@@ -621,7 +655,7 @@ async fn both_document_formats_report_the_same_interchange() {
             elements.first()
         );
         for (name, expected) in [
-            ("ISA_06_InterchangeSenderId", "SENDERID"),
+            ("ISA_06_SenderId", "SENDERID"),
             ("GS_01_FunctionalIdentifierCode", "PO"),
             ("ST_01_TransactionSetIdentifierCode", "850"),
             ("BEG_03", "PO-77"),
@@ -1301,7 +1335,7 @@ async fn a_split_file_carries_its_own_envelope_and_not_the_files_loose_segments(
              {split_interchange}"
         );
         assert_eq!(
-            split_interchange["ISA_06_InterchangeSenderId"].as_str(),
+            split_interchange["ISA_06_SenderId"].as_str(),
             // The ISA's elements are fixed width in this document, and a parse keeps an
             // element's value verbatim — padding included.
             Some("SENDERID       "),
@@ -1556,7 +1590,7 @@ async fn parsing_a_document_changes_nothing_a_later_caller_sees() {
 /// Source: the element table of the ASC X12 interchange control header — position 11 is
 /// the Interchange Control Standards Identifier until release 004020, where the Repetition
 /// Separator takes it.
-const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsIdentifier";
+const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsId";
 const ISA11_FROM_4020: &str = "ISA_11_RepetitionSeparator";
 
 #[tokio::test]
@@ -1618,7 +1652,7 @@ async fn isa11_follows_the_release_the_interchange_declares_when_the_request_nam
             "case {case:?}: ISA11 must be reported once, not also as <{other}>, got {reported}"
         );
         assert_eq!(
-            reported["ISA_12_InterchangeControlVersionNumber"].as_str(),
+            reported["ISA_12_Version"].as_str(),
             Some(isa12),
             "case {case:?}: ISA12 must be the release the interchange declares, got {reported}"
         );
@@ -1753,13 +1787,13 @@ async fn every_interchange_a_file_holds_is_parsed_in_file_order() {
         for (index, (sender, isa12, groups)) in file.iter().enumerate() {
             let reported = &interchanges[index];
             assert_eq!(
-                reported["ISA_06_InterchangeSenderId"].as_str(),
+                reported["ISA_06_SenderId"].as_str(),
                 Some(*sender),
                 "case {case:?}: interchange {index} must be the one {sender:?} sent, got \
                  {reported}"
             );
             assert_eq!(
-                reported["ISA_12_InterchangeControlVersionNumber"].as_str(),
+                reported["ISA_12_Version"].as_str(),
                 Some(*isa12),
                 "case {case:?}: interchange {index} must carry its own ISA12, got {reported}"
             );
@@ -1832,7 +1866,7 @@ async fn every_interchange_a_file_holds_is_parsed_in_file_order() {
             );
             let only = &split_interchanges[0];
             assert_eq!(
-                only["ISA_06_InterchangeSenderId"].as_str(),
+                only["ISA_06_SenderId"].as_str(),
                 Some(*sender),
                 "case {case:?}: split file {index} must carry the envelope of the \
                  interchange it came from, got {split}"

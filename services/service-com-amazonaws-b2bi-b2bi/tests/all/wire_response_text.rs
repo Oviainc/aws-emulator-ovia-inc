@@ -209,7 +209,8 @@ async fn an_unusable_pagination_token_is_refused_with_one_fixed_sentence() {
 
 /// RULE: `TestMapping` answers the mapped DOCUMENT as text in its `String` member,
 /// pretty-printed with two-space indentation — a document, not a structure, and not the
-/// compact serialization of one.
+/// compact serialization of one — with the text JSON-string-encoded into the member, so a
+/// client parses the member once for the mapped file's text.
 ///
 /// Every object's members are written in sorted key order, which makes the answer a
 /// function of the request alone: the interpreter holds an object's members in a hash map,
@@ -293,8 +294,16 @@ async fn a_mapped_document_is_answered_as_pretty_printed_text() {
             status, 200,
             "case {case:?}: the mapping must be served, got {status} {body}"
         );
-        let mapped = body["mappedFileContent"].as_str().unwrap_or_else(|| {
+        let member = body["mappedFileContent"].as_str().unwrap_or_else(|| {
             panic!("case {case:?}: mappedFileContent must be a string, got {body}")
+        });
+        // The member is a JSON string literal whose content is the mapped file's text:
+        // one parse yields that text.
+        let mapped: String = serde_json::from_str(member).unwrap_or_else(|failure| {
+            panic!(
+                "case {case:?}: mappedFileContent {member:?} must hold the mapped file's text: \
+                 {failure}"
+            )
         });
         assert_eq!(
             mapped, expected,
@@ -302,7 +311,7 @@ async fn a_mapped_document_is_answered_as_pretty_printed_text() {
         );
         // And it is the mapped document, not merely text that looks like one: the string
         // parses back as JSON.
-        serde_json::from_str::<Value>(mapped).unwrap_or_else(|failure| {
+        serde_json::from_str::<Value>(&mapped).unwrap_or_else(|failure| {
             panic!("case {case:?}: mappedFileContent {mapped:?} must be JSON: {failure}")
         });
     }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/authorization.rs"]
 mod authorization;
+#[path = "all/canonical_document.rs"]
+mod canonical_document;
 #[path = "all/client_error_bodies.rs"]
 mod client_error_bodies;
 #[path = "all/delete_transformer.rs"]
@@ -21,6 +23,8 @@ mod delete_transformer;
 mod edi_parsing;
 #[path = "all/generate_mapping.rs"]
 mod generate_mapping;
+#[path = "all/mapped_file_encoding.rs"]
+mod mapped_file_encoding;
 #[path = "all/not_found_status.rs"]
 mod not_found_status;
 #[path = "all/onboarding_loop.rs"]
@@ -59,3 +63,4 @@ mod update_partnership_refusal_status;
 mod update_transformer;
 #[path = "all/wire_response_text.rs"]
 mod wire_response_text;
+

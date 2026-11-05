@@ -6,7 +6,9 @@
 //! boots, so every assertion is about what a real SDK client observes.
 //!
 //! The rule under test: `mappedFileContent` is the serialized result of EVALUATING the
-//! template over the input document — so it is a function of both, and of nothing else.
+//! template over the input document — so it is a function of both, and of nothing else —
+//! carried as the mapped file's TEXT, JSON-string-encoded into that `String` member, so a
+//! client parses the member once for the text and parses the text for the document.
 //! Each test states that rule over a TABLE of inputs (or, for the round-trip invariant,
 //! over randomly generated documents) rather than one recorded request; the rows differ
 //! along what the rule generalises over: the JSONata construct, the result's JSON type,
@@ -65,12 +67,22 @@ async fn test_mapping(
     .await
 }
 
-/// The `mappedFileContent` of a success body, parsed back as JSON.
-fn mapped_document(body: &Value) -> Value {
-    let mapped = body["mappedFileContent"]
+/// The mapped file's TEXT, which `mappedFileContent` carries JSON-string-encoded: the
+/// member is parsed once for the text, the way a client reads it.
+fn mapped_text(body: &Value) -> String {
+    let member = body["mappedFileContent"]
         .as_str()
         .unwrap_or_else(|| panic!("mappedFileContent must be a string, got {body}"));
-    serde_json::from_str(mapped)
+    serde_json::from_str::<String>(member).unwrap_or_else(|failure| {
+        panic!("mappedFileContent {member:?} must hold the mapped file's text: {failure}")
+    })
+}
+
+/// The `mappedFileContent` of a success body, parsed back as JSON: the member holds the
+/// mapped file's text as a JSON string literal, so the document takes two parses.
+fn mapped_document(body: &Value) -> Value {
+    let mapped = mapped_text(body);
+    serde_json::from_str(&mapped)
         .unwrap_or_else(|failure| panic!("mappedFileContent {mapped:?} is not JSON: {failure}"))
 }
 
@@ -1026,8 +1038,8 @@ async fn mapping_is_repeatable_and_persists_nothing() {
     // every object's members in sorted key order, so the answer does not depend on the
     // interpreter's hash order.
     assert_eq!(
-        first["mappedFileContent"].as_str(),
-        Some("{\n  \"count\": 2,\n  \"total\": 7\n}"),
+        mapped_text(&first),
+        "{\n  \"count\": 2,\n  \"total\": 7\n}",
         "expected the mapped document as pretty-printed, key-sorted text, got {first}"
     );
     assert!(

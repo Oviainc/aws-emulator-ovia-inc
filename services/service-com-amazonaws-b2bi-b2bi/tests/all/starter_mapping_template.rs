@@ -129,7 +129,7 @@ type TemplateCase<'a> = (
 );
 
 /// Element 11 of the interchange control header before X12 release 004020.
-const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsIdentifier";
+const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsId";
 /// Element 11 of the interchange control header from X12 release 004020 on.
 const ISA11_FROM_4020: &str = "ISA_11_RepetitionSeparator";
 
@@ -239,7 +239,7 @@ async fn starter_template_carries_the_values_the_request_determines() {
                 "case {case:?}: ST03 must be the transaction set's implementation convention, got {st:?}"
             );
             assert_eq!(
-                gs["GS_08_VersionReleaseIndustryIdentifierCode"].as_str(),
+                gs["GS_08_Version"].as_str(),
                 Some(gs08),
                 "case {case:?}: GS08 must be the requested version/release code, got {gs:?}"
             );
@@ -252,7 +252,7 @@ async fn starter_template_carries_the_values_the_request_determines() {
                 isa.get(isa11).is_some(),
                 "case {case:?}: ISA11 must be <{isa11}> at this version, got {isa:?}"
             );
-            let sender = isa["ISA_06_InterchangeSenderId"]
+            let sender = isa["ISA_06_SenderId"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
@@ -282,7 +282,7 @@ async fn starter_template_carries_the_values_the_request_determines() {
                 "case {case:?}: ST01 must be the requested transaction set code"
             );
             assert_eq!(
-                xml_text(case, &elements, "GS_08_VersionReleaseIndustryIdentifierCode"),
+                xml_text(case, &elements, "GS_08_Version"),
                 gs08,
                 "case {case:?}: GS08 must be the requested version/release code"
             );
@@ -311,10 +311,10 @@ async fn starter_template_carries_the_values_the_request_determines() {
                 elements.iter().map(|(name, _)| name).collect::<Vec<_>>()
             );
             assert_eq!(
-                xml_text(case, &elements, "ISA_06_InterchangeSenderId"),
+                xml_text(case, &elements, "ISA_06_SenderId"),
                 PLACEHOLDER,
                 "case {case:?}: ISA06 must be a placeholder, got {:?}",
-                xml_text(case, &elements, "ISA_06_InterchangeSenderId")
+                xml_text(case, &elements, "ISA_06_SenderId")
             );
         }
     }
@@ -412,22 +412,22 @@ async fn template_elements_keep_their_positional_order() {
         let template = mapping_template(case, status, &body);
 
         let positions: Vec<usize> = [
-            "ISA_01_AuthorizationInformationQualifier",
+            "ISA_01_AuthorizationQualifier",
             "ISA_02_AuthorizationInformation",
-            "ISA_03_SecurityInformationQualifier",
+            "ISA_03_SecurityQualifier",
             "ISA_04_SecurityInformation",
-            "ISA_05_InterchangeIdQualifier",
-            "ISA_06_InterchangeSenderId",
-            "ISA_07_InterchangeIdQualifier",
-            "ISA_08_InterchangeReceiverId",
-            "ISA_09_InterchangeDate",
-            "ISA_10_InterchangeTime",
+            "ISA_05_SenderQualifier",
+            "ISA_06_SenderId",
+            "ISA_07_ReceiverQualifier",
+            "ISA_08_ReceiverId",
+            "ISA_09_Date",
+            "ISA_10_Time",
             isa11,
-            "ISA_12_InterchangeControlVersionNumber",
+            "ISA_12_Version",
             "ISA_13_InterchangeControlNumber",
             "ISA_14_AcknowledgmentRequested",
-            "ISA_15_UsageIndicator",
-            "ISA_16_ComponentElementSeparator",
+            "ISA_15_TestIndicator",
+            "ISA_16_ComponentSeparator",
         ]
         .iter()
         .map(|element| {
