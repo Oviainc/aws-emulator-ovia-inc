@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterMemberFromAddressList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterMemberFromAddressList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterMemberFromAddressList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: drops the address from the named address list's membership, under the key
+//! the whole service reads an address by (`crate::state::member_address_key`: the domain
+//! folded to lower case, the local part kept as spelled). `@idempotent`, so the call asks
+//! for the address NOT to be a member: one the list does not hold — never registered, or
+//! already deregistered — is answered exactly like one this call removed, while an address
+//! list nothing created is refused with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +142,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterMemberFromAddressList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterMemberFromAddressListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterMemberFromAddressList"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(
+                DeregisterMemberFromAddressListErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The form of `Address` is this handler's to read for the same reason it is
+        // `RegisterMemberToAddressList`'s: the model bounds only its length, so a value
+        // that is neither an email address nor a domain name names no member of any list
+        // — a parameter violation, not a membership to drop.
+        if !crate::state::is_registrable_address(&input.address) {
+            return Err(
+                DeregisterMemberFromAddressListErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::ADDRESS_NOT_AN_ADDRESS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        // A member is a member OF a list, so the list has to exist: the modelled
+        // `ResourceNotFoundException` ("Occurs when a requested resource is not found") is
+        // what says the named one does not.
+        let Some(record) = store.address_lists.get_mut(&input.address_list_id) else {
+            return Err(
+                DeregisterMemberFromAddressListErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Address list {} not found.",
+                            input.address_list_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `@idempotent`: the call asks for the address NOT to be a member, so one the list
+        // does not hold is already in the asked-for state and is answered exactly like one
+        // this call removed — a repeat, or an address nothing ever registered, is served
+        // rather than refused. The membership is dropped whole, so the instant it was
+        // added goes with it and a later register starts a fresh one.
+        record
+            .members
+            .remove(&crate::state::member_address_key(&input.address));
+
+        // The list's own `LastUpdatedTimestamp` describes the address list itself — its
+        // name and its tags — and is left where it stands, for the reason
+        // `RegisterMemberToAddressList` leaves it: what changed is the membership, which
+        // the member reads report, and nothing in the model ties the two together.
+        Ok(DeregisterMemberFromAddressListOutput {})
     }
 }

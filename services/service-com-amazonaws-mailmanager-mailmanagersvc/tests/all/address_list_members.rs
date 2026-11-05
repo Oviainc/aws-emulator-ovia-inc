@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The membership of an address list, end to end over the wire:
-//! `RegisterMemberToAddressList`, `GetMemberOfAddressList` and
-//! `ListMembersOfAddressList`.
+//! `RegisterMemberToAddressList`, `DeregisterMemberFromAddressList`,
+//! `GetMemberOfAddressList` and `ListMembersOfAddressList`.
 //!
 //! Every assertion here goes through the real request path — `MultiServiceRouter::dispatch`
 //! with `awsJson1_0` bodies, `POST /` and `X-Amz-Target: MailManagerSvc.<Operation>` — so
@@ -85,6 +85,27 @@ impl Harness {
             .as_str()
             .unwrap_or_else(|| panic!("case {name:?}: no AddressListId in {out:?}"))
             .to_string()
+    }
+
+    /// Deregister one address, failing the test on any refusal, and assert the answer
+    /// carries no members (`DeregisterMemberFromAddressListResponse` models none).
+    async fn deregister(&self, address_list_id: &str, address: &str) {
+        let (status, out) = self
+            .call(
+                "DeregisterMemberFromAddressList",
+                json!({ "AddressListId": address_list_id, "Address": address }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {address:?}: expected DeregisterMemberFromAddressList to answer 200, got \
+             {status} {out:?}"
+        );
+        assert_eq!(
+            out,
+            json!({}),
+            "case {address:?}: the response models no members, got {out:?}"
+        );
     }
 
     /// Register one address, failing the test on any refusal.
@@ -771,7 +792,11 @@ async fn an_address_that_is_no_address_is_refused() {
     ];
 
     for (case, address) in rows {
-        for operation in ["RegisterMemberToAddressList", "GetMemberOfAddressList"] {
+        for operation in [
+            "RegisterMemberToAddressList",
+            "DeregisterMemberFromAddressList",
+            "GetMemberOfAddressList",
+        ] {
             let (status, out) = harness
                 .call(
                     operation,
@@ -830,6 +855,10 @@ async fn member_operations_on_an_unknown_address_list_are_not_found() {
         for (operation, body) in [
             (
                 "RegisterMemberToAddressList",
+                json!({ "AddressListId": id, "Address": "user@example.com" }),
+            ),
+            (
+                "DeregisterMemberFromAddressList",
                 json!({ "AddressListId": id, "Address": "user@example.com" }),
             ),
             (
@@ -914,4 +943,332 @@ async fn registers_past_the_membership_quota_are_refused() {
         listed.len(),
         "case membership-after-quota: every member must be reported once"
     );
+
+    // A deregister really gives the slot back: once a member is gone the fresh address the
+    // ceiling refused above is registrable, which is only true if the removal reached the
+    // stored membership.
+    harness.deregister(&list, "member-00000@example.com").await;
+    harness.register(&list, "overflow@example.com").await;
+    let listed = harness.list_all(&list, 1000).await;
+    assert_eq!(
+        listed.len(),
+        MAX_ADDRESS_LIST_MEMBERS,
+        "case slot-reused: expected {MAX_ADDRESS_LIST_MEMBERS} members, got {}",
+        listed.len()
+    );
+    assert!(
+        listed.contains(&"overflow@example.com".to_string())
+            && !listed.contains(&"member-00000@example.com".to_string()),
+        "case slot-reused: the deregistered member must be gone and the new one present, got \
+         {} members starting {:?}",
+        listed.len(),
+        &listed[..3.min(listed.len())]
+    );
+}
+
+/// RULE: a deregister drops the member the address names under the key the service stores an
+/// address by — the domain folded to lower case, the local part as spelled — so the address
+/// is afterwards no member of the list under ANY spelling of that same key, and every other
+/// member is untouched.
+///
+/// Rows span the class: the same spelling, another domain casing, a bare domain in another
+/// casing, a multi-label domain, and both ends of `Address`'s modelled 3..320 length.
+#[tokio::test]
+async fn deregister_drops_the_member_under_the_stored_key() {
+    let harness = Harness::new();
+    let list = harness.create_list("deregister").await;
+
+    let (longest, longest_stored) = longest_address();
+    // (case, as registered, the spelling the deregister names it by, as stored)
+    let rows: [(&str, String, String, String); 6] = [
+        (
+            "the spelling it was registered with",
+            "user@example.com".to_string(),
+            "user@example.com".to_string(),
+            "user@example.com".to_string(),
+        ),
+        (
+            "another domain casing",
+            "Owner@example.com".to_string(),
+            "Owner@EXAMPLE.COM".to_string(),
+            "Owner@example.com".to_string(),
+        ),
+        (
+            "a bare domain in another casing",
+            "Example.NET".to_string(),
+            "EXAMPLE.net".to_string(),
+            "example.net".to_string(),
+        ),
+        (
+            "a multi-label domain",
+            "Jane.Doe@mail.Example.ORG".to_string(),
+            "Jane.Doe@MAIL.EXAMPLE.ORG".to_string(),
+            "Jane.Doe@mail.example.org".to_string(),
+        ),
+        (
+            "the shortest value the modelled length admits",
+            "A.b".to_string(),
+            "a.B".to_string(),
+            "a.b".to_string(),
+        ),
+        (
+            "the longest value the modelled length admits",
+            longest,
+            longest_stored.clone(),
+            longest_stored,
+        ),
+    ];
+
+    // A member that no row names, so every deregister below has a membership to leave
+    // alone.
+    harness.register(&list, "bystander@example.com").await;
+
+    for (case, registered, deregistered, stored) in &rows {
+        harness.register(&list, registered).await;
+        let listed = harness.list_all(&list, 100).await;
+        assert!(
+            listed.contains(stored),
+            "case {case:?}: expected {stored:?} to be a member before the deregister, got \
+             {listed:?}"
+        );
+
+        harness.deregister(&list, deregistered).await;
+
+        // The membership is gone from every read: the member lookup, under both spellings,
+        // and the listing.
+        for (lookup_case, lookup) in [("as registered", registered), ("as stored", stored)] {
+            let (status, out) = harness
+                .call(
+                    "GetMemberOfAddressList",
+                    json!({ "AddressListId": list, "Address": lookup }),
+                )
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?} ({lookup_case}): expected GetMemberOfAddressList to answer 404 \
+                 after the deregister, got {status} {out:?}"
+            );
+            assert_eq!(
+                error_code(&out),
+                "ResourceNotFoundException",
+                "case {case:?} ({lookup_case}): unexpected error code, got {out:?}"
+            );
+        }
+
+        let listed = harness.list_all(&list, 100).await;
+        assert!(
+            !listed.contains(stored),
+            "case {case:?}: {stored:?} must no longer be listed, got {listed:?}"
+        );
+        assert_eq!(
+            listed,
+            vec!["bystander@example.com".to_string()],
+            "case {case:?}: every other member must survive the deregister, got {listed:?}"
+        );
+    }
+}
+
+/// RULE: the local part of an address is case-SENSITIVE while its domain folds, so a
+/// deregister whose local part differs from the stored one names a DIFFERENT member: it
+/// removes nothing and the stored member stays readable.
+#[tokio::test]
+async fn a_deregister_requires_the_stored_local_part_casing() {
+    let harness = Harness::new();
+    let list = harness.create_list("deregister-casing").await;
+
+    // (case, registered, the spellings whose local part differs)
+    let rows: [(&str, &str, [&str; 3]); 3] = [
+        (
+            "a capitalised local part",
+            "User@example.com",
+            ["user@example.com", "USER@example.com", "uSer@EXAMPLE.COM"],
+        ),
+        (
+            "an all-upper local part",
+            "POSTMASTER@Example.ORG",
+            [
+                "postmaster@example.org",
+                "Postmaster@example.org",
+                "postMaster@EXAMPLE.ORG",
+            ],
+        ),
+        (
+            "a dotted mixed-case local part",
+            "Jane.Doe@mail.Example.NET",
+            [
+                "jane.doe@mail.example.net",
+                "JANE.DOE@mail.example.net",
+                "Jane.doe@MAIL.EXAMPLE.NET",
+            ],
+        ),
+    ];
+
+    for (case, registered, others) in rows {
+        harness.register(&list, registered).await;
+        let (_, before) = harness
+            .call(
+                "GetMemberOfAddressList",
+                json!({ "AddressListId": list, "Address": registered }),
+            )
+            .await;
+
+        for other in others {
+            harness.deregister(&list, other).await;
+            let (status, after) = harness
+                .call(
+                    "GetMemberOfAddressList",
+                    json!({ "AddressListId": list, "Address": registered }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {other:?} differs from {registered:?} in its local part, so it \
+                 must remove no member, got {status} {after:?}"
+            );
+            assert_eq!(
+                after, before,
+                "case {case:?}: the stored member must be unchanged after deregistering \
+                 {other:?}, got {after:?}"
+            );
+        }
+    }
+}
+
+/// RULE: `DeregisterMemberFromAddressList` is `@idempotent` — the call asks for the address
+/// NOT to be a member, so an address the list does not hold (one nothing ever registered, or
+/// one a previous call already removed) is served exactly like one this call removed, and
+/// stores nothing.
+#[tokio::test]
+async fn deregistering_an_address_that_is_no_member_is_served() {
+    let harness = Harness::new();
+    let list = harness.create_list("idempotent-deregister").await;
+    harness.register(&list, "member@example.com").await;
+
+    let (longest, _) = longest_address();
+    // Rows: addresses the list never held — an email address, a bare domain, a multi-label
+    // domain, and both ends of the modelled 3..320 length.
+    let unknown: [(&str, String); 5] = [
+        ("an unknown email address", "nobody@example.com".to_string()),
+        ("an unknown bare domain", "Unknown.Example.NET".to_string()),
+        (
+            "an unknown multi-label domain",
+            "mail.unknown.example.org".to_string(),
+        ),
+        (
+            "the shortest value the modelled length admits",
+            "A.b".to_string(),
+        ),
+        ("the longest value the modelled length admits", longest),
+    ];
+
+    for (case, address) in &unknown {
+        // Twice, because an idempotent call is answered the same however often it is made.
+        for attempt in 1..=2 {
+            let (status, out) = harness
+                .call(
+                    "DeregisterMemberFromAddressList",
+                    json!({ "AddressListId": list, "Address": address }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} (attempt {attempt}): deregistering an address that is no member \
+                 must be served, got {status} {out:?}"
+            );
+            assert_eq!(
+                out,
+                json!({}),
+                "case {case:?} (attempt {attempt}): the response models no members, got {out:?}"
+            );
+        }
+
+        // The address the call named is still no member, and nothing was created for it.
+        let (status, out) = harness
+            .call(
+                "GetMemberOfAddressList",
+                json!({ "AddressListId": list, "Address": address }),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a deregister must not create a member, got {status} {out:?}"
+        );
+    }
+
+    // An address that WAS a member is served the same way once it is gone, however often
+    // the call is repeated.
+    for attempt in 1..=3 {
+        harness.deregister(&list, "member@EXAMPLE.com").await;
+        let (status, out) = harness
+            .call(
+                "GetMemberOfAddressList",
+                json!({ "AddressListId": list, "Address": "member@example.com" }),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case already-removed (attempt {attempt}): the member must stay gone, got {status} \
+             {out:?}"
+        );
+    }
+
+    let listed = harness.list_all(&list, 100).await;
+    assert!(
+        listed.is_empty(),
+        "case nothing-stored: no deregister may leave a member behind, got {listed:?}"
+    );
+}
+
+/// RULE: a deregister drops the membership whole, so a later register of the same address
+/// starts a new one, stamped with the instant of THAT register rather than the first.
+#[tokio::test]
+async fn re_registering_a_deregistered_address_starts_a_new_membership() {
+    let harness = Harness::new();
+    let list = harness.create_list("re-register").await;
+
+    // Rows: an email address and a bare domain, each re-registered in another domain
+    // casing, so the round trip goes through the stored key.
+    let rows: [(&str, &str, &str); 2] = [
+        ("an email address", "user@example.com", "user@EXAMPLE.COM"),
+        ("a bare domain", "Example.NET", "example.net"),
+    ];
+
+    for (case, first, again) in rows {
+        harness.register(&list, first).await;
+        let (_, before) = harness
+            .call(
+                "GetMemberOfAddressList",
+                json!({ "AddressListId": list, "Address": first }),
+            )
+            .await;
+        let first_stamp = before["CreatedTimestamp"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: no CreatedTimestamp in {before:?}"));
+
+        harness.deregister(&list, first).await;
+        // Let the clock advance, so a membership that (wrongly) survived the deregister is
+        // visible as an unmoved CreatedTimestamp.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        harness.register(&list, again).await;
+
+        let (status, after) = harness
+            .call(
+                "GetMemberOfAddressList",
+                json!({ "AddressListId": list, "Address": again }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the re-registered member to be readable, got {status} \
+             {after:?}"
+        );
+        let second_stamp = after["CreatedTimestamp"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: no CreatedTimestamp in {after:?}"));
+        assert!(
+            second_stamp > first_stamp,
+            "case {case:?}: expected a fresh CreatedTimestamp past {first_stamp}, got \
+             {second_stamp}"
+        );
+    }
 }
