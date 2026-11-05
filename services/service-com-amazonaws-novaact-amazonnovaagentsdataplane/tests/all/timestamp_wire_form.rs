@@ -11,8 +11,8 @@
 //! whether the optional instant is there at all, and the instant itself, because the rule
 //! is about how a `date-time` member is ENCODED, not about any one value.
 //!
-//! The last case reaches the member schemas directly, which is the only reach the shapes
-//! whose list operations are still scaffolded 501s have.
+//! The last case reaches the member schemas directly, which is the only reach a summary
+//! shape whose list operation is still a scaffolded 501 has.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -379,9 +379,9 @@ async fn get_workflow_run_renders_both_instants_as_date_time_strings() {
 /// targets at `DateTimestamp` reports `date-time`, and a member the model leaves alone
 /// reports no format at all.
 ///
-/// This is the only reach the summary shapes have — `ListWorkflowDefinitions`,
-/// `ListWorkflowRuns` and `ListActs` are still scaffolded 501s — and it is what fails if
-/// any of these schemas goes back to the vendored codegen's output, which drops the trait.
+/// This is the only reach `WorkflowRunSummary` has while `ListWorkflowRuns` is still a
+/// scaffolded 501, and it is what fails if any of these schemas goes back to the vendored
+/// codegen's output, which drops the trait.
 #[test]
 fn every_modelled_date_time_member_schema_carries_the_date_time_format() {
     // Source: every member of this service targeting `com.amazonaws.novaact#DateTimestamp`,

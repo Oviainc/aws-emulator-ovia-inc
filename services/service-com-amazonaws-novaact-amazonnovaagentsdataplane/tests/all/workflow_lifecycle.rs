@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_novaact_amazonnovaagentsdataplane::state::{
-    ComAmazonawsNovaactAmazonnovaagentsdataplaneState, DELETION_COMPLETION_DELAY,
+    service_state, ComAmazonawsNovaactAmazonnovaagentsdataplaneState, DELETION_COMPLETION_DELAY,
     MAX_ACTS_PER_SESSION, MAX_IDEMPOTENCY_ENTRIES, MAX_RUNS_PER_DEFINITION,
     MAX_SESSIONS_PER_RUN, MAX_WORKFLOW_DEFINITIONS, MAX_WORKFLOW_RUNS,
 };
@@ -31,6 +31,9 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
+    /// The engine the service was built on, so a case can reach this service's store for a
+    /// state no implemented operation reaches yet.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -40,11 +43,19 @@ impl Emulator {
         // Signatures are not what these cases are about; the credential scope below is
         // still read for the routing key and the ARN region.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self {
             router,
             region: region.to_string(),
+            engine,
         }
+    }
+
+    /// The store this service's handlers read and write.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<ComAmazonawsNovaactAmazonnovaagentsdataplaneState> {
+        service_state(&*self.engine).expect("the nova-act store is reachable from the engine")
     }
 
     /// Dispatch one request and return its status and parsed body (`Value::Null` when the
@@ -81,13 +92,13 @@ impl Emulator {
     }
 
     /// `CreateWorkflowDefinition` for `name`, with no optional members.
-    async fn create_definition(&self, name: &str) -> (u16, Value) {
+    pub(crate) async fn create_definition(&self, name: &str) -> (u16, Value) {
         self.call("PUT", "/workflow-definitions", Some(json!({ "name": name })))
             .await
     }
 
     /// `CreateWorkflowRun` under `name`.
-    async fn create_run(&self, name: &str) -> (u16, Value) {
+    pub(crate) async fn create_run(&self, name: &str) -> (u16, Value) {
         self.call(
             "PUT",
             &format!("/workflow-definitions/{name}/workflow-runs"),
@@ -100,7 +111,7 @@ impl Emulator {
     }
 
     /// `CreateSession` under that run.
-    async fn create_session(&self, name: &str, run_id: &str) -> (u16, Value) {
+    pub(crate) async fn create_session(&self, name: &str, run_id: &str) -> (u16, Value) {
         self.call(
             "PUT",
             &format!("/workflow-definitions/{name}/workflow-runs/{run_id}/sessions"),
@@ -110,7 +121,13 @@ impl Emulator {
     }
 
     /// `CreateAct` under that session.
-    async fn create_act(&self, name: &str, run_id: &str, session_id: &str, task: &str) -> (u16, Value) {
+    pub(crate) async fn create_act(
+        &self,
+        name: &str,
+        run_id: &str,
+        session_id: &str,
+        task: &str,
+    ) -> (u16, Value) {
         self.call(
             "PUT",
             &format!(

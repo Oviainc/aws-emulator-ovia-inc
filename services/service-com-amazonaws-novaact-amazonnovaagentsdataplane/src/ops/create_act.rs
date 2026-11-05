@@ -280,6 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::ActStatus::Running,
             error: None,
             created_at: now,
+            // A running act has not ended and has no trace recorded for it yet.
+            ended_at: None,
+            trace_location: None,
             insertion_seq,
         };
         let status = act.status.as_wire().to_string();

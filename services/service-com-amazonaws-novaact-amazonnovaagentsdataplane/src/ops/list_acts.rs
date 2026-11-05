@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the acts stored under one workflow definition, oldest-first by default, in
+//! pages.
+//!
+//! WHAT IS LISTED. `workflowDefinitionName` is this operation's only `@httpLabel`, so the
+//! definition is the resource being read and one the store does not hold is refused with
+//! `ResourceNotFoundException`. `workflowRunId` and `sessionId` are optional `@httpQuery`
+//! members: they NARROW that listing to the acts of the run, or the session, they name, so
+//! a filter that matches nothing is answered with an empty page rather than a refusal. The
+//! modelled prose ("Lists all acts within a specific session") describes the common call,
+//! the one that names a session; the members it names are OPTIONAL in the shape, so neither
+//! is required here.
+//!
+//! WHAT IS COMPUTED FROM STATE. Every summary member is read off the stored act and its
+//! place in the resource chain — the run and session holding it, its minted id, the status
+//! it is in and the instant it was created — so an act that was never created cannot
+//! appear, and one whose definition's deletion the clock has made due cannot either (the
+//! same
+//! [`crate::state::ComAmazonawsNovaactAmazonnovaagentsdataplaneState::complete_due_deletions`]
+//! every other read of this service runs first). `endedAt` is the stored instant the act
+//! finished at, which an act that is still running does not have, and `traceLocation` the
+//! stored location of its trace; neither is invented here.
+//!
+//! ORDER AND PAGING. `sortOrder`, `maxResults` and `nextToken` are [`crate::state::paging`]'s,
+//! shared with every other listing of this service: the acts are ordered by the instant
+//! this operation reports (`startedAt`) with the act id as the tie-break, split into pages
+//! of at most `maxResults`, and each page resumes strictly after the act the previous one
+//! ended on.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +111,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::paging;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,18 +186,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActs"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListActsErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        // The region is read for the identifier a refusal reports: the missing resource's
+        // ARN in the requesting credential scope's region.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            ListActsErrorModeled::ResourceNotFoundException(missing.not_found(&region)).into()
+        };
+
+        let order = paging::PageOrder::from_input(input.sort_order.as_deref()).map_err(refused)?;
+        let page_size = paging::page_size(input.max_results);
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                paging::decode_next_token(token, order, Self::NAME, paging::is_uuid_string)
+                    .map_err(refused)?,
+            ),
+        };
+
+        let mut state = state.lock();
+        // A deletion the clock has already made due is completed first, exactly as every
+        // other read of this service does: it materialises a change that was owed at this
+        // instant whether or not anybody called, so this listing cannot report an act
+        // under a definition a `GetWorkflowDefinition` at the same instant would refuse.
+        state.complete_due_deletions(now);
+
+        let definition = state
+            .definition(&input.workflow_definition_name)
+            .map_err(not_found)?;
+
+        // Every act the request selects, each carried with the run and session holding it
+        // — the two members its own summary reports. The walk is bounded by
+        // `crate::state::MAX_ACTS`, so neither it nor the sort grows with request volume.
+        let mut listed: Vec<ListedAct<'_>> = Vec::new();
+        for run in definition.runs.values() {
+            if input
+                .workflow_run_id
+                .as_deref()
+                .is_some_and(|wanted| run.run_id != wanted)
+            {
+                continue;
+            }
+            for session in run.sessions.values() {
+                if input
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|wanted| session.session_id != wanted)
+                {
+                    continue;
+                }
+                for act in session.acts.values() {
+                    listed.push(ListedAct {
+                        run_id: run.run_id.as_str(),
+                        session_id: session.session_id.as_str(),
+                        act,
+                    });
+                }
+            }
+        }
+
+        let (page, next_token) =
+            paging::page(listed, order, page_size, cursor.as_ref(), |listed| {
+                paging::Position::new(listed.act.created_at, listed.act.act_id.clone())
+            });
+
+        Ok(ListActsOutput {
+            act_summaries: page
+                .into_iter()
+                .map(|listed| ActSummary {
+                    workflow_run_id: listed.run_id.to_string(),
+                    session_id: listed.session_id.to_string(),
+                    act_id: listed.act.act_id.clone(),
+                    status: listed.act.status.as_wire().to_string(),
+                    // `startedAt` is "when the act started execution": an act starts when
+                    // this service accepts it, the instant stored on the record.
+                    started_at: ::aws_smithy_types::DateTime::from(listed.act.created_at),
+                    ended_at: listed.act.ended_at.map(::aws_smithy_types::DateTime::from),
+                    trace_location: listed.act.trace_location.clone(),
+                })
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// One stored act together with the place in the resource chain its summary reports: the
+/// ids of the run and the session holding it, which the act record itself does not repeat.
+#[derive(Debug)]
+struct ListedAct<'a> {
+    run_id: &'a str,
+    session_id: &'a str,
+    act: &'a crate::state::Act,
+}
+
+/// A member this operation cannot use, on its own modelled error channel: HTTP 400
+/// `ValidationException`, filled in by [`paging`] so every listing of this service refuses
+/// a bad `sortOrder` or `nextToken` the same way.
+fn refused(invalid: ValidationException) -> ListActsError {
+    ListActsErrorModeled::ValidationException(invalid).into()
 }

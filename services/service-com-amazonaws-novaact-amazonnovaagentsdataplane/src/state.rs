@@ -29,12 +29,16 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ActError, ClientInfo, ResourceNotFoundException, ToolSpec, WorkflowExportConfig,
+    ActError, ClientInfo, ResourceNotFoundException, ToolSpec, TraceLocation, WorkflowExportConfig,
 };
 
 /// The AI models this service publishes. Service-managed, so the catalog is a published
 /// fact rather than part of the store below — see the module's own docs.
 pub mod model_catalog;
+
+/// Ordering, paging and resumption tokens, shared by every `List*` operation of this
+/// service so one implementation of that rule serves all of them.
+pub mod paging;
 
 /// The region an ARN carries when the request's SigV4 credential scope does not name a
 /// usable one (an unsigned in-process call, say). The `@pattern` on every ARN shape in
@@ -388,6 +392,14 @@ pub struct Act {
     pub status: ActStatus,
     pub error: Option<ActError>,
     pub created_at: SystemTime,
+    /// The instant the act finished, which only an act in a terminal status has: it is
+    /// what `ActSummary`'s `endedAt` reports, and `None` while the act is still running or
+    /// waiting on an action. The operations that end an act are still scaffolds, so
+    /// nothing sets it yet and no act is reported as ended.
+    pub ended_at: Option<SystemTime>,
+    /// Where this act's trace is stored, as `ActSummary`'s `traceLocation` reports it.
+    /// `None` until something records a trace for the act.
+    pub trace_location: Option<TraceLocation>,
     pub insertion_seq: u64,
 }
 
