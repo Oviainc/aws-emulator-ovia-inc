@@ -46,3 +46,6 @@ mod statement_lifecycle;
 
 #[path = "all/statement_wait.rs"]
 mod statement_wait;
+
+#[path = "all/warehouse_catalogue.rs"]
+mod warehouse_catalogue;

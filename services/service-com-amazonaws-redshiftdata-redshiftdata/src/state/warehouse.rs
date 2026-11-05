@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether the compute target a request names EXISTS in the caller's Region: a
-//! fact this service RESOLVES rather than holds.
+//! What the compute target a request names IS — whether it exists in the
+//! caller's Region, and which databases it was provisioned with: facts this
+//! service RESOLVES rather than holds.
 //!
 //! The Data API runs a statement on a data warehouse it does not own. A
 //! provisioned cluster is a resource of Amazon Redshift and a serverless
@@ -18,9 +19,11 @@
 //! with no Redshift control plane mounted knows of no cluster — leaves it
 //! UNDECIDED ([`TargetResolution::Unresolvable`]), and a submit admits the
 //! statement rather than refusing it on the strength of a peer that did not
-//! answer.
+//! answer. The databases a warehouse was created with are read the same way: an
+//! owner that was not asked reports none, so none is claimed
+//! ([`TargetFacts::provisioned_databases`]).
 
-use super::{ConnectionRequest, ConnectionTarget};
+use super::ConnectionTarget;
 
 /// The Region a request is resolved in when it carries no SigV4 credential
 /// scope that names one. Matches the Region the emulator's own clients default
@@ -50,6 +53,59 @@ pub enum TargetResolution {
     /// itself, not a caller naming something that does not exist, so the two are
     /// never answered the same way.
     Unresolvable,
+}
+
+/// Everything the control plane that OWNS one compute target answers about it.
+///
+/// A data warehouse is CREATED with a database: a Redshift Serverless workgroup
+/// serves the database its namespace was created with (`dbName`) and a
+/// provisioned cluster the one its create named (`DBName`). That database is a
+/// real database of the warehouse from the moment the warehouse exists, before
+/// any statement has run on it, so the Data API's catalogue has to ask the owner
+/// for it rather than report only what statements here have built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetFacts {
+    /// Whether the target exists in the Region at all.
+    pub resolution: TargetResolution,
+    /// The databases the owner reports the warehouse was provisioned with, in
+    /// the order the owner reports them. Empty for a target that does not exist
+    /// and for one whose owner could not be asked — nothing is invented from
+    /// silence.
+    pub provisioned_databases: Vec<String>,
+}
+
+impl TargetFacts {
+    /// A target the owner answered about in `resolution` and provisioned with no
+    /// database this service could read.
+    fn without_databases(resolution: TargetResolution) -> Self {
+        Self {
+            resolution,
+            provisioned_databases: Vec::new(),
+        }
+    }
+
+    /// Whether the warehouse was provisioned with a database of this name.
+    pub fn provisions_database(&self, database: &str) -> bool {
+        self.provisioned_databases
+            .iter()
+            .any(|provisioned| provisioned == database)
+    }
+}
+
+/// Every database of one warehouse the Data API's catalogue holds: the databases
+/// this emulator opened because a statement ran on them (`held`), together with
+/// the databases the warehouse's own control plane provisioned it with
+/// (`provisioned`) — in name order, each name once.
+///
+/// One place, so that the operations which LIST the catalogue and those which
+/// resolve one database against it cannot disagree about which databases a
+/// warehouse has.
+pub fn catalogue_databases(held: Vec<String>, provisioned: &[String]) -> Vec<String> {
+    let mut names = held;
+    names.extend(provisioned.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The Region this request was signed for, which is the Region its compute
@@ -128,34 +184,24 @@ pub async fn resolve_target(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     target: &ConnectionTarget,
 ) -> TargetResolution {
-    let region = request_region(ctx);
-    match target {
-        ConnectionTarget::Cluster(identifier) => resolve_cluster(ctx, &region, identifier).await,
-        ConnectionTarget::Workgroup(name) => resolve_workgroup(ctx, &region, name).await,
-    }
+    describe_target(ctx, target).await.resolution
 }
 
-/// Whether ANY data warehouse `request` NAMES resolves to no endpoint in the
-/// Region.
+/// Ask the control plane that owns `target` everything this service needs to
+/// know about it: whether it exists, and the databases it was provisioned with.
 ///
-/// Asked before a malformed target SELECTION is reported, because the service
-/// resolves the endpoint a request named FIRST: a cluster or workgroup that does
-/// not exist in the Region is reported as the missing endpoint even when the
-/// selection is also wrong, and only a selection whose named warehouses all
-/// resolve is refused as a selection. `false` for a request that names no
-/// warehouse at all — there is then no endpoint to resolve and nothing but the
-/// selection to report — and `false` for one whose owner could not be asked,
-/// which leaves the question UNDECIDED exactly as [`resolve_target`] does.
-pub async fn names_absent_warehouse(
+/// One round of questions per request, so an operation that both admits a
+/// request on the target's existence and reads its catalogue asks the owner
+/// once.
+pub async fn describe_target(
     ctx: &smithy_server_runtime::OperationContext<'_>,
-    request: ConnectionRequest<'_>,
-) -> bool {
-    for target in request.named_warehouses() {
-        if resolve_target(ctx, &target).await == TargetResolution::Absent {
-            return true;
-        }
+    target: &ConnectionTarget,
+) -> TargetFacts {
+    let region = request_region(ctx);
+    match target {
+        ConnectionTarget::Cluster(identifier) => describe_cluster(ctx, &region, identifier).await,
+        ConnectionTarget::Workgroup(name) => describe_workgroup(ctx, &region, name).await,
     }
-    false
 }
 
 /// Resolve one `ClusterIdentifier` against Amazon Redshift.
@@ -164,24 +210,35 @@ pub async fn names_absent_warehouse(
 /// "does not refer to an existing cluster", which is exactly this question; any
 /// OTHER failure says nothing about whether the cluster exists, so it leaves the
 /// question undecided.
-async fn resolve_cluster(
+/// Its `DBName` — "the name of the initial database that was created when the
+/// cluster was created" — is the database the cluster holds from the moment it
+/// exists, so it is reported beside the resolution.
+async fn describe_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     identifier: &str,
-) -> TargetResolution {
+) -> TargetFacts {
     let answer = redshift(ctx, region)
         .describe_clusters()
         .cluster_identifier(identifier)
         .send()
         .await;
     match answer {
-        Ok(_) => TargetResolution::Exists,
+        Ok(answer) => TargetFacts {
+            resolution: TargetResolution::Exists,
+            provisioned_databases: answer
+                .clusters()
+                .iter()
+                .filter_map(::aws_sdk_redshift::types::Cluster::db_name)
+                .map(str::to_string)
+                .collect(),
+        },
         Err(error) => {
             if error
                 .as_service_error()
                 .is_some_and(::aws_sdk_redshift::operation::describe_clusters::DescribeClustersError::is_cluster_not_found_fault)
             {
-                return TargetResolution::Absent;
+                return TargetFacts::without_databases(TargetResolution::Absent);
             }
             // Visible at default verbosity: a statement admitted because the
             // owner could not be asked reads exactly like one admitted because
@@ -192,12 +249,39 @@ async fn resolve_cluster(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the cluster a statement names could not be resolved"
             );
-            TargetResolution::Unresolvable
+            TargetFacts::without_databases(TargetResolution::Unresolvable)
         }
     }
 }
 
-/// Resolve one `WorkgroupName` against Amazon Redshift Serverless.
+/// Resolve one `WorkgroupName` against Amazon Redshift Serverless, and read the
+/// databases of the NAMESPACE it serves.
+///
+/// A workgroup is compute; its databases belong to the namespace it is attached
+/// to, whose `dbName` is "the name of the first database created in the
+/// namespace" — so the workgroup is resolved first and its namespace then asked
+/// for that database.
+async fn describe_workgroup(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> TargetFacts {
+    let (resolution, namespace) = resolve_workgroup(ctx, region, name).await;
+    if resolution != TargetResolution::Exists {
+        return TargetFacts::without_databases(resolution);
+    }
+    let provisioned_databases = match namespace {
+        Some(namespace) => namespace_databases(ctx, region, &namespace).await,
+        None => Vec::new(),
+    };
+    TargetFacts {
+        resolution,
+        provisioned_databases,
+    }
+}
+
+/// Resolve one `WorkgroupName` against Amazon Redshift Serverless, and answer
+/// the namespace the workgroup belongs to when it resolves.
 ///
 /// `WorkgroupNameString` admits the workgroup's NAME or its ARN, and the
 /// serverless control plane addresses a workgroup by name — so a name is asked
@@ -207,7 +291,7 @@ async fn resolve_workgroup(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     name: &str,
-) -> TargetResolution {
+) -> (TargetResolution, Option<String>) {
     if name.starts_with("arn:") {
         return resolve_workgroup_arn(ctx, region, name).await;
     }
@@ -217,33 +301,72 @@ async fn resolve_workgroup(
         .send()
         .await;
     match answer {
-        Ok(_) => TargetResolution::Exists,
+        Ok(answer) => (
+            TargetResolution::Exists,
+            answer
+                .workgroup()
+                .and_then(::aws_sdk_redshiftserverless::types::Workgroup::namespace_name)
+                .map(str::to_string),
+        ),
         Err(error) => {
             if error
                 .as_service_error()
                 .is_some_and(::aws_sdk_redshiftserverless::operation::get_workgroup::GetWorkgroupError::is_resource_not_found_exception)
             {
-                return TargetResolution::Absent;
+                return (TargetResolution::Absent, None);
             }
             ::tracing::warn!(
                 %region,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the workgroup a statement names could not be resolved"
             );
-            TargetResolution::Unresolvable
+            (TargetResolution::Unresolvable, None)
+        }
+    }
+}
+
+/// The databases one serverless NAMESPACE was created with: its `dbName`, read
+/// from the control plane that owns the namespace. Empty when that control plane
+/// could not be asked — a database is never invented from silence.
+async fn namespace_databases(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    namespace: &str,
+) -> Vec<String> {
+    let answer = redshift_serverless(ctx, region)
+        .get_namespace()
+        .namespace_name(namespace)
+        .send()
+        .await;
+    match answer {
+        Ok(answer) => answer
+            .namespace()
+            .and_then(::aws_sdk_redshiftserverless::types::Namespace::db_name)
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        Err(error) => {
+            ::tracing::warn!(
+                %region,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the namespace a workgroup serves could not be read, so the databases it was \
+                 created with are unknown"
+            );
+            Vec::new()
         }
     }
 }
 
 /// Resolve a workgroup named by ARN: the Region's workgroups are walked and
 /// their own ARNs compared, so the ARN form and the name form resolve to the
-/// same workgroup. A walk that cannot be completed leaves the question
-/// undecided, exactly as an unanswerable `GetWorkgroup` does.
+/// same workgroup — and to the same namespace. A walk that cannot be completed
+/// leaves the question undecided, exactly as an unanswerable `GetWorkgroup`
+/// does.
 async fn resolve_workgroup_arn(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     arn: &str,
-) -> TargetResolution {
+) -> (TargetResolution, Option<String>) {
     let client = redshift_serverless(ctx, region);
     let mut token: Option<String> = None;
     for page_number in 0..MAX_WORKGROUP_PAGES {
@@ -262,19 +385,22 @@ async fn resolve_workgroup_arn(
                     "the Region's workgroups could not be read, so the workgroup a statement \
                      names by ARN is unresolved"
                 );
-                return TargetResolution::Unresolvable;
+                return (TargetResolution::Unresolvable, None);
             }
         };
-        if page
+        if let Some(workgroup) = page
             .workgroups()
             .iter()
-            .any(|workgroup| workgroup.workgroup_arn() == Some(arn))
+            .find(|workgroup| workgroup.workgroup_arn() == Some(arn))
         {
-            return TargetResolution::Exists;
+            return (
+                TargetResolution::Exists,
+                workgroup.namespace_name().map(str::to_string),
+            );
         }
         token = page.next_token().map(str::to_string);
         if token.is_none() {
-            return TargetResolution::Absent;
+            return (TargetResolution::Absent, None);
         }
         if page_number + 1 == MAX_WORKGROUP_PAGES {
             ::tracing::warn!(
@@ -284,5 +410,5 @@ async fn resolve_workgroup_arn(
             );
         }
     }
-    TargetResolution::Unresolvable
+    (TargetResolution::Unresolvable, None)
 }

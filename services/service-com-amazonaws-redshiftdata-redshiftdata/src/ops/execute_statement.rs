@@ -270,17 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             Err(problem) => {
-                // The endpoint a request NAMED is resolved before its SELECTION
-                // is judged: a cluster or workgroup that does not exist in this
-                // Region is reported as the missing endpoint even when the
-                // request also selected its target badly. A request that is
-                // wrong about its database or its authorization method is told
-                // so whatever its target resolves to.
-                if problem.is_target_selection()
-                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
-                {
-                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
-                }
+                // How a request SELECTS its target, and whether it names a
+                // database and one authorization method, are faults of the
+                // REQUEST: they are reported as they stand, before any cluster,
+                // workgroup or session is resolved, so a request that selected
+                // two targets is told exactly that whatever either of them
+                // resolves to.
                 return Err(validation(&problem.message(SELECTORS)));
             }
         };

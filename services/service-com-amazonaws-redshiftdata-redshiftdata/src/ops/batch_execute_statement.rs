@@ -289,13 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             Err(problem) => {
-                // The endpoint a request NAMED is resolved before its SELECTION
-                // is judged, exactly as `ExecuteStatement` does it.
-                if problem.is_target_selection()
-                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
-                {
-                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
-                }
+                // How a request SELECTS its target is a fault of the REQUEST,
+                // reported before any cluster, workgroup or session is
+                // resolved, exactly as `ExecuteStatement` does it.
                 return Err(validation(&problem.message(SELECTORS)));
             }
         };

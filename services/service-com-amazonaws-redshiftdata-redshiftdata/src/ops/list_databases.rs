@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatabases
-//! Lists the databases of the data warehouse a request connects to, enumerated
-//! from the SQL engine this service holds, and paged with an opaque
-//! `NextToken`. A reporting operation — it reports the databases statements
-//! already created and writes nothing, not even the database it connects
-//! through.
+//! Lists the databases of the data warehouse a request connects to — the ones
+//! its own control plane provisioned it with, together with the ones statements
+//! have created on it — and pages them with an opaque `NextToken`. A reporting
+//! operation: it writes nothing, not even the database it connects through.
 //!
 //! ## Shape of an operation
 //!
@@ -224,39 +223,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             secret_arn: input.secret_arn.as_ref(),
         };
         let connection = match requested.resolve() {
+            // How a request SELECTS its target is a fault of the request
+            // itself, so it is reported before any target is resolved.
+            Err(problem) => return Err(validation(&problem.message(SELECTORS))),
             Ok(connection) => connection,
-            Err(problem) => {
-                // The endpoint a request NAMED is resolved before its SELECTION
-                // is judged, exactly as every other operation of this service
-                // does it.
-                if problem.is_target_selection()
-                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
-                {
-                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
-                }
-                return Err(validation(&problem.message(SELECTORS)));
-            }
         };
 
         // A database belongs to a data warehouse, so the target this request
         // named is resolved against the service that owns it before anything is
         // listed: a cluster or workgroup that does not exist in this Region
-        // holds no databases to report. A target the owner could not be asked
-        // about is UNDECIDED, and is read rather than refused.
-        if crate::state::warehouse::resolve_target(ctx, &connection.target).await
-            == crate::state::warehouse::TargetResolution::Absent
-        {
+        // holds no databases to report. The same answer carries the databases
+        // the warehouse was CREATED with, which are databases of it from the
+        // moment it exists. A target the owner could not be asked about is
+        // UNDECIDED, and is read rather than refused.
+        let facts = crate::state::warehouse::describe_target(ctx, &connection.target).await;
+        if facts.resolution == crate::state::warehouse::TargetResolution::Absent {
             return Err(validation(ABSENT_ENDPOINT_MESSAGE));
         }
 
         // The databases of the warehouse the request addressed, in name order
-        // so that paging walks a stable sequence. They are the databases this
-        // emulator really holds: a database exists because a statement ran
-        // against it, and this read opens none.
-        let databases = state.lock().database_names(&connection.target);
+        // so that paging walks a stable sequence: the ones this emulator holds
+        // because a statement ran against them, together with the ones its
+        // owner provisioned it with. This read opens none of them.
+        let held = state.lock().database_names(&connection.target);
+        let databases =
+            crate::state::warehouse::catalogue_databases(held, &facts.provisioned_databases);
 
         // The list is read through a connection to ONE of those databases, and
-        // a database this emulator does not hold cannot be connected to: such a
+        // a database the warehouse does not hold cannot be connected to: such a
         // request names a missing resource, which is what a catalog read of the
         // same database answers.
         if !databases.contains(&connection.database) {

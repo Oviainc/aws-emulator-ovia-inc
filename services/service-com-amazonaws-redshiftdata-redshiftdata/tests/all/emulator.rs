@@ -7,6 +7,11 @@
 //! RedshiftData.<Operation>` dispatched through the router, so what a suite
 //! asserts is the emulator's HTTP behaviour and not a handler's return value.
 //!
+//! There are two harnesses: [`Emulator`], one router with only this service
+//! mounted, and [`Warehouses`], which mounts the two Redshift control planes
+//! beside it for the suites whose requests name a cluster or a workgroup that
+//! has to really exist.
+//!
 //! This module holds NO tests; it exists so that every suite in this crate
 //! shares ONE harness rather than a copy of it each.
 
@@ -346,4 +351,177 @@ pub fn list(value: &Value, member: &str) -> Vec<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+/// The Region every call the [`Warehouses`] harness makes signs for, so the
+/// resources the control planes mint and the target the Data API resolves are in
+/// one Region.
+pub const REGION: &str = "us-east-1";
+
+/// One emulator carrying the Data API and BOTH Redshift control planes over ONE
+/// shared engine, the way the router mounts them in production.
+///
+/// A cluster and a workgroup are THEIR resources, so every suite that needs the
+/// Data API to resolve a real compute target — or to read what that target was
+/// provisioned with — drives this harness and creates the warehouse where it
+/// belongs.
+pub struct Warehouses {
+    router: MultiServiceRouter,
+}
+
+impl Warehouses {
+    pub fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_redshift_redshiftserviceversion20121201::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_redshiftserverless_redshiftserverless::EmulatedService::new(
+                engine,
+            ),
+        );
+        Self { router }
+    }
+
+    /// Call one awsJson operation of the service whose signing name is
+    /// `signing_name`, under the target prefix `prefix`.
+    pub async fn json(
+        &self,
+        signing_name: &str,
+        prefix: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("{prefix}.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=AKIAEMULATORTEST/20260101/{REGION}/{signing_name}/aws4_request, \
+                     SignedHeaders=host;x-amz-date, Signature=00"
+                ),
+            )
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        (status, parsed)
+    }
+
+    /// Call one Data API operation.
+    pub async fn data(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.json("redshift-data", "RedshiftData", operation, body)
+            .await
+    }
+
+    /// Call one Data API operation and require a 200.
+    pub async fn data_ok(&self, operation: &str, body: &Value) -> Value {
+        let (status, response) = self.data(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation} must succeed for {body}, got {status} {response}"
+        );
+        response
+    }
+
+    /// Create a provisioned cluster through Amazon Redshift, letting that
+    /// service name its initial database.
+    pub async fn create_cluster(&self, identifier: &str) {
+        self.create_cluster_with_database(identifier, None).await;
+    }
+
+    /// Create a provisioned cluster through Amazon Redshift, naming the initial
+    /// database it is created with (`DBName`) when `db_name` is given.
+    ///
+    /// Its wire protocol is awsQuery: the request is a form-encoded `Action`,
+    /// and only its status is read here.
+    pub async fn create_cluster_with_database(&self, identifier: &str, db_name: Option<&str>) {
+        let named_database = db_name
+            .map(|name| format!("&DBName={name}"))
+            .unwrap_or_default();
+        let body = format!(
+            "Action=CreateCluster&Version=2012-12-01&ClusterIdentifier={identifier}\
+             &NodeType=ra3.xlplus&MasterUsername=admin{named_database}"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://redshift.{REGION}.amazonaws.com/"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=AKIAEMULATORTEST/20260101/{REGION}/redshift/aws4_request, \
+                     SignedHeaders=host, Signature=00"
+                ),
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "CreateCluster {identifier}: expected 200, got {} {}",
+            response.status().as_u16(),
+            String::from_utf8_lossy(response.body())
+        );
+    }
+
+    /// Create a serverless workgroup (and the namespace it belongs to) through
+    /// Amazon Redshift Serverless, and answer the workgroup's own ARN.
+    pub async fn create_workgroup(&self, name: &str) -> String {
+        self.create_workgroup_with_database(name, None).await
+    }
+
+    /// Create a serverless workgroup and its namespace, naming the database the
+    /// namespace is created with (`dbName`) when `db_name` is given, and answer
+    /// the workgroup's own ARN.
+    pub async fn create_workgroup_with_database(
+        &self,
+        name: &str,
+        db_name: Option<&str>,
+    ) -> String {
+        let mut namespace = json!({"namespaceName": format!("{name}-ns")});
+        if let Some(database) = db_name {
+            namespace["dbName"] = json!(database);
+        }
+        let (status, body) = self
+            .json(
+                "redshift-serverless",
+                "RedshiftServerless",
+                "CreateNamespace",
+                &namespace,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "CreateNamespace for {name}: expected 200, got {status} {body}"
+        );
+        let (status, body) = self
+            .json(
+                "redshift-serverless",
+                "RedshiftServerless",
+                "CreateWorkgroup",
+                &json!({"workgroupName": name, "namespaceName": format!("{name}-ns")}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "CreateWorkgroup {name}: expected 200, got {status} {body}"
+        );
+        body["workgroup"]["workgroupArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a created workgroup carries its ARN: {body}"))
+            .to_string()
+    }
 }

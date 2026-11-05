@@ -2225,10 +2225,8 @@ pub struct Connection {
 ///
 /// The two target faults are kept apart although the service answers both with
 /// the same sentence: they are different requests — one selects nothing, the
-/// other selects two endpoints — and only the second has a warehouse whose
-/// endpoint can be resolved at all (see
-/// [`warehouse::names_absent_warehouse`], which is asked before either is
-/// reported).
+/// other selects two endpoints — so a reader of this enum can tell them apart
+/// even though the refusal does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadConnection {
     /// The request names NO compute target at all: no warehouse and no session.
@@ -2276,17 +2274,6 @@ impl BadConnection {
         }
     }
 
-    /// Whether this is a fault of the request's TARGET SELECTION rather than of
-    /// its database or its authorization method.
-    ///
-    /// Only a selection verdict is reported after the endpoint a request named is
-    /// resolved (see [`warehouse::names_absent_warehouse`]): the database and the
-    /// authorization members say nothing about which endpoint the request
-    /// addresses, so a request that is wrong about one of those is told so
-    /// whatever its target resolves to.
-    pub fn is_target_selection(self) -> bool {
-        matches!(self, Self::NoTarget | Self::SeveralTargets)
-    }
 }
 
 impl ConnectionRequest<'_> {
@@ -2356,20 +2343,6 @@ impl ConnectionRequest<'_> {
         })
     }
 
-    /// The data warehouses this request NAMES, whether or not the selection it
-    /// makes is a valid one: the provisioned cluster, the serverless workgroup,
-    /// or both when the request names both.
-    ///
-    /// The endpoint of a named warehouse is resolved before the SELECTION is
-    /// judged (see [`warehouse::names_absent_warehouse`]), so the targets a
-    /// refused selection named still have to be enumerable.
-    pub fn named_warehouses(self) -> Vec<ConnectionTarget> {
-        non_empty(self.cluster_identifier)
-            .map(ConnectionTarget::Cluster)
-            .into_iter()
-            .chain(non_empty(self.workgroup_name).map(ConnectionTarget::Workgroup))
-            .collect()
-    }
 }
 
 /// A lockable handle to one database's engine.
@@ -2706,13 +2679,18 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             .map(|open| std::sync::Arc::clone(&open.handle))
     }
 
-    /// The names of the databases of `target` this emulator holds, in name
-    /// order — the databases `ListDatabases` enumerates.
+    /// The names of the databases of `target` this emulator HOLDS, in name
+    /// order.
     ///
-    /// A reporting enumeration, so it opens nothing: a database exists in this
-    /// emulator because a statement ran against it (see
-    /// [`Self::reserve_database`]), and a read that opened one would add a
-    /// database to the warehouse every later caller then found there.
+    /// One part of the warehouse's catalogue: a database is held here because a
+    /// statement ran against it (see [`Self::reserve_database`]), while the
+    /// database the warehouse was PROVISIONED with belongs to the control plane
+    /// that owns the warehouse — [`warehouse::catalogue_databases`] is where the
+    /// two become the one list `ListDatabases` enumerates.
+    ///
+    /// A reporting enumeration, so it opens nothing: a read that opened a
+    /// database would add one to the warehouse every later caller then found
+    /// there.
     pub fn database_names(&self, target: &ConnectionTarget) -> Vec<String> {
         self.warehouse_handles(target)
             .into_iter()

@@ -234,32 +234,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             secret_arn: input.secret_arn.as_ref(),
         };
         let connection = match requested.resolve() {
-            Ok(connection) => connection,
             // Every other combination — both warehouses, neither of them, no
-            // database, two authorization methods — is a malformed request.
+            // database, two authorization methods — is a malformed request, and
+            // how a request SELECTS its target is a fault of the request
+            // itself, so it is reported before any target is resolved.
             // `DescribeTable` takes no `SessionId`, so no connection of its
             // own can live on a session.
-            Err(problem) => {
-                // The endpoint a request NAMED is resolved before its SELECTION
-                // is judged, exactly as the submit operations do it.
-                if problem.is_target_selection()
-                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
-                {
-                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
-                }
-                return Err(validation(&problem.message(SELECTORS)));
-            }
+            Err(problem) => return Err(validation(&problem.message(SELECTORS))),
+            Ok(connection) => connection,
         };
 
         // A table lives in a database of a data warehouse, so the target this
         // request named is resolved against the service that owns it before its
         // catalog is read: a cluster or workgroup that does not exist in this
         // Region has no catalog to describe, and that is the same refusal the
-        // submit operations give. A target the owner could not be asked about is
-        // UNDECIDED, and is read rather than refused.
-        if crate::state::warehouse::resolve_target(ctx, &connection.target).await
-            == crate::state::warehouse::TargetResolution::Absent
-        {
+        // submit operations give. The same answer carries the databases the
+        // warehouse was CREATED with, which exist from the moment it does. A
+        // target the owner could not be asked about is UNDECIDED, and is read
+        // rather than refused.
+        let facts = crate::state::warehouse::describe_target(ctx, &connection.target).await;
+        if facts.resolution == crate::state::warehouse::TargetResolution::Absent {
             return Err(validation(ABSENT_ENDPOINT_MESSAGE));
         }
 
@@ -296,14 +290,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(no_such_table(&schema.unwrap_or_default(), table.as_deref()));
         }
 
-        // The catalog of a database no statement has ever opened holds nothing:
-        // a reporting operation must not open one, or a later caller would find
-        // a database this read had created. The database is what is missing
-        // here, so that is what the refusal names.
-        let Some(handle) = state
+        // A reporting operation must not OPEN a database, or a later caller
+        // would find one this read had created — so the catalog is read from
+        // the database this emulator already holds, and a database the
+        // warehouse has but no statement has opened simply holds no table yet.
+        // Only a database the warehouse does not hold at all is the missing
+        // resource the refusal names.
+        let handle = state
             .lock()
-            .open_database(&connection.target, &connection.database)
-        else {
+            .open_database(&connection.target, &connection.database);
+        if handle.is_none() && !facts.provisions_database(&connection.database) {
             return Err(DescribeTableErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("Database does not exist: {}", connection.database),
@@ -311,56 +307,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
+        }
 
         // The catalog is read on the blocking pool with only this database's
         // lock held, bounded exactly as a statement's execution is, so a catalog
         // read queued behind a slow statement cannot pin this request: the
         // engine gives up at its own deadline, and the request waits a grace
         // period longer than that for the answer.
-        let engine_timeout = crate::state::engine_timeout();
-        let budget = crate::state::CATALOG_REQUEST_BUDGET;
-        let bound = crate::state::ExecutionBound::new();
-        let interrupt = bound.interrupt();
-        let wanted = table.clone();
-        let joined = tokio::time::timeout(
-            budget,
-            tokio::task::spawn_blocking(move || {
-                crate::state::catalog_on(&handle, wanted.as_deref(), engine_timeout, &bound)
-            }),
-        )
-        .await;
-        let described = match joined {
-            Ok(Ok(Ok(described))) => described,
-            // The engine could not answer for this database.
-            Ok(Ok(Err(reason))) => {
-                return Err(DescribeTableErrorModeled::DatabaseConnectionException(
-                    DatabaseConnectionException {
-                        message: format!("the database's catalog could not be read: {reason}"),
-                    },
+        let described = match handle {
+            None => Vec::new(),
+            Some(handle) => {
+                let engine_timeout = crate::state::engine_timeout();
+                let budget = crate::state::CATALOG_REQUEST_BUDGET;
+                let bound = crate::state::ExecutionBound::new();
+                let interrupt = bound.interrupt();
+                let wanted = table.clone();
+                let joined = tokio::time::timeout(
+                    budget,
+                    tokio::task::spawn_blocking(move || {
+                        crate::state::catalog_on(&handle, wanted.as_deref(), engine_timeout, &bound)
+                    }),
                 )
-                .into())
-            }
-            Err(_elapsed) => {
-                interrupt.now();
-                return Err(DescribeTableErrorModeled::QueryTimeoutException(
-                    QueryTimeoutException {
-                        message: Some(format!(
-                            "the database's catalog did not answer within {} seconds",
-                            budget.as_secs()
-                        )),
-                    },
-                )
-                .into());
-            }
-            Ok(Err(_panicked)) => {
-                return Err(DescribeTableErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "the SQL engine did not answer for this database's catalog"
-                            .to_string(),
-                    },
-                )
-                .into())
+                .await;
+                match joined {
+                    Ok(Ok(Ok(described))) => described,
+                    // The engine could not answer for this database.
+                    Ok(Ok(Err(reason))) => {
+                        return Err(DescribeTableErrorModeled::DatabaseConnectionException(
+                            DatabaseConnectionException {
+                                message: format!(
+                                    "the database's catalog could not be read: {reason}"
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                    Err(_elapsed) => {
+                        interrupt.now();
+                        return Err(DescribeTableErrorModeled::QueryTimeoutException(
+                            QueryTimeoutException {
+                                message: Some(format!(
+                                    "the database's catalog did not answer within {} seconds",
+                                    budget.as_secs()
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Ok(Err(_panicked)) => {
+                        return Err(DescribeTableErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the SQL engine did not answer for this database's catalog"
+                                    .to_string(),
+                            },
+                        )
+                        .into())
+                    }
+                }
             }
         };
 

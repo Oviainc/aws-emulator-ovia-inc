@@ -27,12 +27,9 @@
 //! cluster and the workgroup are THEIR resources: this suite creates them there
 //! and then submits statements here.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-use super::emulator::{error_code, list, Emulator, ABSENT_ID};
+use super::emulator::{error_code, list, Emulator, Warehouses, ABSENT_ID};
 
 /// AWS's canonical refusal of a request that does not select exactly one compute
 /// target: the same sentence whatever the request named, enumerating every target
@@ -252,142 +249,6 @@ async fn an_id_the_service_holds_no_query_for_is_refused() {
 // Rule 3: the target is resolved against the service that owns it
 // ---------------------------------------------------------------------------
 
-/// The Region every call in the endpoint-resolution suite signs for, so the
-/// resources the control planes mint and the target the Data API resolves are in
-/// one Region.
-const REGION: &str = "us-east-1";
-
-/// One emulator carrying the Data API and BOTH Redshift control planes over ONE
-/// shared engine, the way the router mounts them in production.
-struct Warehouses {
-    router: MultiServiceRouter,
-}
-
-impl Warehouses {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_redshiftdata_redshiftdata::EmulatedService::new(Arc::clone(
-                &engine,
-            )),
-        );
-        router.register_service(
-            service_com_amazonaws_redshift_redshiftserviceversion20121201::EmulatedService::new(
-                Arc::clone(&engine),
-            ),
-        );
-        router.register_service(
-            service_com_amazonaws_redshiftserverless_redshiftserverless::EmulatedService::new(
-                engine,
-            ),
-        );
-        Self { router }
-    }
-
-    /// Call one awsJson operation of the service whose signing name is
-    /// `signing_name`, under the target prefix `prefix`.
-    async fn json(
-        &self,
-        signing_name: &str,
-        prefix: &str,
-        operation: &str,
-        body: &Value,
-    ) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("{prefix}.{operation}"))
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 \
-                     Credential=AKIAEMULATORTEST/20260101/{REGION}/{signing_name}/aws4_request, \
-                     SignedHeaders=host;x-amz-date, Signature=00"
-                ),
-            )
-            .body(bytes::Bytes::from(body.to_string()))
-            .expect("build the request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-        (status, parsed)
-    }
-
-    /// Call one Data API operation.
-    async fn data(&self, operation: &str, body: &Value) -> (u16, Value) {
-        self.json("redshift-data", "RedshiftData", operation, body)
-            .await
-    }
-
-    /// Create a provisioned cluster through Amazon Redshift, whose wire protocol
-    /// is awsQuery: the request is a form-encoded `Action`, and only its status
-    /// is read here.
-    async fn create_cluster(&self, identifier: &str) {
-        let body = format!(
-            "Action=CreateCluster&Version=2012-12-01&ClusterIdentifier={identifier}\
-             &NodeType=ra3.xlplus&MasterUsername=admin"
-        );
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://redshift.{REGION}.amazonaws.com/"))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 \
-                     Credential=AKIAEMULATORTEST/20260101/{REGION}/redshift/aws4_request, \
-                     SignedHeaders=host, Signature=00"
-                ),
-            )
-            .body(bytes::Bytes::from(body))
-            .expect("build the request");
-        let response = self.router.dispatch(request).await;
-        assert_eq!(
-            response.status().as_u16(),
-            200,
-            "CreateCluster {identifier}: expected 200, got {} {}",
-            response.status().as_u16(),
-            String::from_utf8_lossy(response.body())
-        );
-    }
-
-    /// Create a serverless workgroup (and the namespace it belongs to) through
-    /// Amazon Redshift Serverless, and answer the workgroup's own ARN.
-    async fn create_workgroup(&self, name: &str) -> String {
-        let (status, body) = self
-            .json(
-                "redshift-serverless",
-                "RedshiftServerless",
-                "CreateNamespace",
-                &json!({"namespaceName": format!("{name}-ns")}),
-            )
-            .await;
-        assert_eq!(
-            status, 200,
-            "CreateNamespace for {name}: expected 200, got {status} {body}"
-        );
-        let (status, body) = self
-            .json(
-                "redshift-serverless",
-                "RedshiftServerless",
-                "CreateWorkgroup",
-                &json!({"workgroupName": name, "namespaceName": format!("{name}-ns")}),
-            )
-            .await;
-        assert_eq!(
-            status, 200,
-            "CreateWorkgroup {name}: expected 200, got {status} {body}"
-        );
-        body["workgroup"]["workgroupArn"]
-            .as_str()
-            .unwrap_or_else(|| panic!("a created workgroup carries its ARN: {body}"))
-            .to_string()
-    }
-}
-
 /// A statement runs on an ENDPOINT, so a target that resolves to none is refused
 /// and nothing is stored for it — while the very same request against a target the
 /// Region really holds is admitted.
@@ -496,17 +357,22 @@ async fn a_target_that_resolves_to_no_endpoint_is_refused() {
         }
     }
 
-    // The endpoint a request NAMED is resolved BEFORE its SELECTION is judged,
-    // so a request that names both warehouses is refused as the missing endpoint
-    // when the warehouse it names is not there, and as a selection that names
-    // two warehouses when it is. A request that is wrong about its DATABASE or
-    // its authorization method is told so whatever its target resolves to: those
-    // members name no endpoint, so resolving one cannot answer them.
+    // How a request SELECTS its target is a fault of the REQUEST, judged before
+    // any endpoint is resolved: a request that names both warehouses is refused
+    // as a selection that names two of them whether or not either one exists, so
+    // a caller that wired two targets is never sent after a provisioning or
+    // Region problem instead. A request that is wrong about its DATABASE or its
+    // authorization method is told so on the same terms.
     for (case, overrides, expected) in [
         (
             "both warehouses, the cluster absent",
             json!({"ClusterIdentifier": "absent-cluster", "WorkgroupName": "present-workgroup"}),
-            NO_SUCH_ENDPOINT,
+            ONE_TARGET,
+        ),
+        (
+            "both warehouses, both absent",
+            json!({"ClusterIdentifier": "absent-cluster", "WorkgroupName": "absent-workgroup"}),
+            ONE_TARGET,
         ),
         (
             "both warehouses, the cluster present",
