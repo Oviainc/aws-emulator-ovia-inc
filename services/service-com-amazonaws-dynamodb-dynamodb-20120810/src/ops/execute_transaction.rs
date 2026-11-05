@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a collection's members — before the statement is parsed.
         let mut parsed: Vec<crate::state::PartiqlStatement> =
             Vec::with_capacity(input.transact_statements.len());
-        for entry in &input.transact_statements {
+        for (slot, entry) in input.transact_statements.iter().enumerate() {
             // "An optional parameter that returns the item attributes for a PartiQL
             // ParameterizedStatement operation that failed a condition check": the
             // member carries two values.
@@ -264,8 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::check_statement_value(&format!("Parameters[{position}]"), value)
                     .map_err(lift)?;
             }
-            parsed
-                .push(crate::state::parse_statement(&entry.statement, &parameters).map_err(lift)?);
+            // A statement of a transaction is refused as the SLOT it was sent in: the
+            // statement's own defect, behind the position the request stated it at, so a
+            // caller carrying several statements can tell which of them is wrong.
+            parsed.push(
+                crate::state::parse_statement(&entry.statement, &parameters)
+                    .map_err(|error| lift(in_slot(slot, error)))?,
+            );
         }
 
         // "The entire transaction must consist of either read statements or write
@@ -374,10 +379,28 @@ const MIXED_TRANSACTION_MESSAGE: &str =
 ///
 /// A transactional read reports the item its statement names, so the `WHERE` clause must
 /// pin every key attribute by equality — and a secondary index is not keyed by the
-/// table's primary key, so no clause over one addresses an item of the table.
-const SINGLE_ITEM_READ_MESSAGE: &str =
-    "a read statement in a transaction must address one item of the table: its WHERE clause \
-     states an equality on every key attribute, and its source is the table rather than an index";
+/// table's primary key, so no clause over one addresses an item of the table. The
+/// sentence is the one this surface states that rule with, named for the operation that
+/// enforces it exactly as `BatchExecuteStatement` names itself in its own.
+const SINGLE_ITEM_READ_MESSAGE: &str = "Select statements within ExecuteTransaction must specify \
+                                        the primary key in the where clause.";
+
+/// One statement's refusal, reported against the slot the request sent that statement
+/// in.
+///
+/// `TransactStatements` is a list, so WHICH statement was refused is a fact of the
+/// request: a defect of one statement's own text is stated behind its position in that
+/// list, and the statement's refusal follows unchanged.
+fn in_slot(slot: usize, error: crate::state::RequestError) -> crate::state::RequestError {
+    match error {
+        crate::state::RequestError::Validation(message) => {
+            crate::state::RequestError::Validation(format!(
+                "Validation failed in TransactStatements[{slot}]: {message}"
+            ))
+        }
+        error => error,
+    }
+}
 
 /// How a `SELECT` asking for an order is refused: `ORDER BY` orders a result set, and a
 /// transactional read reports at most one item, so an order is something no statement of
@@ -477,7 +500,15 @@ fn read_transaction(
             ));
         };
         let condition = crate::state::parsed_condition(filter).map_err(lift)?;
-        let key = crate::state::singleton_key(table, filter).map_err(lift)?;
+        let key = crate::state::singleton_key(table, filter).map_err(|error| {
+            // A `WHERE` clause that leaves a key attribute free addresses no ONE item of
+            // the table, which this operation states in the sentence above rather than in
+            // the one a single-statement write earns.
+            if error.message() == crate::state::MANDATORY_KEY_EQUALITY_MESSAGE {
+                return crate::scaffolded::Scaffolded::validation(SINGLE_ITEM_READ_MESSAGE);
+            }
+            lift(error)
+        })?;
         // "Transaction request cannot include multiple operations on one item."
         if !keyed.insert((name.clone(), key.clone())) {
             return Err(crate::scaffolded::Scaffolded::validation(

@@ -245,14 +245,18 @@ async fn every_read_statement_reports_into_its_own_slot() {
             "case {case}: expected Item {:?}, got {answered_slot}",
             row.item
         );
-        // "The table name associated with a failed PartiQL batch statement": a slot
-        // reports the table it addressed exactly when it failed having resolved one.
-        let names_table = row.code.is_some() && row.case != "the statement does not parse";
+        // A slot reports the table its statement addressed — whether the statement ran
+        // or failed — so a batch spread over several tables can be attributed slot by
+        // slot. Only a statement that never resolved a table names none.
+        let expected_table = match row.case {
+            "the statement does not parse" => None,
+            "the table is not there" => Some("absent"),
+            _ => Some("items"),
+        };
         assert_eq!(
-            answered_slot.get("TableName").is_some(),
-            names_table,
-            "case {case}: a failed statement that resolved a table reports it and no other \
-             slot does, got {answered_slot}"
+            answered_slot.get("TableName").and_then(Value::as_str),
+            expected_table,
+            "case {case}: expected TableName {expected_table:?}, got {answered_slot}"
         );
     }
 }

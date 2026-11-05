@@ -36,6 +36,15 @@
 //! in the `Query` handler — is parsed here, and everything a statement cannot say is
 //! refused with a `ValidationException` rather than guessed at.
 //!
+//! A refusal states the DEFECT CLASS, not one catch-all sentence: a parse defect
+//! carries the parser's phrase for the position the parse stopped at
+//! ([`ParseDefect`]), a call names the function it called
+//! ([`unrecognized_function`], [`requires_document_path`],
+//! [`incorrect_operand_count`]), and a refusal about a run of the statement text
+//! reports where the statement spells it ([`Position`]) — so a client can tell a
+//! quoting mistake from an unknown function, and nothing but the request's own text
+//! appears in the message.
+//!
 //! Every bound the walk uses is this module's own constant
 //! ([`MAX_STATEMENT_TOKENS`], [`MAX_STATEMENT_DEPTH`]), so neither the token vector
 //! nor the parser's stack is a function of what a caller sends.
@@ -68,21 +77,175 @@ pub const MAX_STATEMENT_TOKENS: usize = 4096;
 /// same items.
 pub const MAX_STATEMENT_DEPTH: usize = 16;
 
-/// How a statement this dialect does not spell is refused: a `ValidationException`,
-/// which is what DynamoDB answers a statement it cannot parse with. The statement
-/// itself is not echoed back.
+/// Where in the statement text one token sits.
 ///
-/// AWS states the fact as a term it did not expect at the position the parse stopped at
-/// — the same sentence family as [`unexpected_token_after_statement`], which is the one
-/// case where the parse stopped PAST a complete statement rather than inside one.
-fn statement_syntax_error() -> RequestError {
-    RequestError::Validation(
-        "Statement wasn't well formed, can't be processed: Unexpected term".to_string(),
-    )
+/// A refusal that reports a position reports it as `<line>:<column>:<length>` — the
+/// line and column the statement spells the offending run at, counted in characters
+/// from 1, and how many characters it takes — so every part of it is a fact of the
+/// text the request sent. `start` is the character offset the run begins at, which is
+/// what lets two positions be joined into the span between them ([`Position::through`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position {
+    line: usize,
+    column: usize,
+    start: usize,
+    width: usize,
 }
+
+impl Position {
+    /// This position as a refusal reports it.
+    fn stated(&self) -> String {
+        format!("{}:{}:{}", self.line, self.column, self.width)
+    }
+
+    /// The span that begins here and ends where `last` ends: how a refusal about a
+    /// whole clause (a source path, say) reports the run of text that clause occupies.
+    fn through(self, last: Self) -> Self {
+        Self {
+            width: (last.start + last.width).saturating_sub(self.start),
+            ..self
+        }
+    }
+}
+
+/// Which defect a statement that does not parse carries, as the phrase the parser
+/// reports for the position it stopped at.
+///
+/// DynamoDB states a parse defect as ONE fixed sentence
+/// ([`statement_parse_error`]) whose tail is the parser's phrase for what was wrong
+/// there, so a client can tell a statement that is no data manipulation from a name
+/// that is not a name from text that carries on past a complete statement. Each phrase
+/// below is the PartiQL parser's own for that position.
+///
+/// The first three are the phrases this surface is RECORDED answering with. The last
+/// two cover the positions no recorded answer names — a keyword the grammar requires,
+/// and a token the grammar admits nowhere there — with the reference parser's own
+/// phrase for each, so the class a client sees is still the class that failed; a
+/// recording that names either position is what would settle its wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseDefect {
+    /// The text reads as an expression rather than as a statement that reads or writes
+    /// items — which is what this surface runs.
+    NotDataManipulation,
+    /// A NAME was required there — a table, an index, an attribute or an alias — and
+    /// what the statement spells is not one (a string literal, say).
+    Identifier,
+    /// A keyword the grammar requires at that position is not there.
+    Keyword,
+    /// The statement is complete and the text carries on.
+    TrailingToken,
+    /// The token at that position is not one the grammar admits there.
+    UnexpectedTerm,
+}
+
+impl ParseDefect {
+    /// The parser's phrase for this defect.
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::NotDataManipulation => "Expected data manipulation",
+            Self::Identifier => "Expected identifier for simple path",
+            Self::Keyword => "Expected keyword",
+            Self::TrailingToken => "Unexpected token after expression",
+            Self::UnexpectedTerm => "Unexpected term",
+        }
+    }
+}
+
+/// How a statement this dialect cannot parse is refused: a `ValidationException`
+/// carrying the fixed sentence DynamoDB states a parse defect with, followed by the
+/// parser's own phrase for the position the parse stopped at. The statement itself is
+/// not echoed back.
+fn statement_parse_error(defect: ParseDefect) -> RequestError {
+    RequestError::Validation(format!(
+        "Statement wasn't well formed, can't be processed: {}",
+        defect.phrase()
+    ))
+}
+
+/// How a call to a function this dialect does not define is refused: the name the
+/// statement called, and where it spells it.
+fn unrecognized_function(name: &str, at: Position) -> RequestError {
+    RequestError::Validation(format!("Unrecognized function: {name} at {}", at.stated()))
+}
+
+/// How an operand that is not a document path is refused, naming the operator or
+/// function that takes one — the functions that read an attribute of the item
+/// (`attribute_exists`, `size`, …) read a PATH, not a value.
+fn requires_document_path(operator_or_function: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Operator or function requires a document path; operator or function: \
+         {operator_or_function}"
+    ))
+}
+
+/// How a call carrying the wrong number of operands is refused, naming what was
+/// called.
+fn incorrect_operand_count(operator_or_function: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Incorrect number of operands for operator or function; operator or function: \
+         {operator_or_function}"
+    ))
+}
+
+/// How a WRITE statement whose `FROM` clause is qualified with an index is refused,
+/// naming where the statement spells that source.
+///
+/// An index projects a table's items and is not written through — "attributes that are
+/// copied (projected) from the table into the global secondary index"
+/// (`GlobalSecondaryIndex$Projection`) — so the `FROM` clause of a statement that
+/// manipulates data names one table and nothing else. The sentence is about that
+/// CLAUSE, so it is what a `DELETE` earns; an `UPDATE` and an `INSERT` name their
+/// target directly rather than through a `FROM` clause, and are refused with
+/// [`unsupported_on_an_index`] instead.
+fn single_table_in_data_manipulation(at: Position) -> RequestError {
+    RequestError::Validation(format!(
+        "FROM clause may only contain a single table name in data manipulation statements at {}",
+        at.stated()
+    ))
+}
+
+/// How a write that names its target directly — an `UPDATE` or an `INSERT` — is refused
+/// when that target is an index: the fixed sentence DynamoDB states for an operation
+/// asked of an index, which is the same one the classic surface states for one.
+///
+/// Neither verb states its target through a `FROM` clause (an `UPDATE` names it after
+/// the verb, an `INSERT` after `INTO`), so the clause sentence
+/// [`single_table_in_data_manipulation`] is not about either of them; this is the
+/// sentence a PartiQL `UPDATE` through an index qualifier is recorded answering, and an
+/// `INSERT`'s target has the same shape.
+fn unsupported_on_an_index() -> RequestError {
+    RequestError::Validation("This operation is not supported on an index".to_string())
+}
+
+/// How a source path naming more than a table and an index of it is refused: the two
+/// components a `FROM` path may hold are the table and the index of it a read is served
+/// through. It is about the `FROM` CLAUSE, so it is what a statement WITH one earns; a
+/// write that names its target directly is refused by [`unsupported_on_an_index`].
+const FROM_PATH_ARITY_MESSAGE: &str = "A path may contain at most 2 components in the FROM clause";
+
+/// How a request whose `Parameters` list and whose statement's `?` markers do not
+/// correspond is refused: "The parameters for the PartiQL statement, if any"
+/// (`ExecuteStatement$Parameters`) fill the markers in order, so one list and one
+/// statement that do not go together is a defect of the REQUEST rather than of either
+/// part.
+pub const PARAMETER_COUNT_MESSAGE: &str =
+    "Number of parameters in request and statement don't match.";
+
+/// How a statement that addresses ONE item, and whose `WHERE` clause does not pin every
+/// key attribute by equality, is refused.
+///
+/// "ExecuteStatement allows you to perform reads and SINGLETON writes" (the operation's
+/// doc): an `UPDATE` or a `DELETE` names one item, so a clause that leaves a key
+/// attribute free names no one item.
+pub const MANDATORY_KEY_EQUALITY_MESSAGE: &str =
+    "Where clause does not contain a mandatory equality on all key attributes";
 
 /// How a statement that parses but asks for something this dialect does not serve is
 /// refused, naming the rule it broke.
+///
+/// What is left here is this surface's OWN bounds (the token count and the nesting
+/// depth the parser is held to) and the shapes of the dialect it does not spell: each
+/// AWS refusal class carries AWS's own sentence above instead.
 fn statement_refused(detail: &str) -> RequestError {
     RequestError::Validation(format!("Invalid Statement: {detail}"))
 }
@@ -92,13 +255,10 @@ fn statement_refused(detail: &str) -> RequestError {
 ///
 /// A statement is one expression, so anything after the one the parser read is not part
 /// of it and nothing in the dialect can be — which is a different fact from a statement
-/// that never parsed, and AWS states it with its own fixed sentence naming the position
-/// the surplus token sits at.
+/// that never parsed, and AWS states it with its own fixed sentence
+/// ([`ParseDefect::TrailingToken`]).
 fn unexpected_token_after_statement() -> RequestError {
-    RequestError::Validation(
-        "Statement wasn't well formed, can't be processed: Unexpected token after expression"
-            .to_string(),
-    )
+    statement_parse_error(ParseDefect::TrailingToken)
 }
 
 /// The type codes `attribute_type` may name, in the order the STATEMENT surface's own
@@ -182,16 +342,30 @@ fn check_scalar_operands<'o>(
     Ok(())
 }
 
-/// How a WRITE statement whose source is qualified with an index is refused.
+/// One number a statement carries, canonicalized, or the refusal its text earns.
 ///
-/// An index projects a table's items and is not written through — "attributes that are
-/// copied (projected) from the table into the global secondary index"
-/// (`GlobalSecondaryIndex$Projection`) — so a write that addresses one asks for something
-/// no index does, which AWS states with this fixed sentence rather than as a statement
-/// this dialect cannot spell: the statement parsed, and the source it names is the
-/// problem.
-fn unsupported_on_an_index() -> RequestError {
-    RequestError::Validation("This operation is not supported on an index".to_string())
+/// The clause is the one every write path states for that numeric rule
+/// ([`number_rejection`]), stated on its OWN rather than inside the
+/// `<N> validation error(s) detected: ` envelope: the envelope reports a constraint on
+/// an input MEMBER the request sent, and a literal inside the statement text is not
+/// one — the statement is the member, and what it says is this parser's to report. The
+/// envelope is recognised through the renderer that writes it ([`validation_message`]),
+/// so the two cannot drift; a clause that carries none (this emulator's own
+/// numeric-text bound, which says so) is passed through as it stands.
+///
+/// TODO: once `super`'s module is split into files small enough to edit, let the clause
+/// itself be built where [`number_rejection`] builds it and have the envelope renderer
+/// wrap THAT, so this call site asks for the clause instead of recognising the wrapper.
+fn statement_number(lexeme: &str) -> Result<String, RequestError> {
+    canonical_number_text(lexeme).map_err(|error| match error {
+        RequestError::Validation(message) => RequestError::Validation(
+            message
+                .strip_prefix(&validation_message([String::new()]).unwrap_or_default())
+                .unwrap_or(&message)
+                .to_string(),
+        ),
+        error => error,
+    })
 }
 
 // ===========================================================================
@@ -238,9 +412,17 @@ fn is_word_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
 
+/// One statement's tokens and where the text spells each of them: the two vectors are
+/// the same length, so a token's position is the entry at its own index.
+#[derive(Debug, Default)]
+struct Lexemes {
+    tokens: Vec<Token>,
+    positions: Vec<Position>,
+}
+
 /// Split one statement into tokens, refusing a token count past
 /// [`MAX_STATEMENT_TOKENS`] before any parsing starts.
-fn tokenize(statement: &str) -> Result<Vec<Token>, RequestError> {
+fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
     if statement.len() > MAX_STATEMENT_BYTES {
         return Err(statement_refused(&format!(
             "a statement may hold at most {MAX_STATEMENT_BYTES} bytes"
@@ -248,7 +430,13 @@ fn tokenize(statement: &str) -> Result<Vec<Token>, RequestError> {
     }
     let characters: Vec<char> = statement.chars().collect();
     let mut tokens = Vec::new();
+    let mut positions: Vec<Position> = Vec::new();
     let mut at = 0;
+    // Where the scan stands in the TEXT: which line it is on, and the character the
+    // line starts at, so a column is counted from the line rather than from the
+    // statement.
+    let mut line = 1;
+    let mut line_start = 0;
     while at < characters.len() {
         if tokens.len() >= MAX_STATEMENT_TOKENS {
             return Err(statement_refused(&format!(
@@ -256,6 +444,8 @@ fn tokenize(statement: &str) -> Result<Vec<Token>, RequestError> {
             )));
         }
         let character = characters[at];
+        let start = at;
+        let (token_line, token_column) = (line, start + 1 - line_start);
         match character {
             c if c.is_whitespace() => at += 1,
             '\'' | '"' => {
@@ -358,13 +548,31 @@ fn tokenize(statement: &str) -> Result<Vec<Token>, RequestError> {
                 tokens.push(Token::Plus);
                 at += 1;
             }
-            _ => return Err(statement_syntax_error()),
+            _ => return Err(statement_parse_error(ParseDefect::UnexpectedTerm)),
+        }
+        // Every arm above reads ONE run of text and pushes at most one token for it, so
+        // the position of whatever it pushed is the run it read.
+        while positions.len() < tokens.len() {
+            positions.push(Position {
+                line: token_line,
+                column: token_column,
+                start,
+                width: at - start,
+            });
+        }
+        // A run the scan has passed may itself hold line breaks — a quoted literal can
+        // — so the line the NEXT token sits on is counted off the text that was read.
+        for (offset, character) in characters[start..at].iter().enumerate() {
+            if *character == '\n' {
+                line += 1;
+                line_start = start + offset + 1;
+            }
         }
     }
     if tokens.is_empty() {
-        return Err(statement_syntax_error());
+        return Err(statement_parse_error(ParseDefect::NotDataManipulation));
     }
-    Ok(tokens)
+    Ok(Lexemes { tokens, positions })
 }
 
 /// Read one quoted run starting at `at`, where `delimiter` is the quote character: a
@@ -391,7 +599,7 @@ fn quoted(
         index += 1;
     }
     // An unterminated literal is a statement that does not parse.
-    Err(statement_syntax_error())
+    Err(statement_parse_error(ParseDefect::UnexpectedTerm))
 }
 
 /// Read one numeric lexeme starting at `at`: digits, an optional fraction and an
@@ -594,6 +802,16 @@ impl ReturnedValues {
     }
 }
 
+/// The source a statement's `FROM` clause names: the table, the index of it a read is
+/// served through, and the position the statement spells the whole path at — which is
+/// what a refusal about the source reports.
+#[derive(Debug, Clone)]
+struct StatementSource {
+    table: String,
+    index: Option<String>,
+    position: Position,
+}
+
 /// A `SELECT`: which stored items to report, and in which order.
 #[derive(Debug, Clone)]
 pub struct SelectStatement {
@@ -666,14 +884,38 @@ impl PartiqlStatement {
 // The parser
 // ===========================================================================
 
+/// The boolean functions of this dialect: each is a predicate in its own right, read
+/// where the grammar admits a predicate.
+const BOOLEAN_FUNCTIONS: [&str; 5] = [
+    "begins_with",
+    "contains",
+    "attribute_type",
+    "attribute_exists",
+    "attribute_not_exists",
+];
+
+/// Whether `name` is a function this dialect defines at all: the boolean predicates
+/// above, `size` (an operand), and the three that belong to a `SET` clause.
+///
+/// What it decides is whether a call the grammar does not admit where it stands is a
+/// call to something UNDEFINED — which AWS names — or one of the dialect's own standing
+/// where only a name may, which is a name the statement does not spell.
+fn is_defined_function(name: &str) -> bool {
+    BOOLEAN_FUNCTIONS
+        .iter()
+        .chain(["size", "list_append", "set_add", "set_delete"].iter())
+        .any(|defined| name.eq_ignore_ascii_case(defined))
+}
+
 /// Parse one statement, resolving each `?` against `parameters` in order.
 pub fn parse_statement(
     statement: &str,
     parameters: &[AttributeValue],
 ) -> Result<PartiqlStatement, RequestError> {
-    let tokens = tokenize(statement)?;
+    let lexemes = tokenize(statement)?;
     let mut parser = StatementParser {
-        tokens: &tokens,
+        tokens: &lexemes.tokens,
+        positions: &lexemes.positions,
         at: 0,
         parameters,
         used_parameters: 0,
@@ -687,8 +929,8 @@ pub fn parse_statement(
     // that sends more values than the statement has markers for has sent a statement
     // and a parameter list that do not go together.
     if parser.used_parameters != parameters.len() {
-        return Err(statement_refused(
-            "the number of parameters in the request and in the statement do not match",
+        return Err(RequestError::Validation(
+            PARAMETER_COUNT_MESSAGE.to_string(),
         ));
     }
     Ok(parsed)
@@ -698,6 +940,8 @@ pub fn parse_statement(
 #[derive(Debug)]
 struct StatementParser<'t> {
     tokens: &'t [Token],
+    /// Where the statement spells each token, at the same index as the token itself.
+    positions: &'t [Position],
     at: usize,
     parameters: &'t [AttributeValue],
     used_parameters: usize,
@@ -713,8 +957,42 @@ impl StatementParser<'_> {
         self.tokens.get(self.at)
     }
 
+    /// Where the statement spells the token the parser stands at, or — past the last
+    /// token — the empty position just after the text, so a refusal about the end of a
+    /// statement still reports a position of the request's own text.
+    fn position(&self) -> Position {
+        if let Some(position) = self.positions.get(self.at) {
+            return *position;
+        }
+        self.positions.last().map_or(
+            Position {
+                line: 1,
+                column: 1,
+                start: 0,
+                width: 0,
+            },
+            |last| Position {
+                line: last.line,
+                column: last.column + last.width,
+                start: last.start + last.width,
+                width: 0,
+            },
+        )
+    }
+
+    /// Where the statement spells the token the parser has just read.
+    fn previous_position(&self) -> Position {
+        self.positions
+            .get(self.at.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| self.position())
+    }
+
     fn bump(&mut self) -> Result<&Token, RequestError> {
-        let token = self.tokens.get(self.at).ok_or_else(statement_syntax_error)?;
+        let token = self
+            .tokens
+            .get(self.at)
+            .ok_or_else(|| statement_parse_error(ParseDefect::UnexpectedTerm))?;
         self.at += 1;
         Ok(token)
     }
@@ -731,7 +1009,7 @@ impl StatementParser<'_> {
         if self.accept(token) {
             return Ok(());
         }
-        Err(statement_syntax_error())
+        Err(statement_parse_error(ParseDefect::UnexpectedTerm))
     }
 
     /// Whether the next token is this keyword, compared case-insensitively — "SELECT"
@@ -753,7 +1031,7 @@ impl StatementParser<'_> {
         if self.accept_word(keyword) {
             return Ok(());
         }
-        Err(statement_syntax_error())
+        Err(statement_parse_error(ParseDefect::Keyword))
     }
 
     /// One identifier: a bare word or a quoted name.
@@ -761,8 +1039,36 @@ impl StatementParser<'_> {
         match self.bump()? {
             Token::Word(word) => Ok(word.clone()),
             Token::Quoted(name) => Ok(name.clone()),
-            _ => Err(statement_syntax_error()),
+            _ => Err(statement_parse_error(ParseDefect::Identifier)),
         }
+    }
+
+    /// One call operand that has to be a document path: the functions that read an
+    /// attribute of the item take a PATH, and AWS names the function when it is given
+    /// anything else.
+    fn function_path(&mut self, function: &str) -> Result<StatementPath, RequestError> {
+        if !self.starts_path() {
+            return Err(requires_document_path(function));
+        }
+        self.path()
+    }
+
+    /// The `,` between two operands of one call: a call that states no further operand
+    /// has the wrong number of them.
+    fn expect_operand(&mut self, function: &str) -> Result<(), RequestError> {
+        if self.accept(&Token::Comma) {
+            return Ok(());
+        }
+        Err(incorrect_operand_count(function))
+    }
+
+    /// The `)` that closes one call: text where the close belongs is another operand,
+    /// so the call carries more of them than the function takes.
+    fn expect_call_close(&mut self, function: &str) -> Result<(), RequestError> {
+        if self.accept(&Token::Close) {
+            return Ok(());
+        }
+        Err(incorrect_operand_count(function))
     }
 
     /// Run `body` one level deeper, refusing a statement whose GRAMMAR nests past
@@ -809,7 +1115,29 @@ impl StatementParser<'_> {
         if self.accept_word("delete") {
             return self.delete().map(PartiqlStatement::Delete);
         }
-        Err(statement_syntax_error())
+        Err(self.not_a_data_manipulation())
+    }
+
+    /// The refusal a statement that opens with no data-manipulation verb earns.
+    ///
+    /// PartiQL reads text that states no such verb as an EXPRESSION, and this surface
+    /// runs statements that read or write items — so the defect is the text being an
+    /// expression when the expression accounts for all of it, and the first token the
+    /// expression does not account for when it does not.
+    fn not_a_data_manipulation(&mut self) -> RequestError {
+        let start = self.at;
+        let read = self.disjunction();
+        // The text accounted for as an expression reaches the end of the statement: what
+        // is left is an expression and no manipulation of data. Text the expression does
+        // not reach is the token it stopped at.
+        if self.at_end() {
+            return statement_parse_error(ParseDefect::NotDataManipulation);
+        }
+        if self.at > start {
+            return statement_parse_error(ParseDefect::TrailingToken);
+        }
+        read.err()
+            .unwrap_or_else(|| statement_parse_error(ParseDefect::TrailingToken))
     }
 
     /// `SELECT (* | attribute, …) FROM source [WHERE predicate] [ORDER BY attribute
@@ -834,7 +1162,8 @@ impl StatementParser<'_> {
             Some(items)
         };
         self.expect_word("from")?;
-        let (table, index) = self.source()?;
+        let source = self.read_source()?;
+        let (table, index) = (source.table, source.index);
         let filter = self.where_clause()?;
         let order_by = if self.accept_word("order") {
             self.expect_word("by")?;
@@ -866,10 +1195,7 @@ impl StatementParser<'_> {
     /// `INSERT INTO source VALUE tuple`.
     fn insert(&mut self) -> Result<InsertStatement, RequestError> {
         self.expect_word("into")?;
-        let (table, index) = self.source()?;
-        if index.is_some() {
-            return Err(unsupported_on_an_index());
-        }
+        let table = self.write_target()?;
         if !self.accept_word("value") {
             self.expect_word("values")?;
         }
@@ -891,10 +1217,7 @@ impl StatementParser<'_> {
     /// therefore a token the grammar has no place for, and the statement is refused as
     /// one token past its expression rather than read as a list.
     fn update(&mut self) -> Result<UpdateStatement, RequestError> {
-        let (table, index) = self.source()?;
-        if index.is_some() {
-            return Err(unsupported_on_an_index());
-        }
+        let table = self.write_target()?;
         let mut clauses = Vec::new();
         loop {
             if self.accept_word("set") {
@@ -927,9 +1250,10 @@ impl StatementParser<'_> {
     /// `DELETE FROM source WHERE predicate [RETURNING values]`.
     fn delete(&mut self) -> Result<DeleteStatement, RequestError> {
         self.expect_word("from")?;
-        let (table, index) = self.source()?;
-        if index.is_some() {
-            return Err(unsupported_on_an_index());
+        let source = self.read_source()?;
+        let table = source.table;
+        if source.index.is_some() {
+            return Err(single_table_in_data_manipulation(source.position));
         }
         let filter = self.required_where_clause()?;
         let returning = self.returning()?;
@@ -954,14 +1278,40 @@ impl StatementParser<'_> {
         Ok(())
     }
 
-    /// `table` or `table.index`, either part quoted or bare.
-    fn source(&mut self) -> Result<(String, Option<String>), RequestError> {        let table = self.identifier()?;
+    /// The source a `FROM` clause names — a `SELECT`'s and a `DELETE`'s: `table` or
+    /// `table.index`, either part quoted or bare, with the position the statement spells
+    /// the whole path at.
+    fn read_source(&mut self) -> Result<StatementSource, RequestError> {
+        let opens_at = self.position();
+        let table = self.identifier()?;
         let index = if self.accept(&Token::Dot) {
             Some(self.identifier()?)
         } else {
             None
         };
-        Ok((table, index))
+        // A source path names a table and, for a read, one index of it: a further
+        // component names nothing this store holds.
+        if self.peek() == Some(&Token::Dot) {
+            return Err(RequestError::Validation(
+                FROM_PATH_ARITY_MESSAGE.to_string(),
+            ));
+        }
+        Ok(StatementSource {
+            table,
+            index,
+            position: opens_at.through(self.previous_position()),
+        })
+    }
+
+    /// The target a write names DIRECTLY — an `INSERT`'s `INTO` and an `UPDATE`'s own
+    /// source. There is no `FROM` clause here, so a qualifier of any length addresses an
+    /// index rather than the table, and no write goes through one.
+    fn write_target(&mut self) -> Result<String, RequestError> {
+        let table = self.identifier()?;
+        if self.peek() == Some(&Token::Dot) {
+            return Err(unsupported_on_an_index());
+        }
+        Ok(table)
     }
 
     /// `RETURNING (ALL | MODIFIED) (OLD | NEW) *`.
@@ -1000,15 +1350,15 @@ impl StatementParser<'_> {
         for (function, is_add) in [("set_add", true), ("set_delete", false)] {
             if self.peek_word(function) && self.tokens.get(self.at + 1) == Some(&Token::Open) {
                 self.at += 2;
-                let target = self.path()?;
+                let target = self.function_path(function)?;
                 if target != path {
                     return Err(statement_refused(&format!(
                         "{function} adds to the attribute it is assigned to"
                     )));
                 }
-                self.expect(&Token::Comma)?;
+                self.expect_operand(function)?;
                 let value = self.value()?;
-                self.expect(&Token::Close)?;
+                self.expect_call_close(function)?;
                 return Ok(if is_add {
                     UpdateClause::Add(path, value)
                 } else {
@@ -1037,11 +1387,11 @@ impl StatementParser<'_> {
             self.at += 2;
             let (left, right) = self.nested(|parser| {
                 let left = parser.set_operand()?;
-                parser.expect(&Token::Comma)?;
+                parser.expect_operand("list_append")?;
                 let right = parser.set_operand()?;
                 Ok((left, right))
             })?;
-            self.expect(&Token::Close)?;
+            self.expect_call_close("list_append")?;
             return Ok(AssignmentOperand::ListAppend(Box::new(left), Box::new(right)));
         }
         if self.starts_path() {
@@ -1059,11 +1409,11 @@ impl StatementParser<'_> {
     }
 
     /// The `WHERE` an `UPDATE` or a `DELETE` must state: both are singleton writes,
-    /// addressed by the primary key the predicate pins.
+    /// addressed by the primary key the predicate pins, so a statement that states no
+    /// clause at all pins no key either.
     fn required_where_clause(&mut self) -> Result<Predicate, RequestError> {
-        self.where_clause()?.ok_or_else(|| {
-            statement_refused("an UPDATE or a DELETE must state a WHERE clause naming one item")
-        })
+        self.where_clause()?
+            .ok_or_else(|| RequestError::Validation(MANDATORY_KEY_EQUALITY_MESSAGE.to_string()))
     }
 
     fn disjunction(&mut self) -> Result<Predicate, RequestError> {
@@ -1106,21 +1456,15 @@ impl StatementParser<'_> {
         }
         // The documented boolean functions are predicates in their own right.
         if self.tokens.get(self.at + 1) == Some(&Token::Open) {
-            for function in [
-                "begins_with",
-                "contains",
-                "attribute_type",
-                "attribute_exists",
-                "attribute_not_exists",
-            ] {
+            for function in BOOLEAN_FUNCTIONS {
                 if self.peek_word(function) {
                     self.at += 2;
-                    let path = self.path()?;
+                    let path = self.function_path(function)?;
                     let predicate = match function {
                         "attribute_exists" => Predicate::Exists(path, true),
                         "attribute_not_exists" => Predicate::Exists(path, false),
                         _ => {
-                            self.expect(&Token::Comma)?;
+                            self.expect_operand(function)?;
                             let operand = self.operand()?;
                             match function {
                                 "begins_with" => Predicate::BeginsWith(path, operand),
@@ -1132,7 +1476,7 @@ impl StatementParser<'_> {
                             }
                         }
                     };
-                    self.expect(&Token::Close)?;
+                    self.expect_call_close(function)?;
                     return Ok(predicate);
                 }
             }
@@ -1187,10 +1531,10 @@ impl StatementParser<'_> {
             });
         }
         if negated {
-            return Err(statement_syntax_error());
+            return Err(statement_parse_error(ParseDefect::UnexpectedTerm));
         }
         let Some(Token::Compare(operator)) = self.peek().cloned() else {
-            return Err(statement_syntax_error());
+            return Err(statement_parse_error(ParseDefect::UnexpectedTerm));
         };
         self.at += 1;
         let right = self.operand()?;
@@ -1202,8 +1546,8 @@ impl StatementParser<'_> {
     fn operand(&mut self) -> Result<PredicateOperand, RequestError> {
         if self.peek_word("size") && self.tokens.get(self.at + 1) == Some(&Token::Open) {
             self.at += 2;
-            let path = self.path()?;
-            self.expect(&Token::Close)?;
+            let path = self.function_path("size")?;
+            self.expect_call_close("size")?;
             return Ok(PredicateOperand::Size(path));
         }
         if self.starts_path() {
@@ -1228,6 +1572,19 @@ impl StatementParser<'_> {
     /// One document path: an attribute name, then the `.name` and `[index]` steps
     /// into it.
     fn path(&mut self) -> Result<StatementPath, RequestError> {
+        // A name the statement CALLS is a function, not a path. Every function this
+        // dialect defines is read where the grammar admits it — before a path is read —
+        // so a call that reaches here is either a function the dialect does not define,
+        // or one of its own standing where only a name may stand, which is no name.
+        if self.tokens.get(self.at + 1) == Some(&Token::Open) {
+            if let Some(Token::Word(name)) = self.peek() {
+                if is_defined_function(name) {
+                    return Err(statement_parse_error(ParseDefect::Identifier));
+                }
+                let name = name.clone();
+                return Err(unrecognized_function(&name, self.position()));
+            }
+        }
         let mut segments = vec![PathSegment::Name(self.identifier()?)];
         loop {
             if segments.len() > MAX_STATEMENT_DEPTH {
@@ -1241,11 +1598,11 @@ impl StatementParser<'_> {
             }
             if self.accept(&Token::OpenBracket) {
                 let Token::Number(lexeme) = self.bump()?.clone() else {
-                    return Err(statement_syntax_error());
+                    return Err(statement_parse_error(ParseDefect::UnexpectedTerm));
                 };
                 let index = lexeme
                     .parse::<usize>()
-                    .map_err(|_| statement_syntax_error())?;
+                    .map_err(|_| statement_parse_error(ParseDefect::UnexpectedTerm))?;
                 self.expect(&Token::CloseBracket)?;
                 segments.push(PathSegment::Index(index));
                 continue;
@@ -1274,13 +1631,13 @@ impl StatementParser<'_> {
             }
             Some(Token::Number(lexeme)) => {
                 self.at += 1;
-                Ok(AttributeValue::N(canonical_number_text(&lexeme)?))
+                Ok(AttributeValue::N(statement_number(&lexeme)?))
             }
             Some(Token::Minus | Token::Plus) => {
                 let negative = self.peek() == Some(&Token::Minus);
                 self.at += 1;
                 let Some(Token::Number(lexeme)) = self.peek().cloned() else {
-                    return Err(statement_syntax_error());
+                    return Err(statement_parse_error(ParseDefect::UnexpectedTerm));
                 };
                 self.at += 1;
                 let signed = if negative {
@@ -1288,7 +1645,7 @@ impl StatementParser<'_> {
                 } else {
                     lexeme
                 };
-                Ok(AttributeValue::N(canonical_number_text(&signed)?))
+                Ok(AttributeValue::N(statement_number(&signed)?))
             }
             Some(Token::Parameter) => {
                 self.at += 1;
@@ -1297,10 +1654,7 @@ impl StatementParser<'_> {
                     .get(self.used_parameters)
                     .cloned()
                     .ok_or_else(|| {
-                        statement_refused(
-                            "the number of parameters in the request and in the statement do not \
-                             match",
-                        )
+                        RequestError::Validation(PARAMETER_COUNT_MESSAGE.to_string())
                     })?;
                 self.used_parameters += 1;
                 Ok(value)
@@ -1336,9 +1690,9 @@ impl StatementParser<'_> {
                 if word.eq_ignore_ascii_case("false") {
                     return Ok(AttributeValue::Bool(false));
                 }
-                Err(statement_syntax_error())
+                Err(statement_parse_error(ParseDefect::UnexpectedTerm))
             }
-            _ => Err(statement_syntax_error()),
+            _ => Err(statement_parse_error(ParseDefect::UnexpectedTerm)),
         }
     }
 
@@ -1368,7 +1722,7 @@ impl StatementParser<'_> {
             let name = match self.bump()? {
                 Token::Text(text) => text.clone(),
                 Token::Quoted(name) => name.clone(),
-                _ => return Err(statement_syntax_error()),
+                _ => return Err(statement_parse_error(ParseDefect::UnexpectedTerm)),
             };
             self.expect(&Token::Colon)?;
             let value = self.raw_value()?;
@@ -2058,8 +2412,7 @@ pub fn singleton_key(table: &Table, predicate: &Predicate) -> Result<ItemKey, Re
             // is about the clause as a whole — every key attribute pinned by equality —
             // so the refusal names no one attribute.
             return Err(RequestError::Validation(
-                "Where clause does not contain a mandatory equality on all key attributes"
-                    .to_string(),
+                MANDATORY_KEY_EQUALITY_MESSAGE.to_string(),
             ));
         };
         key.insert(element.attribute_name.clone(), value.clone());

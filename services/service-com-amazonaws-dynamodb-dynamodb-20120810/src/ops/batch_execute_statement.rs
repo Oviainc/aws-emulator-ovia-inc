@@ -36,8 +36,10 @@
 //!   request is refused rather than half-applied.
 //! * Each statement reports what it did in its own slot: a read reports the item it
 //!   found (none at all when the key holds none), a write reports what its `RETURNING`
-//!   clause asked for, and `ConsumedCapacity` carries one entry per statement that
-//!   consumed capacity, "ordered according to the ordering of the statements".
+//!   clause asked for, every slot that resolved a table echoes that table under
+//!   `TableName` — so a batch spread over several tables can be attributed slot by slot
+//!   — and `ConsumedCapacity` carries one entry per statement that consumed capacity,
+//!   "ordered according to the ordering of the statements".
 //! * A statement's write is admitted from the capacity its table is provisioned for
 //!   ([`crate::state::Table::admit_write`]): one past that budget is throttled in its
 //!   own slot, with the `ProvisionedThroughputExceeded` code, rather than applied.
@@ -481,6 +483,18 @@ fn run_slot(
             return_old_on_failure,
         ),
     }
+    // Every slot is reported against the table its statement addressed — the one it
+    // failed on, and the one it ran against — so a caller that batched statements over
+    // several tables can attribute each slot's result to its table.
+    .map(|(response, capacity)| {
+        (
+            BatchStatementResponse {
+                table_name: Some(name.clone()),
+                ..response
+            },
+            capacity,
+        )
+    })
     .map_err(|failure| failure.at(&name))
 }
 

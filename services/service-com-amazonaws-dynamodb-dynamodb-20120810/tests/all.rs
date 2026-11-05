@@ -95,6 +95,8 @@ mod on_demand_throughput_capacity_mode;
 mod paging_start_keys;
 #[path = "all/parallel_scan_segment_refusals.rs"]
 mod parallel_scan_segment_refusals;
+#[path = "all/partiql_refusal_wording.rs"]
+mod partiql_refusal_wording;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]
