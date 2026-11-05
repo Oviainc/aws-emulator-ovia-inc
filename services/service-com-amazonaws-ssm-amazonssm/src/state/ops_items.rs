@@ -127,6 +127,12 @@ pub const OPS_ITEM_CATEGORIES: &[&str] = &[
 /// past it however it reached the store.
 pub const MAX_OPS_ITEMS: usize = 10_000;
 
+/// The sentence a client reads for an id the Region holds no OpsItem under, which is
+/// `OpsItemNotFoundException`'s own documentation — stated once here so every operation
+/// that cannot resolve an OpsItem id serves one wording.
+pub const OPS_ITEM_NOT_FOUND_MESSAGE: &str =
+    "The specified OpsItem ID doesn't exist. Verify the ID and try again.";
+
 /// Which member of a create was refused, and why — the payload of
 /// `OpsItemInvalidParameterException`, whose `ParameterNames` names the member and whose
 /// `Message` says what the rule is.
@@ -140,7 +146,7 @@ pub struct ParameterRejection {
 
 impl ParameterRejection {
     /// A rejection of `parameter` because of `message`.
-    fn new(parameter: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(parameter: &str, message: impl Into<String>) -> Self {
         Self {
             parameter: parameter.to_string(),
             message: message.into(),

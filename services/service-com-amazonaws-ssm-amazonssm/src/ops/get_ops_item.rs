@@ -155,14 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // `OpsItemNotFoundException`'s own documentation is the sentence a client reads
-        // for an id this Region holds no OpsItem under: "The specified OpsItem ID doesn't
-        // exist. Verify the ID and try again."
+        // for an id this Region holds no OpsItem under, stated once beside the store
+        // (`crate::state::ops_items::OPS_ITEM_NOT_FOUND_MESSAGE`): "The specified OpsItem
+        // ID doesn't exist. Verify the ID and try again."
         let not_found = || {
             GetOpsItemErrorModeled::OpsItemNotFoundException(OpsItemNotFoundException {
-                message: Some(
-                    "The specified OpsItem ID doesn't exist. Verify the ID and try again."
-                        .to_string(),
-                ),
+                message: Some(crate::state::ops_items::OPS_ITEM_NOT_FOUND_MESSAGE.to_string()),
             })
         };
         let Some(record) = store.ops_item(&region, &input.ops_item_id) else {

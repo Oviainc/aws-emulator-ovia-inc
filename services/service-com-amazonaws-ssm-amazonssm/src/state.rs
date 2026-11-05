@@ -85,7 +85,10 @@
 //! Then **OpsCenter's OpsItems**, which live in [`ops_items`]: `CreateOpsItem`
 //! mints one and `GetOpsItem` reports it, keyed by `(region, ops item id)` the same way,
 //! and everything a read reports — the status, the version, who created it and when —
-//! comes from what the create persisted.
+//! comes from what the create persisted. The resources associated with an OpsItem as its
+//! **related items** live beside them in [`ops_item_related_items`], keyed by
+//! `(region, ops item id, association id)`: `AssociateOpsItemRelatedItem` creates one and
+//! `ListOpsItemRelatedItems` reports what it persisted.
 //!
 //! Then the **patch baselines** Patch Manager holds ([`patch_baselines`]):
 //! `CreatePatchBaseline` mints one the account owns, keyed by `(region, baseline id)`,
@@ -135,6 +138,10 @@ pub mod resource_policies;
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
 pub mod ops_items;
+
+/// The related-item resources an OpsItem carries: the record an association persists, the
+/// rules it is held to and the store a listing projects.
+pub mod ops_item_related_items;
 
 /// The patch baselines Patch Manager holds, the ones Systems Manager predefines, and
 /// which of them is the default for an operating system.
@@ -3006,6 +3013,19 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// store never carry one id.
     pub ops_item_sequence: u64,
 
+    /// Every related-item association, keyed by `(region, ops item id, association id)`:
+    /// an association belongs to the OpsItem it was created against and is identified
+    /// there by the id the create minted. A `BTreeMap` so a listing walks a stable, total
+    /// order and can resume a page from the association id it stopped at. See
+    /// [`ops_item_related_items`].
+    pub ops_item_related_items:
+        BTreeMap<(String, String, String), ops_item_related_items::RelatedItemRecord>,
+
+    /// How many related-item association ids this store has minted, which is what the next
+    /// mint is drawn from
+    /// ([`ComAmazonawsSsmAmazonssmState::next_related_item_association_id`]).
+    pub ops_item_related_item_sequence: u64,
+
     /// Every service setting an account has MODIFIED, keyed by `(region, setting id)`: a
     /// setting is reached through one Region's endpoint and its ARN names that Region. A
     /// setting nobody has modified holds no entry and is reported from the catalogue
@@ -3068,6 +3088,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             cloud_connectors: BTreeMap::new(),
             ops_items: BTreeMap::new(),
             ops_item_sequence: 0,
+            ops_item_related_items: BTreeMap::new(),
+            ops_item_related_item_sequence: 0,
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),
