@@ -687,7 +687,7 @@ struct RatedAnswer {
 async fn a_stored_answer_is_reported_and_rated() {
     // The question answered is the same in every row; what varies is the answer. Its
     // choices are the question's own, so a row records a status for each of them.
-    const QUESTION: &str = "sec-01";
+    const QUESTION: &str = "securely-operate";
     let choices = framework_choice_ids(QUESTION);
     let last = choices
         .last()
@@ -860,12 +860,12 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     let workload_id = framework_workload(&client, "frozen-host").await;
 
     // Before the milestone: one question answered with nothing in place.
-    let frozen_question_choices = framework_choice_ids("rel-01");
-    let later_question_choices = framework_choice_ids("cost-02");
+    let frozen_question_choices = framework_choice_ids("manage-service-quotas");
+    let later_question_choices = framework_choice_ids("govern-usage");
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "rel-01",
+        "manage-service-quotas",
         answered_over(&frozen_question_choices, &[], true, None),
     );
     let recorded = client
@@ -889,13 +889,13 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "rel-01",
+        "manage-service-quotas",
         answered_over(&frozen_question_choices, &frozen_all, true, None),
     );
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "cost-02",
+        "govern-usage",
         answered_over(&later_question_choices, &later_all, true, None),
     );
 
@@ -920,10 +920,10 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     .await;
 
     for (case, summaries, question, expected) in [
-        ("live/changed-answer", &live, "rel-01", "NONE"),
-        ("live/new-answer", &live, "cost-02", "NONE"),
-        ("milestone/changed-answer", &frozen, "rel-01", "HIGH"),
-        ("milestone/new-answer", &frozen, "cost-02", "UNANSWERED"),
+        ("live/changed-answer", &live, "manage-service-quotas", "NONE"),
+        ("live/new-answer", &live, "govern-usage", "NONE"),
+        ("milestone/changed-answer", &frozen, "manage-service-quotas", "HIGH"),
+        ("milestone/new-answer", &frozen, "govern-usage", "UNANSWERED"),
     ] {
         let actual = risk_of(summaries, question);
         assert_eq!(

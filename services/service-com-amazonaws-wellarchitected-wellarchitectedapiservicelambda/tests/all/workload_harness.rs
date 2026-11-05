@@ -845,19 +845,34 @@ pub(crate) fn framework_answer_that_does_not_apply(question_id: &str, reason: &s
     )
 }
 
-/// The ARN an AWS-OFFICIAL lens carries: "the lens ARN, such as
-/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc) — the account
-/// segment is EMPTY, because AWS publishes the lens rather than an account owning it.
-/// Spelled out here (rather than read back out of the code under test) with the account
-/// placeholder taken from the emulator's one source of truth, so a caller would fail if
-/// an owner account appeared in it.
+/// The ARN the service REPORTS for an AWS-OFFICIAL lens: partition-global and owned by no
+/// customer account — `arn:aws:wellarchitected::aws:lens/<alias>`. Spelled out here
+/// (rather than read back out of the code under test) with the account placeholder taken
+/// from the emulator's one source of truth, so a caller would fail if an owner account
+/// appeared in it.
+///
+/// `region` is the Region the case asked in, which an AWS-official lens's ARN does not
+/// name: the one lens is the same lens in every Region. A caller may still NAME the lens
+/// by a Region-qualified ARN ([`regional_lens_arn`]), which resolves to the same lens.
 pub(crate) fn official_lens_arn(region: &str, alias: &str) -> String {
-    let arn = format!("arn:aws:wellarchitected:{region}::lens/{alias}");
+    let arn = format!("arn:aws:wellarchitected::aws:lens/{alias}");
     assert!(
         !arn.contains(engine::emulator_account_id()),
         "an AWS-official lens ARN names no owner account, got {arn:?}"
     );
+    assert!(
+        !arn.contains(region) || region.is_empty(),
+        "an AWS-official lens ARN names no Region, got {arn:?} for {region:?}"
+    );
     arn
+}
+
+/// An AWS-official lens ARN as a CALLER may spell it, naming the Region it signed for —
+/// the form the `LensAlias` doc shows ("the lens ARN, such as
+/// `arn:aws:wellarchitected:us-east-1::lens/serverless`"). Accepted on input, and naming
+/// the same lens as the bare alias and as [`official_lens_arn`].
+pub(crate) fn regional_lens_arn(region: &str, alias: &str) -> String {
+    format!("arn:aws:wellarchitected:{region}::lens/{alias}")
 }
 
 /// A minimal valid `CreateWorkload` request; callers override the members their case

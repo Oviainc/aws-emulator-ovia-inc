@@ -325,10 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`crate::state::...::lens_arn_of`, the one place this service resolves a
             // lens's ARN).
             lens_alias: Some(input.lens_alias.clone()),
-            lens_arn: Some(store.lens_arn_of(
-                &input.lens_alias,
-                &crate::state::request_region(ctx.parts()),
-            )),
+            lens_arn: Some(store.lens_arn_of(&input.lens_alias)),
             improvement_summaries: Some(improvement_summaries),
             next_token: page.next_token,
         })

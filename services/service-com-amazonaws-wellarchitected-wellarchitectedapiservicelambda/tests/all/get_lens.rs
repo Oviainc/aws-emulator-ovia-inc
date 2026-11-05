@@ -378,9 +378,10 @@ async fn an_official_lens_is_read_from_the_shipped_catalog() {
             official_lens_arn(REGION, alias),
             "case {alias:?}: expected the account-less official ARN, got {read:?}"
         );
-        assert!(
-            read.get("Owner").is_none(),
-            "case {alias:?}: an official lens ARN names no owner account, got {read:?}"
+        assert_eq!(
+            read.get("Owner").and_then(Value::as_str),
+            Some(state::AWS_OFFICIAL_LENS_OWNER),
+            "case {alias:?}: a lens AWS publishes is owned by AWS, got {read:?}"
         );
         assert!(
             read.get("Tags").is_none(),

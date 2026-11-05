@@ -528,3 +528,8 @@ mod check_best_practice_agreement;
 // are appended here so a new suite does not collide with another insertion.
 #[path = "all/lens_content_validation.rs"]
 mod lens_content_validation;
+
+// Appended at the end of this list for the same reason as the declaration above: the sorted
+// position for a lens suite falls in a crowded run of this list.
+#[path = "all/lens_catalog_identity.rs"]
+mod lens_catalog_identity;

@@ -42,7 +42,7 @@ const ABSENT_WORKLOAD_ID: &str = "0123456789abcdef0123456789abcdef";
 
 /// The `QuestionId` and `PillarId` the framework lens's catalog really carries, used as the
 /// resolvable value a row is varied against.
-const FRAMEWORK_QUESTION: &str = "ops-01";
+const FRAMEWORK_QUESTION: &str = "organization-priorities";
 const FRAMEWORK_PILLAR: &str = "operationalExcellence";
 
 /// A `TemplateArn` of the published form that nothing is stored under.
@@ -625,7 +625,7 @@ async fn a_choice_the_question_does_not_offer_is_refused_with_the_questions_cata
     // The forms a `ChoiceId` that is no choice of the question can take: a word no question
     // offers, a choice of ANOTHER question of the same lens, and a choice of this question
     // in another case.
-    let other_question = offered_choices(&client, &workload_id, "sus-01").await;
+    let other_question = offered_choices(&client, &workload_id, "region-selection").await;
     let undefined: [(&str, String); 3] = [
         ("word-no-question-offers", "not-a-choice".to_string()),
         (

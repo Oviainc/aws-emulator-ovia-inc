@@ -148,8 +148,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let region = crate::state::request_region(ctx.parts());
-
         // "For Amazon Web Services official lenses, this is either the lens alias … or
         // the lens ARN … For custom lenses, this is the lens ARN" (`LensAlias` doc), so
         // the name itself says which half of the catalog the lens is resolved against.
@@ -157,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lens store.
         if crate::state::is_aws_official_lens(&input.lens_alias) {
             return Ok(GetLensOutput {
-                lens: Some(official_catalog_lens(&input, &region)?),
+                lens: Some(official_catalog_lens(&input)?),
             });
         }
 
@@ -258,7 +256,7 @@ const NO_SHARE_INVITATION: &str = "";
 /// that is false — it would say the lens does not exist. `ListLenses` leaving it out of
 /// the enumeration is the same judgement from the other side: there is no content to
 /// describe it by, and every member that would carry that content is modelled optional.
-fn official_catalog_lens(input: &GetLensInput, region: &str) -> Result<Lens, GetLensError> {
+fn official_catalog_lens(input: &GetLensInput) -> Result<Lens, GetLensError> {
     if !crate::state::is_published_official_lens(&input.lens_alias) {
         return Err(GetLensErrorModeled::ResourceNotFoundException(
             crate::state::unknown_lens_not_found(&input.lens_alias),
@@ -281,20 +279,19 @@ fn official_catalog_lens(input: &GetLensInput, region: &str) -> Result<Lens, Get
     }
 
     Ok(Lens {
-        // The lens is reported in the Region the request was signed for, whatever Region
-        // an ARN spelling of the name carried: a lens is named by its alias ("Each lens
-        // is identified by its `LensSummary$LensAlias`"), and every other read of an
-        // official lens here answers the ARN of that Region's endpoint
-        // ([`crate::state::official_lens_arn`], as `ListLenses` and a lens review report
-        // it), so one Region's read never echoes another's ARN back.
-        lens_arn: Some(crate::state::official_lens_arn(region, &input.lens_alias)),
+        // A lens Amazon Web Services publishes is reported by its partition-global ARN,
+        // whatever Region an ARN spelling of the name carried: a lens is named by its alias
+        // ("Each lens is identified by its `LensSummary$LensAlias`") and the one lens is
+        // the same lens in every Region ([`crate::state::official_lens_arn`], as
+        // `ListLenses` and a lens review report it).
+        lens_arn: Some(crate::state::official_lens_arn(&input.lens_alias)),
         lens_version,
         name: described.map(|official| official.name.to_string()),
         description: described.map(|official| official.description.to_string()),
-        // An official lens ARN names no owner account — AWS publishes the lens rather
-        // than an account owning it — and `Owner` is modelled an account id, which no
-        // placeholder would satisfy honestly.
-        owner: None,
+        // The owner of a lens AWS publishes is AWS itself rather than an account
+        // ([`crate::state::AWS_OFFICIAL_LENS_OWNER`], the same owner `ListLenses` reports
+        // for it).
+        owner: Some(crate::state::AWS_OFFICIAL_LENS_OWNER.to_string()),
         // As above: an official lens is not reached through a share invitation, and the
         // member is reported for it either way.
         share_invitation_id: Some(NO_SHARE_INVITATION.to_string()),

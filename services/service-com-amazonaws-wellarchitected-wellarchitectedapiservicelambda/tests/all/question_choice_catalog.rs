@@ -327,16 +327,12 @@ async fn every_answer_summary_carries_the_questions_choice_catalog() {
                 "case {case:?}/{question_id:?}: a ChoiceId must be unique within its \
                  question, got {ids:?}"
             );
-            for (index, (choice_id, title)) in catalog.iter().enumerate() {
-                // The id scheme the catalog documents: the question that offers the
-                // choice and the choice's position in that question's catalog, so a
-                // client reading an id can tell which question it belongs to.
-                assert_eq!(
-                    choice_id,
-                    &format!("{question_id}-bp-{:02}", index + 1),
-                    "case {case:?}/{question_id:?}: choice {index} must be named for its \
-                     question and position, got {choice_id:?}"
-                );
+            for (choice_id, title) in catalog {
+                // The framework lens publishes its own `ChoiceId` per best practice, so
+                // the id is the lens's rather than derived from the question; what every
+                // read has to agree on is the id, its uniqueness within the question and
+                // the modelled bounds. The published ids themselves are pinned against the
+                // lens's content by `super::lens_catalog_identity`.
                 assert!(
                     (CHOICE_ID_RANGE.0..=CHOICE_ID_RANGE.1).contains(&choice_id.len()),
                     "case {case:?}/{question_id:?}: ChoiceId is @length{CHOICE_ID_RANGE:?}, \
@@ -385,7 +381,7 @@ async fn a_discovered_choice_id_round_trips_through_the_stored_answer() {
 
     // Four questions from four pillars, so the rule is exercised across the catalog
     // rather than on one question.
-    let questions: Vec<String> = ["ops-01", "sec-04", "rel-09", "sus-02"]
+    let questions: Vec<String> = ["organization-priorities", "detect-investigate-events", "back-up-data", "user-behavior-patterns"]
         .iter()
         .map(ToString::to_string)
         .collect();
@@ -511,11 +507,11 @@ async fn a_questions_catalog_offers_the_frameworks_published_best_practices() {
     let catalogs = catalogs_of("best-practices", &summaries);
 
     for (question_id, best_practice) in [
-        ("ops-01", "Evaluate external customer needs"),
-        ("sec-01", "Separate workloads using accounts"),
-        ("rel-09", "Secure and encrypt backups"),
-        ("cost-02", "Implement cost controls"),
-        ("sus-05", "Use managed services"),
+        ("organization-priorities", "Evaluate external customer needs"),
+        ("securely-operate", "Separate workloads using accounts"),
+        ("back-up-data", "Secure and encrypt backups"),
+        ("govern-usage", "Implement cost controls"),
+        ("hardware-patterns", "Use managed services"),
     ] {
         let catalog = catalogs
             .get(question_id)

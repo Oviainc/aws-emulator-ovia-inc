@@ -182,7 +182,7 @@ impl Seed {
 /// published numbering and differing in HOW MANY best practices they ask about — `sus-01`
 /// asks about exactly one, so "the first choice" and "every choice" are one selection
 /// there.
-const QUESTIONS: [&str; 3] = ["ops-01", "sec-02", "sus-01"];
+const QUESTIONS: [&str; 3] = ["organization-priorities", "identities", "region-selection"];
 
 /// A request that supplies no writable member records no answer and moves nothing: the
 /// question stays `UNANSWERED` where nothing has answered it, an answered question is

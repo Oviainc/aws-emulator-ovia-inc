@@ -726,12 +726,16 @@ async fn an_official_lenss_review_still_asks_its_catalog_questions() {
             "case {question_id:?}: every question of the catalog asks about best practices, got \
              {summary:?}"
         );
-        for (position, (choice_id, title)) in choices.iter().enumerate() {
-            assert_eq!(
-                *choice_id,
-                format!("{question_id}-bp-{:02}", position + 1),
-                "case {question_id:?}: an official lens's choice id is derived from the question \
-                 and the best practice's position, got {summary:?}"
+        // A choice of the framework lens is named by the `ChoiceId` the lens publishes for
+        // that best practice (pinned against the lens's content by
+        // `super::lens_catalog_identity`), so what this read has to show is one id per best
+        // practice, each naming exactly one choice of the question.
+        let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (choice_id, title) in &choices {
+            assert!(
+                !choice_id.is_empty() && named.insert(choice_id.as_str()),
+                "case {question_id:?}: every choice carries a ChoiceId naming one best \
+                 practice of the question, got {summary:?}"
             );
             assert!(
                 !title.is_empty(),

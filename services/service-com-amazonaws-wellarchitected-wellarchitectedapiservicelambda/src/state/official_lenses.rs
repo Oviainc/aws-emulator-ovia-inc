@@ -27,35 +27,57 @@
 //! [`super::AWS_OFFICIAL_LENS_ALIASES`] — the aliases AWS publishes, which is what a lens
 //! NAME resolves against when a lens is applied to a workload
 //! ([`super::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resolve_lens`])
-//! — and this catalog is the subset of them this emulator carries CONTENT for: a published
-//! alias with no entry here names a lens this emulator knows exists and holds no questions
-//! for, which is therefore applicable but not listed, because a `LensSummary` is content
-//! this emulator would have to invent. A test pins that containment.
+//! — and this catalog carries the CONTENT of those lenses: `ListLenses` reports a
+//! `LensSummary` for each row here, so the published lens library a client discovers is
+//! this table. A published alias with no row is a lens this emulator knows exists and
+//! holds no questions for, which is therefore applicable but not listed, because a
+//! `LensSummary` is content this emulator would have to invent. A test pins that
+//! containment.
 //!
-//! Everything below the lens — its pillars, its questions and the best practices each
-//! question asks about — is lens CONTENT, which neither the Smithy model nor the service
-//! docs publish in a machine-readable form, so it is this emulator's own, exactly as the
-//! framework lens's `question_id`s already are (see
-//! [`super::FRAMEWORK_LENS_QUESTIONS`]): the framework lens carries the framework's
-//! published questions and best practices, and each specialised lens carries a question
-//! set written from that lens's published focus areas, under this emulator's own stable
-//! ids. [`SPECIALISED_LENS_VERSION`] is what every specialised entry reports as its
-//! `LensVersion`, and it names THIS catalog's revision of that content — the same reading
-//! as [`super::FRAMEWORK_LENS_VERSION`].
+//! The FRAMEWORK lens's content is the framework's own published content: its `question_id`s
+//! and its choices' `ChoiceId`s and prose are the ones the Well-Architected Framework lens
+//! publishes, carried verbatim (see [`super::FRAMEWORK_LENS_QUESTIONS`]).
 //!
-//! The catalog is extensible by construction: a lens AWS publishes that is not listed here
-//! is simply a lens this emulator holds no content for, and adding it is adding a row.
+//! Below each SPECIALISED lens, the pillars, questions and best practices are a question
+//! set written from that lens's published focus areas, under this emulator's own stable ids
+//! ([`super::bp`]), because AWS publishes those lenses' content in no machine-readable form
+//! the model or the service docs carry. [`SPECIALISED_LENS_VERSION`] is what every
+//! specialised entry reports as its `LensVersion`, and it names THIS catalog's revision of
+//! that content.
+//!
+//! The catalog is extensible by construction: adding a lens AWS publishes is adding a row
+//! here and its alias to [`super::AWS_OFFICIAL_LENS_ALIASES`].
 
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::LensSummary;
 
 use super::{
-    is_aws_official_lens, lens_alias, official_lens_arn, q, FrameworkQuestion,
-    FRAMEWORK_LENS_ALIAS, FRAMEWORK_LENS_DESCRIPTION, FRAMEWORK_LENS_NAME,
-    FRAMEWORK_LENS_QUESTIONS, FRAMEWORK_LENS_VERSION, LENS_STATUS_CURRENT,
-    LENS_STATUS_PUBLISHED, LENS_TYPE_AWS_OFFICIAL,
+    bp, is_aws_official_lens, lens_alias, official_lens_arn, FrameworkQuestion,
+    AWS_OFFICIAL_LENS_OWNER, FRAMEWORK_LENS_ALIAS, FRAMEWORK_LENS_DESCRIPTION,
+    FRAMEWORK_LENS_NAME, FRAMEWORK_LENS_QUESTIONS, FRAMEWORK_LENS_VERSION,
+    LENS_STATUS_CURRENT, LENS_STATUS_PUBLISHED, LENS_TYPE_AWS_OFFICIAL,
 };
+
+/// One question of a lens whose question set this emulator AUTHORED: the pillar, the
+/// question id, the question and the titles of the best practices it asks about.
+///
+/// The counterpart of [`super::q`], which states a question of a lens that PUBLISHES its
+/// content and therefore carries each choice's own id and prose: here each title becomes a
+/// choice named by its position in the question and carrying no prose ([`bp`]), because
+/// this emulator has no published id or prose to report for it. A macro rather than a
+/// `const fn` because a slice of choices cannot be built from a slice of titles in a
+/// constant — the expansion builds it one title at a time.
+macro_rules! authored_question {
+    ($pillar_id:expr, $question_id:expr, $title:expr, &[$($best_practice:expr),* $(,)?]) => {
+        FrameworkQuestion {
+            pillar_id: $pillar_id,
+            question_id: $question_id,
+            title: $title,
+            best_practices: &[$(bp($best_practice)),*],
+        }
+    };
+}
 
 /// The six pillars of the AWS Well-Architected Framework, in the order the framework
 /// presents them: the `PillarId` each is named by on the wire ("The ID used to identify a
@@ -181,19 +203,17 @@ impl OfficialLens {
         midnight_utc(self.version)
     }
 
-    /// The `LensSummary` `ListLenses` reports this lens as, in the Region the request was
-    /// signed for.
+    /// The `LensSummary` `ListLenses` reports this lens as.
     ///
-    /// An official lens ARN names no owner account — "the lens ARN, such as
-    /// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc), the same
-    /// distinction [`is_aws_official_lens`] reads — so the summary reports no `Owner`
-    /// either: AWS publishes the lens rather than an account owning it, and `Owner` is
-    /// modelled an `AwsAccountId` (`^[0-9]{12}$`), which no placeholder would satisfy
-    /// honestly.
-    pub fn summary(&self, region: &str) -> LensSummary {
+    /// An AWS-official lens's ARN is partition-global and names the publisher rather than
+    /// an owner account ([`official_lens_arn`]), so the summary carries the same identity
+    /// in every Region, and `Owner` reports that publisher
+    /// ([`AWS_OFFICIAL_LENS_OWNER`]): AWS publishes the lens rather than an account owning
+    /// it, which is the distinction [`is_aws_official_lens`] reads.
+    pub fn summary(&self) -> LensSummary {
         let published_at = ::aws_smithy_types::DateTime::from(self.published_at());
         LensSummary {
-            lens_arn: Some(official_lens_arn(region, self.alias)),
+            lens_arn: Some(official_lens_arn(self.alias)),
             lens_alias: Some(self.alias.to_string()),
             lens_name: Some(self.name.to_string()),
             lens_type: Some(LENS_TYPE_AWS_OFFICIAL.to_string()),
@@ -201,7 +221,7 @@ impl OfficialLens {
             created_at: Some(published_at),
             updated_at: Some(published_at),
             lens_version: Some(self.version.to_string()),
-            owner: None,
+            owner: Some(AWS_OFFICIAL_LENS_OWNER.to_string()),
             // AWS's own lenses are published content: their content IS the version they
             // are published at.
             lens_status: Some(LENS_STATUS_PUBLISHED.to_string()),
@@ -344,9 +364,9 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
     FRAMEWORK_LENS,
     OfficialLens {
         alias: "serverless",
-        name: "Serverless Applications Lens",
+        name: "Serverless Lens",
         version: SPECIALISED_LENS_VERSION,
-        description: "The Serverless Applications Lens covers how to design, deploy and \
+        description: "The Serverless Lens covers how to design, deploy and \
              operate serverless application workloads: the health of an event-driven \
              application, access to its APIs, the request rates it regulates and the cost \
              of the functions and managed services it is built from.",
@@ -443,62 +463,92 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
              standards.",
         questions: HEALTHCARE_LENS_QUESTIONS,
     },
+    OfficialLens {
+        alias: "connectedmobility",
+        name: "Connected Mobility Lens",
+        version: SPECIALISED_LENS_VERSION,
+        description: "The Connected Mobility Lens covers how to design and operate \
+             connected vehicle workloads: onboarding vehicles and their identities, \
+             ingesting vehicle telemetry at fleet scale, protecting the personal data a \
+             vehicle produces, and delivering software to vehicles over the air.",
+        questions: CONNECTED_MOBILITY_LENS_QUESTIONS,
+    },
+    OfficialLens {
+        alias: "devops",
+        name: "DevOps Lens",
+        version: SPECIALISED_LENS_VERSION,
+        description: "The DevOps Lens covers how teams build and run software together: \
+             organizing delivery teams and their ownership, automating the path from commit \
+             to production, keeping environments reproducible, and learning from the \
+             operational signals a release produces.",
+        questions: DEVOPS_LENS_QUESTIONS,
+    },
+    OfficialLens {
+        alias: "games",
+        name: "Games Industry Lens",
+        version: SPECIALISED_LENS_VERSION,
+        description: "The Games Industry Lens covers how to build and operate game \
+             workloads: running game servers and matchmaking for players, keeping player \
+             data and progression safe, scaling for a launch or an event, and operating \
+             live content at a cost each title can carry.",
+        questions: GAMES_LENS_QUESTIONS,
+    },
 ];
 
 /// The Serverless Applications Lens's question set: the lens's published focus areas, as
 /// this emulator's content (see this module's docs), in pillar order.
 const SERVERLESS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "serverless-ops-01", "How do you evaluate your serverless application's health?", &[
+    authored_question!("operationalExcellence", "serverless-ops-01", "How do you evaluate your serverless application's health?", &[
         "Understand, analyze and alert on the metrics the platform emits",
         "Use distributed tracing across the application's components",
         "Collect, analyze and alert on application logs",
         "Instrument code with business and operational context",
     ]),
-    q("operationalExcellence", "serverless-ops-02", "How do you approach application lifecycle management?", &[
+    authored_question!("operationalExcellence", "serverless-ops-02", "How do you approach application lifecycle management?", &[
         "Use infrastructure as code, with stages isolated in separate environments",
         "Prototype new features in temporary environments",
         "Use a staged rollout deployment mechanism",
         "Review the runtime deprecation policy of every function",
         "Manage configuration outside the deployment package",
     ]),
-    q("security", "serverless-sec-01", "How do you control access to your serverless API?", &[
+    authored_question!("security", "serverless-sec-01", "How do you control access to your serverless API?", &[
         "Choose the endpoint type and features that secure the API",
         "Authenticate and authorize every request to the API",
         "Scope access on the identity's own attributes",
         "Validate the request before it reaches business logic",
     ]),
-    q("security", "serverless-sec-02", "How do you manage your serverless application's security boundaries?", &[
+    authored_question!("security", "serverless-sec-02", "How do you manage your serverless application's security boundaries?", &[
         "Define resource policies for every resource the application exposes",
         "Control network traffic at every layer the application spans",
         "Use temporary credentials between components",
         "Design smaller, single-purpose functions",
     ]),
-    q("security", "serverless-sec-03", "How do you implement application security in your workload?", &[
+    authored_question!("security", "serverless-sec-03", "How do you implement application security in your workload?", &[
         "Review code dependencies and libraries automatically",
         "Validate inbound events against a schema",
         "Store secrets in a secret store rather than in code or configuration",
         "Keep the team's security awareness current",
     ]),
-    q("reliability", "serverless-rel-01", "How do you regulate inbound request rates?", &[
+    authored_question!("reliability", "serverless-rel-01", "How do you regulate inbound request rates?", &[
         "Throttle inbound requests to a rate the application can serve",
         "Publish, analyze and enforce API quotas per consumer",
         "Protect non-scalable downstream resources with a queue or a proxy",
         "Shed load deliberately rather than failing unpredictably",
     ]),
-    q("reliability", "serverless-rel-02", "How do you build resiliency into your serverless application?", &[
+    authored_question!("reliability", "serverless-rel-02", "How do you build resiliency into your serverless application?", &[
         "Handle transaction, partial and intermittent failures",
         "Make event handling idempotent against duplicate deliveries",
         "Consider scaling behaviour at burst request rates",
         "Orchestrate long-running transactions explicitly",
     ]),
-    q("performance", "serverless-perf-01", "How do you optimize your serverless application's performance?", &[
+    authored_question!("performance", "serverless-perf-01", "How do you optimize your serverless application's performance?", &[
         "Measure, evaluate and select the optimal capacity unit",
         "Measure and optimize function startup time",
         "Optimize the runtime, the dependencies and the deployment package size",
         "Integrate with managed services directly rather than through a function",
         "Apply caching to repeated access patterns",
     ]),
-    q("costOptimization", "serverless-cost-01", "How do you optimize your serverless application's costs?", &[
+    authored_question!("costOptimization", "serverless-cost-01", "How do you optimize your serverless application's costs?", &[
         "Minimize external calls and code initialization work",
         "Optimize logging output and its retention",
         "Tune function configuration to the work it does",
@@ -509,49 +559,49 @@ const SERVERLESS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The SaaS Lens's question set: the lens's published focus areas, as this emulator's
 /// content (see this module's docs), in pillar order.
 const SAAS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "saas-ops-01", "How do you monitor and operate your multi-tenant environment?", &[
+    authored_question!("operationalExcellence", "saas-ops-01", "How do you monitor and operate your multi-tenant environment?", &[
         "Aggregate metrics, logs and traces with the tenant context attached",
         "Alert on tenant-level health rather than only on fleet health",
         "Correlate an operational event with the tenant whose activity caused it",
         "Review tenant usage trends to guide operational change",
     ]),
-    q("operationalExcellence", "saas-ops-02", "How do you onboard and offboard tenants?", &[
+    authored_question!("operationalExcellence", "saas-ops-02", "How do you onboard and offboard tenants?", &[
         "Automate tenant onboarding end to end",
         "Provision tenant resources from a template",
         "Record every tenant's configuration in a tenant management service",
         "Automate offboarding and the clean-up of a tenant's resources",
     ]),
-    q("security", "saas-sec-01", "How do you isolate tenant resources and data?", &[
+    authored_question!("security", "saas-sec-01", "How do you isolate tenant resources and data?", &[
         "Apply an isolation boundary at every layer of the architecture",
         "Derive tenant-scoped credentials from the request's tenant context",
         "Test the isolation boundaries continuously",
         "Separate encryption keys per tenant where the tier requires it",
     ]),
-    q("security", "saas-sec-02", "How do you authenticate and authorize tenants and their users?", &[
+    authored_question!("security", "saas-sec-02", "How do you authenticate and authorize tenants and their users?", &[
         "Authenticate tenant users through a centralized identity provider",
         "Inject the tenant context into every request",
         "Authorize a request against the tenant's tier and entitlements",
         "Audit administrative access to tenant data",
     ]),
-    q("reliability", "saas-rel-01", "How do you prevent one tenant from affecting another?", &[
+    authored_question!("reliability", "saas-rel-01", "How do you prevent one tenant from affecting another?", &[
         "Apply per-tenant throttling and quotas",
         "Move a noisy workload into its own deployment",
         "Spread tenants across resources so one failure reaches few of them",
         "Degrade a tenant that exceeds its quota rather than the whole service",
     ]),
-    q("performance", "saas-perf-01", "How do you scale your multi-tenant environment?", &[
+    authored_question!("performance", "saas-perf-01", "How do you scale your multi-tenant environment?", &[
         "Scale tenant tiers independently of one another",
         "Choose a data partitioning model per service",
         "Benchmark performance per tenant tier",
         "Cache data with the tenant context in the cache key",
     ]),
-    q("costOptimization", "saas-cost-01", "How do you measure and attribute tenant cost?", &[
+    authored_question!("costOptimization", "saas-cost-01", "How do you measure and attribute tenant cost?", &[
         "Tag resources with the tenant they serve",
         "Instrument tenant consumption of pooled resources",
         "Compare a tenant's cost against the tier it pays for",
         "Pool resources wherever the isolation model allows it",
     ]),
-    q("sustainability", "saas-sus-01", "How do you improve the efficiency of your shared infrastructure?", &[
+    authored_question!("sustainability", "saas-sus-01", "How do you improve the efficiency of your shared infrastructure?", &[
         "Pool tenant workloads to raise utilization",
         "Reclaim the resources of inactive tenants",
         "Right-size each tenant tier to its measured demand",
@@ -561,49 +611,49 @@ const SAAS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The IoT Lens's question set: the lens's published focus areas, as this emulator's
 /// content (see this module's docs), in pillar order.
 const IOT_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "iot-ops-01", "How do you monitor the health of your device fleet?", &[
+    authored_question!("operationalExcellence", "iot-ops-01", "How do you monitor the health of your device fleet?", &[
         "Collect device connectivity and lifecycle events",
         "Monitor message throughput and error rates per device",
         "Alert on fleet-wide anomalies rather than per device",
         "Record device state transitions for later analysis",
     ]),
-    q("operationalExcellence", "iot-ops-02", "How do you deliver software and firmware updates to devices?", &[
+    authored_question!("operationalExcellence", "iot-ops-02", "How do you deliver software and firmware updates to devices?", &[
         "Deploy updates in staged waves",
         "Verify the integrity of an update before applying it",
         "Roll back a device whose update failed",
         "Track the software version every device runs",
     ]),
-    q("security", "iot-sec-01", "How do you provision device identity and credentials?", &[
+    authored_question!("security", "iot-sec-01", "How do you provision device identity and credentials?", &[
         "Give every device a unique identity",
         "Provision credentials from a trusted certificate authority",
         "Rotate and revoke device credentials",
         "Keep credentials in hardware-protected storage on the device",
     ]),
-    q("security", "iot-sec-02", "How do you authorize what a device may publish and subscribe to?", &[
+    authored_question!("security", "iot-sec-02", "How do you authorize what a device may publish and subscribe to?", &[
         "Scope each device policy to the device's own identity",
         "Separate device topics by site or tenant",
         "Audit device authorization failures",
         "Quarantine a device that behaves anomalously",
     ]),
-    q("reliability", "iot-rel-01", "How do you operate through intermittent device connectivity?", &[
+    authored_question!("reliability", "iot-rel-01", "How do you operate through intermittent device connectivity?", &[
         "Buffer telemetry on the device while it is offline",
         "Choose a quality-of-service level that matches the data's value",
         "Reconcile device state when connectivity returns",
         "Make message handling idempotent",
     ]),
-    q("performance", "iot-perf-01", "How do you ingest and process device telemetry at scale?", &[
+    authored_question!("performance", "iot-perf-01", "How do you ingest and process device telemetry at scale?", &[
         "Batch and compress telemetry where latency allows",
         "Process at the edge what does not need the cloud",
         "Partition ingestion by device or site",
         "Choose a payload format sized for the network link",
     ]),
-    q("costOptimization", "iot-cost-01", "How do you optimize the cost of device messaging and storage?", &[
+    authored_question!("costOptimization", "iot-cost-01", "How do you optimize the cost of device messaging and storage?", &[
         "Publish only the data the workload consumes",
         "Tier telemetry storage by the age of the data",
         "Aggregate measurements before transmitting them",
         "Review the per-message cost of each topic",
     ]),
-    q("sustainability", "iot-sus-01", "How do you reduce the footprint of your device fleet?", &[
+    authored_question!("sustainability", "iot-sus-01", "How do you reduce the footprint of your device fleet?", &[
         "Extend device lifetime with maintainable firmware",
         "Transmit less data per measurement",
         "Schedule duty cycles to lower device power draw",
@@ -613,43 +663,43 @@ const IOT_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The Machine Learning Lens's question set: the lens's published focus areas, as this
 /// emulator's content (see this module's docs), in pillar order.
 const MACHINE_LEARNING_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "ml-ops-01", "How do you frame the business problem your model solves?", &[
+    authored_question!("operationalExcellence", "ml-ops-01", "How do you frame the business problem your model solves?", &[
         "Define the business outcome the model serves",
         "Choose metrics that measure that outcome",
         "Establish a baseline before training a model",
         "Decide whether machine learning is the right approach at all",
     ]),
-    q("operationalExcellence", "ml-ops-02", "How do you monitor models in production?", &[
+    authored_question!("operationalExcellence", "ml-ops-02", "How do you monitor models in production?", &[
         "Monitor inference quality against ground truth",
         "Detect data and concept drift",
         "Alert on inference latency and error rates",
         "Retrain on a trigger the monitoring provides",
     ]),
-    q("security", "ml-sec-01", "How do you protect training data and model artifacts?", &[
+    authored_question!("security", "ml-sec-01", "How do you protect training data and model artifacts?", &[
         "Classify and encrypt training data",
         "Restrict who may read model artifacts and invoke endpoints",
         "Isolate training environments from production data stores",
         "Audit access to data sets and to models",
     ]),
-    q("reliability", "ml-rel-01", "How do you make training and inference reproducible?", &[
+    authored_question!("reliability", "ml-rel-01", "How do you make training and inference reproducible?", &[
         "Version data sets, code and model artifacts together",
         "Automate the training pipeline",
         "Record the lineage of every deployed model",
         "Keep a path back to the previous model version",
     ]),
-    q("performance", "ml-perf-01", "How do you select and size compute for training and inference?", &[
+    authored_question!("performance", "ml-perf-01", "How do you select and size compute for training and inference?", &[
         "Match the instance type to the model's compute profile",
         "Tune hyperparameters systematically rather than by hand",
         "Distribute training when the data set requires it",
         "Right-size inference endpoints to the request pattern",
     ]),
-    q("costOptimization", "ml-cost-01", "How do you optimize the cost of training and inference?", &[
+    authored_question!("costOptimization", "ml-cost-01", "How do you optimize the cost of training and inference?", &[
         "Use interruptible capacity for fault-tolerant training",
         "Stop idle notebooks and endpoints",
         "Use batch inference where latency allows",
         "Compress or distil models before deploying them",
     ]),
-    q("sustainability", "ml-sus-01", "How do you limit the resources your models consume?", &[
+    authored_question!("sustainability", "ml-sus-01", "How do you limit the resources your models consume?", &[
         "Start from a pre-trained model where one fits",
         "Right-size the data set to what the model needs",
         "Retrain only when measured quality demands it",
@@ -659,43 +709,43 @@ const MACHINE_LEARNING_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The Data Analytics Lens's question set: the lens's published focus areas, as this
 /// emulator's content (see this module's docs), in pillar order.
 const ANALYTICS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "dataanalytics-ops-01", "How do you monitor and operate your analytics pipelines?", &[
+    authored_question!("operationalExcellence", "dataanalytics-ops-01", "How do you monitor and operate your analytics pipelines?", &[
         "Track the freshness and completeness of every data set",
         "Alert on failed and late data loads",
         "Record data quality metrics per data set",
         "Automate the recovery of a failed pipeline run",
     ]),
-    q("operationalExcellence", "dataanalytics-ops-02", "How do you catalog your data so consumers can find it?", &[
+    authored_question!("operationalExcellence", "dataanalytics-ops-02", "How do you catalog your data so consumers can find it?", &[
         "Register every data set in a catalog",
         "Record ownership and schema for each data set",
         "Publish a data contract to the data set's consumers",
         "Track schema evolution over time",
     ]),
-    q("security", "dataanalytics-sec-01", "How do you govern and protect sensitive data?", &[
+    authored_question!("security", "dataanalytics-sec-01", "How do you govern and protect sensitive data?", &[
         "Classify data sets by sensitivity",
         "Enforce fine-grained access to tables and columns",
         "Mask or tokenize sensitive attributes",
         "Audit who read which data set",
     ]),
-    q("reliability", "dataanalytics-rel-01", "How do you make data ingestion reliable?", &[
+    authored_question!("reliability", "dataanalytics-rel-01", "How do you make data ingestion reliable?", &[
         "Design ingestion so a load can be replayed",
         "Handle late and out-of-order data",
         "Validate data on arrival",
         "De-duplicate records idempotently",
     ]),
-    q("performance", "dataanalytics-perf-01", "How do you choose the storage and query layer for your workload?", &[
+    authored_question!("performance", "dataanalytics-perf-01", "How do you choose the storage and query layer for your workload?", &[
         "Partition and compact data for the query pattern",
         "Use a columnar format for analytical scans",
         "Separate storage from compute where the workloads differ",
         "Benchmark queries against representative data volumes",
     ]),
-    q("costOptimization", "dataanalytics-cost-01", "How do you optimize the cost of storing and querying data?", &[
+    authored_question!("costOptimization", "dataanalytics-cost-01", "How do you optimize the cost of storing and querying data?", &[
         "Tier data by how often it is read",
         "Limit the data each query scans",
         "Right-size and pause idle compute",
         "Review the cost per query and per data set",
     ]),
-    q("sustainability", "dataanalytics-sus-01", "How do you avoid storing and processing data nobody uses?", &[
+    authored_question!("sustainability", "dataanalytics-sus-01", "How do you avoid storing and processing data nobody uses?", &[
         "Expire data nobody reads",
         "Remove duplicate copies of the same data set",
         "Process incrementally rather than reprocessing in full",
@@ -705,43 +755,43 @@ const ANALYTICS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The Financial Services Industry Lens's question set: the lens's published focus areas,
 /// as this emulator's content (see this module's docs), in pillar order.
 const FINANCIAL_SERVICES_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "fsi-ops-01", "How do you demonstrate compliance to your regulators?", &[
+    authored_question!("operationalExcellence", "fsi-ops-01", "How do you demonstrate compliance to your regulators?", &[
         "Record evidence of control operation continuously",
         "Map each control to the obligation it satisfies",
         "Automate the production of audit evidence",
         "Review the controls when the regulation changes",
     ]),
-    q("security", "fsi-sec-01", "How do you protect customer and transaction data?", &[
+    authored_question!("security", "fsi-sec-01", "How do you protect customer and transaction data?", &[
         "Classify data by the obligation that governs it",
         "Encrypt data with keys the institution controls",
         "Restrict production data access to a named few",
         "Keep an immutable audit trail of data access",
     ]),
-    q("security", "fsi-sec-02", "How do you manage third-party and vendor risk?", &[
+    authored_question!("security", "fsi-sec-02", "How do you manage third-party and vendor risk?", &[
         "Inventory every third party in the critical path",
         "Assess a vendor's controls before onboarding it",
         "Limit the data each vendor can reach",
         "Plan an exit from every vendor dependency",
     ]),
-    q("reliability", "fsi-rel-01", "How do you keep critical business services available?", &[
+    authored_question!("reliability", "fsi-rel-01", "How do you keep critical business services available?", &[
         "Set recovery objectives per business service",
         "Test the failover of each critical service regularly",
         "Contain a failure to one business service",
         "Rehearse the operational response to an outage",
     ]),
-    q("reliability", "fsi-rel-02", "How do you ensure the integrity of financial transactions?", &[
+    authored_question!("reliability", "fsi-rel-02", "How do you ensure the integrity of financial transactions?", &[
         "Make transaction processing idempotent",
         "Reconcile balances against an independent record",
         "Detect and quarantine suspect transactions",
         "Retain transaction history for the mandated period",
     ]),
-    q("performance", "fsi-perf-01", "How do you meet the latency requirements of your workload?", &[
+    authored_question!("performance", "fsi-perf-01", "How do you meet the latency requirements of your workload?", &[
         "Measure latency at the percentiles the business cares about",
         "Place compute close to the market or payment endpoint",
         "Size capacity for peak market activity",
         "Remove variability from the critical path",
     ]),
-    q("costOptimization", "fsi-cost-01", "How do you control the cost of regulated workloads?", &[
+    authored_question!("costOptimization", "fsi-cost-01", "How do you control the cost of regulated workloads?", &[
         "Attribute cost to the business service it serves",
         "Right-size the environments kept for audit and testing",
         "Review the cost of data retained for compliance",
@@ -752,43 +802,43 @@ const FINANCIAL_SERVICES_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The SAP Lens's question set: the lens's published focus areas, as this emulator's
 /// content (see this module's docs), in pillar order.
 const SAP_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "sap-ops-01", "How do you operate and monitor your SAP systems?", &[
+    authored_question!("operationalExcellence", "sap-ops-01", "How do you operate and monitor your SAP systems?", &[
         "Monitor the SAP application and its database together",
         "Integrate monitoring with SAP's own tooling",
         "Automate the start and stop of non-production systems",
         "Record every change to the SAP landscape",
     ]),
-    q("security", "sap-sec-01", "How do you control access to your SAP landscape?", &[
+    authored_question!("security", "sap-sec-01", "How do you control access to your SAP landscape?", &[
         "Separate production from non-production access",
         "Administer SAP systems through a centralized identity",
         "Encrypt SAP data at rest and in transit",
         "Audit privileged activity in the SAP systems",
     ]),
-    q("reliability", "sap-rel-01", "How do you make your SAP systems highly available?", &[
+    authored_question!("reliability", "sap-rel-01", "How do you make your SAP systems highly available?", &[
         "Deploy SAP central services as a highly available pair",
         "Replicate the SAP database across Availability Zones",
         "Test the failover of each SAP tier",
         "Define recovery objectives per SAP system",
     ]),
-    q("reliability", "sap-rel-02", "How do you back up and recover your SAP systems?", &[
+    authored_question!("reliability", "sap-rel-02", "How do you back up and recover your SAP systems?", &[
         "Back up SAP databases consistently",
         "Test the restore of a complete SAP system",
         "Retain backups for the business's retention period",
         "Protect backups from deletion",
     ]),
-    q("performance", "sap-perf-01", "How do you size infrastructure for your SAP workload?", &[
+    authored_question!("performance", "sap-perf-01", "How do you size infrastructure for your SAP workload?", &[
         "Size instances from SAP's own benchmark figures",
         "Validate the sizing against the certified instance list",
         "Separate the database tier from the application tier",
         "Re-size as the SAP workload changes",
     ]),
-    q("costOptimization", "sap-cost-01", "How do you optimize the cost of your SAP landscape?", &[
+    authored_question!("costOptimization", "sap-cost-01", "How do you optimize the cost of your SAP landscape?", &[
         "Shut down non-production systems outside business hours",
         "Commit to capacity for steady-state production systems",
         "Tier SAP backup storage by age",
         "Consolidate under-used SAP systems",
     ]),
-    q("sustainability", "sap-sus-01", "How do you reduce the footprint of your SAP landscape?", &[
+    authored_question!("sustainability", "sap-sus-01", "How do you reduce the footprint of your SAP landscape?", &[
         "Archive SAP data nobody queries",
         "Retire SAP systems the business no longer uses",
         "Scale application servers to the business day",
@@ -798,36 +848,36 @@ const SAP_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The Migration Lens's question set: the lens's published focus areas, as this emulator's
 /// content (see this module's docs), in pillar order.
 const MIGRATION_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "migration-ops-01", "How do you assess your portfolio before migrating?", &[
+    authored_question!("operationalExcellence", "migration-ops-01", "How do you assess your portfolio before migrating?", &[
         "Inventory applications and their dependencies",
         "Choose a migration strategy per application",
         "Prioritize the portfolio by business value and risk",
         "Record the baseline each migration will be measured against",
     ]),
-    q("operationalExcellence", "migration-ops-02", "How do you run the migration itself?", &[
+    authored_question!("operationalExcellence", "migration-ops-02", "How do you run the migration itself?", &[
         "Migrate in waves of related applications",
         "Automate the migration of repeatable workloads",
         "Define cut-over and rollback criteria per wave",
         "Capture lessons learned after each wave",
     ]),
-    q("security", "migration-sec-01", "How do you keep data secure during migration?", &[
+    authored_question!("security", "migration-sec-01", "How do you keep data secure during migration?", &[
         "Encrypt data in transit to the target environment",
         "Limit who can reach migration tooling and credentials",
         "Verify that migrated data matches the source",
         "Decommission source systems securely",
     ]),
-    q("reliability", "migration-rel-01", "How do you validate a migrated workload?", &[
+    authored_question!("reliability", "migration-rel-01", "How do you validate a migrated workload?", &[
         "Test the migrated workload against its baseline",
         "Rehearse the cut-over before the production run",
         "Keep a documented rollback path",
         "Verify backup and recovery in the target environment",
     ]),
-    q("performance", "migration-perf-01", "How do you right-size workloads in the target environment?", &[
+    authored_question!("performance", "migration-perf-01", "How do you right-size workloads in the target environment?", &[
         "Size from measured utilization at the source",
         "Re-measure once the workload has stabilized",
         "Modernize components that cannot be sized efficiently",
     ]),
-    q("costOptimization", "migration-cost-01", "How do you manage the cost of migrating and running the workload?", &[
+    authored_question!("costOptimization", "migration-cost-01", "How do you manage the cost of migrating and running the workload?", &[
         "Build a business case per migration wave",
         "Track migration cost against that business case",
         "Decommission source infrastructure promptly",
@@ -838,49 +888,49 @@ const MIGRATION_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The Generative AI Lens's question set: the lens's published focus areas, as this
 /// emulator's content (see this module's docs), in pillar order.
 const GENERATIVE_AI_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "genai-ops-01", "How do you evaluate the quality of model output?", &[
+    authored_question!("operationalExcellence", "genai-ops-01", "How do you evaluate the quality of model output?", &[
         "Define quality metrics for each task the model performs",
         "Evaluate against a curated set of prompts",
         "Collect human feedback on responses",
         "Re-evaluate whenever the model or the prompt changes",
     ]),
-    q("operationalExcellence", "genai-ops-02", "How do you monitor a generative AI application in production?", &[
+    authored_question!("operationalExcellence", "genai-ops-02", "How do you monitor a generative AI application in production?", &[
         "Trace a response back to its prompt and the model version",
         "Monitor latency, token usage and error rates",
         "Alert on refusal and guardrail-intervention rates",
         "Review the responses the guardrails flagged",
     ]),
-    q("security", "genai-sec-01", "How do you protect prompts, responses and the data behind them?", &[
+    authored_question!("security", "genai-sec-01", "How do you protect prompts, responses and the data behind them?", &[
         "Keep customer data out of model customization unless it was agreed",
         "Restrict who may invoke which model",
         "Scrub sensitive data from prompts and from logs",
         "Defend against prompt injection carried by untrusted content",
     ]),
-    q("security", "genai-sec-02", "How do you apply responsible AI guardrails?", &[
+    authored_question!("security", "genai-sec-02", "How do you apply responsible AI guardrails?", &[
         "Filter harmful content on input and on output",
         "Constrain the model to the application's domain",
         "Disclose to users that a response was generated by a model",
         "Keep a human in the loop for consequential decisions",
     ]),
-    q("reliability", "genai-rel-01", "How do you ground model responses in your own data?", &[
+    authored_question!("reliability", "genai-rel-01", "How do you ground model responses in your own data?", &[
         "Retrieve authoritative context before generating a response",
         "Keep the retrieval index synchronized with its source data",
         "Cite the source of a grounded response",
         "Fail closed when no context can be retrieved",
     ]),
-    q("performance", "genai-perf-01", "How do you choose and size the model for your workload?", &[
+    authored_question!("performance", "genai-perf-01", "How do you choose and size the model for your workload?", &[
         "Select the smallest model that meets the quality bar",
         "Stream responses where the interface allows it",
         "Cache responses to repeated prompts",
         "Benchmark candidate models on your own prompts",
     ]),
-    q("costOptimization", "genai-cost-01", "How do you optimize inference cost?", &[
+    authored_question!("costOptimization", "genai-cost-01", "How do you optimize inference cost?", &[
         "Measure cost per request and per token",
         "Shorten prompts and bound response length",
         "Route simple requests to cheaper models",
         "Batch inference that nobody is waiting for",
     ]),
-    q("sustainability", "genai-sus-01", "How do you limit the resources inference and customization consume?", &[
+    authored_question!("sustainability", "genai-sus-01", "How do you limit the resources inference and customization consume?", &[
         "Prefer customization that avoids training a model from scratch",
         "Reuse one foundation model across applications",
         "Retire experiments nobody uses",
@@ -890,45 +940,203 @@ const GENERATIVE_AI_LENS_QUESTIONS: &[FrameworkQuestion] = &[
 /// The Healthcare Industry Lens's question set: the lens's published focus areas, as this
 /// emulator's content (see this module's docs), in pillar order.
 const HEALTHCARE_LENS_QUESTIONS: &[FrameworkQuestion] = &[
-    q("operationalExcellence", "healthcare-ops-01", "How do you operate clinical systems without disrupting care?", &[
+    authored_question!("operationalExcellence", "healthcare-ops-01", "How do you operate clinical systems without disrupting care?", &[
         "Schedule change around clinical workflows",
         "Monitor the clinical pathway end to end",
         "Rehearse the response to a clinical system outage",
         "Record the clinical impact of every incident",
     ]),
-    q("security", "healthcare-sec-01", "How do you protect patient health information?", &[
+    authored_question!("security", "healthcare-sec-01", "How do you protect patient health information?", &[
         "Classify the data that identifies a patient",
         "Encrypt patient data with controlled keys",
         "Grant access to a patient record on a need-to-know basis",
         "Audit every access to a patient record",
     ]),
-    q("security", "healthcare-sec-02", "How do you meet your healthcare regulatory obligations?", &[
+    authored_question!("security", "healthcare-sec-02", "How do you meet your healthcare regulatory obligations?", &[
         "Map each control to the regulation it satisfies",
         "Record consent and the purpose of each use of data",
         "Retain clinical records for the mandated period",
         "Review the obligations when entering a new jurisdiction",
     ]),
-    q("reliability", "healthcare-rel-01", "How do you keep clinical workloads available?", &[
+    authored_question!("reliability", "healthcare-rel-01", "How do you keep clinical workloads available?", &[
         "Set recovery objectives from the clinical risk",
         "Give clinicians a documented downtime procedure",
         "Replicate clinical data across Availability Zones",
         "Test the recovery of each clinical system",
     ]),
-    q("performance", "healthcare-perf-01", "How do you exchange clinical data with other systems?", &[
+    authored_question!("performance", "healthcare-perf-01", "How do you exchange clinical data with other systems?", &[
         "Exchange data through healthcare interoperability standards",
         "Validate incoming clinical messages against the standard",
         "Size interfaces for peak clinical activity",
         "Reconcile patient identity across systems",
     ]),
-    q("costOptimization", "healthcare-cost-01", "How do you manage the cost of clinical and research data?", &[
+    authored_question!("costOptimization", "healthcare-cost-01", "How do you manage the cost of clinical and research data?", &[
         "Tier imaging and genomic data by how often it is read",
         "Attribute cost to the clinical service or research study",
         "Right-size research compute to the analysis it runs",
         "Expire research data the study no longer needs",
     ]),
-    q("sustainability", "healthcare-sus-01", "How do you limit the footprint of clinical and research data?", &[
+    authored_question!("sustainability", "healthcare-sus-01", "How do you limit the footprint of clinical and research data?", &[
         "Keep one authoritative copy of each clinical record",
         "Compress imaging and genomic data",
         "Run research analyses incrementally",
     ]),
 ];
+
+/// The Connected Mobility Lens's question set: the lens's published focus areas, as this
+/// emulator's content (see this module's docs), in pillar order.
+const CONNECTED_MOBILITY_LENS_QUESTIONS: &[FrameworkQuestion] = &[
+    authored_question!("operationalExcellence", "connectedmobility-ops-01", "How do you operate a connected vehicle fleet?", &[
+        "Monitor vehicle connectivity and session health",
+        "Alert on fleet-wide anomalies rather than per vehicle",
+        "Record the software and hardware configuration of every vehicle",
+        "Rehearse the response to a fleet-wide incident",
+    ]),
+    authored_question!("operationalExcellence", "connectedmobility-ops-02", "How do you deliver software to vehicles over the air?", &[
+        "Deploy vehicle software in staged campaigns",
+        "Verify the integrity of an update before a vehicle applies it",
+        "Give every campaign a rollback path",
+        "Apply updates only when the vehicle is in a safe state",
+    ]),
+    authored_question!("security", "connectedmobility-sec-01", "How do you establish and protect vehicle identity?", &[
+        "Provision a unique identity per vehicle at manufacture",
+        "Keep vehicle credentials in hardware-protected storage",
+        "Rotate and revoke the credentials of a vehicle",
+        "Authorize each vehicle to its own topics and APIs",
+    ]),
+    authored_question!("security", "connectedmobility-sec-02", "How do you protect the personal data a vehicle produces?", &[
+        "Classify vehicle data by whether it identifies a person",
+        "Record the driver's consent for each use of data",
+        "Minimize the personal data leaving the vehicle",
+        "Honour deletion requests across every store",
+    ]),
+    authored_question!("reliability", "connectedmobility-rel-01", "How do you operate through intermittent vehicle connectivity?", &[
+        "Buffer vehicle data while the vehicle is offline",
+        "Reconcile vehicle state when connectivity returns",
+        "Make the handling of vehicle messages idempotent",
+        "Degrade in-vehicle features rather than failing them",
+    ]),
+    authored_question!("performance", "connectedmobility-perf-01", "How do you ingest and process vehicle telemetry at scale?", &[
+        "Partition ingestion by vehicle, model or region",
+        "Process at the edge what does not need the cloud",
+        "Choose a payload format sized for the mobile link",
+        "Benchmark ingestion against a launch-sized fleet",
+    ]),
+    authored_question!("costOptimization", "connectedmobility-cost-01", "How do you control the cost of a connected fleet?", &[
+        "Publish only the signals a workload consumes",
+        "Tier vehicle data storage by the age of the data",
+        "Review the per-vehicle cost of connectivity and storage",
+        "Aggregate signals in the vehicle before transmitting them",
+    ]),
+    authored_question!("sustainability", "connectedmobility-sus-01", "How do you reduce the footprint of your mobility workloads?", &[
+        "Transmit less data per journey",
+        "Extend vehicle lifetime with maintainable software",
+        "Expire telemetry nobody analyses",
+    ]),
+];
+
+/// The DevOps Lens's question set: the lens's published focus areas, as this emulator's
+/// content (see this module's docs), in pillar order.
+const DEVOPS_LENS_QUESTIONS: &[FrameworkQuestion] = &[
+    authored_question!("operationalExcellence", "devops-ops-01", "How do you organize your teams to deliver and operate software?", &[
+        "Give every service a team that owns it end to end",
+        "Make the ownership of each component discoverable",
+        "Agree the interfaces and expectations between teams",
+        "Measure delivery with team-level metrics",
+    ]),
+    authored_question!("operationalExcellence", "devops-ops-02", "How do you automate the path from commit to production?", &[
+        "Build and test every commit automatically",
+        "Promote one artifact through every environment",
+        "Gate promotion on automated quality checks",
+        "Keep the pipeline itself in version control",
+    ]),
+    authored_question!("operationalExcellence", "devops-ops-03", "How do you learn from what you release?", &[
+        "Trace a production signal back to the change that caused it",
+        "Review incidents without blame and act on the findings",
+        "Feed operational findings into the delivery backlog",
+        "Share what one team learns with the others",
+    ]),
+    authored_question!("security", "devops-sec-01", "How do you secure your delivery pipeline?", &[
+        "Scope the pipeline's permissions to what it deploys",
+        "Scan dependencies and images on every build",
+        "Sign artifacts and verify them before deployment",
+        "Keep deployment secrets in a secret store",
+    ]),
+    authored_question!("reliability", "devops-rel-01", "How do you keep environments reproducible?", &[
+        "Define every environment as code",
+        "Rebuild an environment from its definition rather than repairing it",
+        "Detect and correct configuration drift",
+        "Test infrastructure changes before production",
+    ]),
+    authored_question!("reliability", "devops-rel-02", "How do you release changes safely?", &[
+        "Release small changes often",
+        "Expose a change to a fraction of traffic first",
+        "Automate the rollback of a failed release",
+        "Decouple deployment from feature release",
+    ]),
+    authored_question!("performance", "devops-perf-01", "How do you keep your delivery pipeline fast?", &[
+        "Measure the lead time of each pipeline stage",
+        "Run independent stages in parallel",
+        "Cache dependencies and build outputs",
+        "Size build capacity to the team's cadence",
+    ]),
+    authored_question!("costOptimization", "devops-cost-01", "How do you control the cost of delivery?", &[
+        "Shut down environments nobody is using",
+        "Right-size build and test capacity",
+        "Attribute pipeline cost to the team that incurs it",
+        "Remove pipelines and artifacts nothing consumes",
+    ]),
+];
+
+/// The Games Industry Lens's question set: the lens's published focus areas, as this
+/// emulator's content (see this module's docs), in pillar order.
+const GAMES_LENS_QUESTIONS: &[FrameworkQuestion] = &[
+    authored_question!("operationalExcellence", "games-ops-01", "How do you operate a live game service?", &[
+        "Monitor the player experience rather than only the servers",
+        "Run a live-operations calendar of content and events",
+        "Rehearse the response to a launch-day incident",
+        "Communicate service status to players",
+    ]),
+    authored_question!("security", "games-sec-01", "How do you protect player accounts and their data?", &[
+        "Authenticate players through an identity provider",
+        "Protect player personal data and age-gated information",
+        "Detect and act on account takeover",
+        "Audit administrative access to player data",
+    ]),
+    authored_question!("security", "games-sec-02", "How do you protect your game from cheating and abuse?", &[
+        "Treat the client as untrusted and validate on the server",
+        "Detect anomalous play and automate the response",
+        "Rate-limit and authenticate the game's APIs",
+        "Protect game content and build artifacts from leaking",
+    ]),
+    authored_question!("reliability", "games-rel-01", "How do you run game servers and matchmaking reliably?", &[
+        "Place sessions close to the players in them",
+        "Drain a game server without dropping its sessions",
+        "Keep matchmaking working as the player population changes",
+        "Contain a failure to a subset of sessions",
+    ]),
+    authored_question!("reliability", "games-rel-02", "How do you protect player progression?", &[
+        "Make progression writes idempotent",
+        "Back up player data and test its recovery",
+        "Reconcile entitlements and purchases against an authoritative record",
+        "Keep a path back from a bad content release",
+    ]),
+    authored_question!("performance", "games-perf-01", "How do you meet the latency a game needs?", &[
+        "Measure latency at the percentiles players notice",
+        "Choose Regions and edge locations from the player map",
+        "Size capacity for a launch or an event",
+        "Tune the network protocol to the game's tick rate",
+    ]),
+    authored_question!("costOptimization", "games-cost-01", "How do you control the cost of a game at scale?", &[
+        "Scale session capacity with the player population",
+        "Use interruptible capacity for tolerant workloads",
+        "Attribute cost to the title and the feature",
+        "Retire the infrastructure of a sunset title",
+    ]),
+    authored_question!("sustainability", "games-sus-01", "How do you reduce the footprint of your game workloads?", &[
+        "Raise the utilization of session capacity",
+        "Ship smaller updates to players",
+        "Expire telemetry and replays nobody uses",
+    ]),
+];
+

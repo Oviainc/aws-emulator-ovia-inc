@@ -203,21 +203,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A lens review exists only while that lens is associated with the workload, so the
-        // reviews to report are exactly the workload's attached lenses — in the stable
-        // total order the cursor resumes from, start-EXCLUSIVE, so every review is
-        // enumerated exactly once across the pages.
+        // reviews to report are exactly the workload's attached lenses, in the order the
+        // workload applies them (`crate::state::lens_reviews_of`) — the order a `Workload`
+        // read reports its `Lenses` in, so a client sees a lens and its review in the same
+        // place in both lists. The cursor carries the alias of the last review served and
+        // resumes just past its position in that order, so every review is enumerated
+        // exactly once across the pages; a cursor naming a lens the workload no longer
+        // reviews has no position left in the order, and the enumeration it belonged to is
+        // over.
         let reviews = workload.lens_reviews();
-        let remaining: Vec<(&str, &str)> = reviews
-            .iter()
-            .filter_map(|(&alias, &lens)| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|last| alias > last)
-                    .then_some((alias, lens))
-            })
-            .collect();
+        let remaining: &[(&str, &str)] = match resume_after.as_deref() {
+            None => &reviews,
+            Some(last) => reviews
+                .iter()
+                .position(|(alias, _)| *alias == last)
+                .and_then(|served| reviews.get(served.saturating_add(1)..))
+                .unwrap_or_default(),
+        };
 
-        let page = &remaining[..remaining.len().min(page_size)];
+        // At most one page of them, by lookup rather than by slice index: `page_size` is
+        // the caller's clamped `MaxResults`, and a page shorter than it is the whole
+        // remainder.
+        let page = remaining.get(..page_size).unwrap_or(remaining);
         let next_token = match page.last() {
             Some((alias, _)) if remaining.len() > page.len() => {
                 Some(crate::state::encode_lens_review_next_token(alias))
@@ -225,14 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => None,
         };
 
-        let region = crate::state::request_region(ctx.parts());
         // The content of the lenses this workload reviews, resolved from the whole lens
         // catalog: a lens review's risk roll-up counts the questions THAT lens asks, which
         // for a custom lens are the ones its imported document defines.
         let content = store.reviewed_lens_content(&workload.reviewed_lens_versions());
         let lens_review_summaries: Vec<LensReviewSummary> = page
             .iter()
-            .map(|(_, lens)| lens_review_summary(&store, workload, lens, &region, &content))
+            .map(|(_, lens)| lens_review_summary(&store, workload, lens, &content))
             .collect();
 
         Ok(ListLensReviewsOutput {
@@ -262,10 +268,9 @@ fn lens_review_summary(
     store: &crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
     workload: &crate::state::WorkloadRecord,
     lens: &str,
-    region: &str,
     content: &crate::state::ReviewedLensContent,
 ) -> LensReviewSummary {
-    let reviewed = store.reviewed_lens_at(lens, workload.lens_review_version(lens), region);
+    let reviewed = store.reviewed_lens_at(lens, workload.lens_review_version(lens));
     LensReviewSummary {
         // "Each lens is identified by its `LensSummary$LensAlias`" (`WorkloadLenses` doc):
         // the name the workload records the lens under — for a custom lens its ARN, which

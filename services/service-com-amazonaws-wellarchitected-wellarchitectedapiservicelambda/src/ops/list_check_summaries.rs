@@ -195,7 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.pillar_id,
                 &input.question_id,
                 &input.choice_id,
-                &crate::state::request_region(ctx.parts()),
             )
             .map_err(|refusal| match refusal {
                 crate::state::BestPracticeRefusal::NotFound(exception) => {

@@ -178,16 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The Region the request was signed for is what an AWS-official lens's `LensArn`
-        // is reported in; a custom lens is reported by the ARN its import minted. Resolved
-        // BEFORE the template is taken for writing, with the version this template's
-        // review of the lens is against: both come from the lens catalog, which this write
-        // does not touch.
-        let region = crate::state::request_region(ctx.parts());
+        // What the lens catalog says about the lens this template's review is against,
+        // resolved BEFORE the template is taken for writing, with the version that review
+        // pins: both come from the lens catalog, which this write does not touch.
         let now = std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let reviewed = store.reviewed_lens(&input.template_arn, &input.lens_alias, &region);
+        let reviewed = store.reviewed_lens(&input.template_arn, &input.lens_alias);
         // The content of the lenses this template applies, resolved from the whole lens
         // catalog before the template is taken for writing: a pillar of a CUSTOM lens is
         // one its imported document defines, exactly as an official lens's is its catalog

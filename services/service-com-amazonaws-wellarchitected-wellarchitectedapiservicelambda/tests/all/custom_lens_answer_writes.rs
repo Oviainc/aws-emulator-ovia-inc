@@ -41,7 +41,7 @@ type Shape = &'static [(&'static str, usize, usize)];
 /// question of it: the published Well-Architected Framework numbering, as the emulator's
 /// own ids spell it (`tests/all/answer_updates.rs` answers the same question).
 const FRAMEWORK_LENS: &str = "wellarchitected";
-const FRAMEWORK_QUESTION: &str = "ops-01";
+const FRAMEWORK_QUESTION: &str = "organization-priorities";
 
 /// The documents under test: the rows differ along the number of pillars, the number of
 /// questions a pillar asks and the number of choices a question offers — including a

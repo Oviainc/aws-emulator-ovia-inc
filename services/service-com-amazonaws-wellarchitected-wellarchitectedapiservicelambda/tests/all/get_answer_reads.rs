@@ -313,7 +313,11 @@ async fn every_question_of_every_official_lens_is_reported_from_that_lenss_conte
                 );
                 assert_eq!(
                     choice_members(&answer, "Title"),
-                    question.best_practices,
+                    question
+                        .best_practices
+                        .iter()
+                        .map(|practice| practice.title.to_string())
+                        .collect::<Vec<String>>(),
                     "case {case:?}: each reported choice must carry the best practice it asks \
                      about, got {read:?}"
                 );
@@ -371,8 +375,8 @@ async fn a_read_of_an_answer_changes_nothing_a_later_caller_sees() {
 
     // One answered question, so the rows below span an answer that exists and one that does
     // not.
-    let answered = framework_question("ops-01");
-    let unanswered = framework_question("sec-02");
+    let answered = framework_question("organization-priorities");
+    let unanswered = framework_question("identities");
     let recorded = update_answer(
         &client,
         &workload_id,
@@ -454,8 +458,8 @@ async fn a_milestone_scoped_read_reports_the_review_the_milestone_recorded() {
     let lens = state::FRAMEWORK_LENS_ALIAS;
     let workload_id = workload_reviewing(&client, lens).await;
 
-    let before_the_milestone = framework_question("rel-01");
-    let after_the_milestone = framework_question("cost-01");
+    let before_the_milestone = framework_question("manage-service-quotas");
+    let after_the_milestone = framework_question("cloud-financial-management");
     let every_choice_before = choice_ids_of(before_the_milestone);
     let every_choice_after = choice_ids_of(after_the_milestone);
 
@@ -568,7 +572,7 @@ async fn a_read_that_resolves_nothing_is_refused_over_the_resource_that_was_miss
     let client = Client::new();
     let lens = state::FRAMEWORK_LENS_ALIAS;
     let workload_id = workload_reviewing(&client, lens).await;
-    let question_id = framework_question("sec-01").question_id;
+    let question_id = framework_question("securely-operate").question_id;
     let recorded_milestone = create_milestone(&client, &workload_id, "the-one-milestone").await;
 
     // A lens of the official catalog this workload does not review, so it names no review
@@ -642,7 +646,7 @@ async fn a_milestone_number_outside_the_published_range_is_refused() {
     let client = Client::new();
     let lens = state::FRAMEWORK_LENS_ALIAS;
     let workload_id = workload_reviewing(&client, lens).await;
-    let question_id = framework_question("sus-01").question_id;
+    let question_id = framework_question("region-selection").question_id;
     let recorded = create_milestone(&client, &workload_id, "the-first-milestone").await;
     assert_eq!(
         recorded, 1,

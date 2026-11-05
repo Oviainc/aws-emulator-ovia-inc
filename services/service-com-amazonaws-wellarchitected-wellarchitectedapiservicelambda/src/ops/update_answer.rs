@@ -189,8 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::...::lens_arn_of`, the one place this service resolves a lens's
         // ARN); read before the workload is borrowed for writing, so the answer and the
         // ARN come from one view of the store.
-        let lens_arn =
-            store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts()));
+        let lens_arn = store.lens_arn_of(&input.lens_alias);
 
         // A question belongs to the LENS under review — the questions that lens's own
         // content defines (`crate::state::...::lens_review_question`), as of the lens

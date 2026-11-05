@@ -413,7 +413,7 @@ async fn an_omitted_member_keeps_its_stored_value() {
             "LensNotes": "the lens note",
             "PillarNotes": { "security": "the security note" },
             "JiraConfiguration": {
-                "SelectedPillars": [{ "PillarId": "security", "SelectedQuestionIds": ["sec-02"] }],
+                "SelectedPillars": [{ "PillarId": "security", "SelectedQuestionIds": ["identities"] }],
             },
         }),
     )
@@ -445,7 +445,7 @@ async fn an_omitted_member_keeps_its_stored_value() {
     assert_eq!(
         jira_configuration(&review),
         Some(&json!({
-            "SelectedPillars": [{ "PillarId": "security", "SelectedQuestionIds": ["sec-02"] }],
+            "SelectedPillars": [{ "PillarId": "security", "SelectedQuestionIds": ["identities"] }],
         })),
         "case \"lens-notes-only\": the omitted JiraConfiguration must be left as stored, got \
          {review:?}"
@@ -513,7 +513,7 @@ async fn the_jira_selection_round_trips() {
             "one-pillar-several-questions",
             json!({
                 "SelectedPillars": [
-                    { "PillarId": "reliability", "SelectedQuestionIds": ["rel-01", "rel-13"] },
+                    { "PillarId": "reliability", "SelectedQuestionIds": ["manage-service-quotas", "plan-for-dr"] },
                 ],
             }),
         ),
@@ -521,7 +521,7 @@ async fn the_jira_selection_round_trips() {
             "two-pillars",
             json!({
                 "SelectedPillars": [
-                    { "PillarId": "security", "SelectedQuestionIds": ["sec-11"] },
+                    { "PillarId": "security", "SelectedQuestionIds": ["application-security"] },
                     { "PillarId": "costOptimization", "SelectedQuestionIds": [] },
                 ],
             }),
@@ -628,7 +628,7 @@ async fn an_identifier_the_lens_does_not_define_is_refused() {
             json!({
                 "JiraConfiguration": {
                     "SelectedPillars": [
-                        { "PillarId": "security", "SelectedQuestionIds": ["sec-01", "rel-01"] },
+                        { "PillarId": "security", "SelectedQuestionIds": ["securely-operate", "manage-service-quotas"] },
                     ],
                 },
             }),
@@ -733,7 +733,7 @@ async fn writing_notes_leaves_the_derived_members_alone() {
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "rel-01",
+        "manage-service-quotas",
         answered(&[], true, None),
     );
 

@@ -178,11 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.workload_id)
             .and_then(|workload| workload.lens_review_version(&input.lens_alias))
             .map(str::to_string);
-        let reviewed = store.reviewed_lens_at(
-            &input.lens_alias,
-            pinned.as_deref(),
-            &crate::state::request_region(ctx.parts()),
-        );
+        let reviewed = store.reviewed_lens_at(&input.lens_alias, pinned.as_deref());
         // The content of the lenses this workload reviews, resolved from the whole lens
         // catalog in the same one view of the store and before the workload is borrowed for
         // writing: a pillar or a question of a CUSTOM lens is the one its imported document
@@ -303,12 +299,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workload.updated_at = now;
         }
 
+        let mut lens_review = workload.to_lens_review(&input.lens_alias, &reviewed, &content);
+        // "Configuration of the Jira integration" — the question selection this write
+        // leaves the review with, which is what this operation WROTE, so it is reported
+        // even when the review selects nothing: a selection of no pillars is an empty
+        // `SelectedPillars` list rather than an absent configuration, so a client reading
+        // the list off this response finds one. A READ of the review reports what was
+        // recorded against it and nothing more (`WorkloadRecord::to_lens_review`).
+        lens_review.jira_configuration = Some(lens_review.jira_configuration.unwrap_or(
+            JiraSelectedQuestionConfiguration {
+                selected_pillars: Some(Vec::new()),
+            },
+        ));
+
         Ok(UpdateLensReviewOutput {
             // The workload as STORED, which is the resource this lens review belongs to,
             // and the lens as the REQUEST named it, beside what the catalog says about the
             // version the review is against.
             workload_id: Some(workload.workload_id.clone()),
-            lens_review: Some(workload.to_lens_review(&input.lens_alias, &reviewed, &content)),
+            lens_review: Some(lens_review),
         })
     }
 }

@@ -26,11 +26,10 @@
 //! that question is recorded under, whatever the catalog's ordering.
 //!
 //! [`TrustedAdvisorCheck::id`] and [`TrustedAdvisorCheck::description`] are this
-//! emulator's own, exactly as the framework lens's `question_id`s already are (see
-//! [`super::FRAMEWORK_LENS_QUESTIONS`]): a check's wire id is an opaque value neither the
-//! Smithy model nor the service docs publish, so each id here is a stable slug of the
-//! check's name rather than a guess at AWS's. A test pins that every row resolves to a
-//! choice of the question it names and that the ids are unique.
+//! emulator's own: a check's wire id is an opaque value neither the Smithy model nor the
+//! service docs publish, so each id here is a stable slug of the check's name rather than
+//! a guess at AWS's. A test pins that every row resolves to a choice of the question it
+//! names and that the ids are unique.
 //!
 //! ## What a check can SAY here
 //!
@@ -99,7 +98,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "MFA on Root Account",
         "Checks whether multi-factor authentication is enabled for the root user of the \
          account.",
-        "sec-01",
+        "securely-operate",
         "Secure account root user and properties",
     ),
     check(
@@ -107,14 +106,14 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Exposed Access Keys",
         "Checks for access keys of the account that have been exposed publicly and for \
          irregular usage of them.",
-        "sec-02",
+        "identities",
         "Store and use secrets securely",
     ),
     check(
         "iam-access-key-rotation",
         "IAM Access Key Rotation",
         "Checks for active IAM access keys that have not been rotated recently.",
-        "sec-02",
+        "identities",
         "Audit and rotate credentials periodically",
     ),
     check(
@@ -122,7 +121,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon S3 Bucket Permissions",
         "Checks buckets for open access permissions or access granted to any \
          authenticated AWS user.",
-        "sec-03",
+        "permissions",
         "Analyze public and cross-account access",
     ),
     check(
@@ -130,7 +129,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon RDS Public Snapshots",
         "Checks the permission settings of database snapshots for snapshots that are \
          marked public.",
-        "sec-03",
+        "permissions",
         "Analyze public and cross-account access",
     ),
     check(
@@ -138,7 +137,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon EBS Public Snapshots",
         "Checks the permission settings of volume snapshots for snapshots that are marked \
          public.",
-        "sec-03",
+        "permissions",
         "Analyze public and cross-account access",
     ),
     check(
@@ -146,7 +145,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "AWS CloudTrail Logging",
         "Checks for trails that are not logging, and for trails whose log delivery to \
          Amazon S3 is failing.",
-        "sec-04",
+        "detect-investigate-events",
         "Configure service and application logging",
     ),
     check(
@@ -154,7 +153,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Security Groups - Specific Ports Unrestricted",
         "Checks security groups for rules that allow unrestricted access to specific \
          ports.",
-        "sec-05",
+        "network-protection",
         "Control traffic flow within your network layers",
     ),
     check(
@@ -162,7 +161,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon RDS Security Group Access Risk",
         "Checks database security group rules for rules that grant overly permissive \
          access.",
-        "sec-05",
+        "network-protection",
         "Control traffic flow within your network layers",
     ),
     check(
@@ -170,7 +169,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "ELB Listener Security",
         "Checks load balancer listeners for the absence of a secure protocol and for \
          outdated cipher suites.",
-        "sec-09",
+        "protect-data-in-transit",
         "Enforce encryption in transit",
     ),
     // Reliability.
@@ -178,7 +177,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "service-limits",
         "Service Limits",
         "Checks usage of the account against the service quotas that apply to it.",
-        "rel-01",
+        "manage-service-quotas",
         "Monitor and manage quotas",
     ),
     check(
@@ -186,7 +185,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon EBS Snapshots",
         "Checks volumes for a missing snapshot and for snapshots that are older than the \
          recovery point they are relied on for.",
-        "rel-09",
+        "back-up-data",
         "Identify and back up all data that needs to be backed up, or reproduce the data \
          from sources",
     ),
@@ -195,21 +194,21 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon RDS Backups",
         "Checks database instances for automated backups that are disabled or kept for \
          too short a retention period.",
-        "rel-09",
+        "back-up-data",
         "Perform data backup automatically",
     ),
     check(
         "amazon-rds-multi-az",
         "Amazon RDS Multi-AZ",
         "Checks database instances that are deployed in a single Availability Zone.",
-        "rel-10",
+        "fault-isolation",
         "Deploy the workload to multiple locations",
     ),
     check(
         "elb-cross-zone-load-balancing",
         "ELB Cross-Zone Load Balancing",
         "Checks load balancers for cross-zone load balancing that is not enabled.",
-        "rel-10",
+        "fault-isolation",
         "Deploy the workload to multiple locations",
     ),
     check(
@@ -217,7 +216,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Auto Scaling Group Health Check",
         "Checks Auto Scaling groups whose associated load balancer health check is not \
          the configured health check type.",
-        "rel-11",
+        "withstand-component-failures",
         "Fail over to healthy resources",
     ),
     // Performance efficiency.
@@ -226,7 +225,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "High Utilization Amazon EC2 Instances",
         "Checks instances that ran at consistently high CPU utilization, which can \
          constrain the workload.",
-        "perf-02",
+        "compute-architecture-selection",
         "Configure and right-size compute resources",
     ),
     check(
@@ -234,7 +233,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "CloudFront Content Delivery Optimization",
         "Checks for data transfer out of Amazon S3 buckets that would be served faster \
          through a content delivery network.",
-        "perf-03",
+        "data-management",
         "Implement data access patterns that utilize caching",
     ),
     // Cost optimization.
@@ -243,7 +242,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Idle Load Balancers",
         "Checks load balancers whose request count makes them idle, so they are paid for \
          and not used.",
-        "cost-04",
+        "decomission-resources",
         "Decommission resources",
     ),
     check(
@@ -251,14 +250,14 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Unassociated Elastic IP Addresses",
         "Checks for allocated Elastic IP addresses that are not associated with a running \
          instance.",
-        "cost-04",
+        "decomission-resources",
         "Decommission resources",
     ),
     check(
         "amazon-rds-idle-db-instances",
         "Amazon RDS Idle DB Instances",
         "Checks database instances that have had no connection for a prolonged period.",
-        "cost-04",
+        "decomission-resources",
         "Decommission resources",
     ),
     check(
@@ -266,7 +265,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Low Utilization Amazon EC2 Instances",
         "Checks instances that ran at consistently low CPU utilization and network \
          traffic, so they are over-provisioned.",
-        "cost-06",
+        "resource-type-size-number",
         "Select resource type, size, and number based on data",
     ),
     check(
@@ -274,7 +273,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Amazon EC2 Reserved Instance Optimization",
         "Checks instance usage over time against the Reserved Instance purchases that \
          would cover it.",
-        "cost-07",
+        "pricing-model",
         "Perform pricing model analysis",
     ),
     check(
@@ -282,7 +281,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Savings Plans",
         "Checks compute usage over time against the Savings Plans commitments that would \
          cover it.",
-        "cost-07",
+        "pricing-model",
         "Perform pricing model analysis",
     ),
     // Sustainability.
@@ -291,7 +290,7 @@ pub const TRUSTED_ADVISOR_CHECK_CATALOG: &[TrustedAdvisorCheck] = &[
         "Underutilized Amazon EBS Volumes",
         "Checks volumes whose provisioned capacity and activity make them \
          over-provisioned.",
-        "sus-04",
+        "data-patterns",
         "Minimize over-provisioning in block storage",
     ),
 ];

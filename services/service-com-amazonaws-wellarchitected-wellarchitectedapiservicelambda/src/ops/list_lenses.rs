@@ -208,11 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        // The lenses available to the caller: every AWS-official lens this emulator
-        // publishes content for, plus every custom lens the store holds. A lens exists from
+        // The lenses available to the caller: every lens Amazon Web Services publishes,
+        // plus every custom lens the store holds. A lens exists from
         // the moment `ImportLens` accepts it — that call answers its ARN and records the
         // document it carried — so it is listed from then on, described by that document.
         let mut catalog: Vec<CatalogEntry> =
@@ -223,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::LENS_TYPE_AWS_OFFICIAL,
                     official.alias,
                 ),
-                summary: official.summary(&region),
+                summary: official.summary(),
             });
         }
         for record in store.lenses.values() {

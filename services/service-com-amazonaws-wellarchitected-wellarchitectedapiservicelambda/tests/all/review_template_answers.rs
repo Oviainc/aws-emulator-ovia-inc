@@ -330,15 +330,15 @@ fn statuses_of(
 async fn a_stored_answer_is_reported_on_its_question() {
     let cases: Vec<AnswerCase> = vec![
         AnswerCase {
-            question_id: "ops-01",
-            statuses: statuses_of("ops-01", &[(0, "SELECTED")], "UNSELECTED"),
+            question_id: "organization-priorities",
+            statuses: statuses_of("organization-priorities", &[(0, "SELECTED")], "UNSELECTED"),
             is_applicable: true,
             reason: None,
         },
         AnswerCase {
-            question_id: "sec-04",
+            question_id: "detect-investigate-events",
             statuses: statuses_of(
-                "sec-04",
+                "detect-investigate-events",
                 &[(0, "SELECTED"), (1, "SELECTED")],
                 "UNSELECTED",
             ),
@@ -346,14 +346,14 @@ async fn a_stored_answer_is_reported_on_its_question() {
             reason: None,
         },
         AnswerCase {
-            question_id: "rel-13",
-            statuses: statuses_of("rel-13", &[], "UNSELECTED"),
+            question_id: "plan-for-dr",
+            statuses: statuses_of("plan-for-dr", &[], "UNSELECTED"),
             is_applicable: false,
             reason: Some("OUT_OF_SCOPE"),
         },
         AnswerCase {
-            question_id: "sus-06",
-            statuses: statuses_of("sus-06", &[(0, "NOT_APPLICABLE")], "SELECTED"),
+            question_id: "dev-deploy-patterns",
+            statuses: statuses_of("dev-deploy-patterns", &[(0, "NOT_APPLICABLE")], "SELECTED"),
             is_applicable: true,
             reason: None,
         },
@@ -781,7 +781,7 @@ async fn an_applied_lens_resolves_by_either_name() {
 async fn listing_the_answers_writes_nothing() {
     let client = Client::new();
     let template_arn = template(&client, "report-template", &[FRAMEWORK_LENS]).await;
-    let answered_question_choices = framework_choice_ids("cost-05");
+    let answered_question_choices = framework_choice_ids("select-service");
     let in_place: Vec<&str> = answered_question_choices
         .iter()
         .take(1)
@@ -790,7 +790,7 @@ async fn listing_the_answers_writes_nothing() {
     client.record_template_answer(
         &template_arn,
         FRAMEWORK_LENS,
-        "cost-05",
+        "select-service",
         answered_over(&answered_question_choices, &in_place, true, None),
     );
 

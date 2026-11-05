@@ -407,14 +407,14 @@ async fn the_lens_review_is_derived_from_the_lens_and_the_stored_answers() {
     // questions spread across three pillars.
     let cases: [(&str, &[(&str, &str)]); 3] = [
         ("none", &[]),
-        ("one", &[("security", "sec-01")]),
+        ("one", &[("security", "securely-operate")]),
         (
             "spread",
             &[
-                ("security", "sec-01"),
-                ("security", "sec-02"),
-                ("sustainability", "sus-06"),
-                ("operationalExcellence", "ops-11"),
+                ("security", "securely-operate"),
+                ("security", "identities"),
+                ("sustainability", "dev-deploy-patterns"),
+                ("operationalExcellence", "evolve-operations"),
             ],
         ),
     ];

@@ -170,7 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
         // Which lens's versions this difference is over. An AWS-official lens's versions
@@ -225,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The lens AS THE REQUEST NAMED it — an alias or an ARN both name the same
             // lens — beside the ARN it is reported by.
             lens_alias: Some(input.lens_alias.clone()),
-            lens_arn: Some(store.lens_arn_of(&input.lens_alias, &region)),
+            lens_arn: Some(store.lens_arn_of(&input.lens_alias)),
             base_lens_version: Some(base_version),
             target_lens_version: Some(target_version),
             latest_lens_version: Some(latest),
@@ -339,7 +338,11 @@ fn official_pillars(lens: &str) -> Vec<PillarView> {
                             .iter()
                             .enumerate()
                             .map(|(index, practice)| {
-                                serde_json::json!([question.choice_id(index), practice])
+                                serde_json::json!([
+                                    question.choice_id(index),
+                                    practice.title,
+                                    practice.description,
+                                ])
                             })
                             .collect::<Vec<_>>(),
                     })

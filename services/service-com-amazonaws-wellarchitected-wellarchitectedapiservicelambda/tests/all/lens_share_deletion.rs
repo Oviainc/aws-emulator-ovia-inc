@@ -361,7 +361,7 @@ async fn a_delete_that_resolves_nothing_is_refused_and_removes_nothing() {
         .iter()
         .find(|alias| **alias != state::FRAMEWORK_LENS_ALIAS)
         .expect("the official lens catalog carries more than the framework lens");
-    let official_arn = state::official_lens_arn("us-west-2", state::FRAMEWORK_LENS_ALIAS);
+    let official_arn = state::official_lens_arn(state::FRAMEWORK_LENS_ALIAS);
     let cases: Vec<Refusal> = vec![
         Refusal {
             case: "an-official-lens-alias",

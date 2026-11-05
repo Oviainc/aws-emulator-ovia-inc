@@ -171,8 +171,8 @@ async fn checks_reported_are_the_ones_associated_to_the_best_practice() {
         Associated {
             case: "three-checks",
             pillar_id: "security",
-            question_id: "sec-03",
-            choice_id: "sec-03-bp-07",
+            question_id: "permissions",
+            choice_id: "sec_permissions_analyze_cross_account",
             check_ids: &[
                 "amazon-s3-bucket-permissions",
                 "amazon-rds-public-snapshots",
@@ -182,36 +182,36 @@ async fn checks_reported_are_the_ones_associated_to_the_best_practice() {
         Associated {
             case: "two-checks",
             pillar_id: "reliability",
-            question_id: "rel-10",
-            choice_id: "rel-10-bp-01",
+            question_id: "fault-isolation",
+            choice_id: "rel_fault_isolation_multiaz_region_system",
             check_ids: &["amazon-rds-multi-az", "elb-cross-zone-load-balancing"],
         },
         Associated {
             case: "one-check",
             pillar_id: "costOptimization",
-            question_id: "cost-06",
-            choice_id: "cost-06-bp-02",
+            question_id: "resource-type-size-number",
+            choice_id: "cost_type_size_number_resources_data",
             check_ids: &["low-utilization-amazon-ec2-instances"],
         },
         Associated {
             case: "one-check-in-another-pillar",
             pillar_id: "sustainability",
-            question_id: "sus-04",
-            choice_id: "sus-04-bp-04",
+            question_id: "data-patterns",
+            choice_id: "sus_data_block_storage_provisioning",
             check_ids: &["underutilized-amazon-ebs-volumes"],
         },
         Associated {
             case: "no-check-for-this-choice",
             pillar_id: "security",
-            question_id: "sec-03",
-            choice_id: "sec-03-bp-01",
+            question_id: "permissions",
+            choice_id: "sec_permissions_define",
             check_ids: &[],
         },
         Associated {
             case: "no-check-for-this-question",
             pillar_id: "operationalExcellence",
-            question_id: "ops-01",
-            choice_id: "ops-01-bp-01",
+            question_id: "organization-priorities",
+            choice_id: "ops_priorities_ext_cust_needs",
             check_ids: &[],
         },
     ];
@@ -303,7 +303,7 @@ async fn checks_belong_to_the_lens_whose_best_practice_they_inspect() {
     let framework = list_check_details(
         &client,
         &workload_id,
-        best_practice("security", "sec-02", "sec-02-bp-03"),
+        best_practice("security", "identities", "sec_identities_secrets"),
     )
     .await;
     assert_eq!(
@@ -392,7 +392,7 @@ async fn a_check_is_reported_once_per_account_related_to_the_workload() {
             &client,
             &workload_id,
             // One check only, so the enumeration is exactly the accounts.
-            best_practice("security", "sec-01", "sec-01-bp-02"),
+            best_practice("security", "securely-operate", "sec_securely_operate_aws_account"),
         )
         .await;
         assert_eq!(
@@ -447,7 +447,7 @@ async fn a_check_is_reported_once_per_account_related_to_the_workload() {
 #[tokio::test]
 async fn checks_are_reported_only_while_the_integration_is_activated() {
     let client = Client::new();
-    let request = best_practice("costOptimization", "cost-07", "cost-07-bp-01");
+    let request = best_practice("costOptimization", "pricing-model", "cost_pricing_model_analysis");
     let expected: Vec<(String, String)> = [
         "amazon-ec2-reserved-instance-optimization",
         "savings-plans",
@@ -562,7 +562,7 @@ async fn paging_serves_every_reported_check_once() {
     .await;
     // Three checks over three accounts: nine details, so a page size of one through nine
     // cuts the enumeration inside an account as well as between accounts.
-    let request = best_practice("costOptimization", "cost-04", "cost-04-bp-03");
+    let request = best_practice("costOptimization", "decomission-resources", "cost_decomissioning_resources_decommission");
 
     let (unpaged, pages) = collect(&client, "unpaged", &workload_id, &request, None).await;
     assert_eq!(
@@ -616,7 +616,7 @@ async fn the_read_refuses_what_the_lens_does_not_define() {
         Refused {
             case: "absent-workload",
             workload: Some(ABSENT_HEX_ID),
-            body: best_practice("security", "sec-01", "sec-01-bp-02"),
+            body: best_practice("security", "securely-operate", "sec_securely_operate_aws_account"),
             status: 404,
             error_code: "ResourceNotFoundException",
         },
@@ -626,8 +626,8 @@ async fn the_read_refuses_what_the_lens_does_not_define() {
             body: json!({
                 "LensArn": unreviewed_lens,
                 "PillarId": "security",
-                "QuestionId": "sec-01",
-                "ChoiceId": "sec-01-bp-02",
+                "QuestionId": "securely-operate",
+                "ChoiceId": "sec_securely_operate_aws_account",
             }),
             status: 404,
             error_code: "ResourceNotFoundException",
@@ -635,14 +635,14 @@ async fn the_read_refuses_what_the_lens_does_not_define() {
         Refused {
             case: "pillar-the-lens-does-not-define",
             workload: None,
-            body: best_practice("notapillar", "sec-01", "sec-01-bp-02"),
+            body: best_practice("notapillar", "securely-operate", "sec_securely_operate_aws_account"),
             status: 400,
             error_code: "ValidationException",
         },
         Refused {
             case: "question-of-another-pillar",
             workload: None,
-            body: best_practice("reliability", "sec-01", "sec-01-bp-02"),
+            body: best_practice("reliability", "securely-operate", "sec_securely_operate_aws_account"),
             status: 400,
             error_code: "ValidationException",
         },
@@ -656,14 +656,14 @@ async fn the_read_refuses_what_the_lens_does_not_define() {
         Refused {
             case: "choice-of-another-question",
             workload: None,
-            body: best_practice("security", "sec-02", "sec-01-bp-02"),
+            body: best_practice("security", "identities", "sec_securely_operate_aws_account"),
             status: 400,
             error_code: "ValidationException",
         },
         Refused {
             case: "choice-the-question-does-not-offer",
             workload: None,
-            body: best_practice("security", "sec-01", "sec-01-bp-99"),
+            body: best_practice("security", "securely-operate", "sec-01-bp-99"),
             status: 400,
             error_code: "ValidationException",
         },
@@ -671,7 +671,7 @@ async fn the_read_refuses_what_the_lens_does_not_define() {
             case: "token-this-service-did-not-issue",
             workload: None,
             body: {
-                let mut body = best_practice("security", "sec-01", "sec-01-bp-02");
+                let mut body = best_practice("security", "securely-operate", "sec_securely_operate_aws_account");
                 body["NextToken"] = json!("notatoken");
                 body
             },
@@ -687,7 +687,7 @@ async fn the_read_refuses_what_the_lens_does_not_define() {
         ("max-results-at-the-maximum", MAX_RESULTS_RANGE.1, 200),
         ("max-results-above-the-range", MAX_RESULTS_RANGE.1 + 1, 400),
     ] {
-        let mut body = best_practice("security", "sec-01", "sec-01-bp-02");
+        let mut body = best_practice("security", "securely-operate", "sec_securely_operate_aws_account");
         body["MaxResults"] = json!(max_results);
         if status == 200 {
             let answer = list_check_details(&client, &workload_id, body).await;
@@ -750,7 +750,7 @@ async fn a_resumed_page_starts_just_past_the_token() {
         Some(INTEGRATION_ENABLED),
     )
     .await;
-    let mut request = best_practice("security", "sec-03", "sec-03-bp-07");
+    let mut request = best_practice("security", "permissions", "sec_permissions_analyze_cross_account");
     request["MaxResults"] = json!(2);
 
     let first = list_check_details(&client, &workload_id, request.clone()).await;
@@ -814,7 +814,7 @@ async fn listing_checks_changes_nothing_a_later_read_sees() {
         Some(INTEGRATION_ENABLED),
     )
     .await;
-    let request = best_practice("reliability", "rel-09", "rel-09-bp-03");
+    let request = best_practice("reliability", "back-up-data", "rel_backing_up_data_automated_backups_data");
 
     let before = client.get(&workload_id).await;
     let first = list_check_details(&client, &workload_id, request.clone()).await;
@@ -859,7 +859,10 @@ async fn every_catalog_row_names_a_best_practice_of_the_framework_lens() {
             );
         };
         assert!(
-            question.best_practices.contains(&check.best_practice),
+            question
+                .best_practices
+                .iter()
+                .any(|practice| practice.title == check.best_practice),
             "case {:?}: expected {:?} among the best practices of {:?}, got {:?}",
             check.id,
             check.best_practice,

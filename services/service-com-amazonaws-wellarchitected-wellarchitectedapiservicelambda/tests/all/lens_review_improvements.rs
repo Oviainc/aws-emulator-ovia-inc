@@ -23,7 +23,9 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
+use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
+    self, AnswerRecord,
+};
 
 use super::workload_harness::{
     assert_field_validation, created_id, encode_path_segment, framework_answer,
@@ -32,17 +34,17 @@ use super::workload_harness::{
 };
 
 /// The AWS Well-Architected Framework lens's pillars: the `PillarId` each is named by on
-/// the wire, the prefix its `QuestionId`s carry and the number of questions it asks (OPS
-/// 1-11, SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6). Spelled out here — in the
-/// order the framework presents them — so the tests pin the catalog rather than reading
-/// it back out of the code under test.
-const FRAMEWORK_PILLARS: [(&str, &str, usize); 6] = [
-    ("operationalExcellence", "ops", 11),
-    ("security", "sec", 11),
-    ("reliability", "rel", 13),
-    ("performance", "perf", 5),
-    ("costOptimization", "cost", 11),
-    ("sustainability", "sus", 6),
+/// the wire and the number of questions it asks (OPS 1-11, SEC 1-11, REL 1-13, PERF 1-5,
+/// COST 1-11, SUS 1-6). Spelled out here — in the order the framework presents them — so
+/// the tests pin the framework's published numbering rather than reading it back out of
+/// the code under test.
+const FRAMEWORK_PILLARS: [(&str, usize); 6] = [
+    ("operationalExcellence", 11),
+    ("security", 11),
+    ("reliability", 13),
+    ("performance", 5),
+    ("costOptimization", 11),
+    ("sustainability", 6),
 ];
 
 /// How many questions that lens asks in all.
@@ -71,15 +73,37 @@ const MAX_RESULTS_RANGE: (i64, i64) = (1, 100);
 const ANSWERS_MAX_RESULTS_CEILING: i64 = 50;
 
 /// Every question of the lens, in the framework's order, as `(PillarId, QuestionId)`.
+///
+/// The framework lens publishes its own `QuestionId`s, so they are read from the lens's
+/// content (the question ids themselves are pinned over the wire by
+/// `super::question_choice_catalog`); what this suite pins independently is the framework's
+/// published numbering — the pillar order and the number of questions each pillar asks
+/// ([`FRAMEWORK_PILLARS`]), which this asserts the content against.
 fn catalog() -> Vec<(String, String)> {
-    FRAMEWORK_PILLARS
+    let questions: Vec<(String, String)> = state::FRAMEWORK_LENS_QUESTIONS
         .iter()
-        .flat_map(|(pillar, prefix, count)| {
-            (1..=*count).map(move |number| {
-                ((*pillar).to_string(), format!("{prefix}-{number:02}"))
-            })
+        .map(|question| {
+            (
+                question.pillar_id.to_string(),
+                question.question_id.to_string(),
+            )
         })
-        .collect()
+        .collect();
+    let mut expected: Vec<&str> = Vec::new();
+    for (pillar, count) in FRAMEWORK_PILLARS {
+        for _ in 0..count {
+            expected.push(pillar);
+        }
+    }
+    let pillars: Vec<&str> = questions
+        .iter()
+        .map(|(pillar, _)| pillar.as_str())
+        .collect();
+    assert_eq!(
+        pillars, expected,
+        "the lens must ask the framework's published numbering, in its pillar order"
+    );
+    questions
 }
 
 /// `GET /workloads/{WorkloadId}/lensReviews/{LensAlias}/improvements`, with every filter
@@ -305,43 +329,43 @@ async fn only_identified_risks_appear_in_the_improvement_plan() {
     let rows: Vec<Rated> = vec![
         Rated {
             case: "nothing-in-place",
-            question_id: "ops-02",
-            record: Some(framework_answer("ops-02", InPlace::Nothing)),
+            question_id: "organization-structure",
+            record: Some(framework_answer("organization-structure", InPlace::Nothing)),
             plan_risk: Some("HIGH"),
         },
         Rated {
             case: "one-best-practice-missing",
-            question_id: "sec-03",
-            record: Some(framework_answer("sec-03", InPlace::AllButLast)),
+            question_id: "permissions",
+            record: Some(framework_answer("permissions", InPlace::AllButLast)),
             plan_risk: Some("MEDIUM"),
         },
         Rated {
             case: "every-best-practice-in-place",
-            question_id: "rel-04",
-            record: Some(framework_answer("rel-04", InPlace::Every)),
+            question_id: "prevent-interaction-failure",
+            record: Some(framework_answer("prevent-interaction-failure", InPlace::Every)),
             plan_risk: None,
         },
         Rated {
             case: "unselected-choice-does-not-apply",
-            question_id: "perf-02",
+            question_id: "compute-architecture-selection",
             record: Some(framework_answer(
-                "perf-02",
+                "compute-architecture-selection",
                 InPlace::AllButLastWhichDoesNotApply,
             )),
             plan_risk: None,
         },
         Rated {
             case: "question-does-not-apply",
-            question_id: "cost-06",
+            question_id: "resource-type-size-number",
             record: Some(framework_answer_that_does_not_apply(
-                "cost-06",
+                "resource-type-size-number",
                 "OUT_OF_SCOPE",
             )),
             plan_risk: None,
         },
         Rated {
             case: "no-stored-answer",
-            question_id: "sus-03",
+            question_id: "software-architecture",
             record: None,
             plan_risk: None,
         },
@@ -580,7 +604,7 @@ async fn the_filters_narrow_the_improvement_plan() {
     };
 
     let mut cases: Vec<(String, Vec<String>, usize)> = Vec::new();
-    for (pillar, _, _) in FRAMEWORK_PILLARS {
+    for (pillar, _) in FRAMEWORK_PILLARS {
         cases.push((
             format!("pillar-{pillar}"),
             vec![format!("PillarId={pillar}")],
@@ -986,8 +1010,8 @@ async fn a_milestone_freezes_the_improvement_plan_it_recorded() {
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "rel-01",
-        framework_answer("rel-01", InPlace::Nothing),
+        "manage-service-quotas",
+        framework_answer("manage-service-quotas", InPlace::Nothing),
     );
     let recorded = client
         .send(
@@ -1009,22 +1033,22 @@ async fn a_milestone_freezes_the_improvement_plan_it_recorded() {
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "rel-01",
-        framework_answer("rel-01", InPlace::Every),
+        "manage-service-quotas",
+        framework_answer("manage-service-quotas", InPlace::Every),
     );
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "cost-02",
-        framework_answer("cost-02", InPlace::AllButLast),
+        "govern-usage",
+        framework_answer("govern-usage", InPlace::AllButLast),
     );
 
     for (case, filters, expected) in [
-        ("live", Vec::new(), vec![("cost-02", "MEDIUM")]),
+        ("live", Vec::new(), vec![("govern-usage", "MEDIUM")]),
         (
             "milestone",
             vec!["MilestoneNumber=1".to_string()],
-            vec![("rel-01", "HIGH")],
+            vec![("manage-service-quotas", "HIGH")],
         ),
     ] {
         let (summaries, _) = collect_improvements(
@@ -1169,7 +1193,7 @@ async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
     // is created with, read off this suite's catalog table rather than the code under test.
     let framework_order: Vec<&str> = FRAMEWORK_PILLARS
         .iter()
-        .map(|(pillar_id, _, _)| *pillar_id)
+        .map(|(pillar_id, _)| *pillar_id)
         .collect();
     // The framework's own order rotated, so the row that names it ranks every pillar
     // differently from the rows that name the order itself or its reverse.
@@ -1313,7 +1337,7 @@ async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
 
         // Inside one pillar the lens's own order stands, and the `PillarId` filter serves
         // exactly that pillar's slice of the plan.
-        for (pillar_id, _, _) in FRAMEWORK_PILLARS {
+        for (pillar_id, _) in FRAMEWORK_PILLARS {
             let in_plan: Vec<(String, String)> = summaries
                 .iter()
                 .filter(|summary| string_member(summary, "PillarId") == pillar_id)
@@ -1387,7 +1411,7 @@ async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
     let ranked_pillars = |priorities: &[&str]| -> Vec<String> {
         let mut pillars: Vec<String> = FRAMEWORK_PILLARS
             .iter()
-            .map(|(pillar_id, _, _)| (*pillar_id).to_string())
+            .map(|(pillar_id, _)| (*pillar_id).to_string())
             .collect();
         pillars.sort_by_key(|pillar_id| priority_rank(priorities, pillar_id));
         pillars

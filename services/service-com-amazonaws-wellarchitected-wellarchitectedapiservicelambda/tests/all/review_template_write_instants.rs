@@ -37,7 +37,7 @@ const REGION: &str = "us-west-2";
 const FRAMEWORK_PILLARS: [&str; 2] = ["security", "sustainability"];
 
 /// `QuestionId`s of the framework lens's published numbering, in two different pillars.
-const FRAMEWORK_QUESTIONS: [&str; 2] = ["ops-01", "sec-02"];
+const FRAMEWORK_QUESTIONS: [&str; 2] = ["organization-priorities", "identities"];
 
 /// How far into the past the stored instants are moved before the request under test, so a
 /// write the handler makes is observable whatever the clock's granularity between two

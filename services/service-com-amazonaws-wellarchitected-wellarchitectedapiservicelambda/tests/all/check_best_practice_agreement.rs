@@ -188,8 +188,8 @@ async fn both_views_resolve_a_request_to_the_same_best_practice() {
             case: "three-checks",
             lens: FRAMEWORK_LENS,
             pillar_id: "security",
-            question_id: "sec-03",
-            choice_id: "sec-03-bp-07",
+            question_id: "permissions",
+            choice_id: "sec_permissions_analyze_cross_account",
             check_ids: &[
                 "amazon-s3-bucket-permissions",
                 "amazon-rds-public-snapshots",
@@ -200,24 +200,24 @@ async fn both_views_resolve_a_request_to_the_same_best_practice() {
             case: "two-checks-in-another-pillar",
             lens: FRAMEWORK_LENS,
             pillar_id: "reliability",
-            question_id: "rel-10",
-            choice_id: "rel-10-bp-01",
+            question_id: "fault-isolation",
+            choice_id: "rel_fault_isolation_multiaz_region_system",
             check_ids: &["amazon-rds-multi-az", "elb-cross-zone-load-balancing"],
         },
         Resolved {
             case: "one-check",
             lens: FRAMEWORK_LENS,
             pillar_id: "sustainability",
-            question_id: "sus-04",
-            choice_id: "sus-04-bp-04",
+            question_id: "data-patterns",
+            choice_id: "sus_data_block_storage_provisioning",
             check_ids: &["underutilized-amazon-ebs-volumes"],
         },
         Resolved {
             case: "best-practice-with-no-check",
             lens: FRAMEWORK_LENS,
             pillar_id: "operationalExcellence",
-            question_id: "ops-01",
-            choice_id: "ops-01-bp-01",
+            question_id: "organization-priorities",
+            choice_id: "ops_priorities_ext_cust_needs",
             check_ids: &[],
         },
         Resolved {
@@ -287,7 +287,7 @@ async fn both_views_resolve_a_request_to_the_same_best_practice() {
 #[tokio::test]
 async fn both_views_share_the_activation_gate() {
     let client = Client::new();
-    let request = best_practice(FRAMEWORK_LENS, "security", "sec-03", "sec-03-bp-07");
+    let request = best_practice(FRAMEWORK_LENS, "security", "permissions", "sec_permissions_analyze_cross_account");
 
     for (case, integration, want) in [
         (
@@ -347,28 +347,28 @@ async fn both_views_refuse_a_request_identically() {
         Refused {
             case: "absent-workload",
             workload: Some(ABSENT_HEX_ID),
-            body: best_practice(FRAMEWORK_LENS, "security", "sec-01", "sec-01-bp-02"),
+            body: best_practice(FRAMEWORK_LENS, "security", "securely-operate", "sec_securely_operate_aws_account"),
             status: 404,
             error_code: "ResourceNotFoundException",
         },
         Refused {
             case: "lens-not-reviewed",
             workload: None,
-            body: best_practice(UNREVIEWED_LENS, "security", "sec-01", "sec-01-bp-02"),
+            body: best_practice(UNREVIEWED_LENS, "security", "securely-operate", "sec_securely_operate_aws_account"),
             status: 404,
             error_code: "ResourceNotFoundException",
         },
         Refused {
             case: "pillar-the-lens-does-not-define",
             workload: None,
-            body: best_practice(FRAMEWORK_LENS, "notapillar", "sec-01", "sec-01-bp-02"),
+            body: best_practice(FRAMEWORK_LENS, "notapillar", "securely-operate", "sec_securely_operate_aws_account"),
             status: 400,
             error_code: "ValidationException",
         },
         Refused {
             case: "question-of-another-pillar",
             workload: None,
-            body: best_practice(FRAMEWORK_LENS, "reliability", "sec-01", "sec-01-bp-02"),
+            body: best_practice(FRAMEWORK_LENS, "reliability", "securely-operate", "sec_securely_operate_aws_account"),
             status: 400,
             error_code: "ValidationException",
         },
@@ -382,14 +382,14 @@ async fn both_views_refuse_a_request_identically() {
         Refused {
             case: "choice-of-another-question",
             workload: None,
-            body: best_practice(FRAMEWORK_LENS, "security", "sec-02", "sec-01-bp-02"),
+            body: best_practice(FRAMEWORK_LENS, "security", "identities", "sec_securely_operate_aws_account"),
             status: 400,
             error_code: "ValidationException",
         },
         Refused {
             case: "choice-the-question-does-not-offer",
             workload: None,
-            body: best_practice(FRAMEWORK_LENS, "security", "sec-01", "sec-01-bp-99"),
+            body: best_practice(FRAMEWORK_LENS, "security", "securely-operate", "sec-01-bp-99"),
             status: 400,
             error_code: "ValidationException",
         },

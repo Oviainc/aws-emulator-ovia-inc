@@ -132,7 +132,7 @@ async fn repeated_reads_report_the_same_review_and_change_nothing() {
             &[FRAMEWORK_LENS],
             FRAMEWORK_LENS,
             None,
-            &["sec-01", "ops-11"],
+            &["securely-operate", "evolve-operations"],
             2,
         ),
         (
@@ -140,7 +140,7 @@ async fn repeated_reads_report_the_same_review_and_change_nothing() {
             &[FRAMEWORK_LENS],
             FRAMEWORK_LENS,
             Some("notes beside stored answers"),
-            &["rel-13", "cost-01", "sus-06"],
+            &["plan-for-dr", "cloud-financial-management", "dev-deploy-patterns"],
             3,
         ),
         (
@@ -148,7 +148,7 @@ async fn repeated_reads_report_the_same_review_and_change_nothing() {
             &[FRAMEWORK_LENS],
             framework_arn.as_str(),
             Some("named by the lens ARN"),
-            &["perf-05"],
+            &["performance-monitoring"],
             1,
         ),
         // This emulator ships no question set for this lens, so the lens ASKS nothing and
@@ -159,7 +159,7 @@ async fn repeated_reads_report_the_same_review_and_change_nothing() {
             &[UNSHIPPED_LENS],
             UNSHIPPED_LENS,
             Some("a lens this emulator holds no content for"),
-            &["sec-01"],
+            &["securely-operate"],
             0,
         ),
     ];

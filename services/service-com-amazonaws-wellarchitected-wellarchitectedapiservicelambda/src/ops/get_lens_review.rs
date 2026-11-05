@@ -211,7 +211,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &store.reviewed_lens_at(
                     &input.lens_alias,
                     workload.lens_review_version(&input.lens_alias),
-                    &crate::state::request_region(ctx.parts()),
                 ),
                 // The content of the lenses this workload reviews, resolved from the whole
                 // lens catalog for the version each of its reviews is against: what a lens

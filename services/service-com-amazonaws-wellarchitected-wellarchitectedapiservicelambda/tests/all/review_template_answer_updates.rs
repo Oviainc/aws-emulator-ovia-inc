@@ -93,10 +93,10 @@ const FRAMEWORK_QUESTIONS: i64 = 11 + 11 + 13 + 5 + 11 + 6;
 /// about a single best practice, `ops-01` about several). The ids are this emulator's own
 /// stable question ids, pinned by `super::question_choice_catalog`.
 const QUESTIONS: [(&str, &str); 4] = [
-    ("ops-01", "operationalExcellence"),
-    ("sec-05", "security"),
-    ("cost-11", "costOptimization"),
-    ("sus-01", "sustainability"),
+    ("organization-priorities", "operationalExcellence"),
+    ("network-protection", "security"),
+    ("evaluate-cost-of-effort", "costOptimization"),
+    ("region-selection", "sustainability"),
 ];
 
 /// A well-formed `TemplateArn` (the modelled
@@ -451,8 +451,8 @@ async fn an_empty_member_answers_the_question_and_no_member_answers_nothing() {
     let template_arn = template(&client, "empty-update-template", &[FRAMEWORK_LENS]).await;
 
     for question in [
-        ("ops-11", "operationalExcellence"),
-        ("sus-01", "sustainability"),
+        ("evolve-operations", "operationalExcellence"),
+        ("region-selection", "sustainability"),
     ] {
         let (question_id, _) = question;
         let offered = offered_choices(&client, &template_arn, question).await;
@@ -549,7 +549,7 @@ async fn an_empty_member_answers_the_question_and_no_member_answers_nothing() {
 async fn a_choice_update_replaces_that_choices_answer() {
     let client = Client::new();
     let template_arn = template(&client, "choice-updates-template", &[FRAMEWORK_LENS]).await;
-    let question = ("ops-04", "operationalExcellence");
+    let question = ("implement-observability", "operationalExcellence");
     let (question_id, _) = question;
     let offered = offered_choices(&client, &template_arn, question).await;
     let target = offered[0].clone();
@@ -646,7 +646,7 @@ async fn a_choice_update_replaces_that_choices_answer() {
 async fn each_answer_member_is_written_independently() {
     let client = Client::new();
     let template_arn = template(&client, "members-template", &[FRAMEWORK_LENS]).await;
-    let question = ("sec-02", "security");
+    let question = ("identities", "security");
     let (question_id, _) = question;
     let offered = offered_choices(&client, &template_arn, question).await;
     assert!(
@@ -833,10 +833,10 @@ async fn the_question_rollups_follow_the_recorded_answers() {
 
     // (case, question, pillar, how many distinct questions are answered afterwards)
     let rows: [(&str, &str, &str, i64); 4] = [
-        ("first-answer", "rel-01", "reliability", 1),
-        ("second-pillar", "perf-03", "performance", 2),
-        ("third-pillar", "sus-02", "sustainability", 3),
-        ("answered-again", "rel-01", "reliability", 3),
+        ("first-answer", "manage-service-quotas", "reliability", 1),
+        ("second-pillar", "data-management", "performance", 2),
+        ("third-pillar", "user-behavior-patterns", "sustainability", 3),
+        ("answered-again", "manage-service-quotas", "reliability", 3),
     ];
 
     for (case, question_id, pillar_id, answered_questions) in rows {
@@ -951,7 +951,7 @@ async fn an_unresolvable_or_refused_update_writes_nothing() {
         &[FRAMEWORK_LENS, UNSHIPPED_LENS],
     )
     .await;
-    let question = ("ops-06", "operationalExcellence");
+    let question = ("mitigate-deployment-risks", "operationalExcellence");
     let (question_id, _) = question;
     let offered = offered_choices(&client, &template_arn, question).await;
     let undefined_choice = format!("{question_id}-bp-99");
@@ -1110,13 +1110,13 @@ async fn an_unresolvable_answer_names_the_missing_resource() {
         (
             "read",
             client
-                .get_review_template_answer(&absent, FRAMEWORK_LENS, "ops-01")
+                .get_review_template_answer(&absent, FRAMEWORK_LENS, "organization-priorities")
                 .await,
         ),
         (
             "write",
             client
-                .update_review_template_answer(&absent, FRAMEWORK_LENS, "ops-01", json!({}))
+                .update_review_template_answer(&absent, FRAMEWORK_LENS, "organization-priorities", json!({}))
                 .await,
         ),
     ] {
@@ -1146,7 +1146,7 @@ async fn an_unresolvable_answer_names_the_missing_resource() {
         (
             "lens-not-applied",
             UNSHIPPED_LENS,
-            "ops-01",
+            "organization-priorities",
             "LensAlias",
             format!(
                 "No lens review for lens alias {UNSHIPPED_LENS} was found in review template \
@@ -1191,7 +1191,7 @@ async fn an_unresolvable_answer_names_the_missing_resource() {
 async fn reading_an_answer_writes_nothing() {
     let client = Client::new();
     let template_arn = template(&client, "reporting-template", &[FRAMEWORK_LENS]).await;
-    let question = ("cost-02", "costOptimization");
+    let question = ("govern-usage", "costOptimization");
     let (question_id, _) = question;
     let offered = offered_choices(&client, &template_arn, question).await;
 

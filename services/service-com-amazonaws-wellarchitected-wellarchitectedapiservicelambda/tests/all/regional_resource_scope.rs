@@ -582,18 +582,28 @@ async fn an_imported_lens_belongs_to_the_region_that_imported_it() {
             "case {case:?}: {other:?} imported no lens, got {listed_other:?}"
         );
 
-        // The official catalog is published by every Region, under that Region's ARNs.
+        // The lens library AWS publishes is partition-global: every Region reports the same
+        // lenses, under the same account-less, Region-less ARNs.
         let official = client
             .send_in(&other, "GET", "/lenses?LensType=AWS_OFFICIAL", None)
             .await;
         let official_arns = summarized(&official, "LensSummaries", "LensArn");
+        let in_home = client
+            .send_in(&home, "GET", "/lenses?LensType=AWS_OFFICIAL", None)
+            .await;
         assert!(
             !official_arns.is_empty()
                 && official_arns
                     .iter()
-                    .all(|arn| arn_region_is(arn, other.as_str())),
-            "case {case:?}: {other:?} must publish the official lenses under its own Region, \
-             got {official:?}"
+                    .all(|arn| arn.starts_with("arn:aws:wellarchitected::aws:lens/")),
+            "case {case:?}: a lens AWS publishes carries no Region and no owner account in \
+             its ARN, got {official:?}"
+        );
+        assert_eq!(
+            official_arns,
+            summarized(&in_home, "LensSummaries", "LensArn"),
+            "case {case:?}: {other:?} must publish the same lens library as {home:?}, got \
+             {official:?}"
         );
 
         let export_uri = format!("/lenses/{}/export", encode_path_segment(&lens_arn));

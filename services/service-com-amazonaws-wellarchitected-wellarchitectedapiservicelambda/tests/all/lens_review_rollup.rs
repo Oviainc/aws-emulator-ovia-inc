@@ -54,7 +54,7 @@ const RISKS: [&str; 5] = ["HIGH", "MEDIUM", "NONE", "NOT_APPLICABLE", "UNANSWERE
 const FRAMEWORK_LENS: &str = "wellarchitected";
 
 /// The published name of that lens, as `LensReview$LensName` reports it.
-const FRAMEWORK_LENS_NAME: &str = "Well-Architected Framework";
+const FRAMEWORK_LENS_NAME: &str = "AWS Well-Architected Framework";
 
 /// A lens alias AWS publishes that this emulator's AWS-official lens catalog carries no
 /// content for, so it asks no questions here (the catalog itself is pinned by
@@ -307,36 +307,36 @@ async fn an_answer_moves_the_counts_of_its_pillar_and_of_the_whole_review() {
         (
             "no-best-practice-in-place",
             "reliability",
-            "rel-01",
-            framework_answer("rel-01", InPlace::Nothing),
+            "manage-service-quotas",
+            framework_answer("manage-service-quotas", InPlace::Nothing),
             "HIGH",
         ),
         (
             "a-best-practice-still-unselected",
             "security",
-            "sec-02",
-            framework_answer("sec-02", InPlace::AllButLast),
+            "identities",
+            framework_answer("identities", InPlace::AllButLast),
             "MEDIUM",
         ),
         (
             "every-best-practice-in-place",
             "operationalExcellence",
-            "ops-03",
-            framework_answer("ops-03", InPlace::Every),
+            "organization-culture",
+            framework_answer("organization-culture", InPlace::Every),
             "NONE",
         ),
         (
             "question-does-not-apply",
             "sustainability",
-            "sus-06",
-            framework_answer_that_does_not_apply("sus-06", "OUT_OF_SCOPE"),
+            "dev-deploy-patterns",
+            framework_answer_that_does_not_apply("dev-deploy-patterns", "OUT_OF_SCOPE"),
             "NOT_APPLICABLE",
         ),
         (
             "second-answer-in-the-same-pillar",
             "reliability",
-            "rel-02",
-            framework_answer("rel-02", InPlace::Nothing),
+            "network-topology",
+            framework_answer("network-topology", InPlace::Nothing),
             "HIGH",
         ),
     ];
@@ -397,7 +397,7 @@ async fn every_spelling_of_the_lens_reaches_the_same_review() {
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "cost-01",
+        "cloud-financial-management",
         answered(&[], true, None),
     );
 
@@ -448,7 +448,7 @@ async fn a_milestone_scoped_read_reports_the_review_that_milestone_recorded() {
     );
 
     // Milestone <n> is recorded with exactly <n> questions answered HIGH.
-    let questions = ["rel-01", "rel-02", "rel-03"];
+    let questions = ["manage-service-quotas", "network-topology", "service-architecture"];
     for (index, question_id) in questions.iter().enumerate() {
         client.record_answer(
             &workload_id,
@@ -474,7 +474,7 @@ async fn a_milestone_scoped_read_reports_the_review_that_milestone_recorded() {
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "sec-01",
+        "securely-operate",
         answered(&[], true, None),
     );
 

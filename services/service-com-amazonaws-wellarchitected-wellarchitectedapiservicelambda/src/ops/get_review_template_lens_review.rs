@@ -165,14 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The Region the request was signed for is what an AWS-official lens's `LensArn`
-        // is reported in; a custom lens is reported by the ARN its import minted. Resolved
-        // here, with the version this template's review of the lens is against, because
-        // both come from the lens catalog rather than from the template.
-        let region = crate::state::request_region(ctx.parts());
-
+        // What the lens catalog says about the lens this template's review is against, and
+        // the version that review pins: both come from the lens catalog rather than from
+        // the template.
         let store = state.lock();
-        let reviewed = store.reviewed_lens(&input.template_arn, &input.lens_alias, &region);
+        let reviewed = store.reviewed_lens(&input.template_arn, &input.lens_alias);
         let template = store
             .review_templates
             .get(&input.template_arn)

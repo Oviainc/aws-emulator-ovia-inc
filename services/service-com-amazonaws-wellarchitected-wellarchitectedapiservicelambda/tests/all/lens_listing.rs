@@ -144,11 +144,12 @@ fn record_shared_lens(client: &Client, owner: &str, document: &Value) -> String 
     lens_arn
 }
 
-/// The `LensArn` the AWS Well-Architected Framework lens carries in the Region these
-/// tests sign for: an official lens ARN names no owner account (`LensAlias` doc).
+/// The `LensArn` the AWS Well-Architected Framework lens carries: a lens AWS publishes is
+/// partition-global and owned by no customer account, so its ARN carries no Region and the
+/// publisher in the account position.
 fn official_lens_arn() -> String {
     format!(
-        "arn:aws:wellarchitected:us-west-2::lens/{}",
+        "arn:aws:wellarchitected::aws:lens/{}",
         state::FRAMEWORK_LENS_ALIAS
     )
 }
@@ -167,7 +168,8 @@ fn timestamp(summary: &Value, name: &str) -> Option<f64> {
 }
 
 /// The aliases of every AWS-official lens this emulator publishes, in the order the
-/// catalog enumerates them (by alias).
+/// catalog enumerates them: the Well-Architected Framework lens leads the official group,
+/// the rest follow in alias order.
 ///
 /// WHAT that catalog publishes — each lens's alias, name, version, description and
 /// question set — is pinned by `super::official_lens_catalog`; the suites here are about
@@ -177,8 +179,10 @@ fn official_aliases() -> Vec<String> {
     let mut aliases: Vec<String> = state::OFFICIAL_LENS_CATALOG
         .iter()
         .map(|official| official.alias.to_string())
+        .filter(|alias| alias != state::FRAMEWORK_LENS_ALIAS)
         .collect();
     aliases.sort();
+    aliases.insert(0, state::FRAMEWORK_LENS_ALIAS.to_string());
     aliases
 }
 
@@ -278,9 +282,10 @@ async fn the_catalog_reports_every_stored_lens_from_its_own_record() {
         state::FRAMEWORK_LENS_DESCRIPTION,
         "case \"official\": expected the shipped lens's description, got {official:?}"
     );
-    assert!(
-        official.get("Owner").is_none(),
-        "case \"official\": an official lens ARN names no owner account, got {official:?}"
+    assert_eq!(
+        member(&official, "Owner"),
+        state::AWS_OFFICIAL_LENS_OWNER,
+        "case \"official\": a lens AWS publishes is owned by AWS, got {official:?}"
     );
     assert_eq!(
         timestamp(&official, "CreatedAt"),

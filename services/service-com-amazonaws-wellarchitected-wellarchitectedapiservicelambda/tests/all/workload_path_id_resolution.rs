@@ -48,12 +48,12 @@ const UNAPPLIED_LENS: &str = "serverless";
 /// is what the two check lists name.
 const PILLAR_ID: &str = "security";
 /// See [`PILLAR_ID`].
-const CHECK_QUESTION_ID: &str = "sec-03";
+const CHECK_QUESTION_ID: &str = "permissions";
 /// See [`PILLAR_ID`].
-const CHOICE_ID: &str = "sec-03-bp-07";
+const CHOICE_ID: &str = "sec_permissions_analyze_cross_account";
 
 /// A question of the framework lens, which the answer reads and writes name.
-const ANSWER_QUESTION_ID: &str = "ops-01";
+const ANSWER_QUESTION_ID: &str = "organization-priorities";
 
 /// The one `IntegratingService` the model publishes
 /// (`smithy_query(query="shape", shape="IntegratingService")`).

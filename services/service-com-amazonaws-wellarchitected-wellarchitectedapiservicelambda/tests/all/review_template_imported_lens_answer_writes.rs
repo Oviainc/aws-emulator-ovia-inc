@@ -62,7 +62,7 @@ const UNSELECTED: &str = "UNSELECTED";
 /// A `QuestionId` of the AWS Well-Architected Framework lens, as this emulator's own stable
 /// ids spell it (pinned by `super::question_choice_catalog`): a question no imported
 /// document under test defines, so it names no answer of a custom lens's review.
-const FRAMEWORK_QUESTION: &str = "ops-01";
+const FRAMEWORK_QUESTION: &str = "organization-priorities";
 
 /// Which of a question's choices an answer records as in place. The plans span the shape of
 /// a selection — nothing, one choice, every other choice and all of them — which is what

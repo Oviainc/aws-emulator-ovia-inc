@@ -52,7 +52,7 @@ const ABSENT_HEX_ID: &str = "00000000000000000000000000000000";
 ///
 /// The `ChoiceId`s themselves are never written down: every case reads the question's own
 /// catalog (`Answer$Choices`) first, which is where a client discovers them too.
-const QUESTIONS: [&str; 4] = ["ops-01", "sec-02", "cost-01", "sus-01"];
+const QUESTIONS: [&str; 4] = ["organization-priorities", "identities", "cloud-financial-management", "region-selection"];
 
 /// The `ChoiceStatus` members, as `smithy_query(query="shape", shape="ChoiceStatus")`
 /// publishes them: what an answer can record about one best practice.
@@ -361,7 +361,7 @@ async fn selected_choices_replace_the_best_practices_an_answer_records() {
 async fn a_choice_update_records_the_status_reason_and_notes_of_its_choice() {
     let client = Client::new();
     let workload_id = framework_workload(&client, "choice-updates").await;
-    let question_id = "ops-01";
+    let question_id = "organization-priorities";
 
     let asks = choice_ids(&answer_of(
         &get_answer(&client, &workload_id, FRAMEWORK_LENS, question_id, None).await,
@@ -461,7 +461,7 @@ struct Step {
 async fn an_update_applies_only_the_members_it_carries() {
     let client = Client::new();
     let workload_id = framework_workload(&client, "partial-updates").await;
-    let question_id = "sec-02";
+    let question_id = "identities";
 
     let asks = choice_ids(&answer_of(
         &get_answer(&client, &workload_id, FRAMEWORK_LENS, question_id, None).await,
@@ -596,13 +596,13 @@ struct Refusal {
 async fn an_update_naming_nothing_the_review_holds_is_refused() {
     let client = Client::new();
     let workload_id = framework_workload(&client, "refused-updates").await;
-    let question_id = "ops-01";
+    let question_id = "organization-priorities";
 
     let asks = choice_ids(&answer_of(
         &get_answer(&client, &workload_id, FRAMEWORK_LENS, question_id, None).await,
     ));
     let other_question = choice_ids(&answer_of(
-        &get_answer(&client, &workload_id, FRAMEWORK_LENS, "sus-01", None).await,
+        &get_answer(&client, &workload_id, FRAMEWORK_LENS, "region-selection", None).await,
     ));
     let absent_choice = format!("{question_id}-bp-99");
 
@@ -746,7 +746,7 @@ async fn an_update_naming_nothing_the_review_holds_is_refused() {
 
     // Nothing above was recorded: the question the refused requests named is still
     // unanswered.
-    let read = get_answer(&client, &workload_id, FRAMEWORK_LENS, "ops-01", None).await;
+    let read = get_answer(&client, &workload_id, FRAMEWORK_LENS, "organization-priorities", None).await;
     let answer = answer_of(&read);
     assert_eq!(
         text(&answer, "Risk").as_deref(),
@@ -763,7 +763,7 @@ async fn an_update_naming_nothing_the_review_holds_is_refused() {
 async fn a_recorded_answer_is_what_every_read_of_the_review_reports() {
     let client = Client::new();
     let workload_id = framework_workload(&client, "answer-reads").await;
-    let question_id = "cost-01";
+    let question_id = "cloud-financial-management";
     let lens_arn = official_lens_arn(REQUEST_REGION, FRAMEWORK_LENS);
 
     let asks = choice_ids(&answer_of(

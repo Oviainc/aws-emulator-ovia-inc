@@ -45,21 +45,24 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 /// AWS publishes for the rest
 /// (<https://docs.aws.amazon.com/wellarchitected/latest/userguide/lenses.html>), whose
 /// aliases this crate also carries as `state::AWS_OFFICIAL_LENS_ALIASES`. The
-/// `healthcareindustry` row is an entry the issue that asked for this catalog did not
-/// cite; the framework row's 57 is the framework's own published numbering (OPS 11,
-/// SEC 11, REL 13, PERF 5, COST 11, SUS 6).
+/// `healthcareindustry` and `games` rows are entries the issues that asked for this
+/// catalog did not cite; the framework row's 57 is the framework's own published numbering
+/// (OPS 11, SEC 11, REL 13, PERF 5, COST 11, SUS 6).
 const PUBLISHED_OFFICIAL_LENSES: &[(&str, &str, usize)] = &[
-    ("wellarchitected", "Well-Architected Framework", 57),
-    ("serverless", "Serverless Applications Lens", 9),
-    ("softwareasaservice", "SaaS Lens", 8),
-    ("iot", "IoT Lens", 8),
-    ("machinelearning", "Machine Learning Lens", 7),
+    ("wellarchitected", "AWS Well-Architected Framework", 57),
+    ("connectedmobility", "Connected Mobility Lens", 8),
     ("dataanalytics", "Data Analytics Lens", 7),
+    ("devops", "DevOps Lens", 8),
     ("financialservices", "Financial Services Industry Lens", 7),
-    ("sap", "SAP Lens", 7),
-    ("migration", "Migration Lens", 6),
+    ("games", "Games Industry Lens", 8),
     ("genai", "Generative AI Lens", 8),
     ("healthcareindustry", "Healthcare Industry Lens", 7),
+    ("iot", "IoT Lens", 8),
+    ("machinelearning", "Machine Learning Lens", 7),
+    ("migration", "Migration Lens", 6),
+    ("sap", "SAP Lens", 7),
+    ("serverless", "Serverless Lens", 9),
+    ("softwareasaservice", "SaaS Lens", 8),
 ];
 
 /// A lens alias AWS publishes that this emulator carries no CONTENT for: the content
@@ -291,9 +294,10 @@ async fn list_lenses_reports_every_aws_official_lens() {
             "PUBLISHED",
             "case {alias:?}: AWS's own lenses are published content, got {summary:?}"
         );
-        assert!(
-            summary.get("Owner").is_none(),
-            "case {alias:?}: an official lens ARN names no owner account, got {summary:?}"
+        assert_eq!(
+            member(summary, "Owner"),
+            state::AWS_OFFICIAL_LENS_OWNER,
+            "case {alias:?}: a lens AWS publishes is owned by AWS, got {summary:?}"
         );
 
         let version = member(summary, "LensVersion");
@@ -306,8 +310,13 @@ async fn list_lenses_reports_every_aws_official_lens() {
             (DESCRIPTION_LENGTH.0..=DESCRIPTION_LENGTH.1).contains(&description.len()),
             "case {alias:?}: Description is @length{DESCRIPTION_LENGTH:?}, got {description:?}"
         );
+        // The description must describe THIS lens, so it names the lens — the framework
+        // lens's published description spells its name out in full ("Amazon Web Services"
+        // rather than "AWS"), so the subject rather than the exact `LensName` is what is
+        // looked for.
+        let subject = name.strip_prefix("AWS ").unwrap_or(name).to_lowercase();
         assert!(
-            description.contains(*name) || description.to_lowercase().contains(&name.to_lowercase()),
+            description.to_lowercase().contains(&subject),
             "case {alias:?}: the description must describe THIS lens, got {description:?}"
         );
 
@@ -554,13 +563,30 @@ async fn every_official_lens_is_reviewable_on_a_workload() {
                 "case {alias:?}/{question_id:?}: a question asks about best practices, got \
                  {summary:?}"
             );
+            // A choice is named by the id the LENS names it by: the framework lens
+            // publishes its own `ChoiceId`s, and a lens whose content this emulator
+            // authored names a choice by its position in the question.
+            let mut choice_ids: BTreeSet<String> = BTreeSet::new();
             for (position, choice) in choices.iter().enumerate() {
-                assert_eq!(
-                    member(choice, "ChoiceId"),
-                    format!("{question_id}-bp-{:02}", position + 1),
-                    "case {alias:?}/{question_id:?}: a ChoiceId is named for its question and \
-                     position, got {choice:?}"
+                let choice_id = member(choice, "ChoiceId");
+                assert!(
+                    choice_ids.insert(choice_id.clone()),
+                    "case {alias:?}/{question_id:?}: a ChoiceId names one choice of the \
+                     question, got {choice_id:?} twice"
                 );
+                assert!(
+                    (1..=64).contains(&choice_id.len()),
+                    "case {alias:?}/{question_id:?}: ChoiceId is @length(1, 64), got \
+                     {choice_id:?}"
+                );
+                if alias != &"wellarchitected" {
+                    assert_eq!(
+                        choice_id,
+                        format!("{question_id}-bp-{:02}", position + 1),
+                        "case {alias:?}/{question_id:?}: an authored lens names a choice for \
+                         its question and position, got {choice:?}"
+                    );
+                }
                 assert!(
                     !member(choice, "Title").is_empty(),
                     "case {alias:?}/{question_id:?}: a choice carries its best practice, got \

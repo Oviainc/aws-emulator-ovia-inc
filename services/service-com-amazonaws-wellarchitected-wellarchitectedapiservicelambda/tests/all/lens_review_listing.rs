@@ -38,7 +38,7 @@ use super::workload_harness::{
 const FRAMEWORK_LENS: &str = "wellarchitected";
 
 /// The published name of that lens, as a lens review reports it.
-const FRAMEWORK_LENS_NAME: &str = "Well-Architected Framework";
+const FRAMEWORK_LENS_NAME: &str = "AWS Well-Architected Framework";
 
 /// The members the `LensStatus` enum publishes
 /// (`smithy_query(query="shape", shape="LensStatus")`), so a reported status is checked
@@ -402,25 +402,30 @@ async fn a_summary_is_reported_for_every_lens_the_workload_carries() {
             assert_summary(summary, stored, questions, case);
         }
 
-        // The served order is one stable total order: the ARNs of one Region differ only in
-        // the lens each names, so a strictly increasing ARN sequence is that order.
-        let arns: Vec<String> = page
+        // The served order is the WORKLOAD's own lens order: a review is reported where
+        // its lens is in `Workload$Lenses` — the order the lenses were applied — so a
+        // client sees a lens and its review in the same place in both lists.
+        let reported: Vec<String> = page
             .iter()
             .map(|summary| {
                 summary
-                    .get("LensArn")
+                    .get("LensAlias")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string()
             })
             .collect();
-        let mut sorted = arns.clone();
-        sorted.sort();
-        sorted.dedup();
+        let mut applied: Vec<String> = Vec::new();
+        let mut counted: BTreeSet<String> = BTreeSet::new();
+        for stored in &lenses {
+            if counted.insert(alias_of(stored)) {
+                applied.push(stored.clone());
+            }
+        }
         assert_eq!(
-            arns, sorted,
-            "case {case:?}: the summaries must be served in one stable total order, \
-             got {arns:?}"
+            reported, applied,
+            "case {case:?}: the summaries must be served in the order the workload applies \
+             its lenses, got {reported:?}"
         );
 
         // Rule 5: a read reports; it must not change what the next caller sees.
@@ -543,32 +548,32 @@ async fn the_roll_up_of_each_review_counts_only_that_lens_s_answers() {
     let rows: [(&str, &str, _, &str); 5] = [
         (
             "no-best-practice-in-place",
-            "rel-01",
-            framework_answer("rel-01", InPlace::Nothing),
+            "manage-service-quotas",
+            framework_answer("manage-service-quotas", InPlace::Nothing),
             "HIGH",
         ),
         (
             "a-best-practice-still-unselected",
-            "sec-02",
-            framework_answer("sec-02", InPlace::AllButLast),
+            "identities",
+            framework_answer("identities", InPlace::AllButLast),
             "MEDIUM",
         ),
         (
             "every-best-practice-in-place",
-            "ops-03",
-            framework_answer("ops-03", InPlace::Every),
+            "organization-culture",
+            framework_answer("organization-culture", InPlace::Every),
             "NONE",
         ),
         (
             "question-does-not-apply",
-            "sus-06",
-            framework_answer_that_does_not_apply("sus-06", "OUT_OF_SCOPE"),
+            "dev-deploy-patterns",
+            framework_answer_that_does_not_apply("dev-deploy-patterns", "OUT_OF_SCOPE"),
             "NOT_APPLICABLE",
         ),
         (
             "second-answer-of-the-same-review",
-            "rel-02",
-            framework_answer("rel-02", InPlace::Nothing),
+            "network-topology",
+            framework_answer("network-topology", InPlace::Nothing),
             "HIGH",
         ),
     ];
@@ -614,7 +619,7 @@ async fn a_milestone_scoped_listing_reports_the_reviews_that_milestone_recorded(
     let framework_questions = question_count(&client, &workload_id, FRAMEWORK_LENS).await;
 
     // Milestone <n> is recorded with exactly <n> questions answered HIGH.
-    let questions = ["rel-01", "rel-02", "rel-03"];
+    let questions = ["manage-service-quotas", "network-topology", "service-architecture"];
     for (index, question_id) in questions.iter().enumerate() {
         client.record_answer(
             &workload_id,
@@ -640,7 +645,7 @@ async fn a_milestone_scoped_listing_reports_the_reviews_that_milestone_recorded(
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
-        "sec-01",
+        "securely-operate",
         answered(&[], true, None),
     );
 

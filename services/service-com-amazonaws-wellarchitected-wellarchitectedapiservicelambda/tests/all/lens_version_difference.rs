@@ -567,7 +567,14 @@ async fn an_omitted_version_is_the_lenss_latest_published_version() {
 async fn the_official_lens_differences_against_its_shipped_version() {
     let client = Client::new();
     let shipped = state::FRAMEWORK_LENS_VERSION;
-    let official_arn = format!(
+    // The ARN the service REPORTS for a lens AWS publishes: partition-global, with the
+    // publisher in the account position. A caller may still NAME the lens by the
+    // Region-qualified spelling the `LensAlias` doc shows, which resolves to the same lens.
+    let reported_arn = format!(
+        "arn:aws:wellarchitected::aws:lens/{}",
+        state::FRAMEWORK_LENS_ALIAS
+    );
+    let regional_arn = format!(
         "arn:aws:wellarchitected:us-west-2::lens/{}",
         state::FRAMEWORK_LENS_ALIAS
     );
@@ -575,7 +582,8 @@ async fn the_official_lens_differences_against_its_shipped_version() {
     // (case, how the request names the lens)
     let cases: Vec<(&str, String)> = vec![
         ("bare-alias", state::FRAMEWORK_LENS_ALIAS.to_string()),
-        ("official-arn", official_arn.clone()),
+        ("official-arn", reported_arn.clone()),
+        ("regional-arn", regional_arn.clone()),
     ];
 
     for (case, alias) in &cases {
@@ -599,7 +607,7 @@ async fn the_official_lens_differences_against_its_shipped_version() {
                     member(&answer, "LatestLensVersion"),
                     member(&answer, "LensArn"),
                 ),
-                (shipped, shipped, shipped, official_arn.as_str()),
+                (shipped, shipped, shipped, reported_arn.as_str()),
                 "case {case:?}: the official lens reports its shipped version and ARN, got \
                  {answer:?}"
             );

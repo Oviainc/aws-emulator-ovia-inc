@@ -166,14 +166,14 @@ async fn deleting_a_review_template_drops_it_and_everything_it_holds() {
             overrides: json!({}),
             lens: FRAMEWORK_LENS.to_string(),
             write_notes: false,
-            answer_question: Some("ops-01"),
+            answer_question: Some("organization-priorities"),
         },
         DeleteCase {
             case: "with-notes-and-an-answer",
             overrides: json!({}),
             lens: FRAMEWORK_LENS.to_string(),
             write_notes: true,
-            answer_question: Some("sec-04"),
+            answer_question: Some("detect-investigate-events"),
         },
     ];
 

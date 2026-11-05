@@ -202,9 +202,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        // A lens is reported by its ARN, which for an AWS-official lens is built from the
-        // Region the request was signed for.
-        let region = crate::state::request_region(ctx.parts());
 
         // The resources whose lens reviews this request asks about. `ResourceArn` selects
         // review templates and `WorkloadId` workloads, so a request naming one selector
@@ -276,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                         lens_upgrade_summary: Some(resource.named.lens_upgrade_summary(
                             lens,
-                            store.lens_arn_of(lens, &region),
+                            store.lens_arn_of(lens),
                             current,
                             latest,
                         )),
@@ -422,7 +419,7 @@ impl ResourceNaming<'_> {
 /// resource's own `lens_review_version` — the same resolution a read of that review reports
 /// its version from, so a notification cannot disagree with it.
 fn pinned_reviews<'a>(
-    reviews: ::std::collections::BTreeMap<&'a str, &'a str>,
+    reviews: Vec<(&'a str, &'a str)>,
     pinned: impl Fn(&'a str) -> Option<&'a str>,
 ) -> Vec<(&'a str, &'a str, Option<&'a str>)> {
     reviews

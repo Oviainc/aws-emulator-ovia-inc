@@ -572,7 +572,7 @@ async fn the_lens_is_resolved_by_what_the_alias_names() {
         ("the-framework-lens-alias", state::FRAMEWORK_LENS_ALIAS.to_string()),
         (
             "an-official-lens-arn",
-            state::official_lens_arn("us-west-2", state::FRAMEWORK_LENS_ALIAS),
+            state::official_lens_arn(state::FRAMEWORK_LENS_ALIAS),
         ),
         ("an-unpublished-custom-lens", draft_arn.clone()),
     ] {
