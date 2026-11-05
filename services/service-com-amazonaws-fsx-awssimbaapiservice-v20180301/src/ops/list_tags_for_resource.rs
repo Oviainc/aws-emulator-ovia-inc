@@ -186,15 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due at this instant.
         store.settle_due_transitions();
 
-        let file_system_id = match store.resolve_resource(&input.resource_arn) {
-            ResourceLookup::FileSystem(id) => id,
+        let found = store.resolve_resource(&input.resource_arn);
+        let resource_id = match &found {
+            // Whichever FSx resource the ARN names: tags live on the resource, and every
+            // type carries one tag map.
+            ResourceLookup::FileSystem(id) | ResourceLookup::Backup(id) => id.clone(),
             ResourceLookup::NotFound(resource_id) => {
                 return Err(ListTagsForResourceErrorModeled::ResourceNotFound(
                     ResourceNotFound {
                         resource_arn: input.resource_arn.clone(),
                         // Built from the identifier the request's ARN named, so the response
                         // says WHICH resource could not be found.
-                        message: Some(resource_not_found_message(&resource_id)),
+                        message: Some(resource_not_found_message(resource_id)),
                     },
                 )
                 .into());
@@ -212,17 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let Some(record) = store.file_systems.get(&file_system_id) else {
+        let Some(stored_tags) = store.resource_tags(&found) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFound(
                 ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),
-                    message: Some(resource_not_found_message(&file_system_id)),
+                    message: Some(resource_not_found_message(&resource_id)),
                 },
             )
             .into());
         };
 
-        let page_scope = tags_page_scope(&file_system_id);
+        let page_scope = tags_page_scope(&resource_id);
         let resume_after = match input.next_token.as_deref() {
             Some(token) => match decode_page_token(&page_scope, token) {
                 Some(cursor) => Some(cursor),
@@ -236,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let keys: Vec<String> = record.tags.keys().cloned().collect();
+        let keys: Vec<String> = stored_tags.keys().cloned().collect();
         let (page, next_token) = paginate(
             &page_scope,
             &keys,
@@ -246,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags: Vec<Tag> = page
             .iter()
             .filter_map(|key| {
-                record.tags.get(key).map(|value| Tag {
+                stored_tags.get(key).map(|value| Tag {
                     key: key.clone(),
                     value: value.clone(),
                 })

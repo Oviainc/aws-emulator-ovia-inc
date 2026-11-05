@@ -4,8 +4,9 @@
 //!
 //! This holds the file-system lifecycle slice: the records `CreateFileSystem` writes and
 //! that `DescribeFileSystems`, `UpdateFileSystem`, `DeleteFileSystem`, `TagResource`,
-//! `UntagResource` and `ListTagsForResource` read and mutate. Every handler reaches it
-//! through [`service_state`]; nothing here is per-request.
+//! `UntagResource` and `ListTagsForResource` read and mutate, plus the backup slice in
+//! [`backups`]: the records `CreateBackup` writes and `DescribeBackups` reads. Every
+//! handler reaches it through [`service_state`]; nothing here is per-request.
 //!
 //! `src/lib.rs` and `src/ops/mod.rs` are generated, so this module is also the only place
 //! this crate can keep code more than one operation needs: the record projection onto the
@@ -240,6 +241,42 @@ pub struct ComAmazonawsFsxAwssimbaapiserviceV20180301State {
     token_order: VecDeque<String>,
     /// Source of minted `FileSystemId`s.
     pub next_id_counter: u64,
+    /// Stored backups, keyed by `BackupId`. A `BTreeMap` for the same reason as
+    /// `file_systems`: `DescribeBackups` pages over it, and minted ids sort in creation
+    /// order. See [`backups`] for the record and what a backup keeps of its file system.
+    /// BOUNDED by [`MAX_BACKUPS`], and per file system by
+    /// [`MAX_USER_INITIATED_BACKUPS_PER_FILE_SYSTEM`]; write it through
+    /// [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::insert_backup`], which enforces
+    /// both.
+    pub backups: BTreeMap<String, BackupRecord>,
+    /// How many entries of `backups` were taken of each `FileSystemId`: the per-file-system
+    /// bound asked in constant time instead of by walking every record under the shared
+    /// lock. Maintained by `insert_backup` and `remove_backup`, the only two paths that
+    /// change `backups`, and read through
+    /// [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::backup_count_of_file_system`] —
+    /// private, so it cannot drift from the records.
+    backups_per_file_system: HashMap<String, usize>,
+    /// `ClientRequestToken` -> the replay it stands for, for the `@idempotencyToken`
+    /// behaviour on `CreateBackup`. Written only through
+    /// [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::remember_idempotent_backup`],
+    /// which bounds it. Separate from `idempotency_tokens` because a token is scoped to the
+    /// operation that minted it: one `CreateFileSystem` replays cannot be served as a
+    /// `CreateBackup` replay.
+    pub backup_idempotency_tokens: HashMap<String, IdempotentBackup>,
+    /// Insertion order of `backup_idempotency_tokens`, oldest first — what lets that map be
+    /// bounded, exactly as `token_order` bounds the other one.
+    backup_token_order: VecDeque<String>,
+    /// Source of minted `BackupId`s.
+    pub next_backup_id_counter: u64,
+    /// `ClientRequestToken` -> the `BackupId` a `DeleteBackup` carrying that token removed,
+    /// for the `@idempotencyToken` behaviour AWS documents as "idempotent deletion": a
+    /// retried delete answers as the first one did instead of `BackupNotFound`. Written only
+    /// through [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::remember_backup_deletion`],
+    /// which bounds it.
+    pub deleted_backup_tokens: HashMap<String, String>,
+    /// Insertion order of `deleted_backup_tokens`, oldest first — what lets that map be
+    /// bounded, exactly as `token_order` bounds the first one.
+    deleted_backup_token_order: VecDeque<String>,
 }
 
 /// What an FSx `ResourceARN` names, once resolved against the store.
@@ -247,6 +284,8 @@ pub struct ComAmazonawsFsxAwssimbaapiserviceV20180301State {
 pub enum ResourceLookup {
     /// A file system this service stores, by `FileSystemId`.
     FileSystem(String),
+    /// A backup this service stores, by `BackupId`.
+    Backup(String),
     /// An ARN naming a resource type FSx owns that holds no record here:
     /// `ResourceNotFound`. Carries the resource id from the request's ARN, because the
     /// error's `Message` is built from the identifier the caller sent (see
@@ -277,6 +316,7 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
     /// changes what a later caller would otherwise have seen.
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
+        self.settle_due_backup_transitions(now);
         let mut removed: Vec<String> = Vec::new();
         for (id, record) in &mut self.file_systems {
             let Some(pending) = record.pending else {
@@ -324,24 +364,17 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
     ///
     /// The ONE write path for `idempotency_tokens`, so the bound cannot be bypassed.
     pub fn remember_idempotent_create(&mut self, token: String, replay: IdempotentCreate) {
-        if self
-            .idempotency_tokens
-            .insert(token.clone(), replay)
-            .is_none()
-        {
-            self.token_order.push_back(token);
-        }
-        while self.token_order.len() > MAX_IDEMPOTENCY_TOKENS {
-            if let Some(oldest) = self.token_order.pop_front() {
-                self.idempotency_tokens.remove(&oldest);
-            }
-        }
+        remember_token(
+            &mut self.idempotency_tokens,
+            &mut self.token_order,
+            token,
+            replay,
+        );
     }
 
     /// Forget one `ClientRequestToken`.
     pub fn forget_idempotency_token(&mut self, token: &str) {
-        self.idempotency_tokens.remove(token);
-        self.token_order.retain(|held| held != token);
+        forget_token(&mut self.idempotency_tokens, &mut self.token_order, token);
     }
 
     /// Forget every `ClientRequestToken` that replays `file_system_id`.
@@ -369,11 +402,46 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
         {
             return ResourceLookup::FileSystem(arn.resource_id);
         }
-        // An FSx resource type this slice does not store yet (a backup, a volume, an SVM)
-        // holds no record either, because the operations that would create one are still
-        // 501 — so there is genuinely no such resource. The id the ARN named travels with
-        // the answer, so the error can name it.
+        if arn.resource_type == BACKUP_RESOURCE_TYPE && self.backups.contains_key(&arn.resource_id)
+        {
+            return ResourceLookup::Backup(arn.resource_id);
+        }
+        // An FSx resource type this slice does not store yet (a volume, an SVM) holds no
+        // record either, because the operations that would create one are still 501 — so
+        // there is genuinely no such resource. The id the ARN named travels with the
+        // answer, so the error can name it.
         ResourceLookup::NotFound(arn.resource_id)
+    }
+
+    /// The tags of the resource `lookup` resolved to, or `None` when it resolved to none.
+    ///
+    /// Every FSx resource type carries ONE tag map, and the tagging operations
+    /// (`TagResource`, `UntagResource`, `ListTagsForResource`) each work on whichever
+    /// resource the request's `ResourceARN` names, so the map is reached through the
+    /// resolution rather than through one resource type's own field.
+    pub fn resource_tags(&self, lookup: &ResourceLookup) -> Option<&BTreeMap<String, String>> {
+        match lookup {
+            ResourceLookup::FileSystem(id) => {
+                self.file_systems.get(id).map(|record| &record.tags)
+            }
+            ResourceLookup::Backup(id) => self.backups.get(id).map(|record| &record.tags),
+            ResourceLookup::NotFound(_) | ResourceLookup::NotFsxResource => None,
+        }
+    }
+
+    /// The tags of the resource `lookup` resolved to, for the operations that change them.
+    /// See [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::resource_tags`].
+    pub fn resource_tags_mut(
+        &mut self,
+        lookup: &ResourceLookup,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match lookup {
+            ResourceLookup::FileSystem(id) => {
+                self.file_systems.get_mut(id).map(|record| &mut record.tags)
+            }
+            ResourceLookup::Backup(id) => self.backups.get_mut(id).map(|record| &mut record.tags),
+            ResourceLookup::NotFound(_) | ResourceLookup::NotFsxResource => None,
+        }
     }
 
     /// Mint the next `FileSystemId`.
@@ -495,6 +563,44 @@ pub fn fsx_arn(region: &str, resource_type: &str, resource_id: &str) -> String {
 /// everything else here.
 mod ec2_subnets;
 pub use ec2_subnets::resolve_requested_subnets;
+
+/// The backup slice: the records `CreateBackup` writes and `DescribeBackups` reads, and
+/// what a backup keeps of the file system it was taken of. Re-exported, so a handler
+/// reaches it through `crate::state` like everything else here.
+mod backups;
+pub use backups::*;
+
+/// Remember one `ClientRequestToken` replay in a bounded map, dropping the oldest once
+/// [`MAX_IDEMPOTENCY_TOKENS`] are held.
+///
+/// Shared by every operation that remembers replays, so each one is bounded by the same
+/// rule and the eviction is written once. `order` is the insertion order of `remembered`,
+/// oldest first.
+fn remember_token<V>(
+    remembered: &mut HashMap<String, V>,
+    order: &mut VecDeque<String>,
+    token: String,
+    replay: V,
+) {
+    if remembered.insert(token.clone(), replay).is_none() {
+        order.push_back(token);
+    }
+    while order.len() > MAX_IDEMPOTENCY_TOKENS {
+        if let Some(oldest) = order.pop_front() {
+            remembered.remove(&oldest);
+        }
+    }
+}
+
+/// Forget one remembered `ClientRequestToken`, from both halves of a bounded map.
+fn forget_token<V>(
+    remembered: &mut HashMap<String, V>,
+    order: &mut VecDeque<String>,
+    token: &str,
+) {
+    remembered.remove(token);
+    order.retain(|held| held != token);
+}
 
 /// One subnet of the account, as the service that OWNS subnets reports it: the identifier a
 /// request names, the VPC it belongs to and the Availability Zone it sits in.

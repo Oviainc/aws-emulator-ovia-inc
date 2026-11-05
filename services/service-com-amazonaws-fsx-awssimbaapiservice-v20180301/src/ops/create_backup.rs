@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a backup of a stored file system, persists it in [`crate::state`] and answers with
+//! the stored record projected onto the modelled `Backup` shape. The record starts in
+//! `CREATING` with the clock owing it a transition to `AVAILABLE`, which is what AWS
+//! documents: "The CreateBackup operation returns while the backup's lifecycle state is
+//! still CREATING."
+//!
+//! A backup keeps its own COPY of the file system's record as it stood at this call, because
+//! AWS documents that the metadata "is persisted even if the file system is deleted" — so
+//! the configuration a later `DescribeBackups` reports is the one that was backed up, not
+//! whatever the live file system looks like by then.
+//!
+//! The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +120,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::state::{
+    backup_parameter_fingerprint, file_system_not_found_message, fsx_arn,
+    volume_not_found_message, BackupCountLimitReached, BackupRecord, FileSystemRecord,
+    IdempotentBackup, PendingTransition, TransitionTarget, BACKUP_LIFECYCLE_CREATING,
+    BACKUP_RESOURCE_TYPE, BACKUP_RESOURCE_TYPE_FILE_SYSTEM, BACKUP_TYPE_USER_INITIATED,
+    MAX_BACKUPS, MAX_USER_INITIATED_BACKUPS_PER_FILE_SYSTEM,
+    SERVICE_LIMIT_TOTAL_USER_INITIATED_BACKUPS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,18 +207,308 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBackupErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the FSx backup store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // A backup is taken OF one resource: AWS documents `FileSystemId` as "the ID of the
+        // file system to back up" and `VolumeId` as "the ID of the FSx for ONTAP volume to
+        // back up", so exactly one of them names what this call backs up. Neither — or both
+        // — names no single resource, which is a client error and not a missing one.
+        let file_system_id = match (input.file_system_id.clone(), input.volume_id.as_deref()) {
+            (Some(file_system_id), None) => file_system_id,
+            // A volume is not a resource this slice stores: `CreateVolume` and
+            // `CreateStorageVirtualMachine` are still 501, so the account has no ONTAP
+            // volumes and no identifier can name one.
+            (None, Some(volume_id)) => {
+                return Err(CreateBackupErrorModeled::VolumeNotFound(VolumeNotFound {
+                    message: Some(volume_not_found_message(volume_id)),
+                })
+                .into());
+            }
+            (Some(_), Some(_)) => {
+                return Err(CreateBackupErrorModeled::BadRequest(BadRequest {
+                    message: Some(
+                        "FileSystemId and VolumeId must not both be specified.".to_string(),
+                    ),
+                })
+                .into());
+            }
+            (None, None) => {
+                return Err(CreateBackupErrorModeled::BadRequest(BadRequest {
+                    message: Some("Either FileSystemId or VolumeId must be specified.".to_string()),
+                })
+                .into());
+            }
+        };
+
+        // The backup's ARN is built for the region the caller signed for, like every other
+        // ARN this service mints.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let requested_tags: BTreeMap<String, String> = input
+            .tags
+            .iter()
+            .flatten()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        let fingerprint = backup_parameter_fingerprint(
+            input.file_system_id.as_deref(),
+            input.volume_id.as_deref(),
+            &requested_tags,
+        );
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // `@idempotencyToken`, as AWS documents it for this operation: "If a backup with the
+        // specified client request token exists and the parameters match, this operation
+        // returns the description of the existing backup. If a backup with the specified
+        // client request token exists and the parameters don't match, this operation returns
+        // IncompatibleParameterError." The token is documented as OPTIONAL here (unlike
+        // `CreateFileSystem`, which requires one), so a request carrying none simply
+        // replays nothing.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(previous) = store.backup_idempotency_tokens.get(token).cloned() {
+                match store.backups.get(&previous.backup_id) {
+                    Some(_) if previous.fingerprint != fingerprint => {
+                        return Err(CreateBackupErrorModeled::IncompatibleParameterError(
+                            IncompatibleParameterError {
+                                parameter: "ClientRequestToken".to_string(),
+                                message: Some(format!(
+                                    "the client request token {token} was already used to create \
+                                     {} with different parameters",
+                                    previous.backup_id
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(record) => {
+                        return Ok(CreateBackupOutput {
+                            backup: Some(record.to_backup()),
+                        });
+                    }
+                    // The backup that token created is gone, so the token replays nothing:
+                    // drop it and create a new backup below.
+                    None => store.forget_backup_idempotency_token(token),
+                }
+            }
+        }
+
+        // A backup is of a file system the account HAS; the record is also what the backup
+        // keeps a copy of, so it is read before anything is minted.
+        let Some(file_system) = store.file_systems.get(&file_system_id).cloned() else {
+            return Err(CreateBackupErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                // Built from the id the caller asked about, so the response says WHICH file
+                // system was missing.
+                message: Some(file_system_not_found_message(&file_system_id)),
+            })
+            .into());
+        };
+
+        if let Some(refusal) = lustre_backups_unsupported(&file_system) {
+            return Err(refusal);
+        }
+
+        // "Another backup is already under way. Wait for completion before initiating
+        // additional backups of this file system" — the modelled `BackupInProgress`, which
+        // is exactly the state a record still owing the clock its `CREATING` ->
+        // `AVAILABLE` transition is in.
+        if store.backup_in_progress(&file_system_id) {
+            return Err(CreateBackupErrorModeled::BackupInProgress(BackupInProgress {
+                message: Some(format!(
+                    "Another backup of file system {file_system_id} is already in progress."
+                )),
+            })
+            .into());
+        }
+
+        // The record store is bounded, both per file system and in total, by the service's
+        // own published limit on user-initiated backups: a create past either is refused
+        // with the modelled error instead of growing the store without end. Checked here,
+        // before an id is minted, and enforced again by `insert_backup` below, which is the
+        // one write path.
+        if store.backup_count_of_file_system(&file_system_id)
+            >= MAX_USER_INITIATED_BACKUPS_PER_FILE_SYSTEM
+        {
+            return Err(backup_count_limit_exceeded(
+                &file_system_id,
+                BackupCountLimitReached::PerFileSystem,
+            ));
+        }
+        if store.backups.len() >= MAX_BACKUPS {
+            return Err(backup_count_limit_exceeded(
+                &file_system_id,
+                BackupCountLimitReached::Store,
+            ));
+        }
+
+        let backup_id = store.mint_backup_id();
+        let record = BackupRecord {
+            backup_id: backup_id.clone(),
+            lifecycle: BACKUP_LIFECYCLE_CREATING.to_string(),
+            backup_type: BACKUP_TYPE_USER_INITIATED.to_string(),
+            creation_time: SystemTime::now(),
+            // The backup of a file system's data at rest is encrypted with the file
+            // system's own key, so the key the backup reports is the stored one and never a
+            // new value.
+            kms_key_id: file_system.kms_key_id.clone(),
+            resource_arn: fsx_arn(&region, BACKUP_RESOURCE_TYPE, &backup_id),
+            owner_id: ::emulator_server::emulator_account_id().to_string(),
+            tags: backup_tags(requested_tags, &file_system),
+            // The file system as its record stands at this call, with nothing owed to the
+            // clock: this copy is a record of the past, so it never transitions again.
+            file_system: FileSystemRecord {
+                pending: None,
+                ..file_system
+            },
+            resource_type: BACKUP_RESOURCE_TYPE_FILE_SYSTEM.to_string(),
+            // "The CreateBackup operation returns while the backup's lifecycle state is
+            // still CREATING."
+            pending: Some(PendingTransition::due_now_plus_span(
+                TransitionTarget::Available,
+            )),
+        };
+
+        // The response is the STORED record, so it can never disagree with what the next
+        // `DescribeBackups` returns.
+        let backup = record.to_backup();
+        if let Err(limit) = store.insert_backup(record) {
+            return Err(backup_count_limit_exceeded(&file_system_id, limit));
+        }
+        if let Some(token) = input.client_request_token.clone() {
+            store.remember_idempotent_backup(
+                token,
+                IdempotentBackup {
+                    backup_id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(CreateBackupOutput {
+            backup: Some(backup),
+        })
     }
+}
+
+/// The `FileSystemType` whose backup support depends on the file system's configuration,
+/// from the modelled `FileSystemType` enum (WINDOWS | LUSTRE | ONTAP | OPENZFS).
+const FILE_SYSTEM_TYPE_LUSTRE: &str = "LUSTRE";
+
+/// The `LustreDeploymentType` a Lustre file system has when its create named none. AWS
+/// documents "The default is SCRATCH_1" on `LustreFileSystemConfiguration$DeploymentType`.
+const DEFAULT_LUSTRE_DEPLOYMENT_TYPE: &str = "SCRATCH_1";
+
+/// The `LustreDeploymentType`s AWS can back up: the persistent ones.
+///
+/// From this operation's own documentation — "For Amazon FSx for Lustre file systems, you
+/// can create a backup only for file systems that have the following configuration: A
+/// Persistent deployment type" — over the modelled enum (SCRATCH_1 | SCRATCH_2 |
+/// PERSISTENT_1 | PERSISTENT_2).
+const BACKED_UP_LUSTRE_DEPLOYMENT_TYPES: &[&str] = &["PERSISTENT_1", "PERSISTENT_2"];
+
+/// The modelled refusal for a file system whose type and configuration do not support
+/// backups: `UnsupportedOperation` ("The requested operation is not supported for this
+/// resource or API"), naming the deployment type that cannot be backed up.
+///
+/// Only the deployment-type half of the documented Lustre condition is decided here. The
+/// other half — "are not linked to a data repository" — is a configuration no stored file
+/// system can have: the data-repository operations are still 501 and the file-system record
+/// holds no `DataRepositoryConfiguration`, so refusing on it would be refusing on a state
+/// nothing can reach.
+fn lustre_backups_unsupported(file_system: &FileSystemRecord) -> Option<CreateBackupError> {
+    if file_system.file_system_type != FILE_SYSTEM_TYPE_LUSTRE {
+        return None;
+    }
+    let deployment_type = file_system
+        .lustre_configuration
+        .as_ref()
+        .and_then(|config| config.deployment_type.as_deref())
+        .unwrap_or(DEFAULT_LUSTRE_DEPLOYMENT_TYPE);
+    if BACKED_UP_LUSTRE_DEPLOYMENT_TYPES.contains(&deployment_type) {
+        return None;
+    }
+    Some(
+        CreateBackupErrorModeled::UnsupportedOperation(UnsupportedOperation {
+            message: Some(format!(
+                "Backups are not supported for FSx for Lustre file systems with the \
+                 {deployment_type} deployment type."
+            )),
+        })
+        .into(),
+    )
+}
+
+/// The tags a new backup carries.
+///
+/// AWS documents on `CreateBackup$Tags`: "The tags to apply to the backup at backup
+/// creation ... If you have set CopyTagsToBackups to true, and you specify one or more tags
+/// using the CreateBackup operation, no existing file system tags are copied from the file
+/// system to the backup." So the request's tags win when it carries any, and the file
+/// system's own tags are copied only when it is configured to copy them and the request
+/// named none.
+fn backup_tags(
+    requested: BTreeMap<String, String>,
+    file_system: &FileSystemRecord,
+) -> BTreeMap<String, String> {
+    if !requested.is_empty() || !copies_tags_to_backups(file_system) {
+        return requested;
+    }
+    file_system.tags.clone()
+}
+
+/// Whether a file system is configured to copy its tags to its backups, read off whichever
+/// per-type configuration it carries.
+///
+/// `CopyTagsToBackups` is a member of the Windows, Lustre and OpenZFS configurations; the
+/// ONTAP configuration declares no such member (an ONTAP volume carries its own), so an
+/// ONTAP file system copies nothing here.
+fn copies_tags_to_backups(file_system: &FileSystemRecord) -> bool {
+    [
+        file_system
+            .windows_configuration
+            .as_ref()
+            .and_then(|config| config.copy_tags_to_backups),
+        file_system
+            .lustre_configuration
+            .as_ref()
+            .and_then(|config| config.copy_tags_to_backups),
+        file_system
+            .open_zfs_configuration
+            .as_ref()
+            .and_then(|config| config.copy_tags_to_backups),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|copies| copies)
+}
+
+/// The modelled refusal for a create that would take a file system past
+/// [`MAX_USER_INITIATED_BACKUPS_PER_FILE_SYSTEM`], or the store past [`MAX_BACKUPS`]:
+/// `ServiceLimitExceeded` naming the `TOTAL_USER_INITIATED_BACKUPS` limit, worded from the
+/// bound that was reached.
+fn backup_count_limit_exceeded(
+    file_system_id: &str,
+    limit: BackupCountLimitReached,
+) -> CreateBackupError {
+    let message = match limit {
+        BackupCountLimitReached::PerFileSystem => format!(
+            "file system {file_system_id} already has the maximum of \
+             {MAX_USER_INITIATED_BACKUPS_PER_FILE_SYSTEM} user-initiated backups"
+        ),
+        BackupCountLimitReached::Store => format!(
+            "this account already has the maximum of {MAX_BACKUPS} user-initiated backups in \
+             this Region"
+        ),
+    };
+    CreateBackupErrorModeled::ServiceLimitExceeded(ServiceLimitExceeded {
+        limit: SERVICE_LIMIT_TOTAL_USER_INITIATED_BACKUPS.to_string(),
+        message: Some(message),
+    })
+    .into()
 }

@@ -154,14 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        let file_system_id = match store.resolve_resource(&input.resource_arn) {
-            ResourceLookup::FileSystem(id) => id,
+        let found = store.resolve_resource(&input.resource_arn);
+        let resource_id = match &found {
+            // Whichever FSx resource the ARN names: tags live on the resource, and every
+            // type carries one tag map.
+            ResourceLookup::FileSystem(id) | ResourceLookup::Backup(id) => id.clone(),
             ResourceLookup::NotFound(resource_id) => {
                 return Err(UntagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),
                     // Built from the identifier the request's ARN named, so the response
                     // says WHICH resource could not be found.
-                    message: Some(resource_not_found_message(&resource_id)),
+                    message: Some(resource_not_found_message(resource_id)),
                 })
                 .into());
             }
@@ -178,10 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let Some(record) = store.file_systems.get_mut(&file_system_id) else {
+        let Some(stored_tags) = store.resource_tags_mut(&found) else {
             return Err(UntagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                 resource_arn: input.resource_arn.clone(),
-                message: Some(resource_not_found_message(&file_system_id)),
+                message: Some(resource_not_found_message(&resource_id)),
             })
             .into());
         };
@@ -189,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@idempotent`: a key that is not on the resource is simply not there afterwards
         // either, which is why this does not refuse an unknown key.
         for key in &input.tag_keys {
-            record.tags.remove(key);
+            stored_tags.remove(key);
         }
 
         Ok(UntagResourceOutput {})

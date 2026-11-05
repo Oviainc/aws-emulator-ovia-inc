@@ -270,7 +270,7 @@ fn is_base64_shaped(token: &str) -> bool {
 }
 
 /// The tags of a `FileSystem` (or of a `ListTagsForResource` page) as sorted pairs.
-fn tag_pairs(tags: Option<&Value>) -> Vec<(String, String)> {
+pub(crate) fn tag_pairs(tags: Option<&Value>) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = tags
         .and_then(Value::as_array)
         .map(|list| {

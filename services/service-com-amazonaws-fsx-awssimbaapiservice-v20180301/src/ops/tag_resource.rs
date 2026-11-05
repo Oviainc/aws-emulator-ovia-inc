@@ -156,14 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        let file_system_id = match store.resolve_resource(&input.resource_arn) {
-            ResourceLookup::FileSystem(id) => id,
+        let found = store.resolve_resource(&input.resource_arn);
+        let resource_id = match &found {
+            // Whichever FSx resource the ARN names: tags live on the resource, and every
+            // type carries one tag map.
+            ResourceLookup::FileSystem(id) | ResourceLookup::Backup(id) => id.clone(),
             ResourceLookup::NotFound(resource_id) => {
                 return Err(TagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),
                     // Built from the identifier the request's ARN named, so the response
                     // says WHICH resource could not be found.
-                    message: Some(resource_not_found_message(&resource_id)),
+                    message: Some(resource_not_found_message(resource_id)),
                 })
                 .into());
             }
@@ -180,10 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let Some(record) = store.file_systems.get_mut(&file_system_id) else {
+        let Some(stored_tags) = store.resource_tags_mut(&found) else {
             return Err(TagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                 resource_arn: input.resource_arn.clone(),
-                message: Some(resource_not_found_message(&file_system_id)),
+                message: Some(resource_not_found_message(&resource_id)),
             })
             .into());
         };
@@ -191,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Merge, not replace: a tag whose key is already present takes the new value and
         // every other stored tag stays. `@idempotent`, so re-tagging with the same tags
         // leaves the map exactly as it was.
-        let mut merged = record.tags.clone();
+        let mut merged = stored_tags.clone();
         for tag in &input.tags {
             merged.insert(tag.key.clone(), tag.value.clone());
         }
@@ -209,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        record.tags = merged;
+        *stored_tags = merged;
 
         Ok(TagResourceOutput {})
     }

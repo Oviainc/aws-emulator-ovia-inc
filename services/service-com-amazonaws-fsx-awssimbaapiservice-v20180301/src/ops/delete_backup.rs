@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored backup from [`crate::state`] and answers with its id and the `DELETED`
+//! lifecycle, which is what AWS documents: "the DeleteBackup call returns instantly. The
+//! backup won't show up in later DescribeBackups calls." A backup that is still being
+//! created cannot be deleted — that is the modelled `BackupInProgress` — and a repeat of the
+//! same call under one `ClientRequestToken` answers as the first did, for the "idempotent
+//! deletion" that token is documented to ensure.
+//!
+//! The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +89,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{backup_not_found_message, BACKUP_LIFECYCLE_CREATING, BACKUP_LIFECYCLE_DELETED};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,17 +166,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBackup"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteBackupErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the FSx backup store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // The token AWS documents as what "Amazon FSx uses to ensure idempotent deletion":
+        // a retried delete answers as the first one did, rather than reporting the backup it
+        // already removed as missing. The same token naming a DIFFERENT backup is the
+        // documented `IncompatibleParameterError`.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(deleted) = store.deleted_backup_tokens.get(token).cloned() {
+                if deleted != input.backup_id {
+                    return Err(DeleteBackupErrorModeled::IncompatibleParameterError(
+                        IncompatibleParameterError {
+                            parameter: "ClientRequestToken".to_string(),
+                            message: Some(format!(
+                                "the client request token {token} was already used to delete \
+                                 {deleted}"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(deleted_backup(&input.backup_id));
+            }
+        }
+
+        let Some(record) = store.backups.get(&input.backup_id) else {
+            return Err(DeleteBackupErrorModeled::BackupNotFound(BackupNotFound {
+                // Built from the id the caller asked about, so the response says WHICH
+                // backup could not be found.
+                message: Some(backup_not_found_message(&input.backup_id)),
+            })
+            .into());
+        };
+
+        // A backup whose data is still being written is not a backup that can be thrown
+        // away: the modelled `BackupInProgress` is what protects it until the clock has
+        // settled it to `AVAILABLE`. The `Message` names the backup and the lifecycle it is
+        // refused in, both read off the stored record.
+        if record.lifecycle == BACKUP_LIFECYCLE_CREATING {
+            return Err(DeleteBackupErrorModeled::BackupInProgress(BackupInProgress {
+                message: Some(format!(
+                    "Backup {} cannot be deleted while it is in {} state.",
+                    input.backup_id, record.lifecycle
+                )),
+            })
+            .into());
+        }
+
+        store.remove_backup(&input.backup_id);
+        if let Some(token) = input.client_request_token.clone() {
+            store.remember_backup_deletion(token, input.backup_id.clone());
+        }
+
+        Ok(deleted_backup(&input.backup_id))
+    }
+}
+
+/// The answer to a delete that went through, for `backup_id`: AWS documents the successful
+/// response's `Lifecycle` as `DELETED`.
+fn deleted_backup(backup_id: &str) -> DeleteBackupOutput {
+    DeleteBackupOutput {
+        backup_id: Some(backup_id.to_string()),
+        lifecycle: Some(BACKUP_LIFECYCLE_DELETED.to_string()),
     }
 }
