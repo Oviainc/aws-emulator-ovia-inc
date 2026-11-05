@@ -388,13 +388,26 @@ fn validate_algorithms(
 }
 
 /// The revocation rules the `RevocationConfiguration` member documents, held in
-/// [`crate::state::invalid_revocation_configuration_reason`] because
-/// `UpdateCertificateAuthority` carries the same member under the same rules.
+/// [`crate::state::revocation_configuration_fault`] because `UpdateCertificateAuthority`
+/// carries the same member under the same rules.
+///
+/// Which stage refuses the configuration is the fault's own classification: a member the
+/// configuration's state requires but the model cannot mark `@required` is refused by the
+/// request-validation stage, in the words that stage states a missing member in
+/// ([`crate::service::missing_member_refusal`]); a combination of members that cannot hold
+/// together is the semantic argument fault this operation models.
 fn validate_revocation_configuration(
     revocation: Option<&RevocationConfiguration>,
 ) -> Result<(), CreateCertificateAuthorityError> {
-    match crate::state::invalid_revocation_configuration_reason(revocation) {
-        Some(reason) => Err(invalid_args(reason)),
+    match crate::state::revocation_configuration_fault(revocation) {
+        Some(crate::state::RevocationConfigurationFault::MissingMember(member)) => Err(
+            CreateCertificateAuthorityError::validation(crate::service::missing_member_refusal(
+                member,
+            )),
+        ),
+        Some(crate::state::RevocationConfigurationFault::Unserviceable(reason)) => {
+            Err(invalid_args(reason))
+        }
         None => Ok(()),
     }
 }

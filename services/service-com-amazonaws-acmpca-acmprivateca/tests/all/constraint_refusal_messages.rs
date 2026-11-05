@@ -27,7 +27,6 @@
 //! [`crate::private_ca_lifecycle::Emulator`].
 
 use serde_json::{json, Value};
-use service_com_amazonaws_acmpca_acmprivateca::ops::types::KEY_ALGORITHM_VALUES;
 use service_com_amazonaws_acmpca_acmprivateca::state::CA_NOT_FOUND_MESSAGE;
 
 use crate::private_ca_lifecycle::{root_ca_request, string, Emulator, ACCOUNT, REGION};
@@ -294,6 +293,11 @@ async fn a_constraint_violation_is_refused_with_the_member_and_the_requirement()
 
 /// A value outside an enumerated type's value set: the member and the set, under the count
 /// of how many values failed.
+///
+/// Both rows name a type the request-validation stage judges, which is every type each
+/// declared value of which this front door offers. A type it offers only a subset of is
+/// refused one layer deeper, in the service's own clause, which
+/// `crate::validation_stage_refusals` owns.
 #[tokio::test]
 async fn an_enum_violation_states_the_value_set_under_the_count() {
     let emulator = Emulator::new();
@@ -301,17 +305,7 @@ async fn an_enum_violation_states_the_value_set_under_the_count() {
     // The enum members each row names, and the member path of the one that failed. Both
     // rows carry a value of the right TYPE and the wrong value, so what is refused is the
     // value set and nothing else.
-    let rows: [(&str, &str, Value, &[&str]); 3] = [
-        (
-            "a key algorithm no private CA key uses",
-            "certificateAuthorityConfiguration.keyAlgorithm",
-            {
-                let mut body = root_ca_request("enum-key-algorithm");
-                body["CertificateAuthorityConfiguration"]["KeyAlgorithm"] = json!("AES_256");
-                body
-            },
-            KEY_ALGORITHM_VALUES,
-        ),
+    let rows: [(&str, &str, Value, &[&str]); 2] = [
         (
             "a CA kind that is neither of the two",
             "certificateAuthorityType",

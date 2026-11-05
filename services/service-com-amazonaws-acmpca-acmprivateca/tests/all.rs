@@ -57,3 +57,5 @@ mod state_roundtrip;
 mod tag_listing;
 #[path = "all/update_certificate_authority.rs"]
 mod update_certificate_authority;
+#[path = "all/validation_stage_refusals.rs"]
+mod validation_stage_refusals;

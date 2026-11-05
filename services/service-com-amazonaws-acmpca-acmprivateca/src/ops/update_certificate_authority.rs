@@ -206,10 +206,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        if let Some(reason) =
-            crate::state::invalid_revocation_configuration_reason(input.revocation_configuration.as_ref())
+        // The same classification as on the create, from the one place both operations
+        // read these rules out of: a member an enabled CRL configuration requires is the
+        // request-validation stage's to refuse, naming the member; members that cannot hold
+        // together are the semantic argument fault this operation models.
+        match crate::state::revocation_configuration_fault(input.revocation_configuration.as_ref())
         {
-            return Err(invalid_args(reason));
+            Some(crate::state::RevocationConfigurationFault::MissingMember(member)) => {
+                return Err(UpdateCertificateAuthorityError::validation(
+                    crate::service::missing_member_refusal(member),
+                ));
+            }
+            Some(crate::state::RevocationConfigurationFault::Unserviceable(reason)) => {
+                return Err(invalid_args(reason));
+            }
+            None => {}
         }
         // This call "updates the status or configuration of a private certificate
         // authority", and both members are optional: a request naming neither asks for no

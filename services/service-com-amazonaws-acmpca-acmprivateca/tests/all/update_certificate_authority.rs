@@ -469,14 +469,13 @@ async fn an_update_this_operation_cannot_carry_out_is_refused_with_invalid_args(
         update_request(&arn, None, None),
     ));
 
-    // The rules `RevocationConfiguration` documents: an enabled CRL needs the bucket it is
-    // written to and the period it expires after, and a disabled mechanism may carry
-    // nothing but `Enabled=false`.
-    let bad_configurations: [(&str, Value); 5] = [
-        (
-            "CRLs enabled with no S3 bucket",
-            json!({"CrlConfiguration": {"Enabled": true, "ExpirationInDays": 7}}),
-        ),
+    // The rules `RevocationConfiguration` documents, in the ones the SEMANTIC argument
+    // check owns: an enabled CRL needs the period it expires after, and a disabled
+    // mechanism may carry nothing but `Enabled=false`. The bucket an enabled CRL publishes
+    // to is a member the request-validation stage requires instead, so its absence is
+    // refused as `ValidationException` naming the member — `crate::validation_stage_refusals`
+    // drives that rule on this operation and on the create.
+    let bad_configurations: [(&str, Value); 4] = [
         (
             "CRLs enabled with no expiry",
             json!({"CrlConfiguration": {"Enabled": true, "S3BucketName": "example-crl-bucket"}}),

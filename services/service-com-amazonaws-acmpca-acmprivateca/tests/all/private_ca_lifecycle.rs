@@ -739,36 +739,43 @@ async fn validity_resolves_the_way_each_validity_period_type_is_documented() {
 /// documents: "A configuration disabling CRLs or OCSP must contain only the
 /// Enabled=False parameter, and will fail if other parameters such as CustomCname or
 /// ExpirationInDays are included."
+///
+/// Each row states the error code its configuration is refused with, because the two
+/// stages that refuse one answer differently: a member an enabled CRL configuration
+/// requires but the model cannot mark `@required` is the request-validation stage's
+/// (`ValidationException`, the member named — `crate::validation_stage_refusals`), while
+/// members that cannot hold together are the semantic argument fault this operation models.
 #[tokio::test]
 async fn revocation_configurations_are_accepted_only_where_documented() {
     let emulator = Emulator::new();
 
-    let rows: &[(&str, Value, bool)] = &[
-        ("crl disabled alone", json!({"CrlConfiguration": {"Enabled": false}}), true),
+    // The code each row is refused with, or `None` for a configuration that is accepted.
+    let rows: &[(&str, Value, Option<&str>)] = &[
+        ("crl disabled alone", json!({"CrlConfiguration": {"Enabled": false}}), None),
         (
             "crl disabled with a cname",
             json!({"CrlConfiguration": {"Enabled": false, "CustomCname": "crl.example.com"}}),
-            false,
+            Some("InvalidArgsException"),
         ),
         (
             "crl disabled with an expiration",
             json!({"CrlConfiguration": {"Enabled": false, "ExpirationInDays": 7}}),
-            false,
+            Some("InvalidArgsException"),
         ),
         (
             "crl disabled with a bucket",
             json!({"CrlConfiguration": {"Enabled": false, "S3BucketName": "crl-bucket"}}),
-            false,
+            Some("InvalidArgsException"),
         ),
         (
             "crl enabled without a bucket",
             json!({"CrlConfiguration": {"Enabled": true, "ExpirationInDays": 7}}),
-            false,
+            Some("ValidationException"),
         ),
         (
             "crl enabled without an expiration",
             json!({"CrlConfiguration": {"Enabled": true, "S3BucketName": "crl-bucket"}}),
-            false,
+            Some("InvalidArgsException"),
         ),
         (
             "crl enabled with both",
@@ -779,35 +786,38 @@ async fn revocation_configurations_are_accepted_only_where_documented() {
                     "S3BucketName": "crl-bucket",
                 }
             }),
-            true,
+            None,
         ),
-        ("ocsp disabled alone", json!({"OcspConfiguration": {"Enabled": false}}), true),
+        ("ocsp disabled alone", json!({"OcspConfiguration": {"Enabled": false}}), None),
         (
             "ocsp disabled with a cname",
             json!({"OcspConfiguration": {"Enabled": false, "OcspCustomCname": "ocsp.example.com"}}),
-            false,
+            Some("InvalidArgsException"),
         ),
         (
             "ocsp enabled with a cname",
             json!({"OcspConfiguration": {"Enabled": true, "OcspCustomCname": "ocsp.example.com"}}),
-            true,
+            None,
         ),
     ];
 
     // Create (or refuse) every row first, then wait for the clock ONCE before reading
     // the accepted ones back.
     let mut created: Vec<(&str, &Value, String)> = Vec::new();
-    for (case, revocation, accepted) in rows {
+    for (case, revocation, refused_with) in rows {
         let mut body = root_ca_request("revocation-root");
         body["RevocationConfiguration"] = revocation.clone();
-        if *accepted {
-            let response = emulator.ok(case, "CreateCertificateAuthority", &body).await;
-            let arn = string(&response, "CertificateAuthorityArn", case);
-            created.push((case, revocation, arn));
-        } else {
-            emulator
-                .refused(case, "CreateCertificateAuthority", &body, "InvalidArgsException")
-                .await;
+        match refused_with {
+            None => {
+                let response = emulator.ok(case, "CreateCertificateAuthority", &body).await;
+                let arn = string(&response, "CertificateAuthorityArn", case);
+                created.push((case, revocation, arn));
+            }
+            Some(code) => {
+                emulator
+                    .refused(case, "CreateCertificateAuthority", &body, code)
+                    .await;
+            }
         }
     }
     wait_for_the_clock();

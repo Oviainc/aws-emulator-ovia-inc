@@ -151,20 +151,65 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 const CONSTRAINT_PREAMBLE: &str = " failed to satisfy constraint: ";
 
 /// The message a constraint refusal of this service carries: one clause per value that
-/// failed, each naming the member path and the requirement it failed, under the count of
-/// how many failed.
+/// failed, each naming the member path and the requirement it failed.
 ///
 /// What the clauses say is not the value that failed: a refusal names the MEMBER and the
 /// bound, never the submitted value, so nothing a caller sent is reflected back in the
 /// diagnostic (a member whose value is sensitive is refused like any other).
 ///
-/// The count prefix opens EVERY constraint refusal, whichever constraints the request
-/// failed and however deep in it they sit: it states how many values failed, so a caller
-/// reading the message learns that a second bad member is being reported even when it
-/// parses only the first clause.
+/// WHICH layer refuses the value decides how the message is stated, and the two layers are
+/// not interleaved:
+///
+/// * the request-validation stage judges every member against the constraint the model
+///   declares for it, and states its findings under the count of how many values failed, so
+///   a caller learns that a second bad member is being reported even when it parses only the
+///   first clause;
+/// * a member whose admissible values this service FILTERS is not one the stage can judge —
+///   the model declares the whole set, this front door offers a subset — so that value is
+///   refused one layer deeper, by the service's own check, which states its single clause in
+///   its own words rather than under a count the stage did not reach.
+///
+/// A request that fails both is refused by the stage: the service's check runs only on a
+/// request the stage passed, so what the stage found is the whole of what is stated.
 fn constraint_message(violations: &[Violation]) -> String {
-    let stated = stated_order(violations);
-    let clauses: Vec<String> = stated.iter().map(|violation| clause(violation)).collect();
+    let (stage, service): (Vec<&Violation>, Vec<&Violation>) = stated_order(violations)
+        .into_iter()
+        .partition(|violation| !service_filtered(violation));
+    if stage.is_empty() && !service.is_empty() {
+        return service
+            .iter()
+            .map(|violation| clause(violation))
+            .collect::<Vec<String>>()
+            .join("; ");
+    }
+    let clauses: Vec<String> = stage.iter().map(|violation| clause(violation)).collect();
+    stated_refusal(&clauses)
+}
+
+/// Whether `violation` is one only this service's own check sees: a value outside an
+/// enumerated type whose admissible values this front door filters.
+///
+/// The filtering is what identifies the type, and it is read off the type's own declared
+/// values rather than off the member or the operation carrying it: a member targeting a type
+/// every declared value of which is offered is judged by the request-validation stage, at
+/// any depth of any request.
+fn service_filtered(violation: &Violation) -> bool {
+    match &violation.kind {
+        ViolationKind::EnumValue(allowed) => allowed
+            .iter()
+            .any(|value| UNOFFERED_VALUES.contains(&value.as_str())),
+        _ => false,
+    }
+}
+
+/// The count envelope a refusal of the request-validation stage is stated under, over the
+/// clauses of one refusal.
+///
+/// The ONE place the envelope is written, so a clause this service applies by hand — a rule
+/// the model cannot express, which the validating walk therefore never sees
+/// ([`missing_member_refusal`]) — is stated under the same count as a clause the walk
+/// produced.
+fn stated_refusal(clauses: &[String]) -> String {
     if clauses.is_empty() {
         return "invalid request".to_string();
     }
@@ -174,6 +219,61 @@ fn constraint_message(violations: &[Violation]) -> String {
         clauses.len(),
         clauses.join("; ")
     )
+}
+
+/// What the request-validation stage answers for a member this service requires that the
+/// request carried no value for: the member's wire name and the requirement it failed,
+/// under the count envelope above.
+///
+/// A member whose necessity depends on ANOTHER member's value — the bucket an enabled CRL
+/// configuration is published to — is not `@required` in the model, so the validating walk
+/// cannot see it missing; the rule is still the request-validation stage's rather than one
+/// of this service's semantic argument faults, so it is worded here, beside the clauses the
+/// walk produces, and answered with the same status and error code.
+///
+/// `member` is the member's WIRE name, which is what a caller repairing the request looks
+/// for in its own payload.
+pub fn missing_member_refusal(member: &str) -> String {
+    stated_refusal(&[format!(
+        "Value null or empty at '{member}'{CONSTRAINT_PREAMBLE}Member must not be null or \
+         empty."
+    )])
+}
+
+/// The values this service's front door does NOT offer, though the model declares them.
+///
+/// The model is this service's whole surface across every partition it is deployed in, while
+/// a front door advertises the subset it offers — so a set this service STATES lists the
+/// values it offers and not the ones it does not: `SM2` is a key algorithm the model declares
+/// and this front door does not advertise. The list is also what tells an enumerated type
+/// this service filters the values of from one it does not ([`service_filtered`]).
+pub const UNOFFERED_VALUES: &[&str] = &["SM2"];
+
+/// The admissible set this service states for an enumerated type, as the values it lists
+/// in the order it lists them.
+///
+/// Where the set comes from is what decides the order, so one rule covers both kinds of
+/// type:
+///
+/// * a type this front door offers EVERY declared value of is stated from the value set
+///   itself, walked the way that set's own hash table is ([`stated_value_set`]);
+/// * a type it offers only SOME of the declared values of is stated from the list it
+///   filtered them into, which holds no value it does not offer and keeps the order the
+///   values were filtered in — the order the model declares them.
+///
+/// `allowed` is the type's declared values in declaration order, as the validating walk
+/// hands them over, so both renderings are built from the model and neither can drift from
+/// the type it describes.
+fn admissible_set(allowed: &[String]) -> Vec<&str> {
+    let offered: Vec<&str> = allowed
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !UNOFFERED_VALUES.contains(value))
+        .collect();
+    if offered.len() == allowed.len() {
+        return stated_value_set(allowed);
+    }
+    offered
 }
 
 /// How wide the table an enumerated type's admissible values are held in is, and so the
@@ -257,9 +357,9 @@ fn stated_order(violations: &[Violation]) -> Vec<&Violation> {
 /// Three things about the clause are this service's: the submitted value is not stated; a
 /// `@pattern` is quoted as the EXPRESSION the value must match rather than as the model's
 /// anchored literal — the anchors make it a whole-value match, which "must satisfy regular
-/// expression pattern" already says; and an enumerated type's admissible set is listed in
-/// the order this service states that type in ([`stated_value_set`]), not in the order the
-/// model happens to declare its values.
+/// expression pattern" already says; and an enumerated type's admissible set is listed as
+/// the set this service states for that type ([`admissible_set`]) — the values it offers, in
+/// the order it states them — rather than as the model's whole declared list.
 fn clause(violation: &Violation) -> String {
     let stated = violation.message();
     let requirement = match stated.split_once(CONSTRAINT_PREAMBLE) {
@@ -274,13 +374,12 @@ fn clause(violation: &Violation) -> String {
             let unanchored = opened.strip_suffix('$').unwrap_or(opened);
             requirement.replace(pattern.as_str(), unanchored)
         }
-        // The set the framework listed in the model's declaration order, restated in the
-        // order this service lists that enumerated type's values in. Both renderings are
-        // built from the same values, so the two cannot drift.
-        ViolationKind::EnumValue(allowed) => requirement.replace(
-            &allowed.join(", "),
-            &stated_value_set(allowed).join(", "),
-        ),
+        // The set the framework listed from the model's declaration, restated as the set
+        // this service states for that enumerated type. Both renderings are built from the
+        // same declared values, so the two cannot drift.
+        ViolationKind::EnumValue(allowed) => {
+            requirement.replace(&allowed.join(", "), &admissible_set(allowed).join(", "))
+        }
         _ => requirement.to_string(),
     };
     // An absent member has no value to name, and the clause says so; a value that is

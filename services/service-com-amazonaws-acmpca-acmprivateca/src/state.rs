@@ -1323,35 +1323,54 @@ pub fn reported_revocation_configuration(
     }
 }
 
-/// Why `revocation` is not a revocation configuration this service will store, or `None`
-/// when it is.
+/// Why `revocation` is not a revocation configuration this service will store, classified
+/// by the stage that refuses it, or `None` when it is one.
 ///
 /// The rules the `RevocationConfiguration` member documents, identically on
 /// `CreateCertificateAuthority` and `UpdateCertificateAuthority`: "A configuration
 /// disabling CRLs or OCSP must contain only the `Enabled=False` parameter, and will fail
 /// if other parameters such as `CustomCname` or `ExpirationInDays` are included." An
 /// enabled CRL configuration conversely needs the bucket it is written to and the period
-/// it expires after. Each caller lifts the reason into its own modelled
-/// `InvalidArgsException`.
-pub fn invalid_revocation_configuration_reason(
+/// it expires after.
+pub fn revocation_configuration_fault(
     revocation: Option<&RevocationConfiguration>,
-) -> Option<String> {
+) -> Option<RevocationConfigurationFault> {
     let revocation = revocation?;
     if let Some(crl) = revocation.crl_configuration.as_ref() {
         if crl.enabled {
-            if crl.s3_bucket_name.is_none() {
-                return Some(
-                    "RevocationConfiguration.CrlConfiguration.S3BucketName is required when \
-                     CRLs are enabled"
-                        .to_string(),
-                );
+            // The bucket the CRLs are published to is a member the configuration's own
+            // state requires, so its absence is the request-validation stage's to refuse,
+            // naming the member ([`RevocationConfigurationFault::MissingMember`]).
+            if crl
+                .s3_bucket_name
+                .as_deref()
+                .is_none_or(|bucket| bucket.trim().is_empty())
+            {
+                return Some(RevocationConfigurationFault::MissingMember(
+                    CRL_BUCKET_MEMBER,
+                ));
             }
             if crl.expiration_in_days.is_none() {
-                return Some(
+                return Some(RevocationConfigurationFault::Unserviceable(
                     "RevocationConfiguration.CrlConfiguration.ExpirationInDays is required \
                      when CRLs are enabled"
                         .to_string(),
-                );
+                ));
+            }
+            // "Designates a custom ﬁle path in S3 for CRL(s)"
+            // (`CrlConfiguration$CustomPath`): a path is where under the bucket the CRLs
+            // are written, so one whose segments name the folder itself or the one above it
+            // designates no such place and is not a path this service will publish to.
+            if crl
+                .custom_path
+                .as_deref()
+                .is_some_and(path_leaves_its_folder)
+            {
+                return Some(RevocationConfigurationFault::Unserviceable(
+                    "RevocationConfiguration.CrlConfiguration.CustomPath must designate a \
+                     path under the CRL bucket, so it cannot contain a '.' or '..' segment"
+                        .to_string(),
+                ));
             }
         } else if let Some((member, _)) = [
             ("ExpirationInDays", crl.expiration_in_days.is_some()),
@@ -1368,22 +1387,43 @@ pub fn invalid_revocation_configuration_reason(
         .iter()
         .find(|(_, present)| *present)
         {
-            return Some(format!(
+            return Some(RevocationConfigurationFault::Unserviceable(format!(
                 "RevocationConfiguration.CrlConfiguration must contain only Enabled=false when \
                  CRLs are disabled, but {member} was included"
-            ));
+            )));
         }
     }
     if let Some(ocsp) = revocation.ocsp_configuration.as_ref() {
         if !ocsp.enabled && ocsp.ocsp_custom_cname.is_some() {
-            return Some(
+            return Some(RevocationConfigurationFault::Unserviceable(
                 "RevocationConfiguration.OcspConfiguration must contain only Enabled=false \
                  when OCSP is disabled, but OcspCustomCname was included"
                     .to_string(),
-            );
+            ));
         }
     }
     None
+}
+
+/// The WIRE name of the member an enabled CRL configuration publishes its CRLs to, which is
+/// the name a refusal of the request-validation stage states for it.
+pub const CRL_BUCKET_MEMBER: &str = "s3BucketName";
+
+/// What is wrong with a submitted `RevocationConfiguration`, as the STAGE that refuses it.
+///
+/// The two stages answer a caller differently, so which one a rule belongs to is part of
+/// the rule. A member the configuration's own state requires is the request-validation
+/// stage's: a schema fault, refused with the generic `ValidationException` naming the
+/// member and the constraint it failed, which a caller can repair from the message alone. A
+/// combination of members that cannot hold together got PAST that stage and is a semantic
+/// argument fault, which each caller lifts into its own modelled `InvalidArgsException`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevocationConfigurationFault {
+    /// The configuration carried no value for a member its own state requires, named here
+    /// by its wire name.
+    MissingMember(&'static str),
+    /// Members that cannot hold together, with the sentence saying which rule they broke.
+    Unserviceable(String),
 }
 
 /// What Amazon Web Services Private CA answers a revocation configuration whose CRLs are
@@ -1538,14 +1578,37 @@ pub struct CrlPublication {
 /// revocation information across partitions, each with a partition id of its own; this
 /// service keeps ONE partition per CA, so the object's name is the CA's id whichever type
 /// the configuration names, and the type stays readable on the configuration.
+///
+/// The key is assembled from the custom path's SEGMENTS, keeping only the ones that name a
+/// step down into it: an empty segment, and a `.` or `..` segment that would resolve
+/// somewhere other than under the designated path, is not one, so no key this builds can
+/// name an object outside `<bucket>/<path>`. A configuration carrying such a segment is
+/// refused when it is submitted ([`revocation_configuration_fault`]), so this is the second
+/// place the rule holds rather than the first.
 pub fn crl_object_key(certificate_authority_id: &str, crl: &CrlConfiguration) -> String {
-    let path = crl
+    let custom = crl
         .custom_path
         .as_deref()
-        .map(|path| path.trim_matches('/'))
-        .filter(|path| !path.is_empty())
-        .unwrap_or(DEFAULT_CRL_PATH);
+        .map(|path| descending_segments(path).join("/"))
+        .filter(|path| !path.is_empty());
+    let path = custom.as_deref().unwrap_or(DEFAULT_CRL_PATH);
     format!("{path}/{certificate_authority_id}.crl")
+}
+
+/// The segments of `path` that each name a step DOWN into it: every non-empty segment other
+/// than the two relative ones (`.`, which names the path itself, and `..`, which names the
+/// one above it).
+pub fn descending_segments(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .collect()
+}
+
+/// Whether `path` names anywhere but a place under the path it is relative to: a segment of
+/// `.` or `..`, which is what a path that leaves the designated folder is spelled with.
+fn path_leaves_its_folder(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == "." || segment == "..")
 }
 
 /// The canned object ACL a CRL object is written with, for the `S3ObjectAcl` the
