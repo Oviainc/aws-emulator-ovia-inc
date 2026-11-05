@@ -82,7 +82,7 @@ pub(crate) fn slot_body(name: &str, extra: Value) -> Value {
 }
 
 /// The `slotSummaries` `ListSlots` reports for one intent, by slot name.
-async fn listed_slot_names(
+pub(crate) async fn listed_slot_names(
     router: &MultiServiceRouter,
     bot_id: &str,
     locale_id: &str,

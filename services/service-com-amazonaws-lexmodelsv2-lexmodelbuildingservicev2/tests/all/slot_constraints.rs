@@ -28,7 +28,7 @@ use crate::bot_lifecycle::{call, emulator, error_code, member, text};
 use crate::bot_locale::{host_bot, locale_body, locales_uri};
 use crate::intents_and_builds::{create_intent, intent_body};
 use crate::slot_type::{host_locale, name_of_length};
-use crate::slots::{slot_body, slots_uri};
+use crate::slots::{listed_slot_names, slot_body, slots_uri};
 
 /// A `CreateIntent` body for an intent a slot can hang off.
 fn utterance_intent(name: &str) -> Value {
@@ -38,28 +38,17 @@ fn utterance_intent(name: &str) -> Value {
     )
 }
 
-/// How many slots `ListSlots` reports for one intent of one locale.
+/// How many slots `ListSlots` reports for one intent of one locale, off the slot suite's
+/// own listing helper.
 async fn slot_count(
     router: &MultiServiceRouter,
     bot_id: &str,
     locale_id: &str,
     intent_id: &str,
 ) -> usize {
-    let (status, listed) = call(
-        router,
-        "POST",
-        &slots_uri(bot_id, "DRAFT", locale_id, intent_id),
-        Some(json!({})),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "expected ListSlots to answer 200, got {status} {listed:?}"
-    );
-    member(&listed, "slotSummaries")
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or_default()
+    listed_slot_names(router, bot_id, locale_id, intent_id)
+        .await
+        .len()
 }
 
 #[tokio::test]
@@ -111,11 +100,19 @@ async fn a_multi_value_slot_is_accepted_only_in_the_locale_the_member_documents(
                 "locale {locale_id} case {case:?}: expected CreateSlot to answer 200, got \
                  {status} {answered:?}"
             );
+            // A setting the request named is reported back; one it did not name is
+            // reported by its absence, never as an invented default.
             assert_eq!(
                 member(&answered, "multipleValuesSetting"),
                 member(extra, "multipleValuesSetting"),
                 "locale {locale_id} case {case:?}: CreateSlot must report the stored setting, \
                  got {answered:?}"
+            );
+            assert_eq!(
+                answered.get("multipleValuesSetting").is_none(),
+                extra.get("multipleValuesSetting").is_none(),
+                "locale {locale_id} case {case:?}: CreateSlot must omit a setting the request \
+                 did not carry, got {answered:?}"
             );
         }
 
