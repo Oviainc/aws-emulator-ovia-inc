@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANGateway, LoRaWANMulticast, LoRaWANServiceProfile,
-    ResourceNotFoundException, SidewalkDevice, Tag, UpdateWirelessGatewayTaskCreate,
+    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway, LoRaWANMulticast,
+    LoRaWANServiceProfile, ResourceNotFoundException, SidewalkDevice, Tag,
+    UpdateWirelessGatewayTaskCreate,
 };
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
@@ -53,6 +54,11 @@ pub fn service_profile_arn(region: &str, id: &str) -> String {
 /// `arn:aws:iotwireless:<region>:<account>:MulticastGroup/<id>`.
 pub fn multicast_group_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("MulticastGroup/{id}"))
+}
+
+/// `arn:aws:iotwireless:<region>:<account>:FuotaTask/<id>`.
+pub fn fuota_task_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("FuotaTask/{id}"))
 }
 
 /// `arn:aws:iotwireless:<region>:<account>:WirelessGateway/<id>`.
@@ -333,6 +339,62 @@ pub struct MulticastGroup {
     pub created_at: SystemTime,
 }
 
+/// A FUOTA task: the firmware image a set of wireless devices is updated with, and the
+/// fragmentation settings the update is sent down with.
+///
+/// The membership itself lives on the devices (`WirelessDevice::fuota_task_id`), like a
+/// multicast group's, so nothing here is a second copy of it.
+#[derive(Debug, Clone)]
+pub struct FuotaTask {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// The LoRaWAN settings the create carried (`RfRegion`), reported back by the
+    /// task's reader.
+    pub lorawan: Option<LoRaWANFuotaTask>,
+    /// The S3 URI of the firmware image. `CreateFuotaTask` marks it required, so every
+    /// stored task has one.
+    pub firmware_update_image: String,
+    /// The role the firmware update is applied under. Required, like the image.
+    pub firmware_update_role: String,
+    pub redundancy_percent: Option<i32>,
+    pub fragment_size_bytes: Option<i32>,
+    pub fragment_interval_ms: Option<i32>,
+    /// The base64 file descriptor the create carried, reported back unchanged.
+    pub descriptor: Option<String>,
+    pub tags: Vec<Tag>,
+    /// `FuotaTaskStatus`, as [`FUOTA_TASK_STATUS_PENDING`] documents the value a
+    /// created task carries.
+    pub status: String,
+    /// When the task was created, reported as `GetFuotaTask`'s `CreatedAt`.
+    pub created_at: SystemTime,
+    /// When the FUOTA session started, reported as `GetFuotaTask`'s `LoRaWAN.StartTime`.
+    /// A session starts only on `StartFuotaTask`, which is still scaffolded, so a task
+    /// created today has none.
+    pub start_time: Option<SystemTime>,
+}
+
+/// The `FuotaTaskStatus` a created FUOTA task carries: nothing has asked for its
+/// session yet, so it is waiting to be started.
+///
+/// One of the modelled values [`crate::ops::types::FUOTA_TASK_STATUS_VALUES`] lists;
+/// the task leaves it only when an operation moves it (the session operations are still
+/// scaffolded).
+pub const FUOTA_TASK_STATUS_PENDING: &str = "Pending";
+
+/// The `ResourceNotFoundException` body for a FUOTA task the account does not hold.
+///
+/// One function, so every operation that addresses a FUOTA task by `Id` refuses a
+/// missing one with the same body.
+pub fn fuota_task_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("FuotaTask {id} not found")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some("FuotaTask".to_string()),
+    }
+}
+
 /// What an `@idempotencyToken` create remembers: which resource the token minted, and
 /// a fingerprint of the parameters it was minted with.
 ///
@@ -396,6 +458,17 @@ pub const MAX_SERVICE_PROFILES: usize = 100;
 /// Validation), so a full store refuses with `ValidationException`.
 pub const MAX_MULTICAST_GROUPS: usize = 100;
 
+/// The most FUOTA tasks this emulator stores. A ceiling, for the same reason as
+/// [`MAX_DESTINATIONS`]; `CreateFuotaTask` models no quota error either
+/// (`smithy_query(query="operation", operation="CreateFuotaTask")` lists AccessDenied /
+/// Conflict / InternalServer / ResourceNotFound / Throttling / Validation), so a full
+/// store refuses with `ValidationException`.
+pub const MAX_FUOTA_TASKS: usize = 100;
+
+/// The most `ClientRequestToken` entries kept for `CreateFuotaTask` idempotency.
+/// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
+pub const MAX_FUOTA_TASK_TOKENS: usize = MAX_FUOTA_TASKS;
+
 /// The most wireless gateways this emulator stores. A ceiling, for the same reason as
 /// [`MAX_DESTINATIONS`]; `CreateWirelessGateway` models no quota error either
 /// (`smithy_query(query="operation", operation="CreateWirelessGateway")` lists
@@ -453,19 +526,19 @@ pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 ///
 /// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
 /// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_SERVICE_PROFILES`] /
-/// [`MAX_MULTICAST_GROUPS`] /
+/// [`MAX_MULTICAST_GROUPS`] / [`MAX_FUOTA_TASKS`] /
 /// [`MAX_WIRELESS_GATEWAYS`] / [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`] (the
 /// creates refuse once full), `dev_eui_index` by one entry per stored device,
 /// `gateway_eui_index` by one entry per stored gateway, and the
 /// token maps by [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
 /// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_SERVICE_PROFILE_TOKENS`] /
-/// [`MAX_MULTICAST_GROUP_TOKENS`] /
+/// [`MAX_MULTICAST_GROUP_TOKENS`] / [`MAX_FUOTA_TASK_TOKENS`] /
 /// [`MAX_WIRELESS_GATEWAY_TOKENS`] /
 /// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS`] with oldest-entry
 /// eviction. The token maps are private so every write goes through
 /// [`Self::record_destination_token`] / [`Self::record_wireless_device_token`] /
 /// [`Self::record_device_profile_token`] / [`Self::record_service_profile_token`] /
-/// [`Self::record_multicast_group_token`] /
+/// [`Self::record_multicast_group_token`] / [`Self::record_fuota_task_token`] /
 /// [`Self::record_wireless_gateway_token`] /
 /// [`Self::record_wireless_gateway_task_definition_token`] and
 /// cannot bypass the cap.
@@ -481,6 +554,8 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     pub service_profiles: BTreeMap<String, ServiceProfile>,
     /// Multicast groups by `Id`. Bounded by [`MAX_MULTICAST_GROUPS`].
     pub multicast_groups: BTreeMap<String, MulticastGroup>,
+    /// FUOTA tasks by `Id`. Bounded by [`MAX_FUOTA_TASKS`].
+    pub fuota_tasks: BTreeMap<String, FuotaTask>,
     /// Wireless gateways by `Id`. Bounded by [`MAX_WIRELESS_GATEWAYS`].
     pub wireless_gateways: BTreeMap<String, WirelessGateway>,
     /// Wireless gateway task definitions by `Id`. Bounded by
@@ -521,6 +596,11 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     multicast_group_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::multicast_group_tokens`].
     multicast_group_token_order: VecDeque<String>,
+    /// `CreateFuotaTask` client request tokens, bounded by [`MAX_FUOTA_TASK_TOKENS`].
+    /// Private, like the destination tokens.
+    fuota_task_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::fuota_task_tokens`].
+    fuota_task_token_order: VecDeque<String>,
     /// `CreateWirelessGateway` client request tokens, bounded by
     /// [`MAX_WIRELESS_GATEWAY_TOKENS`]. Private, like the destination tokens.
     wireless_gateway_tokens: HashMap<String, IdempotentCreate>,
@@ -635,6 +715,28 @@ impl ComAmazonawsIotwirelessIotwirelessState {
     /// Mint a fresh, unused `MulticastGroupId`.
     pub fn mint_multicast_group_id(&mut self) -> String {
         mint_unused_uuid(&self.multicast_groups)
+    }
+
+    /// Mint a fresh, unused `FuotaTaskId`.
+    pub fn mint_fuota_task_id(&mut self) -> String {
+        mint_unused_uuid(&self.fuota_tasks)
+    }
+
+    /// What a `CreateFuotaTask` `ClientRequestToken` already minted, if anything.
+    pub fn fuota_task_token(&self, token: &str) -> Option<&IdempotentCreate> {
+        self.fuota_task_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the FUOTA task named by `record`, evicting the
+    /// oldest token first if that would push the map past [`MAX_FUOTA_TASK_TOKENS`].
+    pub fn record_fuota_task_token(&mut self, token: String, record: IdempotentCreate) {
+        record_token(
+            &mut self.fuota_task_tokens,
+            &mut self.fuota_task_token_order,
+            MAX_FUOTA_TASK_TOKENS,
+            token,
+            record,
+        );
     }
 
     /// Mint a fresh, unused `WirelessGatewayId`.

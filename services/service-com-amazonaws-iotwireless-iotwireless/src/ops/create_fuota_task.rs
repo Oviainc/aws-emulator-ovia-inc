@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFuotaTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFuotaTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFuotaTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a FUOTA task, minting its `Id` and ARN. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +173,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFuotaTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFuotaTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFuotaTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateFuotaTaskError::from(CreateFuotaTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotwireless store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = fingerprint(&input);
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is an `@idempotencyToken`: replaying it with the same
+        // parameters completes successfully and returns the id the first call minted;
+        // replaying it with different parameters is an HTTP 409.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(prior) = store.fuota_task_token(token) {
+                if prior.fingerprint != fingerprint {
+                    return Err(CreateFuotaTaskErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientRequestToken {token} was already used with different \
+                                 parameters"
+                            )),
+                            resource_id: Some(prior.resource_key.clone()),
+                            resource_type: Some("FuotaTask".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.fuota_tasks.get(&prior.resource_key) {
+                    return Ok(CreateFuotaTaskOutput {
+                        arn: Some(existing.arn.clone()),
+                        id: Some(existing.id.clone()),
+                    });
+                }
+                // The task this token minted has since been deleted, so there is nothing
+                // to replay: fall through and create a new one.
+            }
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap without
+        // bound: the task map by this ceiling, and the idempotency ledger a successful
+        // create also writes by `MAX_FUOTA_TASK_TOKENS` with oldest-entry eviction inside
+        // `record_fuota_task_token`. This operation models no quota error, so a full
+        // store is a `ValidationException` naming the ceiling it hit.
+        if store.fuota_tasks.len() >= crate::state::MAX_FUOTA_TASKS {
+            return Err(CreateFuotaTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "this emulator stores at most {} FUOTA tasks; delete one before \
+                         creating another",
+                        crate::state::MAX_FUOTA_TASKS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_fuota_task_id();
+        let task = crate::state::FuotaTask {
+            arn: crate::state::fuota_task_arn(&region, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            lorawan: input.lo_ra_wan.clone(),
+            firmware_update_image: input.firmware_update_image.clone(),
+            firmware_update_role: input.firmware_update_role.clone(),
+            redundancy_percent: input.redundancy_percent,
+            fragment_size_bytes: input.fragment_size_bytes,
+            fragment_interval_ms: input.fragment_interval_ms,
+            descriptor: input.descriptor.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            // A created task is waiting for its session to be asked for; it leaves this
+            // status when an operation moves it, never because time passed.
+            status: crate::state::FUOTA_TASK_STATUS_PENDING.to_string(),
+            created_at: ::std::time::SystemTime::now(),
+            // No session has started, so the task has no start time to report.
+            start_time: None,
+        };
+        let output = CreateFuotaTaskOutput {
+            arn: Some(task.arn.clone()),
+            id: Some(task.id.clone()),
+        };
+        store.fuota_tasks.insert(id.clone(), task);
+        if let Some(token) = input.client_request_token.clone() {
+            store.record_fuota_task_token(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_key: id,
+                    fingerprint,
+                },
+            );
+        }
+        Ok(output)
     }
+}
+
+/// The create parameters, the token excluded, as one comparable string — what decides
+/// whether a replayed `ClientRequestToken` carries "the same parameters".
+fn fingerprint(input: &CreateFuotaTaskInput) -> String {
+    let tags = crate::state::sorted_tag_pairs(input.tags.as_deref().unwrap_or_default());
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{tags:?}",
+        input.name,
+        input.description,
+        input.lo_ra_wan,
+        input.firmware_update_image,
+        input.firmware_update_role,
+        input.redundancy_percent,
+        input.fragment_size_bytes,
+        input.fragment_interval_ms,
+        input.descriptor,
+    )
 }
