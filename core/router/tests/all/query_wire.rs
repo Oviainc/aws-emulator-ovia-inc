@@ -136,6 +136,21 @@ pub(crate) fn members_of(xml: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Each `<item>` block of an ec2Query answer's LIST, in document order.
+///
+/// [`members_of`] reads the awsQuery `<member>` form; an ec2Query list wraps each entry in
+/// `<item>` instead, so a suite reading one route or one association out of a route table
+/// scopes the read to that entry rather than to the first element of that name anywhere in
+/// the answer. Here for the reason this module exists: a suite that writes its own drifts
+/// from the others.
+pub(crate) fn items_of(xml: &str) -> Vec<&str> {
+    xml.split("<item")
+        .skip(1)
+        .filter_map(|block| block.split_once('>'))
+        .filter_map(|(_, body)| body.split("</item>").next())
+        .collect()
+}
+
 /// One pair of elements per list member, as the map a client reads a keyed list as.
 ///
 /// Each pair is read from the member that carries BOTH, rather than by zipping two

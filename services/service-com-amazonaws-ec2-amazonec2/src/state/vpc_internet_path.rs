@@ -160,6 +160,21 @@ pub fn resource_already_attached<E>(internet_gateway_id: &str, vpc_id: &str) -> 
     )
 }
 
+/// EC2's error code for a request that named a route table association id this account holds
+/// no association for (EC2 API "Error codes": `InvalidAssociationID.NotFound`).
+pub const INVALID_ASSOCIATION_ID_NOT_FOUND: &str = "InvalidAssociationID.NotFound";
+
+/// Refuse a request that named an association id no association of a stored route table
+/// carries: HTTP 400 [`INVALID_ASSOCIATION_ID_NOT_FOUND`], worded the way every other
+/// not-found id of this crate is ([`super::id_not_found`]).
+pub fn invalid_association_id_not_found<E>(association_id: &str) -> Scaffolded<E> {
+    super::id_not_found(
+        INVALID_ASSOCIATION_ID_NOT_FOUND,
+        "association ID",
+        association_id,
+    )
+}
+
 /// Refuse an association the subnet already has: HTTP 400
 /// [`super::RESOURCE_ALREADY_ASSOCIATED`] as well, since "each subnet in your VPC must be
 /// associated with a route table" and with exactly one — changing which one is
@@ -672,6 +687,109 @@ impl ComAmazonawsEc2Amazonec2State {
             route_table.tags.as_deref().unwrap_or_default(),
         ));
         Some(route_table)
+    }
+
+    /// Whether the route table `route_table_id` is the MAIN table of its VPC — "your VPC
+    /// automatically comes with a main route table" — which is what the table's own implicit
+    /// association records ([`Self::insert_route_table`]).
+    ///
+    /// Read by the delete that refuses one ("you can't delete the main route table" —
+    /// `DeleteRouteTable`), so the question is asked of the stored record rather than of a
+    /// second copy kept beside it.
+    pub fn route_table_is_main(&self, route_table_id: &str) -> bool {
+        self.route_tables
+            .get(route_table_id)
+            .and_then(|route_table| route_table.associations.as_deref())
+            .is_some_and(|associations| {
+                associations
+                    .iter()
+                    .any(|association| association.main == Some(true))
+            })
+    }
+
+    /// The EXPLICIT associations of the route table `route_table_id`, as the association ids
+    /// they carry: the ones an `AssociateRouteTable` made, never the implicit association a
+    /// main table is reported with.
+    ///
+    /// They are what a delete has to find none of ("you must disassociate the route table
+    /// from any subnets before you can delete it" — `DeleteRouteTable`).
+    pub fn explicit_route_table_associations(&self, route_table_id: &str) -> Vec<String> {
+        self.route_tables
+            .get(route_table_id)
+            .and_then(|route_table| route_table.associations.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .filter(|association| association.main != Some(true))
+            .filter_map(|association| association.route_table_association_id.clone())
+            .collect()
+    }
+
+    /// The explicit association `association_id` names, whichever table holds it.
+    ///
+    /// A READ, so a disassociate can refuse an id that names no association before it
+    /// changes anything. The implicit association of a main table is not one a caller can
+    /// name: "the ID of the association representing the CURRENT association between the
+    /// route table and subnet or gateway" (`DisassociateRouteTableRequest$AssociationId`)
+    /// is an association a caller made.
+    pub fn explicit_route_table_association(
+        &self,
+        association_id: &str,
+    ) -> Option<RouteTableAssociation> {
+        self.route_tables
+            .values()
+            .flat_map(|route_table| route_table.associations.iter().flatten())
+            .find(|association| {
+                association.main != Some(true)
+                    && association.route_table_association_id.as_deref() == Some(association_id)
+            })
+            .cloned()
+    }
+
+    /// Drop the explicit association `association_id`, and answer whether one was dropped.
+    ///
+    /// The reverse of [`Self::associate_subnet_with_route_table`]: "after you perform this
+    /// action, the subnet no longer uses the routes in the route table" — the association is
+    /// the pair, so taking it away is removing the record of it. The records hold no
+    /// caller-supplied bytes, so there is nothing to give back to the budget.
+    pub fn disassociate_route_table(&mut self, association_id: &str) -> bool {
+        let mut dropped = false;
+        for route_table in self.route_tables.values_mut() {
+            if let Some(associations) = route_table.associations.as_mut() {
+                associations.retain(|association| {
+                    let matched = association.main != Some(true)
+                        && association.route_table_association_id.as_deref()
+                            == Some(association_id);
+                    dropped |= matched;
+                    !matched
+                });
+            }
+        }
+        dropped
+    }
+
+    /// Drop every route of every table whose GATEWAY target is `gateway_id`, and answer how
+    /// many were dropped.
+    ///
+    /// A route may only point at a gateway of the route table's own VPC, so a gateway that
+    /// stops existing cannot leave routes behind pointing at it: "when you delete a gateway
+    /// endpoint, we delete the endpoint routes in the route tables for the endpoint"
+    /// (`DeleteVpcEndpoints`) is that rule for a VPC endpoint, which is reported as a route's
+    /// `GatewayId` ([`RouteTarget::Gateway`]). A route holds no bytes the byte budget counts,
+    /// so there is nothing to give back for one.
+    pub fn drop_routes_to_gateway(&mut self, gateway_id: &str) -> usize {
+        let mut dropped = 0usize;
+        for route_table in self.route_tables.values_mut() {
+            if let Some(routes) = route_table.routes.as_mut() {
+                routes.retain(|route| {
+                    let matched = route.gateway_id.as_deref() == Some(gateway_id);
+                    if matched {
+                        dropped += 1;
+                    }
+                    !matched
+                });
+            }
+        }
+        dropped
     }
 }
 

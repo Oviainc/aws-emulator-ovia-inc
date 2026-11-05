@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored VPC endpoints the request names, taking each one's
+//! endpoint routes and endpoint network interfaces with it, and reports the ids it could not
+//! remove in `Unsuccessful` (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoints`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +136,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcEndpoints"))
+        // `ctx` carries request metadata only; this operation reads none of it — an endpoint
+        // is named by id, which is unique across Regions in this store. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Naming one endpoint twice asks for it once, which is what keeps the second mention
+        // from being reported as an id that does not exist after the first removed it.
+        let requested = state::deduplicate_ids(&input.vpc_endpoint_ids);
+        // The work this call does is one removal per id named, each a walk of the stores that
+        // hold what an endpoint cannot outlive, so the number of ids one request may carry is
+        // bounded before any of that work is done — the bound every list of resource ids in
+        // this crate is held to.
+        if requested.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "VpcEndpointIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owed is applied before the store is read, so what this
+        // removes is the endpoint as it actually stands.
+        store.materialize_due_transitions();
+
+        // Each endpoint is judged on its own and reported in `Unsuccessful` when it cannot be
+        // deleted — "information about the VPC endpoints that were not successfully deleted"
+        // — so one bad id does not refuse the endpoints beside it. The code carried is the one
+        // this service answers that same cause with elsewhere.
+        let mut unsuccessful: Vec<UnsuccessfulItem> = Vec::new();
+        let mut deletable: Vec<String> = Vec::new();
+        for endpoint_id in &requested {
+            let refusal = if !state::vpc_endpoint_id_is_well_formed(endpoint_id) {
+                Some((
+                    state::INVALID_VPC_ENDPOINT_ID_MALFORMED,
+                    state::invalid_id_message(endpoint_id),
+                ))
+            } else if store.vpc_endpoints.contains_key(endpoint_id) {
+                None
+            } else {
+                Some((
+                    state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+                    format!("The VpcEndpoint Id '{endpoint_id}' does not exist"),
+                ))
+            };
+            match refusal {
+                Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
+                    resource_id: Some(endpoint_id.clone()),
+                    error: Some(UnsuccessfulItemError {
+                        code: Some(code.to_string()),
+                        message: Some(message),
+                    }),
+                }),
+                None => deletable.push(endpoint_id.clone()),
+            }
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        for endpoint_id in deletable {
+            remove_endpoint(&mut store, &endpoint_id);
+        }
+
+        Ok(DeleteVpcEndpointsOutput {
+            unsuccessful: Some(unsuccessful),
+        })
     }
+}
+
+/// Remove ONE stored VPC endpoint with everything that cannot outlive it.
+///
+/// "When you delete a gateway endpoint, we delete the endpoint routes in the route tables
+/// for the endpoint… When you delete an interface endpoint, we delete its endpoint network
+/// interfaces" (`DeleteVpcEndpoints`) — so both go here rather than being left behind for a
+/// describe to report a route or an interface of an endpoint that no longer exists. The
+/// caller-chosen bytes the record retained go back to the store's budget on exactly the terms
+/// `create_vpc_endpoint` took them on: the record overhead and tags
+/// [`crate::state::ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint`] charged, and the
+/// policy, the service name, the derived DNS entries and the client token that create added.
+fn remove_endpoint(store: &mut crate::state::ComAmazonawsEc2Amazonec2State, endpoint_id: &str) {
+    use crate::state;
+
+    let Some(endpoint) = store.vpc_endpoints.remove(endpoint_id) else {
+        return;
+    };
+    // The move the clock still owed this endpoint is owed no longer: the endpoint went with
+    // it.
+    store.vpc_endpoint_moves.remove(endpoint_id);
+    // A route pointing at the endpoint is a route to nothing once the endpoint is gone; an
+    // endpoint is reported as a route's `GatewayId`, whichever route table holds it.
+    store.drop_routes_to_gateway(endpoint_id);
+    for network_interface_id in endpoint.network_interface_ids.iter().flatten() {
+        // The exact reverse of the insert the create made: it gives the interface's private
+        // address and its bytes back as well.
+        store.remove_network_interface(network_interface_id);
+    }
+    // A `ClientToken` left naming an endpoint the store no longer holds would replay into a
+    // dangling id, so it goes with the endpoint — and its bytes with it.
+    let tokens: Vec<String> = store
+        .vpc_endpoint_client_tokens
+        .iter()
+        .filter(|(_, minted)| minted.as_str() == endpoint_id)
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in tokens {
+        store.vpc_endpoint_client_tokens.remove(&token);
+        store.release_stored_bytes(token.len());
+    }
+    store.release_stored_bytes(
+        state::STORED_RECORD_OVERHEAD_BYTES
+            .saturating_add(state::tag_list_bytes(
+                endpoint.tags.as_deref().unwrap_or_default(),
+            ))
+            .saturating_add(endpoint.policy_document.as_deref().map_or(0, str::len))
+            .saturating_add(endpoint.service_name.as_deref().map_or(0, str::len))
+            .saturating_add(state::dns_entry_list_bytes(
+                endpoint.dns_entries.as_deref().unwrap_or_default(),
+            )),
+    );
 }

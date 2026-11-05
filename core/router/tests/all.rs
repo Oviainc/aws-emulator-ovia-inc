@@ -727,6 +727,11 @@ mod compute_optimizer_automation_denial_principal_agrees_with_sts;
 // with all of them.
 #[path = "all/cloudformation_ec2_network_identifiers.rs"]
 mod cloudformation_ec2_network_identifiers;
+// Declared HERE, beside the sibling suite above in the same quiet span, for the reason that
+// entry records: the appended tail at the end of this file and the `c…` span beside the other
+// `cloudformation_*` suites are both where every concurrently landing suite puts its line.
+#[path = "all/cloudformation_ec2_network_stack_routes.rs"]
+mod cloudformation_ec2_network_stack_routes;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail or in the
 // `c…` span beside the other `cloudformation_provisions_*` suites: both of those are where
 // every concurrently landing suite puts its line.

@@ -198,6 +198,7 @@ use serde_json::Value;
 use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
+mod ec2_vpc_network;
 mod lambda_function;
 mod lambda_permission;
 
@@ -522,6 +523,11 @@ pub(super) enum Owner {
     LambdaFunction,
     /// `AWS::Lambda::Permission`, whose arms are [`lambda_permission`]'s.
     LambdaPermission,
+    /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
+    /// the subnet association that puts a subnet on one, and the VPC endpoint reached
+    /// through it. Which of them it is travels with the owner, so the algorithm resolves the
+    /// type once and every call below is about that same resource.
+    Ec2VpcNetwork(ec2_vpc_network::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -532,6 +538,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == lambda_permission::LAMBDA_PERMISSION {
         return Some(Owner::LambdaPermission);
+    }
+    if let Some(kind) = ec2_vpc_network::kind_of(resource_type) {
+        return Some(Owner::Ec2VpcNetwork(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -556,6 +565,9 @@ impl Owner {
             // A policy statement carries no tags of its own: it is not a resource, so
             // CloudFormation propagates none to it.
             Self::LambdaPermission => lambda_permission::create(ctx, region, resource).await,
+            Self::Ec2VpcNetwork(kind) => {
+                ec2_vpc_network::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -574,6 +586,13 @@ impl Owner {
             Self::LambdaFunction => Ok(lambda_function::readiness()),
             // The statement is in force the moment `AddPermission` answers.
             Self::LambdaPermission => Ok(Readiness::Ready),
+            // Each of these resources EXISTS from the moment its create answers: the table
+            // takes its routes, the association holds, and the endpoint's own route is in
+            // the tables the create named. The `pending` window Amazon EC2 reports a new
+            // endpoint in is that service's own transition, not a resource that has yet to
+            // come into being — the case [`lambda_function::readiness`] states for a function
+            // and an `AWS::RDS::DBInstance` for a database.
+            Self::Ec2VpcNetwork(_) => Ok(Readiness::Ready),
         }
     }
 
@@ -596,6 +615,9 @@ impl Owner {
             // owner created has every attribute it publishes already, and a policy
             // statement publishes none at all.
             Self::LambdaFunction | Self::LambdaPermission => Ok(BTreeMap::new()),
+            // Each of these types publishes its own identifier and nothing else, and the
+            // create answered it, so there is nothing to read once the resource is up.
+            Self::Ec2VpcNetwork(_) => Ok(BTreeMap::new()),
         }
     }
 
@@ -616,6 +638,10 @@ impl Owner {
             }
             // `RemovePermission` takes the statement away, so there is nothing to wait for.
             Self::LambdaPermission => Ok(Removal::Gone),
+            // Each of these deletes takes the resource away as it answers — Amazon EC2
+            // reports no state a deleted route table, association or endpoint is still being
+            // removed in — so there is nothing to wait for either.
+            Self::Ec2VpcNetwork(_) => Ok(Removal::Gone),
         }
     }
 
@@ -639,6 +665,13 @@ impl Owner {
             // and `RemovePermission` removes one, so a changed declaration is reported as
             // not applied rather than as a success that dropped the caller's change.
             Self::LambdaPermission => Ok(None),
+            // Neither an association nor a route table has a property that can change on the
+            // resource that exists (both of an association's are its identity, and a route
+            // table's VPC is create-only), and the members of an endpoint that can are
+            // `ModifyVpcEndpoint`'s, which this emulator does not serve yet — so a changed
+            // declaration is reported as not applied rather than as a success that dropped
+            // the caller's change.
+            Self::Ec2VpcNetwork(_) => Ok(None),
         }
     }
 
@@ -663,6 +696,10 @@ impl Owner {
             }
             // A policy statement is not taggable, so nothing is asked about its tags.
             Self::LambdaPermission => Ok(()),
+            // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
+            // here yet — as for every other type of that service ([`Provisioner::retag`]'s
+            // own default) — so nothing is asked about them.
+            Self::Ec2VpcNetwork(_) => Ok(()),
         }
     }
 
@@ -686,6 +723,12 @@ impl Owner {
             // the function with no snapshot invented for it.
             Self::LambdaFunction => lambda_function::delete(ctx, region, resource).await,
             Self::LambdaPermission => lambda_permission::delete(ctx, region, resource).await,
+            // Amazon EC2 takes no snapshot of any of these on the way out: there is no such
+            // call, so a `Snapshot` deletion policy on one of them deletes the resource with
+            // no snapshot invented for it.
+            Self::Ec2VpcNetwork(kind) => {
+                ec2_vpc_network::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -713,6 +756,10 @@ impl Owner {
             // The policy a statement belongs to is read by the function's own drift read,
             // so a statement reports no configuration of its own to compare.
             Self::LambdaPermission => Ok(None),
+            // These three report no configuration of their own to compare either: every
+            // property each one has is part of its identity or of the call that made it, so
+            // there is no member a later read could find changed.
+            Self::Ec2VpcNetwork(_) => Ok(None),
         }
     }
 
@@ -723,6 +770,8 @@ impl Owner {
             Self::Builtin(provisioner) => provisioner.handler_message(class, message),
             // AWS Lambda's resource provider reports the service's own message as it came.
             Self::LambdaFunction | Self::LambdaPermission => message.to_string(),
+            // Amazon EC2's does the same.
+            Self::Ec2VpcNetwork(_) => message.to_string(),
         }
     }
 }

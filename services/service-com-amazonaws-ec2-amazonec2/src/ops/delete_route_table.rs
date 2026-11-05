@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes a stored route table once nothing is associated with it any more,
+//! refusing the main table of a VPC and a table a subnet still uses (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::remove_route_table`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRouteTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — a route
+        // table is named by id, which is unique across Regions in this store. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Whether anything still uses the table is a question about the CURRENT state, so a
+        // move the clock already owed is applied before it is asked: the move was due at
+        // that instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified route table": a table id this account holds no table for is
+        // a refusal, not a no-op — a caller that deletes twice has to be able to tell the
+        // deletion it performed from one it did not.
+        if !store.route_tables.contains_key(&input.route_table_id) {
+            return Err(state::invalid_route_table_id_not_found(&input.route_table_id));
+        }
+        // "You can't delete the main route table" (`DeleteRouteTable`): it is the table the
+        // VPC came with, reported with the implicit association every subnet without one of
+        // its own uses — a dependency like any other, so it is refused in the sentence AWS
+        // words this error class with, naming the table the request named.
+        if store.route_table_is_main(&input.route_table_id) {
+            return Err(state::dependency_violation(format!(
+                "The routeTable '{route_table_id}' has dependencies and cannot be deleted.",
+                route_table_id = input.route_table_id,
+            )));
+        }
+        // "You must disassociate the route table from any subnets before you can delete it"
+        // (`DeleteRouteTable`): a table a subnet still uses has a dependency, so it is
+        // refused rather than deleted out from under that subnet.
+        if !store
+            .explicit_route_table_associations(&input.route_table_id)
+            .is_empty()
+        {
+            // The refusal names the TABLE THE REQUEST NAMED and nothing else: which subnet
+            // still uses it is not part of the message AWS builds for this error class.
+            return Err(state::dependency_violation(format!(
+                "The routeTable '{route_table_id}' has dependencies and cannot be deleted.",
+                route_table_id = input.route_table_id,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `remove_route_table` is what gives the record's caller-supplied bytes back to the
+        // store's budget and takes the table's own routes with it.
+        if store.remove_route_table(&input.route_table_id).is_none() {
+            return Err(state::internal_error(
+                "the route table checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DeleteRouteTableOutput)
     }
 }

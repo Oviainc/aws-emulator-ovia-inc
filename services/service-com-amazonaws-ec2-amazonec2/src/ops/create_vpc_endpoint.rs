@@ -230,17 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CreateVpcEndpoint for a resource configuration or a service network",
             ));
         }
-        // "(Gateway endpoint) The route table IDs" (`RouteTableIds`): a VPC route table is a
-        // resource of its own and this crate holds no store of them (`CreateRouteTable` is
-        // still a scaffold), so there is nothing an association could name.
-        if input
-            .route_table_ids
-            .as_deref()
-            .is_some_and(|ids| !ids.is_empty())
-        {
-            return Err(Scaffolded::not_implemented(
-                "CreateVpcEndpoint with route table associations",
-            ));
+        // "(Gateway endpoint) The route table IDs" (`RouteTableIds`): the tables the
+        // endpoint is reached through, deduplicated first — naming one table twice asks for
+        // it once — and bounded before any per-entry work is done.
+        let requested_route_tables =
+            state::deduplicate_ids(input.route_table_ids.as_deref().unwrap_or_default());
+        if requested_route_tables.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "RouteTableIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested_route_tables.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
         }
         // "The IP address type for the endpoint" (`IpAddressType`): an endpoint reached over
         // IPv6 needs IPv6 addresses on its endpoint network interfaces, and a subnet of this
@@ -329,6 +329,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::invalid_parameter_combination(
                 "SubnetIds cannot be specified for a Gateway endpoint",
             ));
+        }
+        if !gateway && !requested_route_tables.is_empty() {
+            // "(Gateway endpoint) The route table IDs" (`RouteTableIds`): every other type
+            // is reached through endpoint network interfaces in subnets rather than through
+            // a route, so a route table names nothing for one.
+            return Err(state::invalid_parameter_combination(format!(
+                "RouteTableIds cannot be specified for a {endpoint_type} endpoint"
+            )));
         }
         if !interface && !requested_groups.is_empty() {
             // "(Interface, Resource, ServiceNetwork, and Tunnel endpoints only) The IDs of
@@ -586,6 +594,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "(Gateway endpoint) The route table IDs" (`RouteTableIds`): "a gateway endpoint
+        // … you specify the route tables that use the endpoint" (Amazon Web Services
+        // PrivateLink User Guide, "Gateway endpoints"), so each table has to exist and has
+        // to route for the endpoint's own VPC — a table of another VPC routes traffic the
+        // endpoint cannot carry.
+        for route_table_id in &requested_route_tables {
+            let Some(route_table) = store.route_tables.get(route_table_id) else {
+                return Err(state::invalid_route_table_id_not_found(route_table_id));
+            };
+            if route_table.vpc_id.as_deref() != Some(input.vpc_id.as_str()) {
+                return Err(state::invalid_parameter_value(format!(
+                    "route table {route_table_id} and VPC {vpc_id} belong to different \
+                     networks",
+                    vpc_id = input.vpc_id,
+                )));
+            }
+        }
+        // The destination of the route a gateway endpoint adds to each of those tables: "the
+        // route … uses the prefix list for the service as the destination" (same guide), and
+        // the prefix lists a Region publishes are exactly the services it serves gateway
+        // endpoints for ([`crate::state::service_prefix_lists_in_region`]). A route-table
+        // association to any other name therefore names no gateway endpoint service, which
+        // is the refusal EC2 answers for a service name it does not serve.
+        let endpoint_prefix_list = state::service_prefix_lists_in_region(&region)
+            .into_iter()
+            .find(|published| published.prefix_list_name == service_name)
+            .map(|published| published.prefix_list_id);
+        if !requested_route_tables.is_empty() && endpoint_prefix_list.is_none() {
+            return Err(state::invalid_service_name(service_name));
+        }
+        // Each named table has to have ROOM for that one route, and must not already route
+        // its destination: "the route identified by <x> already exists" and the per-table
+        // route quota are the table's own bounds, asked here — before anything is written —
+        // so an endpoint is never stored reporting a table it does not actually route to.
+        if let Some(prefix_list_id) = endpoint_prefix_list.as_deref() {
+            for route_table_id in &requested_route_tables {
+                if store.route_table_holds_destination(route_table_id, prefix_list_id) {
+                    return Err(state::route_already_exists(prefix_list_id));
+                }
+                if store.route_count(route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
+                    return Err(state::route_limit_exceeded());
+                }
+            }
+        }
+
         // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
         // the request": a repeat of a request this store already served answers with the
         // endpoint it created then, and creates nothing. Compared on what the REQUEST chose
@@ -639,6 +692,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && stored.policy_document == policy_document
                 && stored.private_dns_enabled.unwrap_or(false) == private_dns_enabled
                 && stored.subnet_ids.as_deref().unwrap_or_default() == requested_subnets
+                && stored.route_table_ids.as_deref().unwrap_or_default()
+                    == requested_route_tables
                 && stored_group_ids == asked_group_ids
                 && asked_addresses_match
                 && stored
@@ -778,8 +833,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: Some(state::VPC_ENDPOINT_STATE_PENDING.to_string()),
             policy_document: policy_document.clone(),
             // "(Gateway endpoint) The IDs of the route tables associated with the
-            // endpoint": none are, nothing having associated one.
-            route_table_ids: gateway.then(Vec::new),
+            // endpoint": the tables the request named, each of which the endpoint's own
+            // route is added to below.
+            route_table_ids: gateway.then(|| requested_route_tables.clone()),
             subnet_ids: (!gateway).then(|| {
                 placements
                     .iter()
@@ -833,6 +889,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_id.clone(),
             state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
         );
+        // "We automatically add a route to the route table with a destination of the prefix
+        // list for the service and a target of the gateway endpoint" (Amazon Web Services
+        // PrivateLink User Guide, "Gateway endpoints"): the endpoint is only REACHED through
+        // that route, so a table the request associated carries it from the moment the
+        // endpoint exists. It is stored through the one writer of a route
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_route`]), so
+        // `DescribeRouteTables` reports it exactly as it reports a route a caller added.
+        if let Some(prefix_list_id) = endpoint_prefix_list.as_deref() {
+            for route_table_id in &requested_route_tables {
+                let stored = store.insert_route(
+                    route_table_id,
+                    state::RouteSpec {
+                        destination_cidr_block: None,
+                        destination_ipv6_cidr_block: None,
+                        destination_prefix_list_id: Some(prefix_list_id.to_string()),
+                        // A VPC endpoint is reported as a route's `GatewayId`, the modelled
+                        // `Route` carrying no member of its own for one.
+                        target: state::RouteTarget::Gateway(endpoint_id.clone()),
+                        // "`CreateRoute` - The route was manually added to the route table"
+                        // (`Route$Origin`) is the origin AWS reports an endpoint route under:
+                        // it is a route of the table rather than one the table came with.
+                        origin: state::ROUTE_ORIGIN_CREATE_ROUTE,
+                    },
+                );
+                if !stored {
+                    // Unreachable: every bound the insert enforces was asked above and the
+                    // store is locked throughout. Answered rather than discarded, because an
+                    // endpoint that reported a table it does not route to would be a success
+                    // nothing carried out — so the endpoint, the routes already added for it
+                    // and the bytes it took are handed back, leaving the store as the request
+                    // found it.
+                    store.drop_routes_to_gateway(&endpoint_id);
+                    store.vpc_endpoints.remove(&endpoint_id);
+                    store.vpc_endpoint_moves.remove(&endpoint_id);
+                    store.release_stored_bytes(
+                        state::STORED_RECORD_OVERHEAD_BYTES
+                            .saturating_add(state::tag_list_bytes(&tags))
+                            .saturating_add(policy_document.as_deref().map_or(0, str::len))
+                            .saturating_add(service_name.len()),
+                    );
+                    release_interfaces(&mut store, &network_interface_ids);
+                    return Err(state::route_limit_exceeded());
+                }
+            }
+        }
         // "(Interface endpoint) The DNS entries for the endpoint" (`DnsEntries`): the names
         // the endpoint answers on, built from the id it was just given, the service it is to
         // and the zones its interfaces sit in.

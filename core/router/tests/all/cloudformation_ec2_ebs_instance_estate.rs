@@ -36,16 +36,16 @@
 //! the service that owns the resource, and whose deletion takes the group and the volume
 //! away again.
 //!
-//! That stack's internet gateway, its gateway attachment, its route table, its default route
-//! and its subnet association are DECLARED-ONLY here: the Amazon EC2 operations that would
-//! create them (`CreateInternetGateway`, `AttachInternetGateway`, `CreateRouteTable`,
-//! `CreateRoute`, `AssociateRouteTable`) are still scaffold stubs, each with an open issue of
-//! its own, so the stack records those resources as the template declared them and asks
-//! nothing of any service for them. Reaching `CREATE_COMPLETE` with them in the template is
-//! therefore not a claim that they exist in Amazon EC2 — nothing below reads one back — and
-//! the day their creates are implemented this suite is where the reads for them belong. Every
-//! other resource of the estate IS created in its owning service, and the last test reads
-//! each one back there.
+//! That stack's internet gateway, its gateway attachment and its default route are
+//! DECLARED-ONLY here: the Amazon EC2 operations that would create them
+//! (`CreateInternetGateway`, `AttachInternetGateway`, `CreateRoute`) are not reached for a
+//! declared resource of those types yet, each with an open issue of its own, so the stack
+//! records those resources as the template declared them and asks nothing of any service for
+//! them. Reaching `CREATE_COMPLETE` with them in the template is therefore not a claim that
+//! they exist in Amazon EC2 — nothing below reads one back — and the day they are provisioned
+//! this suite is where the reads for them belong. Its route table and its subnet association
+//! ARE created in Amazon EC2, as is every other resource of the estate, and the last test
+//! reads each one back there.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

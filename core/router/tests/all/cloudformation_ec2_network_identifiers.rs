@@ -191,9 +191,17 @@ struct IdentityRow {
 /// The CIDR block the rows that declare one use, and the subnet block inside it.
 const VPC_CIDR: &str = "10.77.0.0/16";
 
-/// No further resources: what every row but the subnet's is deployed beside.
+/// No further resources: what every row whose resource is created on its own is deployed
+/// beside.
 fn nothing_else() -> Value {
     json!({})
+}
+
+/// The VPC a row whose resource is created INSIDE one declares it beside: the types this
+/// emulator creates in Amazon EC2 are created in the VPC their declaration names, so that VPC
+/// has to be a resource of the same stack rather than an id nothing holds.
+fn supporting_vpc() -> Value {
+    json!({ "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": VPC_CIDR } } })
 }
 
 const IDENTITY_ROWS: &[IdentityRow] = &[
@@ -216,9 +224,7 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
                 "CidrBlock": format!("10.77.{}.0/24", index + 1),
             })
         },
-        supporting: || {
-            json!({ "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": VPC_CIDR } } })
-        },
+        supporting: supporting_vpc,
     },
     IdentityRow {
         resource_type: "AWS::EC2::SecurityGroup",
@@ -238,8 +244,8 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         resource_type: "AWS::EC2::RouteTable",
         prefix: "rtb",
         identifier_attribute: "RouteTableId",
-        properties: |_| json!({ "VpcId": "vpc-0a1b2c3d4e5f60718" }),
-        supporting: nothing_else,
+        properties: |_| json!({ "VpcId": { "Ref": "Vpc" } }),
+        supporting: supporting_vpc,
     },
     IdentityRow {
         resource_type: "AWS::EC2::NatGateway",
@@ -283,10 +289,10 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         prefix: "vpce",
         identifier_attribute: "Id",
         properties: |_| json!({
-            "VpcId": "vpc-0a1b2c3d4e5f60718",
+            "VpcId": { "Ref": "Vpc" },
             "ServiceName": "com.amazonaws.us-east-1.s3",
         }),
-        supporting: nothing_else,
+        supporting: supporting_vpc,
     },
 ];
 

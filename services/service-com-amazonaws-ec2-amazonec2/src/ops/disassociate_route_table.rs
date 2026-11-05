@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: drops the explicit association between a stored route table and a subnet,
+//! so that subnet uses its VPC's main route table again (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::disassociate_route_table`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateRouteTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // association is named by id, which is unique across Regions in this store. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owed is applied before the store is read, so the
+        // association this answers about is not a stale one.
+        store.materialize_due_transitions();
+
+        // "The association ID representing the current association between the route table
+        // and subnet or gateway" (`AssociationId`): an id no association carries is a
+        // refusal, not a no-op — a caller that disassociates twice has to be able to tell
+        // the one it performed from the one it did not. The implicit association of a main
+        // route table is not an association a caller made, so it is not one this takes away.
+        if store
+            .explicit_route_table_association(&input.association_id)
+            .is_none()
+        {
+            return Err(state::invalid_association_id_not_found(&input.association_id));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if !store.disassociate_route_table(&input.association_id) {
+            return Err(state::internal_error(
+                "the route table association checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DisassociateRouteTableOutput)
     }
 }

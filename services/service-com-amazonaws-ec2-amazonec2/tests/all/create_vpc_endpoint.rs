@@ -854,14 +854,14 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
             "NotImplemented",
         ),
         (
-            "route table associations",
+            "a route table the account does not hold",
             vec![
                 param("VpcId", &built.vpc_id),
                 param("ServiceName", SERVICE),
                 param("RouteTableId.1", "rtb-0000000000000beef"),
             ],
-            501,
-            "NotImplemented",
+            400,
+            ec2::state::INVALID_ROUTE_TABLE_ID_NOT_FOUND,
         ),
         (
             "an endpoint reached over IPv6",

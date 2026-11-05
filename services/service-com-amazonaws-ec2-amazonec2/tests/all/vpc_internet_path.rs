@@ -947,3 +947,385 @@ async fn associate_route_table_refuses_a_subnet_of_another_vpc_or_an_id_naming_n
         "expected no association after every refusal, got {read}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DisassociateRouteTable / DeleteRouteTable
+// ---------------------------------------------------------------------------
+
+/// The rule: the path comes apart the way it was built — "after you perform this action, the
+/// subnet no longer uses the routes in the route table" (`DisassociateRouteTable`), and "you
+/// must disassociate the route table from any subnets before you can delete it. You can't
+/// delete the main route table" (`DeleteRouteTable`) — so a table a subnet still uses is
+/// refused, a table nothing uses is removed, and its own describe then reports it for nobody.
+///
+/// The rows differ in how many subnets the table covers, which is what the set a delete has
+/// to find empty generalises over.
+#[tokio::test]
+async fn a_route_table_is_deleted_once_every_subnet_is_disassociated_from_it() {
+    let router = emulator();
+    // (case, the VPC's block, the subnet blocks associated with the one table)
+    let cases: [(&str, &str, &[&str]); 3] = [
+        ("no subnet", "10.70.0.0/16", &[]),
+        ("one subnet", "10.71.0.0/16", &["10.71.1.0/24"]),
+        (
+            "two subnets",
+            "10.72.0.0/16",
+            &["10.72.1.0/24", "10.72.2.0/24"],
+        ),
+    ];
+
+    for (case, vpc_cidr, subnet_cidrs) in cases {
+        let vpc_id = create_vpc(case, &router, vpc_cidr).await;
+        let route_table_id = create_route_table(case, &router, &vpc_id).await;
+        let mut associations = Vec::new();
+        for subnet_cidr in subnet_cidrs {
+            let subnet_id = create_subnet(case, &router, &vpc_id, subnet_cidr).await;
+            let body = ok(
+                case,
+                &router,
+                "AssociateRouteTable",
+                &[
+                    param("RouteTableId", &route_table_id),
+                    param("SubnetId", &subnet_id),
+                ],
+            )
+            .await;
+            associations.push(member(case, &body, "associationId"));
+        }
+
+        // A table a subnet still uses has a dependency, so the delete is refused rather than
+        // carried out under that subnet.
+        if !associations.is_empty() {
+            let (status, body) = call(
+                &router,
+                "DeleteRouteTable",
+                &[param("RouteTableId", &route_table_id)],
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the delete of an associated table refused, got {status} \
+                 with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "DependencyViolation",
+                "case {case:?}: expected DependencyViolation, got {body}"
+            );
+        }
+
+        for association_id in &associations {
+            ok(
+                case,
+                &router,
+                "DisassociateRouteTable",
+                &[param("AssociationId", association_id)],
+            )
+            .await;
+            // A disassociate is not idempotent: the association it took away names nothing
+            // now, which is what a caller that disassociates twice has to be able to tell.
+            let (status, body) = call(
+                &router,
+                "DisassociateRouteTable",
+                &[param("AssociationId", association_id)],
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected a second disassociate refused, got {status} with body \
+                 {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidAssociationID.NotFound",
+                "case {case:?}: expected InvalidAssociationID.NotFound, got {body}"
+            );
+        }
+
+        // The table reports no association at all now, and the subnets go on using the VPC's
+        // main table, which is still there.
+        let read = describe_route_table(case, &router, &route_table_id).await;
+        assert!(
+            elements(&read, "routeTableAssociationId").is_empty(),
+            "case {case:?}: expected no association left on the table, got {read}"
+        );
+
+        ok(
+            case,
+            &router,
+            "DeleteRouteTable",
+            &[param("RouteTableId", &route_table_id)],
+        )
+        .await;
+        let (status, body) = call(
+            &router,
+            "DescribeRouteTables",
+            &[param("RouteTableId.1", &route_table_id)],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the deleted table to be reported for nobody, got {status} \
+             with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRouteTableID.NotFound",
+            "case {case:?}: expected InvalidRouteTableID.NotFound, got {body}"
+        );
+
+        // "You can't delete the main route table": the table the VPC came with is refused,
+        // and it is still the VPC's after the refusal.
+        let main_table_id = {
+            let read = ok(
+                case,
+                &router,
+                "DescribeRouteTables",
+                &filters(&[("vpc-id", &[vpc_id.as_str()])]),
+            )
+            .await;
+            elements(&read, "routeTableId")
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        };
+        let (status, body) = call(
+            &router,
+            "DeleteRouteTable",
+            &[param("RouteTableId", &main_table_id)],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the delete of the main table refused, got {status} with \
+             body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "DependencyViolation",
+            "case {case:?}: expected DependencyViolation for the main table, got {body}"
+        );
+        let read = describe_route_table(case, &router, &main_table_id).await;
+        assert!(
+            elements(&read, "routeTableId").contains(&main_table_id),
+            "case {case:?}: expected the main table still held after the refusal, got {read}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreateVpcEndpoint with route tables / DeleteVpcEndpoints
+// ---------------------------------------------------------------------------
+
+/// The rule: "we automatically add a route to the route table with a destination of the prefix
+/// list for the service and a target of the gateway endpoint" (Amazon Web Services PrivateLink
+/// User Guide, "Gateway endpoints") — so a gateway endpoint created for route tables of its own
+/// VPC puts that one route in EVERY table it names and in no table it does not, and "when you
+/// delete a gateway endpoint, we delete the endpoint routes in the route tables for the
+/// endpoint" (`DeleteVpcEndpoints`) takes them away again.
+///
+/// The rows differ in how many of the VPC's tables the endpoint names, which is what the
+/// association set generalises over.
+#[tokio::test]
+async fn a_gateway_endpoint_routes_every_table_it_names_through_itself() {
+    let router = emulator();
+    /// The endpoint service of this Region a gateway endpoint is created for, spelled the way
+    /// a gateway endpoint's service name is (`com.amazonaws.<region>.<service>`), and the one
+    /// `DescribePrefixLists` publishes a prefix list for.
+    const SERVICE_NAME: &str = "com.amazonaws.us-east-1.s3";
+
+    // (case, the VPC's block, how many of its three tables the endpoint names)
+    let cases: [(&str, &str, usize); 3] = [
+        ("one table", "10.80.0.0/16", 1),
+        ("two tables", "10.81.0.0/16", 2),
+        ("three tables", "10.82.0.0/16", 3),
+    ];
+
+    for (case, vpc_cidr, named) in cases {
+        let vpc_id = create_vpc(case, &router, vpc_cidr).await;
+        let tables = {
+            let mut tables = Vec::new();
+            for _ in 0..3 {
+                tables.push(create_route_table(case, &router, &vpc_id).await);
+            }
+            tables
+        };
+        let mut params = vec![
+            param("VpcId", &vpc_id),
+            param("ServiceName", SERVICE_NAME),
+            param("VpcEndpointType", "Gateway"),
+        ];
+        for (index, route_table_id) in tables.iter().take(named).enumerate() {
+            params.push(param(&format!("RouteTableId.{}", index + 1), route_table_id));
+        }
+        let body = ok(case, &router, "CreateVpcEndpoint", &params).await;
+        let endpoint_id = member(case, &body, "vpcEndpointId");
+        // "(Gateway endpoint) The IDs of the route tables associated with the endpoint" — the
+        // set the create answers with, read out of that member's own list.
+        let reported_tables = elements(
+            &element(&body, "routeTableIdSet")
+                .unwrap_or_else(|| panic!("case {case:?}: no routeTableIdSet in {body}")),
+            "item",
+        );
+        assert_eq!(
+            reported_tables,
+            tables[..named].to_vec(),
+            "case {case:?}: expected the endpoint to report the tables it was created for, got \
+             {body}"
+        );
+
+        for (index, route_table_id) in tables.iter().enumerate() {
+            let read = describe_route_table(case, &router, route_table_id).await;
+            let through_the_endpoint = elements(&read, "gatewayId")
+                .into_iter()
+                .filter(|target| target == &endpoint_id)
+                .count();
+            let expected = usize::from(index < named);
+            assert_eq!(
+                through_the_endpoint, expected,
+                "case {case:?}: expected {expected} route(s) through {endpoint_id} in table \
+                 {route_table_id}, got {read}"
+            );
+            // The destination is the SERVICE's prefix list, which that service publishes under
+            // the endpoint service's own name.
+            if expected == 1 {
+                let prefix_list_id = element(&read, "destinationPrefixListId")
+                    .unwrap_or_else(|| panic!("case {case:?}: no prefix list route in {read}"));
+                let published = ok(
+                    case,
+                    &router,
+                    "DescribePrefixLists",
+                    &[param("PrefixListId.1", &prefix_list_id)],
+                )
+                .await;
+                assert_eq!(
+                    element(&published, "prefixListName").as_deref(),
+                    Some(SERVICE_NAME),
+                    "case {case:?}: expected the route's prefix list to be {SERVICE_NAME}'s, got \
+                     {published}"
+                );
+            }
+            // The local route every table comes with is untouched by the endpoint.
+            assert!(
+                elements(&read, "gatewayId").contains(&"local".to_string()),
+                "case {case:?}: expected the table to keep its local route, got {read}"
+            );
+        }
+
+        // The endpoint's deletion takes its routes with it, and the endpoint is then reported
+        // for nobody.
+        let deleted = ok(
+            case,
+            &router,
+            "DeleteVpcEndpoints",
+            &[param("VpcEndpointId.1", &endpoint_id)],
+        )
+        .await;
+        assert!(
+            elements(&deleted, "code").is_empty(),
+            "case {case:?}: expected the delete to report nothing unsuccessful, got {deleted}"
+        );
+        for route_table_id in &tables {
+            let read = describe_route_table(case, &router, route_table_id).await;
+            assert!(
+                !elements(&read, "gatewayId").contains(&endpoint_id),
+                "case {case:?}: expected the endpoint's route gone from {route_table_id}, got \
+                 {read}"
+            );
+        }
+        let (status, body) = call(
+            &router,
+            "DescribeVpcEndpoints",
+            &[param("VpcEndpointId.1", &endpoint_id)],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the deleted endpoint reported for nobody, got {status} with \
+             body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVpcEndpointId.NotFound",
+            "case {case:?}: expected InvalidVpcEndpointId.NotFound, got {body}"
+        );
+        // A second delete of the same endpoint reports it as one it could not delete rather
+        // than refusing the call: "information about the VPC endpoints that were not
+        // successfully deleted".
+        let again = ok(
+            case,
+            &router,
+            "DeleteVpcEndpoints",
+            &[param("VpcEndpointId.1", &endpoint_id)],
+        )
+        .await;
+        assert_eq!(
+            elements(&again, "code"),
+            vec!["InvalidVpcEndpointId.NotFound".to_string()],
+            "case {case:?}: expected the second delete to report the endpoint unsuccessful, got \
+             {again}"
+        );
+    }
+}
+
+/// The rule's own-VPC half: a gateway endpoint is only reached through route tables of ITS
+/// VPC, so a table of another VPC — or an id naming no table at all — is refused, and the
+/// endpoint is not created.
+#[tokio::test]
+async fn a_gateway_endpoint_refuses_a_route_table_outside_its_own_vpc() {
+    let router = emulator();
+    let case = "the two VPCs";
+    let vpc_id = create_vpc(case, &router, "10.90.0.0/16").await;
+    let other_vpc_id = create_vpc(case, &router, "10.91.0.0/16").await;
+    let foreign_table_id = create_route_table(case, &router, &other_vpc_id).await;
+
+    // (case, the route table the endpoint names, the expected error code)
+    let cases = [
+        (
+            "a route table of another VPC",
+            foreign_table_id.as_str(),
+            "InvalidParameterValue",
+        ),
+        (
+            "a route table id naming nothing",
+            "rtb-00000000000000000",
+            "InvalidRouteTableID.NotFound",
+        ),
+    ];
+
+    for (case, route_table_id, expected_code) in cases {
+        let (status, body) = call(
+            &router,
+            "CreateVpcEndpoint",
+            &[
+                param("VpcId", &vpc_id),
+                param("ServiceName", "com.amazonaws.us-east-1.s3"),
+                param("VpcEndpointType", "Gateway"),
+                param("RouteTableId.1", route_table_id),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+    }
+
+    // Nothing above created an endpoint: the VPC holds none.
+    let read = ok(
+        case,
+        &router,
+        "DescribeVpcEndpoints",
+        &filters(&[("vpc-id", &[vpc_id.as_str()])]),
+    )
+    .await;
+    assert!(
+        element(&read, "vpcEndpointId").is_none(),
+        "expected no endpoint after every refusal, got {read}"
+    );
+}
