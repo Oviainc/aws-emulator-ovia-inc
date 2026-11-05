@@ -1203,7 +1203,8 @@ pub fn branch_name_not_supported_message(branch_name: &str) -> String {
 const BRANCH_NAME_CHARACTERS_MESSAGE: &str =
     "The name can only contain letters, numbers, and the symbols /_.-";
 
-/// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].///
+/// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].
+///
 /// The apps map is NOT partitioned by region: an app's ARN records the region of the
 /// request that created it, but any later call reaches every app in the store
 /// whatever region it is signed for. Partitioning the control plane by region is a

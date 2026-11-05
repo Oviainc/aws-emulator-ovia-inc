@@ -425,9 +425,21 @@ async fn create_branch_refuses_a_name_outside_the_accepted_character_set() {
     );
 }
 
+/// The sentence `StartDeployment` refuses a request that names neither member with, as
+/// AWS words it: entirely fixed text naming the request shape and the two members, with
+/// nothing from the request or the store in it.
+const EXPECTED_NO_SOURCE_MESSAGE: &str = "Must specify jobId or sourceUrl for StartDeploymentRequest.";
+
 /// Rule 4: `StartDeployment` states the two members a request has to pick between.
 #[tokio::test]
 async fn start_deployment_names_the_members_a_request_must_pick_between() {
+    // The crate's own constant is the one every caller of it states, so it has to BE
+    // AWS's sentence rather than merely be used consistently.
+    assert_eq!(
+        NO_SOURCE_MESSAGE, EXPECTED_NO_SOURCE_MESSAGE,
+        "the refusal this service states must be AWS's sentence"
+    );
+
     let emulator = Emulator::new();
     let app_id = emulator.app_id_of_new_app("start-without-a-source").await;
     let created = emulator
@@ -468,8 +480,8 @@ async fn start_deployment_names_the_members_a_request_must_pick_between() {
         );
         assert_eq!(
             refused.message().as_deref(),
-            Some(NO_SOURCE_MESSAGE),
-            "case {case:?}: expected {NO_SOURCE_MESSAGE:?}, got {:?}",
+            Some(EXPECTED_NO_SOURCE_MESSAGE),
+            "case {case:?}: expected {EXPECTED_NO_SOURCE_MESSAGE:?}, got {:?}",
             refused.message()
         );
     }

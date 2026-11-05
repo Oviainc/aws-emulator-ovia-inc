@@ -371,7 +371,8 @@ fn reserved_job_summary(
     }
 }
 
-/// Where ONE upload of a reserved deployment goes.///
+/// Where ONE upload of a reserved deployment goes.
+///
 /// A deployment's content is uploaded to a destination THIS EMULATOR SERVES — the
 /// endpoint the reserving caller reached, under the reservation's own path
 /// (`crate::state::deployment_upload_path`) — because a URL this operation hands back
