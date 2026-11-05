@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCollaborationTrainedModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCollaborationTrainedModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the persisted trained models of one collaboration in
+//! [`crate::state`], one `CollaborationTrainedModelSummary` per record, in the one
+//! stable order the store's ARN keys give. A collaboration holding none — every
+//! collaboration, until a model is trained in it — is reported as an empty list, not
+//! as a refusal: the operation models no not-found error for a collaboration.
+//! `nextToken` is the ARN the next page resumes at, so following it to the end
+//! enumerates every trained model of that collaboration exactly once.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCollaborationTrainedModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The only write is the status change the clock already owed a model it reports:
+//! a trained model is trained asynchronously, so a reader materialises the
+//! transition that fell due whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +152,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCollaborationTrainedModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCollaborationTrainedModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCollaborationTrainedModels"))
+        // This operation reports on the store; the region the request was signed for is
+        // the endpoint it reached, and a Clean Rooms ML endpoint is regional.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // The token is the ARN the next page starts at. `NextToken` is modelled only as
+        // a 1..10240 string, so a token this operation never issued is refused with the
+        // modelled `ValidationException` rather than silently serving page one.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_trained_model_arn(token) {
+                return Err(
+                    ListCollaborationTrainedModelsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by \
+                                 ListCollaborationTrainedModels"
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)` and the boundary validator
+        // refused anything outside it before this handler ran, so the only case left is
+        // an absent value: serve the largest page the model allows. The `clamp` states
+        // that invariant rather than correcting a caller — a value reaching here outside
+        // the range is a validator bug, which the debug assertion surfaces instead of
+        // silently repairing.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::TRAINED_MODEL_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::TRAINED_MODEL_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::TRAINED_MODEL_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let mut collaboration_trained_models = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for model in store.trained_models.values_mut() {
+            // Resume at the first ARN at or after the token, so a page is still served
+            // when the model the token named was deleted meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| model.arn.as_str() < token)
+            {
+                continue;
+            }
+            // A regional endpoint reports its own region's resources and no others, and
+            // this call reports one collaboration's models and no others.
+            if model.region != region
+                || model.collaboration_identifier != input.collaboration_identifier
+            {
+                continue;
+            }
+            if collaboration_trained_models.len() == page_size {
+                next_token = Some(model.arn.clone());
+                break;
+            }
+            // The status a reported model carries is the one the clock owes it now.
+            model.settle(now);
+            collaboration_trained_models.push(model.to_collaboration_summary());
+        }
+
+        Ok(ListCollaborationTrainedModelsOutput {
+            next_token,
+            collaboration_trained_models,
+        })
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/collaboration_ml_input_channels.rs"]
 mod collaboration_ml_input_channels;
+#[path = "all/collaboration_trained_models.rs"]
+mod collaboration_trained_models;
 #[path = "all/configured_model_algorithm.rs"]
 mod configured_model_algorithm;
 #[path = "all/ops_name_bindings.rs"]

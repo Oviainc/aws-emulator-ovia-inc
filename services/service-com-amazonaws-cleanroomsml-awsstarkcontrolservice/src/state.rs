@@ -16,14 +16,17 @@
 //!
 //! The ML input channel is the collaboration-scoped link of the same chain: a
 //! channel is created under a membership, and every member of the collaboration
-//! that membership belongs to can list the channels it holds.
+//! that membership belongs to can list the channels it holds. A trained model is
+//! scoped the same way: it is created under a membership and listed through the
+//! collaboration that membership belongs to.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CollaborationMLInputChannelSummary, ConflictException, ContainerConfig, Dataset,
-    InferenceContainerConfig, PayerConfiguration, ResourceNotFoundException, TrainingDatasetSummary,
+    CollaborationMLInputChannelSummary, CollaborationTrainedModelSummary, ConflictException,
+    ContainerConfig, Dataset, IncrementalTrainingDataChannelOutput, InferenceContainerConfig,
+    PayerConfiguration, ResourceNotFoundException, TrainingDatasetSummary,
 };
 
 /// The region a minted ARN names when the request carries no SigV4 credential
@@ -78,6 +81,12 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// `ListCollaborationMLInputChannelsRequest$maxResults` is modelled
 /// `@range(min: 1, max: 100)`.
 pub const ML_INPUT_CHANNEL_PAGE_LIMIT: i32 = 100;
+
+/// The largest page `ListCollaborationTrainedModels` serves, and the page size
+/// it uses when the request names no `maxResults`:
+/// `ListCollaborationTrainedModelsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const TRAINED_MODEL_PAGE_LIMIT: i32 = 100;
 
 /// A status change the clock owes a resource: the instant it falls due, and the
 /// status the resource carries from then on.
@@ -239,6 +248,79 @@ impl MlInputChannel {
     }
 }
 
+/// One Clean Rooms ML trained model version, as this emulator persists it.
+///
+/// A trained model is created under a membership, and every member of the
+/// collaboration that membership belongs to sees it through the
+/// collaboration-scoped reads — which is why the collaboration is held on the
+/// record beside the membership its ARN names.
+#[derive(Debug, Clone)]
+pub struct TrainedModel {
+    /// The `TrainedModelArn` this record is keyed by.
+    pub arn: String,
+    /// The region the create was signed for, which the ARN names. A regional
+    /// endpoint reports only its own region's resources, so this is the scope
+    /// every read of this record is checked against.
+    pub region: String,
+    /// The membership the model was created under, which its ARN names.
+    pub membership_identifier: String,
+    /// The collaboration that membership belongs to. It is the scope
+    /// `ListCollaborationTrainedModels` reports in: a model is visible to that
+    /// call only through the collaboration it was trained in.
+    pub collaboration_identifier: String,
+    pub name: String,
+    /// The version of the trained model this record is, when the model carries
+    /// versions: `CollaborationTrainedModelSummary$versionIdentifier` is
+    /// optional, so a model with no version reports none.
+    pub version_identifier: Option<String>,
+    /// The incremental training data channels this version was trained from, as
+    /// `IncrementalTrainingDataChannelsOutput` reports them.
+    pub incremental_training_data_channels: Option<Vec<IncrementalTrainingDataChannelOutput>>,
+    /// The configured model algorithm association the model was trained through.
+    pub configured_model_algorithm_association_arn: String,
+    pub description: Option<String>,
+    /// The account of the member that created the model.
+    pub creator_account_id: String,
+    /// The account that pays for the training, when the create named one.
+    pub ml_model_training_payer_account_id: Option<String>,
+    /// One of `TrainedModelStatus`'s values.
+    pub status: String,
+    /// The status change the clock owes this model, if any.
+    pub pending: Option<PendingTransition>,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+}
+
+impl TrainedModel {
+    /// Materialise the status change the clock owes this model, if `now` is past
+    /// its due instant.
+    pub fn settle(&mut self, now: SystemTime) {
+        settle_pending(&mut self.status, &mut self.pending, now);
+    }
+
+    /// The `CollaborationTrainedModelSummary` projection
+    /// `ListCollaborationTrainedModels` returns.
+    pub fn to_collaboration_summary(&self) -> CollaborationTrainedModelSummary {
+        CollaborationTrainedModelSummary {
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(self.update_time),
+            trained_model_arn: self.arn.clone(),
+            name: self.name.clone(),
+            version_identifier: self.version_identifier.clone(),
+            incremental_training_data_channels: self.incremental_training_data_channels.clone(),
+            description: self.description.clone(),
+            membership_identifier: self.membership_identifier.clone(),
+            collaboration_identifier: self.collaboration_identifier.clone(),
+            status: self.status.clone(),
+            configured_model_algorithm_association_arn: self
+                .configured_model_algorithm_association_arn
+                .clone(),
+            creator_account_id: self.creator_account_id.clone(),
+            ml_model_training_payer_account_id: self.ml_model_training_payer_account_id.clone(),
+        }
+    }
+}
+
 /// One Clean Rooms ML configured model algorithm, as this emulator persists it.
 ///
 /// The resource is container configuration plus the role that reads the
@@ -285,6 +367,10 @@ pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
     /// collaboration- and membership-scoped lists the one stable total order
     /// their pagination tokens index into.
     pub ml_input_channels: BTreeMap<String, MlInputChannel>,
+    /// Every trained model, keyed by its ARN, which gives the collaboration- and
+    /// membership-scoped lists the one stable total order their pagination
+    /// tokens index into.
+    pub trained_models: BTreeMap<String, TrainedModel>,
     /// The counter the resource segment of every minted ARN comes from.
     resource_id_seq: u64,
 }
@@ -395,6 +481,20 @@ pub fn ml_input_channel_arn(membership_identifier: &str, id: &str, region: &str)
     )
 }
 
+/// The ARN of the trained model with resource id `id`, created under the
+/// membership `membership_identifier` names, in `region`.
+///
+/// `TrainedModelArn` nests the model under its membership
+/// (`membership/{uuid}/trained-model/{id}`), so the membership a model belongs
+/// to is readable from its ARN.
+pub fn trained_model_arn(membership_identifier: &str, id: &str, region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("membership/{membership_identifier}/trained-model/{id}"),
+    )
+}
+
 /// The resource portion of `value` when it is shaped like a Clean Rooms ML ARN
 /// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:` and a non-empty
 /// remainder), and `None` otherwise.
@@ -469,6 +569,26 @@ pub fn is_training_dataset_arn(value: &str) -> bool {
     })
 }
 
+/// True when `value` is shaped like one of this service's membership-nested ARNs
+/// — `arn:…:cleanrooms-ml:…:membership/{uuid}/{kind}/[-a-zA-Z0-9_/.]+`, where
+/// `kind` is the resource segment that follows the membership
+/// (`ml-input-channel`, `trained-model`).
+///
+/// Every membership-nested shape in this service differs only in that segment,
+/// so each predicate below names its own and shares this check.
+fn is_membership_nested_arn(value: &str, kind: &str) -> bool {
+    let Some(resource) = cleanrooms_ml_arn_resource(value) else {
+        return false;
+    };
+    let Some(nested) = resource.strip_prefix("membership/") else {
+        return false;
+    };
+    let Some((membership_identifier, id)) = nested.split_once(&format!("/{kind}/")) else {
+        return false;
+    };
+    is_uuid(membership_identifier) && is_arn_resource_id(id)
+}
+
 /// True when `value` is shaped like an `MLInputChannelArn`
 /// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:membership/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ml-input-channel/[-a-zA-Z0-9_/.]+$`).
 ///
@@ -476,16 +596,15 @@ pub fn is_training_dataset_arn(value: &str) -> bool {
 /// constrain to that pattern — the `nextToken` of a list that pages over ML
 /// input channels, which carries the ARN the next page resumes at.
 pub fn is_ml_input_channel_arn(value: &str) -> bool {
-    let Some(resource) = cleanrooms_ml_arn_resource(value) else {
-        return false;
-    };
-    let Some(nested) = resource.strip_prefix("membership/") else {
-        return false;
-    };
-    let Some((membership_identifier, id)) = nested.split_once("/ml-input-channel/") else {
-        return false;
-    };
-    is_uuid(membership_identifier) && is_arn_resource_id(id)
+    is_membership_nested_arn(value, "ml-input-channel")
+}
+
+/// True when `value` is shaped like a `TrainedModelArn`
+/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:membership/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/trained-model/[-a-zA-Z0-9_/.]+$`),
+/// for the same reason: it is the `nextToken` of a list that pages over trained
+/// models, which carries the ARN the next page resumes at.
+pub fn is_trained_model_arn(value: &str) -> bool {
+    is_membership_nested_arn(value, "trained-model")
 }
 
 /// The region this request was signed for — what a minted ARN names.
