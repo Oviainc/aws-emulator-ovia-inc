@@ -75,6 +75,10 @@ struct ArnCase {
     name_segment: String,
     /// The extension name the activation is held under, where the ARN names one.
     activates: Option<String>,
+    /// WHICH of the registry's two sentences refuses an ARN that names no activatable
+    /// extension: the name is not one the registry resolves, or the ARN pins a public version
+    /// number past a name that is. Ignored on a row the ARN activates.
+    refused_with: &'static str,
 }
 
 fn arn_cases() -> Vec<ArnCase> {
@@ -85,6 +89,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "Example-Store-Bucket".to_string(),
             activates: Some("Example::Store::Bucket".to_string()),
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a module, whose name carries the MODULE suffix the pattern admits",
@@ -92,6 +97,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "Example-Network-Subnets-MODULE".to_string(),
             activates: Some("Example::Network::Subnets::MODULE".to_string()),
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a Hook",
@@ -99,6 +105,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "Example-Guard-Hook".to_string(),
             activates: Some("Example::Guard::Hook".to_string()),
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name segment at the modelled minimum segment length",
@@ -106,6 +113,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: name_segment(3, 2),
             activates: Some(name_segment(3, 2).replace('-', "::")),
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name segment at the modelled maximum segment length",
@@ -113,14 +121,24 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: name_segment(3, 64),
             activates: Some(name_segment(3, 64).replace('-', "::")),
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
+            // The ARN's segments are read by what they ARE rather than by their position: a
+            // publisher id is "^[0-9a-zA-Z]{12,40}$" and an extension name is three
+            // alphanumeric `-`-joined segments, so an ARN whose segment after the kind is a
+            // NAME names that extension — with whatever follows it pinned past the name,
+            // which for a public extension is a version number the registry refuses an
+            // activation of. That is the reading that lets an extension Amazon Web Services
+            // published, whose ARN carries no publisher segment at all, be activated by the
+            // ARN this registry publishes it under.
             case: "a name segment that is a version number, under a publisher segment the \
                    modelled pattern does not admit",
             kind: registry::registry_type::RESOURCE,
             publisher: "SomeVendor-Thing-Thing".to_string(),
             name_segment: "00000001".to_string(),
             activates: None,
+            refused_with: registry::PUBLIC_VERSION_NUMBER_IN_ARN,
         },
         ArnCase {
             case: "a name segment that is a version number, under a well-formed publisher",
@@ -128,6 +146,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "00000001".to_string(),
             activates: None,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name carrying only two segments",
@@ -135,6 +154,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "Example-Store".to_string(),
             activates: None,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name carrying four segments that are not the MODULE suffix",
@@ -142,6 +162,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "Example-Store-Bucket-Extra".to_string(),
             activates: None,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name segment one character below the modelled minimum",
@@ -149,6 +170,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: name_segment(3, 1),
             activates: None,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name segment one character past the modelled maximum",
@@ -156,6 +178,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: name_segment(3, 65),
             activates: None,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name segment carrying a character the modelled pattern does not admit",
@@ -163,6 +186,7 @@ fn arn_cases() -> Vec<ArnCase> {
             publisher: PUBLISHER_ID.to_string(),
             name_segment: "Example-Store-Buck_t".to_string(),
             activates: None,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
     ]
 }
@@ -231,7 +255,7 @@ async fn an_arn_naming_no_extension_type_name_is_the_registrys_own_refusal() {
                     ),
                     (
                         "CFNRegistryException".to_string(),
-                        registry::INVALID_TYPE_NAME.to_string()
+                        row.refused_with.to_string()
                     ),
                     "case {:?}: expected the registry's own modelled refusal, got {body}",
                     row.case

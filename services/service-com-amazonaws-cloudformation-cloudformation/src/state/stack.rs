@@ -495,7 +495,7 @@ impl StoredStack {
                     existing.materialised && provisioning::is_same_resource(existing, resource)
                 })
                 .or_else(|| {
-                    template::identity_is_service_assigned(&resource.resource_type)
+                    identity_is_assigned_elsewhere(&resource.resource_type)
                         .then(|| {
                             already_created.iter().find(|existing| {
                                 existing.materialised
@@ -516,7 +516,7 @@ impl StoredStack {
                 // reported about it, and an identity that service MINTED (which no
                 // deployment recomputes) carry forward here.
                 resource.materialised = true;
-                if template::identity_is_service_assigned(&resource.resource_type) {
+                if identity_is_assigned_elsewhere(&resource.resource_type) {
                     // The identifier in force is the one that service minted, so the
                     // record keeps it: an output naming the resource reports the id a
                     // client can call that service with, and `reconcile` sees the resource
@@ -1142,6 +1142,44 @@ impl StoredStack {
         });
     }
 
+    /// Record that the removal of ONE physical resource this stack no longer manages was
+    /// REFUSED, with the reason that service — or that resource's own provider — gave.
+    ///
+    /// `DELETE_FAILED` is "the status of a resource the service that owns it refused to
+    /// delete", and the resource is still there: this is the event that names which physical
+    /// resource was left behind and why, for a removal the operation in flight owed but is
+    /// not itself failed by — the cleanup of a resource an update REPLACED, whose own change
+    /// has already been applied ("the stack update was successful, and CloudFormation is
+    /// deleting the old resources"). A removal the OPERATION is failed by goes through
+    /// [`Self::fail_stabilisation`] instead, which installs the operation's failed status too.
+    pub fn record_failed_removal(
+        &mut self,
+        now: SystemTime,
+        logical_resource_id: &str,
+        resource_type: &str,
+        physical_resource_id: &str,
+        reason: &str,
+    ) {
+        let (operation_id, client_request_token) = match self.pending.as_ref() {
+            Some(pending) => (
+                pending.operation_id.clone(),
+                pending.client_request_token.clone(),
+            ),
+            None => (None, self.client_request_token.clone()),
+        };
+        self.record_resource_event(
+            now,
+            logical_resource_id,
+            Some(physical_resource_id.to_string()),
+            resource_type,
+            resource_status::DELETE_FAILED,
+            Some(reason.to_string()),
+            None,
+            operation_id,
+            client_request_token,
+        );
+    }
+
     /// The claim an operation of this stack already made on `token`, or `None` for a token
     /// new to it.
     ///
@@ -1663,6 +1701,7 @@ impl StoredStack {
                     stabilising.resource_type.clone(),
                     stabilising.physical_resource_id.clone(),
                     stabilising.reported_state.clone(),
+                    stabilising.provider_request.clone(),
                     opened_at,
                 ));
         }
@@ -2065,9 +2104,12 @@ impl StoredStack {
             installed_resources(&self.resources, started, opened_at, &self.resource_finished_instants());
         for deployed in &mut reported {
             // A wait condition is in the status of the OPERATION that is waiting at it — it
-            // is a resource that operation is creating or updating — while a resource held
-            // for its owning service to report it ready is one the operation CREATED,
-            // whichever operation that is, so it reports the create it has not finished.
+            // is a resource that operation is creating or updating — and so is a resource
+            // held for the answer that finishes the work on it: a resource the operation is
+            // bringing INTO the stack is being created, and one the stack already holds is
+            // being updated (which is what a CUSTOM RESOURCE held for its provider's answer
+            // to an `Update` is), by the same rule [`Self::in_progress_status_of`] applies to
+            // every other resource.
             let waiting_at = unsatisfied
                 .iter()
                 .find(|barrier| barrier.logical_id() == deployed.resource.logical_id)
@@ -2083,7 +2125,12 @@ impl StoredStack {
                         !barrier.released()
                             && barrier.logical_id == deployed.resource.logical_id
                     })
-                    .map(|barrier| (barrier.opened_at, resource_status::CREATE_IN_PROGRESS))
+                    .map(|barrier| {
+                        (
+                            barrier.opened_at,
+                            self.in_progress_status_of(&deployed.resource.logical_id),
+                        )
+                    })
             });
             if let Some((gated_at, in_progress)) = gated {
                 deployed.status = in_progress.to_string();
@@ -2322,6 +2369,73 @@ impl StoredStack {
         if changed {
             self.reevaluate_outputs();
         }
+    }
+
+    /// Record the identity the PROVIDER of a custom resource answered with as the one the
+    /// resource is known by.
+    ///
+    /// A custom resource's physical id is the provider's to decide — "a required custom
+    /// resource provider-defined physical ID that is unique for that provider" — so the
+    /// identifier the naming rules computed for the record is a stand-in until the provider
+    /// answers, and what `Ref` resolves to from then on is this one. Written onto the records
+    /// of the operation IN FLIGHT where there is one, since those are what [`Self::settle`]
+    /// installs; an id already carrying this value changes nothing.
+    pub fn adopt_provider_identity(&mut self, logical_id: &str, physical_resource_id: &str) {
+        if physical_resource_id.is_empty() {
+            return;
+        }
+        let held = match &mut self.pending_deployment {
+            Some(deployment) => deployment
+                .resources
+                .iter_mut()
+                .find(|resource| resource.logical_id == logical_id),
+            None => self
+                .resources
+                .iter_mut()
+                .map(|deployed| &mut deployed.resource)
+                .find(|resource| resource.logical_id == logical_id),
+        };
+        let Some(held) = held else {
+            return;
+        };
+        if held.physical_resource_id == physical_resource_id {
+            return;
+        }
+        held.physical_resource_id = physical_resource_id.to_string();
+        // An output whose value is a `Ref` to this resource resolved to the stand-in, so what
+        // the stack publishes is re-evaluated against the identity it really has.
+        self.reevaluate_outputs();
+    }
+
+    /// Report that the update in flight has applied every change and is now removing the
+    /// resources it REPLACED.
+    ///
+    /// "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS — the stack update was successful, and
+    /// CloudFormation is deleting the old resources": the status a client polling the update
+    /// reads while that cleanup runs, which is what says the change itself landed. The
+    /// operation's own terminal status is untouched — it is still the one the update settles
+    /// into once the cleanup is through.
+    pub fn report_update_cleanup(&mut self, now: SystemTime) {
+        if self.status == status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS {
+            return;
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if pending.status != status::UPDATE_COMPLETE {
+            return;
+        }
+        let operation_id = pending.operation_id.clone();
+        let client_request_token = pending.client_request_token.clone();
+        self.status = status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS.to_string();
+        self.status_reason = None;
+        self.record_event(
+            now,
+            status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS,
+            None,
+            operation_id,
+            client_request_token,
+        );
     }
 
     /// Open a deletion CloudFormation CANCELS: the attempt runs and then puts the stack
@@ -2772,15 +2886,41 @@ fn declares_the_same_create_only(existing: &StoredResource, resource: &StoredRes
         .all(|property| existing.properties.get(property) == resource.properties.get(property))
 }
 
+/// Whether the identifier a resource of `resource_type` is known by is one that this
+/// deployment cannot recompute, so a re-deploy carries the one in force FORWARD rather than
+/// treating the resource as a different one.
+///
+/// Two cases, for the one reason: the OWNING SERVICE assigned the identifier
+/// ([`template::identity_is_service_assigned`]), or — for a CUSTOM RESOURCE — the resource's
+/// own PROVIDER did. "Ref returns the physical ID of the resource", and a custom resource's
+/// is "a required custom resource provider-defined physical ID that is unique for that
+/// provider" — the value the naming rules compute is only the stand-in a declaration is
+/// resolved against until the provider answers. Without this a re-declaration of a custom
+/// resource would be read as a different resource and created all over again, instead of
+/// being updated through its provider.
+fn identity_is_assigned_elsewhere(resource_type: &str) -> bool {
+    template::identity_is_service_assigned(resource_type)
+        || resource_types::is_custom_resource(resource_type)
+}
+
 /// The status an operation that cannot be carried out leaves the stack in, by the
 /// `*_IN_PROGRESS` status it is in.
 ///
-/// A wait condition is waited at by a create or an update only
-/// ([`StoredStack::opening_barriers`]), which are the two this answers for; anything else
-/// is a create, the status a stack that never completed one reports.
+/// One rule, read off the operation in flight: a failure leaves the stack in the `*_FAILED`
+/// status of the operation that failed — which is what a client polling that operation stops
+/// on, and, for an update's rollback, the one status `ContinueUpdateRollback` resumes from
+/// ("a stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't roll back
+/// all changes after a failed stack update"). An update that has applied every change and is
+/// removing the resources it replaced is still that UPDATE, so its own failed status is the
+/// update's. Anything else is a create, the status a stack that never completed one reports.
 pub(crate) fn failed_status_of(in_progress: &str) -> &'static str {
     match in_progress {
-        status::UPDATE_IN_PROGRESS => status::UPDATE_FAILED,
+        status::UPDATE_IN_PROGRESS | status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS => {
+            status::UPDATE_FAILED
+        }
+        status::DELETE_IN_PROGRESS => status::DELETE_FAILED,
+        status::ROLLBACK_IN_PROGRESS => status::ROLLBACK_FAILED,
+        status::UPDATE_ROLLBACK_IN_PROGRESS => status::UPDATE_ROLLBACK_FAILED,
         _ => status::CREATE_FAILED,
     }
 }

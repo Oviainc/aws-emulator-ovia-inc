@@ -92,7 +92,7 @@ const QUEUE_READS: [&str; 3] = ["ReceiveMessage", "DeleteMessage", "GetQueueAttr
 
 /// Percent-encode one component of an `application/x-www-form-urlencoded` body, which is
 /// how IAM's `awsQuery` parameters travel.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

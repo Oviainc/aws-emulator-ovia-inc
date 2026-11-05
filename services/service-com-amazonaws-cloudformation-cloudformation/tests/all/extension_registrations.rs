@@ -658,6 +658,225 @@ async fn each_registration_of_one_extension_adds_a_version_and_leaves_the_defaul
     );
 }
 
+/// One `ListTypeVersions` read: the HTTP status, the body, and the `(VersionId,
+/// IsDefaultVersion, Arn)` triple each summary reports, in wire order.
+async fn list_type_versions(
+    router: &MultiServiceRouter,
+    members: &[(String, String)],
+) -> (u16, String, Vec<(String, String, String)>) {
+    let (status, body) = call(router, "ListTypeVersions", members).await;
+    // The summaries are read INSIDE their own block, so an element of another list the
+    // envelope carries cannot be swept up with them.
+    let summaries = match xml_blocks(&body, "TypeVersionSummaries").into_iter().next() {
+        Some(block) => xml_blocks(&block, "member")
+            .into_iter()
+            .map(|summary| {
+                (
+                    xml_text(&summary, "VersionId").unwrap_or_default(),
+                    xml_text(&summary, "IsDefaultVersion").unwrap_or_default(),
+                    xml_text(&summary, "Arn").unwrap_or_default(),
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    (status, body, summaries)
+}
+
+/// `ListTypeVersions` reports every version the identified extension holds — each with its
+/// own id and ARN, and the default one marked — narrowed by the deprecation status the
+/// request asks for and paged as the model's `@paginated` trait states.
+///
+/// The rows differ along what the rule generalises over: how the request identifies the
+/// extension (its kind and name, its own ARN, one of its VERSION ARNs), how many versions
+/// the extension holds, which of them is the default, the deprecation status asked for, and
+/// the page size.
+#[tokio::test]
+async fn every_version_an_extension_holds_is_listed() {
+    let (router, _engine) = router_with_engine();
+    create_package_bucket(&router).await;
+    let type_name = "My::Listed::Resource";
+    let extension_arn = type_arn(REGION, registry_type::RESOURCE, type_name);
+
+    // Three registrations of ONE extension: the versions the listing must report, in the
+    // order they were added.
+    let versions: &[&str] = &["00000001", "00000002", "00000003"];
+    for version in versions {
+        let key = format!("listed-{version}.zip");
+        stage(
+            &router,
+            &key,
+            &package_of(Some(&schema_of(type_name, EVERY_HANDLER))),
+        )
+        .await;
+        register_ok(
+            "the versions of one extension",
+            &router,
+            Some(registry_type::RESOURCE),
+            type_name,
+            &Style::S3Uri.url(&key),
+            &[],
+        )
+        .await;
+        wait_for_the_conclusion().await;
+    }
+
+    // Each of the three ways a request may identify that extension names the same versions.
+    let identifiers: &[(&str, Vec<(String, String)>)] = &[
+        (
+            "by kind and name",
+            vec![
+                member("Type", registry_type::RESOURCE),
+                member("TypeName", type_name),
+            ],
+        ),
+        (
+            "by the extension's own ARN",
+            vec![member("Arn", &extension_arn)],
+        ),
+        (
+            // "The version ID is the value at the end of the ARN assigned to the extension
+            // version": such an ARN names the extension it is a version OF, and the listing
+            // is of that extension's versions.
+            "by one of its version ARNs",
+            vec![member("Arn", &type_version_arn(&extension_arn, "00000002"))],
+        ),
+    ];
+    let expected: Vec<(String, String, String)> = versions
+        .iter()
+        .map(|version| {
+            (
+                (*version).to_string(),
+                // "The first version registered becomes the default version", and a later
+                // registration leaves it there.
+                (*version == FIRST_VERSION).to_string(),
+                type_version_arn(&extension_arn, version),
+            )
+        })
+        .collect();
+    for (case, members) in identifiers {
+        let (status, body, listed) = list_type_versions(&router, members).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the version listing to succeed, got {status} {body}"
+        );
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected every version the extension holds, got {listed:?} in \
+             {body}"
+        );
+    }
+
+    // `DeprecatedStatus` is "the deprecation status of the extension versions that you want
+    // to get summary information about … The default is LIVE": the registered versions are
+    // LIVE, and asking for the DEPRECATED ones reports none of them.
+    let by_status: &[(&str, &str, usize)] = &[
+        ("the status the default admits", deprecated_status::LIVE, 3),
+        (
+            "the status no registered version is in",
+            deprecated_status::DEPRECATED,
+            0,
+        ),
+    ];
+    for (case, status_filter, expected_count) in by_status {
+        let (status, body, listed) = list_type_versions(
+            &router,
+            &[
+                member("Type", registry_type::RESOURCE),
+                member("TypeName", type_name),
+                member("DeprecatedStatus", status_filter),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the version listing to succeed, got {status} {body}"
+        );
+        assert_eq!(
+            listed.len(),
+            *expected_count,
+            "case {case:?}: expected {expected_count} summaries, got {listed:?} in {body}"
+        );
+    }
+
+    // `@paginated(pageSize: MaxResults)`: a page carries at most that many summaries and the
+    // token that resumes just past them, and the pages of one collection partition it.
+    for page_size in [1usize, 2, 3] {
+        let case = format!("pages of {page_size}");
+        let mut seen: Vec<(String, String, String)> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut members = vec![
+                member("Type", registry_type::RESOURCE),
+                member("TypeName", type_name),
+                member("MaxResults", &page_size.to_string()),
+            ];
+            if let Some(token) = token.as_deref() {
+                members.push(member("NextToken", token));
+            }
+            let (status, body, listed) = list_type_versions(&router, &members).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the page to be served, got {status} {body}"
+            );
+            assert!(
+                listed.len() <= page_size,
+                "case {case:?}: a page must carry at most {page_size} summaries, got \
+                 {listed:?}"
+            );
+            seen.extend(listed);
+            token = xml_text(&body, "NextToken");
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: the pages of one collection must partition it, got {seen:?}"
+        );
+    }
+
+    // And the refusals: an extension the registry does not hold, and a request that
+    // identifies no single extension.
+    let refusals: &[(&str, Vec<(String, String)>)] = &[
+        (
+            "an extension nothing registered",
+            vec![
+                member("Type", registry_type::RESOURCE),
+                member("TypeName", "My::Absent::Resource"),
+            ],
+        ),
+        (
+            "half of the name form",
+            vec![member("TypeName", type_name)],
+        ),
+        (
+            "both identifying forms at once",
+            vec![
+                member("Arn", &extension_arn),
+                member("Type", registry_type::RESOURCE),
+                member("TypeName", type_name),
+            ],
+        ),
+    ];
+    for (case, members) in refusals {
+        let (status, body, listed) = list_type_versions(&router, members).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the listing to be refused, got {status} {body}"
+        );
+        assert!(
+            listed.is_empty(),
+            "case {case:?}: a refusal reports no summaries, got {listed:?}"
+        );
+        assert_eq!(
+            refusal(&body).0,
+            REGISTRY_REFUSAL_CODE,
+            "case {case:?}: expected the registry's own refusal code, got {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_resubmission_under_one_client_request_token_registers_one_version() {
     let (router, _engine) = router_with_engine();

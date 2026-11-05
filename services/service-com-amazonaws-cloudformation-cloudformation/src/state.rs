@@ -348,6 +348,10 @@ pub mod wait_conditions;
 /// reports otherwise.
 pub mod stabilising;
 
+/// Receiving a custom resource provider's answer: the one write the `ResponseURL` this
+/// service publishes for a provider request performs on this store.
+pub mod provider_responses;
+
 /// The permissions a stack operation runs under: the identity policies of the stack's
 /// service role, which decide the calls a deployment makes in the services that own the
 /// stack's resources.
@@ -845,6 +849,11 @@ pub mod status {
     /// all changes after a failed stack update" (`ContinueUpdateRollback`), which is the one
     /// status that operation resumes from.
     pub const UPDATE_ROLLBACK_FAILED: &str = "UPDATE_ROLLBACK_FAILED";
+    /// The status a stack takes while an update that has applied every change is removing
+    /// the resources it REPLACED: "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS — the stack update
+    /// was successful, and CloudFormation is deleting the old resources" — so the update's
+    /// own work is done and the stack is not settled until the replaced resources are gone.
+    pub const UPDATE_COMPLETE_CLEANUP_IN_PROGRESS: &str = "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS";
     /// The status of a stack a `CREATE` change set brought into existence and nothing has
     /// executed yet (`CreateChangeSetInput$ChangeSetType`: "If you create a change set for
     /// a new stack, CloudFormation creates a stack with a unique stack ID, but no template
@@ -4083,6 +4092,8 @@ pub enum PageOf {
     AccountLimits,
     /// `ListTypes`'s `TypeSummaries`.
     TypeSummaries,
+    /// `ListTypeVersions`'s `TypeVersionSummaries`.
+    TypeVersionSummaries,
     /// `ListTypeRegistrations`'s `RegistrationTokenList`.
     RegistrationTokens,
     /// `ListStackInstances`'s `Summaries`.
@@ -4125,6 +4136,7 @@ impl PageOf {
             Self::Exports => "exports",
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",
+            Self::TypeVersionSummaries => "type-version-summaries",
             Self::RegistrationTokens => "registration-tokens",
             Self::StackInstanceSummaries => "stack-instance-summaries",
             Self::StackSetSummaries => "stack-set-summaries",
@@ -4734,6 +4746,12 @@ pub async fn settle_due_rollbacks<Eng: Send + Sync + 'static>(
         };
         stack.schedule_resource_events(&reverted.transitions);
         stack.record_materialised_resources(reverted.resources);
+        // A resource whose owning service accepted the revert without having carried it out
+        // — or whose PROVIDER has been sent the request and has not answered — holds this
+        // rollback open, exactly as it holds the operation being rolled back open: the
+        // rollback is not reported complete while a resource it put back is still coming up,
+        // and a wait that runs out fails it ([`provisioning::advance_stabilisations`]).
+        stack.record_stabilisations(&reverted.stabilising, SystemTime::now());
         // What the rollback left each resource in, which is what a client reads back —
         // and what says which resource a resumed rollback may skip.
         stack.record_rollback_resource_statuses(&reverted.transitions, SystemTime::now());

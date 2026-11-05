@@ -203,6 +203,11 @@ mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
 
+/// Custom resources: the provider a template names in a resource's `ServiceToken`, the
+/// request CloudFormation sends it on every stack operation touching the resource, and the
+/// answer the provider PUTs to the `ResponseURL` the request carries.
+pub mod custom_resource;
+
 /// The awsJson media types the services this module calls speak, named once here because
 /// [`call_json_rpc`] takes the one the called service's own model declares: an answer is
 /// rendered in it, and a call written in the other version is not the wire that service
@@ -469,6 +474,11 @@ pub struct Stabilising {
     pub physical_resource_id: String,
     /// That service's own word for the state the resource is in, as its API spells it.
     pub reported_state: String,
+    /// The PROVIDER REQUEST this wait is for, where the resource is a CUSTOM RESOURCE
+    /// ([`custom_resource`]): such a resource is backed by no API of this emulator's, so
+    /// what ends its wait is the answer its provider PUTs to the request's `ResponseURL`
+    /// rather than a read of an owning service. `None` for every other resource.
+    pub provider_request: Option<custom_resource::ProviderRequest>,
 }
 
 /// What the service that owns a resource says about a resource it has CREATED: whether the
@@ -860,29 +870,47 @@ pub async fn advance_stabilisations(
     };
     for (stack_id, barriers) in waiting {
         for barrier in barriers {
+            // A CUSTOM RESOURCE's wait is no question for an owning service: the resource is
+            // backed by the PROVIDER its `ServiceToken` names, and what ends the wait is the
+            // answer that provider PUT to the request's `ResponseURL`, which the plane that
+            // received it recorded on this barrier
+            // ([`crate::service::custom_resource_plane`]). So nothing is asked of anybody
+            // for it — the answer is either there or the wait holds.
+            let provider_answer = barrier
+                .provider_request
+                .as_ref()
+                .map(|_| barrier.provider_response.as_ref());
             // WHICH of the owning service's answers ends this wait: that the resource it
             // created is ready, or that the resource it deleted is gone. A removal that is
             // still in flight holds the operation exactly as a creation that is still coming
             // up does, so the two answers are read as the one thing they both are — whether
             // the call that service accepted has been carried out.
-            let readiness = match owner_for(&barrier.resource_type) {
-                Some(provisioner) => match barrier.awaited {
-                    super::stabilising::Awaited::Ready => {
-                        provisioner
-                            .readiness(ctx, region, &barrier.physical_resource_id)
+            let readiness = match provider_answer {
+                Some(Some(response)) if response.succeeded() => Ok(Readiness::Ready),
+                // The provider says it did not carry the request out, so nothing is going to
+                // bring the resource up — or take it away — and the reason it gave is the
+                // resource's own failure.
+                Some(Some(response)) => Ok(Readiness::Failed(response.failure_reason())),
+                Some(None) => Ok(Readiness::Pending(barrier.reported_state.clone())),
+                None => match owner_for(&barrier.resource_type) {
+                    Some(provisioner) => match barrier.awaited {
+                        super::stabilising::Awaited::Ready => {
+                            provisioner
+                                .readiness(ctx, region, &barrier.physical_resource_id)
+                                .await
+                        }
+                        super::stabilising::Awaited::Gone => provisioner
+                            .removal(ctx, region, &barrier.physical_resource_id)
                             .await
-                    }
-                    super::stabilising::Awaited::Gone => provisioner
-                        .removal(ctx, region, &barrier.physical_resource_id)
-                        .await
-                        .map(|removal| match removal {
-                            Removal::Gone => Readiness::Ready,
-                            Removal::Pending(state) => Readiness::Pending(state),
-                        }),
+                            .map(|removal| match removal {
+                                Removal::Gone => Readiness::Ready,
+                                Removal::Pending(state) => Readiness::Pending(state),
+                            }),
+                    },
+                    // Nothing owns the type any more, so there is nothing to ask: the wait is
+                    // over, because what opened it was that provisioner's answer.
+                    None => Ok(Readiness::Ready),
                 },
-                // Nothing owns the type any more, so there is nothing to ask: the wait is
-                // over, because what opened it was that provisioner's answer.
-                None => Ok(Readiness::Ready),
             };
             let now = SystemTime::now();
             // The identifiers the owning service publishes for a resource that has only NOW
@@ -891,9 +919,17 @@ pub async fn advance_stabilisations(
             // service has just reported the resource ready; a read it refuses leaves the
             // records as they stand, since one unanswered read is no evidence about the
             // resource.
-            let ready_attributes = if matches!(readiness, Ok(Readiness::Ready))
-                && barrier.awaited == super::stabilising::Awaited::Ready
+            //
+            // For a custom resource those identifiers are the `Data` its provider answered
+            // with, which is exactly what `Fn::GetAtt` resolves against for the type: the
+            // answer is already in hand, so there is nothing to read.
+            let ready_attributes = if !matches!(readiness, Ok(Readiness::Ready))
+                || barrier.awaited != super::stabilising::Awaited::Ready
             {
+                BTreeMap::new()
+            } else if let Some(Some(response)) = provider_answer {
+                response.data.clone()
+            } else {
                 match owner_for(&barrier.resource_type) {
                     Some(provisioner) => provisioner
                         .ready_attributes(
@@ -906,8 +942,31 @@ pub async fn advance_stabilisations(
                         .unwrap_or_default(),
                     None => BTreeMap::new(),
                 }
-            } else {
-                BTreeMap::new()
+            };
+            // A provider that answered an `Update` with a DIFFERENT `PhysicalResourceId` has
+            // REPLACED the resource: the new physical resource is the one the stack keeps,
+            // and the OLD one is cleaned up by a further `Delete` carrying the old id and the
+            // old properties. That request is sent here, with the lock released, exactly as
+            // every other call this module makes is — and it opens a wait of its own, so the
+            // operation is not reported complete while the replaced resource is still there.
+            //
+            // A cleanup the provider's own service REFUSED opens no wait: nothing is going to
+            // answer a request that was not delivered. The update itself has already been
+            // applied, so what that refusal costs is the removal of the resource the update
+            // replaced — reported as that resource's own failed removal (`Err` below), never
+            // dropped.
+            let mut refused_cleanup: Option<(ReplacedResource, Refusal)> = None;
+            let cleanup = match custom_resource_cleanup(&stack_id, &barrier, &readiness) {
+                Some(call) => match custom_resource::send(ctx, region, &call.as_provider_call())
+                    .await
+                {
+                    Ok(()) => Some(call.awaited_removal()),
+                    Err(refusal) => {
+                        refused_cleanup = Some((call, refusal));
+                        None
+                    }
+                },
+                None => None,
             };
             // What a failure the answer makes due owes besides the stack's own failed
             // status: the resources a rolled-back CREATE has to remove again. Taken under
@@ -920,7 +979,42 @@ pub async fn advance_stabilisations(
                 };
                 let taken = match readiness {
                     Ok(Readiness::Ready) => {
+                        // What the PROVIDER of a custom resource answered is that resource's
+                        // real identity: the `PhysicalResourceId` it reports is what `Ref`
+                        // resolves to from here on, whatever identifier the naming rules had
+                        // computed for the record.
+                        if barrier.awaited == super::stabilising::Awaited::Ready {
+                            if let Some(response) = barrier.provider_response.as_ref() {
+                                stack.adopt_provider_identity(
+                                    &barrier.logical_id,
+                                    &response.physical_resource_id,
+                                );
+                            }
+                        }
                         stack.record_ready_attributes(&barrier.logical_id, &ready_attributes);
+                        // The cleanup of a replaced resource holds the operation exactly as
+                        // the update itself did — recorded BEFORE this wait is released, so
+                        // the operation's completion is never made due in between.
+                        if let Some(cleanup) = cleanup {
+                            stack.record_stabilisations(
+                                ::std::slice::from_ref(&cleanup),
+                                now,
+                            );
+                            stack.report_update_cleanup(now);
+                        }
+                        // ...and a cleanup the provider's service refused is the replaced
+                        // resource's own failed removal: the stack records WHICH physical
+                        // resource was left behind and why, rather than reporting the update
+                        // complete with no trace of it.
+                        if let Some((replaced, refusal)) = &refused_cleanup {
+                            stack.record_failed_removal(
+                                now,
+                                &replaced.logical_id,
+                                &replaced.resource_type,
+                                &replaced.physical_resource_id,
+                                &handler_failure_reason(None, refusal),
+                            );
+                        }
                         stack.release_stabilisation(&barrier, now);
                         None
                     }
@@ -986,6 +1080,7 @@ pub async fn advance_stabilisations(
                 region,
                 &resources,
                 &Teardown {
+                    stack_id: &stack_id,
                     held: &held,
                     needs: &needs,
                     on_refusal: OnRefusal::Stop,
@@ -1008,6 +1103,94 @@ pub async fn advance_stabilisations(
             }
         }
     }
+}
+
+/// The resource an `Update` a provider answered REPLACED: what the cleanup `Delete` of the
+/// old physical resource is sent with.
+///
+/// Owned rather than borrowed, because it outlives the barrier reading that produced it: the
+/// request is sent with the store's lock released.
+#[derive(Debug, Clone)]
+struct ReplacedResource {
+    /// The stack the resource belongs to, which the request names.
+    stack_id: String,
+    logical_id: String,
+    resource_type: String,
+    /// The physical resource the provider replaced — the id this `Delete` addresses.
+    physical_resource_id: String,
+    /// The properties that resource was declared with, which this `Delete` carries: the
+    /// `OldResourceProperties` of the `Update` the provider replaced it in answer to.
+    properties: Value,
+    /// The `RequestId` the cleanup is answered under.
+    request_id: String,
+}
+
+impl ReplacedResource {
+    /// The `Delete` request this cleanup sends.
+    fn as_provider_call(&self) -> custom_resource::ProviderCall<'_> {
+        custom_resource::ProviderCall {
+            request_type: custom_resource::request_type::DELETE,
+            request_id: &self.request_id,
+            stack_id: &self.stack_id,
+            logical_resource_id: &self.logical_id,
+            resource_type: &self.resource_type,
+            properties: &self.properties,
+            physical_resource_id: Some(&self.physical_resource_id),
+            old_properties: None,
+        }
+    }
+
+    /// The wait that cleanup opens: the replaced resource is gone when its provider answers.
+    fn awaited_removal(&self) -> Stabilising {
+        Stabilising {
+            awaited: super::stabilising::Awaited::Gone,
+            logical_id: self.logical_id.clone(),
+            resource_type: self.resource_type.clone(),
+            physical_resource_id: self.physical_resource_id.clone(),
+            reported_state: super::resource_status::DELETE_IN_PROGRESS.to_string(),
+            provider_request: Some(self.as_provider_call().remembered()),
+        }
+    }
+}
+
+/// The cleanup `barrier`'s answer owes, or `None` where it owes none.
+///
+/// "If the custom resource provider returns a new `PhysicalResourceId`, CloudFormation
+/// treats the update as a replacement" and sends a `Delete` for the resource that was
+/// replaced; the SAME id is an in-place update and owes no `Delete` at all. Every other
+/// wait — a create, a delete, a resource of any other type — owes none either.
+fn custom_resource_cleanup(
+    stack_id: &str,
+    barrier: &super::stabilising::StabilisationBarrier,
+    readiness: &Result<Readiness, Refusal>,
+) -> Option<ReplacedResource> {
+    if !matches!(readiness, Ok(Readiness::Ready))
+        || barrier.awaited != super::stabilising::Awaited::Ready
+    {
+        return None;
+    }
+    let request = barrier.provider_request.as_ref()?;
+    if request.request_type != custom_resource::request_type::UPDATE {
+        return None;
+    }
+    let replaced = request.physical_resource_id.as_deref()?;
+    let response = barrier.provider_response.as_ref()?;
+    if response.physical_resource_id == replaced {
+        return None;
+    }
+    Some(ReplacedResource {
+        stack_id: stack_id.to_string(),
+        logical_id: barrier.logical_id.clone(),
+        resource_type: barrier.resource_type.clone(),
+        physical_resource_id: replaced.to_string(),
+        // The OLD properties: what the resource that is being cleaned up was declared with,
+        // which the `Update` carried as its `OldResourceProperties`.
+        properties: request
+            .old_properties
+            .clone()
+            .unwrap_or_else(|| request.properties.clone()),
+        request_id: custom_resource::new_request_id(),
+    })
 }
 
 /// Materialise the failures the WAIT CONDITIONS of this Region's stacks have run out on, and
@@ -1063,6 +1246,7 @@ async fn settle_expired_waits(
             region,
             &resources,
             &Teardown {
+                stack_id: &stack_id,
                 held: &held,
                 needs: &needs,
                 on_refusal: OnRefusal::Stop,
@@ -1261,6 +1445,65 @@ pub async fn reconcile(
                     &resource,
                     super::resource_status::UPDATE_IN_PROGRESS,
                 ));
+                // A CUSTOM RESOURCE's changed declaration is applied by its PROVIDER, not by
+                // an owning service: the `Update` request carries the resource's current
+                // `PhysicalResourceId` and the `OldResourceProperties` it was last declared
+                // with, and the resource is held until the provider answers. An answer naming
+                // a DIFFERENT physical id has REPLACED the resource, whose cleanup `Delete`
+                // of the old one is sent when that answer lands
+                // ([`advance_stabilisations`]).
+                if custom_resource::is_custom_resource(&resource.resource_type) {
+                    let request_id = custom_resource::new_request_id();
+                    let call = custom_resource::ProviderCall {
+                        request_type: custom_resource::request_type::UPDATE,
+                        request_id: &request_id,
+                        stack_id: &stack.stack_id,
+                        logical_resource_id: &resource.logical_id,
+                        resource_type: &resource.resource_type,
+                        properties: &deployed_properties,
+                        physical_resource_id: Some(&resource.physical_resource_id),
+                        old_properties: Some(&existing.properties),
+                    };
+                    let sent = custom_resource::send(ctx, region, &call).await;
+                    let request = call.remembered();
+                    match sent {
+                        Ok(()) => {
+                            // The configuration the provider was asked for is the DECLARED
+                            // one, which is what the stack records — exactly as it records an
+                            // owning service's applied change.
+                            resource.properties = declared_properties.clone();
+                            outcome.stabilising.push(Stabilising {
+                                awaited: super::stabilising::Awaited::Ready,
+                                logical_id: resource.logical_id.clone(),
+                                resource_type: resource.resource_type.clone(),
+                                physical_resource_id: resource.physical_resource_id.clone(),
+                                reported_state: super::resource_status::UPDATE_IN_PROGRESS
+                                    .to_string(),
+                                provider_request: Some(request),
+                            });
+                            outcome.transitions.push(ResourceTransition::finished(
+                                &resource,
+                                super::resource_status::UPDATE_COMPLETE,
+                                None,
+                            ));
+                            outcome.resources.push(resource);
+                            continue;
+                        }
+                        Err(refusal) => {
+                            outcome.failure = Some(super::resource_failure_summary(
+                                super::failed_action::UPDATE,
+                                [resource.logical_id.as_str()],
+                            ));
+                            outcome.transitions.push(ResourceTransition::finished(
+                                &resource,
+                                super::resource_status::UPDATE_FAILED,
+                                Some(handler_failure_reason(None, &refusal)),
+                            ));
+                            outcome.resources.push(resource);
+                            break;
+                        }
+                    }
+                }
                 let applied = match owner_for(&resource.resource_type) {
                     Some(provisioner) => {
                         // The call is the stack's, made under its service role and about
@@ -1391,6 +1634,74 @@ pub async fn reconcile(
         outcome
             .transitions
             .push(ResourceTransition::creating(&resource));
+        // A CUSTOM RESOURCE is backed by no API of this emulator's: it is backed by the
+        // PROVIDER its own `ServiceToken` names. CloudFormation SENDS that provider a
+        // request and holds the resource until the provider answers at the request's
+        // `ResponseURL` ([`custom_resource`]) — so this arm is not a create in an owning
+        // service at all, and the wait it opens is released by the provider's answer rather
+        // than by a service's own read.
+        if custom_resource::is_custom_resource(&resource.resource_type) {
+            let request_id = custom_resource::new_request_id();
+            let call = custom_resource::ProviderCall {
+                request_type: custom_resource::request_type::CREATE,
+                request_id: &request_id,
+                stack_id: &stack.stack_id,
+                logical_resource_id: &resource.logical_id,
+                resource_type: &resource.resource_type,
+                // Asked for with the DEPLOYED document, exactly as an owning service's
+                // create is: the provider is sent the resolved properties while the record
+                // keeps the ones the stack reports.
+                properties: &deployed_properties,
+                // Nothing exists yet, so the request names no physical resource and no
+                // properties the resource was declared with before.
+                physical_resource_id: None,
+                old_properties: None,
+            };
+            match custom_resource::send(ctx, region, &call).await {
+                Ok(()) => {
+                    let request = call.remembered();
+                    // The request is with the provider, so the stack is responsible for the
+                    // resource from here on: the record carries `materialised`, which is what
+                    // makes a later teardown send the provider the `Delete` it owes.
+                    resource.materialised = true;
+                    outcome
+                        .transitions
+                        .push(ResourceTransition::initiated(&resource));
+                    outcome.stabilising.push(Stabilising {
+                        awaited: super::stabilising::Awaited::Ready,
+                        logical_id: resource.logical_id.clone(),
+                        resource_type: resource.resource_type.clone(),
+                        physical_resource_id: resource.physical_resource_id.clone(),
+                        reported_state: super::resource_status::CREATE_IN_PROGRESS.to_string(),
+                        provider_request: Some(request),
+                    });
+                    outcome.transitions.push(ResourceTransition::finished(
+                        &resource,
+                        super::resource_status::CREATE_COMPLETE,
+                        None,
+                    ));
+                    outcome.resources.push(resource);
+                    continue;
+                }
+                // The provider could not be SENT the request — the declaration names none,
+                // or the service its token names refused to carry it — so nothing is going
+                // to answer for this resource and the deployment stops here, exactly as it
+                // does on a refused create.
+                Err(refusal) => {
+                    outcome.failure = Some(super::resource_failure_summary(
+                        super::failed_action::CREATE,
+                        [resource.logical_id.as_str()],
+                    ));
+                    outcome.transitions.push(ResourceTransition::failed(
+                        &resource,
+                        super::resource_status::CREATE_FAILED,
+                        handler_failure_reason(None, &refusal),
+                    ));
+                    outcome.resources.push(resource);
+                    break;
+                }
+            }
+        }
         // Which service owns the type, resolved ONCE here: the create below and the
         // readiness read that follows it are two questions for the same provisioner, and
         // one lookup is what keeps them from ever being asked of different ones.
@@ -1521,6 +1832,9 @@ pub async fn reconcile(
                             resource_type: resource.resource_type.clone(),
                             physical_resource_id: resource.physical_resource_id.clone(),
                             reported_state: state,
+                            // The wait is the OWNING SERVICE's answer about the resource, so
+                            // there is no provider request it is for.
+                            provider_request: None,
                         });
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
@@ -1648,6 +1962,7 @@ pub async fn reconcile(
     // the one in force on the stack ([`Dependencies`]).
     let no_relation = Dependencies::new();
     let replacement_walk = Teardown {
+        stack_id: &stack.stack_id,
         held: &held,
         needs: &no_relation,
         on_refusal: OnRefusal::Stop,
@@ -1978,6 +2293,9 @@ pub async fn delete(
 /// the passes behind them answers all four for the same walk.
 #[derive(Debug, Clone, Copy)]
 pub struct Teardown<'a> {
+    /// `Stack$StackId`: the stack whose resources this teardown is taking down, which is
+    /// what a CUSTOM RESOURCE's `Delete` request names ([`custom_resource::ProviderCall`]).
+    pub stack_id: &'a str,
     /// The logical ids the stack holds a record of
     /// ([`super::StoredStack::held_resource_ids`]) — the resources this teardown is
     /// responsible for.
@@ -2172,6 +2490,7 @@ async fn delete_pass(
     opened: &mut BTreeSet<String>,
 ) -> Deleted {
     let Teardown {
+        stack_id,
         held,
         needs,
         on_refusal,
@@ -2285,18 +2604,44 @@ async fn delete_pass(
             }
         }
         let resource = &outcome.resources[index];
-        let deleted = match owner {
-            Some(provisioner) => {
+        // A CUSTOM RESOURCE is removed by its own PROVIDER: the `Delete` request carries the
+        // physical resource the provider minted and the properties it was last declared
+        // with, and the removal is not finished until the provider answers
+        // ([`custom_resource`]). `None` for every other resource, whose removal is the
+        // owning service's own delete.
+        let provider_delete = (resource.materialised
+            && custom_resource::is_custom_resource(&resource.resource_type))
+            .then(custom_resource::new_request_id);
+        let deleted = match (&provider_delete, owner) {
+            (Some(request_id), _) => {
+                let call = custom_resource::ProviderCall {
+                    request_type: custom_resource::request_type::DELETE,
+                    request_id,
+                    stack_id,
+                    logical_resource_id: &resource.logical_id,
+                    resource_type: &resource.resource_type,
+                    properties: &resource.properties,
+                    physical_resource_id: Some(&resource.physical_resource_id),
+                    // A `Delete` names no previous declaration: the properties it carries
+                    // ARE the ones the resource was last declared with.
+                    old_properties: None,
+                };
+                custom_resource::send(ctx, region, &call)
+                    .await
+                    .map(|()| Some(call.remembered()))
+            }
+            (None, Some(provisioner)) => {
                 super::service_role::on_resource(
                     super::service_role::target_of(resource),
                     provisioner.delete(ctx, region, resource, final_snapshot.as_deref()),
                 )
                 .await
+                .map(|()| None)
             }
-            None => Ok(()),
+            (None, None) => Ok(None),
         };
         match deleted {
-            Ok(()) => {
+            Ok(provider_request) => {
                 // The delete was ACCEPTED; whether the resource is gone is the owning
                 // service's to say. A type whose delete that service documents as
                 // asynchronous leaves the resource in a state it is still being removed from
@@ -2306,8 +2651,13 @@ async fn delete_pass(
                 // complete while a resource it deleted is still there. An unanswered read is
                 // no evidence that the resource is still there, so it opens no wait: the
                 // delete itself went through.
-                let removal = match owner {
-                    Some(provisioner) => {
+                let removal = match (&provider_request, owner) {
+                    // The provider has been SENT the `Delete`; the resource is gone when it
+                    // answers, which is a wait like any other.
+                    (Some(_), _) => Ok(Removal::Pending(
+                        super::resource_status::DELETE_IN_PROGRESS.to_string(),
+                    )),
+                    (None, Some(provisioner)) => {
                         provisioner
                             .removal(
                                 ctx,
@@ -2316,7 +2666,7 @@ async fn delete_pass(
                             )
                             .await
                     }
-                    None => Ok(Removal::Gone),
+                    (None, None) => Ok(Removal::Gone),
                 };
                 if let Ok(Removal::Pending(state)) = removal {
                     let resource = &outcome.resources[index];
@@ -2326,6 +2676,7 @@ async fn delete_pass(
                         resource_type: resource.resource_type.clone(),
                         physical_resource_id: resource.physical_resource_id.clone(),
                         reported_state: state,
+                        provider_request,
                     });
                 }
                 outcome.resources[index].materialised = false;

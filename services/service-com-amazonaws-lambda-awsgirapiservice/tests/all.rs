@@ -49,6 +49,8 @@ mod capacity_provider_listing;
 mod capacity_provider_managed_function_state;
 #[path = "all/capacity_provider_naming.rs"]
 mod capacity_provider_naming;
+#[path = "all/capacity_provider_operator_role.rs"]
+mod capacity_provider_operator_role;
 #[path = "all/capacity_provider_refusal_messages.rs"]
 mod capacity_provider_refusal_messages;
 #[path = "all/capacity_provider_update.rs"]

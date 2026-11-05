@@ -1,40 +1,61 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTypeVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTypeVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lists the VERSIONS one extension of this account and Region's registry
+//! holds ([`crate::state::registry::StoredTypeVersion`]), narrowed by the deprecation status
+//! and the publisher the request names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTypeVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What the operation reports
 //!
-//! ## Shape of an operation
+//! "Returns summary information about the versions of an extension." A version is a record
+//! of its own, written onto the extension by the call that added it — `RegisterType` for a
+//! private extension, `ActivateType` for a public one this account activated — so the
+//! listing is served from the versions the identified extension really holds and nothing is
+//! invented: an extension holding one version reports one summary. Each summary names the
+//! extension the version belongs to, the version's own id and ARN, whether it is the
+//! extension's DEFAULT version, when it was registered and the public version number a
+//! publisher published it under.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `ListTypeVersions::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The registry also holds the public extensions Amazon Web Services publishes, which are in
+//! every account's registry without anybody registering them
+//! ([`crate::state::registry::aws_published`]), so an extension this account registered no
+//! record for is still read there — the same two sources `DescribeType` reads.
+//!
+//! ## What identifies the extension, and what narrows the listing
+//!
+//! The model states the extension's identity across three members at once — "Conditional:
+//! You must specify either TypeName and Type, or Arn" — so `Arn` names it on its own (an
+//! extension-VERSION ARN names the extension it is a version of, since the listing is of
+//! that extension's versions) and `Type` and `TypeName` name it together; neither half of
+//! the name form, and both forms at once, identify one extension, and each is refused with
+//! the registry's own modelled `CFNRegistryException`.
+//!
+//! `DeprecatedStatus` is "the deprecation status of the extension versions that you want to
+//! get summary information about … The default is LIVE", so a request naming none lists the
+//! versions that "can be used in CloudFormation operations" and leaves out the deregistered
+//! ones. `PublisherId` is "the publisher ID of the extension publisher", so an extension some
+//! other publisher published — or one nobody did, as "extensions published by Amazon aren't
+//! assigned a publisher ID" — is not the extension the request named.
+//!
+//! ## Ordering and paging
+//!
+//! `@paginated(inputToken: NextToken, outputToken: NextToken, items: TypeVersionSummaries,
+//! pageSize: MaxResults)`: one response carries at most `MaxResults` summaries and the token
+//! that resumes just past them. The listing is in the order the versions were added to the
+//! extension, which is a property of the records rather than of the walk, so a caller paging
+//! through the collection sees each version exactly once.
 //!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! [`crate::state::service_state`] and read it through the guard it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
-//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
+//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`; the
+//! Region a request is served in comes from there ([`crate::state::request_region`]).
 //! The engine is NOT reached through `ctx`.
 //!
-//! @generated by the emulator core scaffold op-stub generator.
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -95,6 +116,118 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::registry::{self, StoredExtension, StoredTypeVersion};
+
+/// How the request identifies the extension whose versions are listed.
+///
+/// The model states that identity across three members at once — "Conditional: You must
+/// specify either TypeName and Type, or Arn" — so each form identifies the extension on its
+/// own and a request that states half of one, or both at once, identifies no single
+/// extension.
+#[derive(Debug, Clone, Copy)]
+enum Identifier<'a> {
+    /// `Arn`, "the Amazon Resource Name (ARN) of the extension for which you want version
+    /// summary information". An extension-VERSION ARN names the extension it is a version
+    /// of: the listing is of that extension's versions.
+    Arn(&'a str),
+    /// `Type` and `TypeName`, which name it together, resolved in the Region the request was
+    /// served in.
+    Name {
+        type_kind: &'a str,
+        type_name: &'a str,
+    },
+}
+
+impl Identifier<'_> {
+    /// What the request named the extension by, for the not-found message.
+    fn named(&self) -> &str {
+        match self {
+            Self::Arn(arn) => arn,
+            Self::Name { type_name, .. } => type_name,
+        }
+    }
+}
+
+/// Read which extension the request identifies, or `Err(message)` for a combination of
+/// members that identifies none.
+///
+/// Every modelled constraint (each member's length and pattern, `Type`'s enum and
+/// `DeprecatedStatus`'s) is already enforced before the handler runs; what is left is the
+/// conditional rule the model states in prose — the same reading `DescribeType` takes of the
+/// same three members.
+fn read_request(input: &ListTypeVersionsInput) -> Result<Identifier<'_>, String> {
+    match (
+        input.arn.as_deref(),
+        input.r#type.as_deref(),
+        input.type_name.as_deref(),
+    ) {
+        (Some(arn), None, None) => Ok(Identifier::Arn(registry::split_version_arn(arn).0)),
+        (None, Some(type_kind), Some(type_name)) => Ok(Identifier::Name {
+            type_kind,
+            type_name,
+        }),
+        // Both forms at once: the two identify the extension independently, so a request
+        // carrying both states two identities for one listing.
+        (Some(_), _, _) => Err(
+            "Specify either Arn, or Type and TypeName, but not both: an extension is \
+             identified by its ARN or by its kind and name"
+                .to_string(),
+        ),
+        // Neither form, or half of the name form: the kind without the name admits every
+        // extension of that kind and the name without the kind admits none, so neither half
+        // identifies the extension whose versions are listed.
+        (None, _, _) => Err(
+            "Either Arn, or both Type and TypeName, must be specified to identify an \
+             extension"
+                .to_string(),
+        ),
+    }
+}
+
+/// One version of `extension` as the modelled `TypeVersionSummary`.
+fn version_summary(extension: &StoredExtension, version: &StoredTypeVersion) -> TypeVersionSummary {
+    TypeVersionSummary {
+        // "The kind of extension" and "the name of the extension" — the extension the
+        // version belongs to, which for one activated under an alias is the alias the record
+        // holds.
+        r#type: Some(extension.type_kind.clone()),
+        type_name: Some(extension.type_name.clone()),
+        // "The ID of a specific version of the extension. The version ID is the value at the
+        // end of the Amazon Resource Name (ARN) assigned to the extension version when it's
+        // registered."
+        version_id: Some(version.version_id.clone()),
+        // "Whether the specified extension version is set as the default version."
+        is_default_version: Some(extension.is_default_version(&version.version_id)),
+        // "The Amazon Resource Name (ARN) of the extension version" — this version's own,
+        // not the extension's.
+        arn: Some(version.arn.clone()),
+        // "When the version was registered."
+        time_created: version.time_created.map(crate::state::timestamp),
+        // "The description of the extension version."
+        description: version.description.clone(),
+        // "For public extensions that have been activated for this account and Region, the
+        // version of the public extension to be used for CloudFormation operations in this
+        // account and Region."
+        public_version_number: version.public_version_number.clone(),
+    }
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> ListTypeVersionsError {
+    ListTypeVersionsErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The same refusal for an extension the registry does not hold: this operation models no
+/// not-found error of its own, so the registry's exception is what carries it, with the
+/// sentence every read of a missing extension words
+/// ([`crate::state::extension_does_not_exist`]).
+fn type_not_found(identifier: &str) -> ListTypeVersionsError {
+    registry_exception(crate::state::extension_does_not_exist(identifier))
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,18 +297,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTypeVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTypeVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTypeVersions"))
+        // Which extension the request identifies. A combination of members that identifies
+        // none is refused with the registry's own modelled 400 before any state is touched.
+        let identifier = read_request(&input).map_err(registry_exception)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to read, so this answers
+            // 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTypeVersions",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // A pure report, but one that must not withhold a transition the clock already made
+        // due: `TestType` leaves a version's contract tests in progress and their conclusion
+        // due a moment later, and a version's own record is what carries that status.
+        // Settling materialises only that already-due conclusion — nothing is advanced
+        // because it was read.
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
+
+        let stored = match identifier {
+            Identifier::Arn(arn) => store.extension_by_arn(&region, arn),
+            Identifier::Name {
+                type_kind,
+                type_name,
+            } => store.extension_by_name(&region, type_kind, type_name),
+        };
+        // The registry also holds the public extensions Amazon Web Services publishes, which
+        // are in every account's registry without anybody registering them. A name this
+        // account registered cannot be one of those — `RegisterType` reserves the `AWS`
+        // namespace — so the two sources cannot disagree about one extension. Both are read
+        // in the Region the request was served in: the registry is regional whichever source
+        // holds a record.
+        let published = match (stored.is_none(), identifier) {
+            (false, _) => None,
+            (true, Identifier::Arn(arn)) => registry::aws_published_by_arn(&region, arn),
+            (
+                true,
+                Identifier::Name {
+                    type_kind,
+                    type_name,
+                },
+            ) => registry::aws_published(&region, type_kind, type_name),
+        };
+        let extension = stored
+            .or(published.as_ref())
+            .ok_or_else(|| type_not_found(identifier.named()))?;
+        // "The publisher ID of the extension publisher. Extensions published by Amazon
+        // aren't assigned a publisher ID": a record some other publisher published, or one
+        // nobody did, is not the extension the request named.
+        if let Some(publisher_id) = input.publisher_id.as_deref() {
+            if extension.publisher_id.as_deref() != Some(publisher_id) {
+                return Err(type_not_found(identifier.named()));
+            }
+        }
+
+        // "The deprecation status of the extension versions that you want to get summary
+        // information about … The default is LIVE": a request naming none lists the versions
+        // that can still be used in CloudFormation operations.
+        let wanted_status = input
+            .deprecated_status
+            .as_deref()
+            .unwrap_or(registry::deprecated_status::LIVE);
+        let summaries: Vec<TypeVersionSummary> = extension
+            .versions
+            .iter()
+            .filter(|version| version.deprecated_status == wanted_status)
+            .map(|version| version_summary(extension, version))
+            .collect();
+
+        // `MaxResults` is "the maximum number of results to be returned with a single call",
+        // and the modelled range (1..100) is already enforced before this handler runs.
+        let max_results = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok());
+        let (type_version_summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::TypeVersionSummaries,
+            summaries,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListTypeVersionsOutput {
+            type_version_summaries: Some(type_version_summaries),
+            next_token,
+        })
     }
 }

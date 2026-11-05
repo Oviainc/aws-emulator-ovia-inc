@@ -293,9 +293,17 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // AWS CloudFormation's own types, including the generic custom resource and the
     // registry's own records.
     CLOUDFORMATION_CUSTOM_RESOURCE,
+    // The two Hook types a template may declare a Hook itself with, beside the registry
+    // records below: a Guard Hook, which evaluates CloudFormation Guard rules against a
+    // stack operation's targets, and a Lambda Hook, which hands those targets to a function
+    // (the two Hook kinds the CloudFormation Hooks documentation publishes, and the two this
+    // registry's own public catalogue holds —
+    // [`crate::state::registry::PUBLIC_EXTENSION_CATALOG`]).
+    "AWS::CloudFormation::GuardHook",
     "AWS::CloudFormation::HookDefaultVersion",
     "AWS::CloudFormation::HookTypeConfig",
     "AWS::CloudFormation::HookVersion",
+    "AWS::CloudFormation::LambdaHook",
     "AWS::CloudFormation::Macro",
     "AWS::CloudFormation::ModuleDefaultVersion",
     "AWS::CloudFormation::ModuleVersion",
@@ -924,7 +932,7 @@ pub fn is_published(resource_type: &str) -> bool {
 
 /// Whether `resource_type` names a custom resource: `Custom::<Name>` within the documented
 /// name alphabet and length, or the generic `AWS::CloudFormation::CustomResource`.
-fn is_custom_resource(resource_type: &str) -> bool {
+pub fn is_custom_resource(resource_type: &str) -> bool {
     if resource_type == CLOUDFORMATION_CUSTOM_RESOURCE {
         return true;
     }

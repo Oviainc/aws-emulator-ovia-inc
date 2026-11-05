@@ -492,17 +492,23 @@ pub fn arn_extension_name(arn: &str) -> Option<String> {
 /// The kind, the publisher id, the extension name and any pinned public version a PUBLIC
 /// extension ARN carries.
 ///
-/// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`,
-/// so the three segments after `type/` are read back here: the kind, the id of the publisher
-/// that published it, and the extension's name. A registry ARN spells the kind in lower case
-/// and the `::` separators of a type name as `-` ([`arn_kind_segment`], [`arn_type_name`]), so
-/// both are read back into the spellings the registry keys a record by — a type name's own
-/// segments carry no `-` of their own (the modelled `TypeName` pattern admits only letters and
-/// digits in them), so that reading is unambiguous, and a kind the registry does not name is
-/// read as the extension kind it spells. Anything PAST the name segment is the public version
-/// number the ARN pins, reported in
-/// [`PublicTypeArnParts::public_version_number`]. `None` for an ARN carrying no such segments
-/// at all.
+/// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`
+/// where a PUBLISHER published it, and by `…::type/<kind>/<Type-Name>` where AMAZON WEB
+/// SERVICES did — "extensions published by Amazon aren't assigned a publisher ID"
+/// (`ListTypeVersionsInput$PublisherId`), so such an ARN carries no publisher segment at all,
+/// which is also the form this registry PUBLISHES one under ([`public_type_arn`]). Both are
+/// read here, told apart by whether the segment after the kind is an extension TYPE NAME
+/// ([`is_type_name`]): a publisher id is "^[0-9a-zA-Z]{12,40}$", which no type name is, and a
+/// dashed type name is three alphanumeric segments, which no publisher id is — so the
+/// reading is unambiguous either way, and an ARN this registry handed out can be used to
+/// activate the extension it names.
+///
+/// A registry ARN spells the kind in lower case and the `::` separators of a type name as `-`
+/// ([`arn_kind_segment`], [`arn_type_name`]), so both are read back into the spellings the
+/// registry keys a record by, and a kind the registry does not name is read as the extension
+/// kind it spells. Anything PAST the name segment is the public version number the ARN pins,
+/// reported in [`PublicTypeArnParts::public_version_number`]. `None` for an ARN carrying no
+/// such segments at all.
 ///
 /// The registry PARSES this ARN itself rather than leaving it to a syntax gate, which is why
 /// this reading is shared: the refusal an unresolvable one gets is the registry's own
@@ -512,9 +518,20 @@ pub fn split_public_type_arn(arn: &str) -> Option<PublicTypeArnParts> {
     let (_, path) = arn.split_once(":type/")?;
     let mut segments = path.split('/');
     let type_kind = segments.next()?;
-    let publisher_id = segments.next()?;
-    let type_name = segments.next()?;
-    if type_kind.is_empty() || publisher_id.is_empty() || type_name.is_empty() {
+    let after_kind = segments.next()?;
+    if type_kind.is_empty() || after_kind.is_empty() {
+        return None;
+    }
+    // Whether the segment after the kind is the extension's own NAME — the form an extension
+    // Amazon Web Services published carries, which names no publisher — or the publisher that
+    // published it, with the name in the segment after that.
+    let publishers_own = is_type_name(&after_kind.replace('-', "::"));
+    let (publisher_id, type_name, pinned_at) = if publishers_own {
+        ("", after_kind, 2)
+    } else {
+        (after_kind, segments.next()?, 3)
+    };
+    if type_name.is_empty() {
         return None;
     }
     let type_kind = [
@@ -528,7 +545,10 @@ pub fn split_public_type_arn(arn: &str) -> Option<PublicTypeArnParts> {
     // Everything past the name segment, kept whole: an extension's name carries no `/` of
     // its own, so whatever follows it is the version the ARN pins rather than part of the
     // name.
-    let pinned = path.splitn(4, '/').nth(3).unwrap_or_default();
+    let pinned = path
+        .splitn(pinned_at + 1, '/')
+        .nth(pinned_at)
+        .unwrap_or_default();
     Some(PublicTypeArnParts {
         type_kind,
         publisher_id: publisher_id.to_string(),
@@ -1820,4 +1840,139 @@ pub fn ascii_configuration(configuration: &str) -> String {
         .chars()
         .map(|character| if character.is_ascii() { character } else { '?' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every ARN this registry PUBLISHES for a public extension is one it reads back: the
+    /// form an extension a publisher published carries (with its publisher id) and the form
+    /// one Amazon Web Services published carries (with none), each with and without a public
+    /// version number pinned past the name.
+    ///
+    /// The rows differ along what the two forms generalise over: whether the ARN names a
+    /// publisher, the kind of extension, whether the name is a module's (which carries one
+    /// further segment), and whether a version is pinned.
+    #[test]
+    fn every_published_public_extension_arn_is_read_back() {
+        const REGION: &str = "us-east-1";
+        const PUBLISHER: &str = "abcdef0123456789abcd";
+        // One row: the ARN, and the four things reading it back must answer.
+        struct Row {
+            case: &'static str,
+            arn: String,
+            type_kind: &'static str,
+            publisher_id: &'static str,
+            type_name: &'static str,
+            pinned: Option<&'static str>,
+        }
+        let rows: &[Row] = &[
+            Row {
+                case: "a Hook Amazon Web Services published, as this registry mints its ARN",
+                arn: public_type_arn(REGION, registry_type::HOOK, "AWS::Hooks::GuardHook"),
+                type_kind: registry_type::HOOK,
+                publisher_id: "",
+                type_name: "AWS::Hooks::GuardHook",
+                pinned: None,
+            },
+            Row {
+                case: "a resource type Amazon Web Services published",
+                arn: public_type_arn(REGION, registry_type::RESOURCE, "AWS::SQS::Queue"),
+                type_kind: registry_type::RESOURCE,
+                publisher_id: "",
+                type_name: "AWS::SQS::Queue",
+                pinned: None,
+            },
+            Row {
+                case: "a module Amazon Web Services published, whose name carries MODULE",
+                arn: public_type_arn(REGION, registry_type::MODULE, "AWS::Network::Vpc::MODULE"),
+                type_kind: registry_type::MODULE,
+                publisher_id: "",
+                type_name: "AWS::Network::Vpc::MODULE",
+                pinned: None,
+            },
+            Row {
+                case: "a Hook a publisher published",
+                arn: format!(
+                    "arn:aws:cloudformation:{REGION}::type/hook/{PUBLISHER}/Example-Guard-Hook"
+                ),
+                type_kind: registry_type::HOOK,
+                publisher_id: PUBLISHER,
+                type_name: "Example::Guard::Hook",
+                pinned: None,
+            },
+            Row {
+                case: "a publisher's extension with a public version pinned past the name",
+                arn: format!(
+                    "arn:aws:cloudformation:{REGION}::type/resource/{PUBLISHER}/Example-Store-Bucket/1.0.0"
+                ),
+                type_kind: registry_type::RESOURCE,
+                publisher_id: PUBLISHER,
+                type_name: "Example::Store::Bucket",
+                pinned: Some("1.0.0"),
+            },
+            Row {
+                case: "an AWS-published extension with a public version pinned past the name",
+                arn: format!(
+                    "arn:aws:cloudformation:{REGION}::type/hook/AWS-Hooks-LambdaHook/2.1.0"
+                ),
+                type_kind: registry_type::HOOK,
+                publisher_id: "",
+                type_name: "AWS::Hooks::LambdaHook",
+                pinned: Some("2.1.0"),
+            },
+        ];
+        for row in rows {
+            let Row {
+                case,
+                arn,
+                type_kind,
+                publisher_id,
+                type_name,
+                pinned,
+            } = row;
+            let read = split_public_type_arn(arn);
+            assert_eq!(
+                read,
+                Some(PublicTypeArnParts {
+                    type_kind: (*type_kind).to_string(),
+                    publisher_id: (*publisher_id).to_string(),
+                    type_name: (*type_name).to_string(),
+                    public_version_number: pinned.map(str::to_string),
+                }),
+                "case {case:?}: expected {arn} to be read back whole, got {read:?}"
+            );
+            assert!(
+                is_type_name(type_name),
+                "case {case:?}: the name read out of the ARN must be an extension type name, \
+                 got {type_name:?}"
+            );
+        }
+    }
+
+    /// An ARN that names no public extension is read as naming none.
+    #[test]
+    fn an_arn_that_names_no_public_extension_reads_as_none() {
+        let rows: &[(&str, &str)] = &[
+            ("no type path at all", "arn:aws:cloudformation:us-east-1::stack/a/0000"),
+            ("nothing after the kind", "arn:aws:cloudformation:us-east-1::type/hook"),
+            ("an empty kind", "arn:aws:cloudformation:us-east-1::type//Example-Guard-Hook"),
+            (
+                "a publisher with no name after it",
+                "arn:aws:cloudformation:us-east-1::type/hook/abcdef0123456789abcd",
+            ),
+            (
+                "a segment that is neither a name nor a publisher with a name",
+                "arn:aws:cloudformation:us-east-1::type/hook/garbage",
+            ),
+        ];
+        for (case, arn) in rows {
+            let read = split_public_type_arn(arn);
+            assert!(
+                read.is_none(),
+                "case {case:?}: expected {arn} to name no public extension, got {read:?}"
+            );
+        }
+    }
 }

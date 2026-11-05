@@ -67,10 +67,12 @@
 //! through one code path for every operation rather than a recording written into each
 //! handler.
 
+pub mod custom_resource_plane;
 pub mod double_members;
 pub mod management_events;
 pub mod query_error_envelope;
 
+use crate::state::provisioning::custom_resource;
 use crate::state::registry;
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};
@@ -219,6 +221,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
     envelope: RequestIdEnvelopeOperation<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the custom resource RESPONSE plane is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read and write the one store the operations use,
+    /// not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -237,6 +246,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 management_events::audited_table(&engine),
             ),
             envelope: RequestIdEnvelopeOperation::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -332,6 +342,17 @@ impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
     }
 }
 
+/// The host a request is addressed to and the PATH it names, read through the workspace's
+/// one reading of each: a `Host` header where the request carries one, else the authority of
+/// its absolute URI ([`::service_common::data_plane_addressing::addressed_host`]), and the
+/// path with any scheme, authority and query removed
+/// ([`::service_common::request_path`]). Both are reached from a request's PARTS
+/// (`can_handle`) and from a runtime-API request (`override_routing_error`), which share no
+/// type, so each seam passes the two things it has.
+fn addressed_host(uri: &str, host_header: Option<&str>) -> Option<String> {
+    ::service_common::data_plane_addressing::addressed_host(uri, host_header)
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -350,10 +371,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
+        if match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
+        } {
+            return true;
         }
+        // And a request addressed to the host this service publishes a custom resource
+        // provider request's `ResponseURL` on, whose first label names no service at all:
+        // without this the router answers `UnknownService` for a URL this service handed
+        // out. See [`custom_resource_plane`].
+        if addressed_host(
+            &parts.uri.to_string(),
+            parts.headers.get("host").and_then(|host| host.to_str().ok()),
+        )
+        .is_some_and(|host| custom_resource::is_response_host(&host))
+        {
+            return true;
+        }
+        // ...and one whose PATH is one of those published URLs, whatever endpoint name it
+        // reached this emulator by: the path names the STACK, by its own ARN, so a provider
+        // following the URL it was handed addresses this service's own target either way.
+        custom_resource::parse_response_path(parts.uri.path())
+            .is_some_and(|target| custom_resource::target_region(&target).is_some())
     }
 
     fn override_operation(
@@ -395,10 +435,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A write to the `ResponseURL` of a custom resource provider request is exactly that
+        // case by construction — the path is not in the model — so this is where the
+        // provider's documented answer is received. The PATH decides: a request to this
+        // service's own endpoint that named no operation is a routing failure, whatever its
+        // host looks like, and keeps the framework's default.
+        let target =
+            custom_resource::parse_response_path(::service_common::request_path(req.uri()))?;
+        // The Region the answer is about: the one the stack's own ARN names, and failing that
+        // the one the published host carries.
+        let region = match custom_resource::target_region(&target) {
+            Some(region) => region.to_string(),
+            None => addressed_host(req.uri(), req.headers().get("host"))
+                .and_then(|host| {
+                    custom_resource::response_host_region(&host).map(str::to_string)
+                })?,
+        };
+        Some(custom_resource_plane::serve(
+            &*self.engine,
+            req,
+            &region,
+            &target,
+        ))
     }
 
     fn override_framework_error(

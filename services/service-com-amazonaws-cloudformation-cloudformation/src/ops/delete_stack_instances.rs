@@ -443,6 +443,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &removal.region,
                 &removal.resources,
                 &crate::state::provisioning::Teardown {
+                    stack_id: &removal.stack_id,
                     held: &removal.held,
                     // A stack instance's resources are a stack set's deployment of one
                     // template: this path holds no dependency relation of its own, so a

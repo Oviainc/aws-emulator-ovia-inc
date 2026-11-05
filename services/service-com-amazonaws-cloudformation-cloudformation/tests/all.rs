@@ -51,6 +51,8 @@ mod cognito_user_pool_return_values;
 mod content_delivery_stack_outputs;
 #[path = "all/cross_stack_imports.rs"]
 mod cross_stack_imports;
+#[path = "all/custom_resource_providers.rs"]
+mod custom_resource_providers;
 // An EMPTY, moved-out suite: its rows now live in `all/delete_stack_export_in_use.rs`.
 // Declared because the layout check refuses an undeclared file under `tests/all/`, and this
 // fixer's tool set can write a file but not remove one; the next change to touch this

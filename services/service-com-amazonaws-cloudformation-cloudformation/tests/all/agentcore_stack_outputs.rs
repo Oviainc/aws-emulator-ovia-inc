@@ -242,9 +242,7 @@ fn cases() -> Vec<Case> {
         Case {
             // The complement, which keeps the rule honest: an attribute NOTHING here can
             // compute is reported with its key and no value. A sandbox's RUNNING state is
-            // one — nothing here provisioned a sandbox to be in a state — and so are a
-            // `Custom::` resource's return values, which come from a provider this
-            // emulator cannot run (that is the case the AgentCore deployment check drives).
+            // one — nothing here provisioned a sandbox to be in a state.
             case: "an attribute nothing can compute carries no value",
             stack_name: "agentcore-unknowable",
             template: concat!(
@@ -253,22 +251,15 @@ fn cases() -> Vec<Case> {
                 "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
                 "    Properties:\n",
                 "      Name: probeInterpreter\n",
-                "  Provided:\n",
-                "    Type: Custom::CodeInterpreterProvisioner\n",
-                "    Properties:\n",
-                "      ServiceToken: arn:aws:lambda:us-east-1:000000000000:function:provisioner\n",
                 "Outputs:\n",
                 "  InterpreterId:\n",
                 "    Value: !GetAtt Interpreter.CodeInterpreterId\n",
                 "  Status:\n",
                 "    Value: !GetAtt Interpreter.Status\n",
-                "  ProvidedId:\n",
-                "    Value: !GetAtt Provided.CodeInterpreterId\n",
             ),
             expected: vec![
                 ("InterpreterId", Expect::Id("probeInterpreter")),
                 ("Status", Expect::NoValue),
-                ("ProvidedId", Expect::NoValue),
             ],
         },
     ]

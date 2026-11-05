@@ -918,6 +918,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                     &resources,
                     &crate::state::provisioning::Teardown {
+                        stack_id: &stack_id,
                         held: &held,
                         needs: &needs,
                         on_refusal: crate::state::provisioning::OnRefusal::Stop,

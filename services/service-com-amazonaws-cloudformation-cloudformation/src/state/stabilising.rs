@@ -54,6 +54,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use super::provisioning::custom_resource::{ProviderRequest, ProviderResponse};
+
 /// The longest CloudFormation holds ONE resource's creation open waiting for the service
 /// that owns it to report the resource ready.
 ///
@@ -121,6 +123,15 @@ pub struct StabilisationBarrier {
     /// The instant the owning service was first seen to give the answer this barrier waits
     /// for, or `None` while it does not.
     pub released_at: Option<SystemTime>,
+    /// The PROVIDER REQUEST this wait is for, where the resource is a CUSTOM RESOURCE
+    /// ([`super::provisioning::custom_resource`]): such a resource is backed by no API of
+    /// this emulator's, so what ends its wait is not a service's own read but the answer
+    /// the provider PUTs to the request's `ResponseURL`. `None` for every other resource,
+    /// whose wait is that service's answer about the resource.
+    pub provider_request: Option<ProviderRequest>,
+    /// The answer the provider PUT to that request's `ResponseURL`, once it has
+    /// ([`super::ComAmazonawsCloudformationCloudformationState::record_provider_response`]).
+    pub provider_response: Option<ProviderResponse>,
 }
 
 impl StabilisationBarrier {
@@ -131,6 +142,7 @@ impl StabilisationBarrier {
         resource_type: String,
         physical_resource_id: String,
         reported_state: String,
+        provider_request: Option<ProviderRequest>,
         now: SystemTime,
     ) -> Self {
         Self {
@@ -141,6 +153,8 @@ impl StabilisationBarrier {
             reported_state,
             opened_at: now,
             released_at: None,
+            provider_request,
+            provider_response: None,
         }
     }
 
@@ -155,6 +169,11 @@ impl StabilisationBarrier {
         self.awaited == other.awaited
             && self.logical_id == other.logical_id
             && self.physical_resource_id == other.physical_resource_id
+            // A custom resource's wait is identified by the REQUEST it is waiting for as
+            // well: one resource can be asked twice under the same physical id, and only the
+            // answer to the request a barrier was opened for releases that barrier.
+            && self.provider_request.as_ref().map(|request| &request.request_id)
+                == other.provider_request.as_ref().map(|request| &request.request_id)
     }
 
     /// Whether the owning service has given the answer this barrier waits for, so the
