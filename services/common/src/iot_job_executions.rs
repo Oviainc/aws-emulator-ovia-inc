@@ -996,14 +996,41 @@ impl JobExecutionStore {
         removed
     }
 
-    /// How many executions of `job_id` are still pending, on any thing — a job with
-    /// one of these is a job still running on some device.
-    pub fn pending_executions_of_job(&self, job_id: &str) -> usize {
+    /// Every execution of `job_id`, on whichever thing it was queued on, in thing
+    /// order — what a reader of the JOB counts to report how its targets are getting
+    /// on with it.
+    pub fn executions_of_job<'store, 'id>(
+        &'store self,
+        job_id: &'id str,
+    ) -> impl Iterator<Item = &'store JobExecutionRecord> + use<'store, 'id> {
         self.things
             .values()
             .flatten()
-            .filter(|held| held.job_id == job_id && held.is_pending())
+            .filter(move |held| held.job_id == job_id)
+    }
+
+    /// How many executions of `job_id` are still pending, on any thing — a job with
+    /// one of these is a job still running on some device.
+    pub fn pending_executions_of_job(&self, job_id: &str) -> usize {
+        self.executions_of_job(job_id)
+            .filter(|held| held.is_pending())
             .count()
+    }
+
+    /// Materialise the `TIMED_OUT` transition every execution of `job_id` has already
+    /// come due for, and answer how many moved — the job-scoped counterpart of
+    /// [`Self::time_out_due_executions`], for a reader of the whole job rather than of
+    /// one device's queue. See [`JobExecutionRecord::time_out_if_due`] for why a
+    /// reporting handler may write it: each move was owed at that execution's own
+    /// deadline, whether or not this call happened.
+    pub fn time_out_due_executions_of_job(&mut self, job_id: &str, now: i64) -> usize {
+        let mut moved = 0usize;
+        for record in self.things.values_mut().flatten() {
+            if record.job_id == job_id && record.time_out_if_due(now) {
+                moved += 1;
+            }
+        }
+        moved
     }
 
     /// How many COMMAND executions `thing_name` currently holds in a non-terminal

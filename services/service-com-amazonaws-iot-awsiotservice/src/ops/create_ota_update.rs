@@ -233,6 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(unavailable());
         };
+        // The job this update deploys through goes in the SHARED jobs store every
+        // creator of an IoT job records one in.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(unavailable());
+        };
         // The executions the deployed job creates are the device-facing records the
         // IoT Jobs data plane serves, so they go in the SHARED store, not in this
         // service's.
@@ -367,9 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing is written until every target resolves and both ids are free, so a
         // request this operation refuses creates neither the update, nor its job, nor
         // an execution for the targets that did resolve. The lock order is this
-        // service's state first and the shared execution store second, the order
-        // `CreateJob` takes.
+        // service's state first, the shared jobs store second and the shared execution
+        // store third, the order `CreateJob` takes.
         let mut store = state.lock();
+        let mut registry = jobs.lock();
 
         // "The ID of the OTA update to be created" identifies the update, so a second
         // create under a live update's id is the conflict
@@ -391,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if let Some(existing) = store.jobs.get(&aws_iot_job_id) {
+        if let Some(existing) = registry.job(&aws_iot_job_id) {
             return Err(
                 CreateOTAUpdateErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
@@ -403,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if store.jobs.len() >= crate::state::MAX_JOBS {
+        if registry.is_full() {
             return Err(over_limit(format!(
                 "the maximum of {} jobs is already reached",
                 crate::state::MAX_JOBS
@@ -418,8 +424,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let job = crate::state::RegisteredJob {
-            job_id: aws_iot_job_id.clone(),
-            job_arn: ota_update.aws_iot_job_arn.clone(),
             description: ota_update.description.clone(),
             // The document the OTA service generated for this update above: it is the
             // job's own, so `GetJobDocument` reports it and every execution the
@@ -431,8 +435,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             in_progress_timeout_minutes,
             // An OTA update names no substitution parameters: `CreateOTAUpdate` models
             // no `documentParameters`, so the job it deploys carries none.
-            document_parameters: ::std::collections::BTreeMap::new(),
-            created_at: now_seconds,
+            ..crate::state::RegisteredJob::in_progress(
+                aws_iot_job_id.clone(),
+                ota_update.aws_iot_job_arn.clone(),
+                now_seconds,
+            )
         };
 
         let mut pending = executions.lock();
@@ -456,7 +463,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             aws_iot_job_arn: Some(ota_update.aws_iot_job_arn.clone()),
             ota_update_status: Some(ota_update.status.clone()),
         };
-        store.jobs.insert(job.job_id.clone(), job);
+        let (job_id, job_arn) = (job.job_id.clone(), job.job_arn.clone());
+        // The store refuses the same two cases checked above, under the one lock this
+        // whole decision is taken under — so each is answered with the modelled error
+        // for that case here as well, and a refused register writes nothing.
+        if let Err(refusal) = registry.register(job) {
+            return Err(match refusal {
+                crate::state::iot_jobs::RegisterRefusal::AlreadyRegistered => {
+                    CreateOTAUpdateErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(format!("Job {job_id} already exists")),
+                            resource_id: Some(job_id),
+                            resource_arn: Some(job_arn),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::iot_jobs::RegisterRefusal::StoreFull => {
+                    over_limit(refusal.to_string())
+                }
+            });
+        }
         store
             .ota_updates
             .insert(ota_update.ota_update_id.clone(), ota_update);

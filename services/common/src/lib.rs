@@ -57,7 +57,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, eight SHARED STORES live here, each held once in the shared engine so
+//! Beside them, nine SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`acm_certificate_associations`], the directory of which resources reference an ACM
@@ -67,6 +67,11 @@
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
 //!   (a job targets a thing) and the IoT Jobs data plane reads and updates (the device
 //!   polls, starts and reports);
+//! * [`iot_jobs`], the account's IoT jobs — written by every control plane that mints
+//!   one (IoT's own job and OTA-update creates, and the IoT Greengrass V2 deployment
+//!   create, which reports the id and ARN of the job that applies the deployment) and
+//!   read by the IoT jobs plane, which is where a client then describes, deletes or
+//!   waits on that job and so must find the very job the other service reported;
 //! * [`db_data_sources`], the directory of which database service minted an immutable
 //!   DB resource id — written by the database control planes when they mint one, read
 //!   by the services that monitor those resources, which cannot tell an RDS id from a
@@ -332,6 +337,7 @@ pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;
+pub mod iot_jobs;
 /// The ONE construction of the in-process Kinesis client a service DELIVERS a data record
 /// through, so that hop — and the fact that it opens no socket — is configured once rather
 /// than per service.

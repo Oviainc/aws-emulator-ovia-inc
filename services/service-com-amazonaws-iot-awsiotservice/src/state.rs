@@ -97,10 +97,11 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Action, AuthorizerDescription, AwsJobExecutionsRolloutConfig, AwsJobPresignedUrlConfig,
     CodeSigning, CommandParameter, CommandParameterValue, CommandPayload, CommandPreprocessor,
-    GetCommandExecutionOutput, GetCommandOutput, JobExecution, JobExecutionStatusDetails,
-    Mqtt5Configuration, OTAUpdateFile, OTAUpdateInfo, PackageVersionArtifact, PropagatingAttribute,
-    S3Location, Sbom, ThingGroupIndexingConfiguration, ThingIndexingConfiguration, ThingTypeMetadata,
-    ThingTypeProperties, TopicRule, TopicRulePayload,
+    GetCommandExecutionOutput, GetCommandOutput, Job, JobExecution, JobExecutionStatusDetails,
+    JobProcessDetails, Mqtt5Configuration, OTAUpdateFile, OTAUpdateInfo, PackageVersionArtifact,
+    PropagatingAttribute, S3Location, Sbom, ThingGroupIndexingConfiguration,
+    ThingIndexingConfiguration, ThingTypeMetadata, ThingTypeProperties, TimeoutConfig, TopicRule,
+    TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -111,6 +112,21 @@ use crate::ops::types::{
 /// engine keys state by TYPE, and a store two service crates share has to be declared
 /// in a crate they both depend on. See `service_common::iot_commands`.
 pub use ::service_common::iot_commands;
+
+/// The SHARED IoT jobs store, and the record one job is kept as.
+///
+/// Re-exported here for the same reason the job-execution store is: a job is minted by
+/// THIS control plane (`CreateJob`, `CreateOTAUpdate`) *and* by IoT Greengrass V2
+/// (`CreateDeployment` reports the `iotJobId` / `iotJobArn` of the job that applies the
+/// deployment), while it is described, deleted and waited on here — the engine keys
+/// state by TYPE, so a store two service crates share has to be declared in a crate
+/// they both depend on. A handler reaches the store through [`job_store`].
+/// See `service_common::iot_jobs`.
+pub use ::service_common::iot_jobs;
+/// One job in the jobs plane, as the services that mint one persist it. The record is
+/// shared (see [`iot_jobs`]); this crate names it `RegisteredJob` beside its other
+/// `Registered*` records.
+pub use ::service_common::iot_jobs::{IotJob as RegisteredJob, MAX_JOBS};
 
 /// The configuration of a thing: the members of a `CreateThing` request that
 /// describe the thing rather than name it.
@@ -635,17 +651,15 @@ pub fn derive_endpoint_identifier(account_id: &str, region: &str) -> String {
 /// whatever region it is signed for. Partitioning the control plane by region is a
 /// separate change; nothing here claims it.
 ///
-/// The JOB EXECUTIONS a job creates do not live here: they are the device-facing
-/// records the IoT Jobs data plane serves, so both services reach the one shared
-/// store ([`job_execution_store`]) instead of each keeping a copy.
+/// The JOBS this account holds do not live here, and neither do the JOB EXECUTIONS a
+/// job creates: a job is minted by this control plane AND by IoT Greengrass V2, and its
+/// executions are the device-facing records the IoT Jobs data plane serves, so every
+/// service on either side of those hand-offs reaches the one shared store ([`job_store`],
+/// [`job_execution_store`]) instead of each keeping a copy.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotAwsiotserviceState {
     /// Every thing that exists, keyed by `thingName`.
     pub things: BTreeMap<String, RegisteredThing>,
-    /// Every job that exists, keyed by `jobId` — "A job identifier which must be
-    /// unique for your account" (`CreateJob$jobId`), which is what makes the id the
-    /// key and a repeat create a conflict.
-    pub jobs: BTreeMap<String, RegisteredJob>,
     /// Every thing group that exists, keyed by `thingGroupName`.
     ///
     /// The name is the group's identity — the model binds it as the `@httpLabel` of
@@ -1206,13 +1220,8 @@ pub fn parse_job_target(target_arn: &str) -> Result<JobTarget, JobTargetRejectio
     }
 }
 
-/// How many jobs this emulator keeps for the account.
-///
-/// AWS publishes a service quota on an account's jobs; the exact figure is not in
-/// the model, so this is the emulator's own ceiling on a store a caller can grow,
-/// and `CreateJob` past it answers the modelled `LimitExceededException` rather than
-/// growing without bound.
-pub const MAX_JOBS: usize = 10_000;
+// How many jobs this emulator keeps for the account is the SHARED store's own ceiling:
+// `MAX_JOBS`, re-exported at the top of this module beside the store it bounds.
 
 /// How many `targets` ONE request that creates a job may name.
 ///
@@ -1347,45 +1356,10 @@ pub fn queue_job_executions(
     pending.try_insert_executions(records)
 }
 
-/// One job in the control plane, as this service persists it.
-///
-/// It holds what a job NEEDS to be reconstructed by a reader and to create its
-/// executions. The members that shape a ROLLOUT rather than the executions
-/// themselves (`jobExecutionsRolloutConfig`, `abortConfig`,
-/// `jobExecutionsRetryConfig`, `presignedUrlConfig`, `tags`, …) are NOT kept: nothing
-/// stages a rollout here, so storing them would promise a later reader data this
-/// record does not carry. `targets` IS kept verbatim, so a reader still reports what
-/// the job was pointed at.
-#[derive(Debug, Clone)]
-pub struct RegisteredJob {
-    /// The id the job was created under; also its key in the store.
-    pub job_id: String,
-    /// `arn:aws:iot:<region>:<account>:job/<jobId>`, minted on create.
-    pub job_arn: String,
-    /// The description the job was created with, when it has one.
-    pub description: Option<String>,
-    /// The job document, when the request carried one. `None` for a job created
-    /// from `documentSource`: that names an S3 object this emulator does not fetch,
-    /// so it reports no document rather than inventing one.
-    pub document: Option<String>,
-    /// The `documentSource` the job was created with, when it has one.
-    pub document_source: Option<String>,
-    /// The targets the job was created with, verbatim.
-    pub targets: Vec<String>,
-    /// `targetSelection` as supplied (`CONTINUOUS` / `SNAPSHOT`), or `None` when the
-    /// request left it out.
-    pub target_selection: Option<String>,
-    /// `timeoutConfig.inProgressTimeoutInMinutes`, carried onto every execution the
-    /// job creates.
-    pub in_progress_timeout_minutes: Option<i64>,
-    /// The `documentParameters` the job was created with: the values its document's
-    /// substitution parameters resolve to. Kept so a reader can report the document
-    /// BOTH ways — as written, and with every parameter resolved — which is what the
-    /// `beforeSubstitution` flag on the job readers selects between.
-    pub document_parameters: BTreeMap<String, String>,
-    /// When the job was created, in epoch seconds.
-    pub created_at: i64,
-}
+// One job in the control plane is the SHARED `IotJob` record, re-exported at the top of
+// this module as `RegisteredJob`: a job minted here and a job minted by a Greengrass
+// deployment are one record in one store, which is what lets either be described,
+// deleted or waited on through this plane.
 
 /// How many `documentParameters` ONE job may carry.
 ///
@@ -2646,9 +2620,10 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// TYPE, so a copy of its own here would be invisible to the device.
 ///
 /// LOCK ORDER, for an operation that writes BOTH stores: take
-/// [`service_state`] first and this one second (`CreateJob` and `DeleteJob` both do).
-/// The data-plane handlers take only this one, so that order has no inversion — keep
-/// it if another writer of both is added.
+/// [`service_state`] first and this one second (`CreateJob` and `DeleteJob` both do),
+/// and the SHARED JOB store ([`job_store`]) between them. The data-plane handlers take
+/// only this one, so that order has no inversion — keep it if another writer of both is
+/// added.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
 pub fn job_execution_store<Eng: Send + Sync + 'static>(
@@ -2657,6 +2632,171 @@ pub fn job_execution_store<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<JobExecutionStore>)
+}
+
+/// The SHARED IoT jobs store in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A job is minted by this control plane (`CreateJob`, and one per `CreateOTAUpdate`)
+/// and by IoT Greengrass V2 (`CreateDeployment` reports the id and ARN of the job that
+/// applies the deployment), and is described, deleted and waited on HERE — so it is one
+/// store under one shared type, `service_common::iot_jobs::IotJobStore`, and not a copy
+/// inside [`ComAmazonawsIotAwsiotserviceState`]: the engine keys state by TYPE, so a
+/// copy of its own here would be invisible to the other creator and a job it minted
+/// would address nothing.
+///
+/// LOCK ORDER: [`service_state`] first, this one second, [`job_execution_store`] third.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn job_store<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<iot_jobs::IotJobStore>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<iot_jobs::IotJobStore>)
+}
+
+/// What a job's TARGETS have made of it: the `JobStatus` it reports, when it was
+/// completed, and the per-status counts `jobProcessDetails` carries.
+///
+/// It is COUNTED from the executions in the shared store rather than stored a second
+/// time on the job, so what a reader of the job says and what a reader of one device's
+/// execution says cannot disagree.
+#[derive(Debug, Clone)]
+pub struct JobProgress {
+    /// The `JobStatus` to report.
+    pub status: String,
+    /// When the job was completed, in epoch seconds — only for a job that IS
+    /// completed, since `Job$completedAt` is "the time … when the job was completed".
+    pub completed_at: Option<i64>,
+    /// `Job$jobProcessDetails`.
+    pub details: JobProcessDetails,
+}
+
+/// How far a job's targets have got with it, from the executions the shared store
+/// holds.
+///
+/// The job's own `status` decides while it is TERMINAL — a cancelled job rolls out to
+/// nothing further, whatever its executions say. Otherwise a SNAPSHOT job that has
+/// executions and no PENDING one is `COMPLETED`: `Job$targetSelection` documents such a
+/// job as one that "will be complete after all those things specified as targets have
+/// completed the job". A `CONTINUOUS` job "will continue to run", and a job whose
+/// creator named no selection documents neither, so both keep the status their creator
+/// recorded.
+///
+/// `processingTargets` is "the target devices to which the job execution is being
+/// rolled out. This value will be null after the job execution has finished rolling out
+/// to all the target devices", so it lists the things whose execution is still pending
+/// and is left out once none is.
+pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobProgress {
+    let mut details = JobProcessDetails::default();
+    let mut processing: Vec<String> = Vec::new();
+    let (mut total, mut pending) = (0usize, 0usize);
+    let mut finished_at: Option<i64> = None;
+    for record in executions.executions_of_job(&job.job_id) {
+        total += 1;
+        // The modelled `JobExecutionStatus` values
+        // (`super::types::JOB_EXECUTION_STATUS_VALUES`), each counted into the member
+        // `JobProcessDetails` declares for it.
+        let bucket = match record.status.as_str() {
+            "QUEUED" => &mut details.number_of_queued_things,
+            "IN_PROGRESS" => &mut details.number_of_in_progress_things,
+            "SUCCEEDED" => &mut details.number_of_succeeded_things,
+            "FAILED" => &mut details.number_of_failed_things,
+            "REJECTED" => &mut details.number_of_rejected_things,
+            "TIMED_OUT" => &mut details.number_of_timed_out_things,
+            "CANCELED" => &mut details.number_of_canceled_things,
+            "REMOVED" => &mut details.number_of_removed_things,
+            // A status outside the enum counts towards no bucket rather than towards
+            // the wrong one.
+            _ => continue,
+        };
+        *bucket = Some(bucket.unwrap_or(0).saturating_add(1));
+        if record.is_pending() {
+            pending += 1;
+            processing.push(record.thing_name.clone());
+        } else {
+            finished_at = Some(
+                finished_at
+                    .unwrap_or(record.last_updated_at)
+                    .max(record.last_updated_at),
+            );
+        }
+    }
+    details.processing_targets = (!processing.is_empty()).then_some(processing);
+
+    let completed = !job.is_terminal() && job.is_snapshot() && total > 0 && pending == 0;
+    let status = if completed {
+        iot_jobs::JOB_STATUS_COMPLETED.to_string()
+    } else {
+        job.status.clone()
+    };
+    JobProgress {
+        status,
+        // The job was completed when its last execution finished.
+        completed_at: completed.then_some(finished_at).flatten(),
+        details,
+    }
+}
+
+/// A stored job as the modeled `Job` this plane reports.
+///
+/// The shared store holds the job; this is the only place that projects it onto the
+/// shapes THIS model declares, so every reader of a job here reports one value for one
+/// record — whichever service minted it.
+///
+/// The members a job CARRIES come from the record, and the members its rollout has
+/// REACHED from the executions ([`job_progress`]). The rollout-shaping members no
+/// creator persists (`presignedUrlConfig`, `jobExecutionsRolloutConfig`, `abortConfig`,
+/// `jobExecutionsRetryConfig`, `schedulingConfig`, `jobTemplateArn`, `namespaceId`,
+/// `destinationPackageVersions`) are left OUT rather than reported empty: nothing
+/// stages a rollout here, so reporting them would claim data no record carries.
+/// `forceCanceled` is "true if the job was canceled with the optional force parameter
+/// set to true" and nothing force-cancels a job yet, so there is no stored force-cancel
+/// to report; `reasonCode` and `comment` are "if the job was updated" and `UpdateJob`
+/// is still a scaffold.
+pub fn to_job(job: &RegisteredJob, executions: &JobExecutionStore) -> Job {
+    let progress = job_progress(job, executions);
+    Job {
+        job_arn: Some(job.job_arn.clone()),
+        job_id: Some(job.job_id.clone()),
+        target_selection: job.target_selection.clone(),
+        status: Some(progress.status),
+        force_canceled: None,
+        reason_code: None,
+        comment: None,
+        // `JobTargets` is modelled `len 1..`, so a job with no stored target reports
+        // no list rather than an empty one.
+        targets: (!job.targets.is_empty()).then(|| job.targets.clone()),
+        description: job.description.clone(),
+        presigned_url_config: None,
+        job_executions_rollout_config: None,
+        abort_config: None,
+        created_at: Some(::aws_smithy_types::DateTime::from_secs(job.created_at)),
+        last_updated_at: Some(::aws_smithy_types::DateTime::from_secs(job.last_updated_at)),
+        completed_at: progress
+            .completed_at
+            .map(::aws_smithy_types::DateTime::from_secs),
+        job_process_details: Some(progress.details),
+        timeout_config: job
+            .in_progress_timeout_minutes
+            .map(|minutes| TimeoutConfig {
+                in_progress_timeout_in_minutes: Some(minutes),
+            }),
+        namespace_id: None,
+        job_template_arn: None,
+        job_executions_retry_config: None,
+        document_parameters: (!job.document_parameters.is_empty()).then(|| {
+            job.document_parameters
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }),
+        is_concurrent: None,
+        scheduling_config: None,
+        scheduled_job_rollouts: None,
+        destination_package_versions: None,
+    }
 }
 
 /// A stored job execution as the modeled `JobExecution` this CONTROL plane reports.

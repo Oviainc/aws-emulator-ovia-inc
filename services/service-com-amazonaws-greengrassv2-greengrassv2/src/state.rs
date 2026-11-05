@@ -624,6 +624,29 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsGreengrassv2Greengrassv2State>)
 }
 
+/// The SHARED IoT jobs store in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A deployment is APPLIED by an AWS IoT job — `CreateDeployment` reports that job's
+/// `iotJobId` and `iotJobArn` — and a client then tracks the rollout through the IoT
+/// jobs plane, which is a different service crate. So the job this service mints is
+/// recorded in the one store that plane reads,
+/// `service_common::iot_jobs::IotJobStore`, and not in
+/// [`ComAmazonawsGreengrassv2Greengrassv2State`]: the engine keys state by TYPE, so a
+/// copy of its own here would be invisible there and the id this service reports would
+/// address nothing.
+///
+/// LOCK ORDER: [`service_state`] first, this one second.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn iot_job_store<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::iot_jobs::IotJobStore>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::iot_jobs::IotJobStore>)
+}
+
 // ---------------------------------------------------------------------------
 // Request-derived values
 // ---------------------------------------------------------------------------
@@ -894,6 +917,17 @@ pub fn to_datetime(instant: SystemTime) -> ::aws_smithy_types::DateTime {
         .unwrap_or_default()
         .as_millis();
     ::aws_smithy_types::DateTime::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
+}
+
+/// A `SystemTime` in epoch SECONDS, which is how the shared IoT stores timestamp a
+/// record — so the deployment and the IoT job it creates are stamped from one instant
+/// rather than from two clock reads.
+pub fn epoch_seconds(instant: SystemTime) -> i64 {
+    let seconds = instant
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    i64::try_from(seconds).unwrap_or(i64::MAX)
 }
 
 /// An optional tag map for a response: Greengrass reports the tag set of a resource

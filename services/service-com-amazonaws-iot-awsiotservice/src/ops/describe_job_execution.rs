@@ -162,7 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into()
         };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        // The job the execution belongs to lives in the SHARED jobs store every creator
+        // of an IoT job records one in.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
             return Err(unavailable());
         };
         // The executions live in the SHARED store the IoT Jobs data plane serves, so
@@ -188,15 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::service_common::iot_job_executions::now_epoch_seconds();
 
-        // LOCK ORDER: this service's store first, the shared one second, as
-        // `crate::state::job_execution_store` documents. A job execution belongs to a
-        // job of this account's registry (`CreateJob$jobId` is "A job identifier which
-        // must be unique for your account"), so a `jobId` the registry does not hold
-        // has no job execution to report — which is also what keeps a COMMAND
-        // execution, keyed in the shared store by its own minted `executionId` and
-        // read through `GetCommandExecution`, from being reported here as a job
-        // execution.
-        if !state.lock().jobs.contains_key(&input.job_id) {
+        // LOCK ORDER: the shared jobs store first, the shared execution store second,
+        // as `crate::state::job_store` documents. A job execution belongs to a job of
+        // this account's jobs store (`CreateJob$jobId` is "A job identifier which must
+        // be unique for your account"), so a `jobId` that store does not hold has no
+        // job execution to report — which is also what keeps a COMMAND execution, keyed
+        // in the shared execution store by its own minted `executionId` and read through
+        // `GetCommandExecution`, from being reported here as a job execution.
+        if !jobs.lock().contains(&input.job_id) {
             return Err(not_found());
         }
 

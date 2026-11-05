@@ -176,16 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(unavailable());
         };
-        // The deployed job's executions are the device-facing records the IoT Jobs data
-        // plane serves, so removing the update reaches into the SHARED store they live
-        // in, the same one `CreateOTAUpdate` wrote them to.
+        // The deployed job lives in the SHARED jobs store `CreateOTAUpdate` recorded it
+        // in, and its executions are the device-facing records the IoT Jobs data plane
+        // serves, so removing the update reaches into both SHARED stores.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(unavailable());
+        };
         let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
             return Err(unavailable());
         };
 
-        // The lock order is this service's state first and the shared execution store
-        // second, the order `CreateOTAUpdate` takes.
+        // The lock order is this service's state first, the shared jobs store second and
+        // the shared execution store third, the order `CreateOTAUpdate` takes.
         let mut store = state.lock();
+        let mut registry = jobs.lock();
         let Some(ota_update) = store.ota_updates.get(&input.ota_update_id) else {
             return Err(DeleteOTAUpdateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -220,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing was removed until here, so a refused delete leaves the update, its
         // job and every execution exactly as they were.
         pending.remove_job_executions(&job_id);
-        store.jobs.remove(&job_id);
+        registry.remove(&job_id);
         store.ota_updates.remove(&input.ota_update_id);
         Ok(DeleteOTAUpdateOutput {})
     }

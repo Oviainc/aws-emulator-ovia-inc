@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only; this operation needs none of it.
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| -> Self::Error {
+        let jobs = crate::state::job_store(&*self.engine).ok_or_else(|| -> Self::Error {
             GetJobDocumentErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the IoT emulator has no state store attached".to_string()),
             })
@@ -168,8 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and resolved after it is released, so one read never holds the store while it
         // builds a response.
         let stored = {
-            let store = state.lock();
-            let job = store.jobs.get(&input.job_id).ok_or_else(|| -> Self::Error {
+            let registry = jobs.lock();
+            let job = registry.job(&input.job_id).ok_or_else(|| -> Self::Error {
                 GetJobDocumentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(format!("Job {} does not exist", input.job_id)),
                 })

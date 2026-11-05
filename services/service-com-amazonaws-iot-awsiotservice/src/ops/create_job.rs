@@ -240,6 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(unavailable());
         };
+        // The job itself goes in the SHARED jobs store, which is where every creator of
+        // an IoT job records one and where this plane's readers find it.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(unavailable());
+        };
         // The executions this job creates are the device-facing records the IoT Jobs
         // data plane serves, so they go in the SHARED store, not in this service's.
         let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
@@ -350,9 +355,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::service_common::iot_job_executions::now_epoch_seconds();
+        // The identity and the lifecycle come from the shared record's constructor (a
+        // job that is rolling out), the rest from this request.
         let job = crate::state::RegisteredJob {
-            job_id: input.job_id.clone(),
-            job_arn: crate::state::job_arn(&region, &input.job_id),
             description: input.description.clone(),
             document: input.document.clone(),
             document_source: input.document_source.clone(),
@@ -363,19 +368,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|config| config.in_progress_timeout_in_minutes),
             document_parameters,
-            created_at: now,
+            ..crate::state::RegisteredJob::in_progress(
+                input.job_id.clone(),
+                crate::state::job_arn(&region, &input.job_id),
+                now,
+            )
         };
 
         // Nothing is written until every target resolves and the id is free, so a
         // request this operation refuses creates neither the job nor an execution for
         // the targets that did resolve. Only the DECISION and the writes are inside
         // the locks; the bounded work above is not.
-        let mut store = state.lock();
+        let store = state.lock();
+        // LOCK ORDER: this service's store first, the shared jobs store second, the
+        // shared execution store third, as `crate::state::job_store` documents.
+        let mut registry = jobs.lock();
 
         // "A job identifier which must be unique for your account": a second
         // CreateJob under a live job's id is the conflict
         // `ResourceAlreadyExistsException` (HTTP 409) names.
-        if let Some(existing) = store.jobs.get(&job.job_id) {
+        if let Some(existing) = registry.job(&job.job_id) {
             return Err(CreateJobErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
                     message: Some(format!("Job {} already exists", existing.job_id)),
@@ -385,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store.jobs.len() >= crate::state::MAX_JOBS {
+        if registry.is_full() {
             return Err(over_limit(format!(
                 "the maximum of {} jobs is already reached",
                 crate::state::MAX_JOBS
@@ -421,7 +433,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_id: Some(job.job_id.clone()),
             description: job.description.clone(),
         };
-        store.jobs.insert(job.job_id.clone(), job);
+        let (job_id, job_arn) = (job.job_id.clone(), job.job_arn.clone());
+        // The store refuses the same two cases checked above, under the one lock this
+        // whole decision is taken under — so each is answered with the modelled error
+        // for that case here as well, and a refused register writes nothing.
+        if let Err(refusal) = registry.register(job) {
+            return Err(match refusal {
+                crate::state::iot_jobs::RegisterRefusal::AlreadyRegistered => {
+                    CreateJobErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(format!("Job {job_id} already exists")),
+                            resource_id: Some(job_id),
+                            resource_arn: Some(job_arn),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::iot_jobs::RegisterRefusal::StoreFull => {
+                    over_limit(refusal.to_string())
+                }
+            });
+        }
         Ok(output)
     }
 }

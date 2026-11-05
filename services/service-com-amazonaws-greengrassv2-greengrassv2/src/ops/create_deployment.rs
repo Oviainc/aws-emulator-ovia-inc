@@ -193,6 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The deployment is applied by an AWS IoT job, and this response reports that
+        // job's id and ARN — so the job is created in the store the IoT jobs plane
+        // reads, which is where a client then describes, cancels or waits on it.
+        let Some(iot_jobs) = st::iot_job_store(&*self.engine) else {
+            return Err(CreateDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the shared IoT jobs store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
 
         let now = ::std::time::SystemTime::now();
         let region = st::request_region(ctx.parts());
@@ -243,6 +255,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_timestamp: now,
             tags: st::tags_in(input.tags.as_ref()),
         };
+        // The IoT job that applies this deployment, in the plane that owns jobs: the id
+        // and ARN this call reports address THIS record, so `iot:DescribeJob` answers
+        // for them. The job targets what the deployment targets, and is CONTINUOUS
+        // because the deployment is — "when you add a new core device to a group of core
+        // devices that has a deployment, IoT Greengrass deploys that group's deployment
+        // to the new device" — and it carries the in-progress timeout the request's job
+        // configuration set, which is the timer each device's execution runs under.
+        //
+        // It is registered BEFORE the deployment is recorded, so a job that cannot be
+        // created (an id already taken, a jobs store at its ceiling) leaves no
+        // deployment behind and nothing reports a job identity that addresses nothing.
+        let iot_job = ::service_common::iot_jobs::IotJob {
+            targets: vec![input.target_arn.clone()],
+            target_selection: Some(
+                ::service_common::iot_jobs::TARGET_SELECTION_CONTINUOUS.to_string(),
+            ),
+            in_progress_timeout_minutes: input
+                .iot_job_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.timeout_config.as_ref())
+                .and_then(|timeout| timeout.in_progress_timeout_in_minutes),
+            ..::service_common::iot_jobs::IotJob::in_progress(
+                iot_job_id.clone(),
+                iot_job_arn.clone(),
+                st::epoch_seconds(now),
+            )
+        };
+        // LOCK ORDER: this service's store first, the shared jobs store second, as
+        // `st::iot_job_store` documents.
+        if let Err(refusal) = iot_jobs.lock().register(iot_job) {
+            return Err(CreateDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "the IoT job that applies this deployment could not be created: \
+                         {refusal}"
+                    ),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        }
+
         // Records the deployment as the newest revision for its target, demotes
         // whichever deployment held that position, and trims the target's history.
         store.insert_deployment(entry);

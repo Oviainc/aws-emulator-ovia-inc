@@ -170,11 +170,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Cancelling what is already cancelled changes nothing and is not a failure:
         // the operation asks for a terminal status, which the deployment already has.
+        let iot_job_id = entry.iot_job_id.clone();
         let previous = ::std::mem::replace(
             &mut entry.deployment_status,
             st::DEPLOYMENT_STATUS_CANCELED.to_string(),
         );
         drop(store);
+
+        // "Cancels a deployment. This operation cancels the deployment for devices that
+        // haven't yet received it" — which is what cancelling the IoT job that applies
+        // it does, so the job this deployment reported is moved to the terminal
+        // `CANCELED` status in the plane that owns jobs, where a client reads it. A
+        // deployment whose job is no longer there (deleted through the jobs plane) is
+        // cancelled on its own.
+        if let Some(iot_jobs) = st::iot_job_store(&*self.engine) {
+            let now = ::service_common::iot_job_executions::now_epoch_seconds();
+            if let Some(job) = iot_jobs.lock().job_mut(&iot_job_id) {
+                job.set_status(::service_common::iot_jobs::JOB_STATUS_CANCELED, now);
+            }
+        }
 
         // Audit record for a state-changing call: who asked, what changed, and how it
         // ended. The presented access-key id is an identifier, never a secret.

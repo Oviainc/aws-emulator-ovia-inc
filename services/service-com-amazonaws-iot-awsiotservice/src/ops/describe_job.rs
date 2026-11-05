@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one IoT job from the shared jobs store: what it was created with, and how
+//! far its targets have got with it.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +138,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJob"))
+        // `ctx` carries request metadata only; this operation needs none of it — a job
+        // is reported with the ARN its creator minted, not one rebuilt per request.
+        let _ = ctx;
+        // `beforeSubstitution` selects "a view of the job document before and after the
+        // substitution parameters have been resolved", and this operation's output
+        // carries no job document at all (`documentSource` is a link, and `Job` has no
+        // document member), so it selects between two identical answers here. The
+        // document itself is reported by `GetJobDocument`, which honours the flag.
+        let _ = input.before_substitution;
+        let unavailable = || -> DescribeJobError {
+            DescribeJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        // The job lives in the SHARED jobs store every creator of an IoT job records one
+        // in — this plane's `CreateJob` and `CreateOTAUpdate`, and the Greengrass V2
+        // deployment create, which reports the id and ARN of the job that applies the
+        // deployment — so this read answers for the job whichever of them minted it.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+        // How far the job's targets have got with it is counted from the executions the
+        // IoT Jobs data plane serves, so the job's progress and the device's own view of
+        // its execution are one record read two ways.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        let now = ::service_common::iot_job_executions::now_epoch_seconds();
+
+        // LOCK ORDER: the shared jobs store first, the shared execution store second,
+        // as `crate::state::job_store` documents.
+        let registry = jobs.lock();
+        let Some(job) = registry.job(&input.job_id) else {
+            // A `jobId` no creator recorded names no job: the modelled 404, never a
+            // success reporting a job that does not exist.
+            return Err(DescribeJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Job {} does not exist", input.job_id)),
+                },
+            )
+            .into());
+        };
+
+        let mut pending = executions.lock();
+        // A timer the job or a device armed moves an execution to `TIMED_OUT` by itself,
+        // so the transitions the clock has already made due are recorded before the
+        // job's progress is counted: each was owed at its own deadline whether or not
+        // this call happened, and a later reader of either store must see the same one.
+        pending.time_out_due_executions_of_job(&input.job_id, now);
+
+        Ok(DescribeJobOutput {
+            // "An S3 link to the job document": reported for a job created from one,
+            // and left out for a job whose document the request carried inline.
+            document_source: job.document_source.clone(),
+            job: Some(crate::state::to_job(job, &pending)),
+        })
     }
 }

@@ -27,6 +27,8 @@ mod describe_endpoint;
 mod fleet_index_description;
 #[path = "all/indexing_configuration.rs"]
 mod indexing_configuration;
+#[path = "all/job_description.rs"]
+mod job_description;
 #[path = "all/job_document_read.rs"]
 mod job_document_read;
 #[path = "all/job_execution_read.rs"]

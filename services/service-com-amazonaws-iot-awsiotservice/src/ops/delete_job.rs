@@ -200,7 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into()
         };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        // The job lives in the SHARED jobs store every creator of an IoT job records
+        // one in, so this delete reaches the very record the create wrote.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
             return Err(unavailable());
         };
         // "Deletes a job AND ITS RELATED JOB EXECUTIONS": those live in the shared
@@ -209,8 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(unavailable());
         };
 
-        let mut store = state.lock();
-        if !store.jobs.contains_key(&input.job_id) {
+        // LOCK ORDER: the shared jobs store first, the shared execution store second,
+        // as `crate::state::job_store` documents.
+        let mut registry = jobs.lock();
+        if !registry.contains(&input.job_id) {
             return Err(DeleteJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Job {} does not exist", input.job_id)),
@@ -241,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         pending.remove_job_executions(&input.job_id);
-        store.jobs.remove(&input.job_id);
+        registry.remove(&input.job_id);
         Ok(DeleteJobOutput {})
     }
 }
