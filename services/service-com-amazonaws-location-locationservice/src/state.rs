@@ -173,6 +173,24 @@ pub const MAX_ROUTE_CALCULATORS: usize = 1_000;
 /// `ServiceQuotaExceededException` rather than growing the store without limit.
 pub const MAX_GEOFENCE_COLLECTIONS: usize = 1_000;
 
+/// Emulator memory bound, NOT an AWS quota: geofences held per collection, the
+/// least recently updated evicted first. The real service bounds a collection with
+/// its own quota; this cap exists so repeated writes cannot grow the in-memory store
+/// without limit, and is chosen large enough that a client never meets it in a
+/// normal session. [`GeofenceCollection::record_geofence`] is where it is applied,
+/// and is the contract a geofence write uses: `PutGeofence` and `BatchPutGeofence`
+/// are scaffolded 501s today, so the only way into this map goes through that
+/// helper.
+pub const MAX_GEOFENCES_PER_COLLECTION: usize = 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: consumer associations held per tracker.
+/// [`Tracker::associate_consumer`] reports no room past it rather than growing the
+/// store without limit, so a caller minting unbounded collection ARNs is refused
+/// instead of accumulating them. It is the contract an association write uses:
+/// `AssociateTrackerConsumer` is a scaffolded 501 today, so the only way into this
+/// set goes through that helper.
+pub const MAX_CONSUMERS_PER_TRACKER: usize = 100;
+
 impl Tracker {
     /// Record `sample` in its device's history, keeping the history sorted ascending
     /// by `sample_time`, then apply the retention window and the memory bounds.
@@ -232,10 +250,11 @@ impl Tracker {
             // Logged because this discards stored positions on an otherwise
             // successful write: someone debugging a device that stopped answering
             // GetDevicePosition needs to see that the bound, not the caller,
-            // dropped it.
+            // dropped it. The ids are rendered with Debug, so a value carrying
+            // control characters cannot forge a line of the emulator's log.
             ::tracing::warn!(
-                tracker = %self.name,
-                device_id = %device_id,
+                tracker = ?self.name,
+                device_id = ?device_id,
                 max_devices_per_tracker = MAX_DEVICES_PER_TRACKER,
                 "evicting the least recently sampled device to stay within the emulator's per-tracker device bound"
             );
@@ -247,6 +266,66 @@ impl Tracker {
     /// device has no stored position under this tracker.
     pub fn latest_position(&self, device_id: &str) -> Option<&StoredPosition> {
         self.devices.get(device_id)?.last()
+    }
+
+    /// Associate `consumer_arn` with this tracker, reporting whether the tracker
+    /// holds it afterwards.
+    ///
+    /// An ARN the tracker already holds stays held and is never refused (the set
+    /// holds each one once). `false` is "no room": the tracker already holds
+    /// [`MAX_CONSUMERS_PER_TRACKER`] other consumers, so the association is not made
+    /// and the caller refuses it rather than growing the store without limit.
+    #[must_use]
+    pub fn associate_consumer(&mut self, consumer_arn: String) -> bool {
+        if self.consumer_arns.contains(&consumer_arn) {
+            return true;
+        }
+        if self.consumer_arns.len() >= MAX_CONSUMERS_PER_TRACKER {
+            return false;
+        }
+        self.consumer_arns.insert(consumer_arn)
+    }
+}
+
+impl GeofenceCollection {
+    /// Store `geofence` under this collection, keyed by its `GeofenceId`, and apply
+    /// the memory bound.
+    ///
+    /// A put for an id the collection already holds REPLACES it, so re-putting a
+    /// geofence never grows the collection; a NEW id past
+    /// [`MAX_GEOFENCES_PER_COLLECTION`] evicts the least recently updated geofence
+    /// first, so what one collection holds is bounded however many puts arrive.
+    pub fn record_geofence(&mut self, geofence: Geofence) {
+        if self.geofences.len() >= MAX_GEOFENCES_PER_COLLECTION
+            && !self.geofences.contains_key(&geofence.geofence_id)
+        {
+            self.evict_least_recently_updated_geofence();
+        }
+        self.geofences
+            .insert(geofence.geofence_id.clone(), geofence);
+    }
+
+    /// Drop the geofence whose `UpdateTime` is the oldest, to make room under
+    /// [`MAX_GEOFENCES_PER_COLLECTION`].
+    fn evict_least_recently_updated_geofence(&mut self) {
+        let stale = self
+            .geofences
+            .iter()
+            .min_by_key(|(_, geofence)| geofence.update_time)
+            .map(|(geofence_id, _)| geofence_id.clone());
+        if let Some(geofence_id) = stale {
+            // Logged for the reason the device eviction above is: this discards a
+            // stored geofence on an otherwise successful write, and the id is
+            // rendered with Debug so a value carrying control characters cannot
+            // forge a line of the emulator's log.
+            ::tracing::warn!(
+                collection = ?self.name,
+                geofence_id = ?geofence_id,
+                max_geofences_per_collection = MAX_GEOFENCES_PER_COLLECTION,
+                "evicting the least recently updated geofence to stay within the emulator's per-collection geofence bound"
+            );
+            self.geofences.remove(&geofence_id);
+        }
     }
 }
 
@@ -421,18 +500,31 @@ pub fn wgs84_position(position: &[f64]) -> Result<[f64; 2], String> {
         }
     };
     if !(-MAX_LONGITUDE..=MAX_LONGITUDE).contains(&longitude) {
-        return Err(format!(
-            "Position longitude must be between {} and {MAX_LONGITUDE} degrees; got {longitude}",
-            -MAX_LONGITUDE
-        ));
+        return Err(outside_wgs84_domain(LONGITUDE_AXIS, MAX_LONGITUDE));
     }
     if !(-MAX_LATITUDE..=MAX_LATITUDE).contains(&latitude) {
-        return Err(format!(
-            "Position latitude must be between {} and {MAX_LATITUDE} degrees; got {latitude}",
-            -MAX_LATITUDE
-        ));
+        return Err(outside_wgs84_domain(LATITUDE_AXIS, MAX_LATITUDE));
     }
     Ok([longitude, latitude])
+}
+
+/// The axis name the coordinate-domain refusal states for a `Position`'s first
+/// value: "WGS 84 format: `[X or longitude, Y or latitude]`".
+const LONGITUDE_AXIS: &str = "longitude";
+
+/// The axis name the same refusal states for a `Position`'s second value.
+const LATITUDE_AXIS: &str = "latitude";
+
+/// The sentence a coordinate outside its WGS 84 bound is refused with.
+///
+/// It names the axis and the two bounds of that axis's domain, and nothing else:
+/// no model member name, and never the submitted coordinate — `Position` is
+/// `@sensitive`, so a value read from the request may not appear in an error
+/// string. The only variable parts are the bounds, which are the domain constants
+/// (`±180` for longitude, `±90` for latitude), so the text a caller matches on is
+/// the same for every rejected coordinate of an axis.
+fn outside_wgs84_domain(axis: &str, bound: f64) -> String {
+    format!("{axis} must be between {} and {bound} degrees", -bound)
 }
 
 /// The `BatchItemError$Code` a per-entry input failure carries: the
