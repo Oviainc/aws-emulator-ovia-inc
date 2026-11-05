@@ -21,9 +21,10 @@
 //! * a pair that resolves to no stored domain name is that record's missing-resource
 //!   `NotFoundException` rather than an empty page, while a stored record carrying no
 //!   mapping reports an EMPTY page;
-//! * the listing is computed from the stored records, so a mapping a later call patches,
-//!   or whose REST API is deleted out from under it, is reported as the store then holds
-//!   it; and reading the collection changes nothing a later caller sees.
+//! * the listing is computed from the stored records, so a mapping a later call patches is
+//!   reported as the store then holds it — and a delete of the REST API it names is refused
+//!   while the mapping stands, so the listing never reports a mapping whose API has gone;
+//!   and reading the collection changes nothing a later caller sees.
 //!
 //! [`Gateway`], [`Answer`], [`assert_failure`], [`string_member`] and [`page_items`] are
 //! this crate's one wire-test harness, reused rather than standing a second emulator up
@@ -454,16 +455,17 @@ async fn the_listing_reports_the_stored_mappings_as_later_calls_leave_them() {
         patched.status, patched.body
     );
 
-    // Deleting the REST API a mapping points at leaves that MAPPING where it was: the
-    // mapping names the API by identifier and the delete of an API is not a delete of the
-    // domain name's records, so the collection still reports it.
-    let deleted = gateway
+    // Deleting the REST API a mapping points at is REFUSED while the mapping stands — the
+    // mapping names that API, so the delete would leave it pointing at an API that does
+    // not exist — and the collection still reports the record the refusal protected.
+    let refused = gateway
         .call("DELETE", &format!("/restapis/{other_api}"), None)
         .await;
     assert_eq!(
-        deleted.status, 202,
-        "case the orphaned mapping: expected 202 from DeleteRestApi, got {} with {:?}",
-        deleted.status, deleted.body
+        refused.status, 400,
+        "case the mapped api: expected 400 from DeleteRestApi while a mapping names it, got \
+         {} with {:?}",
+        refused.status, refused.body
     );
 
     let body = page_of(&gateway, domain_name, "", "after the later calls").await;
@@ -488,7 +490,7 @@ async fn the_listing_reports_the_stored_mappings_as_later_calls_leave_them() {
         "case after the later calls: expected the stored records in creation order, got {body:?}"
     );
 
-    // Each listed record still matches its own reader, the patched one and the orphan
+    // Each listed record still matches its own reader, the patched one and the mapped one
     // alike.
     for base_path in ["patched", "orphan"] {
         let case = format!("the listed mapping {base_path}");

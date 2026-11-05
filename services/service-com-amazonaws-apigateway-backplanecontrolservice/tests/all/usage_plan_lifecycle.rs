@@ -121,17 +121,19 @@ async fn a_created_usage_plan_is_persisted_and_read_back_member_for_member() {
         ),
         (
             "a quota with a positive offset".to_string(),
-            json!({ "name": "plan-offset", "quota": { "limit": 500, "offset": 10, "period": "WEEK" } }),
+            // At the top of the window the `WEEK` period gives the offset: an offset falls
+            // inside the initial period it shifts (`bound_quota_settings`).
+            json!({ "name": "plan-offset", "quota": { "limit": 500, "offset": 6, "period": "WEEK" } }),
         ),
         (
             "a quota at the bottom of its range".to_string(),
             json!({ "name": "plan-zero-quota", "quota": { "limit": 0, "offset": 0, "period": "DAY" } }),
         ),
         (
-            "a quota at the top of the modelled Integer".to_string(),
+            "a quota limit at the top of the modelled Integer, with the offset at the top of its period".to_string(),
             json!({
                 "name": "plan-large-quota",
-                "quota": { "limit": MAX_INTEGER, "offset": MAX_INTEGER - 1, "period": "MONTH" },
+                "quota": { "limit": MAX_INTEGER, "offset": 27, "period": "MONTH" },
             }),
         ),
         (

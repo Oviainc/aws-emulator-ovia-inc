@@ -4,8 +4,10 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
+//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
+
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -333,6 +335,7 @@ mod stage_execution_logging_account_role;
 // collection is walked by.
 #[path = "all/collection_page_envelope.rs"]
 mod collection_page_envelope;
+// Appended for the reason the note above gives: what an exported definition says about
 // ITSELF — the version the downloaded file is named for, and the containers each OpenAPI
 // dialect always writes.
 #[path = "all/stage_export_version_and_containers.rs"]
@@ -346,6 +349,15 @@ mod stage_canary_and_patch_grammar;
 // invoke with, on an emulator that verifies request signatures.
 #[path = "all/stage_invoke_signed.rs"]
 mod stage_invoke_signed;
+// Appended for the reason the note above gives: what this control plane ADMITS on the
+// members whose value names something outside the request (a certificate, a URL path, a
+// metering window).
+#[path = "all/control_plane_input_admission.rs"]
+mod control_plane_input_admission;
+// Appended for the reason the note above gives: the records a base path mapping holds a
+// REFERENCE to, and the deletes that reference refuses.
+#[path = "all/base_path_mapping_references.rs"]
+mod base_path_mapping_references;
 // Appended for the reason the note above gives: the sentences a SETTING's own illegal
 // value is refused with, and the one a domain name ARN this service cannot read earns.
 #[path = "all/setting_refusal_sentences.rs"]

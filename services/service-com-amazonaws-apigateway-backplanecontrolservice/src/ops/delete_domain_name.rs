@@ -190,6 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let domain_name = entry.domain_name.clone();
         let domain_name_arn = entry.domain_name_arn.clone();
+        // The base path mappings this record still holds, in creation order, so the
+        // refusal below names the first mapping a caller created rather than whichever
+        // one the key order happens to hold first.
+        let base_path = entry.base_paths_in_creation_order().first().cloned();
 
         // A `DomainNameAccessAssociation` is a record of the ACCOUNT that NAMES a stored
         // private custom domain name — `CreateDomainNameAccessAssociation` refuses one
@@ -209,6 +213,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ConflictException {
                     message: Some(crate::state::domain_name_has_access_associations(
                         &domain_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A `BasePathMapping` of this record sends the calls arriving on its base path of
+        // this domain name to a REST API, so it is a mapping a client still reaches that
+        // API through: deleting the domain name would take it away with the record and
+        // leave the custom-domain URL it published answering nothing. Such a delete is
+        // therefore refused while the mapping stands, as the sibling access-association
+        // dependency above is; removing the mapping is `DeleteBasePathMapping`'s own call,
+        // not something this one does on the caller's behalf.
+        if let Some(base_path) = &base_path {
+            return Err(DeleteDomainNameErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::domain_name_has_base_path_mappings(
+                        &domain_name,
+                        base_path,
                     )),
                 },
             )

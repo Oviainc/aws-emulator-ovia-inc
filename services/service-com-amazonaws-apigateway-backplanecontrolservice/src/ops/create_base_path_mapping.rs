@@ -201,6 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one a caller reaches by naming the domain name and nothing after it; see
         // `crate::state::base_path_key`.
         let base_path = crate::state::base_path_key(input.base_path.as_deref());
+        // And what a caller may ask for is bounded by what the URL the mapping is reached
+        // by can carry: a base path is read as a URL path before any record is touched, so
+        // a value no client could present is refused rather than stored. See
+        // `crate::state::bound_base_path`.
+        crate::state::bound_base_path(&base_path).map_err(bad_request)?;
         // A `stage` of `(none)` names NO stage — "Specify '(none)' if you want callers to
         // explicitly specify the stage name after any base path name" — so it is not
         // resolved against the API's stages, and an empty one is no stage at all.

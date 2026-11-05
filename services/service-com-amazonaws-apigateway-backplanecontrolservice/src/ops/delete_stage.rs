@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both identifiers are resolved against stored state before anything is removed,
         // each naming its own record so the refusal says which one was not found — the
         // same order `GetStage` resolves them in.
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
             DeleteStageErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes a Stage resource": removing the record is what makes a later `GetStage`
         // — and the API's `GetStages` listing — stop reporting it. A stage name that names
         // no stage is nothing to delete, so the call is refused rather than answering a
-        // silent success. Nothing else about the stage conditions the removal: a stage
+        // silent success. Nothing else ABOUT THE STAGE conditions the removal: a stage
         // serving a deployment, carrying a cache cluster or holding tags goes the same
         // way, which is what makes two concurrent deletes of one stage resolve to one
         // success and one `NotFoundException` rather than to a conflict.
@@ -195,12 +195,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteStage` models no error for them and the model states no rule for
         // rewriting them, so this call leaves them exactly as `DeleteRestApi` does, and
         // dropping an association is `UpdateApiKey`'s / `UpdateUsagePlan`'s job.
-        if api.stages.remove(&input.stage_name).is_none() {
+        if !api.stages.contains_key(&input.stage_name) {
             return Err(DeleteStageErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_STAGE.to_string()),
             })
             .into());
         }
+
+        // A `BasePathMapping` that names this stage ROUTES to it: the calls arriving on
+        // its base path of a custom domain name are served by this stage, so removing the
+        // stage would leave that mapping pointing at a stage that does not exist. Such a
+        // delete is refused while the reference stands and the stage survives; dropping
+        // the mapping (or pointing it at another stage) is the mapping's own operations'
+        // call, not something this one does on the caller's behalf.
+        if let Some(referencing) =
+            store.base_path_mapping_referencing_api(&input.rest_api_id, Some(&input.stage_name))
+        {
+            return Err(DeleteStageErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::stage_in_use_by_base_path_mapping(
+                        &input.stage_name,
+                        &referencing,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The lookup, the reference check and the removal share ONE hold of the store
+        // lock, so two concurrent deletes of one stage cannot both remove it.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        api.stages.remove(&input.stage_name);
         // The store lock is released before the record is formatted: the critical section
         // covers the state change only.
         drop(store);

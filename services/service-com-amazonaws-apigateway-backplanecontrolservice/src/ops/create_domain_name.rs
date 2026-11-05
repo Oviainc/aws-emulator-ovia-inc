@@ -222,6 +222,20 @@ fn bound_input(input: &CreateDomainNameInput) -> Result<(), String> {
     if let Some(policy) = &input.policy {
         bound_chars("policy", policy, MAX_POLICY_CHARS)?;
     }
+    // The three members that name a certificate name ONE kind of resource — a Certificate
+    // Manager certificate — so a value that is not the ARN of one is refused here rather
+    // than stored on a domain name that could never present it; see
+    // `crate::state::require_certificate_arn`.
+    for value in [
+        &input.certificate_arn,
+        &input.regional_certificate_arn,
+        &input.ownership_verification_certificate_arn,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::state::require_certificate_arn(value)?;
+    }
     if let Some(authentication) = &input.mutual_tls_authentication {
         if let Some(value) = &authentication.truststore_uri {
             bound_chars("mutualTlsAuthentication.truststoreUri", value, MAX_STRING_CHARS)?;

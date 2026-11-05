@@ -80,7 +80,9 @@ async fn a_patched_usage_plan_member_is_stored_and_read_back() {
         json!({
             "name": "plan-metered",
             "throttle": { "burstLimit": 10, "rateLimit": 5.0 },
-            "quota": { "limit": 100, "offset": 1, "period": "DAY" },
+            // The offset is nonzero, so the period is one whose window admits a shift:
+            // an offset must be zero in the `DAY` period (`bound_quota_settings`).
+            "quota": { "limit": 100, "offset": 1, "period": "WEEK" },
         })
     };
     let staged = || {
@@ -216,7 +218,7 @@ async fn a_patched_usage_plan_member_is_stored_and_read_back() {
                 ("throttle", Value::Null),
                 (
                     "quota",
-                    json!({ "limit": 100, "offset": 1, "period": "DAY" }),
+                    json!({ "limit": 100, "offset": 1, "period": "WEEK" }),
                 ),
             ],
         ),
@@ -226,7 +228,7 @@ async fn a_patched_usage_plan_member_is_stored_and_read_back() {
             vec![replace("/quota/limit", "250")],
             vec![(
                 "quota",
-                json!({ "limit": 250, "offset": 1, "period": "DAY" }),
+                json!({ "limit": 250, "offset": 1, "period": "WEEK" }),
             )],
         ),
         (
@@ -235,7 +237,7 @@ async fn a_patched_usage_plan_member_is_stored_and_read_back() {
             vec![replace("/quota/offset", "0")],
             vec![(
                 "quota",
-                json!({ "limit": 100, "offset": 0, "period": "DAY" }),
+                json!({ "limit": 100, "offset": 0, "period": "WEEK" }),
             )],
         ),
         (
@@ -244,7 +246,7 @@ async fn a_patched_usage_plan_member_is_stored_and_read_back() {
             vec![replace("/quota/limit", &i32::MAX.to_string())],
             vec![(
                 "quota",
-                json!({ "limit": i32::MAX, "offset": 1, "period": "DAY" }),
+                json!({ "limit": i32::MAX, "offset": 1, "period": "WEEK" }),
             )],
         ),
         (
@@ -522,15 +524,24 @@ async fn a_patched_usage_plan_member_is_stored_and_read_back() {
     ];
     // Every period the model declares, so the catalog is exercised and not one recorded
     // value. Source: `smithy_query(query="shape", shape="QuotaPeriodType")`, re-exported
-    // as `QUOTA_PERIOD_TYPE_VALUES`.
+    // as `QUOTA_PERIOD_TYPE_VALUES`. The plan under the row carries a ZERO offset, the one
+    // offset every period's window admits, so the row is about the period and not about
+    // the offset's window (`bound_quota_settings`).
+    let unshifted = || {
+        json!({
+            "name": "plan-metered",
+            "throttle": { "burstLimit": 10, "rateLimit": 5.0 },
+            "quota": { "limit": 100, "offset": 0, "period": "WEEK" },
+        })
+    };
     for period in QUOTA_PERIOD_TYPE_VALUES {
         rows.push((
             format!("replace the quota period with {period}"),
-            metered(),
+            unshifted(),
             vec![replace("/quota/period", period)],
             vec![(
                 "quota",
-                json!({ "limit": 100, "offset": 1, "period": period }),
+                json!({ "limit": 100, "offset": 0, "period": period }),
             )],
         ));
     }
@@ -800,7 +811,7 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         ("throttle", json!({ "burstLimit": 10, "rateLimit": 5.0 })),
         (
             "quota",
-            json!({ "limit": 100, "offset": 1, "period": "DAY" }),
+            json!({ "limit": 100, "offset": 1, "period": "WEEK" }),
         ),
         ("apiStages", json!([])),
         ("tags", tag_map(1)),
@@ -815,7 +826,8 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
             "name": "plan-baseline",
             "description": "initial description",
             "throttle": { "burstLimit": 10, "rateLimit": 5.0 },
-            "quota": { "limit": 100, "offset": 1, "period": "DAY" },
+            // See the `metered` plan above for why a nonzero offset names `WEEK`.
+            "quota": { "limit": 100, "offset": 1, "period": "WEEK" },
             "tags": tag_map(1),
         }),
     )

@@ -129,7 +129,13 @@ fn apply_patch(entry: &mut BasePathMappingEntry, patch: &Patch) -> Result<(), Pa
                     let value = patch.require_value()?;
                     bound_chars(&patch.path, value, MAX_PATH_CHARS)
                         .map_err(PatchFailure::BadRequest)?;
-                    entry.base_path = base_path_key(Some(value));
+                    let base_path = base_path_key(Some(value));
+                    // Read as a URL path by the rule `CreateBasePathMapping` reads it by,
+                    // so a mapping cannot be patched onto a base path a create would have
+                    // refused; see `crate::state::bound_base_path`.
+                    crate::state::bound_base_path(&base_path)
+                        .map_err(PatchFailure::BadRequest)?;
+                    entry.base_path = base_path;
                     Ok(())
                 }
                 _ => Err(patch.unsupported_op()),

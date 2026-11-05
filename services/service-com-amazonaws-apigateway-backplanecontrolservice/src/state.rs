@@ -1402,6 +1402,31 @@ pub struct BasePathMappingEntry {
     pub sequence: u64,
 }
 
+/// WHICH stored `BasePathMapping` one is: the custom domain name that holds it (by the
+/// [`domain_name_key`] it is addressed under) and the base path it answers to.
+///
+/// A mapping has no identifier of its own — it is addressed by its domain name and its
+/// base path — so this pair is how a refusal names the mapping that still stands in the
+/// way of a delete, the way [`MethodReference`] names the method that still references an
+/// authorizer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasePathMappingReference {
+    /// The key of the [`DomainNameEntry`] that holds the mapping; see [`domain_name_key`].
+    pub domain_name: String,
+    /// The mapping's base path, which is its address under that domain name.
+    pub base_path: String,
+}
+
+impl ::std::fmt::Display for BasePathMappingReference {
+    /// The mapping as a refusal names it: the domain name and the base path, joined the
+    /// way the URL the mapping serves joins them, because a base path is unique only
+    /// within one domain name. One terse composite, as this service's other in-use
+    /// refusals render the reference that blocks a delete ([`MethodReference`]).
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(formatter, "{}/{}", self.domain_name, self.base_path)
+    }
+}
+
 /// The base path a `BasePathMapping` is stored and addressed under, from the (possibly
 /// absent) `basePath` a request carried.
 ///
@@ -2419,6 +2444,44 @@ pub fn bound_domain_name(domain_name: &str) -> Result<(), String> {
 /// The longest a domain name can be: 253 characters, the DNS limit on a fully qualified
 /// name (RFC 1035's 255-octet wire form, less its length and root bytes).
 pub const MAX_DOMAIN_NAME_CHARS: usize = 253;
+
+/// Refuse a caller-supplied `basePath` outside the character class API Gateway admits for
+/// one.
+///
+/// A base path is "the base path name that callers of the API must provide as part of the
+/// URL after the domain name" (`BasePathMapping$basePath`), and API Gateway admits one
+/// character class for it: letters, numbers and the safe punctuation
+/// [`BASE_PATH_CHARACTERS`] — which is what its refusal states ([`INVALID_BASE_PATH`]).
+/// A value carrying anything else — a non-ASCII character, a space, a URL delimiter — is
+/// not a base path this service will store, so it is refused before any record is touched;
+/// the model declares no constraint on the member, so the check lives here.
+///
+/// [`NONE_BASE_PATH`] is inside the class anyway (its parentheses are among the admitted
+/// characters), and it is the spelling the member itself documents for the mapping that
+/// has no base path at all.
+///
+/// `Err` carries the message, for the caller to fix the request from; a refused base path
+/// never reaches the store.
+pub fn bound_base_path(base_path: &str) -> Result<(), String> {
+    let admitted = !base_path.is_empty()
+        && base_path.chars().all(|character| {
+            character.is_ascii_alphanumeric() || BASE_PATH_CHARACTERS.contains(character)
+        });
+    if !admitted {
+        return Err(INVALID_BASE_PATH.to_string());
+    }
+    Ok(())
+}
+
+/// The punctuation a `basePath` may carry beside letters and numbers, in the order
+/// [`INVALID_BASE_PATH`] states it.
+pub const BASE_PATH_CHARACTERS: &str = "$-_.+!*'(),";
+
+/// The `BadRequestException` message for a `basePath` outside the class
+/// [`bound_base_path`] admits: ONE sentence of entirely fixed text, which states the class
+/// and quotes back neither the value nor the member that carried it.
+pub const INVALID_BASE_PATH: &str =
+    "A base path may contain only letters, numbers and one of $-_.+!*'(),";
 
 /// The longest one dot-separated label of a domain name can be: 63 characters (RFC 1035).
 pub const MAX_DOMAIN_LABEL_CHARS: usize = 63;
@@ -3660,6 +3723,41 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             .any(|association| association.domain_name_arn == domain_name_arn)
     }
 
+    /// The base path mapping that still routes to the API `rest_api_id` — to the stage
+    /// `stage_name` of it when one is named, or to the API at all when none is — or `None`
+    /// when none does.
+    ///
+    /// A `BasePathMapping` names "the string identifier of the associated RestApi" and
+    /// "the name of the associated stage", so a mapping carrying those is a REFERENCE to
+    /// that API and that stage — the same kind of reference
+    /// [`Self::integration_referencing_vpc_link`] finds for a VPC link. A mapping is a
+    /// record of a custom domain name and a domain name belongs to the ACCOUNT, so the
+    /// walk covers every stored domain name; both walks are in key order, so a refusal
+    /// NAMES the same mapping on every call for one set of records.
+    ///
+    /// A mapping whose `stage` is absent, or is the `(none)` spelling that leaves the
+    /// stage to the caller, names no stage and so references none — while still
+    /// referencing its API.
+    pub fn base_path_mapping_referencing_api(
+        &self,
+        rest_api_id: &str,
+        stage_name: Option<&str>,
+    ) -> Option<BasePathMappingReference> {
+        self.domain_names.values().find_map(|domain| {
+            domain
+                .base_path_mappings
+                .values()
+                .find(|mapping| {
+                    mapping.rest_api_id == rest_api_id
+                        && stage_name.is_none_or(|stage| mapping.stage.as_deref() == Some(stage))
+                })
+                .map(|mapping| BasePathMappingReference {
+                    domain_name: domain.key(),
+                    base_path: mapping.base_path.clone(),
+                })
+        })
+    }
+
     /// The method whose integration still reaches the VPC link `vpc_link_id`, with the
     /// id of the API that method belongs to, or `None` when none does.
     ///
@@ -3918,15 +4016,52 @@ pub const INVALID_THROTTLE_SETTINGS: &str =
 /// count with a fixed sentence per member that names the member and the rule, and quotes
 /// no value back (see [`invalid_quota_count`]).
 ///
-/// `period` is NOT checked here: it targets the modelled `QuotaPeriodType` enum, so a
-/// value outside that set is refused at the boundary before any handler runs.
+/// `period` is checked for the WINDOW it gives the offset: a value outside the modelled
+/// `QuotaPeriodType` enum is refused at the boundary before any handler runs, but a value
+/// INSIDE it fixes how large an initial-period offset can be — see
+/// [`max_quota_offset`].
 pub fn bound_quota_settings(quota: &QuotaSettings) -> Result<(), String> {
     for (count_member, count) in [("limit", quota.limit), ("offset", quota.offset)] {
         if count < 0 {
             return Err(invalid_quota_count(count_member));
         }
     }
+    if let Some(period) = quota.period.as_deref() {
+        if let Some(max) = max_quota_offset(period) {
+            if quota.offset > max {
+                return Err(invalid_quota_offset(period, max));
+            }
+        }
+    }
     Ok(())
+}
+
+/// The largest `offset` a usage plan's quota may carry in the metering period `period`,
+/// or `None` for a period this service knows no window for.
+///
+/// `offset` is "the number of requests subtracted from the given limit in the INITIAL
+/// time period" (`QuotaSettings$offset`), and AWS counts that offset in the period's own
+/// units — days: it shifts the start of the first window, so it has to fall inside the
+/// window it shifts. A `DAY` period is one day long and so admits no shift at all; a
+/// `WEEK` is seven days and a `MONTH` twenty-eight, so the offset may name any day of
+/// them but the last, which is the next period's first.
+pub fn max_quota_offset(period: &str) -> Option<i32> {
+    match period {
+        "DAY" => Some(0),
+        "WEEK" => Some(6),
+        "MONTH" => Some(27),
+        _ => None,
+    }
+}
+
+/// The refusal for an offset outside the window its metering period gives it: the fixed
+/// sentence AWS answers a nonzero offset in the `DAY` period with, stated over the period
+/// that fixed the window and the bound it broke.
+pub fn invalid_quota_offset(period: &str, max: i32) -> String {
+    if max == 0 {
+        return format!("Usage Plan quota offset must be zero in the {period} period");
+    }
+    format!("Usage Plan quota offset must be between 0 and {max} in the {period} period")
 }
 
 /// The refusal for one negative count of a usage plan's quota: the fixed sentence AWS
@@ -4211,6 +4346,54 @@ pub fn domain_name_has_access_associations(domain_name: &str) -> String {
     )
 }
 
+/// The `BadRequestException` message for a custom domain name that still holds a
+/// `BasePathMapping`, which is what `DeleteDomainName` refuses while the mapping stands.
+///
+/// A mapping sends the calls arriving on its base path of this domain name to a REST API,
+/// so removing the domain name would take a mapping a client still reaches an API through
+/// with it. AWS publishes no fixed sentence for this condition, so the message is BUILT
+/// FROM STORED STATE the way the sibling dependency sentences above are: it names the
+/// record the request addressed and the base path of the mapping standing in its way, so
+/// the caller can see which `DeleteBasePathMapping` to make first.
+pub fn domain_name_has_base_path_mappings(domain_name: &str, base_path: &str) -> String {
+    format!(
+        "The domain name {domain_name} has base path mapping {base_path}. Delete the base \
+         path mappings before deleting the domain name."
+    )
+}
+
+/// The `BadRequestException` message for a stage a `BasePathMapping` still names, which is
+/// what `DeleteStage` refuses while the reference stands (see
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::base_path_mapping_referencing_api`]).
+///
+/// BUILT FROM STATE, in the shape of this service's sibling in-use sentences
+/// ([`authorizer_in_use`], [`vpc_link_in_use`]): the fixed text names the condition and
+/// the variable parts are the stage's own name and the referencing mapping
+/// ([`BasePathMappingReference`]), so a client is told which record has to go first.
+pub fn stage_in_use_by_base_path_mapping(
+    stage_name: &str,
+    referencing: &BasePathMappingReference,
+) -> String {
+    format!("Cannot delete stage '{stage_name}', is referenced in base path mapping: {referencing}")
+}
+
+/// The `BadRequestException` message for a REST API a `BasePathMapping` still names, which
+/// is what `DeleteRestApi` refuses while the reference stands.
+///
+/// The same condition one level up: a mapping names the API as well as the stage of it, so
+/// deleting the API would leave the mapping pointing at an API that does not exist. Worded
+/// as [`stage_in_use_by_base_path_mapping`] words it over the stage, so the two refusals of
+/// one reference differ only in which record they name.
+pub fn rest_api_in_use_by_base_path_mapping(
+    rest_api_id: &str,
+    referencing: &BasePathMappingReference,
+) -> String {
+    format!(
+        "Cannot delete REST API '{rest_api_id}', is referenced in base path mapping: \
+         {referencing}"
+    )
+}
+
 /// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
 /// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers
 /// to it, which is a missing resource and not a malformed request.
@@ -4273,6 +4456,25 @@ pub fn require_arn(value: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(invalid_arn_prefix(value))
+}
+
+/// Refuse a value set on a member that names an Amazon Web Services-managed CERTIFICATE.
+///
+/// `certificateArn` and `regionalCertificateArn` are "the reference to an Amazon Web
+/// Services-managed certificate … Certificate Manager is the only supported source", and
+/// `ownershipVerificationCertificateArn` is "the ARN of the public certificate issued by
+/// ACM", so such a member names ONE kind of resource: a certificate in Certificate
+/// Manager. What that ARN looks like comes from [`::service_common::arn::ACM_CERTIFICATE`]
+/// — this emulator's one definition of the form — so no service of it disagrees about what
+/// the ARN of a certificate is. A value that is not one (a string that is no ARN at all,
+/// an ARN of another vendor, an ARN of another ACM resource) names no certificate the
+/// domain name could ever present, and is refused with this service's fixed
+/// unreadable-ARN sentence ([`INVALID_ARN`]) before anything is stored.
+pub fn require_certificate_arn(value: &str) -> Result<(), String> {
+    if ::service_common::arn::ACM_CERTIFICATE.admits(value) {
+        return Ok(());
+    }
+    Err(INVALID_ARN.to_string())
 }
 
 /// The `NotFoundException` message for a `documentationPartId` that names no stored

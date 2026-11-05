@@ -182,6 +182,20 @@ fn endpoint_types(entry: &DomainNameEntry) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Refuse a patched value on a member that names a certificate, by the rule
+/// `CreateDomainName` reads the same three members by — so a record cannot be patched
+/// into carrying a certificate reference a create would have refused. A patch that
+/// CLEARS the member leaves no value to read, which is a record with no certificate
+/// rather than one with a bad reference.
+fn patched_certificate_arn(value: Option<&String>) -> Result<(), PatchFailure> {
+    match value {
+        Some(value) => {
+            crate::state::require_certificate_arn(value).map_err(PatchFailure::BadRequest)
+        }
+        None => Ok(()),
+    }
+}
+
 /// Apply one patch to a COPY of a stored domain name.
 fn apply_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFailure> {
     match patch.member() {
@@ -190,6 +204,7 @@ fn apply_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFa
         }
         "certificateArn" => {
             patch_optional_string(&mut entry.certificate_arn, patch, MAX_STRING_CHARS)?;
+            patched_certificate_arn(entry.certificate_arn.as_ref())?;
             // `certificateUploadDate` is "the timestamp when the certificate that was
             // used by edge-optimized endpoint or private endpoint for this domain name
             // was uploaded". It therefore STAMPS the instant such a certificate is
@@ -215,13 +230,17 @@ fn apply_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFa
             patch_optional_string(&mut entry.regional_certificate_name, patch, MAX_STRING_CHARS)
         }
         "regionalCertificateArn" => {
-            patch_optional_string(&mut entry.regional_certificate_arn, patch, MAX_STRING_CHARS)
+            patch_optional_string(&mut entry.regional_certificate_arn, patch, MAX_STRING_CHARS)?;
+            patched_certificate_arn(entry.regional_certificate_arn.as_ref())
         }
-        "ownershipVerificationCertificateArn" => patch_optional_string(
-            &mut entry.ownership_verification_certificate_arn,
-            patch,
-            MAX_STRING_CHARS,
-        ),
+        "ownershipVerificationCertificateArn" => {
+            patch_optional_string(
+                &mut entry.ownership_verification_certificate_arn,
+                patch,
+                MAX_STRING_CHARS,
+            )?;
+            patched_certificate_arn(entry.ownership_verification_certificate_arn.as_ref())
+        }
         // A patch `value` is a bare string on the wire, so an enum-typed member's value
         // set is checked here rather than by the boundary validator. `securityPolicy`
         // carries its own refusal sentence; see `patch_security_policy`.

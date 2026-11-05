@@ -165,13 +165,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
         // The API owns its resources and their methods, so removing the record removes
-        // the whole tree with it.
-        if store.rest_apis.remove(&input.rest_api_id).is_none() {
+        // the whole tree with it. What it does NOT own is the base path mapping of a
+        // custom domain name that ROUTES to it: that record is a domain name's, and it
+        // names this API, so deleting the API would leave the mapping pointing at an API
+        // that does not exist. Such a delete is refused while the mapping stands —
+        // the same reference `DeleteStage` refuses for one stage of this API — and
+        // removing the mapping is `DeleteBasePathMapping`'s own call.
+        if !store.rest_apis.contains_key(&input.rest_api_id) {
             return Err(DeleteRestApiErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
             .into());
         }
+        if let Some(referencing) = store.base_path_mapping_referencing_api(&input.rest_api_id, None)
+        {
+            return Err(DeleteRestApiErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::rest_api_in_use_by_base_path_mapping(
+                        &input.rest_api_id,
+                        &referencing,
+                    )),
+                },
+            )
+            .into());
+        }
+        store.rest_apis.remove(&input.rest_api_id);
         Ok(DeleteRestApiOutput)
     }
 }
