@@ -184,89 +184,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let plan = input.backup_plan;
 
-        // A plan "includes a BackupPlanName and one or more sets of Rules"
-        // (model doc for the member), so a rule list the model admits as
-        // present but empty schedules nothing and is refused.
-        if plan.rules.is_empty() {
-            return Err(invalid_parameter(
-                "Rules must contain at least one backup rule",
-            ));
-        }
-
-        // The rule list is sized by the request, so it is capped BEFORE the
-        // per-rule checks below walk it and before any of it is stored.
-        if plan.rules.len() > crate::state::MAX_RULES_PER_PLAN {
-            return Err(CreateBackupPlanErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "a backup plan may hold at most {} rules",
-                        crate::state::MAX_RULES_PER_PLAN
-                    )),
-                    ..Default::default()
-                },
-            )
+        // Whether this is a plan body AWS stores is the check this operation
+        // shares with the update that stores another version of one, so the
+        // two cannot drift in what they accept. This operation models the
+        // limit error, so a body past the rule cap answers that.
+        if let Some(refusal) = crate::state::rejected_backup_plan_body(&plan) {
+            return Err(match refusal {
+                crate::state::RejectedBackupPlanBody::Value(refusal) => {
+                    CreateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
+                }
+                crate::state::RejectedBackupPlanBody::TooManyRules(message) => {
+                    CreateBackupPlanErrorModeled::LimitExceededException(LimitExceededException {
+                        message: Some(message),
+                        ..Default::default()
+                    })
+                }
+            }
             .into());
-        }
-
-        for (index, rule) in plan.rules.iter().enumerate() {
-            // A rule is identified within its plan by its name, so two rules of
-            // one plan cannot share one.
-            if plan.rules[..index]
-                .iter()
-                .any(|earlier| earlier.rule_name == rule.rule_name)
-            {
-                return Err(invalid_parameter(&format!(
-                    "RuleName {} is used by more than one rule; rule names must be \
-                     unique within a backup plan",
-                    rule.rule_name
-                )));
-            }
-
-            // Both backup windows carry a documented range — `StartWindowMinutes`
-            // "must be at least 60 minutes to avoid errors" and "has a maximum
-            // value of 100 years (52,560,000 minutes)" — and a value outside it
-            // is one AWS refuses. The check is `crate::state`'s, shared with the
-            // windows of a single `StartBackupJob`, so the two cannot drift.
-            for (member, minutes, minimum) in [
-                (
-                    "StartWindowMinutes",
-                    rule.start_window_minutes,
-                    crate::state::MIN_START_WINDOW_MINUTES,
-                ),
-                ("CompletionWindowMinutes", rule.completion_window_minutes, 0),
-            ] {
-                if let Some(refusal) =
-                    crate::state::rejected_window_minutes(member, minutes, minimum)
-                {
-                    return Err(
-                        CreateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
-                            .into(),
-                    );
-                }
-            }
-
-            // The model types both members below as `ARN` with no pattern, so
-            // the framework cannot refuse a malformed one; AWS does, rather than
-            // storing a rule whose destination no ARN resolves to.
-            let arns = rule
-                .target_logically_air_gapped_backup_vault_arn
-                .as_deref()
-                .map(|arn| ("TargetLogicallyAirGappedBackupVaultArn", arn))
-                .into_iter()
-                .chain(rule.copy_actions.iter().flatten().map(|copy| {
-                    (
-                        "DestinationBackupVaultArn",
-                        copy.destination_backup_vault_arn.as_str(),
-                    )
-                }));
-            for (member, arn) in arns {
-                if let Some(refusal) = crate::state::rejected_arn(member, arn) {
-                    return Err(
-                        CreateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
-                            .into(),
-                    );
-                }
-            }
         }
 
         let mut store = state.lock();
@@ -311,25 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let plan_id = store.next_id(now);
-        let version_id = store.next_id(now);
-        let rules = plan
-            .rules
-            .into_iter()
-            .map(|rule| {
-                let rule_id = store.next_id(now);
-                crate::state::stored_backup_rule(rule, rule_id)
-            })
-            .collect();
         let record = crate::state::BackupPlanRecord {
             arn: crate::state::backup_plan_arn(&region, &plan_id),
             plan_id: plan_id.clone(),
-            version_id,
-            name: plan.backup_plan_name,
-            rules,
-            advanced_backup_settings: plan.advanced_backup_settings.unwrap_or_default(),
-            scan_settings: plan.scan_settings.unwrap_or_default(),
+            // The plan's first and, until an update makes another, only
+            // version.
+            current: store.minted_backup_plan_version(plan, now),
+            superseded: Vec::new(),
             creator_request_id: input.creator_request_id,
-            creation_date: now,
             // A plan is live from the moment it is created, and nothing has run
             // one of its rules yet.
             deletion_date: None,
@@ -353,18 +276,10 @@ fn plan_created(record: &crate::state::BackupPlanRecord) -> CreateBackupPlanOutp
     CreateBackupPlanOutput {
         backup_plan_id: Some(record.plan_id.clone()),
         backup_plan_arn: Some(record.arn.clone()),
-        creation_date: Some(::aws_smithy_types::DateTime::from(record.creation_date)),
-        version_id: Some(record.version_id.clone()),
-        advanced_backup_settings: record.advanced_backup_settings_view(),
+        creation_date: Some(::aws_smithy_types::DateTime::from(
+            record.current.creation_date,
+        )),
+        version_id: Some(record.current.version_id.clone()),
+        advanced_backup_settings: record.current.advanced_backup_settings_view(),
     }
-}
-
-/// This operation's refusal for a `BackupPlan` member carrying a value AWS does
-/// not accept.
-fn invalid_parameter(message: &str) -> CreateBackupPlanError {
-    CreateBackupPlanErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
-        message: Some(message.to_string()),
-        ..Default::default()
-    })
-    .into()
 }

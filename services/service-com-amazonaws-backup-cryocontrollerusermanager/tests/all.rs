@@ -17,6 +17,8 @@ mod backup_job_listing;
 mod backup_plan;
 #[path = "all/backup_plan_deletion.rs"]
 mod backup_plan_deletion;
+#[path = "all/backup_plan_update.rs"]
+mod backup_plan_update;
 #[path = "all/backup_selection.rs"]
 mod backup_selection;
 #[path = "all/copy_job.rs"]

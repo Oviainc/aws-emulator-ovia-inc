@@ -13,8 +13,9 @@
 //! * [`BackupJob`] — the job that produced that recovery point.
 //! * [`CopyJobRecord`] — the job `StartCopyJob` starts to put a COPY of one
 //!   vault's recovery point into another vault, and the copy it writes there.
-//! * [`BackupPlanRecord`] — the plan `CreateBackupPlan` inserts, whose body
-//!   every plan read projects through [`BackupPlanRecord::backup_plan`].
+//! * [`BackupPlanRecord`] — the plan `CreateBackupPlan` inserts, holding every
+//!   [`BackupPlanVersion`] of it an update has made, whose body every plan read
+//!   projects through [`BackupPlanVersion::backup_plan`].
 //! * [`BackupSelectionRecord`] — one resource selection of such a plan.
 //! * [`FrameworkRecord`] — the audit framework `CreateFramework` inserts, whose
 //!   controls and deployment status every framework read answers from.
@@ -50,7 +51,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
+    AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput, BackupRule,
+    BackupRuleInput,
     BackupSelection, CalculatedLifecycle, ConflictException, CopyJob, FrameworkControl,
     InvalidParameterValueException, InvalidRequestException, InvalidResourceStateException,
     LegalHold, Lifecycle, MissingParameterValueException, RecoveryPointSelection,
@@ -228,6 +230,13 @@ pub const MAX_BACKUP_PLANS: usize = 500;
 /// the request, so it is capped before the plan is stored. AWS caps the rules a
 /// plan may hold too, and answers `LimitExceededException` for a plan past it.
 pub const MAX_RULES_PER_PLAN: usize = 100;
+
+/// The most versions of ONE backup plan this emulator keeps readable. An
+/// EMULATOR-CHOSEN ceiling, for the reason given on [`MAX_VAULTS`]: every
+/// update of a plan appends a version, so the oldest superseded ones are
+/// forgotten once a plan has this many rather than letting one plan's history
+/// grow without bound. The plan's CURRENT version is never one of them.
+pub const MAX_BACKUP_PLAN_VERSIONS: usize = 100;
 
 /// The most resource selections this emulator keeps in ONE backup plan. An
 /// EMULATOR-CHOSEN ceiling, for the reason given on [`MAX_VAULTS`]; AWS caps the
@@ -1190,6 +1199,100 @@ pub fn rejected_arn(member: &str, value: &str) -> Option<InvalidParameterValueEx
     Some(rejected_parameter(member))
 }
 
+/// Why a `BackupPlan` body is not one AWS stores, as
+/// [`rejected_backup_plan_body`] decides it.
+///
+/// The two refusals are kept apart because the operations that store a plan
+/// body do not model the same errors for them: one states a value AWS does not
+/// accept, the other that the body is past a limit, and each operation answers
+/// the latter with the error ITS model declares.
+#[derive(Debug)]
+pub enum RejectedBackupPlanBody {
+    /// A member of the body carries a value AWS does not accept, as this
+    /// modelled refusal states.
+    Value(InvalidParameterValueException),
+    /// The body carries more rules than a backup plan may hold; the sentence
+    /// states the limit.
+    TooManyRules(String),
+}
+
+/// Whether `plan` is a backup plan body this service stores, and why not when
+/// it is not.
+///
+/// The ONE check every operation that stores a plan body applies \u2014 the create
+/// and the update \u2014 so the two cannot drift in what they accept. Modelled
+/// constraints are already refused before a handler runs, so what is left is
+/// what the model admits and AWS does not:
+///
+/// * a plan "includes a BackupPlanName and one or more sets of Rules" (model
+///   doc for the member), so a rule list the model admits as present but empty
+///   schedules nothing;
+/// * the rule list is sized by the request, so it is capped before the
+///   per-rule checks below walk it and before any of it is stored;
+/// * a rule is identified within its plan by its name, so two rules of one
+///   plan cannot share one;
+/// * both backup windows carry a documented range ([`rejected_window_minutes`]);
+/// * the members the model types as `ARN` with no pattern carry one
+///   ([`rejected_arn`]), rather than a rule being stored whose destination no
+///   ARN resolves to.
+pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBackupPlanBody> {
+    if plan.rules.is_empty() {
+        return Some(RejectedBackupPlanBody::Value(InvalidParameterValueException {
+            message: Some("Rules must contain at least one backup rule".to_string()),
+            ..Default::default()
+        }));
+    }
+    if plan.rules.len() > MAX_RULES_PER_PLAN {
+        return Some(RejectedBackupPlanBody::TooManyRules(format!(
+            "a backup plan may hold at most {MAX_RULES_PER_PLAN} rules"
+        )));
+    }
+    for (index, rule) in plan.rules.iter().enumerate() {
+        if plan.rules[..index]
+            .iter()
+            .any(|earlier| earlier.rule_name == rule.rule_name)
+        {
+            return Some(RejectedBackupPlanBody::Value(InvalidParameterValueException {
+                message: Some(format!(
+                    "RuleName {} is used by more than one rule; rule names must be \
+                     unique within a backup plan",
+                    rule.rule_name
+                )),
+                ..Default::default()
+            }));
+        }
+        for (member, minutes, minimum) in [
+            (
+                "StartWindowMinutes",
+                rule.start_window_minutes,
+                MIN_START_WINDOW_MINUTES,
+            ),
+            ("CompletionWindowMinutes", rule.completion_window_minutes, 0),
+        ] {
+            if let Some(refusal) = rejected_window_minutes(member, minutes, minimum) {
+                return Some(RejectedBackupPlanBody::Value(refusal));
+            }
+        }
+        let arns = rule
+            .target_logically_air_gapped_backup_vault_arn
+            .as_deref()
+            .map(|arn| ("TargetLogicallyAirGappedBackupVaultArn", arn))
+            .into_iter()
+            .chain(rule.copy_actions.iter().flatten().map(|copy| {
+                (
+                    "DestinationBackupVaultArn",
+                    copy.destination_backup_vault_arn.as_str(),
+                )
+            }));
+        for (member, arn) in arns {
+            if let Some(refusal) = rejected_arn(member, arn) {
+                return Some(RejectedBackupPlanBody::Value(refusal));
+            }
+        }
+    }
+    None
+}
+
 /// The modelled refusal for a member that names an MPA APPROVAL TEAM by ARN
 /// whose value is not the ARN of a team at all, or `None` when it has the form
 /// of one.
@@ -1751,31 +1854,84 @@ pub struct CopyJobRecord {
     pub idempotency_token: Option<String>,
 }
 
-/// A backup plan as `CreateBackupPlan` stored it: the plan body the caller gave,
-/// plus the identifiers this service minted for it.
+/// ONE version of a backup plan: the body a create or an update was given,
+/// plus the `VersionId` this service minted for it and the instant it was
+/// stored.
 ///
 /// A plan is identified by the ID this service mints, never by its body, so the
 /// body is kept verbatim (with a `RuleId` added to each rule, which only the
-/// service can mint) and every read projects it through
-/// [`Self::backup_plan`] \u2014 one projection, so two readers of a plan can never
-/// report two different bodies.
+/// service can mint) and every read projects it through [`Self::backup_plan`]
+/// \u2014 one projection, so two readers of a version can never report two
+/// different bodies.
 #[derive(Debug, Clone)]
-pub struct BackupPlanRecord {
-    pub plan_id: String,
-    pub arn: String,
-    /// The id of the version of the plan this record holds. A plan has exactly
-    /// one version until an update makes another: "Unique, randomly generated,
-    /// Unicode, UTF-8 encoded strings that are at most 1,024 bytes long. They
-    /// cannot be edited" (model doc for `VersionId`).
+pub struct BackupPlanVersion {
+    /// This version's id: "Unique, randomly generated, Unicode, UTF-8 encoded
+    /// strings that are at most 1,024 bytes long. Version Ids cannot be edited"
+    /// (model doc for `VersionId`), so a version keeps the id it was stored
+    /// under and an update mints another for the version it adds.
     pub version_id: String,
+    /// The plan's display name as this version carries it: a plan's body
+    /// "includes a BackupPlanName and one or more sets of Rules" (model doc for
+    /// `BackupPlanInput`), so a version states the name the plan had while it
+    /// was the current one.
     pub name: String,
-    /// The plan's rules in the order the caller gave them, each carrying the
+    /// The version's rules in the order the caller gave them, each carrying the
     /// `RuleId` this service minted for it.
     pub rules: Vec<BackupRule>,
     pub advanced_backup_settings: Vec<AdvancedBackupSetting>,
     pub scan_settings: Vec<ScanSetting>,
-    pub creator_request_id: Option<String>,
+    /// When this version was stored: the instant the create or the update that
+    /// made it was served.
     pub creation_date: SystemTime,
+}
+
+impl BackupPlanVersion {
+    /// The plan body a read of this version reports. The ONE place a stored
+    /// plan's wire body is computed.
+    pub fn backup_plan(&self) -> BackupPlan {
+        BackupPlan {
+            backup_plan_name: self.name.clone(),
+            rules: self.rules.clone(),
+            advanced_backup_settings: self.advanced_backup_settings_view(),
+            scan_settings: self.scan_settings_view(),
+        }
+    }
+
+    /// `AdvancedBackupSettings` as a response reports it: "The list is populated
+    /// only if the advanced option is set for the backup plan" (model doc), so a
+    /// plan configured with none reports none rather than an empty list.
+    pub fn advanced_backup_settings_view(&self) -> Option<Vec<AdvancedBackupSetting>> {
+        (!self.advanced_backup_settings.is_empty()).then(|| self.advanced_backup_settings.clone())
+    }
+
+    /// `ScanSettings` as a response reports it, for the same reason as the
+    /// settings above: a plan configured with no scanning reports none rather
+    /// than an empty list.
+    pub fn scan_settings_view(&self) -> Option<Vec<ScanSetting>> {
+        (!self.scan_settings.is_empty()).then(|| self.scan_settings.clone())
+    }
+}
+
+/// A backup plan as `CreateBackupPlan` stored it: the identifiers this service
+/// minted for it, the account-level members an update leaves alone, and every
+/// [`BackupPlanVersion`] of its body.
+///
+/// A plan is a VERSIONED resource: `UpdateBackupPlan` "updates the specified
+/// backup plan. The new version is uniquely identified by its ID" (model doc),
+/// so an update stores the body it was given as ANOTHER version of this same
+/// plan \u2014 same plan id, same ARN \u2014 and the version it replaces is kept
+/// readable by the id it was stored under.
+#[derive(Debug, Clone)]
+pub struct BackupPlanRecord {
+    pub plan_id: String,
+    pub arn: String,
+    /// The plan's current version: the one a read that names no version
+    /// answers from, and the one an update supersedes.
+    pub current: BackupPlanVersion,
+    /// The versions an update has superseded, oldest first. Bounded by
+    /// [`MAX_BACKUP_PLAN_VERSIONS`].
+    pub superseded: Vec<BackupPlanVersion>,
+    pub creator_request_id: Option<String>,
     /// When the plan was deleted; `None` while the account still holds it.
     pub deletion_date: Option<SystemTime>,
     /// The last time one of this plan's rules ran. `None` until one does: this
@@ -1787,22 +1943,32 @@ pub struct BackupPlanRecord {
 }
 
 impl BackupPlanRecord {
-    /// The plan body a read reports. The ONE place a stored plan's wire body is
-    /// computed.
-    pub fn backup_plan(&self) -> BackupPlan {
-        BackupPlan {
-            backup_plan_name: self.name.clone(),
-            rules: self.rules.clone(),
-            advanced_backup_settings: self.advanced_backup_settings_view(),
-            scan_settings: (!self.scan_settings.is_empty()).then(|| self.scan_settings.clone()),
-        }
+    /// Every version of this plan, oldest first \u2014 the superseded ones and then
+    /// the current one. The ONE walk of a plan's history, so what a read of a
+    /// version resolves and what a list of them reports cannot disagree.
+    pub fn versions(&self) -> impl Iterator<Item = &BackupPlanVersion> {
+        self.superseded
+            .iter()
+            .chain(::std::iter::once(&self.current))
     }
 
-    /// `AdvancedBackupSettings` as a response reports it: "The list is populated
-    /// only if the advanced option is set for the backup plan" (model doc), so a
-    /// plan configured with none reports none rather than an empty list.
-    pub fn advanced_backup_settings_view(&self) -> Option<Vec<AdvancedBackupSetting>> {
-        (!self.advanced_backup_settings.is_empty()).then(|| self.advanced_backup_settings.clone())
+    /// The version stored under `version_id`, if this plan has one: a version
+    /// stays readable by its own id after an update supersedes it.
+    pub fn version(&self, version_id: &str) -> Option<&BackupPlanVersion> {
+        self.versions()
+            .find(|version| version.version_id == version_id)
+    }
+
+    /// Store `version` as this plan's current version, keeping the one it
+    /// replaces readable. The ONE place a plan's history grows, so the bound on
+    /// it holds however many updates a plan is given: once the plan holds
+    /// [`MAX_BACKUP_PLAN_VERSIONS`], the oldest superseded version is forgotten
+    /// \u2014 never the current one.
+    pub fn supersede_current_version(&mut self, version: BackupPlanVersion) {
+        let replaced = ::std::mem::replace(&mut self.current, version);
+        self.superseded.push(replaced);
+        let overflow = (self.superseded.len() + 1).saturating_sub(MAX_BACKUP_PLAN_VERSIONS);
+        self.superseded.drain(..overflow);
     }
 }
 
@@ -2093,6 +2259,36 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         )
     }
 
+    /// The stored version a plan body becomes: the body the caller gave, with
+    /// the `VersionId` and the per-rule `RuleId`s only this service can mint.
+    ///
+    /// The ONE place a plan body becomes a stored version, shared by the create
+    /// and the update, so a plan stored by either carries the same members
+    /// filled the same way and every read of it reports them.
+    pub fn minted_backup_plan_version(
+        &mut self,
+        plan: BackupPlanInput,
+        now: SystemTime,
+    ) -> BackupPlanVersion {
+        let version_id = self.next_id(now);
+        let rules = plan
+            .rules
+            .into_iter()
+            .map(|rule| {
+                let rule_id = self.next_id(now);
+                stored_backup_rule(rule, rule_id)
+            })
+            .collect();
+        BackupPlanVersion {
+            version_id,
+            name: plan.backup_plan_name,
+            rules,
+            advanced_backup_settings: plan.advanced_backup_settings.unwrap_or_default(),
+            scan_settings: plan.scan_settings.unwrap_or_default(),
+            creation_date: now,
+        }
+    }
+
     /// Resolve a backup plan for a read, by the id it is stored under and
     /// optionally the version asked for.
     ///
@@ -2108,24 +2304,30 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     ///   version the plan never had. Neither refusal tells the caller which
     ///   half of the pair was wrong.
     ///
+    /// A read that names NO version answers from the plan's current version,
+    /// the one the latest update stored; one that names a version answers from
+    /// exactly that version, which an update that superseded it left readable.
+    ///
     /// A deleted plan's record is KEPT (the deletion instant is part of it),
-    /// but it is no longer readable: the body of a plan the account has deleted
-    /// is not reported again.
+    /// but it is no longer readable: no version of a plan the account has
+    /// deleted is reported again.
     pub fn backup_plan(
         &self,
         plan_id: &str,
         version_id: Option<&str>,
-    ) -> Result<&BackupPlanRecord, ResourceNotFoundException> {
+    ) -> Result<(&BackupPlanRecord, &BackupPlanVersion), ResourceNotFoundException> {
         let plan = self
             .backup_plans
             .get(plan_id)
             .ok_or_else(backup_plan_not_found)?;
-        let version_is_there = plan.deletion_date.is_none()
-            && version_id.is_none_or(|version| version == plan.version_id);
-        if !version_is_there {
+        if plan.deletion_date.is_some() {
             return Err(backup_plan_version_unreadable());
         }
-        Ok(plan)
+        let version = match version_id {
+            None => &plan.current,
+            Some(asked) => plan.version(asked).ok_or_else(backup_plan_version_unreadable)?,
+        };
+        Ok((plan, version))
     }
 
     /// The plan a `CreatorRequestId` names, if this account holds one: "If the
@@ -2146,10 +2348,13 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// plan whose deletion was recorded no longer holds its name: the account
     /// may create another plan under it, exactly as it may after a plan it never
     /// created.
+    /// The name a plan holds is the one its CURRENT version carries: a plan's
+    /// body includes its name, so an update that states another name moves the
+    /// plan to it.
     pub fn holds_backup_plan_named(&self, name: &str) -> bool {
         self.backup_plans
             .values()
-            .any(|plan| plan.name == name && plan.deletion_date.is_none())
+            .any(|plan| plan.current.name == name && plan.deletion_date.is_none())
     }
 
     /// The plan a mutating call must find: one this account holds whose deletion
@@ -2159,6 +2364,15 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     pub fn live_backup_plan(&self, plan_id: &str) -> Option<&BackupPlanRecord> {
         self.backup_plans
             .get(plan_id)
+            .filter(|plan| plan.deletion_date.is_none())
+    }
+
+    /// The same resolution for a call that WRITES the plan it names, so a
+    /// read-modify-write of one plan resolves it exactly as a read does and the
+    /// two cannot disagree about which plans the account holds.
+    pub fn live_backup_plan_mut(&mut self, plan_id: &str) -> Option<&mut BackupPlanRecord> {
+        self.backup_plans
+            .get_mut(plan_id)
             .filter(|plan| plan.deletion_date.is_none())
     }
 
