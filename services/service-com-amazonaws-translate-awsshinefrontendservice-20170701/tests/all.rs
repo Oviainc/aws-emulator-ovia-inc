@@ -15,6 +15,8 @@
 mod document_translation;
 #[path = "all/rejection_paths.rs"]
 mod rejection_paths;
+#[path = "all/resource_tag_listing.rs"]
+mod resource_tag_listing;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]
