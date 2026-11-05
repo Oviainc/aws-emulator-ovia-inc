@@ -4,12 +4,13 @@
 //! conflict is refused with, end to end over the wire.
 //!
 //! The rule under test: the refusal a duplicate idempotency token is answered with is
-//! worded from the state of the create the token already started, and that wording is
-//! fixed text a client matches on — the creation-in-flight branch carries NO variable
-//! part at all, and the already-created branch's only variable part is the stored
-//! resource's ARN. The caller's token is a value the client chose as its idempotency key
-//! and never appears in either message, so neither branch's text varies with the
-//! request.
+//! worded from the state of the create that claimed the token, and that wording is fixed
+//! text a client matches on — the creation-in-progress branch, which a call overlapping a
+//! create that has not stored its report yet gets, carries NO variable part at all, and
+//! the already-created branch, which every call presenting a token whose create has
+//! stored its report gets, carries one variable part: the ARN of that report. The
+//! caller's token is a value the client chose as its idempotency key and never appears in
+//! either message, so neither branch's text varies with the request.
 //!
 //! The table spans what the rule generalises over: the token itself. Its rows walk
 //! `ClientToken`'s constraints (length 1..128, pattern `^[\u0021-\u007E]+$`, source:
@@ -23,19 +24,21 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::create_report_client_token::wait_out_the_creation_window;
-use super::dashboard_lifecycle::{call, error_code, ok_call, router};
+use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::service_state;
+
+use super::dashboard_lifecycle::{call, emulator, error_code, ok_call};
 use super::scheduled_report_lifecycle::{source_dashboard, EXECUTION_ROLE_ARN};
 
-/// The whole message a duplicate token racing the create it started is refused with.
-/// Fixed text: there is no variable part, and the "retry after some time" instruction is
-/// what tells a client this conflict is the transient one.
-const IN_PROGRESS_MESSAGE: &str = "A scheduled report creation is already in progress \
+/// The whole message a call overlapping a create that has not stored its report yet is
+/// refused with. Fixed text: there is no variable part, and the "retry after some time"
+/// instruction is what tells a client this conflict is the transient one.
+pub(crate) const IN_PROGRESS_MESSAGE: &str = "A scheduled report creation is already in progress \
      for the provided clientToken. Please retry after some time.";
 
-/// The message a token whose create has settled is refused with: fixed text around the
-/// one value a caller can act on, the ARN of the report the token already created.
-fn already_exists_message(arn: &str) -> String {
+/// The message a call presenting a token whose create has stored its report is refused
+/// with: fixed text around the one value a caller can act on, the ARN of the report the
+/// token already created.
+pub(crate) fn already_exists_message(arn: &str) -> String {
     format!(
         "A scheduled report with the provided clientToken already exists (ARN: {arn}). \
          Use a different clientToken to create a new scheduled report, or use the \
@@ -97,15 +100,6 @@ fn create_request(token: &str, dashboard_arn: &str, widget_id: &str, name: &str)
     })
 }
 
-/// A row's own store, the create it served and the request that created it.
-struct Served {
-    router: MultiServiceRouter,
-    request: Value,
-    arn: String,
-    dashboard_arn: String,
-    widget_id: String,
-}
-
 /// The conflict body of a refused create: asserts the code and status, and hands back the
 /// message.
 fn conflict_message(case: &str, branch: &str, status: u16, body: &Value) -> String {
@@ -123,20 +117,20 @@ fn conflict_message(case: &str, branch: &str, status: u16, body: &Value) -> Stri
         .to_string()
 }
 
-/// Both conflict branches, over the table: the in-flight refusal is the fixed text with
-/// nothing of the request in it (identical for every row), and the settled refusal is the
-/// fixed text carrying only the ARN the token's create minted.
-#[tokio::test]
-async fn a_duplicate_client_token_is_refused_in_aws_s_own_words() {
-    let cases = cases();
+/// A dashboard to report on, on a fresh store of its own.
+async fn source(name: &str) -> (MultiServiceRouter, String, String) {
+    let (router, _engine) = emulator();
+    let (dashboard_arn, widget_id) = source_dashboard(&router, name).await;
+    (router, dashboard_arn, widget_id)
+}
 
-    // The racing branch first, row by row: the duplicate has to reach the handler while
-    // its create is still in flight, so each row creates and immediately duplicates.
-    let mut served: Vec<Served> = Vec::new();
-    let mut racing_messages: Vec<String> = Vec::new();
-    for case in &cases {
-        let router = router();
-        let (dashboard_arn, widget_id) = source_dashboard(&router, "ConflictMessageSource").await;
+/// The already-created branch, over the table: the refusal every call presenting a spent
+/// token gets is the fixed text carrying only the ARN the token's create minted — not the
+/// token, however the token is spelled.
+#[tokio::test]
+async fn a_spent_client_token_is_refused_in_aws_s_own_words() {
+    for case in cases() {
+        let (router, dashboard_arn, widget_id) = source("ConflictMessageSource").await;
         let request = create_request(&case.token, &dashboard_arn, &widget_id, "Conflict Rollup");
         let created = ok_call(&router, "CreateScheduledReport", &request).await;
         let arn = created["arn"]
@@ -144,64 +138,78 @@ async fn a_duplicate_client_token_is_refused_in_aws_s_own_words() {
             .unwrap_or_else(|| panic!("case {:?}: the create returns an arn: {created}", case.label))
             .to_string();
 
-        let (status, body) = call(&router, "CreateScheduledReport", &request).await;
-        let message = conflict_message(case.label, "racing the create", status, &body);
-        assert_eq!(
-            message, IN_PROGRESS_MESSAGE,
-            "case {:?} (racing the create): expected the fixed in-progress text {IN_PROGRESS_MESSAGE:?}, got {message:?}",
-            case.label
-        );
-        assert!(
-            !message.contains(&case.token),
-            "case {:?} (racing the create): the presented clientToken must not appear in the refusal, got {message:?}",
-            case.label
-        );
-        racing_messages.push(message);
-        served.push(Served {
-            router,
-            request,
-            arn,
-            dashboard_arn,
-            widget_id,
-        });
-    }
-
-    // Fixed text means fixed: every row's in-flight refusal is the same bytes.
-    for (case, message) in cases.iter().zip(&racing_messages) {
-        assert_eq!(
-            message, &racing_messages[0],
-            "case {:?} (racing the create): the in-progress message has no variable part, so every row's must match {:?}, got {message:?}",
-            case.label, racing_messages[0]
-        );
-    }
-
-    // Past the creation window the same token is no longer racing anything: a request it
-    // would have created a different report for is refused as already created.
-    wait_out_the_creation_window().await;
-    for (case, served) in cases.iter().zip(&served) {
+        // Both shapes of reuse the rule covers: the identical request, and one that would
+        // have created a different report.
         let different = create_request(
             &case.token,
-            &served.dashboard_arn,
-            &served.widget_id,
-            "Another Rollup",
+            &dashboard_arn,
+            &widget_id,
+            "Another Conflict Rollup",
         );
-        assert_ne!(
-            different, served.request,
-            "case {:?} (settled): a different-request row must really differ",
-            case.label
-        );
-        let (status, body) = call(&served.router, "CreateScheduledReport", &different).await;
-        let message = conflict_message(case.label, "settled", status, &body);
-        let expected = already_exists_message(&served.arn);
+        for (branch, reuse) in [("the identical request", &request), ("a different request", &different)] {
+            let (status, body) = call(&router, "CreateScheduledReport", reuse).await;
+            let message = conflict_message(case.label, branch, status, &body);
+            let expected = already_exists_message(&arn);
+            assert_eq!(
+                message, expected,
+                "case {:?} ({branch}): expected {expected:?}, got {message:?}",
+                case.label
+            );
+            assert!(
+                !message.contains(&case.token),
+                "case {:?} ({branch}): the presented clientToken must not appear in the refusal, got {message:?}",
+                case.label
+            );
+        }
+    }
+}
+
+/// The creation-in-progress branch, over the same table: a call that overlaps a create
+/// which has claimed the token and not stored its report yet is refused with text that
+/// has no variable part at all, so every row's refusal is the same bytes.
+#[tokio::test]
+async fn the_in_progress_refusal_is_the_same_fixed_text_for_every_token() {
+    let mut messages: Vec<(String, String)> = Vec::new();
+    for case in cases() {
+        let (router, engine) = emulator();
+        let (dashboard_arn, widget_id) = source_dashboard(&router, "InProgressMessageSource").await;
+
+        // A create has claimed this row's token and has not stored its report yet, which
+        // is the state the call below overlaps.
+        {
+            let state = service_state(&*engine).expect("the dashboard store");
+            let claimed = state
+                .lock()
+                .reserve_scheduled_report_creation(case.token.clone());
+            assert!(
+                claimed.is_none(),
+                "case {:?} (overlapping the create): the token must be free before the claim",
+                case.label
+            );
+        }
+
+        let request = create_request(&case.token, &dashboard_arn, &widget_id, "Conflict Rollup");
+        let (status, body) = call(&router, "CreateScheduledReport", &request).await;
+        let message = conflict_message(case.label, "overlapping the create", status, &body);
         assert_eq!(
-            message, expected,
-            "case {:?} (settled): expected {expected:?}, got {message:?}",
+            message, IN_PROGRESS_MESSAGE,
+            "case {:?} (overlapping the create): expected the fixed in-progress text {IN_PROGRESS_MESSAGE:?}, got {message:?}",
             case.label
         );
         assert!(
             !message.contains(&case.token),
-            "case {:?} (settled): the presented clientToken must not appear in the refusal, got {message:?}",
+            "case {:?} (overlapping the create): the presented clientToken must not appear in the refusal, got {message:?}",
             case.label
+        );
+        messages.push((case.label.to_string(), message));
+    }
+
+    // Fixed text means fixed: every row's in-progress refusal is the same bytes.
+    let (first_label, first) = messages[0].clone();
+    for (label, message) in &messages {
+        assert_eq!(
+            message, &first,
+            "case {label:?} (overlapping the create): the in-progress message has no variable part, so every row's must match case {first_label:?}'s {first:?}, got {message:?}"
         );
     }
 }

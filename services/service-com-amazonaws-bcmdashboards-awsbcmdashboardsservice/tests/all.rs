@@ -21,6 +21,8 @@ mod concurrent_execution_idempotency;
 mod create_report_client_token;
 #[path = "all/create_report_conflict_message.rs"]
 mod create_report_conflict_message;
+#[path = "all/create_report_token_spent.rs"]
+mod create_report_token_spent;
 #[path = "all/create_time_tag_merge.rs"]
 mod create_time_tag_merge;
 #[path = "all/cursor_spelling.rs"]

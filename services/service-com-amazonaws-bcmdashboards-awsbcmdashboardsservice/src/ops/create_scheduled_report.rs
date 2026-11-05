@@ -24,27 +24,23 @@
 //!   `ValidationException` (400) and creates nothing
 //!   ([`crate::state::schedule_period_refusal`], shared with the update path the same
 //!   sentence is written for);
-//! * a `clientToken` an earlier successful create already recorded makes this call that
-//!   same request again: it REPLAYS that create's outcome — HTTP 200 with the ARN the
-//!   first call minted — and creates no second report, which is what the member's
-//!   `@idempotencyToken` is for. `ConflictException` (409) is kept for the conflict the
-//!   model documents, "a resource that already exists or is being created": a duplicate
-//!   that arrives while the create the token started is still in flight
-//!   ([`crate::state::SCHEDULED_REPORT_CREATION_WINDOW`]), so several callers sharing
-//!   one token get exactly one report and one success, and a token presented with a
-//!   materially different request, which would have created a different report. A retry
-//!   that arrives inside that span is deliberately refused as one of those racing
-//!   duplicates — the span is what the two cannot be told apart by, since this handler
-//!   decides and writes under one lock — while the retry an SDK sends once its transport
-//!   has given up lands past it and is replayed. A token whose report this service no
-//!   longer stores has no outcome left to answer with, so it creates a report again and
-//!   records that one;
+//! * a `clientToken` is SPENT by the create it is presented to: this call claims the
+//!   token before it stores anything and settles the claim with the ARN of the report it
+//!   stored, so one token answers for at most one report. Every later call presenting a
+//!   claimed token is refused with the modelled `ConflictException` (409) — what the
+//!   model documents it for, "a resource that already exists or is being created" — and
+//!   creates nothing, whether the rest of the request is byte-identical to the create
+//!   that claimed the token or materially different. The claim's own state chooses which
+//!   of the two conflicts it is ([`crate::state::ScheduledReportCreation`]): the report
+//!   is BEING CREATED while the claim is unsettled, which a duplicate overlapping the
+//!   create finds and may present its token for again, and it ALREADY EXISTS, under the
+//!   ARN the claim holds, once the claim is settled, which is terminal — the caller has
+//!   to choose another token or update that report. A token whose report this service no
+//!   longer stores has no report left to name, so it is free again and creates one;
 //! * past the stored-report quota, `ServiceQuotaExceededException` (402).
 //!
 //! Being state-changing, it emits the audit record `crate::state::record_state_change`
-//! writes on every one of those paths as well as on success — except the replay, which
-//! creates nothing: it changes nothing a later caller sees, so it accounts for nothing,
-//! exactly as `ExecuteScheduledReport`'s idempotent retry does.
+//! writes on every one of those paths as well as on success.
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +178,19 @@ impl<Eng> CreateScheduledReport<Eng> {
     }
 }
 
+/// Release the create claim `token` holds, for a call that claimed it and was then
+/// refused before it stored anything: a refused request creates no report, so the token
+/// it presented stays free for the request that corrects it. A call with no token has no
+/// claim to release.
+fn release_claim(
+    state: &mut crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState,
+    token: Option<&str>,
+) {
+    if let Some(token) = token {
+        state.release_scheduled_report_creation(token);
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateScheduledReport<Eng>
 {
@@ -204,7 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the dashboard store is unavailable".to_string(),
             })
         })?;
-        let mut state = state.lock();
 
         let requested = input.scheduled_report;
         let resource_tags = input.resource_tags.unwrap_or_default();
@@ -278,60 +286,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The `@idempotencyToken` is what it is modelled as: "A unique, case-sensitive
-        // identifier that you provide to ensure the idempotency of the request". A call
-        // presenting a token an earlier create already recorded is that same request
-        // again — what an SDK's transport retry sends when the first answer was lost —
-        // so it REPLAYS the first call's outcome: the ARN that call minted, at HTTP 200,
-        // with no second report created. Replaying changes nothing a later caller sees,
-        // so — like `ExecuteScheduledReport`'s idempotent retry — it emits no audit
-        // record; the create it replays already emitted one.
+        // identifier that you provide to ensure the idempotency of the request" — one
+        // token, at most one report. The create it is presented to SPENDS it: this call
+        // claims the token before it stores anything
+        // ([`crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reserve_scheduled_report_creation`])
+        // and settles the claim with the ARN of the report it stored, so the token
+        // answers for that one report for as long as this service stores it.
         //
-        // The modelled `ConflictException` (409) stays what the model documents it for,
-        // "a conflict with the current state of the resource. For example, attempting to
-        // create a resource that already exists or is being created", which is two
-        // branches:
+        // A call presenting a token already claimed is therefore refused with the
+        // modelled `ConflictException` (409) — what the model documents it for, "a
+        // conflict with the current state of the resource. For example, attempting to
+        // create a resource that already exists or is being created" — and never served:
+        // it creates no report and is answered no ARN, whether the rest of the request
+        // is byte-identical to the create that claimed the token or materially different.
+        // Which of the two conflicts it is comes from the claim's own state
+        // ([`crate::state::ScheduledReportCreation::conflict_message`]): the report IS
+        // BEING CREATED while the claim is unsettled — the duplicate of a create whose
+        // report is not stored yet, so the caller may present the token again — and it
+        // ALREADY EXISTS, under the ARN the claim holds, once the claim is settled, which
+        // is terminal: the caller has to choose another token or update that report.
         //
-        // * the report the token started IS BEING CREATED — a duplicate racing the first
-        //   call, inside `crate::state::SCHEDULED_REPORT_CREATION_WINDOW` of it. Several
-        //   callers sharing one token therefore produce exactly one report and one
-        //   success, and the losers are told a creation is in progress;
-        // * the token is presented with a MATERIALLY DIFFERENT request, which would have
-        //   created a different report, so it cannot be answered with the first report's
-        //   ARN whenever it arrives.
-        //
-        // Only a call that got as far as creating records its token: a refused request
-        // created nothing, so its token stays free. The lookup and the insert below both
-        // happen under one lock. A request carrying no token has no idempotency to
-        // resolve, so neither the rendering nor the sweep runs for it.
-        let mut fingerprint = String::new();
-        if input.client_token.is_some() {
-            fingerprint =
-                crate::state::scheduled_report_creation_fingerprint(&requested, &resource_tags);
-            // The records whose report this service no longer stores, dropped before any
-            // of them can be read as a retry's outcome: the ARN such a record holds
-            // resolves to nothing, so it is no outcome to answer with.
-            state.forget_creations_of_removed_reports();
-        }
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(prior) = state.scheduled_report_client_tokens.get(token) {
-                if !prior.in_progress_at(now) && prior.request_fingerprint == fingerprint {
-                    return Ok(CreateScheduledReportOutput {
-                        arn: prior.arn.clone(),
-                    });
+        // Only a call that gets as far as storing a report keeps the token: one refused
+        // below releases its claim, so its token stays free for the request that corrects
+        // it. A token whose report this service no longer stores keeps nothing either —
+        // there is no report left for its claim to name. A request carrying no token has
+        // no claim to take.
+        {
+            let mut store = state.lock();
+            if let Some(token) = input.client_token.as_deref() {
+                // The claims whose report this service no longer stores, dropped before
+                // any of them can refuse this create in the name of an ARN that resolves
+                // to nothing.
+                store.forget_creations_of_removed_reports();
+                if let Some(claimed) = store.reserve_scheduled_report_creation(token.to_string()) {
+                    // Neither wording carries the presented token: it is the caller's
+                    // idempotency key, not a value an error body reports.
+                    let message = claimed.conflict_message();
+                    crate::state::record_state_change(ctx, Self::NAME, "-", "ConflictException");
+                    return Err(CreateScheduledReportErrorModeled::ConflictException(
+                        ConflictException { message },
+                    )
+                    .into());
                 }
-                // Both refusals are worded by the record of the create the token already
-                // started ([`crate::state::ScheduledReportCreation::conflict_message`]),
-                // which owns the two texts: the in-flight one, which tells the caller to
-                // retry, and the already-exists one, whose only value is the stored ARN.
-                // Neither carries the presented token.
-                let message = prior.conflict_message(now);
-                crate::state::record_state_change(ctx, Self::NAME, "-", "ConflictException");
-                return Err(CreateScheduledReportErrorModeled::ConflictException(
-                    ConflictException { message },
-                )
-                .into());
             }
         }
+
+        // The claim is taken and no report is stored under it yet, which is the state a
+        // duplicate presenting the same token in this gap finds: the store is not held
+        // across it, so the "is being created" conflict is the real overlap of two calls
+        // rather than a span of clock. Everything from here decides and writes under one
+        // guard, so the report, the quota it counts against and the settled claim land
+        // together.
+        let mut state = state.lock();
 
         // A scheduled report reports on a dashboard, so the dashboard it names has to
         // be one this account stores. This operation models no
@@ -340,6 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // within the bound that member declares (`crate::state::within_message_bound`),
         // because `DashboardArn` admits twice the text `ValidationException$message` does.
         if !state.dashboards.contains_key(&requested.dashboard_arn) {
+            release_claim(&mut state, input.client_token.as_deref());
             crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
             return Err(CreateScheduledReportErrorModeled::ValidationException(
                 ValidationException {
@@ -356,6 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is bounded, as it is on the real service: past the quota this operation
         // answers its modelled `ServiceQuotaExceededException` (HTTP 402).
         if state.scheduled_reports.len() >= crate::state::MAX_SCHEDULED_REPORTS {
+            release_claim(&mut state, input.client_token.as_deref());
             crate::state::record_state_change(ctx, Self::NAME, "-", "ServiceQuotaExceededException");
             return Err(
                 CreateScheduledReportErrorModeled::ServiceQuotaExceededException(
@@ -398,19 +406,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_tags: crate::state::merge_resource_tags(Vec::new(), resource_tags),
         };
         state.scheduled_reports.insert(arn.clone(), record);
-        if let Some(token) = input.client_token {
-            // This call's outcome, under the token it presented, so the retry that
-            // presents it again is answered with this ARN rather than creating a second
-            // report — and a duplicate racing it, or a different request reusing the
-            // token, is told why it cannot have one.
-            state.scheduled_report_client_tokens.insert(
-                token,
-                crate::state::ScheduledReportCreation {
-                    arn: arn.clone(),
-                    request_fingerprint: fingerprint,
-                    in_progress_until: now + crate::state::SCHEDULED_REPORT_CREATION_WINDOW,
-                },
-            );
+        if let Some(token) = input.client_token.as_deref() {
+            // The claim this call took, settled with the report it stored: from here the
+            // token is spent, so every later call presenting it is refused in the name of
+            // this ARN rather than told a creation is in progress — and none of them is
+            // served a second report.
+            state.settle_scheduled_report_creation(token, &arn);
         }
 
         // The record this call changed state, for the audit stream.

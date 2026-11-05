@@ -35,7 +35,6 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::service_state;
 use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::EmulatedService;
 
-use super::create_report_client_token::wait_out_the_creation_window;
 use super::dashboard_lifecycle::{call, error_code, ok_call, router};
 use super::resource_not_found::assert_not_found;
 use super::scheduled_report_lifecycle::{source_dashboard, EXECUTION_ROLE_ARN};
@@ -416,9 +415,9 @@ async fn a_malformed_arn_is_refused_with_validation() {
     );
 }
 
-/// The delete takes the create-idempotency record of the report it removed with it, so a
-/// `CreateScheduledReport` retry under that token creates a report again rather than being
-/// answered with an ARN that resolves to nothing.
+/// The delete takes the create claim of the report it removed with it, so a
+/// `CreateScheduledReport` under that token creates a report again rather than being
+/// refused in the name of an ARN that resolves to nothing.
 #[tokio::test]
 async fn deleting_a_report_drops_the_create_record_that_minted_it() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -437,7 +436,6 @@ async fn deleting_a_report_drops_the_create_record_that_minted_it() {
         }
     });
     let first = create_report(&router, &request).await;
-    wait_out_the_creation_window().await;
 
     ok_call(&router, "DeleteScheduledReport", &json!({"arn": first})).await;
     assert!(
@@ -446,13 +444,13 @@ async fn deleting_a_report_drops_the_create_record_that_minted_it() {
             .lock()
             .scheduled_report_client_tokens
             .is_empty(),
-        "case the deleted report: the delete must drop the create record naming it"
+        "case the deleted report: the delete must drop the create claim naming it"
     );
 
     let again = create_report(&router, &request).await;
     assert_ne!(
         again, first,
-        "case the deleted report: the retry must mint a new report rather than replay the removed one"
+        "case the deleted report: the second create must mint a new report rather than be refused for the removed one"
     );
     let fetched = ok_call(&router, "GetScheduledReport", &json!({"arn": again})).await;
     assert_eq!(

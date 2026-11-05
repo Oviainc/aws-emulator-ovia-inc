@@ -394,12 +394,11 @@ async fn the_quota_refusal_is_audited() {
 }
 
 /// `CreateScheduledReport`'s idempotency paths account for themselves by what they
-/// change: the create leaves one SUCCESS record, the retry that only replays it creates
-/// nothing and so leaves none — the rule the dry run and the idempotent execution
-/// retry follow above — and the token reused for a different request leaves its
-/// ConflictException.
+/// change: the create leaves one SUCCESS record, and every later call presenting the
+/// token that create spent — the identical request as much as a different one — leaves
+/// its ConflictException.
 #[tokio::test]
-async fn scheduled_report_create_retries_are_audited_by_what_they_change() {
+async fn scheduled_report_create_reuses_are_audited_by_what_they_change() {
     use super::scheduled_report_lifecycle::EXECUTION_ROLE_ARN;
 
     let router = router();
@@ -429,12 +428,16 @@ async fn scheduled_report_create_retries_are_audited_by_what_they_change() {
 
     {
         let (capture, _guard) = capture_events();
-        super::create_report_client_token::wait_out_the_creation_window().await;
-        ok_call(&router, "CreateScheduledReport", &request).await;
-        let leaked = capture.records_for("CreateScheduledReport");
-        assert!(
-            leaked.is_empty(),
-            "case replayed retry: a call that creates nothing must emit no audit record, captured {leaked:?}"
+        let (status, body) = call(&router, "CreateScheduledReport", &request).await;
+        assert_eq!(
+            status, 409,
+            "case the identical request again: expected 409, got {status}: {body}"
+        );
+        assert_record(
+            &capture.record_for("CreateScheduledReport"),
+            "CreateScheduledReport",
+            "-",
+            "ConflictException",
         );
     }
 
@@ -460,7 +463,7 @@ async fn scheduled_report_create_retries_are_audited_by_what_they_change() {
     assert_eq!(
         listed["scheduledReports"].as_array().map(Vec::len),
         Some(1),
-        "the retries must have created no second report: {listed}"
+        "the refused reuses must have created no second report: {listed}"
     );
     assert_eq!(
         listed["scheduledReports"][0]["arn"].as_str(),

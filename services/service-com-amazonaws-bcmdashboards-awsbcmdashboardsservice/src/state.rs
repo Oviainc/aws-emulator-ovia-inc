@@ -31,7 +31,7 @@ use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use crate::ops::types::{
     CostAndUsageQuery, DashboardReference, DateTimeRange, DateTimeValue, DisplayConfig,
     GraphDisplayConfig, GroupDefinition, HealthStatus, QueryParameters, ReservationUtilizationQuery,
-    ResourceTag, SavingsPlansCoverageQuery, ScheduleConfig, ScheduledReport, ScheduledReportInput,
+    ResourceTag, SavingsPlansCoverageQuery, ScheduleConfig, ScheduledReport,
     ScheduledReportSummary, TableDisplayConfigStruct, Widget, WidgetConfig,
 };
 
@@ -635,179 +635,67 @@ impl ScheduledReportRecord {
     }
 }
 
-/// How long a `CreateScheduledReport` call's creation counts as still IN PROGRESS, so
-/// a duplicate-token call racing it is refused with the modelled `ConflictException`
-/// ("attempting to create a resource that already exists or is being created") while a
-/// retry that arrives after it — what an SDK resends once its transport has timed out —
-/// is answered with the first call's outcome.
+/// What the `CreateScheduledReport` call that claimed a `clientToken` has done with it.
 ///
-/// The real service creates the report over some interval and refuses a duplicate token
-/// for its duration; this emulator stores a record under one lock, so the interval would
-/// otherwise be zero and no caller could ever observe the conflict the service answers.
-/// The length is CHOSEN, not cited — the model states none — and kept short: long
-/// enough that the calls of one racing client fall inside it, short enough that a
-/// client's next retry does not.
-pub const SCHEDULED_REPORT_CREATION_WINDOW: Duration = Duration::from_millis(500);
-
-/// The outcome one `CreateScheduledReport` call recorded under the `clientToken` it
-/// presented, so a RETRY of that same call answers that same outcome — the ARN the
-/// first call minted — instead of creating a second report or being refused.
+/// The member is modelled `@idempotencyToken`, and the create it is presented to SPENDS
+/// it: the claim is taken by the call that commits to creating
+/// ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reserve_scheduled_report_creation`])
+/// and settled with the ARN of the report that call stored
+/// ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::settle_scheduled_report_creation`]),
+/// so one token answers for exactly one report for as long as that report is stored and
+/// no second call presenting it is ever served.
 ///
-/// `request_fingerprint` is what tells a retry from a different request that happens to
-/// reuse the token: it is a canonical rendering of the create request
-/// ([`scheduled_report_creation_fingerprint`]), compared only against another rendering
-/// built by that same function and never parsed.
+/// Which refusal a later call presenting the token gets is what this record says, and it
+/// is the two the model documents for its `ConflictException` — "attempting to create a
+/// resource that already exists or is being created":
 ///
-/// `in_progress_until` is the instant the creation this record describes stops counting
-/// as in flight ([`SCHEDULED_REPORT_CREATION_WINDOW`] past the call that made it). It is
-/// read, never slept on, so nothing waits for it.
+/// * [`Self::InFlight`] — the create holding the claim has not stored its report yet, so
+///   the resource IS BEING CREATED. The conflict is transient and the caller may present
+///   the same token again.
+/// * [`Self::Created`] — that create stored the report at this ARN, so the resource
+///   ALREADY EXISTS and the token is terminally spent: the caller has to choose another
+///   token or update the report this one names.
 #[derive(Debug, Clone)]
-pub struct ScheduledReportCreation {
-    pub arn: String,
-    pub request_fingerprint: String,
-    pub in_progress_until: SystemTime,
+pub enum ScheduledReportCreation {
+    /// A create has claimed the token and has not stored its report yet.
+    InFlight,
+    /// The create that claimed the token stored its report under this ARN.
+    Created { arn: String },
 }
 
 impl ScheduledReportCreation {
-    /// Whether the creation this record describes is still in flight at `now`.
-    pub fn in_progress_at(&self, now: SystemTime) -> bool {
-        now < self.in_progress_until
+    /// The ARN of the report the create holding this claim stored, or `None` while that
+    /// create is still in flight and has stored nothing to name.
+    pub fn created_arn(&self) -> Option<&str> {
+        match self {
+            Self::InFlight => None,
+            Self::Created { arn } => Some(arn.as_str()),
+        }
     }
 
     /// The `ConflictException` message a `CreateScheduledReport` call presenting this
-    /// record's `clientToken` is refused with at `now`.
+    /// claim's `clientToken` is refused with.
     ///
-    /// The service words the refusal from the state of the create the token already
-    /// started, and the wording is part of the contract: a client decides from it whether
-    /// to back off and retry (the creation is still in flight, so the conflict is
-    /// transient) or to pick another token (the report exists, so the conflict is
-    /// terminal). Both texts are therefore FIXED; the only value either of them carries
-    /// is the ARN this record stores, which the caller may act on. The presented token is
-    /// deliberately absent from both: it is the caller's idempotency key, and an error
-    /// body is not where it belongs.
-    pub fn conflict_message(&self, now: SystemTime) -> String {
-        if self.in_progress_at(now) {
-            "A scheduled report creation is already in progress for the provided \
-             clientToken. Please retry after some time."
-                .to_string()
-        } else {
-            format!(
-                "A scheduled report with the provided clientToken already exists (ARN: {}). \
+    /// The service words the refusal from the state of the create that already claimed
+    /// the token, and the wording is part of the contract: a client decides from it
+    /// whether to back off and present the same token again (the creation is still in
+    /// flight, so the conflict is transient) or to pick another token (the report exists,
+    /// so the conflict is terminal). Both texts are therefore FIXED; the only value
+    /// either of them carries is the ARN of the report already created, which the caller
+    /// may act on. The presented token is deliberately absent from both: it is the
+    /// caller's idempotency key, and an error body is not where it belongs.
+    pub fn conflict_message(&self) -> String {
+        match self {
+            Self::InFlight => "A scheduled report creation is already in progress for the \
+                 provided clientToken. Please retry after some time."
+                .to_string(),
+            Self::Created { arn } => format!(
+                "A scheduled report with the provided clientToken already exists (ARN: {arn}). \
                  Use a different clientToken to create a new scheduled report, or use the \
-                 existing report's ARN to update it.",
-                self.arn
-            )
+                 existing report's ARN to update it."
+            ),
         }
     }
-}
-
-/// A canonical rendering of a `CreateScheduledReport` request, so two calls can be
-/// compared for "the same request" when they present the same `clientToken`.
-///
-/// It renders exactly the members that decide which resource the call creates — the
-/// submitted `scheduledReport` and the `resourceTags` — one line per member, in a fixed
-/// order, and NORMALISED the way the create itself normalises them: the schedule's
-/// `state` resolved through [`resolve_schedule_config`] and the tags resolved by key
-/// through [`merge_resource_tags`] and then ordered by key. Two requests that would store
-/// the same record therefore render alike, whatever order their tags arrived in and
-/// whether they spelled the default schedule state out.
-///
-/// Every member is rendered from its own value rather than through a derived formatter,
-/// so what counts as "the same request" is this function's list and nothing else: a
-/// string is quoted (so a value holding a separator cannot look like one, and an empty
-/// string cannot look like an absent member), a timestamp is its seconds and nanoseconds,
-/// and an absent optional member is a marker no rendered value can equal.
-///
-/// The rendering is OPAQUE: it is only ever compared to another rendering this function
-/// produced, never parsed, and never put on the wire.
-pub fn scheduled_report_creation_fingerprint(
-    report: &ScheduledReportInput,
-    resource_tags: &[ResourceTag],
-) -> String {
-    /// The marker for an optional member the request left out.
-    const ABSENT: &str = "~absent~";
-
-    fn text(value: Option<&str>) -> String {
-        value.map_or_else(|| ABSENT.to_string(), |value| format!("{value:?}"))
-    }
-
-    fn instant(value: Option<&::aws_smithy_types::DateTime>) -> String {
-        value.map_or_else(
-            || ABSENT.to_string(),
-            |value| format!("{}.{:09}", value.secs(), value.subsec_nanos()),
-        )
-    }
-
-    fn date_time_value(value: &crate::ops::types::DateTimeValue) -> String {
-        format!("{} {}", text(Some(&value.r#type)), text(Some(&value.value)))
-    }
-
-    let schedule = resolve_schedule_config(report.schedule_config.clone());
-    let period = schedule.schedule_period.as_ref();
-    let mut lines = vec![
-        format!("name={}", text(Some(&report.name))),
-        format!("dashboardArn={}", text(Some(&report.dashboard_arn))),
-        format!(
-            "executionRoleArn={}",
-            text(Some(&report.scheduled_report_execution_role_arn))
-        ),
-        format!(
-            "scheduleExpression={}",
-            text(schedule.schedule_expression.as_deref())
-        ),
-        format!(
-            "scheduleTimeZone={}",
-            text(schedule.schedule_expression_time_zone.as_deref())
-        ),
-        format!(
-            "schedulePeriod={}",
-            if period.is_some() { "present" } else { ABSENT }
-        ),
-        format!(
-            "schedulePeriodStart={}",
-            instant(period.and_then(|period| period.start_time.as_ref()))
-        ),
-        format!(
-            "schedulePeriodEnd={}",
-            instant(period.and_then(|period| period.end_time.as_ref()))
-        ),
-        format!("scheduleState={}", text(schedule.state.as_deref())),
-        format!("description={}", text(report.description.as_deref())),
-    ];
-    match &report.widget_ids {
-        None => lines.push(format!("widgetIds={ABSENT}")),
-        Some(ids) => {
-            lines.push(format!("widgetIdCount={}", ids.len()));
-            lines.extend(ids.iter().map(|id| format!("widgetId={}", text(Some(id)))));
-        }
-    }
-    match &report.widget_date_range_override {
-        None => lines.push(format!("widgetDateRangeOverride={ABSENT}")),
-        Some(range) => {
-            lines.push(format!(
-                "widgetDateRangeStart={}",
-                date_time_value(&range.start_time)
-            ));
-            lines.push(format!(
-                "widgetDateRangeEnd={}",
-                date_time_value(&range.end_time)
-            ));
-        }
-    }
-    let mut tags: Vec<(String, String)> = merge_resource_tags(Vec::new(), resource_tags.to_vec())
-        .into_iter()
-        .map(|tag| (tag.key, tag.value))
-        .collect();
-    tags.sort();
-    lines.push(format!("tagCount={}", tags.len()));
-    lines.extend(tags.iter().map(|(key, value)| {
-        format!(
-            "tag={} {}",
-            text(Some(key.as_str())),
-            text(Some(value.as_str()))
-        )
-    }));
-    lines.join("\n")
 }
 
 /// The outcome one `ExecuteScheduledReport` call recorded under the report it executed
@@ -854,16 +742,20 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     pub scheduled_reports: BTreeMap<String, ScheduledReportRecord>,
     /// Monotonic counter behind every minted scheduled-report resource id.
     pub next_scheduled_report_seq: u64,
-    /// The `clientToken` of every `CreateScheduledReport` that has created a report,
-    /// mapped to that call's outcome. A token makes the create IDEMPOTENT: a later call
-    /// presenting the same token for the same request answers the recorded ARN and
-    /// creates nothing, one presenting it while that create is still in flight
-    /// ([`SCHEDULED_REPORT_CREATION_WINDOW`]) or for a materially different request is
-    /// refused with the modelled `ConflictException` — so a retried token can never mint
-    /// a second LIVE report. A record whose report is no longer stored is dropped
+    /// The `clientToken` of every `CreateScheduledReport` that has claimed one, mapped to
+    /// what the create holding that claim has done ([`ScheduledReportCreation`]). A token
+    /// is SPENT by the create it is presented to: the call that commits to creating claims
+    /// it ([`Self::reserve_scheduled_report_creation`]) and settles the claim with the ARN
+    /// of the report it stored ([`Self::settle_scheduled_report_creation`]), so every later
+    /// call presenting that token is refused with the modelled `ConflictException` — the
+    /// report is being created while the claim is unsettled, and already exists once it is
+    /// settled — and a token can never mint a second report. A call that is refused before
+    /// it stores anything releases its claim
+    /// ([`Self::release_scheduled_report_creation`]), leaving the token free. A settled
+    /// claim whose report is no longer stored is dropped
     /// ([`Self::forget_creations_of_removed_reports`]), which is what keeps the map
     /// bounded by [`MAX_SCHEDULED_REPORTS`] — one record per stored report at most — and
-    /// what stops a retry from being answered with an ARN that resolves to nothing.
+    /// what frees a token whose report a caller deleted.
     pub scheduled_report_client_tokens: BTreeMap<String, ScheduledReportCreation>,
     /// Every `ExecuteScheduledReport` call that has triggered (or declined to trigger)
     /// an execution under a `clientToken`, keyed by the pair (the executed report's ARN,
@@ -1193,20 +1085,83 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
         report.summary(self.reported_scheduled_report_health(report))
     }
 
-    /// Drop every create idempotency record whose scheduled report this service no
-    /// longer stores.
+    /// Drop every settled create claim whose scheduled report this service no longer
+    /// stores.
     ///
-    /// A record exists to answer the retry of the create it describes with that create's
-    /// outcome; once the report it minted is gone, that outcome is gone with it, so the
-    /// record would otherwise have a retry answered with an ARN nothing resolves to. The
-    /// removal of the report is what makes the record due for dropping — it was owed at
-    /// that moment, whether or not anybody called afterwards — and dropping it is also
-    /// what bounds the map by the reports actually stored
-    /// ([`MAX_SCHEDULED_REPORTS`]) rather than by every token ever presented.
+    /// A settled claim exists to refuse a later create presenting its token with the ARN
+    /// of the report that token already created; once that report is gone there is no
+    /// such report to name, so the claim would otherwise refuse a create in the name of
+    /// an ARN nothing resolves to. The removal of the report is what makes the claim due
+    /// for dropping — it was owed at that moment, whether or not anybody called
+    /// afterwards — and dropping it is also what bounds the map by the reports actually
+    /// stored ([`MAX_SCHEDULED_REPORTS`]) rather than by every token ever presented.
+    ///
+    /// A claim that is still IN FLIGHT names no report yet, so it has nothing removed to
+    /// forget: it is held until the create holding it settles or releases it.
     pub fn forget_creations_of_removed_reports(&mut self) {
         let reports = &self.scheduled_reports;
         self.scheduled_report_client_tokens
-            .retain(|_, creation| reports.contains_key(&creation.arn));
+            .retain(|_, creation| {
+                creation
+                    .created_arn()
+                    .is_none_or(|arn| reports.contains_key(arn))
+            });
+    }
+
+    /// Claim `token` for the `CreateScheduledReport` call that is about to create, or —
+    /// when another create already claimed it — answer that claim and leave it alone.
+    ///
+    /// The lookup and the claim are ONE operation under the caller's single guard, which
+    /// is what makes the token suppress a duplicate that is IN FLIGHT and not only one
+    /// that arrives after the report is stored: the claim is taken before the report
+    /// exists and the store is not held from the claim to the write, so a token recorded
+    /// only once the report was stored would leave a window in which a duplicate finds
+    /// the token free and creates a second report. Of several calls presenting one token
+    /// exactly one is therefore answered `None` and goes on to create; every other is
+    /// answered the claim it found and refused by its wording
+    /// ([`ScheduledReportCreation::conflict_message`]).
+    pub fn reserve_scheduled_report_creation(
+        &mut self,
+        token: String,
+    ) -> Option<ScheduledReportCreation> {
+        match self.scheduled_report_client_tokens.entry(token) {
+            Entry::Occupied(claimed) => Some(claimed.get().clone()),
+            Entry::Vacant(free) => {
+                free.insert(ScheduledReportCreation::InFlight);
+                None
+            }
+        }
+    }
+
+    /// Settle the claim `token` holds with `arn`, the report the call holding it stored:
+    /// from here the token is terminally spent, so every later call presenting it is
+    /// refused in the name of that report rather than told a creation is in progress.
+    ///
+    /// Only an unsettled claim is written: a claim another call settled under the same
+    /// token — which it can only have taken once this one released its own — is left as
+    /// that call settled it.
+    pub fn settle_scheduled_report_creation(&mut self, token: &str, arn: &str) {
+        if let Some(claim) = self.scheduled_report_client_tokens.get_mut(token) {
+            if claim.created_arn().is_none() {
+                *claim = ScheduledReportCreation::Created {
+                    arn: arn.to_string(),
+                };
+            }
+        }
+    }
+
+    /// Release the IN-FLIGHT claim `token` holds, because the call that took it was
+    /// refused and stored nothing: a refused request creates no report, so its token
+    /// stays free for the request that corrects it. A settled claim is left alone — the
+    /// report it names exists, and the token that created it is spent.
+    pub fn release_scheduled_report_creation(&mut self, token: &str) {
+        if self
+            .scheduled_report_client_tokens
+            .get(token)
+            .is_some_and(|claim| claim.created_arn().is_none())
+        {
+            self.scheduled_report_client_tokens.remove(token);
+        }
     }
 
     /// Drop every execution idempotency record whose [`EXECUTION_IDEMPOTENCY_WINDOW`]

@@ -9,9 +9,9 @@
 //! it was stored, `createdAt == updatedAt` on a report that was never updated, and no
 //! execution time until something executes the report (its health reads HEALTHY from
 //! the moment the service accepted it).
-//! A `clientToken` makes the create idempotent — a retry presenting it again replays the
-//! ARN the first call minted — and a `dashboardArn` no stored dashboard answers to is
-//! refused.
+//! A `clientToken` is spent by the create it is presented to — a later call presenting it
+//! again is refused rather than served a report — and a `dashboardArn` no stored
+//! dashboard answers to is refused.
 //!
 //! Each assertion spans the class rather than one recorded request: the table below
 //! differs in which optional members are present, in schedule state (absent, `ENABLED`,
@@ -21,7 +21,6 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::create_report_client_token::wait_out_the_creation_window;
 use super::dashboard_lifecycle::{call, graph_config, ok_call, router, timestamp};
 
 /// A well-formed `ServiceRoleArn` (pattern
@@ -382,11 +381,10 @@ async fn create_scheduled_report_persists_the_configuration_and_get_reads_it_bac
 }
 
 /// A `clientToken` creates at most one report: the first call presenting it creates the
-/// report, the retry of that same request is answered with the ARN it minted, and a
-/// token presented with a different request is refused with the modelled
-/// ConflictException (409) — leaving the first record untouched either way. The retry
-/// rule itself, including the duplicate that races the create, is tabled in
-/// `tests/all/create_report_client_token.rs`.
+/// report, and every later call presenting it — the identical request as much as a
+/// different one — is refused with the modelled ConflictException (409), leaving the
+/// first record untouched. The refusal's own rule, including the wording each conflict
+/// carries, is tabled in `tests/all/create_report_token_spent.rs`.
 #[tokio::test]
 async fn a_client_token_creates_at_most_one_scheduled_report() {
     let router = router();
@@ -406,18 +404,19 @@ async fn a_client_token_creates_at_most_one_scheduled_report() {
     let winner_arn = winner["arn"].as_str().expect("an arn").to_string();
     let winner_record = ok_call(&router, "GetScheduledReport", &json!({"arn": winner_arn})).await;
 
-    // Past the span the create counts as in flight, the identical request again — what
-    // an SDK transport retry resends — is that same request, so it is answered with the
-    // ARN it already created.
-    wait_out_the_creation_window().await;
-    let retried = ok_call(&router, "CreateScheduledReport", &first).await;
+    // The identical request again — what an SDK transport retry resends — presents a
+    // token the create above already spent, so it is refused rather than served.
+    let (status, body) = call(&router, "CreateScheduledReport", &first).await;
     assert_eq!(
-        retried["arn"].as_str(),
-        Some(winner_arn.as_str()),
-        "an identical retry replays the arn the token already created: {retried}"
+        status, 409,
+        "a clientToken the create already spent is refused with 409, got {status}: {body}"
+    );
+    assert!(
+        error_code(&body).ends_with("ConflictException"),
+        "expected ConflictException, got {body}"
     );
 
-    // A different request reusing the token is the conflict the model documents.
+    // So is a different request reusing the token.
     let mut different = first.clone();
     different["scheduledReport"]["name"] = json!("Token Loser");
     different["scheduledReport"]["scheduleConfig"] = json!({"scheduleExpression": "rate(1 day)", "state": "DISABLED"});
@@ -436,7 +435,7 @@ async fn a_client_token_creates_at_most_one_scheduled_report() {
     assert_eq!(
         ok_call(&router, "GetScheduledReport", &json!({"arn": winner_arn})).await,
         winner_record,
-        "neither the replayed retry nor the refused reuse may touch the winning record"
+        "no refused reuse of the token may touch the winning record"
     );
     let second = ok_call(
         &router,
