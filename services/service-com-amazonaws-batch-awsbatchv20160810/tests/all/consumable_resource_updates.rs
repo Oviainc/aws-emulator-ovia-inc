@@ -9,14 +9,15 @@
 //!
 //! * an update applies the request's `quantity` to the stored `totalQuantity` the way
 //!   `operation` says — `SET` makes it the new total, `ADD` increases it, `REMOVE` reduces
-//!   it — persists the result and answers the resource's name, its ARN and that total,
-//!   which `DescribeConsumableResource` then reads back;
+//!   it, saturating at zero — persists the result and answers the resource's name, its ARN
+//!   and that total, which `DescribeConsumableResource` then reads back;
 //! * the identifier is resolved by name or by ARN, the two forms `consumableResource`
 //!   documents, and an identifier that resolves to nothing is refused rather than created;
+//! * a `REMOVE` whose `quantity` is larger than the stored total empties the resource
+//!   instead of being refused: the total saturates at zero and never goes negative;
 //! * a request the service cannot apply is refused with the modelled `ClientException` and
 //!   leaves the stored quantity exactly as it was: an `operation` outside the documented
-//!   three, a negative `quantity`, a `REMOVE` past what the resource holds, and an `ADD`
-//!   past the largest `Long`;
+//!   three, a negative `quantity`, and an `ADD` past the largest `Long`;
 //! * `clientToken` makes an identical repeat THE SAME request: both calls succeed with the
 //!   same response and the update happens once, while an update carrying no token is a new
 //!   request every time.
@@ -158,6 +159,36 @@ fn steps() -> Vec<Step> {
             body: json!({"operation": "SET", "quantity": i64::MAX}),
             by_arn: true,
             expected_total: i64::MAX,
+        },
+        Step {
+            label: "SET a small total to over-remove from",
+            body: json!({"operation": "SET", "quantity": 5}),
+            by_arn: false,
+            expected_total: 5,
+        },
+        Step {
+            label: "REMOVE one past the total saturates at zero",
+            body: json!({"operation": "REMOVE", "quantity": 6}),
+            by_arn: false,
+            expected_total: 0,
+        },
+        Step {
+            label: "REMOVE against a zero total stays at zero",
+            body: json!({"operation": "REMOVE", "quantity": 1_000}),
+            by_arn: true,
+            expected_total: 0,
+        },
+        Step {
+            label: "SET a total the largest Long dwarfs",
+            body: json!({"operation": "SET", "quantity": 123}),
+            by_arn: false,
+            expected_total: 123,
+        },
+        Step {
+            label: "REMOVE the largest Long from a smaller total saturates at zero",
+            body: json!({"operation": "REMOVE", "quantity": i64::MAX}),
+            by_arn: true,
+            expected_total: 0,
         },
     ]
 }
@@ -351,20 +382,6 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             "a negative quantity with no operation",
             json!({"consumableResource": "guarded", "quantity": -5}),
             "quantity".to_string(),
-        ),
-        (
-            "REMOVE one past what the resource holds",
-            json!({"consumableResource": "guarded", "operation": "REMOVE", "quantity": 11}),
-            "totalQuantity".to_string(),
-        ),
-        (
-            "REMOVE the largest Long",
-            json!({
-                "consumableResource": "guarded",
-                "operation": "REMOVE",
-                "quantity": i64::MAX,
-            }),
-            "totalQuantity".to_string(),
         ),
         (
             "ADD past the largest Long",

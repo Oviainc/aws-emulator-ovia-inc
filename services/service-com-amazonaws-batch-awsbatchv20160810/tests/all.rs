@@ -19,6 +19,8 @@ mod cancel_job;
 mod clock_owed_spans_are_per_resource;
 #[path = "all/compute_environment_update.rs"]
 mod compute_environment_update;
+#[path = "all/consumable_resource_drain.rs"]
+mod consumable_resource_drain;
 #[path = "all/consumable_resource_listing.rs"]
 mod consumable_resource_listing;
 #[path = "all/consumable_resource_release.rs"]

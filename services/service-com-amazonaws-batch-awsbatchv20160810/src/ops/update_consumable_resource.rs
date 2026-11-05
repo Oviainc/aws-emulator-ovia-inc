@@ -4,7 +4,8 @@
 //!
 //! Applies the request's `quantity` to the total quantity of one stored consumable
 //! resource ([`crate::state`]) the way `operation` says — `SET` makes it the new total,
-//! `ADD` increases it, `REMOVE` reduces it — and answers that resource's name, its ARN and
+//! `ADD` increases it, `REMOVE` reduces it, saturating at zero rather than going negative —
+//! and answers that resource's name, its ARN and
 //! the total the update left it at. The whole read-modify-write happens under this store's
 //! lock, so two overlapping updates serialize instead of one reading a stale total, and
 //! `DescribeConsumableResource` reads the result back.
@@ -275,19 +276,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     sum
                 }
                 batch::UPDATE_OPERATION_REMOVE => {
-                    // A consumable resource's `totalQuantity` is non-negative (the
-                    // member's doc: "Must be non-negative"), so a reduction past what the
-                    // resource holds is refused and the stored total is left as it was.
-                    if quantity > current {
-                        return Err(UpdateConsumableResourceErrorModeled::ClientException(
-                            batch::client_exception(format!(
-                                "quantity {quantity} is more than the totalQuantity \
-                                 {current} of {name}"
-                            )),
-                        )
-                        .into());
-                    }
-                    current - quantity
+                    // "Reduces the quantity of the resource by the value specified by the
+                    // quantity parameter." Nothing bounds that value by what the resource
+                    // currently holds, and a `totalQuantity` is never negative, so the
+                    // reduction SATURATES at zero: a request that asks for more than the
+                    // resource holds empties it and succeeds. That is what lets a caller
+                    // drain a resource with one deliberately over-sized reduction instead
+                    // of reading the total first and racing every concurrent increase.
+                    current.saturating_sub(quantity).max(0)
                 }
                 // `SET`, and the default above: the request's quantity IS the new total.
                 _ => quantity,
