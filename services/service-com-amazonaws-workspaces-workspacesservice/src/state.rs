@@ -42,6 +42,16 @@
 //! `CreateWorkspaces` request's `DirectoryId` resolves against. Unlike the
 //! bundle catalog it starts empty — a directory exists in WorkSpaces only once
 //! it has been registered.
+//!
+//! The tag set each of those resources carries is reached through the `tags`
+//! submodule: `CreateTags`, `DescribeTags` and `DeleteTags` address a resource by
+//! its `ResourceId` whatever its kind, so resolving an id to ONE tag set — the
+//! very list the create that minted the resource wrote — belongs beside the
+//! records rather than in any one handler.
+
+mod tags;
+
+pub use tags::{TagRefusal, MESSAGE_TAG_RESOURCE_NOT_FOUND};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;

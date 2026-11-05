@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the tags the request's `TagKeys` names from the WorkSpaces resource it
+//! names, leaving every other tag that resource holds in place.
 //!
 //! ## Shape of an operation
 //!
@@ -78,11 +72,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DeleteTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DeleteTags")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DeleteTags",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteTagsErrorModeled {
     InvalidParameterValuesException(InvalidParameterValuesException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -136,18 +138,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTags"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTagsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // One lock covers resolving the id and rewriting the tag set, so a delete
+        // cannot land on a record another call removed in between.
+        let mut store = state.lock();
+        // A resource whose termination or deletion the clock already owes is gone
+        // before the id is resolved.
+        store.settle();
+        let resource_existed = store.delete_resource_tags(&input.resource_id, &input.tag_keys);
+        drop(store);
+
+        // A key the resource does not hold removes nothing and is not a refusal:
+        // the caller named the keys it wants the resource rid of, and a resource
+        // already rid of one is in the asked-for state.
+        if resource_existed {
+            return Ok(DeleteTagsOutput {});
+        }
+        // The message is the sentence for this error class, entirely fixed — the
+        // operation's `ResourceId` is kind-agnostic, so a refusal has no resource
+        // kind to name — and the id the caller asked about travels in the shape's
+        // own `ResourceId` member ("The ID of the resource that could not be
+        // found").
+        Err(DeleteTagsErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(crate::state::MESSAGE_TAG_RESOURCE_NOT_FOUND.to_string()),
+                resource_id: Some(input.resource_id.clone()),
+            },
+        )
+        .into())
     }
 }

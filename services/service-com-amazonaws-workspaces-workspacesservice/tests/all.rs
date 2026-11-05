@@ -41,6 +41,9 @@ mod ip_access_control_groups;
 #[path = "all/ip_group_and_alias_refusal_messages.rs"]
 mod ip_group_and_alias_refusal_messages;
 
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

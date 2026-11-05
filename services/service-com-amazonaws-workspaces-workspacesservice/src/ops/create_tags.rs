@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the tags the request names on the WorkSpaces resource it names: a key
+//! the resource already holds has its value replaced, a key it does not hold is
+//! added, and the resource is left holding at most
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags. The set written here is the one
+//! `DescribeTags` reports and the one the create that minted the resource wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -80,12 +77,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `CreateTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#CreateTags")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#CreateTags",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateTagsErrorModeled {
     InvalidParameterValuesException(InvalidParameterValuesException),
     ResourceLimitExceededException(ResourceLimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +144,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTags"))
+        let _ = ctx;
+
+        // `Tags`: "Each WorkSpaces resource can have a maximum of 50 tags." The
+        // model constrains the list's own length nowhere, so the caller-chosen
+        // count is bounded HERE, before the shared store is locked: a request
+        // naming more DISTINCT keys than the maximum cannot be satisfied whatever
+        // the resource holds. Counting stops at the key that crosses the limit, so
+        // the set this costs is never larger than the limit itself.
+        let mut requested_keys: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for tag in &input.tags {
+            requested_keys.insert(tag.key.as_str());
+            if requested_keys.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(limit_exceeded());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTagsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // One lock covers resolving the id and writing the tag set, so a write
+        // cannot land on a record another call removed in between.
+        let mut store = state.lock();
+        // A resource whose termination or deletion the clock already owes is gone
+        // before the id is resolved, so a tag write cannot land on a record a
+        // describe no longer reports.
+        store.settle();
+        let written = store.create_resource_tags(&input.resource_id, &input.tags);
+        drop(store);
+
+        match written {
+            Ok(()) => Ok(CreateTagsOutput {}),
+            // The message is the sentence for this error class, entirely fixed —
+            // the operation's `ResourceId` is kind-agnostic, so a refusal has no
+            // resource kind to name — and the id the caller asked about travels in
+            // the shape's own `ResourceId` member ("The ID of the resource that
+            // could not be found").
+            Err(crate::state::TagRefusal::NotFound) => {
+                Err(CreateTagsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::MESSAGE_TAG_RESOURCE_NOT_FOUND.to_string()),
+                        resource_id: Some(input.resource_id.clone()),
+                    },
+                )
+                .into())
+            }
+            // The maximum is on the RESOURCE, so it is measured against the tags
+            // it already holds plus the requested keys it does not hold yet — a
+            // request that only replaces values never reaches it.
+            Err(crate::state::TagRefusal::LimitExceeded) => Err(limit_exceeded()),
+        }
     }
+}
+
+/// A refusal of a request that would leave a resource holding more tags than a
+/// WorkSpaces resource can have, as the modelled `ResourceLimitExceededException`.
+///
+/// Wholly fixed text: the sentence for this error class, naming neither the
+/// request's tag count nor the resource's.
+fn limit_exceeded() -> CreateTagsError {
+    CreateTagsErrorModeled::ResourceLimitExceededException(ResourceLimitExceededException {
+        message: Some("Your resource limits have been exceeded.".to_string()),
+    })
+    .into()
 }
