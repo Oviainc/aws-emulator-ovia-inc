@@ -283,9 +283,23 @@ async fn the_synthetic_error_shapes_carry_no_shape_id_of_this_service() {
             "ValidationException",
         ),
         (
+            // The one operation of this service still carrying the scaffold marker: the
+            // X12 interchange it would have to serialise needs segment dictionaries this
+            // emulator does not hold, so a well-formed request reaches the 501.
             "an operation nobody has implemented",
-            "UpdateCapability",
-            json!({ "capabilityId": UNKNOWN_CAPABILITY }),
+            "TestConversion",
+            json!({
+                "source": {
+                    "fileFormat": "JSON",
+                    "inputFile": { "fileContent": "{\"transactionSets\":[]}" }
+                },
+                "target": {
+                    "fileFormat": "X12",
+                    "formatDetails": {
+                        "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
+                    }
+                }
+            }),
             501,
             "NotImplemented",
         ),

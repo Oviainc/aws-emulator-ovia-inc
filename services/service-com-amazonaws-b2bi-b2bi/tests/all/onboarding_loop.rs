@@ -1641,10 +1641,26 @@ async fn operations_outside_this_slice_still_answer_501() {
     let router = b2bi_router();
 
     // (case, operation, a request that satisfies the modelled input constraints)
+    //
+    // `TestConversion` is the one operation of this service still carrying the scaffold
+    // marker: serialising the X12 interchange it answers with needs segment dictionaries
+    // this emulator does not hold, so a request that satisfies every modelled constraint
+    // reaches the 501 rather than a fabricated interchange.
     let cases: &[(&str, &str, Value)] = &[(
-        "update capability",
-        "UpdateCapability",
-        json!({ "capabilityId": "c-0123456789abcdef0" }),
+        "test conversion",
+        "TestConversion",
+        json!({
+            "source": {
+                "fileFormat": "JSON",
+                "inputFile": { "fileContent": "{\"transactionSets\":[]}" }
+            },
+            "target": {
+                "fileFormat": "X12",
+                "formatDetails": {
+                    "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
+                }
+            }
+        }),
     )];
 
     for (case, operation, request) in cases {

@@ -620,9 +620,23 @@ pub fn profile_reference_not_found(profile_id: &str) -> String {
     format!("Profile with profileId {profile_id} not found.")
 }
 
-/// The `ResourceNotFoundException` message for an unknown `capabilityId`.
+/// The `ResourceNotFoundException` message for a `capabilityId` the reader, the delete and
+/// the operations that resolve a capability as a REFERENCE report absent —
+/// `GetCapability`, `DeleteCapability`, `CreatePartnership`, `UpdatePartnership`.
 pub fn capability_not_found(capability_id: &str) -> String {
     format!("Capability ID {capability_id} not found.")
+}
+
+/// The `ResourceNotFoundException` message `UpdateCapability` reports an unknown
+/// `capabilityId` with.
+///
+/// The recorded form for that path names the MEMBER the id arrived in, unlike the template
+/// every other capability path states ([`capability_not_found`]) — the same per-path split
+/// a transformer's two forms carry ([`transformer_not_found`] and
+/// [`transformer_reference_not_found`]), and the same wording the partnership paths use
+/// ([`partnership_not_found`]).
+pub fn capability_update_not_found(capability_id: &str) -> String {
+    format!("Capability with capabilityId {capability_id} not found.")
 }
 
 /// The `ResourceNotFoundException` message for an unknown `partnershipId`.

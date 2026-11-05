@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCapability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCapability`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the members this request names to the stored capability, leaving every member
+//! it omits as it was, stamps `modifiedAt`, and answers with the STORED record — so a
+//! later `GetCapability` cannot disagree with the update.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCapability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Partial update: only the members present in the request are written, which is what the
+//! model's own wording asks for ("Updates some of the parameters for a capability, based
+//! on the specified parameters", "Specifies a new name for the capability, to replace the
+//! existing name"). `type` and `createdAt` are not input members here, so they stay the
+//! create's.
+//!
+//! Three requests are refused instead of stored: an unknown `capabilityId` (resolved
+//! first, so a request that is also wrong about its configuration still answers for the
+//! missing resource), a `configuration` whose input or output location names a bucket this
+//! account does not own, and one whose `transformerId` resolves to no stored transformer —
+//! the same two resolutions `CreateCapability` performs over the same configuration,
+//! decided before anything is written, so a refused update leaves the record untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +159,42 @@ impl From<UpdateCapabilityErrorModeled> for UpdateCapabilityError {
     }
 }
 
+/// The modelled refusal for a `capabilityId` this service holds no capability for, in the
+/// wording THIS path states it ([`crate::state::capability_update_not_found`], which names
+/// the member the id arrived in).
+fn capability_not_found(capability_id: &str) -> UpdateCapabilityError {
+    UpdateCapabilityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::capability_update_not_found(capability_id),
+    })
+    .into()
+}
+
+/// The modelled refusal for a configuration naming an input or output bucket this account
+/// does not own ([`crate::state::BUCKETS_NOT_OWNED`]) — the same refusal
+/// `CreateCapability` answers the same configuration with.
+fn buckets_not_owned() -> UpdateCapabilityError {
+    UpdateCapabilityErrorModeled::ValidationException(ValidationException {
+        message: crate::state::BUCKETS_NOT_OWNED.to_string(),
+    })
+    .into()
+}
+
+/// The response for the stored capability — every member read back off the record, so the
+/// update and a later `GetCapability` cannot disagree. `type` and `createdAt` are not
+/// input members of this operation, so they are the create's values.
+fn stored_capability_response(capability: &crate::state::Capability) -> UpdateCapabilityOutput {
+    UpdateCapabilityOutput {
+        capability_id: capability.capability_id.clone(),
+        capability_arn: capability.capability_arn.clone(),
+        name: capability.name.clone(),
+        r#type: capability.r#type.clone(),
+        configuration: capability.configuration.clone(),
+        instructions_documents: capability.instructions_documents.clone(),
+        created_at: capability.created_at,
+        modified_at: capability.modified_at,
+    }
+}
+
 /// The `UpdateCapability` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,18 +231,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCapability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCapabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCapability"))
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(&region, "capability", &input.capability_id),
+        ) {
+            return Err(UpdateCapabilityErrorModeled::AccessDeniedException(denied).into());
+        }
+        // Beyond that decision the request's signing region is only what the bucket
+        // lookups below are addressed to: the ARN and the id are the create's, and an
+        // update never re-mints either.
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCapabilityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The resolution verdict comes first: a `capabilityId` this service does not hold
+        // names no capability to update, which is the modelled 404 — never a create, and
+        // never a refusal about the configuration that request also carried. Taken under
+        // its own short-lived lock so no guard is held across the bucket lookups below.
+        if !store.lock().capabilities.contains_key(&input.capability_id) {
+            return Err(capability_not_found(&input.capability_id));
+        }
+
+        // A capability READS the EDI documents its input location holds and WRITES the
+        // transformed ones to its output location, so a configuration written onto the
+        // record has to name buckets this account owns — the same resolution
+        // `CreateCapability` performs, over the same two locations. A request that names no
+        // configuration keeps the stored one and asks object storage nothing.
+        if let Some(configuration) = input.configuration.as_ref() {
+            for bucket in crate::ops::create_capability::configured_buckets(configuration) {
+                if !crate::state::owns_bucket(ctx, &region, bucket).await {
+                    return Err(buckets_not_owned());
+                }
+            }
+        }
+
+        let mut state = store.lock();
+
+        // Then every reference the new configuration names, BEFORE anything is written: a
+        // capability's configuration references a transformer by id, so an id that resolves
+        // to no stored transformer refuses the whole call and leaves the record exactly as
+        // it was, rather than persisting a dangling reference.
+        if let Some(configuration) = input.configuration.as_ref() {
+            for transformer_id in
+                crate::ops::create_capability::referenced_transformers(configuration)
+            {
+                if !state.transformers.contains_key(transformer_id) {
+                    return Err(UpdateCapabilityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::transformer_reference_not_found(transformer_id),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let Some(capability) = state.capabilities.get_mut(&input.capability_id) else {
+            return Err(capability_not_found(&input.capability_id));
+        };
+
+        // Only the members the request names are written; one it omits keeps its stored
+        // value. `configuration` and `instructionsDocuments` are each the whole member
+        // rather than a delta, so the submitted value REPLACES the stored one. `type` is
+        // not an input member of this operation, so it is never rewritten here.
+        if let Some(name) = input.name {
+            capability.name = name;
+        }
+        if let Some(configuration) = input.configuration {
+            capability.configuration = configuration;
+        }
+        if let Some(instructions_documents) = input.instructions_documents {
+            capability.instructions_documents = Some(instructions_documents);
+        }
+        capability.modified_at = Some(crate::state::now());
+
+        Ok(stored_capability_response(capability))
     }
 }
+

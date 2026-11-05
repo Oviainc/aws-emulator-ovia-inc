@@ -53,6 +53,8 @@ mod transformer_jobs;
 mod transformer_lifecycle;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/update_capability.rs"]
+mod update_capability;
 #[path = "all/update_partnership.rs"]
 mod update_partnership;
 #[path = "all/update_partnership_refusal_status.rs"]

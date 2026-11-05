@@ -237,7 +237,10 @@ pub(crate) fn referenced_transformers(configuration: &CapabilityConfiguration) -
 /// [`referenced_transformers`] is: a configuration variant the model adds stops this
 /// matching until its own locations are listed here. A location naming no bucket yields
 /// the empty name, which no account owns.
-fn configured_buckets(configuration: &CapabilityConfiguration) -> Vec<&str> {
+///
+/// Shared with `UpdateCapability`, which writes a configuration onto an existing record
+/// and so has to resolve the very same locations the create does.
+pub(crate) fn configured_buckets(configuration: &CapabilityConfiguration) -> Vec<&str> {
     match configuration {
         CapabilityConfiguration::Edi(edi) => vec![
             edi.input_location.bucket_name.as_deref().unwrap_or_default(),
