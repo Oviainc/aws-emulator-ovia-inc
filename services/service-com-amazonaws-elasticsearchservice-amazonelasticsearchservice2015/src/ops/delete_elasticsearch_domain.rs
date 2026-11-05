@@ -176,6 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         domain.last_updated = now;
         domain.active_at = now;
 
+        // An association belongs to the domain it is on: with the domain gone,
+        // its package associations go with it, so `ListDomainsForPackage` never
+        // reports a domain this store no longer holds.
+        store
+            .package_associations
+            .retain(|(each, _, associated), _| {
+                each != &region || associated != &input.domain_name
+            });
+
         Ok(DeleteElasticsearchDomainOutput {
             domain_status: Some(domain.domain_status(now)),
         })

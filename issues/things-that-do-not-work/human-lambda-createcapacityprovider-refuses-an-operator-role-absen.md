@@ -38,3 +38,18 @@ Real AWS refuses a nonexistent operator role in the caller's own account, in eve
 
 ## Steps to Reproduce
 `cargo test -p aws-emulator-router --test all lambda_capacity_provider_operator_role` fails at the row "a role this account's IAM holds none of": "a role this service cannot assume must be refused", got 202.
+
+## Status (partial fix landed)
+The FIRST half above is now in the code, landed from another service's fix because the red
+gate blocked it: `operator_role_is_unassumable`
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/capacity_provider.rs`)
+now takes `service_common::iam_role::role_is_unassumable`, which refuses an operator role
+ARN of THIS account that IAM reports absent — 400 `InvalidParameterValueException` with the
+fixed message above, persisting nothing — and carries the comment this issue asks for.
+`held_role_is_unassumable` is unchanged for its execution-role callers. The row "a role this
+account's IAM holds none of" therefore passes.
+
+What REMAINS for this issue: the cross-account arm — AWS refuses a well-formed role ARN of
+another account with HTTP 403 `AccessDeniedException`, message `Cross-account pass role is
+not allowed.`, persisting nothing — and the matching change to that test row (still
+`accepted: true`), plus the comment on it.

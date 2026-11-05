@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches tags to the domain the `ARN` names and PERSISTS them on that domain
+//! record: the keys a later `ListTags` reports are the ones written here.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call is ADDITIVE — a key the domain already carries takes the submitted
+//! value and every other key it holds is left alone — since "tag keys must be
+//! unique for the Elasticsearch domain to which they are attached"
+//! (`Tag$Key`'s own documentation).
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +70,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{merge_tags, MAX_TAGS_PER_DOMAIN};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,20 +165,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The ARN carries the Region, so this call needs nothing from the
+        // request's own credential scope.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTags"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The request's own list is bounded BEFORE the store is locked and
+        // before anything is merged, so the work one call costs is bounded by
+        // the allowance rather than by how long a list the request carried.
+        if let Some(reason) = crate::state::oversized_tag_list(input.tag_list.len()) {
+            return Err(AddTagsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The ARN names its own Region and domain, so it is resolved against
+        // every domain this store holds rather than against the Region the call
+        // was signed for. An ARN that resolves to no domain of this account is
+        // an invalid input — this operation models no not-found error, and an
+        // ARN naming nothing is the request field that is wrong.
+        let Some(domain) = store.domain_by_arn_mut(&input.arn) else {
+            return Err(AddTagsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::INVALID_TAG_ARN_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // The documented per-domain tag allowance, counted on the set the merge
+        // WOULD leave behind, so a request that only re-values keys the domain
+        // already carries is never refused by it. Both lists are already capped
+        // at the allowance, so the merge below is bounded. Checked before the
+        // merge lands, so a refused call attaches nothing.
+        let mut merged = domain.tags.clone();
+        merge_tags(&mut merged, input.tag_list);
+        if merged.len() > MAX_TAGS_PER_DOMAIN {
+            return Err(AddTagsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Tag limit of {MAX_TAGS_PER_DOMAIN} tags per domain has been reached for \
+                         domain {domain}",
+                        domain = domain.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+        domain.tags = merged;
+
+        Ok(AddTagsOutput)
     }
 }

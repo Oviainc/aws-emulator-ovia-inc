@@ -16,13 +16,22 @@
 //! fabricated per response — so two reads of an unchanged domain agree and a
 //! read never has to write.
 //!
+//! A domain's tag set lives on that same record: `AddTags` merges into it,
+//! `ListTags` reads it and `RemoveTags` drops the keys it names, all addressed
+//! by the ARN the create reported.
+//!
+//! A [`Package`] carries its own content history — one [`PackageVersionRecord`]
+//! per revision, appended by `CreatePackage` and `UpdatePackage` — and a
+//! [`DomainPackage`] records one package installed on one domain, which
+//! `AssociatePackage` writes and the two list operations read.
+//!
 //! The other resource this store holds is the outbound
 //! [`CrossClusterSearchConnection`]: `CreateOutboundCrossClusterSearchConnection`
 //! mints one and `DescribeOutboundCrossClusterSearchConnections` reports it. Its
 //! status is COMPUTED from the stored validation outcome and the instant that
 //! outcome falls due, for the same reason: reporting it must not write.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 // The service's modelled shapes. They are the stored representation as well as
@@ -1044,12 +1053,27 @@ pub const PACKAGE_STATUS_COPYING: &str = "COPYING";
 /// associated with a domain.
 pub const PACKAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
 
-/// The version `CreatePackage` stamps on a package's first content.
+/// The label the `ordinal`-th revision of a package's content carries.
 ///
-/// `PackageVersion` is an unconstrained string and `UpdatePackage` reports the
-/// version its new content got, so the versions a package goes through are the
-/// counting numbers from here.
-pub const FIRST_PACKAGE_VERSION: &str = "1";
+/// `PackageVersion` is an unconstrained string, and the versions one package
+/// goes through are a GENERATED SEQUENCE rather than anything the caller
+/// supplies: a create mints the first, and every `UpdatePackage` the next
+/// counting number behind the same `v` prefix. One function is the only place
+/// that shape is written, so `AvailablePackageVersion`, the version history and
+/// an association's `PackageVersion` cannot name a package's version three
+/// different ways.
+pub fn package_version_label(ordinal: usize) -> String {
+    format!("v{ordinal}")
+}
+
+/// The most revisions one package may hold.
+///
+/// `UpdatePackage` is a caller-driven growth site on a record that is never
+/// otherwise trimmed, and this is the emulator's own bound on it, answered with
+/// the modelled `LimitExceededException` ("trying to create more than allowed
+/// resources or sub-resources"). It sits far above the number of revisions a
+/// dictionary goes through in any one workflow.
+pub const MAX_PACKAGE_VERSIONS: usize = 100;
 
 /// A hard ceiling on every stored package, across every region.
 ///
@@ -1074,6 +1098,34 @@ pub fn package_key(region: &str, package_id: &str) -> (String, String) {
 /// behind the prefix naming the resource it identifies.
 pub fn package_id(seq: u64) -> String {
     format!("pkg-{token:016x}", token = seq.wrapping_mul(ID_MULTIPLIER))
+}
+
+/// One revision of a package's content, as stored.
+///
+/// The sequence of these IS the package's version history: `CreatePackage`
+/// appends the first and each `UpdatePackage` the next, so the history a read
+/// reports is the stored sequence rather than anything recomputed per response.
+#[derive(Debug, Clone)]
+pub struct PackageVersionRecord {
+    /// This revision's label — see [`package_version_label`].
+    pub version: String,
+    /// `CommitMessage`, "a message associated with the version", where the
+    /// update that minted it carried one. A create has no such input member, so
+    /// a package's first version has none.
+    pub commit_message: Option<String>,
+    /// When this revision was minted.
+    pub created_at: SystemTime,
+}
+
+impl PackageVersionRecord {
+    /// This record as the `PackageVersionHistory` entry a history read reports.
+    pub fn to_history(&self) -> PackageVersionHistory {
+        PackageVersionHistory {
+            package_version: Some(self.version.clone()),
+            commit_message: self.commit_message.clone(),
+            created_at: Some(datetime_of(self.created_at)),
+        }
+    }
 }
 
 /// One package, as stored.
@@ -1104,8 +1156,10 @@ pub struct Package {
     /// When the clock finishes copying the current content, i.e. when the
     /// package becomes [`PACKAGE_STATUS_AVAILABLE`].
     pub available_at: SystemTime,
-    /// `AvailablePackageVersion` — the version the current content got.
-    pub available_version: String,
+    /// Every revision of the package's content, oldest first — the package's
+    /// version history, and the source of the version its current content
+    /// carries.
+    pub versions: Vec<PackageVersionRecord>,
 }
 
 impl Package {
@@ -1127,8 +1181,55 @@ impl Package {
             created_at: now,
             last_updated_at: now,
             available_at: active_deadline(now),
-            available_version: FIRST_PACKAGE_VERSION.to_string(),
+            versions: vec![PackageVersionRecord {
+                version: package_version_label(1),
+                commit_message: None,
+                created_at: now,
+            }],
         }
+    }
+
+    /// The label of the package's newest revision — the version its current
+    /// copy is of, and the one `AvailablePackageVersion` names once that copy
+    /// has landed.
+    pub fn current_version(&self) -> &str {
+        self.versions
+            .last()
+            .map(|revision| revision.version.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Take new content: the package's source becomes `source`, the clock starts
+    /// copying it again, and the history grows by the next version.
+    ///
+    /// `PackageDescription` is replaced only when the update supplied one, since
+    /// the member is optional and an update that omits it changes nothing about
+    /// the description.
+    pub fn revise(
+        &mut self,
+        source: PackageSource,
+        package_description: Option<String>,
+        commit_message: Option<String>,
+        now: SystemTime,
+    ) {
+        self.source = source;
+        if package_description.is_some() {
+            self.package_description = package_description;
+        }
+        self.versions.push(PackageVersionRecord {
+            version: package_version_label(self.versions.len() + 1),
+            commit_message,
+            created_at: now,
+        });
+        self.last_updated_at = now;
+        self.available_at = active_deadline(now);
+    }
+
+    /// The package's version history, NEWEST FIRST: a history read reports the
+    /// most recent revision first, so the newest version is the head of the
+    /// first page.
+    pub fn history_newest_first(&self) -> Vec<&PackageVersionRecord> {
+        self.versions.iter().rev().collect()
     }
 
     /// Whether the clock has not yet finished copying the package's content.
@@ -1162,11 +1263,236 @@ impl Package {
             created_at: Some(datetime_of(self.created_at)),
             last_updated_at: Some(datetime_of(self.last_updated_at)),
             available_package_version: (!self.copying(now))
-                .then(|| self.available_version.clone()),
+                .then(|| self.current_version().to_string()),
             error_details: None,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Package/domain associations
+// ---------------------------------------------------------------------------
+
+/// `DomainPackageStatus`'s `ASSOCIATING`: the package is being installed on the
+/// domain's nodes. The state an association holds from the instant
+/// `AssociatePackage` returns until [`active_deadline`] has passed.
+pub const DOMAIN_PACKAGE_STATUS_ASSOCIATING: &str = "ASSOCIATING";
+
+/// `DOMAIN_PACKAGE_STATUS`'s `ACTIVE`: the package is installed and the domain
+/// can reference it.
+pub const DOMAIN_PACKAGE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How many packages one domain may hold associated with it.
+///
+/// AWS documents a quota of 100 packages per domain. Enforcing it keeps the
+/// association count of one domain bounded by a stated service limit rather
+/// than by how many associate calls a caller issues.
+pub const MAX_PACKAGES_PER_DOMAIN: usize = 100;
+
+/// A hard ceiling on every stored association, across every region.
+///
+/// [`MAX_PACKAGES_PER_DOMAIN`] alone does not bound the store: the region comes
+/// from the request's own credential scope, so a caller varying it would get a
+/// fresh allowance each time. This cap dominates the single growth site
+/// instead, and sits well above the per-domain quota, so no domain's allowance
+/// is clipped by it.
+pub const MAX_ASSOCIATIONS_TOTAL: usize = 10_000;
+
+/// The refusal `AssociatePackage` gives a domain whose service software is not
+/// the latest one.
+///
+/// A domain still provisioning a change has not finished moving onto its
+/// service software, so it cannot take a package yet. The sentence pair is the
+/// whole message: nothing from the request or the store is interpolated into it.
+pub const NOT_ON_LATEST_SOFTWARE_MESSAGE: &str =
+    "The domain is not on the latest software version. Upgrade the domain to start using this \
+     feature. ";
+
+/// The key one association is stored under: the region, the package and the
+/// domain.
+///
+/// Region first, so an account's regions stay apart; the package before the
+/// domain, so one package's associations are contiguous and in domain-name
+/// order, which is the order a list of them is reported in.
+pub fn association_key(
+    region: &str,
+    package_id: &str,
+    domain_name: &str,
+) -> (String, String, String) {
+    (
+        region.to_string(),
+        package_id.to_string(),
+        domain_name.to_string(),
+    )
+}
+
+/// `ReferencePath` — "the relative path on Amazon ES nodes, which can be used
+/// as synonym_path when the package is synonym file" (its own documentation):
+/// the package's content is laid down under the nodes' analyzer directory,
+/// addressed by the package's own id.
+pub fn package_reference_path(package_id: &str) -> String {
+    format!("analyzers/{package_id}")
+}
+
+/// One package associated with one domain, as stored.
+///
+/// This record is the single source of truth for the association: the
+/// associate's own `DomainPackageDetails` and every later `ListPackagesForDomain`
+/// / `ListDomainsForPackage` entry are both [`Self::to_details`] of it. The
+/// association's status is COMPUTED from the instant its installation falls
+/// due, so reporting it never has to write.
+#[derive(Debug, Clone)]
+pub struct DomainPackage {
+    /// The package being installed, which is half the key the store holds the
+    /// record under.
+    pub package_id: String,
+    /// The domain it is installed on, the other half of that key.
+    pub domain_name: String,
+    /// The package version the domain picked up when the association was made.
+    /// A later `UpdatePackage` mints a new version for the package without
+    /// moving the domain onto it, so this is stored rather than read back off
+    /// the package.
+    pub package_version: String,
+    /// When the association last changed — `LastUpdated`, "timestamp of the
+    /// most-recent update to the association status".
+    pub last_updated: SystemTime,
+    /// When the clock finishes installing the package on the domain, i.e. when
+    /// the association becomes [`DOMAIN_PACKAGE_STATUS_ACTIVE`].
+    pub active_at: SystemTime,
+}
+
+impl DomainPackage {
+    /// A freshly made association, still being installed.
+    pub fn associate(package: &Package, domain_name: String, now: SystemTime) -> Self {
+        Self {
+            package_id: package.package_id.clone(),
+            domain_name,
+            package_version: package.current_version().to_string(),
+            last_updated: now,
+            active_at: active_deadline(now),
+        }
+    }
+
+    /// Whether the clock has not yet finished installing the package.
+    pub fn associating(&self, now: SystemTime) -> bool {
+        now < self.active_at
+    }
+
+    /// The association's modelled state — one of `DOMAIN_PACKAGE_STATUS_VALUES`.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.associating(now) {
+            DOMAIN_PACKAGE_STATUS_ASSOCIATING
+        } else {
+            DOMAIN_PACKAGE_STATUS_ACTIVE
+        }
+    }
+
+    /// This record as the `DomainPackageDetails` every association operation
+    /// reports.
+    ///
+    /// The package's name and type come from the package record this
+    /// association names, so a list of associations and a describe of the
+    /// package cannot disagree about them. `ErrorDetails` is "additional
+    /// information if the package is in an error state. Null otherwise" (its own
+    /// documentation), and a stored association is in no error state.
+    pub fn to_details(&self, package: &Package, now: SystemTime) -> DomainPackageDetails {
+        DomainPackageDetails {
+            package_id: Some(self.package_id.clone()),
+            package_name: Some(package.package_name.clone()),
+            package_type: Some(package.package_type.clone()),
+            last_updated: Some(datetime_of(self.last_updated)),
+            domain_name: Some(self.domain_name.clone()),
+            domain_package_status: Some(self.status(now).to_string()),
+            package_version: Some(self.package_version.clone()),
+            reference_path: Some(package_reference_path(&self.package_id)),
+            error_details: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Domain tags
+// ---------------------------------------------------------------------------
+
+/// How many tags one domain may carry.
+///
+/// Straight from `AddTags`'s own documentation: "An Elasticsearch domain may
+/// have up to 10 tags." It is also this store's bound on the tag set one domain
+/// record retains, since neither `TagList` nor `AddTags` declares a length for
+/// the boundary validator to enforce.
+pub const MAX_TAGS_PER_DOMAIN: usize = 10;
+
+/// `Some(reason)` when one `AddTags` call names more tags than a domain may
+/// carry at all.
+///
+/// A domain holds at most [`MAX_TAGS_PER_DOMAIN`] keys, so a single call naming
+/// more than that cannot describe a tag set the service would keep: it is the
+/// allowance's own refusal, reached on the request's list alone and therefore
+/// before anything is merged — which is also what keeps the merge's cost bounded
+/// by the allowance rather than by how long a list the request carried, since
+/// `TagList` declares no length for the boundary validator to enforce.
+pub fn oversized_tag_list(count: usize) -> Option<String> {
+    (count > MAX_TAGS_PER_DOMAIN).then(|| {
+        format!(
+            "TagList carries {count} tags, which is more than the \
+             {MAX_TAGS_PER_DOMAIN} tags a domain may have"
+        )
+    })
+}
+
+/// Merge `added` into a domain's tag set.
+///
+/// A key the domain already carries takes the submitted value and a key it does
+/// not is appended, so "tag keys must be unique for the Elasticsearch domain"
+/// (`Tag$Key`'s own documentation) holds and the set keeps the order its keys
+/// were first attached in.
+///
+/// The keys already held are indexed once, so merging costs one lookup per
+/// submitted tag rather than a scan of the whole set per tag.
+pub fn merge_tags(tags: &mut Vec<Tag>, added: Vec<Tag>) {
+    let mut at: BTreeMap<String, usize> = tags
+        .iter()
+        .enumerate()
+        .map(|(index, tag)| (tag.key.clone(), index))
+        .collect();
+    for tag in added {
+        match at.get(&tag.key).copied() {
+            Some(index) => {
+                if let Some(held) = tags.get_mut(index) {
+                    held.value = tag.value;
+                }
+            }
+            None => {
+                at.insert(tag.key.clone(), tags.len());
+                tags.push(tag);
+            }
+        }
+    }
+}
+
+/// The keys one removal names, indexed once.
+///
+/// A removal may name any number of keys — nothing documents a limit on
+/// `TagKeys`, and naming a key the domain does not carry is not an error — so
+/// the list is not refused for its length; it is turned into a set HERE, which
+/// the caller does before it locks the store, so the only work done while
+/// holding the store is one lookup per tag the domain actually carries.
+pub fn tag_keys_to_drop(removed: &[String]) -> BTreeSet<&str> {
+    removed.iter().map(String::as_str).collect()
+}
+
+/// Drop every tag whose key `dropped` holds, leaving every other key and value
+/// as it was.
+pub fn remove_tag_keys(tags: &mut Vec<Tag>, dropped: &BTreeSet<&str>) {
+    tags.retain(|tag| !dropped.contains(tag.key.as_str()));
+}
+
+/// The refusal a tag operation gives an `ARN` that names no domain of this
+/// account — one that is not an Elasticsearch domain ARN at all, or one whose
+/// domain this store does not hold.
+///
+/// Wholly fixed text: nothing from the request is interpolated into it.
+pub const INVALID_TAG_ARN_MESSAGE: &str = "Invalid ARN. Domain not found.";
 
 /// Per-service state for com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -1192,6 +1518,11 @@ pub struct ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
     pub packages: BTreeMap<(String, String), Package>,
     /// Monotonic counter feeding [`Self::mint_package_id`].
     pub package_seq: u64,
+    /// Every package/domain association, keyed by `(region, package id, domain
+    /// name)` — see [`association_key`]. Ordered, so both list operations report
+    /// the same order twice, which is what lets a pagination token name a place
+    /// in the set.
+    pub package_associations: BTreeMap<(String, String, String), DomainPackage>,
 }
 
 impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
@@ -1280,6 +1611,60 @@ impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
     pub fn package_named<'a>(&'a self, region: &'a str, package_name: &str) -> Option<&'a Package> {
         self.packages_in(region)
             .find(|package| package.package_name == package_name)
+    }
+
+    /// The domain the ARN names, if this store holds one.
+    ///
+    /// The tag operations address a domain by the ARN a create reported, and
+    /// that ARN names its own Region, so the lookup is NOT scoped to the
+    /// Region the call was signed for.
+    pub fn domain_by_arn(&self, arn: &str) -> Option<&Domain> {
+        self.domains.values().find(|domain| domain.arn == arn)
+    }
+
+    /// The same domain, to write its tag set through.
+    pub fn domain_by_arn_mut(&mut self, arn: &str) -> Option<&mut Domain> {
+        self.domains.values_mut().find(|domain| domain.arn == arn)
+    }
+
+    /// The associations of one domain, in package-id order.
+    pub fn packages_of_domain<'a>(
+        &'a self,
+        region: &'a str,
+        domain_name: &'a str,
+    ) -> impl Iterator<Item = &'a DomainPackage> {
+        self.package_associations
+            .iter()
+            .filter(move |((each, _, _), association)| {
+                each == region && association.domain_name == domain_name
+            })
+            .map(|(_, association)| association)
+    }
+
+    /// The associations of one package, in domain-name order.
+    pub fn domains_of_package<'a>(
+        &'a self,
+        region: &'a str,
+        package_id: &'a str,
+    ) -> impl Iterator<Item = &'a DomainPackage> {
+        self.package_associations
+            .iter()
+            .filter(move |((each, package, _), _)| each == region && package == package_id)
+            .map(|(_, association)| association)
+    }
+
+    /// One association as the `DomainPackageDetails` every association
+    /// operation reports, or `None` when the store no longer holds the package
+    /// it names.
+    pub fn association_details(
+        &self,
+        region: &str,
+        association: &DomainPackage,
+        now: SystemTime,
+    ) -> Option<DomainPackageDetails> {
+        self.packages
+            .get(&package_key(region, &association.package_id))
+            .map(|package| association.to_details(package, now))
     }
 }
 

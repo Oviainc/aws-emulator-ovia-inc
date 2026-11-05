@@ -19,10 +19,16 @@ mod compatible_versions;
 mod describe_domains_batch;
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
+#[path = "all/domain_tags.rs"]
+mod domain_tags;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/outbound_cross_cluster_search_connections.rs"]
 mod outbound_cross_cluster_search_connections;
+#[path = "all/package_associations.rs"]
+mod package_associations;
+#[path = "all/package_versions.rs"]
+mod package_versions;
 #[path = "all/packages.rs"]
 mod packages;
 #[path = "all/shared_es_signing_name_claim.rs"]

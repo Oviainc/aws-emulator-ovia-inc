@@ -137,6 +137,16 @@ pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
 /// emulator with no IAM mounted to ask at all, and an answer this emulator could not read.
 /// The principal that has to be admitted is the one a function's execution role admits
 /// ([`super::EXECUTION_ROLE_PRINCIPAL`]): this service is what assumes both.
+///
+/// It therefore takes the STRONGER of the two shared readings
+/// (`service_common::iam_role::role_is_unassumable`, which refuses a role this account's IAM
+/// reports ABSENT) rather than the one a function's EXECUTION role takes
+/// (`held_role_is_unassumable`, which serves it): an execution role is routinely provisioned
+/// out of band, while the role a provider manages compute as is part of what the client
+/// provisions in this account, and THIS operation is recorded refusing an operator role that
+/// does not exist. The difference between the two surfaces is deliberate; the cross-service
+/// suite `core/router/tests/all/lambda_capacity_provider_operator_role.rs` pins it, so a
+/// change that makes that suite fail is the change to fix.
 pub async fn operator_role_is_unassumable(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,

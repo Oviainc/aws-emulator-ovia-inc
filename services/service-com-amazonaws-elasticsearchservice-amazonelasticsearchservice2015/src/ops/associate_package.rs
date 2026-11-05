@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociatePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociatePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Installs a package on a domain and PERSISTS the association: the stored
+//! [`crate::state::DomainPackage`] is what this call's own
+//! `DomainPackageDetails` and every later `ListPackagesForDomain` /
+//! `ListDomainsForPackage` entry are built from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociatePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A domain takes a package only once it is on the latest service software,
+//! which a domain still provisioning a change is not: that request is refused
+//! with the modelled 400 `ValidationException` BEFORE anything is written, so
+//! the refused call leaves both lists exactly as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +79,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    DomainPackage, MAX_ASSOCIATIONS_TOTAL, MAX_PACKAGES_PER_DOMAIN,
+    NOT_ON_LATEST_SOFTWARE_MESSAGE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +157,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociatePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociatePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociatePackage"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        // Both the package and the domain are held by the control plane of the
+        // Region the call was signed for, so that is the scope each is resolved
+        // in and the scope the association is stored in.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let mut store = state.lock();
+
+        // The two resources the request names, in the order the URI names them.
+        let Some(package) = store
+            .packages
+            .get(&crate::state::package_key(&region, &input.package_id))
+            .cloned()
+        else {
+            return Err(AssociatePackageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Package not found: {}", input.package_id)),
+                },
+            )
+            .into());
+        };
+        let Some(domain) = store
+            .domains
+            .get(&crate::state::domain_key(&region, &input.domain_name))
+        else {
+            return Err(AssociatePackageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Domain not found: {}", input.domain_name)),
+                },
+            )
+            .into());
+        };
+
+        // THE SOFTWARE-VERSION GATE, which runs before any write: a domain that
+        // is still provisioning a change has not finished moving onto its
+        // service software, so it is not on the latest one and cannot take a
+        // package yet.
+        if domain.processing(now) {
+            return Err(AssociatePackageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(NOT_ON_LATEST_SOFTWARE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let key = crate::state::association_key(&region, &input.package_id, &input.domain_name);
+        // An association this domain already holds for this package is reported
+        // as it stands: the package is installed, so there is nothing to install
+        // again and nothing about the stored association to move.
+        if let Some(held) = store.package_associations.get(&key) {
+            return Ok(AssociatePackageOutput {
+                domain_package_details: Some(held.to_details(&package, now)),
+            });
+        }
+
+        // The documented per-domain quota, and the store's ceiling across every
+        // region — the only bounds on this growth site, since the region is
+        // request-derived. Both are refused as invalid input because this
+        // operation models no limit error at all (unlike its sibling package
+        // operations), and the store-wide ceiling is the EMULATOR's own bound
+        // with no AWS counterpart, so neither sentence is AWS's wording.
+        if store
+            .packages_of_domain(&region, &input.domain_name)
+            .count()
+            >= MAX_PACKAGES_PER_DOMAIN
+        {
+            return Err(AssociatePackageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Package limit of {MAX_PACKAGES_PER_DOMAIN} packages per domain has been \
+                         reached for domain {domain}",
+                        domain = input.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.package_associations.len() >= MAX_ASSOCIATIONS_TOTAL {
+            return Err(AssociatePackageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Association limit of {MAX_ASSOCIATIONS_TOTAL} package associations per \
+                         account has been reached"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The response is the details of the record being stored — the same
+        // value the next list reads back — so the two cannot disagree.
+        let association = DomainPackage::associate(&package, input.domain_name, now);
+        let details = association.to_details(&package, now);
+        store.package_associations.insert(key, association);
+        Ok(AssociatePackageOutput {
+            domain_package_details: Some(details),
+        })
     }
 }

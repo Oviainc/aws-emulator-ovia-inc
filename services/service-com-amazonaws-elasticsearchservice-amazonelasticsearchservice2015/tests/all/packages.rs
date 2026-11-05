@@ -307,7 +307,7 @@ async fn a_package_copies_then_settles_without_a_read_changing_it() {
         );
         assert_eq!(
             entries[0].pointer("/AvailablePackageVersion"),
-            Some(&json!("1")),
+            Some(&json!("v1")),
             "case {case:?}: an available package reports its first version, got {:?}",
             entries[0].pointer("/AvailablePackageVersion")
         );

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the tags the request names from the domain the `ARN` names, on that
+//! domain record: only the named keys go, and every other key and value the
+//! domain carries is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +63,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::remove_tag_keys;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -162,20 +157,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The ARN carries the Region, so this call needs nothing from the
+        // request's own credential scope.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTags"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The keys the request names are indexed BEFORE the store is locked, so
+        // the only work done while holding it is one lookup per tag the domain
+        // actually carries. A removal is not refused for naming many keys:
+        // nothing documents a limit on `TagKeys`.
+        let dropped = crate::state::tag_keys_to_drop(&input.tag_keys);
+
+        let mut store = state.lock();
+        // The ARN names its own Region and domain, so it is resolved against
+        // every domain this store holds rather than against the Region the call
+        // was signed for. An ARN that resolves to no domain of this account is
+        // an invalid input — this operation models no not-found error, and an
+        // ARN naming nothing is the request field that is wrong.
+        let Some(domain) = store.domain_by_arn_mut(&input.arn) else {
+            return Err(RemoveTagsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::INVALID_TAG_ARN_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A key the domain does not carry is no error: the request asks for that
+        // key to be gone, and it is.
+        remove_tag_keys(&mut domain.tags, &dropped);
+
+        Ok(RemoveTagsOutput)
     }
 }
