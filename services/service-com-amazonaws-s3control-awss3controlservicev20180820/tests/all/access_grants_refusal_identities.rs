@@ -152,7 +152,10 @@ fn is_hex(value: &str, upper: bool) -> bool {
 /// Assert `reply` names the request it answers: the `RequestId` and `HostId`
 /// elements beside `<Error>`, in the shape an S3-family service renders them,
 /// mirrored by the two correlation headers.
-fn assert_names_the_request(case: &str, call: &str, reply: &Reply) {
+///
+/// `pub(crate)` because every refusal of this service names the response it is,
+/// so the sibling suites assert the same pair rather than copying it.
+pub(crate) fn assert_names_the_request(case: &str, call: &str, reply: &Reply) {
     let request_id = reply.text("RequestId").unwrap_or_default();
     let host_id = reply.text("HostId").unwrap_or_default();
     assert!(

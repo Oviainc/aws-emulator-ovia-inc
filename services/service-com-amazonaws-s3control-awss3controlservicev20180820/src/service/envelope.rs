@@ -146,6 +146,15 @@ const REQUEST_TOKEN_MEMBER: &str = "requestTokenARN";
 /// spelled as the request boundary states a member path.
 const ADDRESS_MEMBERS: [&str; 2] = ["configId", "accountId"];
 
+/// The path space a Batch Operations job is addressed in: `CreateJob` and
+/// `ListJobs` are bound on [`JOBS_COLLECTION_PATH`] itself and every per-job
+/// route is that path with the job id and an optional sub-resource under it
+/// (`smithy_query(query="digest")`), so a request addressing a job is one whose
+/// path is the collection or lies under [`JOBS_PATH`]. The second ends in a
+/// separator, so a sibling segment that merely starts with it is not claimed.
+const JOBS_COLLECTION_PATH: &str = "/v20180820/jobs";
+const JOBS_PATH: &str = "/v20180820/jobs/";
+
 /// The path space an access point is addressed in: every route that names one
 /// is `/v20180820/accesspoint/{Name}` or a sub-resource of it
 /// (`.../policy`, `.../policyStatus`, `.../scope`), so the segment after this
@@ -562,7 +571,9 @@ fn access_point_name_refusal(path: &str) -> Option<(u16, &'static str, &'static 
 /// request whose BODY the codec could not read at all is restated as the one
 /// refusal this service answers a request it will not carry out with, whatever
 /// the member and whatever the value: the codec's own sentence is neither this
-/// service's wording nor a code a client branches on.
+/// service's wording nor a code a client branches on. The Batch Operations job
+/// surface answers that SAME refusal for every value the model does not admit,
+/// read or unread, for the same reason.
 fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     let refusal = framework_refusal(resp)?;
     let path = request_path(req.uri());
@@ -592,6 +603,23 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
         ));
     }
     if refused_as_unreadable(refusal) {
+        return Some(error_response(
+            Envelope::of(path),
+            crate::state::REQUEST_INVALID_STATUS,
+            crate::state::REQUEST_INVALID_CODE,
+            crate::state::REQUEST_INVALID_MESSAGE,
+            &[],
+        ));
+    }
+    // A Batch Operations job request the boundary refused over a value the
+    // model does not admit — a status outside its enum, a priority outside its
+    // range, a reason past its length. The job surface answers ONE refusal for
+    // a request it will not carry out, whatever the member and whatever the
+    // value ([`crate::state::request_invalid`]): the framework's validation
+    // vocabulary is neither a code this service answers nor wording a client
+    // can branch on, and the sentence it builds restates the value and the rule
+    // back to the caller that sent them.
+    if path == JOBS_COLLECTION_PATH || path.starts_with(JOBS_PATH) {
         return Some(error_response(
             Envelope::of(path),
             crate::state::REQUEST_INVALID_STATUS,

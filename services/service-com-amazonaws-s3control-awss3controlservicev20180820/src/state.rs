@@ -3457,17 +3457,24 @@ pub fn storage_lens_group_name_mismatch<E>(
 ///
 /// The model binds `NotFoundException` to `DescribeJob`, but the recorded
 /// behaviour of this service for a well-formed id that names no job is the
-/// S3-style XML envelope with code `InvalidRequest` and HTTP 400 (example
-/// message "Job not found"), so that is what the job-id surface answers —
-/// uniformly, so `DescribeJob` and the job tagging operations cannot drift on
+/// S3-style XML envelope with code `InvalidRequest` and HTTP 400, so that is
+/// what the job-id surface answers — uniformly, so `DescribeJob`, the job
+/// priority and status updates and the job tagging operations cannot drift on
 /// it.
-pub fn job_not_found<E>(job_id: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
-        "InvalidRequest",
-        400,
-        format!("Job not found: {job_id}"),
-    )
+///
+/// The message is FIXED text, [`JOB_NOT_FOUND_MESSAGE`]: the id that was looked
+/// up is the caller's own, carried by the request it sent, so it is not
+/// interpolated into the sentence — which is why this takes no job id at all
+/// and no caller can put one back. What names THIS answer is the correlation
+/// pair the envelope carries beside the message
+/// ([`new_error_correlation`]).
+pub fn job_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure("InvalidRequest", 400, JOB_NOT_FOUND_MESSAGE)
 }
+
+/// The fixed sentence the Batch Operations job surface answers for a job id the
+/// account owns no job for, as this service words it.
+pub const JOB_NOT_FOUND_MESSAGE: &str = "Job not found";
 
 /// `InvalidRequest` (HTTP 400): the job is in a status that admits no move to
 /// the one `UpdateJobStatus` asks for — a confirmation of a job that awaits

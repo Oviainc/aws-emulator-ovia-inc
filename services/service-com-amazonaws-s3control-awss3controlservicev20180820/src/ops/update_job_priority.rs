@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_jobs(::std::time::SystemTime::now());
 
         let Some(job) = store.job_mut(&input.account_id, &input.job_id) else {
-            return Err(crate::state::job_not_found(&input.job_id));
+            return Err(crate::state::job_not_found());
         };
 
         // The modelled `JobPriority` range (0..2147483647) is refused at the

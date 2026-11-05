@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(job) = store.job_mut(&input.account_id, &input.job_id) else {
-            return Err(crate::state::job_not_found(&input.job_id));
+            return Err(crate::state::job_not_found());
         };
 
         // "Replace the tag set with the one you modified": the submitted set
