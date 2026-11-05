@@ -648,8 +648,9 @@ async fn updating_a_configuration_that_does_not_exist_is_refused() {
             json!({ "KernelGatewayImageConfig": { "KernelSpecs": [{ "Name": "python3" }] } }),
             "ResourceNotFound",
             format!(
-                "Could not find AppImageConfig \
-                 \"arn:aws:sagemaker:us-east-1:{ACCOUNT}:app-image-config/absent\"."
+                "AppImageConfig \
+                 [arn:aws:sagemaker:us-east-1:{ACCOUNT}:app-image-config/absent] \
+                 does not exist"
             ),
         ),
         (
@@ -659,8 +660,9 @@ async fn updating_a_configuration_that_does_not_exist_is_refused() {
             json!({}),
             "ResourceNotFound",
             format!(
-                "Could not find AppImageConfig \
-                 \"arn:aws:sagemaker:us-east-1:{ACCOUNT}:app-image-config/absent\"."
+                "AppImageConfig \
+                 [arn:aws:sagemaker:us-east-1:{ACCOUNT}:app-image-config/absent] \
+                 does not exist"
             ),
         ),
         (

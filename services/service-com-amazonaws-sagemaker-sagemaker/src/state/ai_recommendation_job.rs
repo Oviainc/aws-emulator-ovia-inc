@@ -42,6 +42,17 @@ pub const AI_RECOMMENDATION_STATUS_STOPPING: &str = "Stopping";
 /// job the caller asked to stop.
 pub const AI_RECOMMENDATION_STATUS_STOPPED: &str = "Stopped";
 
+/// The lifecycle state a job that has been accepted but whose run has not STARTED is in,
+/// as the service that holds the job names it in [`ai_recommendation_job_not_deletable`].
+///
+/// It is not a member of `AIRecommendationJobStatus`
+/// (`smithy_query(query="shape",shape="AIRecommendationJobStatus")` answers `InProgress`,
+/// `Completed`, `Failed`, `Stopping` and `Stopped`), whose `InProgress` covers a job that
+/// is queued as well as one that is running: the two vocabularies are distinct, so a
+/// reported `AIRecommendationJobStatus` is never compared against this value and this
+/// value is never reported as one.
+pub const AI_RECOMMENDATION_STATE_PENDING: &str = "Pending";
+
 /// How long after `CreateAIRecommendationJob` the clock owes the job's move out of
 /// `InProgress` into its terminal status.
 ///
@@ -113,6 +124,21 @@ pub fn ai_recommendation_job_not_running(name: &str, status: &str) -> String {
         "The AI recommendation job \"{name}\" is {status} and is not running, so there is \
          nothing to stop."
     )
+}
+
+/// Why a delete of a job that is still running is refused, naming the state that stands
+/// in the way.
+///
+/// `DeleteAIRecommendationJob` releases a job, and a job whose run has not finished is
+/// still holding the work the caller asked for: SageMaker refuses the delete, names the
+/// state the job is in and points at the stop that ends it, rather than destroying a
+/// running job. The state is the one the service that holds the job names — see
+/// [`AIRecommendationJob::deletion_state`] — not a member of the reported
+/// `AIRecommendationJobStatus`. The operation models only `ResourceNotFound`, and the job
+/// IS found, so
+/// the refusal is a 400 `ValidationException` carrying this sentence.
+pub fn ai_recommendation_job_not_deletable(status: &str) -> String {
+    format!("Cannot delete job in '{status}' state. Stop the job first.")
 }
 
 /// An AI recommendation job created by `CreateAIRecommendationJob`, as
@@ -206,6 +232,21 @@ impl AIRecommendationJob {
     /// in the transient `Stopping` status.
     pub fn is_stopping(&self) -> bool {
         self.status == AI_RECOMMENDATION_STATUS_STOPPING
+    }
+
+    /// The lifecycle state [`ai_recommendation_job_not_deletable`] names this job by.
+    ///
+    /// A stop in flight is the state it names ([`AI_RECOMMENDATION_STATUS_STOPPING`]);
+    /// otherwise the job is QUEUED — nothing here analyses a model, so no run of a job in
+    /// this store is ever started (which is why it reports no `StartTime` and ends with
+    /// [`NO_RECOMMENDATION_RUNTIME_REASON`]), and the state of a job whose run has not
+    /// started is [`AI_RECOMMENDATION_STATE_PENDING`].
+    pub fn deletion_state(&self) -> &'static str {
+        if self.is_stopping() {
+            AI_RECOMMENDATION_STATUS_STOPPING
+        } else {
+            AI_RECOMMENDATION_STATE_PENDING
+        }
     }
 
     /// Record that the caller asked this job to stop: it moves to the transient

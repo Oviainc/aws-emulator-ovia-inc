@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAlgorithm
-//! IMPLEMENTED: removes the algorithm entry from `crate::state`, so a later
-//! `DescribeAlgorithm` refuses it and its name is free again, and refuses an unknown
-//! name. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the algorithm entry from `crate::state` once its registration
+//! has settled, so a later `DescribeAlgorithm` refuses it and its name is free again;
+//! refuses an unknown name, and refuses a delete of an algorithm still in a
+//! non-terminal status. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Removing an algorithm that is not there is refused rather than reported as a
         // delete: a caller cannot tell a 200 from one that removed something.
@@ -158,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists, and the recorded algorithm lifecycles replay it that way. The modelled
         // `ConflictException` is for a delete that collides with a concurrent
         // modification of the entity, which this single-lock store cannot observe.
-        let Some(algorithm) = store.algorithms.remove(&input.algorithm_name) else {
+        let Some(algorithm) = store.algorithms.get_mut(&input.algorithm_name) else {
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 "algorithm",
@@ -168,7 +170,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::entity_does_not_exist(crate::state::ALGORITHM_ENTITY, &arn),
             ));
         };
-        let arn = algorithm.arn;
+        // The transition the clock already owed is materialised before the deletion is
+        // weighed, so an algorithm whose terminal instant has passed is deletable here
+        // even though no read has reported it yet: it was due at that instant whether or
+        // not anybody called.
+        algorithm.settle_status(now);
+        // An algorithm is deleted once its REGISTRATION HAS SETTLED: while it is still
+        // being registered SageMaker refuses the delete and names the status that stands
+        // in the way rather than destroying an algorithm mid-registration. The status is
+        // observable (the span is never zero), so this refusal is reachable, and the
+        // algorithm SURVIVES it — a later read still replays it and its name is still in
+        // use.
+        if !algorithm.is_terminal() {
+            let refusal = crate::state::algorithm_not_deletable(&algorithm.status);
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+        let arn = algorithm.arn.clone();
+        let name = algorithm.name.clone();
+        store.algorithms.remove(&name);
         drop(store);
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);

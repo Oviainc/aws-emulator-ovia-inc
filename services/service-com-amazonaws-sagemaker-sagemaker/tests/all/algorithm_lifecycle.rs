@@ -582,6 +582,11 @@ async fn delete_algorithm_removes_the_algorithm_and_frees_its_name() {
         emulator.ok("CreateAlgorithm", &body).await;
         emulator.ok("CreateAlgorithm", &minimal_create("survivor")).await;
 
+        // An algorithm is deleted once its registration has SETTLED, so each delete here
+        // waits past the transition the clock owes; the refusal before that instant is
+        // pinned by `delete_algorithm_refuses_an_algorithm_whose_registration_is_pending`.
+        tokio::time::sleep(PAST_COMPLETED_DUE).await;
+
         let deleted = emulator
             .ok("DeleteAlgorithm", &json!({ "AlgorithmName": case }))
             .await;
@@ -708,7 +713,10 @@ async fn delete_algorithm_is_accepted_while_a_model_package_records_it() {
             package_arns.push(str_field(&package, "ModelPackageArn"));
         }
 
-        // The delete is ACCEPTED while every one of those packages still names it.
+        // The delete is ACCEPTED while every one of those packages still names it, once
+        // the algorithm's own registration has settled: this case is about the package's
+        // hold, not about the clock.
+        tokio::time::sleep(PAST_COMPLETED_DUE).await;
         let (status, deleted) = emulator
             .call("DeleteAlgorithm", &json!({ "AlgorithmName": algorithm }))
             .await;
@@ -923,7 +931,8 @@ async fn a_create_past_the_algorithm_quota_is_refused_with_the_modelled_limit_fa
     );
 
     // A delete frees a slot, so the same create then succeeds: the bound is a live count,
-    // not a one-way counter.
+    // not a one-way counter. The algorithm it releases has to have settled first.
+    tokio::time::sleep(PAST_COMPLETED_DUE).await;
     emulator
         .ok(
             "DeleteAlgorithm",

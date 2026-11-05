@@ -48,6 +48,19 @@ pub const DETAILED_ALGORITHM_STATUS_NOT_STARTED: &str = "NotStarted";
 pub const VALIDATION_NOT_RUN: &str = "This emulator runs no algorithm validation training \
      or transform jobs, so the validation this algorithm requested was not performed.";
 
+/// Why a delete of an algorithm that has not reached a terminal status is refused,
+/// naming the status that stands in the way.
+///
+/// An algorithm is registered asynchronously: while it is still `Pending` SageMaker is
+/// listing it and (when the create asked for one) running its validation, so there is
+/// nothing settled to remove and the delete is refused rather than destroying an
+/// algorithm mid-registration. The operation models `ConflictException` only for a
+/// collision with a concurrent modification, so this refusal is a 400
+/// `ValidationException` carrying this sentence.
+pub fn algorithm_not_deletable(status: &str) -> String {
+    format!("Cannot delete Algorithm in {status} status.")
+}
+
 /// An algorithm created by `CreateAlgorithm`, as `DescribeAlgorithm` replays it.
 ///
 /// `completed_at` is the instant the clock owes the algorithm's transition out of
@@ -96,6 +109,18 @@ impl Algorithm {
             return true;
         }
         false
+    }
+
+    /// Whether the algorithm has reached a status nothing leaves on its own, i.e. its
+    /// registration has settled — [`STATUS_COMPLETED`] for an algorithm with nothing to
+    /// validate, [`ALGORITHM_STATUS_FAILED`] for one whose create asked for validation
+    /// jobs this emulator does not run. Only a settled algorithm can be deleted; see
+    /// [`algorithm_not_deletable`].
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            STATUS_COMPLETED | ALGORITHM_STATUS_FAILED
+        )
     }
 
     /// The algorithm's `AlgorithmStatusDetails`, derived from what it stores.

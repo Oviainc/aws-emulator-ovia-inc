@@ -59,6 +59,8 @@ mod custom_image_deletion;
 mod custom_image_version_deletion;
 #[path = "all/custom_images.rs"]
 mod custom_images;
+#[path = "all/delete_and_stop_preconditions.rs"]
+mod delete_and_stop_preconditions;
 #[path = "all/endpoint_config_deletion.rs"]
 mod endpoint_config_deletion;
 #[path = "all/endpoint_hosting_quota.rs"]

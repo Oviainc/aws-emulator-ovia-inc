@@ -5,7 +5,8 @@
 //! Releases the AI recommendation job `CreateAIRecommendationJob` registered under this
 //! `AIRecommendationJobName`, and answers the ARN that job carried, so a later
 //! `DescribeAIRecommendationJob` of the same name is refused as not found. A name
-//! nothing created is refused with the modelled `ResourceNotFound`; this is the ONLY
+//! nothing created is refused with the modelled `ResourceNotFound`, and a job whose run
+//! has not finished is refused until it is stopped; this is the ONLY
 //! file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -138,6 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The job leaves the one store `CreateAIRecommendationJob` writes and
         // `DescribeAIRecommendationJob` reads, so the release is observable: the next
@@ -149,14 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reading a 200 here would be told a job it never created had just been released.
         // That refusal names the job name the request presented, because there is no
         // stored record to report anything else from.
-        //
-        // The operation models no in-use or state failure, and its documentation names no
-        // status a job must reach first ("Deletes the specified AI recommendation job."),
-        // so a job still owing the clock its move out of `InProgress` is released the
-        // same way a settled one is rather than refused on a rule AWS does not state.
         let Some(job) = store
             .ai_recommendation_jobs
-            .remove(&input.ai_recommendation_job_name)
+            .get_mut(&input.ai_recommendation_job_name)
         else {
             return Err(DeleteAIRecommendationJobErrorModeled::ResourceNotFound(
                 ResourceNotFound {
@@ -168,13 +165,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        drop(store);
-
-        crate::state::record_state_change(Self::NAME, &job.arn, ctx);
+        // The move out of a non-terminal status the clock already owed is materialised
+        // before the deletion is weighed, so a job whose run has ended is deletable here
+        // even though no read has reported it yet: it was due at that instant whether or
+        // not anybody called.
+        job.settle_status(now);
+        // A job is released once its run has FINISHED: while it is still running (or
+        // still stopping) the delete is refused, naming the state the job is in and the
+        // stop that ends it, rather than destroying work in flight. The non-terminal
+        // statuses are observable (every span is never zero), so this refusal is
+        // reachable, and the job SURVIVES it — `StopAIRecommendationJob` still answers
+        // its ARN and a later read still replays it.
+        if !job.is_terminal() {
+            let refusal = crate::state::ai_recommendation_job_not_deletable(job.deletion_state());
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
         // The ARN the create minted and stored, so the delete reports the identity the
         // resource actually carried rather than one rebuilt from this request.
+        let arn = job.arn.clone();
+        store
+            .ai_recommendation_jobs
+            .remove(&input.ai_recommendation_job_name);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(DeleteAIRecommendationJobOutput {
-            ai_recommendation_job_arn: Some(job.arn),
+            ai_recommendation_job_arn: Some(arn),
         })
     }
 }

@@ -465,6 +465,9 @@ async fn an_absent_algorithm_is_stated_the_same_way_by_every_reference() {
     // One algorithm is created and deleted, so the rows cover a name that was never used
     // AND one the account held a moment ago.
     create_algorithm(&emulator, "deleted-algo").await;
+    // The delete is only accepted once the algorithm's registration has settled, which
+    // `crate::algorithm_lifecycle` pins; here it just has to get the name released.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     emulator
         .ok("DeleteAlgorithm", &json!({ "AlgorithmName": "deleted-algo" }))
         .await;

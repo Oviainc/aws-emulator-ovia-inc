@@ -991,6 +991,10 @@ async fn deleting_a_job_releases_it_and_frees_its_name() {
         let (_, described) = describe(&emulator, &target).await;
         let stored_arn = str_field(&described, "AIRecommendationJobArn");
 
+        // A job is released only once its run has finished, so the delete waits for the
+        // move out of `InProgress` the clock owes rather than destroying work in flight.
+        tokio::time::sleep(PAST_JOB_END_DUE).await;
+
         let (status, deleted) = delete(&emulator, &target).await;
         assert_eq!(
             status, 200,
