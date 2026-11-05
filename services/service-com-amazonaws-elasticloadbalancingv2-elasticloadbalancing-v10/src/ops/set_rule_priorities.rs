@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut moves: Vec<Move> = Vec::with_capacity(asked.len());
         for (rule_arn, priority) in asked {
             let Some(rule) = guard.rule_by_arn(&rule_arn) else {
-                return Err(rule_not_found(&rule_arn));
+                return Err(rule_not_found());
             };
             if rule.is_default.unwrap_or(false) {
                 return Err(SetRulePrioritiesErrorModeled::OperationNotPermittedException(
@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Unreachable for an ARN the read above resolved: the owning listener is
                 // a pure string transform of the rule ARN. Were it ever absent, the rule
                 // is one this store cannot hold.
-                return Err(rule_not_found(&rule_arn));
+                return Err(rule_not_found());
             };
             moves.push(Move {
                 listener_arn,
@@ -275,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 // The rule was resolved above under this same lock, so nothing can have
                 // released it; were it ever gone, that is the modelled refusal for it.
-                return Err(rule_not_found(rule_arn));
+                return Err(rule_not_found());
             };
             record.priority = *priority;
             moved.push(record.to_shape());
@@ -308,12 +308,15 @@ fn distinct_listeners(moves: &[Move]) -> Vec<&str> {
     listeners
 }
 
-/// The refusal for a `RuleArn` this store holds no rule for. The identifier the request
-/// carried is the only thing the caller can act on, so the message names it
-/// ([`crate::state::rule_not_found_message`]).
-fn rule_not_found(arn: &str) -> SetRulePrioritiesError {
+/// The refusal for a `RuleArn` this store holds no rule for.
+///
+/// This operation addresses a LIST — one `RulePriorityPair` per rule — so the refusal is
+/// about the set of priorities the request asked for rather than one rule it addresses,
+/// and it names no value ([`crate::state::rule_priorities_not_found_message`]), exactly as
+/// every other list-addressing refusal of this service does.
+fn rule_not_found() -> SetRulePrioritiesError {
     SetRulePrioritiesErrorModeled::RuleNotFoundException(RuleNotFoundException {
-        message: Some(crate::state::rule_not_found_message(arn)),
+        message: Some(crate::state::rule_priorities_not_found_message()),
     })
     .into()
 }

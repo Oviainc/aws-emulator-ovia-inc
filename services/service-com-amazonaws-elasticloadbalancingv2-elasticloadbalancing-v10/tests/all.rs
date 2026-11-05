@@ -19,6 +19,8 @@ mod attribute_collections;
 mod aws_error_wording;
 #[path = "all/capacity_reservation.rs"]
 mod capacity_reservation;
+#[path = "all/cascaded_delete_idempotency.rs"]
+mod cascaded_delete_idempotency;
 #[path = "all/catalog_reads.rs"]
 mod catalog_reads;
 #[path = "all/certificate_consumer_registry.rs"]
@@ -89,6 +91,8 @@ mod tag_not_found_wording_by_kind;
 mod tag_removal;
 #[path = "all/tag_writes.rs"]
 mod tag_writes;
+#[path = "all/target_deregistration_and_health_spans.rs"]
+mod target_deregistration_and_health_spans;
 #[path = "all/target_group_attribute_writes.rs"]
 mod target_group_attribute_writes;
 #[path = "all/target_group_attributes_and_modification.rs"]

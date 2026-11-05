@@ -355,9 +355,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = record.to_shape();
         listener.rules.push(record);
         // A load balancer routes to every target group one of its rules forwards to, so
-        // the association that target group reports follows this rule.
+        // the association that target group reports follows this rule — and, for a target
+        // group nothing forwarded to yet, so does the start of its health checks.
+        let now = ::std::time::SystemTime::now();
         for target_group_arn in &forwarded {
-            guard.associate_target_group(target_group_arn, &load_balancer_arn);
+            guard.associate_target_group(target_group_arn, &load_balancer_arn, now);
         }
 
         Ok(CreateRuleOutput {

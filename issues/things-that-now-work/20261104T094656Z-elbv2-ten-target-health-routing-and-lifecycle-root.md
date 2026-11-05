@@ -1,36 +1,52 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elbv2.deregister-targets-draining-before-removal elbv2.target-draining-after-deregister elbv2.deregister-targets-transitions-state elbv2.health-check-transitions-to-unhealthy-with-reason elbv2.target-health-check-state-transition-unhealthy-to-healthy elbv2.listener-rule-condition-type-matrix-routing elbv2.routing-http2-attribute-decides-the-alpn-protocol-the-alb-selects elbv2.cascade-delete-dependency elbv2.concurrent-modify-rule-priority-optimistic-lock elbv2.op-contract-delete-listener elbv2.deploy-alb-cfn-then-target-health-behaves elbv2.deploy-alb-listener-target-group-cfn-behaves elbv2.deploy-alb-listener-target-group-cfn-routes-traffic elbv2.deploy-nlb-target-registration-cfn-health-check elbv2.deploy-duplicate-rule-priority-rejected elbv2.e2e-alb-target-routing-lifecycle elbv2.e2e-blue-green-weighted-target-group-shift elbv2.e2e-http-to-https-redirect-traffic-flow elbv2.imported-certificate-is-presented-and-sni-selects-per-host elbv2.listener-ssl-policy-bounds-the-negotiated-tls-version-and-cipher elbv2.elbv2attr-deep-elbv2-1-mtls-passthrough-clientcert-chain elbv2.elbv2attr-deep-elbv2-1-mtls-passthrough-forged-clientcert-header-stripped elbv2.elbv2attr-deep-elbv2-1-server-header-removed-and-hsts-injected elbv2.source-ip-condition-uses-the-layer3-address-not-x-forwarded-for elbv2.xff-header-processing-mode-changes-what-the-target-receives elbv2.capacity-reservation-modify-then-describe-transitions elbv2.server-side-capacity-reservation-provisioning-completes-without-client-polling
+Issue-Trace-Ids: elbv2.deregister-targets-draining-before-removal elbv2.target-draining-after-deregister elbv2.deregister-targets-transitions-state elbv2.cascade-delete-dependency
 Issue-Shape-Id: com.amazonaws.elasticloadbalancingv2#ElasticLoadBalancing_v10
 Issue-Key: elbv2.deregister-targets-draining-before-removal|run#15|AssertionError|assert state_immediately_after == "draining", (
 Issue-Key: elbv2.target-draining-after-deregister|run#18|AssertionError|assert state == "draining", f"expected draining state right after deregister, got {state}"
 Issue-Key: elbv2.deregister-targets-transitions-state|_poll_until#27|Timeout|time.sleep(interval_s)
 Issue-Key: elbv2.health-check-transitions-to-unhealthy-with-reason|run#21|AssertionError|assert first.get("State") == "initial", (
-Issue-Key: elbv2.target-health-check-state-transition-unhealthy-to-healthy|run#14|AssertionError|assert state1 == "unhealthy", f"expected unhealthy before the code fix, got {state1}"
-Issue-Key: elbv2.listener-rule-condition-type-matrix-routing|_assert_body#23|AssertionError|assert body.strip() == expected, (
-Issue-Key: elbv2.routing-http2-attribute-decides-the-alpn-protocol-the-alb-selects|run#14|AssertionError|assert selected == "h2", (
 Issue-Key: elbv2.cascade-delete-dependency|run#32|AssertionError|assert rule_delete_code is None, f"expected DeleteRule on the cascaded-away rule to succeed idempotently, got error {rule_delete_code}"
-Issue-Key: elbv2.concurrent-modify-rule-priority-optimistic-lock|run#16|AssertionError|assert loser_message == "One or more priorities not found", loser_message
-Issue-Key: elbv2|DeleteListener|ListenerNotFound
-Issue-Key: elbv2|DescribeLoadBalancers|LoadBalancerNotFound
-Issue-Key: elbv2|RegisterTargets|TargetGroupNotFound
-Issue-Key: elbv2.deploy-duplicate-rule-priority-rejected|run#7|AssertionError|assert code == "PriorityInUse", f"expected PriorityInUse, got CODE={code!r}"
-Issue-Key: elbv2.e2e-alb-target-routing-lifecycle|_fetch_http#24|TimeoutError|raise TimeoutError(f"a 2xx answer from {url}: the run budget ended first; not "
-Issue-Key: elbv2.e2e-blue-green-weighted-target-group-shift|_poll_http_get#23|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.e2e-http-to-https-redirect-traffic-flow|_poll_http_get#21|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.imported-certificate-is-presented-and-sni-selects-per-host|_poll_until#18|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.listener-ssl-policy-bounds-the-negotiated-tls-version-and-cipher|_poll_until#24|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.elbv2attr-deep-elbv2-1-mtls-passthrough-clientcert-chain|_poll_until#29|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.elbv2attr-deep-elbv2-1-mtls-passthrough-forged-clientcert-header-stripped|_poll_until#28|TimeoutError|raise TimeoutError(f"{description}: the run budget ended first; not graded")
-Issue-Key: elbv2.elbv2attr-deep-elbv2-1-server-header-removed-and-hsts-injected|_poll_until#27|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.source-ip-condition-uses-the-layer3-address-not-x-forwarded-for|_poll_until#20|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.xff-header-processing-mode-changes-what-the-target-receives|_poll_until#18|Timeout|time.sleep(interval_s)
-Issue-Key: elbv2.capacity-reservation-modify-then-describe-transitions|_assert_reservation_withheld#8|Timeout|time.sleep(2.0)
-Issue-Key: elbv2.server-side-capacity-reservation-provisioning-completes-without-client-polling|run#4|Timeout|time.sleep(2.0)
 Issue-Commit: 7fd8acd3be042b6d00a1996e0a0d05df0b6f87ae
 
-# elbv2: ten target-health, routing and lifecycle root causes — no 'draining'/'initial' states, host-header rules ignored, HTTP/2 ALPN ignored, CFN-created ELBv2 resources absent, listener data plane never answers
+# elbv2: the 'draining' and 'initial' target-health states and the idempotent delete of a cascaded-away rule (3 of ten causes; the other seven are split out and still open)
+
+## Resolution
+
+Causes 1 and 5, the `initial` half of cause 2 and the message half of cause 6 are FIXED.
+The other seven causes are NOT fixed, and they have been SPLIT OUT into their own open
+report rather than counted as resolved here — every Issue-Key and trace id they own moved
+with them, out of this record's header, into
+`issues/things-that-do-not-work/20261104T094656Z-elbv2-seven-target-health-routing-and-data-plane-causes-still-open.md`.
+
+* Cause 1 — FIXED. A target a load balancer is sending traffic to now enters `draining`
+  (`Target.DeregistrationInProgress`) when `DeregisterTargets` names it, takes no new
+  request while it is there, and leaves the target group when the group's
+  `deregistration_delay.timeout_seconds` has elapsed; a registration nothing is sending
+  traffic to has no connections to drain and leaves at once. The state machine is
+  `services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/src/state/target_health.rs`,
+  pinned by `tests/all/target_deregistration_and_health_spans.rs`.
+* Cause 2 — the `initial` half is FIXED: health checking on a registration begins when it
+  is registered or when the target group first becomes one a load balancer forwards to,
+  whichever is later, so the first read after the attach reports
+  `initial`/`Elb.RegistrationInProgress`. The PROBE half (a target whose health check
+  cannot be answered must report `unhealthy`) is NOT fixed and is split out: deriving a
+  health from a probe means connecting to the registered target, which this project's
+  egress prohibition forbids, and reporting a constant `unhealthy` instead of a constant
+  `healthy` would be the same defect with another literal.
+* Cause 5 — FIXED. A rule released WITH the listener that held it (or with the load
+  balancer that held the listener) is deleted idempotently: that deletion has been
+  performed, so `DeleteRule` completes, while a rule the caller deleted itself and an
+  identifier this store never held stay the modelled `RuleNotFound`
+  (`src/state/cascaded_releases.rs`, pinned by `tests/all/cascaded_delete_idempotency.rs`).
+  `DeleteListener` deliberately keeps `ListenerNotFound` for a listener a cascade removed,
+  which is what the same recorded check asserts.
+* Cause 6 — the MESSAGE half is FIXED: `SetRulePriorities` answers its `RuleNotFound` with
+  `One or more priorities not found`, the collection-level wording the recorded refusal
+  carries, rather than quoting one rule ARN. The RACE half is NOT fixed and is split out.
+* Causes 3, 4, 7, 8, 9 and 10 — NOT FIXED, and split out so they stay filed. See the
+  split-out report for each one's blocker.
 
 > _Note: this issue was identified against the code base at commit `7fd8acd3be042b6d00a1996e0a0d05df0b6f87ae`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

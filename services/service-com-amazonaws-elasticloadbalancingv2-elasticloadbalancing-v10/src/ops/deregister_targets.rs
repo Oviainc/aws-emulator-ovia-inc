@@ -2,11 +2,18 @@
 
 //! @op DeregisterTargets
 //!
-//! Removes the named registrations from a persisted target group, so a later
-//! `DescribeTargetHealth` no longer reports them. The model documents the operation as
-//! idempotent — "if the specified target does not exist, the action returns
-//! successfully" — so a target the group does not hold is removed from nothing and the
-//! call still succeeds; only a target group that does not exist is a refusal.
+//! Deregisters the named registrations from a persisted target group. A registration a
+//! load balancer is sending traffic to does not vanish: it enters `draining` — "the load
+//! balancer is draining connections to the target" — receives no new request from then
+//! on, and leaves the group once the group's `deregistration_delay.timeout_seconds` has
+//! passed, which is the state machine in [`crate::state::target_health`] and what
+//! `DescribeTargetHealth` reports in the meantime. A registration nothing is sending
+//! traffic to has no connections to drain, so it leaves the group at once.
+//!
+//! The model documents the operation as idempotent — "if the specified target does not
+//! exist, the action returns successfully" — so a target the group does not hold is
+//! removed from nothing and the call still succeeds; only a target group that does not
+//! exist is a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -150,6 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
         let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
             return Err(DeregisterTargetsErrorModeled::TargetGroupNotFoundException(
                 TargetGroupNotFoundException {
@@ -160,6 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // What an earlier deregistration already owes this group, before this one is
+        // applied: a registration whose drain is over has left the group, so a
+        // deregistration of it names nothing rather than restarting a drain.
+        group.settle_draining(now);
 
         for target in &input.targets {
             // The same key `RegisterTargets` stored the registration under: the
@@ -168,9 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ID and the port when you deregister it" — so a request naming only the
             // id removes the registration on the group's port, and a registration on
             // another port is left alone.
-            group
-                .targets
-                .remove(&(target.id.clone(), target.port.or(group.port)));
+            //
+            // The registration does not simply disappear: a target a load balancer is
+            // sending traffic to DRAINS first, which is the state the health read reports
+            // until the deregistration delay has passed (`crate::state::target_health`).
+            group.deregister(&(target.id.clone(), target.port.or(group.port)), now);
         }
 
         Ok(DeregisterTargetsOutput {})

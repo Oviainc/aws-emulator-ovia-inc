@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the group's ("by default, the load balancer routes requests to registered
             // targets using the protocol and port for the target group. Alternatively,
             // you can override the port for a target when you register it").
-            let requested: Vec<(String, Option<i32>)> = input
+            let requested: Vec<crate::state::TargetKey> = input
                 .targets
                 .iter()
                 .map(|target| (target.id.clone(), target.port.or(group.port)))
@@ -216,6 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
             return Err(group_not_found(&input.target_group_arn));
         };
+        // What the clock already owes the group: a registration whose draining span is
+        // over has left it, so it occupies neither the group's quota nor its own key.
+        group.settle_draining(now);
         // Asked again on the record as it is NOW: the store is unlocked while the targets
         // are resolved, so another request may have filled the group in between, and the
         // bound is on what is stored rather than on what was stored when this one started.
@@ -234,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     availability_zone: zone.or_else(|| target.availability_zone.clone()),
                     registered_at: now,
                     healthy_at: now + crate::state::SETTLE_AFTER,
+                    // A registration replaces whatever this key held, so registering a
+                    // target that was draining returns it to service: it is checked from
+                    // now rather than removed when the drain it was in runs out.
+                    draining_until: None,
                 },
             );
         }
@@ -264,10 +271,10 @@ fn group_not_found(arn: &str) -> RegisterTargetsError {
 /// per element.
 fn check_quota(
     group: &crate::state::TargetGroupRecord,
-    requested: &[(String, Option<i32>)],
+    requested: &[crate::state::TargetKey],
 ) -> Result<(), RegisterTargetsError> {
     let quota = crate::state::targets_per_target_group(group);
-    let mut added: Vec<&(String, Option<i32>)> = requested
+    let mut added: Vec<&crate::state::TargetKey> = requested
         .iter()
         .filter(|key| !group.targets.contains_key(*key))
         .collect();

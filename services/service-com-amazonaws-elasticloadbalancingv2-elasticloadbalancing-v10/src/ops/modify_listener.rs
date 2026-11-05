@@ -385,7 +385,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The listener's actions decide which target groups report this load balancer, so
         // a modification that stopped forwarding to one drops that association and one
         // that started forwarding adds it.
-        guard.refresh_target_group_associations(&load_balancer_arn);
+        guard.refresh_target_group_associations(
+            &load_balancer_arn,
+            ::std::time::SystemTime::now(),
+        );
 
         let stored = guard
             .listeners

@@ -10,8 +10,14 @@
 //! "You can't delete the default rule" — the rule a listener mints with itself, which
 //! carries that listener's default actions and goes only when the listener does — so
 //! naming it is the modelled `OperationNotPermittedException`, while a `RuleArn` this
-//! store holds no rule for (one already deleted included) is the modelled
+//! store holds no rule for (one the caller already deleted included) is the modelled
 //! `RuleNotFoundException`.
+//!
+//! One `RuleArn` the store holds no rule for is NOT refused: one this store released WITH
+//! THE LISTENER that contained it. A listener's rules go with the listener, so that
+//! deletion has already been performed and this call completes
+//! ([`crate::state::cascaded_releases`]), which is what lets a teardown deleting a
+//! listener and then its rules finish instead of failing its second pass.
 //!
 //! ## Shape of an operation
 //!
@@ -143,10 +149,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // Whether this store RELEASED the rule with the listener (or load balancer) that
+        // contained it: a listener's rules go with the listener, so a delete naming a rule
+        // that cascade already removed asks for something that has been performed, and it
+        // completes instead of failing the second pass of a teardown that deletes
+        // top-down. A rule the caller deleted ITSELF, and an ARN this store never held,
+        // are the modelled `RuleNotFound`.
+        let released_with_its_listener = guard.cascaded_releases.holds(&input.rule_arn);
+
         // The rule is resolved through the very read that REPORTS it, so a listener's
         // default rule resolves here too: it is a rule `DescribeRules` answers with, and
         // the one rule this operation refuses to remove.
         let Some(rule) = guard.rule_by_arn(&input.rule_arn) else {
+            if released_with_its_listener {
+                return Ok(DeleteRuleOutput {});
+            }
             return Err(rule_not_found(&input.rule_arn));
         };
         if rule.is_default.unwrap_or(false) {
@@ -160,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if !guard.remove_rule(&input.rule_arn) {
+        if !guard.remove_rule(&input.rule_arn, ::std::time::SystemTime::now()) {
             // The rule was resolved above under this same lock, so nothing can have
             // released it; were it ever gone, that is the modelled refusal for it.
             return Err(rule_not_found(&input.rule_arn));

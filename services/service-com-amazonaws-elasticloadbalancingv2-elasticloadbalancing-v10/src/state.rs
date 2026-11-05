@@ -51,12 +51,23 @@ pub mod rule_actions;
 
 pub use rule_actions::{check_redirect_actions, redirects_to_itself, REDIRECT_LOOP_MESSAGE};
 
+/// The health state machine of a target group's registrations: the states a read reports
+/// and the two spans the clock owes a registration.
+pub mod target_health;
+
+pub use target_health::{deregistration_delay, DEREGISTRATION_DELAY_ATTRIBUTE};
+
+/// What this store released WITH ITS CONTAINER, which is what makes a delete of it
+/// idempotent.
+pub mod cascaded_releases;
+
+pub use cascaded_releases::CascadedReleases;
+
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, ForwardActionConfig, IpamPools, Listener,
     ListenerAttribute, LoadBalancer, LoadBalancerAddress, LoadBalancerAttribute, LoadBalancerState,
     Matcher, MutualAuthenticationAttributes, Rule, RuleCondition, RuleTransform, SubnetMapping,
-    TargetDescription, TargetGroup, TargetGroupAttribute, TargetGroupTuple, TargetHealth,
-    TargetHealthDescription, TrustStore,
+    TargetGroup, TargetGroupAttribute, TargetGroupTuple, TrustStore,
 };
 
 /// How long after the call that starts it a load balancer owes its move out of
@@ -642,6 +653,19 @@ pub fn rule_selection_not_found_message() -> String {
 /// no value ([`rule_selection_not_found_message`]).
 pub fn rule_not_found_message(arn: &str) -> String {
     format!("Rule '{arn}' not found")
+}
+
+/// The message Elastic Load Balancing answers the `RuleNotFound` of `SetRulePriorities`
+/// with: that operation addresses a LIST (`RulePriorities`, one `RulePriorityPair` per
+/// rule) rather than one rule, so the refusal is about the set of priorities the request
+/// asked for and names no value — the collection-level wording every list-addressing read
+/// of this service answers, worded for the member the list carries.
+///
+/// Pinned by the recorded answer: the concurrent-reorder behaviour this service is checked
+/// against has the losing `SetRulePriorities` of the race refused with exactly this
+/// sentence, where the rule its pairs named was no longer there.
+pub fn rule_priorities_not_found_message() -> String {
+    "One or more priorities not found".to_string()
 }
 
 /// The message Elastic Load Balancing answers a `PriorityInUse` with: the priority the
@@ -2591,6 +2615,22 @@ impl AttributeDomain {
             }
         }
     }
+
+    /// The largest integer this domain admits, for a domain stated as a RANGE; `None` for
+    /// one that is not a range at all.
+    ///
+    /// What it is for: a SPAN read out of an attribute is bounded by the attribute's own
+    /// documented range, which is the range [`Self::check`] refuses a write outside — so a
+    /// span taken from the collection cannot exceed what a write could have stored, and
+    /// the ceiling is read from the catalog rather than restated beside it.
+    pub fn integer_ceiling(&self) -> Option<i64> {
+        match *self {
+            Self::Integer { max, .. }
+            | Self::IntegerOrOff { max, .. }
+            | Self::ZeroOrInteger { max, .. } => Some(max),
+            Self::Boolean | Self::Text | Self::OneOf(_) | Self::CookieName => None,
+        }
+    }
 }
 
 /// One target group attribute: which target groups carry it, what it accepts, and the
@@ -2853,9 +2893,19 @@ pub struct RegisteredTarget {
     pub port: Option<i32>,
     pub availability_zone: Option<String>,
     pub registered_at: SystemTime,
-    /// When the clock owes this registration its move out of `initial`.
+    /// When the clock owes this registration its move out of `initial` — the instant
+    /// health checking on it began plus [`SETTLE_AFTER`].
     pub healthy_at: SystemTime,
+    /// When the clock owes this registration its REMOVAL from the target group, for a
+    /// registration `DeregisterTargets` put in `draining`; `None` for one nothing has
+    /// deregistered ([`target_health`]).
+    pub draining_until: Option<SystemTime>,
 }
+
+/// How a registration is keyed in a target group: the target id and the port the target
+/// receives traffic on, so "you can register each EC2 instance or IP address with the same
+/// target group multiple times using different ports" holds.
+pub type TargetKey = (String, Option<i32>);
 
 /// A persisted target group.
 #[derive(Debug, Clone, Default)]
@@ -2876,7 +2926,7 @@ pub struct TargetGroupRecord {
     pub tags: HashMap<String, String>,
     /// Registrations keyed by target id and effective port, so registering the same
     /// id on two ports keeps two registrations and re-registering one replaces it.
-    pub targets: BTreeMap<(String, Option<i32>), RegisteredTarget>,
+    pub targets: BTreeMap<TargetKey, RegisteredTarget>,
 }
 
 impl TargetGroupRecord {
@@ -3046,81 +3096,12 @@ impl TargetGroupRecord {
         }
     }
 
-    /// The health of one registered target, derived from what is stored plus the
-    /// clock: a target group no load balancer forwards to has nothing checking its
-    /// targets, a group whose health checks are off reports them unavailable, and a
-    /// registration younger than [`SETTLE_AFTER`] is still coming up.
-    pub fn health_of(&self, target: &RegisteredTarget, now: SystemTime) -> TargetHealth {
-        if self.load_balancer_arns.is_empty() {
-            return TargetHealth {
-                state: Some("unused".to_string()),
-                reason: Some("Target.NotInUse".to_string()),
-                description: Some(
-                    "Target group is not configured to receive traffic from the load balancer"
-                        .to_string(),
-                ),
-            };
-        }
-        if !self.health_check.enabled {
-            return TargetHealth {
-                state: Some("unavailable".to_string()),
-                reason: Some("Target.HealthCheckDisabled".to_string()),
-                description: Some("Health checks are not enabled for this target group".to_string()),
-            };
-        }
-        if now < target.healthy_at {
-            return TargetHealth {
-                state: Some("initial".to_string()),
-                reason: Some("Elb.RegistrationInProgress".to_string()),
-                description: Some("Target registration is in progress".to_string()),
-            };
-        }
-        TargetHealth {
-            state: Some("healthy".to_string()),
-            reason: None,
-            description: None,
-        }
-    }
-
-    /// The description of a target that is not registered with this group.
-    ///
-    /// It carries the same `HealthCheckPort` a registered target's does
-    /// ([`Self::health_check_port_for`]): the port is the group's health-check
-    /// configuration read against the target the request named, which an unregistered
-    /// target has as much as a registered one.
-    pub fn unregistered_health_description(&self, target: &TargetDescription) -> TargetHealthDescription {
-        TargetHealthDescription {
-            target: Some(target.clone()),
-            health_check_port: self.health_check_port_for(target.port),
-            target_health: Some(TargetHealth {
-                state: Some("unused".to_string()),
-                reason: Some("Target.NotRegistered".to_string()),
-                description: Some("Target is not registered to the target group".to_string()),
-            }),
-            anomaly_detection: None,
-            administrative_override: None,
-        }
-    }
-
-    /// The health description of one registered target.
-    pub fn health_description_of(
-        &self,
-        target: &RegisteredTarget,
-        now: SystemTime,
-    ) -> TargetHealthDescription {
-        TargetHealthDescription {
-            target: Some(TargetDescription {
-                id: target.id.clone(),
-                port: target.port,
-                availability_zone: target.availability_zone.clone(),
-                quic_server_id: None,
-            }),
-            health_check_port: self.health_check_port_of(target),
-            target_health: Some(self.health_of(target, now)),
-            anomaly_detection: None,
-            administrative_override: None,
-        }
-    }
+    // The health of one registered target, the description of one that is not registered
+    // and the description of one that is all live in [`target_health`]: the health STATE
+    // MACHINE is one concern, read by the operation that reports it and by the data plane
+    // that decides which targets may be sent a request. Both descriptions report the
+    // health-check port [`Self::health_check_port_for`] answers for the target the read
+    // was asked about.
 }
 
 /// The statuses the model's `TrustStoreStatus` enum names
@@ -3957,6 +3938,10 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// store: nothing accumulates here either, because a marker carries the position it
     /// names rather than pointing at a page kept on the side.
     page_token_key: PageTokenKey,
+    /// The listeners and rules this store released WITH THEIR CONTAINER, which is what
+    /// makes a delete of one of them idempotent ([`CascadedReleases`]). A bounded window,
+    /// so it does not grow with the number of calls.
+    pub cascaded_releases: CascadedReleases,
 }
 
 impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
@@ -4186,27 +4171,53 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     }
 
     /// Record that `load_balancer_arn` forwards to `target_group_arn`.
-    pub fn associate_target_group(&mut self, target_group_arn: &str, load_balancer_arn: &str) {
+    ///
+    /// The association is what starts the HEALTH CHECKS on the group's targets, so a
+    /// group that was forwarded to by nothing begins checking them here
+    /// ([`TargetGroupRecord::begin_health_checking`]): before this, nothing was checking
+    /// them and their reported state was `unused`.
+    pub fn associate_target_group(
+        &mut self,
+        target_group_arn: &str,
+        load_balancer_arn: &str,
+        now: SystemTime,
+    ) {
         if let Some(group) = self.target_groups.get_mut(target_group_arn) {
             if !group
                 .load_balancer_arns
                 .iter()
                 .any(|arn| arn == load_balancer_arn)
             {
+                let was_in_use = !group.load_balancer_arns.is_empty();
                 group.load_balancer_arns.push(load_balancer_arn.to_string());
+                if !was_in_use {
+                    group.begin_health_checking(now);
+                }
             }
         }
     }
 
     /// Remove a load balancer, its listeners and every association its listeners
     /// made, answering whether it was there.
+    ///
+    /// "Deleting a load balancer also deletes its listeners" — and a listener's rules go
+    /// with the listener — so each RULE the cascade releases is recorded as released with
+    /// its container: a delete of one of them afterwards asks for something this cascade
+    /// already performed ([`cascaded_releases`]). The listeners themselves are not:
+    /// `DeleteListener` models `ListenerNotFoundException` and answers it for a listener a
+    /// cascade removed.
     pub fn remove_load_balancer(&mut self, arn: &str) -> bool {
         let Some(removed) = self.load_balancers.remove(arn) else {
             return false;
         };
         self.name_to_lb_arn.remove(&removed.name);
         for listener_arn in &removed.listener_arns {
-            self.listeners.remove(listener_arn);
+            if let Some(listener) = self.listeners.remove(listener_arn) {
+                for rule in &listener.rules {
+                    self.cascaded_releases.record(&rule.arn);
+                }
+                self.cascaded_releases.record(&listener.default_rule_arn());
+            }
         }
         for group in self.target_groups.values_mut() {
             group.load_balancer_arns.retain(|lb| lb != arn);
@@ -4217,15 +4228,22 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// Remove ONE listener — from the store, from its load balancer's listener list and
     /// from every target group no remaining listener of that load balancer forwards to —
     /// answering whether it was there.
-    pub fn remove_listener(&mut self, arn: &str) -> bool {
+    pub fn remove_listener(&mut self, arn: &str, now: SystemTime) -> bool {
         let Some(removed) = self.listeners.remove(arn) else {
             return false;
         };
+        // The listener's rules go with the listener — the ones a caller added and the
+        // default rule it minted with itself — so a delete of one of them afterwards asks
+        // for something this removal already performed ([`cascaded_releases`]).
+        for rule in &removed.rules {
+            self.cascaded_releases.record(&rule.arn);
+        }
+        self.cascaded_releases.record(&removed.default_rule_arn());
         let load_balancer_arn = removed.load_balancer_arn.clone();
         if let Some(load_balancer) = self.load_balancers.get_mut(&load_balancer_arn) {
             load_balancer.listener_arns.retain(|listener| listener != arn);
         }
-        self.refresh_target_group_associations(&load_balancer_arn);
+        self.refresh_target_group_associations(&load_balancer_arn, now);
         true
     }
 
@@ -4239,7 +4257,11 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// it: a second listener of the same load balancer still forwarding there does, and
     /// so does a RULE of one — a load balancer routes to a target group an action of any
     /// of its rules forwards to, not only one its default actions name.
-    pub fn refresh_target_group_associations(&mut self, load_balancer_arn: &str) {
+    pub fn refresh_target_group_associations(
+        &mut self,
+        load_balancer_arn: &str,
+        now: SystemTime,
+    ) {
         let forwarded: Vec<String> = self
             .listeners
             .values()
@@ -4253,7 +4275,11 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
                 .any(|lb| lb == load_balancer_arn);
             if forwarded.contains(arn) {
                 if !holds {
+                    let was_in_use = !group.load_balancer_arns.is_empty();
                     group.load_balancer_arns.push(load_balancer_arn.to_string());
+                    if !was_in_use {
+                        group.begin_health_checking(now);
+                    }
                 }
             } else if holds {
                 group.load_balancer_arns.retain(|lb| lb != load_balancer_arn);
@@ -4327,7 +4353,7 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// here: it has no record of its own, being derived from the listener
     /// ([`ListenerRecord::default_rule`]), and the operation that would remove it refuses
     /// instead.
-    pub fn remove_rule(&mut self, arn: &str) -> bool {
+    pub fn remove_rule(&mut self, arn: &str, now: SystemTime) -> bool {
         let Some(listener_arn) = rule_listener_arn(arn) else {
             return false;
         };
@@ -4343,7 +4369,7 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
         // to, so the rule going away can be what releases that association — and what
         // lets the target group be deleted.
         let load_balancer_arn = listener.load_balancer_arn.clone();
-        self.refresh_target_group_associations(&load_balancer_arn);
+        self.refresh_target_group_associations(&load_balancer_arn, now);
         true
     }
 

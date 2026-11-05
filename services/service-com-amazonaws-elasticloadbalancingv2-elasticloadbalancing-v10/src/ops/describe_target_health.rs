@@ -151,8 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = std::time::SystemTime::now();
 
-        let guard = state.lock();
-        let Some(group) = guard.target_groups.get(&input.target_group_arn) else {
+        let mut guard = state.lock();
+        let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
             return Err(DescribeTargetHealthErrorModeled::TargetGroupNotFoundException(
                 TargetGroupNotFoundException {
                     // The message every operation that acts on ONE named target group
@@ -165,6 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // What the CLOCK already owes this group: a registration whose draining span is
+        // over left the target group at the instant the deregistration delay ran out,
+        // whether or not anything called then. This is the only thing a health read
+        // materialises — it moves no health state, consumes nothing and counts nothing.
+        group.settle_draining(now);
+        let group = &*group;
 
         let descriptions = match input.targets.as_deref() {
             // "Describes the health of the specified targets": each named target, in

@@ -446,7 +446,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             load_balancer.listener_arns.push(arn.clone());
         }
         for target_group_arn in &forwarded {
-            guard.associate_target_group(target_group_arn, &input.load_balancer_arn);
+            guard.associate_target_group(target_group_arn, &input.load_balancer_arn, now);
         }
 
         let stored = guard.listeners.get(&arn).expect("the listener just inserted");

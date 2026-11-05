@@ -318,7 +318,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A load balancer routes to every target group an action of one of its rules
         // forwards to, so a modification that stopped forwarding to one drops that
         // association and one that started forwarding adds it.
-        guard.refresh_target_group_associations(&listener.load_balancer_arn);
+        guard.refresh_target_group_associations(
+            &listener.load_balancer_arn,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(ModifyRuleOutput {
             rules: Some(vec![modified]),

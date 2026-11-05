@@ -9,7 +9,11 @@
 //!
 //! Unlike `DeleteLoadBalancer`, whose documentation makes deleting an absent load
 //! balancer a success, this operation models `ListenerNotFoundException`, and that is
-//! what an absent listener answers.
+//! what an absent listener answers — including one that went with its load balancer:
+//! "deleting a load balancer also deletes its listeners", and a delete naming a listener
+//! that cascade removed is refused, which is what the recorded teardown of a load
+//! balancer and then its listener answers. (A RULE released by such a cascade is NOT
+//! refused — see [`crate::ops::delete_rule`].)
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
         // The load balancer the listener belonged to, read before the removal: what it
         // presents is recomputed from the listeners that remain, so the ARN has to be
         // taken while the listener is still there.
@@ -155,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .listeners
             .get(&input.listener_arn)
             .map(|listener| listener.load_balancer_arn.clone());
-        if !guard.remove_listener(&input.listener_arn) {
+        if !guard.remove_listener(&input.listener_arn, now) {
             return Err(DeleteListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
                     message: Some(crate::state::listener_not_found_message(&input.listener_arn)),
@@ -171,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 &guard,
                 &load_balancer_arn,
-                ::std::time::SystemTime::now(),
+                now,
             );
         }
 
