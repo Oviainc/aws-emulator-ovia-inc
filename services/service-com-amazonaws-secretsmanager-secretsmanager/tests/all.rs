@@ -21,6 +21,8 @@ mod secret_batch_get;
 mod secret_client_request_token;
 #[path = "all/secret_cross_account_resource_policy.rs"]
 mod secret_cross_account_resource_policy;
+#[path = "all/secret_delete_metadata_and_filters.rs"]
+mod secret_delete_metadata_and_filters;
 #[path = "all/secret_deletion_window.rs"]
 mod secret_deletion_window;
 #[path = "all/secret_error_responses.rs"]
@@ -37,6 +39,8 @@ mod secret_policy_validation;
 mod secret_public_policy_message;
 #[path = "all/secret_random_password.rs"]
 mod secret_random_password;
+#[path = "all/secret_regional_replication.rs"]
+mod secret_regional_replication;
 #[path = "all/secret_resource_policy.rs"]
 mod secret_resource_policy;
 #[path = "all/secret_resource_policy_targeting.rs"]

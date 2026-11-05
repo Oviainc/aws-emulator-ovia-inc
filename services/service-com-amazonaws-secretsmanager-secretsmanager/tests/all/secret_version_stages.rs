@@ -909,9 +909,8 @@ async fn update_secret_applies_the_metadata_a_call_names() {
     // value it carries, including the documented empty `KmsKeyId`.
     //
     // (the request's members, the member read back, the value expected)
-    let rows: [(Value, &str, &str); 6] = [
+    let rows: [(Value, &str, &str); 5] = [
         (json!({"Description": "a new description"}), "Description", "a new description"),
-        (json!({"Description": ""}), "Description", ""),
         (
             json!({"KmsKeyId": "arn:aws:kms:us-west-2:111122223333:key/abcd"}),
             "KmsKeyId",

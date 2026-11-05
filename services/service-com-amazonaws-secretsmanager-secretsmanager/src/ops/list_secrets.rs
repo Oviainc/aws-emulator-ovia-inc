@@ -194,14 +194,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A secret scheduled for deletion is hidden unless the caller asks for it.
         let include_deleted = input.include_planned_deletion.unwrap_or(false);
         let filters = input.filters.as_deref().unwrap_or(&[]);
-        let mut matching: Vec<&crate::state::Secret> = store
-            .secrets
-            .values()
-            .filter(|secret| include_deleted || !secret.scheduled_for_deletion())
-            .filter(|secret| {
+        // "Lists the secrets that are stored by Secrets Manager in the Amazon Web
+        // Services account" (`ListSecrets`, this service's Smithy model) — in the
+        // Region this request is addressed to: a secret is held in one Region,
+        // and the replicas of a secret in other Regions are listed by those
+        // Regions.
+        let region = crate::state::request_region(ctx.parts());
+        let mut matching: Vec<crate::state::SecretView<'_>> = store
+            .in_region(&region)
+            .map(|secret| crate::state::SecretView {
+                secret,
+                content: store.content_of(secret),
+            })
+            .filter(|view| include_deleted || !view.secret.scheduled_for_deletion())
+            .filter(|view| {
                 filters
                     .iter()
-                    .all(|filter| crate::state::matches_filter(secret, filter))
+                    .all(|filter| crate::state::matches_filter(*view, filter))
             })
             .collect();
         sort_secrets(&mut matching, input.sort_by.as_deref(), input.sort_order.as_deref());
@@ -212,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let resume = crate::state::decode_next_token(token)
-                    .and_then(|name| matching.iter().position(|secret| secret.name == name));
+                    .and_then(|name| matching.iter().position(|view| view.secret.name == name));
                 match resume {
                     Some(index) => index,
                     None => {
@@ -238,11 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|max| usize::try_from(max).ok())
             .unwrap_or(matching.len())
             .max(1);
-        let page: Vec<&crate::state::Secret> =
+        let page: Vec<crate::state::SecretView<'_>> =
             matching.iter().skip(start).take(page_size).copied().collect();
         let next_token = matching
             .get(start + page.len())
-            .map(|secret| crate::state::encode_next_token(&secret.name));
+            .map(|view| crate::state::encode_next_token(&view.secret.name));
 
         Ok(ListSecretsOutput {
             secret_list: Some(page.into_iter().map(entry_for).collect()),
@@ -251,33 +260,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One `SecretListEntry`, built from the stored secret.
-fn entry_for(secret: &crate::state::Secret) -> SecretListEntry {
+/// One `SecretListEntry`, built from the stored secret: its identity and its
+/// per-Region state from the record this Region holds, and everything the secret
+/// CONTAINS from the record that holds it — which for a replica is the primary it
+/// tracks (the same projection `DescribeSecret` reports).
+fn entry_for(view: crate::state::SecretView<'_>) -> SecretListEntry {
+    let crate::state::SecretView { secret, content } = view;
     SecretListEntry {
         arn: Some(secret.arn.clone()),
         name: Some(secret.name.clone()),
-        r#type: secret.secret_type.clone(),
-        description: secret.description.clone(),
+        r#type: content.secret_type.clone(),
+        description: content.description.clone(),
         kms_key_id: secret.kms_key_id.clone(),
-        rotation_enabled: Some(secret.rotation_enabled),
+        rotation_enabled: Some(content.rotation_enabled),
         // The rotation configuration `RotateSecret` persisted, the same way
         // `DescribeSecret` projects it. `LastRotatedDate` stays absent until a
         // rotation completes.
-        rotation_lambda_arn: secret.rotation_lambda_arn.clone(),
-        rotation_rules: secret.rotation_rules_out(),
-        external_secret_rotation_metadata: secret.external_rotation_metadata_out(),
-        external_secret_rotation_role_arn: secret.external_rotation_role_arn.clone(),
-        last_rotated_date: secret.last_rotated_date.map(crate::state::timestamp),
-        next_rotation_date: secret.next_rotation_date.map(crate::state::timestamp),
-        last_changed_date: Some(crate::state::timestamp(secret.last_changed_date)),
+        rotation_lambda_arn: content.rotation_lambda_arn.clone(),
+        rotation_rules: content.rotation_rules_out(),
+        external_secret_rotation_metadata: content.external_rotation_metadata_out(),
+        external_secret_rotation_role_arn: content.external_rotation_role_arn.clone(),
+        last_rotated_date: content.last_rotated_date.map(crate::state::timestamp),
+        next_rotation_date: content.next_rotation_date.map(crate::state::timestamp),
+        last_changed_date: Some(crate::state::timestamp(content.last_changed_date)),
         last_accessed_date: secret.last_accessed_date.map(crate::state::timestamp),
         deleted_date: secret.deleted_date.map(crate::state::timestamp),
-        tags: secret.tags_out(),
-        secret_versions_to_stages: secret.versions_to_stages(),
-        owning_service: secret.owning_service.clone(),
+        tags: content.tags_out(),
+        secret_versions_to_stages: content.versions_to_stages(),
+        owning_service: content.owning_service.clone(),
         created_date: Some(crate::state::timestamp(secret.created_date)),
         // Part of the replication view, so it is reported only while the secret
-        // is a replication primary — the same rule `DescribeSecret` follows.
+        // takes part in replication — the same rule `DescribeSecret` follows.
         primary_region: secret.primary_region_out(),
     }
 }
@@ -289,17 +302,17 @@ fn entry_for(secret: &crate::state::Secret) -> SecretListEntry {
 /// accepts `asc` and `desc` (`SORT_ORDER_TYPE_VALUES`). With no `SortBy` the
 /// secrets stay in name order, which is the order the store holds them in.
 fn sort_secrets(
-    secrets: &mut [&crate::state::Secret],
+    secrets: &mut [crate::state::SecretView<'_>],
     sort_by: Option<&str>,
     sort_order: Option<&str>,
 ) {
     match sort_by {
-        Some("created-date") => secrets.sort_by_key(|secret| secret.created_date),
-        Some("last-changed-date") => secrets.sort_by_key(|secret| secret.last_changed_date),
-        Some("last-accessed-date") => secrets.sort_by_key(|secret| secret.last_accessed_date),
+        Some("created-date") => secrets.sort_by_key(|view| view.secret.created_date),
+        Some("last-changed-date") => secrets.sort_by_key(|view| view.content.last_changed_date),
+        Some("last-accessed-date") => secrets.sort_by_key(|view| view.secret.last_accessed_date),
         // `name`, and any value the enum does not name, leave the store's own
         // name order in place.
-        _ => secrets.sort_by(|a, b| a.name.cmp(&b.name)),
+        _ => secrets.sort_by(|a, b| a.secret.name.cmp(&b.secret.name)),
     }
     if sort_order == Some("desc") {
         secrets.reverse();

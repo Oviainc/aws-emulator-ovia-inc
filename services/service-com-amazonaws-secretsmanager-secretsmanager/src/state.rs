@@ -3,12 +3,15 @@
 //! Engine state for the com-amazonaws-secretsmanager-secretsmanager service.
 //!
 //! The shape of the resource this service stores: a secret is identified by its
-//! name, carries an ARN that ends in the name plus a hyphen and six random
-//! characters, and owns an insertion-ordered list of versions. The staging
-//! labels (`AWSCURRENT`, `AWSPREVIOUS`, and any label a caller names) live on
-//! the versions, and a label is attached to at most one version of a secret at a
-//! time; a version that carries no label is deprecated and is left out of
-//! `VersionIdsToStages` / `SecretVersionsToStages`.
+//! name WITHIN A REGION — the namespace is per Region, so the same name in
+//! another Region is another secret, and the replicas of a secret are secrets of
+//! their own in the Regions it is replicated to (see [`replication`]) — carries
+//! an ARN that ends in the name plus a hyphen and six random characters, and owns
+//! an insertion-ordered list of versions. The staging labels (`AWSCURRENT`,
+//! `AWSPREVIOUS`, and any label a caller names) live on the versions, and a label
+//! is attached to at most one version of a secret at a time; a version that
+//! carries no label is deprecated and is left out of `VersionIdsToStages` /
+//! `SecretVersionsToStages`.
 //!
 //! A secret also carries the rotation configuration `RotateSecret` set for it —
 //! the rotation function, the rules, the external-rotation metadata and the
@@ -41,6 +44,11 @@ pub mod authorization;
 /// The IAM condition keys a request and the secret it addresses populate, which the
 /// gate above decides a statement's `Condition` against.
 pub mod condition_keys;
+
+/// Cross-region replication: how a replica of a secret becomes a secret of its own
+/// in its Region, how its status settles, and how it is torn down or promoted.
+pub mod replication;
+pub use replication::*;
 
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
@@ -501,6 +509,10 @@ pub const REPLICA_STATUS_IN_PROGRESS: &str = "InProgress";
 /// `ReplicationStatusType$Status` once the replica exists.
 pub const REPLICA_STATUS_IN_SYNC: &str = "InSync";
 
+/// `ReplicationStatusType$Status` for a replica the service could not create
+/// (`StatusType`, this service's Smithy model).
+pub const REPLICA_STATUS_FAILED: &str = "Failed";
+
 /// How long a fresh replica stays `InProgress` before the clock owes it the move
 /// to `InSync`.
 ///
@@ -527,12 +539,22 @@ pub fn is_valid_secret_name(name: &str) -> bool {
 
 /// Whether a secret satisfies one `Filter`.
 ///
-/// A filter's `Values` are alternatives (any one matching is enough) and each
-/// value may be negated with a leading `!`; separate filters all have to hold.
+/// "You can prefix your search value with an exclamation mark (`!`) in order to
+/// perform negation filters" (`Filter$Values`, this service's Smithy model), so a
+/// filter's values are of two kinds and they do different work: the plain ones
+/// are alternatives (any one matching is enough), and every negated one EXCLUDES
+/// the secrets it matches, whatever the others select. A filter that carries only
+/// negated values selects everything they do not exclude; separate filters all
+/// have to hold.
+///
+/// The attributes are read from the view ([`SecretView`]), so a replica is
+/// selected by the content it serves — the primary's — under its own name and
+/// Region.
+///
 /// Every operation that selects secrets by filter — the listing and the batched
 /// read, which share one `Filter` shape — selects with THIS function, so the two
 /// cannot disagree about what a filter means.
-pub fn matches_filter(secret: &Secret, filter: &Filter) -> bool {
+pub fn matches_filter(view: SecretView<'_>, filter: &Filter) -> bool {
     let Some(key) = filter.key.as_deref() else {
         return true;
     };
@@ -540,10 +562,18 @@ pub fn matches_filter(secret: &Secret, filter: &Filter) -> bool {
     if values.is_empty() {
         return true;
     }
-    values.iter().any(|value| match value.strip_prefix('!') {
-        Some(negated) => !matches_filter_value(secret, key, negated),
-        None => matches_filter_value(secret, key, value),
-    })
+    let (negated, selecting): (Vec<&String>, Vec<&String>) =
+        values.iter().partition(|value| value.starts_with('!'));
+    let excluded = negated.iter().any(|value| {
+        matches_filter_value(view, key, value.strip_prefix('!').unwrap_or(value))
+    });
+    if excluded {
+        return false;
+    }
+    selecting.is_empty()
+        || selecting
+            .iter()
+            .any(|value| matches_filter_value(view, key, value))
 }
 
 /// Whether a secret matches one filter value.
@@ -553,34 +583,47 @@ pub fn matches_filter(secret: &Secret, filter: &Filter) -> bool {
 /// case-sensitive prefix matches, `description` is a prefix match that is not
 /// case-sensitive, and `all` "breaks the filter value string into words and then
 /// searches all attributes for matches", not case-sensitive.
-fn matches_filter_value(secret: &Secret, key: &str, value: &str) -> bool {
+///
+/// The two keys that search TEXT — `description` and `all` — match a prefix of
+/// any WORD of what they search ([`words`]), not of the whole attribute alone: a
+/// description is a sentence, and the word is the unit a search of one selects by.
+/// `all` searches the words of every attribute, and — "breaks the filter value
+/// string into words" — all of the words of its own value have to be found.
+fn matches_filter_value(view: SecretView<'_>, key: &str, value: &str) -> bool {
+    let SecretView { secret, content } = view;
     match key {
         "name" => secret.name.starts_with(value),
-        "description" => secret
+        "description" => content
             .description
             .as_deref()
-            .is_some_and(|description| starts_with_ignoring_case(description, value)),
-        "tag-key" => secret
+            .is_some_and(|description| matches_text(description, value)),
+        "tag-key" => content
             .tags
             .iter()
             .filter_map(|tag| tag.key.as_deref())
             .any(|tag_key| tag_key.starts_with(value)),
-        "tag-value" => secret
+        "tag-value" => content
             .tags
             .iter()
             .filter_map(|tag| tag.value.as_deref())
             .any(|tag_value| tag_value.starts_with(value)),
-        "primary-region" => secret.region.starts_with(value),
-        "owning-service" => secret
+        // The Region the secret's primary is in, which for a replica is another
+        // Region than its own and for every other secret is its own.
+        "primary-region" => secret
+            .replica_of
+            .as_deref()
+            .unwrap_or(&secret.region)
+            .starts_with(value),
+        "owning-service" => content
             .owning_service
             .as_deref()
             .is_some_and(|owner| owner.starts_with(value)),
         "all" => {
-            let attributes = searchable_attributes(secret);
+            let attributes = searchable_attributes(view);
             value.split_whitespace().all(|word| {
                 attributes
                     .iter()
-                    .any(|attribute| starts_with_ignoring_case(attribute, word))
+                    .any(|attribute| matches_text(attribute, word))
             })
         }
         // A key the model does not name matches nothing.
@@ -588,12 +631,28 @@ fn matches_filter_value(secret: &Secret, key: &str, value: &str) -> bool {
     }
 }
 
+/// Whether `value` is a prefix of `text` or of any word of it, ignoring case —
+/// what the filter keys that search text match by.
+fn matches_text(text: &str, value: &str) -> bool {
+    starts_with_ignoring_case(text, value)
+        || words(text).any(|word| starts_with_ignoring_case(word, value))
+}
+
+/// The words of a searchable attribute: its maximal runs of alphanumeric
+/// characters, so the words of a sentence, of a path-like secret name and of a
+/// hyphenated tag value are all reached.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+}
+
 /// The attributes the `all` filter key searches.
-fn searchable_attributes(secret: &Secret) -> Vec<&str> {
+fn searchable_attributes(view: SecretView<'_>) -> Vec<&str> {
+    let SecretView { secret, content } = view;
     let mut attributes = vec![secret.name.as_str(), secret.region.as_str()];
-    attributes.extend(secret.description.as_deref());
-    attributes.extend(secret.owning_service.as_deref());
-    for tag in &secret.tags {
+    attributes.extend(content.description.as_deref());
+    attributes.extend(content.owning_service.as_deref());
+    for tag in &content.tags {
         attributes.extend(tag.key.as_deref());
         attributes.extend(tag.value.as_deref());
     }
@@ -1034,23 +1093,57 @@ impl StoredRotationRules {
 pub struct Replica {
     pub region: String,
     pub kms_key_id: String,
-    /// One of [`REPLICA_STATUS_IN_PROGRESS`] or [`REPLICA_STATUS_IN_SYNC`].
+    /// One of [`REPLICA_STATUS_IN_PROGRESS`], [`REPLICA_STATUS_IN_SYNC`] or
+    /// [`REPLICA_STATUS_FAILED`].
     pub status: String,
+    /// "Status message such as 'Secret with this name already exists in this
+    /// region'" (`ReplicationStatusType$StatusMessage`, this service's Smithy
+    /// model): what the status it accompanies says about this replica — why a
+    /// `Failed` one could not be created, and that replication succeeded for one
+    /// that is `InSync`. A replica whose creation is still `InProgress` has
+    /// nothing to report yet.
+    pub status_message: Option<String>,
     /// The instant the `InProgress` -> `InSync` move the clock owes this replica
-    /// becomes due; `None` once it has been made. Stored rather than slept on,
+    /// becomes due; `None` once it has been made, and for a replica that failed —
+    /// there is nothing left for the clock to owe it. Stored rather than slept on,
     /// so nothing blocks a request.
     pub in_sync_due: Option<SystemTime>,
+    /// "The date that the secret was last accessed in the Region"
+    /// (`ReplicationStatusType$LastAccessedDate`): stamped by a read of the
+    /// replica's own value in its own Region, and absent while nothing has read
+    /// it there.
+    pub last_accessed_date: Option<SystemTime>,
 }
 
 impl Replica {
     /// A replica whose creation has just started in `region`.
-    fn creating(region: String, kms_key_id: String, at: SystemTime) -> Self {
+    pub(crate) fn creating(region: String, kms_key_id: String, at: SystemTime) -> Self {
         Self {
             region,
             kms_key_id,
             status: REPLICA_STATUS_IN_PROGRESS.to_string(),
+            status_message: None,
             in_sync_due: at.checked_add(REPLICA_SYNC_DELAY),
+            last_accessed_date: None,
         }
+    }
+
+    /// A replica the service could not create, carrying the reason it could not.
+    pub(crate) fn failed(region: String, kms_key_id: String, reason: String) -> Self {
+        Self {
+            region,
+            kms_key_id,
+            status: REPLICA_STATUS_FAILED.to_string(),
+            status_message: Some(reason),
+            in_sync_due: None,
+            last_accessed_date: None,
+        }
+    }
+
+    /// Whether this replica exists as a secret in its Region: one whose creation
+    /// failed does not, and one still being created does not yet.
+    pub fn is_live(&self) -> bool {
+        self.status != REPLICA_STATUS_FAILED
     }
 
     /// Materialise the move to `InSync` once the clock has made it due. Returns
@@ -1061,6 +1154,7 @@ impl Replica {
             return false;
         }
         self.status = REPLICA_STATUS_IN_SYNC.to_string();
+        self.status_message = Some(REPLICATION_SUCCEEDED_MESSAGE.to_string());
         self.in_sync_due = None;
         true
     }
@@ -1234,6 +1328,21 @@ pub struct Secret {
     /// replicated to. Empty for a secret that does not participate in
     /// cross-region replication.
     pub replicas: Vec<Replica>,
+    /// The Region holding the PRIMARY this secret is a replica of; `None` for a
+    /// primary or a standalone secret.
+    ///
+    /// A replica is "a separate secret in the Region" it was replicated to
+    /// (`ReplicateSecretToRegions`, this service's Smithy model): it carries its
+    /// own region-qualified ARN and is read in its own Region, and while it
+    /// tracks the primary its content is the primary's — so every write goes to
+    /// the primary, and `StopReplicationToReplica` is what makes it a secret of
+    /// its own.
+    pub replica_of: Option<String>,
+    /// The ARN this secret's stored version values were sealed under, when it is
+    /// not this secret's own: the values of a replica, and of a secret promoted
+    /// from one, were sealed for the primary's ARN, which is the encryption
+    /// context they can only be opened under (see [`envelope::ValueContext`]).
+    pub sealed_under: Option<String>,
     /// The resource-based permission policy document attached to this secret,
     /// exactly as the caller supplied it; `None` for a secret no policy is
     /// attached to. `GetResourcePolicy` "retrieves the JSON text of the
@@ -1272,6 +1381,8 @@ impl Secret {
             next_rotation_date: None,
             pending_rotation_version_id: None,
             replicas: Vec::new(),
+            replica_of: None,
+            sealed_under: None,
             resource_policy: None,
             versions: Vec::new(),
         }
@@ -1287,8 +1398,19 @@ impl Secret {
     /// the end of the recovery window it reports as `DeletionDate`, and
     /// `purge_at` the instant the store owes its permanent removal.
     ///
+    /// Scheduling a deletion also turns ROTATION off: a secret on its way out is
+    /// not rotated, and `RotationEnabled` is "whether automatic rotation is turned
+    /// on for this secret" (`DescribeSecretResponse$RotationEnabled`, this
+    /// service's Smithy model), which it no longer is. The rotation
+    /// CONFIGURATION is kept, so a restored secret can be put back on a schedule
+    /// by `RotateSecret` — "to turn on automatic rotation again, call
+    /// RotateSecret" — but nothing turns it back on by itself, which is why
+    /// [`cancel_deletion`] leaves it off.
+    ///
     /// Re-scheduling a secret that is already marked replaces all three, so a
     /// second deletion request measures its window from itself.
+    ///
+    /// [`cancel_deletion`]: Secret::cancel_deletion
     pub fn schedule_deletion(
         &mut self,
         requested_at: SystemTime,
@@ -1298,6 +1420,8 @@ impl Secret {
         self.deleted_date = Some(requested_at);
         self.deletion_date = Some(deletion_date);
         self.purge_at = Some(purge_at);
+        self.rotation_enabled = false;
+        self.next_rotation_date = None;
     }
 
     /// Whether a scheduled deletion of this secret can still be cancelled.
@@ -1315,6 +1439,13 @@ impl Secret {
     /// Cancel a scheduled deletion: drop the `DeletionDate` stamp and with it
     /// the permanent removal the store owed, leaving the secret's versions,
     /// staging labels and every other attribute as they were.
+    ///
+    /// Rotation stays OFF: scheduling the deletion turned it off (see
+    /// [`schedule_deletion`]), and `RestoreSecret` "cancels the scheduled
+    /// deletion" (this service's Smithy model) — nothing more, so a caller that
+    /// wants the secret rotated again asks for that itself.
+    ///
+    /// [`schedule_deletion`]: Secret::schedule_deletion
     pub fn cancel_deletion(&mut self, at: SystemTime) {
         self.deleted_date = None;
         self.deletion_date = None;
@@ -1603,27 +1734,29 @@ impl Secret {
 
     /// Record a replication attempt into `region`.
     ///
-    /// The replica starts `InProgress`, which the clock moves to `InSync` (see
-    /// [`settle_replicas`]); a Region that already holds a replica OF THIS
-    /// SECRET is replicated again, which starts its creation over rather than
-    /// adding a second entry for the same Region.
-    ///
-    /// Nothing here reports `Failed`: that status is for a replica the service
-    /// could not create, and the conflict
-    /// `ReplicateSecretToRegionsRequest$ForceOverwriteReplicaSecret` resolves
-    /// ("whether to overwrite a secret with the same name in the destination
-    /// Region") is a DIFFERENT secret of this name in the destination Region,
-    /// which this store cannot hold — a name identifies at most one secret in
-    /// it. A status for a failure nothing suffered would be fabricated, so the
-    /// emulator reports none.
+    /// A replica the service could create starts `InProgress`, which the clock
+    /// moves to `InSync` (see [`settle_replicas`]); one it could not — `reason`
+    /// states why — is recorded `Failed` carrying that reason, which is what a
+    /// client reads to decide whether the replica is usable. A Region that
+    /// already holds a replica OF THIS SECRET is replicated again, which starts
+    /// its creation over rather than adding a second entry for the same Region.
     ///
     /// [`settle_replicas`]: Secret::settle_replicas
-    pub fn replicate_to(&mut self, region: &str, kms_key_id: Option<&str>, at: SystemTime) {
+    pub fn replicate_to(
+        &mut self,
+        region: &str,
+        kms_key_id: Option<&str>,
+        reason: Option<String>,
+        at: SystemTime,
+    ) {
         let key = kms_key_id
             .filter(|key| !key.is_empty())
             .unwrap_or(DEFAULT_KMS_KEY_ALIAS)
             .to_string();
-        let fresh = Replica::creating(region.to_string(), key, at);
+        let fresh = match reason {
+            Some(reason) => Replica::failed(region.to_string(), key, reason),
+            None => Replica::creating(region.to_string(), key, at),
+        };
         match self
             .replicas
             .iter_mut()
@@ -1655,16 +1788,6 @@ impl Secret {
 
     /// The secret's replication view for the wire — one `ReplicationStatusType`
     /// per replica — omitted while the secret has no replicas.
-    ///
-    /// `StatusMessage` is "Status message such as 'Secret with this name already
-    /// exists in this region'" — the reason a replica was not created, which
-    /// nothing in this emulator produces (see [`replicate_to`]), so it is
-    /// omitted. `LastAccessedDate` is "the date that the secret was last
-    /// accessed in the Region. This field is omitted if the secret has never
-    /// been retrieved in the Region": this emulator serves `GetSecretValue` from
-    /// the primary, so no call has ever retrieved a replica in its own Region.
-    ///
-    /// [`replicate_to`]: Secret::replicate_to
     pub fn replication_status_out(&self) -> Option<Vec<ReplicationStatusType>> {
         (!self.replicas.is_empty()).then(|| self.replication_status())
     }
@@ -1680,10 +1803,22 @@ impl Secret {
                 region: Some(replica.region.clone()),
                 kms_key_id: Some(replica.kms_key_id.clone()),
                 status: Some(replica.status.clone()),
-                status_message: None,
-                last_accessed_date: None,
+                status_message: replica.status_message.clone(),
+                last_accessed_date: replica.last_accessed_date.map(timestamp),
             })
             .collect()
+    }
+
+    /// Whether this secret is a replica of a primary in another Region.
+    pub fn is_replica(&self) -> bool {
+        self.replica_of.is_some()
+    }
+
+    /// The ARN this secret's version values were sealed under, which is the
+    /// encryption context they are opened under: its own, unless they were
+    /// mirrored from a primary (see [`Secret::sealed_under`]).
+    pub fn value_context_arn(&self) -> &str {
+        self.sealed_under.as_deref().unwrap_or(&self.arn)
     }
 
     /// The secret's `PrimaryRegion` for the wire.
@@ -1691,12 +1826,14 @@ impl Secret {
     /// `PrimaryRegion` is part of the replication view — "The Region the secret
     /// is in. If a secret is replicated to other Regions, the replicas are
     /// listed in ReplicationStatus" — and Secrets Manager "only returns fields
-    /// that have a value in the response", so a secret that is not a replication
-    /// primary has no primary Region to report and the member is omitted. It
-    /// comes back as soon as the secret has a replica, and goes away again once
-    /// the last one is removed.
+    /// that have a value in the response", so a secret that takes no part in
+    /// replication has no primary Region to report and the member is omitted. A
+    /// replica reports the Region its primary is in; a primary reports its own,
+    /// from the moment it has a replica until the last one is removed.
     pub fn primary_region_out(&self) -> Option<String> {
-        (!self.replicas.is_empty()).then(|| self.region.clone())
+        self.replica_of
+            .clone()
+            .or_else(|| (!self.replicas.is_empty()).then(|| self.region.clone()))
     }
 
     /// Whether another version fits under [`VERSIONS_PER_SECRET`], given the
@@ -1984,34 +2121,60 @@ pub struct RotationConfig {
     pub role_arn: Option<String>,
 }
 
+/// Where one secret lives: the Region it is homed in and the name it carries
+/// there.
+///
+/// The secret NAMESPACE is per Region — "ReplicateSecretToRegions creates a
+/// separate secret in each Region", and a replica "is the same as the original
+/// primary secret except the Region is changed"
+/// (`StopReplicationToReplicaResponse$ARN`, this service's Smithy model) — so one
+/// name identifies at most one secret IN A REGION, and the same name in another
+/// Region is another secret.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SecretKey {
+    pub region: String,
+    pub name: String,
+}
+
+impl SecretKey {
+    /// The key of the secret named `name` in `region`.
+    pub fn new(region: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            region: region.into(),
+            name: name.into(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-secretsmanager-secretsmanager. A handler reaches it through [`service_state`].
 ///
-/// Secrets are held in ONE store rather than one per region: the region a secret
-/// is homed in is recorded on it (and reported as `PrimaryRegion` once the
-/// secret has a replica), but a `SecretId` resolves across the whole store, so a
-/// secret created under one signed region is visible to a caller signing for
-/// another. That is a simplification — the real service's namespace is
-/// per-region — and it is the same store the quota in [`SECRET_QUOTA`] bounds.
+/// Secrets are held by Region and name ([`SecretKey`]), which is the namespace
+/// the service itself has: a `SecretId` resolves only within the Region the
+/// request was signed for, so the same name in two Regions is two secrets — the
+/// primary and its replica among them. The quota in [`SECRET_QUOTA`] bounds the
+/// whole store.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSecretsmanagerSecretsmanagerState {
-    /// Secrets by name, in name order so `ListSecrets` pages deterministically.
-    pub secrets: BTreeMap<String, Secret>,
-    /// Full ARN to secret name, so a `SecretId` is accepted in either form.
-    pub arn_index: HashMap<String, String>,
+    /// Secrets by Region and name, in that order, so `ListSecrets` pages one
+    /// Region deterministically in name order.
+    pub secrets: BTreeMap<SecretKey, Secret>,
+    /// Full ARN to the secret it names, so a `SecretId` is accepted in either
+    /// form.
+    pub arn_index: HashMap<String, SecretKey>,
 }
 
 impl ComAmazonawsSecretsmanagerSecretsmanagerState {
     /// Store a secret and index its ARN.
     ///
-    /// Replacing a name drops the ARN index entry of the secret it replaces, so
-    /// no ARN that names nothing is left resolvable.
+    /// Replacing the secret at a key drops the ARN index entry of the secret it
+    /// replaces, so no ARN that names nothing is left resolvable.
     pub fn insert(&mut self, secret: Secret) {
-        self.arn_index
-            .insert(secret.arn.clone(), secret.name.clone());
-        if let Some(replaced) = self.secrets.insert(secret.name.clone(), secret) {
+        let key = SecretKey::new(secret.region.clone(), secret.name.clone());
+        self.arn_index.insert(secret.arn.clone(), key.clone());
+        if let Some(replaced) = self.secrets.insert(key.clone(), secret) {
             let still_current = self
                 .secrets
-                .get(&replaced.name)
+                .get(&key)
                 .is_some_and(|current| current.arn == replaced.arn);
             if !still_current {
                 self.arn_index.remove(&replaced.arn);
@@ -2019,41 +2182,85 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
         }
     }
 
-    /// Remove a secret by name, dropping its ARN index entry with it.
-    pub fn remove(&mut self, name: &str) -> Option<Secret> {
-        let removed = self.secrets.remove(name)?;
+    /// Remove the secret at `key`, dropping its ARN index entry with it.
+    pub fn remove(&mut self, key: &SecretKey) -> Option<Secret> {
+        let removed = self.secrets.remove(key)?;
         self.arn_index.remove(&removed.arn);
         Some(removed)
     }
 
-    /// The stored name a `SecretId` names: the bare secret name, the full ARN,
-    /// or the partial ARN (the ARN without the trailing hyphen and six random
-    /// characters, which a caller that never saw the full ARN can still build).
-    pub fn resolve(&self, secret_id: &str) -> Option<String> {
-        if self.secrets.contains_key(secret_id) {
-            return Some(secret_id.to_string());
+    /// The secret a `SecretId` names in `region`: the bare secret name, the full
+    /// ARN, or the partial ARN (the ARN without the trailing hyphen and six
+    /// random characters, which a caller that never saw the full ARN can still
+    /// build).
+    ///
+    /// Resolution never leaves `region`: a request is addressed to one Region's
+    /// endpoint, and the secret it names is the one that Region holds — an ARN
+    /// naming another Region's secret names nothing here.
+    pub fn resolve(&self, region: &str, secret_id: &str) -> Option<SecretKey> {
+        let by_name = SecretKey::new(region, secret_id);
+        if self.secrets.contains_key(&by_name) {
+            return Some(by_name);
         }
-        if let Some(name) = self.arn_index.get(secret_id) {
-            return Some(name.clone());
+        if let Some(key) = self.arn_index.get(secret_id) {
+            return (key.region == region).then(|| key.clone());
         }
         // The partial-ARN scan walks the name-ordered map, not the ARN hash
         // map, so the match it picks does not depend on hash iteration order.
         self.secrets
             .values()
-            .find(|secret| partial_arn(&secret.arn) == secret_id)
-            .map(|secret| secret.name.clone())
+            .find(|secret| secret.region == region && partial_arn(&secret.arn) == secret_id)
+            .map(|secret| SecretKey::new(secret.region.clone(), secret.name.clone()))
     }
 
-    /// The secret a `SecretId` names.
-    pub fn get(&self, secret_id: &str) -> Option<&Secret> {
-        let name = self.resolve(secret_id)?;
-        self.secrets.get(&name)
+    /// The secret a `SecretId` names in `region`.
+    pub fn get(&self, region: &str, secret_id: &str) -> Option<&Secret> {
+        let key = self.resolve(region, secret_id)?;
+        self.secrets.get(&key)
     }
 
-    /// The secret a `SecretId` names, for mutation.
-    pub fn get_mut(&mut self, secret_id: &str) -> Option<&mut Secret> {
-        let name = self.resolve(secret_id)?;
-        self.secrets.get_mut(&name)
+    /// The secret a `SecretId` names in `region`, for mutation.
+    pub fn get_mut(&mut self, region: &str, secret_id: &str) -> Option<&mut Secret> {
+        let key = self.resolve(region, secret_id)?;
+        self.secrets.get_mut(&key)
+    }
+
+    /// The secret named `name` in `region`, by name alone.
+    pub fn named(&self, region: &str, name: &str) -> Option<&Secret> {
+        self.secrets.get(&SecretKey::new(region, name))
+    }
+
+    /// Every secret `region` holds, in name order.
+    pub fn in_region<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Secret> + 'a {
+        self.secrets
+            .values()
+            .filter(move |secret| secret.region == region)
+    }
+
+    /// Record that a read in the secret's own Region retrieved the value of the
+    /// version `version_id`.
+    ///
+    /// A read of a REPLICA is a read of the secret in the replica's Region, which
+    /// is what the primary's replication view reports
+    /// (`ReplicationStatusType$LastAccessedDate`), so the stamp lands on both.
+    pub fn record_access(&mut self, key: &SecretKey, version_id: &str, at: SystemTime) {
+        let Some(secret) = self.secrets.get_mut(key) else {
+            return;
+        };
+        secret.record_access(version_id, at);
+        let Some(primary_region) = secret.replica_of.clone() else {
+            return;
+        };
+        let primary_key = SecretKey::new(primary_region, key.name.clone());
+        if let Some(primary) = self.secrets.get_mut(&primary_key) {
+            if let Some(replica) = primary
+                .replicas
+                .iter_mut()
+                .find(|replica| replica.region == key.region)
+            {
+                replica.last_accessed_date = Some(start_of_day(at));
+            }
+        }
     }
 
     /// Permanently remove every secret whose deletion the clock has already made
@@ -2064,23 +2271,26 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
     /// before it answers, and never reports a secret the service would already
     /// have deleted.
     pub fn expire_due(&mut self, now: SystemTime) {
-        let due: Vec<String> = self
+        let due: Vec<SecretKey> = self
             .secrets
-            .values()
-            .filter(|secret| secret.purge_at.is_some_and(|at| at <= now))
-            .map(|secret| secret.name.clone())
+            .iter()
+            .filter(|(_, secret)| secret.purge_at.is_some_and(|at| at <= now))
+            .map(|(key, _)| key.clone())
             .collect();
-        for name in due {
-            self.remove(&name);
+        for key in due {
+            self.remove(&key);
         }
     }
 
     /// Materialise every replica transition the clock has already made due,
-    /// across every secret the store holds. Like [`expire_due`], this is a
-    /// change that was owed at this instant whether or not anybody called, so an
+    /// across every secret the store holds. Like [`expire_due`], this is a change
+    /// that was owed at this instant whether or not anybody called, so an
     /// operation that reports a replication view performs it before it answers
     /// and never reports a replica as still being created once its span has
     /// elapsed.
+    ///
+    /// Nothing is propagated here: a replica holds no copy of its primary to
+    /// bring up to date (see [`replication`]).
     ///
     /// [`expire_due`]: ComAmazonawsSecretsmanagerSecretsmanagerState::expire_due
     pub fn settle_replicas_due(&mut self, now: SystemTime) {
@@ -2097,6 +2307,38 @@ fn partial_arn(arn: &str) -> &str {
         Some(cut) if arn.as_bytes().get(cut) == Some(&b'-') => &arn[..cut],
         _ => arn,
     }
+}
+
+/// The secret NAME a `SecretId` spells: "the ARN or name of the secret"
+/// (`DeleteSecretRequest$SecretId`, this service's Smithy model), so an id that is
+/// an ARN spells the name in its resource field — without the hyphen and six
+/// random characters a secret's ARN ends in, which belong to the secret rather
+/// than to its name.
+///
+/// This is the name of the secret the id NAMES, whether or not this store holds
+/// one: it is what an operation that answers for a secret it does not hold —
+/// `DeleteSecret` with `ForceDeleteWithoutRecovery` — reports as the `Name`.
+#[must_use]
+pub fn secret_name_in(secret_id: &str) -> &str {
+    let Some(resource) = secret_id
+        .strip_prefix("arn:")
+        .and_then(|rest| rest.split_once("secret:"))
+        .map(|(_, resource)| resource)
+    else {
+        return secret_id;
+    };
+    let stripped = partial_arn(resource);
+    // Only a suffix of the six characters the service draws from letters and
+    // digits is one of its own; a name that ends in a hyphen and six other
+    // characters keeps them.
+    if stripped.len() < resource.len()
+        && resource[stripped.len() + 1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return stripped;
+    }
+    resource
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

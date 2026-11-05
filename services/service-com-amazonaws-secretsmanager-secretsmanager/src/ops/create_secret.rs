@@ -443,7 +443,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let now = ::std::time::SystemTime::now();
             store.expire_due(now);
 
-            if let Some(existing) = store.secrets.get(&input.name) {
+            if let Some(existing) = store.named(&region, &input.name) {
                 return answer_existing(
                     existing,
                     input.client_request_token.as_deref(),
@@ -454,8 +454,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Bound the store before it grows: "The request failed because it would
             // exceed one of the Secrets Manager quotas." The bound is the
             // emulator's own (see `state::SECRET_QUOTA`) and every record it holds
-            // is released by `DeleteSecret`.
-            if store.secrets.len() >= crate::state::SECRET_QUOTA {
+            // is released by `DeleteSecret`. A create that replicates stores a
+            // secret per added Region as well as the primary (see
+            // `state::replication`), so all of them are counted against it here —
+            // before any of them is stored.
+            let replicated_to: ::std::collections::BTreeSet<&str> = input
+                .add_replica_regions
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|replica| replica.region.as_deref())
+                .collect();
+            if store.secrets.len() + 1 + replicated_to.len() > crate::state::SECRET_QUOTA {
                 return Err(CreateSecretErrorModeled::LimitExceededException(
                     LimitExceededException {
                         message: Some(format!(
@@ -517,6 +527,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // Each replica is encrypted under the KMS key its Region names, so a key
+        // that cannot be used is the reason that replica's creation fails — which
+        // KMS is asked before anything is stored, with no store guard held.
+        let mut replica_failures: Vec<Option<String>> = Vec::with_capacity(replica_regions.len());
+        for replica in replica_regions {
+            let failure = match replica.region.as_deref() {
+                Some(replica_region) => {
+                    crate::state::envelope::key_refusal(
+                        ctx,
+                        replica_region,
+                        replica.kms_key_id.as_deref(),
+                    )
+                    .await
+                    .map(|stated| crate::state::replica_key_failure_message(&stated))
+                }
+                None => None,
+            };
+            replica_failures.push(failure);
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A secret name belongs to one secret, and the guard was released while the
@@ -524,28 +554,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds NOW, so a concurrent create of the same name under the same
         // idempotency token is still the same request and is answered from what it
         // stored rather than refused.
-        if let Some(existing) = store.secrets.get(&input.name) {
+        if let Some(existing) = store.named(&region, &input.name) {
             return answer_existing(
                 existing,
                 input.client_request_token.as_deref(),
                 value.as_ref(),
             );
         }
-        let mut secret = crate::state::Secret::new(input.name.clone(), arn, region, now);
-        secret.description = input.description.clone();
+        let mut secret =
+            crate::state::Secret::new(input.name.clone(), arn, region.clone(), now);
+        // "The description of the secret." (`CreateSecretRequest$Description`,
+        // this service's Smithy model.) `DescriptionType` is modelled with a
+        // minimum length of 0, so the empty string is accepted on the wire — and
+        // it describes nothing: the secret carries no description, exactly as one
+        // created without the member does, and nothing is reported back for it.
+        secret.description = input.description.clone().filter(|text| !text.is_empty());
         secret.kms_key_id = input.kms_key_id.clone();
         secret.secret_type = input.r#type.clone();
         secret.tags = tags.iter().map(crate::state::StoredTag::from_modeled).collect();
-        // Each requested replica starts being created, exactly as
-        // `ReplicateSecretToRegions` records it; the clock moves it to `InSync`.
-        // `ForceOverwriteReplicaSecret` decides nothing here for the same reason
-        // it decides nothing there (see `state::Secret::replicate_to`).
-        let _ = input.force_overwrite_replica_secret;
-        for replica in replica_regions {
-            if let Some(replica_region) = replica.region.as_deref() {
-                secret.replicate_to(replica_region, replica.kms_key_id.as_deref(), now);
-            }
-        }
 
         if let Some(sealed) = sealed {
             secret.put_version(
@@ -563,11 +589,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         store.insert(secret);
 
+        // Each requested replica is created from the stored secret, exactly as
+        // `ReplicateSecretToRegions` creates it: a separate secret in that
+        // Region, whose creation the clock moves to `InSync` — or a `Failed`
+        // entry stating why it could not be created.
+        let key = crate::state::SecretKey::new(region.clone(), input.name.clone());
+        let force_overwrite = input.force_overwrite_replica_secret;
+        for (replica, failure) in replica_regions.iter().zip(replica_failures) {
+            if let Some(replica_region) = replica.region.as_deref() {
+                store.replicate(
+                    &key,
+                    replica_region,
+                    replica.kms_key_id.as_deref(),
+                    force_overwrite,
+                    failure,
+                    now,
+                );
+            }
+        }
+
         // Read the response back out of the store, so what the caller is told is
         // what a later GetSecretValue / DescribeSecret will find.
         let stored = store
-            .secrets
-            .get(&input.name)
+            .named(&region, &input.name)
             .ok_or_else(state_unavailable)?;
         Ok(CreateSecretOutput {
             arn: Some(stored.arn.clone()),

@@ -177,13 +177,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.secret_id.as_str()),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The only write a read performs: dropping secrets whose recovery window
-        // has already elapsed, which the clock made due whether or not anybody
-        // called.
-        store.expire_due(::std::time::SystemTime::now());
+        // The only writes a read performs, both changes the clock had already
+        // made due whether or not anybody called: dropping secrets whose recovery
+        // window has elapsed, and bringing a replica up to date with the primary
+        // it tracks.
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(secret) = store.get(&input.secret_id) else {
+        let Some(view) = store.view(&region, &input.secret_id) else {
             return Err(ListSecretVersionIdsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -191,6 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let secret = view.secret;
+        // The versions are the secret's CONTENT, which for a replica is the
+        // primary's: a replica lists the primary's versions under its own
+        // identity (see `crate::state::replication`).
+        let content = view.content;
 
         // "Specifies whether to include versions of secrets that don't have any
         // staging labels attached to them. Versions without staging labels are
@@ -198,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // aren't included." (`ListSecretVersionIdsRequest$IncludeDeprecated`,
         // this service's Smithy model.)
         let include_deprecated = input.include_deprecated.unwrap_or(false);
-        let listed: Vec<&crate::state::SecretVersion> = secret
+        let listed: Vec<&crate::state::SecretVersion> = content
             .versions
             .iter()
             .filter(|version| include_deprecated || !version.version_stages.is_empty())
@@ -254,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: Some(secret.name.clone()),
             versions: Some(
                 page.into_iter()
-                    .map(|version| entry_for(secret, version))
+                    .map(|version| entry_for(content, version))
                     .collect(),
             ),
             next_token,

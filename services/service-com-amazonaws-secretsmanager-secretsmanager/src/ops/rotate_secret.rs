@@ -224,9 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
         // "A unique identifier for the new version of the secret. ... If you use
         // the Amazon Web Services CLI or one of the Amazon Web Services SDKs to
@@ -241,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value, Secrets Manager rotates the secret immediately."
         let rotate_immediately = input.rotate_immediately.unwrap_or(true);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(RotateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -270,6 +272,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // you must use that service to update it."
         if secret.scheduled_for_deletion() {
             return Err(invalid_request(crate::state::MARKED_FOR_DELETION_MESSAGE));
+        }
+        // A replica tracks its primary, so the rotation of the secret is
+        // configured and started on the primary, and the versions it creates
+        // reach the replica from there.
+        if secret.is_replica() {
+            return Err(invalid_parameter(
+                crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string(),
+            ));
         }
         if let Some(owner) = secret.owning_service.clone() {
             return Err(invalid_request(format!(

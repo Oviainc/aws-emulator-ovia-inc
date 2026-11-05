@@ -221,7 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let now = ::std::time::SystemTime::now();
             store.expire_due(now);
 
-            let Some(secret) = store.get(secret_id) else {
+            let Some(secret) = store.get(&crate::state::request_region(ctx.parts()), secret_id)
+            else {
                 return Err(ValidateResourcePolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),

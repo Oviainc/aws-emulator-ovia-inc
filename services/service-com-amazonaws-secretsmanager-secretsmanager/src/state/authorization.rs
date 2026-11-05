@@ -350,11 +350,18 @@ fn addressed_secret<Eng: Send + Sync + 'static>(
     };
     let held = crate::state::service_state(engine).and_then(|state| {
         let store = state.lock();
-        store.get(secret_id).map(|secret| AddressedSecret {
-            arn: secret.arn.clone(),
-            tags: secret.tags.clone(),
-            policy: secret.resource_policy.clone(),
-        })
+        // A request is addressed to one Region, so the secret it names is the one
+        // THAT Region holds: the decision is made against the resource the
+        // operation will act on, which is the one the operation itself resolves.
+        // The tags and the policy a statement is decided against are the SECRET's,
+        // which for a replica are the primary's it tracks.
+        store
+            .view(&crate::state::request_region(ctx.parts()), secret_id)
+            .map(|view| AddressedSecret {
+                arn: view.secret.arn.clone(),
+                tags: view.content.tags.clone(),
+                policy: view.content.resource_policy.clone(),
+            })
     });
     held.unwrap_or_else(|| AddressedSecret {
         arn: unheld_secret_arn(ctx, secret_id),
@@ -432,7 +439,9 @@ pub fn created_secret_arn<Eng: Send + Sync + 'static>(
 ) -> String {
     let held = crate::state::service_state(engine).and_then(|state| {
         let store = state.lock();
-        store.secrets.get(name).map(|secret| secret.arn.clone())
+        store
+            .named(region, name)
+            .map(|secret| secret.arn.clone())
     });
     held.unwrap_or_else(|| {
         ::engine::emulator_arn(

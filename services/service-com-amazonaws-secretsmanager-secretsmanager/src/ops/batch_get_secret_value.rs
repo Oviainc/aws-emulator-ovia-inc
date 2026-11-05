@@ -239,16 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         // Each selection's answer, decided under the store's guard and carried out
         // of it: opening a sealed value is a call to KMS, which cannot be made
         // while the guard is held.
         let (pending, mut errors, next_token) = {
             let mut store = state.lock();
-            // The only write this read performs: dropping secrets whose deletion the
-            // clock has already made due, which was owed at this instant whether or
-            // not anybody called.
+            // The only writes this read performs, both changes the clock has
+            // already made due whether or not anybody called: dropping secrets
+            // whose deletion was owed at this instant, and bringing a replica up
+            // to date with the primary it tracks.
             let now = ::std::time::SystemTime::now();
             store.expire_due(now);
+            store.settle_replicas_due(now);
 
             // What this call selects, in the order it answers: the ids the caller
             // listed, or — for the filter form — the names of the secrets every
@@ -261,15 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (None, filters) => {
                     let filters = filters.unwrap_or_default();
                     store
-                        .secrets
-                        .values()
-                        .filter(|secret| !secret.scheduled_for_deletion())
-                        .filter(|secret| {
+                        .in_region(&region)
+                        .map(|secret| crate::state::SecretView {
+                            secret,
+                            content: store.content_of(secret),
+                        })
+                        .filter(|view| !view.secret.scheduled_for_deletion())
+                        .filter(|view| {
                             filters
                                 .iter()
-                                .all(|filter| crate::state::matches_filter(secret, filter))
+                                .all(|filter| crate::state::matches_filter(*view, filter))
                         })
-                        .map(|secret| secret.name.clone())
+                        .map(|view| view.secret.name.clone())
                         .collect()
                 }
             };
@@ -311,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut pending = Vec::new();
             let mut errors = Vec::new();
             for secret_id in selected.iter().skip(start).take(page_size) {
-                match entry_for(&store, secret_id) {
+                match entry_for(&store, &region, secret_id) {
                     Ok(entry) => pending.push(entry),
                     Err(error) => errors.push(error),
                 }
@@ -327,16 +333,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fails THAT secret alone: "If Secrets Manager encounters errors … while
         // attempting to retrieve any of the secrets, you can see the errors in
         // Errors in the response."
-        let region = crate::state::request_region(ctx.parts());
         let mut values = Vec::new();
-        let mut retrieved: Vec<(String, String)> = Vec::new();
+        let mut retrieved: Vec<(crate::state::SecretKey, String)> = Vec::new();
         for entry in pending {
             let context =
-                crate::state::envelope::ValueContext::new(&entry.arn, &entry.version_id);
-            match crate::state::envelope::open(ctx, &region, &context, &entry.value).await {
+                crate::state::envelope::ValueContext::new(&entry.context_arn, &entry.version_id);
+            match crate::state::envelope::open(ctx, &entry.sealed_region, &context, &entry.value)
+                .await
+            {
                 Ok(opened) => {
                     let (secret_string, secret_binary) = opened.into_members();
-                    retrieved.push((entry.secret_id.clone(), entry.version_id.clone()));
+                    retrieved.push((entry.key.clone(), entry.version_id.clone()));
                     values.push(SecretValueEntry {
                         arn: Some(entry.arn),
                         name: Some(entry.name),
@@ -363,10 +370,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // retrieved nothing, so it records nothing.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        for (secret_id, version_id) in retrieved {
-            if let Some(secret) = store.get_mut(&secret_id) {
-                secret.record_access(&version_id, now);
-            }
+        for (key, version_id) in retrieved {
+            store.record_access(&key, &version_id, now);
         }
 
         Ok(BatchGetSecretValueOutput {
@@ -383,7 +388,15 @@ struct Pending {
     /// The `SecretId` the selection named, which is what an entry and an error
     /// report it as.
     secret_id: String,
+    /// Where the secret this selection resolved to is held, so the access it
+    /// records lands on that secret.
+    key: crate::state::SecretKey,
     arn: String,
+    /// The ARN this version's value was sealed for, and the Region it was sealed
+    /// in: a replica's values are the primary's (see
+    /// [`crate::state::Secret::sealed_under`]).
+    context_arn: String,
+    sealed_region: String,
     name: String,
     version_id: String,
     stages: Option<Vec<String>>,
@@ -402,6 +415,7 @@ struct Pending {
 /// the whole call failing.
 fn entry_for(
     store: &crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState,
+    region: &str,
     secret_id: &str,
 ) -> Result<Pending, APIErrorType> {
     let error = |code: &str, message: String| APIErrorType {
@@ -409,12 +423,20 @@ fn entry_for(
         error_code: Some(code.to_string()),
         message: Some(message),
     };
-    let Some(secret) = store.get(secret_id) else {
+    let Some(key) = store.resolve(region, secret_id) else {
         return Err(error(
             "ResourceNotFoundException",
             crate::state::SECRET_NOT_FOUND_MESSAGE.to_string(),
         ));
     };
+    let Some(view) = store.view_of(&key) else {
+        return Err(error(
+            "ResourceNotFoundException",
+            crate::state::SECRET_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    };
+    let secret = view.secret;
+    let content = view.content;
     if secret.scheduled_for_deletion() {
         return Err(error(
             "InvalidRequestException",
@@ -423,8 +445,9 @@ fn entry_for(
     }
     // The batched read answers the current value of each secret, the version
     // `GetSecretValue` resolves when the caller names neither a version nor a
-    // stage; a secret created with no value has none.
-    let Some(version) = secret.version_with_stage(crate::state::STAGE_CURRENT) else {
+    // stage; a secret created with no value has none. The versions are the
+    // secret's CONTENT, which for a replica is the primary's.
+    let Some(version) = content.version_with_stage(crate::state::STAGE_CURRENT) else {
         return Err(error(
             "ResourceNotFoundException",
             crate::state::stage_not_found_message(crate::state::STAGE_CURRENT),
@@ -432,7 +455,12 @@ fn entry_for(
     };
     Ok(Pending {
         secret_id: secret_id.to_string(),
+        key,
         arn: secret.arn.clone(),
+        context_arn: content.value_context_arn().to_string(),
+        sealed_region: crate::state::arn_region(content.value_context_arn())
+            .unwrap_or(region)
+            .to_string(),
         name: secret.name.clone(),
         version_id: version.version_id.clone(),
         stages: version.stages_out(),

@@ -357,9 +357,12 @@ async fn update_secret_persists_every_member_one_call_names() {
             json!({"Description": "a new description"}),
         ),
         (
+            // `DescriptionType` has a minimum length of 0, so the empty string
+            // is accepted on the wire — and it describes nothing, so the secret
+            // is left carrying no description at all.
             "an emptied description",
             json!({"Description": ""}),
-            json!({"Description": ""}),
+            json!({}),
         ),
         (
             "a key and a short value",

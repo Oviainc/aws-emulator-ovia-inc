@@ -208,7 +208,7 @@ impl Emulator {
             .state::<ComAmazonawsSecretsmanagerSecretsmanagerState>();
         let store = state.lock();
         let secret = store
-            .get(name)
+            .get(REGION, name)
             .unwrap_or_else(|| panic!("case {case:?}: the store holds no secret {name:?}"));
         secret
             .version_with_stage("AWSCURRENT")

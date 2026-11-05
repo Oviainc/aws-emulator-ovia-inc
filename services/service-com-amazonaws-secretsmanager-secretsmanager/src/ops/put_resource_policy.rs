@@ -215,11 +215,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -234,6 +236,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutResourcePolicyErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // A replica tracks its primary, so the policy that governs the secret is
+        // attached to the primary and reaches the replica from there.
+        if secret.is_replica() {
+            return Err(PutResourcePolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -7,12 +7,10 @@
 //! primary secret", so what a request may do depends on whether the signed
 //! Region holds the secret's primary or one of its replicas.
 //!
-//! The promotion ITSELF is answered with the scaffold's 501: it would leave the
-//! primary and the promoted replica as two independent secrets of the same name
-//! in two Regions, and this emulator's store holds one secret per name (see
-//! `crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState`), so there is
-//! no faithful way to store the result. Every Region-scoped refusal around it is
-//! real.
+//! The promotion "[r]emoves the link between the replica secret and the primary
+//! secret": the secret the replica had become in its Region stays exactly as it
+//! is — its ARN, its versions and their staging labels, its tags — and simply
+//! stops tracking the primary, which stops replicating to it.
 //!
 //! ## Shape of an operation
 //!
@@ -180,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_due(now);
         store.settle_replicas_due(now);
 
-        let Some(secret) = store.get(&input.secret_id) else {
+        let Some(key) = store.resolve(&region, &input.secret_id) else {
             return Err(
                 StopReplicationToReplicaErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -191,6 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+        let Some(secret) = store.secrets.get(&key) else {
+            return Err(state_unavailable());
         };
 
         // "A parameter value is not valid for the current state of the resource.
@@ -206,21 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        if secret.replica(&region).is_some() {
-            // The one path this store cannot represent: promoting the replica
-            // would leave the primary and the promoted secret as two
-            // independent secrets of the same name, in two Regions. Answering
-            // 501 is honest; reporting the primary's ARN back and storing
-            // nothing would not be.
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "StopReplicationToReplica promoting a replica to a secret of its own",
-            ));
-        }
-
-        if secret.region == region {
-            // The secret in this Region is the PRIMARY (or a standalone secret,
-            // which is a primary with no replicas), not a replica, so there is
-            // no link to a primary to remove here.
+        // The secret this Region holds under that id is the PRIMARY (or a
+        // standalone secret, which is a primary with no replicas), not a
+        // replica, so there is no link to a primary to remove here.
+        if !secret.is_replica() {
             return Err(
                 StopReplicationToReplicaErrorModeled::InvalidParameterException(
                     InvalidParameterException {
@@ -231,16 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The Region this request is signed for holds neither the secret nor a
-        // replica of it, so there is nothing of this secret in it to promote.
-        Err(
-            StopReplicationToReplicaErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into(),
-        )
+        // "The ARN of the promoted secret. The ARN is the same as the original
+        // primary secret except the Region is changed."
+        let arn = store
+            .promote_replica(&key, now)
+            .ok_or_else(state_unavailable)?;
+        Ok(StopReplicationToReplicaOutput { arn: Some(arn) })
     }
 }
 

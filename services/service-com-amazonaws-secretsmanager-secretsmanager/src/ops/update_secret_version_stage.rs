@@ -208,14 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         // The permanent removal the clock has already made due, materialised
         // before this call resolves anything: it was owed at this instant
         // whether or not anybody called.
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(UpdateSecretVersionStageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -228,6 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deletion." (`InvalidRequestException`, this service's Smithy model.)
         if secret.scheduled_for_deletion() {
             return Err(marked_for_deletion());
+        }
+        // A replica tracks its primary: the staging labels of its versions are
+        // the primary's, so they are moved there and reach the replica from
+        // there.
+        if secret.is_replica() {
+            return Err(UpdateSecretVersionStageErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string()),
+                },
+            )
+            .into());
         }
 
         // The version the label names right now. For `AWSPENDING` that is the id

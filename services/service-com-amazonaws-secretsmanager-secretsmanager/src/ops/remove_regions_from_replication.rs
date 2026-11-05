@@ -180,6 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
@@ -187,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // view left after the removals is current.
         store.settle_replicas_due(now);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(key) = store.resolve(&region, &input.secret_id) else {
             return Err(
                 RemoveRegionsFromReplicationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -198,6 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+        let Some(secret) = store.secrets.get(&key) else {
+            return Err(state_unavailable());
         };
 
         // "A parameter value is not valid for the current state of the resource.
@@ -212,15 +216,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // The replication of a secret is governed by its primary: a replica holds
+        // no replicas of its own to remove.
+        if secret.is_replica() {
+            return Err(
+                RemoveRegionsFromReplicationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // "The Regions of the replicas to remove": a Region that holds no
         // replica of this secret has nothing to delete, which is not an error,
         // and once the last replica goes the secret stops participating in
         // replication — so `ReplicationStatus` and `PrimaryRegion` both go away.
-        for region in &input.remove_replica_regions {
-            secret.remove_replica(region);
+        // "When you delete a replica, it is deleted immediately" (`DeleteSecret`,
+        // this service's Smithy model), so the secret that Region held is gone
+        // with the entry for it.
+        for replica_region in &input.remove_replica_regions {
+            store.remove_replica_region(&key, replica_region);
         }
 
+        let secret = store.secrets.get(&key).ok_or_else(state_unavailable)?;
         Ok(RemoveRegionsFromReplicationOutput {
             arn: Some(secret.arn.clone()),
             // "The status of replicas for this secret after you remove

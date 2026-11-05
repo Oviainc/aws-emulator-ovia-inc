@@ -310,6 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this update is refused for, and the key the new value is to be
         // stored under, decided under the store's guard; sealing that value is a
         // call to KMS, which cannot be made while the guard is held.
+        let region = crate::state::request_region(ctx.parts());
         let (target, staged) = {
             let mut store = state.lock();
             let now = ::std::time::SystemTime::now();
@@ -320,9 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deletion that skipped the recovery window report the secret missing
             // rather than succeed.
             store.expire_due(now);
+            store.settle_replicas_due(now);
 
             let target = admit(
-                store.get(&input.secret_id),
+                store.get(&region, &input.secret_id),
                 &version_id,
                 value.as_ref(),
                 input.kms_key_id.as_deref(),
@@ -331,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // guard with the values they are held as: re-encrypting one is a pair
             // of KMS calls, which cannot be made while the guard is held.
             let staged = store
-                .get(&input.secret_id)
+                .get(&region, &input.secret_id)
                 .filter(|secret| {
                     moves_to_another_key(
                         secret.kms_key_id.as_deref(),
@@ -347,7 +349,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under that key: a key KMS will not encrypt with is the
         // `EncryptionFailure` this update answers, and nothing about the secret
         // changes.
-        let region = crate::state::request_region(ctx.parts());
         let sealed = match value.as_ref().filter(|_| !target.replay) {
             Some(value) => Some(
                 crate::state::envelope::seal(
@@ -380,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // concurrent write of this same token, or one that has since taken the last
         // version slot refuses this update rather than being overwritten by it.
         let target = admit(
-            store.get(&input.secret_id),
+            store.get(&region, &input.secret_id),
             &version_id,
             value.as_ref(),
             input.kms_key_id.as_deref(),
@@ -389,7 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same request again: the version it stored stands, and this call only
         // applies the metadata it names.
         let sealed = sealed.filter(|_| !target.replay);
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -400,9 +401,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The metadata this call names is applied; a member it does not name
         // keeps the value already stored, since this operation "modifies the
-        // details of a secret" rather than replacing them.
+        // details of a secret" rather than replacing them. An empty description
+        // describes nothing, so it is stored as no description at all — the same
+        // state a secret created without one is in (see
+        // [`crate::ops::create_secret`]).
         if input.description.is_some() {
-            secret.description = input.description.clone();
+            secret.description = input.description.clone().filter(|text| !text.is_empty());
         }
         if input.kms_key_id.is_some() {
             secret.kms_key_id = target.kms_key_id.clone();
@@ -486,6 +490,17 @@ fn admit(
         return Err(UpdateSecretErrorModeled::InvalidRequestException(
             InvalidRequestException {
                 message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    // A replica tracks its primary, so it is not written in its own Region: the
+    // primary is where a value or a detail of the secret is changed, and the
+    // change reaches the replica from there.
+    if secret.is_replica() {
+        return Err(UpdateSecretErrorModeled::InvalidParameterException(
+            InvalidParameterException {
+                message: Some(crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string()),
             },
         )
         .into());

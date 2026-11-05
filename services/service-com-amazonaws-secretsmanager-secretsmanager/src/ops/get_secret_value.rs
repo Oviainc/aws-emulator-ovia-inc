@@ -222,19 +222,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         // What the answer is built from, read under the store's guard and carried
         // out of it: unwrapping the data key this version was sealed under is a
         // call to KMS, which cannot be made while the guard is held.
         let resolved = {
             let mut store = state.lock();
             let now = ::std::time::SystemTime::now();
-            // Dropping secrets whose recovery window has already elapsed, which the
-            // clock made due whether or not anybody called.
+            // Dropping secrets whose recovery window has already elapsed, and
+            // bringing a replica up to date with the primary it tracks: both
+            // changes the clock made due whether or not anybody called.
             store.expire_due(now);
+            store.settle_replicas_due(now);
 
-            let Some(secret) = store.get(&input.secret_id) else {
+            let Some(key) = store.resolve(&region, &input.secret_id) else {
                 return Err(no_such_secret());
             };
+            let Some(view) = store.view_of(&key) else {
+                return Err(no_such_secret());
+            };
+            let secret = view.secret;
+            let content = view.content;
             // "If a secret is scheduled for deletion, then its details, including the
             // encrypted secret value, is not accessible."
             if secret.scheduled_for_deletion() {
@@ -247,15 +255,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let stage = input.version_stage.as_deref();
+            // The versions are the CONTENT of the secret, which for a replica is
+            // the primary's: a replica serves the primary's values under its own
+            // identity (see `crate::state::replication`).
             let version = match input.version_id.as_deref() {
                 // A `VersionId` names the version outright; a `VersionStage` given
                 // alongside it has to agree with the labels that version carries.
-                Some(version_id) => secret
+                Some(version_id) => content
                     .version(version_id)
                     .filter(|version| stage.is_none_or(|stage| version.has_stage(stage))),
                 // "If you don't specify either a VersionStage or VersionId, Secrets
                 // Manager returns the AWSCURRENT version."
-                None => secret.version_with_stage(stage.unwrap_or(crate::state::STAGE_CURRENT)),
+                None => content.version_with_stage(stage.unwrap_or(crate::state::STAGE_CURRENT)),
             };
             let Some(version) = version else {
                 return Err(GetSecretValueErrorModeled::ResourceNotFoundException(
@@ -273,7 +284,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             Resolved {
+                key,
                 arn: secret.arn.clone(),
+                // A value is opened under the ARN it was sealed for, and in the
+                // Region it was sealed in: the values of a replica are the
+                // primary's, so they open under the primary's ARN and against
+                // the key in the primary's Region.
+                context_arn: content.value_context_arn().to_string(),
+                sealed_region: crate::state::arn_region(content.value_context_arn())
+                    .unwrap_or(&region)
+                    .to_string(),
                 name: secret.name.clone(),
                 version_id: version.version_id.clone(),
                 stages: version.stages_out(),
@@ -285,12 +305,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The value is held under the secret's own key, so answering with it means
         // decrypting it under that key: a key KMS will not decrypt with is the
         // `DecryptionFailure` this read answers, relaying the refusal KMS stated.
-        let context = crate::state::envelope::ValueContext::new(&resolved.arn, &resolved.version_id);
-        let region = crate::state::request_region(ctx.parts());
-        let opened =
-            crate::state::envelope::open(ctx, &region, &context, &resolved.value)
-                .await
-                .map_err(decryption_failure)?;
+        let context =
+            crate::state::envelope::ValueContext::new(&resolved.context_arn, &resolved.version_id);
+        let opened = crate::state::envelope::open(
+            ctx,
+            &resolved.sealed_region,
+            &context,
+            &resolved.value,
+        )
+        .await
+        .map_err(decryption_failure)?;
         let (secret_string, secret_binary) = opened.into_members();
 
         let answer = GetSecretValueOutput {
@@ -312,9 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never reaches here.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        if let Some(secret) = store.get_mut(&input.secret_id) {
-            secret.record_access(&resolved.version_id, now);
-        }
+        store.record_access(&resolved.key, &resolved.version_id, now);
         Ok(answer)
     }
 }
@@ -322,7 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The version this read resolved, carried out of the store's guard so the KMS call
 /// that opens its value is made with no lock held.
 struct Resolved {
+    key: crate::state::SecretKey,
     arn: String,
+    context_arn: String,
+    sealed_region: String,
     name: String,
     version_id: String,
     stages: Option<Vec<String>>,

@@ -167,14 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.secret_id.as_str()),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The only write this read performs is one the clock has already made
+        // The only writes this read performs are ones the clock has already made
         // due whether or not anybody called: dropping secrets whose recovery
-        // window has elapsed.
+        // window has elapsed, and bringing a replica up to date with its primary.
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(secret) = store.get(&input.secret_id) else {
+        let Some(view) = store.view(&region, &input.secret_id) else {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -182,6 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let secret = view.secret;
 
         // "A parameter value is not valid for the current state of the
         // resource. Possible causes: The secret is scheduled for deletion."
@@ -198,10 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(secret.arn.clone()),
             name: Some(secret.name.clone()),
             // The document the secret carries, byte for byte as it was
-            // attached. A secret no policy is attached to is not an error: the
-            // member is simply absent, `NonEmptyResourcePolicyType` being
+            // attached — the policy of the secret this Region answers for, which
+            // for a replica is the primary's, since that is the secret the policy
+            // is attached to. A secret no policy is attached to is not an error:
+            // the member is simply absent, `NonEmptyResourcePolicyType` being
             // modelled with a minimum length of 1 and there being no document.
-            resource_policy: secret.resource_policy.clone(),
+            resource_policy: view.content.resource_policy.clone(),
         })
     }
 }

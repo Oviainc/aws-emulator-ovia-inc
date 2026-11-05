@@ -1062,7 +1062,10 @@ async fn a_forced_delete_marks_the_secret_and_the_clock_then_removes_it() {
     );
 
     // "If you forcibly delete an already deleted or nonexistent secret, the
-    // operation does not return ResourceNotFoundException."
+    // operation does not return ResourceNotFoundException." The delete succeeds
+    // having deleted nothing, and answers for the secret the request NAMED:
+    // `DeleteSecretResponse` carries ARN, Name and DeletionDate, so a teardown
+    // path reading them back works whether or not the secret was ever created.
     let repeated = ok(
         &router,
         "DeleteSecret",
@@ -1070,9 +1073,37 @@ async fn a_forced_delete_marks_the_secret_and_the_clock_then_removes_it() {
         "force delete a secret that is gone",
     )
     .await;
+    assert_eq!(
+        repeated.get("Name").and_then(Value::as_str),
+        Some("forced"),
+        "expected the forced delete of a secret that is gone to answer its Name, got {repeated}"
+    );
+    let repeated_arn = repeated
+        .get("ARN")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected an ARN in the forced delete answer, got {repeated}"));
     assert!(
-        repeated.get("ARN").is_none(),
-        "expected no ARN for a secret that no longer exists, got {repeated}"
+        repeated_arn.starts_with(&format!(
+            "arn:aws:secretsmanager:{REGION}:{}:secret:forced-",
+            engine::EMULATOR_ACCOUNT_ID
+        )),
+        "expected an ARN for the named secret in the signed Region, got {repeated_arn:?}"
+    );
+    assert!(
+        repeated.get("DeletionDate").is_some(),
+        "expected a DeletionDate in the forced delete answer, got {repeated}"
+    );
+    // And it created nothing: the name is still free.
+    let after = ok(
+        &router,
+        "ListSecrets",
+        json!({"IncludePlannedDeletion": true}),
+        "list after forcing the delete of a secret that is gone",
+    )
+    .await;
+    assert!(
+        listed_names(&after).is_empty(),
+        "expected the forced delete of an absent secret to create nothing, got {after}"
     );
 
     // The name is free again, and the new secret gets a different ARN.
@@ -1262,7 +1293,9 @@ async fn list_secrets_filters_by_every_documented_filter_key() {
     // tag-key, tag-value, primary-region and owning-service are case-sensitive
     // prefix matches, description is a prefix match that is not case-sensitive,
     // and `all` breaks the value into words and searches every attribute, not
-    // case-sensitive. A value prefixed `!` negates the match.
+    // case-sensitive. The two keys that search text — description and `all` —
+    // match a prefix of any WORD of what they search, which is the unit a search
+    // of a sentence selects by. A value prefixed `!` negates the match.
     for (case, key, value, expected) in [
         ("name, prefix", "name", "alpha", vec!["alpha/one"]),
         ("name, case-sensitive", "name", "ALPHA", vec![]),
@@ -1273,9 +1306,15 @@ async fn list_secrets_filters_by_every_documented_filter_key() {
             vec!["alpha/one"],
         ),
         (
-            "description, prefix only",
+            "description, a prefix of a later word",
             "description",
-            "database",
+            "databa",
+            vec!["alpha/one"],
+        ),
+        (
+            "description, a word it does not carry",
+            "description",
+            "atabase",
             vec![],
         ),
         ("tag-key", "tag-key", "env", vec!["alpha/one"]),

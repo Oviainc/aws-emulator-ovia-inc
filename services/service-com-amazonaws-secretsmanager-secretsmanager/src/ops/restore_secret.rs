@@ -166,8 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this instant is gone whether or not anybody called, so no call here
         // restores it back into existence.
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(secret) = store.get_mut(&crate::state::request_region(ctx.parts()), &input.secret_id)
+        else {
             return Err(not_found());
         };
 

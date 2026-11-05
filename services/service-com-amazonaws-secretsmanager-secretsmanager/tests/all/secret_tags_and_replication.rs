@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager::state::{
-    DEFAULT_KMS_KEY_ALIAS, REPLICAS_PER_SECRET, REPLICA_STATUS_IN_PROGRESS,
-    REPLICA_STATUS_IN_SYNC, REPLICA_SYNC_DELAY, TAGS_PER_SECRET,
+    DEFAULT_KMS_KEY_ALIAS, REPLICAS_PER_SECRET, REPLICATION_SUCCEEDED_MESSAGE,
+    REPLICA_STATUS_IN_PROGRESS, REPLICA_STATUS_IN_SYNC, REPLICA_SYNC_DELAY, TAGS_PER_SECRET,
 };
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -624,9 +624,9 @@ async fn a_replica_reaches_in_sync_once_its_creation_span_has_elapsed() {
                 "case {case:?}: expected {region} to have reached InSync, got {settled}"
             );
             assert_eq!(
-                entry.get("StatusMessage"),
-                None,
-                "case {case:?}: a created replica carries no StatusMessage, got {entry}"
+                member(&entry, "StatusMessage"),
+                Some(REPLICATION_SUCCEEDED_MESSAGE.to_string()),
+                "case {case:?}: a created replica reports that replication succeeded, got {entry}"
             );
         }
     }
@@ -789,10 +789,16 @@ async fn replicating_again_into_a_region_restarts_that_one_replica() {
             "case {case:?}: wrong Status after re-replicating: expected one of {:?}, got {entry}",
             expected_statuses(started)
         );
+        // The `StatusMessage` is the one the status it accompanies carries: a
+        // replica that has reached `InSync` reports that replication succeeded,
+        // and one still being created has nothing to report yet.
+        let expected_message = (member(&entry, "Status").as_deref()
+            == Some(REPLICA_STATUS_IN_SYNC))
+        .then(|| REPLICATION_SUCCEEDED_MESSAGE.to_string());
         assert_eq!(
-            entry.get("StatusMessage"),
-            None,
-            "case {case:?}: a replica nothing failed on carries no StatusMessage, got {entry}"
+            member(&entry, "StatusMessage"),
+            expected_message,
+            "case {case:?}: wrong StatusMessage for the status reported, got {entry}"
         );
     }
 }
@@ -1097,7 +1103,8 @@ async fn stop_replication_to_replica_answers_for_the_region_it_is_called_in() {
 
     // The table is over the Region the call is made in, which is what this
     // operation is scoped by: "You must call this operation from the Region in
-    // which you want to promote the replica to a primary secret."
+    // which you want to promote the replica to a primary secret." Every Region
+    // but the replica's own refuses it.
     let rows: &[(&str, &str, u16, &str)] = &[
         (
             "called in the primary's own Region",
@@ -1116,15 +1123,6 @@ async fn stop_replication_to_replica_answers_for_the_region_it_is_called_in() {
             "ap-northeast-1",
             400,
             "ResourceNotFoundException",
-        ),
-        (
-            // The promotion itself leaves two independent secrets of one name in
-            // two Regions, which this emulator's single store cannot hold, so it
-            // answers 501 rather than pretending.
-            "called in the replica's Region",
-            replica_region,
-            501,
-            "NotImplemented",
         ),
     ];
     for (case, region, status, code) in rows {
@@ -1160,5 +1158,27 @@ async fn stop_replication_to_replica_answers_for_the_region_it_is_called_in() {
             .collect::<Vec<String>>(),
         vec![replica_region.to_string()],
         "case \"after the refused promotions\": the replica must still be there, got {described}"
+    );
+
+    // Called in the replica's own Region it promotes: the replica answers with
+    // its own ARN and the primary stops replicating to it.
+    let case = "called in the replica's Region";
+    let (status, promoted) =
+        call_in(&router, replica_region, "StopReplicationToReplica", &json!({"SecretId": name}))
+            .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the promotion to succeed, got {status} with body {promoted}"
+    );
+    let promoted_arn = member(&promoted, "ARN")
+        .unwrap_or_else(|| panic!("case {case:?}: no ARN in {promoted}"));
+    assert!(
+        promoted_arn.contains(&format!(":{replica_region}:")),
+        "case {case:?}: expected the promoted secret's own ARN, got {promoted_arn:?}"
+    );
+    let after = ok(&router, "DescribeSecret", json!({"SecretId": name}), case).await;
+    assert!(
+        after.get("ReplicationStatus").is_none() && after.get("PrimaryRegion").is_none(),
+        "case {case:?}: the primary no longer replicates to the promoted Region, got {after}"
     );
 }

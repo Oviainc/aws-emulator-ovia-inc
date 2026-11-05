@@ -223,16 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.secret_id.as_str()),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The only writes a read performs, both of them changes the clock has
-        // already made due whether or not anybody called: dropping secrets whose
-        // recovery window has elapsed, and moving a replica whose creation span
-        // has elapsed from `InProgress` to `InSync`.
+        // The only writes a read performs, every one of them a change the clock
+        // has already made due whether or not anybody called: dropping secrets
+        // whose recovery window has elapsed, moving a replica whose creation span
+        // has elapsed from `InProgress` to `InSync`, and bringing a replica up to
+        // date with the primary it tracks.
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
         store.settle_replicas_due(now);
 
-        let Some(secret) = store.get(&input.secret_id) else {
+        let Some(view) = store.view(&region, &input.secret_id) else {
             return Err(DescribeSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -240,32 +242,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The secret's identity and its per-Region state come from the record
+        // this Region holds; everything the secret CONTAINS comes from the record
+        // that holds it, which for a replica is the primary it tracks.
+        let secret = view.secret;
+        let content = view.content;
 
         Ok(DescribeSecretOutput {
             arn: Some(secret.arn.clone()),
             name: Some(secret.name.clone()),
-            r#type: secret.secret_type.clone(),
-            description: secret.description.clone(),
+            r#type: content.secret_type.clone(),
+            description: content.description.clone(),
             kms_key_id: secret.kms_key_id.clone(),
-            rotation_enabled: Some(secret.rotation_enabled),
+            rotation_enabled: Some(content.rotation_enabled),
             // The rotation configuration `RotateSecret` persisted, and the
             // schedule's next due instant computed from it. `LastRotatedDate` is
             // "the last date and time that this secret was modified in any way"
             // by a COMPLETED rotation, so it stays absent until one completes.
-            rotation_lambda_arn: secret.rotation_lambda_arn.clone(),
-            rotation_rules: secret.rotation_rules_out(),
-            external_secret_rotation_metadata: secret.external_rotation_metadata_out(),
-            external_secret_rotation_role_arn: secret.external_rotation_role_arn.clone(),
-            last_rotated_date: secret.last_rotated_date.map(crate::state::timestamp),
-            next_rotation_date: secret.next_rotation_date.map(crate::state::timestamp),
-            last_changed_date: Some(crate::state::timestamp(secret.last_changed_date)),
+            rotation_lambda_arn: content.rotation_lambda_arn.clone(),
+            rotation_rules: content.rotation_rules_out(),
+            external_secret_rotation_metadata: content.external_rotation_metadata_out(),
+            external_secret_rotation_role_arn: content.external_rotation_role_arn.clone(),
+            last_rotated_date: content.last_rotated_date.map(crate::state::timestamp),
+            next_rotation_date: content.next_rotation_date.map(crate::state::timestamp),
+            last_changed_date: Some(crate::state::timestamp(content.last_changed_date)),
+            // "The date that the secret was last accessed in the Region": the
+            // Region this request is addressed to, so a replica reports its own.
             last_accessed_date: secret.last_accessed_date.map(crate::state::timestamp),
             // "The date the secret is scheduled for deletion. If it is not
             // scheduled for deletion, this field is omitted."
             deleted_date: secret.deleted_date.map(crate::state::timestamp),
-            tags: secret.tags_out(),
-            version_ids_to_stages: secret.versions_to_stages(),
-            owning_service: secret.owning_service.clone(),
+            tags: content.tags_out(),
+            version_ids_to_stages: content.versions_to_stages(),
+            owning_service: content.owning_service.clone(),
             created_date: Some(crate::state::timestamp(secret.created_date)),
             // Both members of the replication view: reported from the secret's
             // own replica state, and omitted together while it has none.

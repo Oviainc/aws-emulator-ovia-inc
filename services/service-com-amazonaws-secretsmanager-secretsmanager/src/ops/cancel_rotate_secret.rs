@@ -179,11 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.secret_id.as_str()),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
+        let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(CancelRotateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
@@ -205,6 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You can't perform this operation on the secret because it is managed by \
                  {owner}, and you must use that service to update it."
             )));
+        }
+        // A replica tracks its primary, so the rotation of the secret is
+        // configured — and cancelled — on the primary.
+        if secret.is_replica() {
+            return Err(invalid_parameter(
+                crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE,
+            ));
         }
 
         // "Turns off automatic rotation, and if a rotation is currently in
@@ -231,6 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// resource."
 fn invalid_request(message: impl Into<String>) -> CancelRotateSecretError {
     CancelRotateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `InvalidParameterException` — "the parameter name or value is invalid" — for a
+/// `SecretId` that names a secret this call is not permitted on.
+fn invalid_parameter(message: impl Into<String>) -> CancelRotateSecretError {
+    CancelRotateSecretErrorModeled::InvalidParameterException(InvalidParameterException {
         message: Some(message.into()),
     })
     .into()

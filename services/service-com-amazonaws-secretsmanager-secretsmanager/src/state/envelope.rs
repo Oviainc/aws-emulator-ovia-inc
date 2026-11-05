@@ -428,6 +428,47 @@ pub async fn open(
     })
 }
 
+/// What KMS says about the key `kms_key_id` that stops it being used at all, as the
+/// `EncryptionFailure` message a write under that key would be refused with;
+/// `None` when the key can be used.
+///
+/// A secret is encrypted under the key it names, so a key KMS will not even describe
+/// cannot hold one — which is what a replica whose Region names such a key reports
+/// as the reason its creation failed, and it reports it as what the service could
+/// not do with that key: the same message, relayed KMS answer and all, that a
+/// write refused under it carries. The judgement is KMS's, as everywhere else in
+/// this module: the key's own state and the permissions on it are KMS's to state,
+/// and this asks it (`kms:DescribeKey`).
+///
+/// `None`, for the same two cases the sealing path treats as nothing said about the
+/// key: the Amazon Web Services managed key, which names no key a caller can act on,
+/// and an emulator assembled without KMS, where the request reached no KMS at all.
+pub async fn key_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key_id: Option<&str>,
+) -> Option<String> {
+    let key_id = customer_managed_key(kms_key_id)?;
+    match kms_client(ctx, region)
+        .describe_key()
+        .key_id(key_id)
+        .send()
+        .await
+    {
+        Ok(_) => None,
+        Err(error) => match call_failure(&error) {
+            CallFailure::NoKms => None,
+            // A fault KMS stated nothing about says nothing about the key, so
+            // there is nothing to report: the modelled sentence for the failure
+            // class stands for a refused write, not for a judgement of the key.
+            CallFailure::Failed(refusal) => refusal
+                .relayed
+                .is_some()
+                .then(|| refusal.encryption_failure_message()),
+        },
+    }
+}
+
 /// The customer managed key a secret's `KmsKeyId` names, or `None` for a secret left
 /// on the Amazon Web Services managed key: "If you don't specify this value, then
 /// Secrets Manager uses the Amazon Web Services managed key `aws/secretsmanager`"

@@ -230,17 +230,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .recovery_window_in_days
             .unwrap_or(crate::state::DEFAULT_RECOVERY_WINDOW_DAYS);
 
+        // The Region the caller signed for, which is the Region the secret this
+        // request names is looked for in — the namespace of a secret name is one
+        // Region's.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
+        store.settle_replicas_due(now);
 
-        let Some(name) = store.resolve(&input.secret_id) else {
+        let Some(key) = store.resolve(&region, &input.secret_id) else {
             // "If you forcibly delete an already deleted or nonexistent secret,
-            // the operation does not return ResourceNotFoundException." There is
-            // no secret to report, so the response carries no ARN, name or date.
+            // the operation does not return ResourceNotFoundException." The
+            // delete succeeds having deleted nothing, and answers for the secret
+            // the request NAMED: the name that `SecretId` spells, the ARN a
+            // secret of that name carries in this Region, and this instant as
+            // the date the deletion is due — there is no recovery window to
+            // wait out. Nothing is stored: a secret the account never held is
+            // not created by deleting it.
             if force {
-                return Ok(DeleteSecretOutput::default());
+                let name = crate::state::secret_name_in(&input.secret_id).to_string();
+                return Ok(DeleteSecretOutput {
+                    arn: Some(crate::state::authorization::secret_arn(
+                        &region,
+                        &format!("{name}-{}", crate::state::new_arn_suffix()),
+                    )),
+                    name: Some(name),
+                    deletion_date: Some(crate::state::timestamp(now)),
+                });
             }
             return Err(DeleteSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -249,6 +267,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "You can't delete a primary secret that is replicated to other
+        // Regions", and a REPLICA is not deleted here either: the deletion of a
+        // replica is `RemoveRegionsFromReplication`, which "deletes the replica"
+        // in its own Region.
+        let Some(secret) = store.secrets.get(&key) else {
+            return Err(state_unavailable());
+        };
+        if secret.is_replica() {
+            return Err(invalid_parameter(
+                crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE,
+            ));
+        }
+        if !secret.replicas.is_empty() {
+            return Err(invalid_parameter(
+                crate::state::primary_is_replicated_message(
+                    &secret.arn,
+                    &secret.replica_regions(),
+                ),
+            ));
+        }
 
         if force {
             // A forced deletion skips the recovery window, but it is not
@@ -262,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already deleted or nonexistent secret, the operation does not
             // return ResourceNotFoundException." So a secret a window is already
             // pending on is forced too, and this call's schedule replaces it.
-            let secret = store.secrets.get_mut(&name).ok_or_else(state_unavailable)?;
+            let secret = store.secrets.get_mut(&key).ok_or_else(state_unavailable)?;
             let purge_at = now
                 .checked_add(crate::state::FORCE_DELETE_PURGE_DELAY)
                 .unwrap_or(now);
@@ -277,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        let Some(secret) = store.secrets.get_mut(&name) else {
+        let Some(secret) = store.secrets.get_mut(&key) else {
             return Err(state_unavailable());
         };
         // "This value is the date and time of the delete request plus the number

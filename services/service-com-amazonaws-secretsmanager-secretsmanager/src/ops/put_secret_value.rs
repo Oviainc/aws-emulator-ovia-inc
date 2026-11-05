@@ -284,6 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
 
         // "If you don't include VersionStages, then Secrets Manager automatically
         // moves the staging label AWSCURRENT to this version."
@@ -300,8 +301,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             let now = ::std::time::SystemTime::now();
             store.expire_due(now);
+            store.settle_replicas_due(now);
 
-            match admit(store.get(&input.secret_id), &version_id, &stages, &value)? {
+            match admit(
+                store.get(&region, &input.secret_id),
+                &version_id,
+                &stages,
+                &value,
+            )? {
                 Admission::Replay(answer) => return Ok(answer),
                 Admission::Store { arn, kms_key_id } => (arn, kms_key_id),
             }
@@ -311,7 +318,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // encrypting it under that key: a key KMS will not encrypt with is the
         // `EncryptionFailure` this write answers, and no version is stored.
         let context = crate::state::envelope::ValueContext::new(&arn, &version_id);
-        let region = crate::state::request_region(ctx.parts());
         let sealed = crate::state::envelope::seal(
             ctx,
             &region,
@@ -328,12 +334,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decided again against what the store holds NOW: a concurrent delete, a
         // concurrent write of this same token, or one that has since taken the last
         // version slot refuses this write rather than being overwritten by it.
-        match admit(store.get(&input.secret_id), &version_id, &stages, &value)? {
+        match admit(
+            store.get(&region, &input.secret_id),
+            &version_id,
+            &stages,
+            &value,
+        )? {
             Admission::Replay(answer) => return Ok(answer),
             Admission::Store { .. } => {}
         }
         let secret = store
-            .get_mut(&input.secret_id)
+            .get_mut(&region, &input.secret_id)
             .ok_or_else(no_such_secret)?;
         secret.put_version(
             crate::state::SecretVersion {
@@ -390,6 +401,17 @@ fn admit(
         return Err(PutSecretValueErrorModeled::InvalidRequestException(
             InvalidRequestException {
                 message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    // A replica is not written in its own Region: "every write goes to the
+    // primary" is what makes the replica a copy of it, so a value is stored on
+    // the primary and propagates from there.
+    if secret.is_replica() {
+        return Err(PutSecretValueErrorModeled::InvalidParameterException(
+            InvalidParameterException {
+                message: Some(crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string()),
             },
         )
         .into());
