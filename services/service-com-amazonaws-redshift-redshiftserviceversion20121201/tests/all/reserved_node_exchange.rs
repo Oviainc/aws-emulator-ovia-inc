@@ -24,7 +24,8 @@
 //!
 //! Each table row differs along what the rule generalises over: which part of
 //! the identifier form is broken, which operation and member carries it, which
-//! offering the reservation was bought from (node type, term, utilization), and
+//! offering the reservation was bought from (node type, term, payment option),
+//! and
 //! which kind of resource an options read is asked about.
 
 use std::time::Duration;
@@ -88,7 +89,7 @@ const SEEDED_DS2_NODE_COUNT: i32 = 2;
 /// resource whose node type the operation does not cover.
 const ONLY_DS2: &str = "You can only exchange DS2 reserved nodes.";
 
-/// Buy the offering of this node type, term and utilization and wait for the
+/// Buy the offering of this node type, term and payment option and wait for the
 /// clock-owed payment confirmation, answering the reservation's id.
 async fn active_reservation(
     emulator: &Emulator,
@@ -120,24 +121,28 @@ async fn active_reservation(
     reserved_node_id
 }
 
-/// The offering identifiers the catalog publishes that the reservation in
-/// `reservation_block` may be exchanged onto, computed from the catalog AS
-/// SERVED: the exchange-target offerings whose payment type, term and usage
-/// price are the reservation's own.
-fn expected_targets(case: &str, offerings: &[String], reservation_block: &str) -> Vec<String> {
+/// The offering identifiers the EXCHANGE-TARGET catalog publishes that the
+/// reservation in `reservation_block` may be exchanged onto: the upgradable
+/// offerings whose payment type, term and usage price are the reservation's own.
+fn expected_targets(case: &str, reservation_block: &str) -> Vec<String> {
     let offering_type = one(case, reservation_block, "OfferingType");
     let duration = one(case, reservation_block, "Duration");
-    let usage_price = one(case, reservation_block, "UsagePrice");
-    offerings
-        .iter()
-        .filter(|block| {
-            one(case, block, "ReservedNodeOfferingType")
-                == state::RESERVED_NODE_OFFERING_TYPE_UPGRADABLE
-                && one(case, block, "OfferingType") == offering_type
-                && one(case, block, "Duration") == duration
-                && one(case, block, "UsagePrice") == usage_price
+    let usage_price: f64 = one(case, reservation_block, "UsagePrice")
+        .parse()
+        .unwrap_or_else(|_| panic!("case {case}: a reservation reports a numeric UsagePrice"));
+    state::published_exchange_reserved_node_offerings()
+        .into_iter()
+        .filter(|offering| {
+            offering.reserved_node_offering_type.as_deref()
+                == Some(state::RESERVED_NODE_OFFERING_TYPE_UPGRADABLE)
+                && offering.offering_type.as_deref() == Some(offering_type.as_str())
+                && offering.duration.map(|term| term.to_string()).as_deref()
+                    == Some(duration.as_str())
+                && offering
+                    .usage_price
+                    .is_some_and(|price| (price - usage_price).abs() < 1e-6)
         })
-        .map(|block| one(case, block, "ReservedNodeOfferingId"))
+        .filter_map(|offering| offering.reserved_node_offering_id)
         .collect()
 }
 
@@ -196,10 +201,10 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
         .into_iter()
         .find(|offering| {
             offering.node_type.as_deref() == Some("dc2.large")
-                && offering.offering_type.as_deref() == Some(state::HEAVY_UTILIZATION_OFFERING_TYPE)
+                && offering.offering_type.as_deref() == Some(state::PARTIAL_UPFRONT_OFFERING_TYPE)
                 && offering.duration == Some(31_536_000)
         })
-        .expect("the catalog publishes a one-year heavy-utilization dc2.large offering");
+        .expect("the catalog publishes a one-year part-upfront dc2.large offering");
     let reserved_node_id = state::new_reserved_node_id();
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");
     let mut store = store.lock();
@@ -269,7 +274,7 @@ async fn a_malformed_identifier_is_refused_before_any_lookup() {
         "the held reservation",
         "dc2.large",
         ONE_YEAR,
-        state::HEAVY_UTILIZATION_OFFERING_TYPE,
+        state::ALL_UPFRONT_OFFERING_TYPE,
     )
     .await;
     let a_published_offering = one(
@@ -279,7 +284,7 @@ async fn a_malformed_identifier_is_refused_before_any_lookup() {
             &offerings,
             "dc2.large",
             ONE_YEAR,
-            state::HEAVY_UTILIZATION_OFFERING_TYPE,
+            state::ALL_UPFRONT_OFFERING_TYPE,
         ),
         "ReservedNodeOfferingId",
     );
@@ -336,7 +341,7 @@ async fn a_well_formed_identifier_naming_nothing_is_the_modelled_not_found() {
         "the held reservation",
         "dc2.large",
         ONE_YEAR,
-        state::HEAVY_UTILIZATION_OFFERING_TYPE,
+        state::ALL_UPFRONT_OFFERING_TYPE,
     )
     .await;
     let a_published_offering = one(
@@ -346,7 +351,7 @@ async fn a_well_formed_identifier_naming_nothing_is_the_modelled_not_found() {
             &offerings,
             "dc2.large",
             ONE_YEAR,
-            state::HEAVY_UTILIZATION_OFFERING_TYPE,
+            state::ALL_UPFRONT_OFFERING_TYPE,
         ),
         "ReservedNodeOfferingId",
     );
@@ -600,7 +605,6 @@ async fn the_options_read_resolves_the_resource_then_its_node_type() {
 #[tokio::test]
 async fn the_options_of_a_covered_cluster_are_computed_from_the_account_inventory() {
     let emulator = Emulator::new();
-    let offerings = catalog(&emulator).await;
     let seeded = seed_ds2(&emulator, "ds2-cluster");
 
     let answer = emulator
@@ -622,7 +626,7 @@ async fn the_options_of_a_covered_cluster_are_computed_from_the_account_inventor
 
     let case = "a covered cluster";
     let held = reservation(&emulator, case, &seeded).await;
-    let expected = expected_targets(case, &offerings, &held);
+    let expected = expected_targets(case, &held);
     assert!(
         expected.len() > 1,
         "case {case}: the seeded reservation must have several candidate offerings, got {expected:?}"
@@ -671,42 +675,42 @@ async fn the_offerings_an_exchange_may_target_match_the_reservation() {
     let offerings = catalog(&emulator).await;
 
     // Rows differ along node type (inside and outside the exchange-target
-    // family), term and payment type — which between them give a candidate set
-    // of several offerings, of exactly one, and of none at all.
+    // family), term and payment option — the three dimensions the candidate rule
+    // reads off the reservation.
     let rows: [(&str, &str, &str, &str); 5] = [
         (
-            "a dense-compute node, one year, heavy utilization",
+            "a dense-compute node, one year, all upfront",
             "dc2.large",
             ONE_YEAR,
-            state::HEAVY_UTILIZATION_OFFERING_TYPE,
+            state::ALL_UPFRONT_OFFERING_TYPE,
         ),
         (
-            "a dense-compute node, one year, light utilization",
+            "a dense-compute node, one year, nothing upfront",
             "dc2.large",
             ONE_YEAR,
-            "Light Utilization",
+            state::NO_UPFRONT_OFFERING_TYPE,
         ),
         (
-            "the largest dense-compute node, three years, medium utilization",
+            "the largest dense-compute node, three years, part upfront",
             "dc2.8xlarge",
             THREE_YEARS,
-            "Medium Utilization",
+            state::PARTIAL_UPFRONT_OFFERING_TYPE,
         ),
         (
-            "a managed-storage node, one year, light utilization",
+            "a managed-storage node, one year, nothing upfront",
             "ra3.large",
             ONE_YEAR,
-            "Light Utilization",
+            state::NO_UPFRONT_OFFERING_TYPE,
         ),
         (
-            "a reserve-group node, three years, heavy utilization",
+            "a reserve-group node, three years, all upfront",
             "rg.large",
             THREE_YEARS,
-            state::HEAVY_UTILIZATION_OFFERING_TYPE,
+            state::ALL_UPFRONT_OFFERING_TYPE,
         ),
     ];
 
-    let mut sizes = Vec::new();
+    let mut candidate_sets: Vec<(&str, (&str, &str), Vec<String>)> = Vec::new();
     for (case, node_type, duration, offering_type) in rows {
         let reserved_node_id = active_reservation(
             &emulator,
@@ -718,23 +722,72 @@ async fn the_offerings_an_exchange_may_target_match_the_reservation() {
         )
         .await;
         let held = reservation(&emulator, case, &reserved_node_id).await;
-        let expected = expected_targets(case, &offerings, &held);
+        let expected = expected_targets(case, &held);
         let served = exchange_offerings(&emulator, case, &reserved_node_id).await;
         assert_eq!(
             served, expected,
-            "case {case}: expected the candidate offerings the catalog publishes, got {served:?}"
+            "case {case}: expected the candidate offerings the exchange catalog publishes, got {served:?}"
         );
-        sizes.push(served.len());
+        assert!(
+            !served.is_empty(),
+            "case {case}: a reservation of a published term and payment option has candidates, got {served:?}"
+        );
+        candidate_sets.push((case, (duration, offering_type), served));
     }
 
-    // The rule READS the reservation: a filter that ignored it would answer
-    // every row the same way.
+    // The rule READS the reservation: two reservations differing in term or
+    // payment option can share no candidate, while one bought under a payment
+    // option no exchange target carries has none at all.
+    for (case, dimensions, served) in &candidate_sets {
+        for (other_case, other_dimensions, other) in &candidate_sets {
+            if dimensions == other_dimensions {
+                continue;
+            }
+            assert!(
+                served.iter().all(|id| !other.contains(id)),
+                "case {case} against {other_case}: expected disjoint candidate sets, got {served:?} and {other:?}"
+            );
+        }
+    }
+
+    let retired = seed_retired_payment_option(&emulator);
+    let none = exchange_offerings(&emulator, "a retired payment option", &retired).await;
     assert!(
-        sizes.iter().any(|size| *size > 1)
-            && sizes.contains(&1)
-            && sizes.contains(&0),
-        "case the whole table: expected the candidate set to vary with the reservation, got {sizes:?}"
+        none.is_empty(),
+        "case a retired payment option: expected no candidate offering, got {none:?}"
     );
+}
+
+/// Seed an ACTIVE reservation bought under a payment option neither published
+/// catalog offers any more, so no exchange-target offering matches its payment
+/// type: the zero-candidate row of the table above, which nothing this emulator
+/// serves can create.
+fn seed_retired_payment_option(emulator: &Emulator) -> String {
+    let reserved_node_id = state::new_reserved_node_id();
+    let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+    store.lock().reserved_nodes.push(state::StoredReservedNode {
+        node: ReservedNode {
+            reserved_node_id: Some(reserved_node_id.clone()),
+            reserved_node_offering_id: None,
+            node_type: Some("dc2.large".to_string()),
+            start_time: Some(aws_smithy_types::DateTime::from(
+                std::time::SystemTime::now(),
+            )),
+            duration: Some(31_536_000),
+            fixed_price: Some(0.0),
+            usage_price: Some(0.215),
+            currency_code: Some("USD".to_string()),
+            node_count: Some(1),
+            state: Some(state::RESERVED_NODE_STATE_ACTIVE.to_string()),
+            offering_type: Some("Heavy Utilization".to_string()),
+            recurring_charges: Some(Vec::new()),
+            reserved_node_offering_type: Some(
+                state::RESERVED_NODE_OFFERING_TYPE_REGULAR.to_string(),
+            ),
+        },
+        active_at: std::time::Instant::now(),
+    });
+    reserved_node_id
 }
 
 /// The compute-node bound the purchase path enforces bounds the exchange path
@@ -754,7 +807,7 @@ async fn an_exchange_past_the_compute_node_quota_is_refused() {
         &offerings,
         "dc2.large",
         ONE_YEAR,
-        state::HEAVY_UTILIZATION_OFFERING_TYPE,
+        state::ALL_UPFRONT_OFFERING_TYPE,
     );
     let bought = purchase(
         &emulator,
@@ -830,7 +883,7 @@ async fn an_exchange_past_the_compute_node_quota_is_refused() {
 async fn an_accepted_exchange_moves_the_reservation_and_is_reported_by_a_later_read() {
     let emulator = Emulator::new();
     let offerings = catalog(&emulator).await;
-    let case = "an exchange of a one-year heavy-utilization dc2.large reservation";
+    let case = "an exchange of a one-year fully-upfront dc2.large reservation";
 
     // A reservation whose payment is not confirmed yet is not available for
     // use, so an exchange of it is refused for its STATE — the transient state
@@ -840,7 +893,7 @@ async fn an_accepted_exchange_moves_the_reservation_and_is_reported_by_a_later_r
         &offerings,
         "dc2.large",
         ONE_YEAR,
-        state::HEAVY_UTILIZATION_OFFERING_TYPE,
+        state::ALL_UPFRONT_OFFERING_TYPE,
     );
     let bought = purchase(&emulator, &offering, Some(3), case).await;
     assert_eq!(
@@ -931,7 +984,7 @@ async fn an_accepted_exchange_moves_the_reservation_and_is_reported_by_a_later_r
         "a second reservation",
         "dc2.large",
         ONE_YEAR,
-        "Light Utilization",
+        "No Upfront",
     )
     .await;
     let other = offering_of(
@@ -939,7 +992,7 @@ async fn an_accepted_exchange_moves_the_reservation_and_is_reported_by_a_later_r
         &offerings,
         "ra3.large",
         THREE_YEARS,
-        "Light Utilization",
+        "No Upfront",
     );
     let other_id = one(case, &other, "ReservedNodeOfferingId");
     let refused = emulator

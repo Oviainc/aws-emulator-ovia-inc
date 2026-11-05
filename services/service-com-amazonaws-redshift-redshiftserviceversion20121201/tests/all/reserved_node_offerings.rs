@@ -9,10 +9,10 @@
 //!
 //! The suite asserts the RULE rather than one recorded request: the catalog is
 //! the product of the offered node types, the published terms and the published
-//! offering types; each offering charges the term's whole cost as an upfront
-//! `FixedPrice` plus the remainder spread over the term's hours — per RUNNING
-//! hour as the `UsagePrice`, or for every hour regardless as a recurring charge
-//! when the offering type is the heavy-utilization one; `ReservedNodeOfferingId`
+//! payment options; each offering charges the share of the term its payment
+//! option takes upfront as the `FixedPrice` and whatever is left as ONE hourly
+//! recurring charge, charging nothing per running hour; every offering of this
+//! catalog is a `Regular` one; `ReservedNodeOfferingId`
 //! selects the one offering it names and an id the catalog does not publish is
 //! refused; the shared `MaxRecords` window and `Marker` cursor paginate it; and
 //! reading it changes nothing. The catalog tables are written out here, quoting
@@ -51,22 +51,31 @@ const NODE_TYPE_RATES: [(&str, f64); 10] = [
 const TERMS: [(i32, f64); 2] = [(31_536_000, 0.70), (94_608_000, 0.45)];
 
 /// Every published offering type, as `(OfferingType, share of the term's cost
-/// charged upfront)`, in catalog order.
+/// charged upfront)`, in catalog order: the payment options Amazon Redshift's
+/// reserved-node catalog is published under, from the one that charges nothing
+/// upfront to the one that charges all of it.
 const OFFERING_TYPES: [(&str, f64); 3] = [
-    ("Light Utilization", 0.25),
-    ("Medium Utilization", 0.50),
-    ("Heavy Utilization", 0.75),
+    ("No Upfront", 0.0),
+    ("Partial Upfront", 0.5),
+    ("All Upfront", 1.0),
 ];
 
-/// The one offering type whose remaining term cost is a recurring charge.
-///
-/// Source: `smithy_query(query="doc", shape="ReservedNodeOffering",
-/// member="RecurringCharges")` — "Recurring charges are only in effect for
-/// heavy-utilization reserved nodes."
-const HEAVY_UTILIZATION: &str = "Heavy Utilization";
+/// The payment option that charges the whole term upfront, leaving a recurring
+/// charge of nothing.
+const ALL_UPFRONT: &str = "All Upfront";
 
-/// The node-type prefix of an offering an exchange can target, which is what
-/// makes an offering `Upgradable`.
+/// The `ReservedNodeOfferingType` every offering of the PURCHASE catalog
+/// carries: it is bought outright, not exchanged onto.
+///
+/// Source: `smithy_query(query="shape", shape="ReservedNodeOfferingType")` —
+/// the enum's values are `Regular` and `Upgradable`, and
+/// `smithy_query(query="doc", shape="GetReservedNodeExchangeOfferings")` is what
+/// reports the `Upgradable` ones ("Returns an array of DC2 ReservedNodeOfferings
+/// that matches the payment type, term, and usage price of the given DC1
+/// reserved node").
+const REGULAR: &str = "Regular";
+
+/// The node-type prefix of an offering an exchange can target.
 ///
 /// Source: `smithy_query(query="doc", shape="GetReservedNodeExchangeOfferings")`
 /// — "Returns an array of DC2 ReservedNodeOfferings that matches the payment
@@ -244,7 +253,7 @@ fn node_rate(node_type: &str) -> f64 {
 }
 
 #[tokio::test]
-async fn the_catalog_is_the_product_of_node_type_term_and_offering_type() {
+async fn the_catalog_is_the_product_of_node_type_term_and_payment_option() {
     let emulator = Emulator::new();
 
     let served = offerings(&emulator, "the whole catalog", &[]).await;
@@ -291,7 +300,7 @@ async fn the_catalog_is_the_product_of_node_type_term_and_offering_type() {
 }
 
 #[tokio::test]
-async fn every_offering_charges_the_term_cost_the_way_its_offering_type_says() {
+async fn every_offering_charges_the_term_cost_the_way_its_payment_option_says() {
     let emulator = Emulator::new();
 
     let served = offerings(&emulator, "the whole catalog", &[]).await;
@@ -302,7 +311,6 @@ async fn every_offering_charges_the_term_cost_the_way_its_offering_type_says() {
         );
         let rate = node_rate(&offering.node_type) * term_share(offering.duration);
         let upfront = upfront_share(&offering.offering_type);
-        let heavy = offering.offering_type == HEAVY_UTILIZATION;
 
         assert_eq!(
             offering.currency_code, CURRENCY_CODE,
@@ -318,41 +326,39 @@ async fn every_offering_charges_the_term_cost_the_way_its_offering_type_says() {
             offering.fixed_price
         );
 
-        // The remainder is spread over the term's hours — charged for every hour
-        // regardless as a recurring charge for the heavy-utilization offering,
-        // and per running hour as the usage price otherwise.
+        // Whatever the payment option does not take upfront is charged for every
+        // hour of the term as the offering's ONE recurring charge, and nothing is
+        // charged per hour the cluster using the offering runs.
         let expected_hourly = rate * (1.0 - upfront);
-        if heavy {
+        assert_eq!(
+            offering.usage_price, 0.0,
+            "case {case}: a published offering charges nothing per running hour, got {}",
+            offering.usage_price
+        );
+        assert_eq!(
+            offering.recurring.len(),
+            1,
+            "case {case}: expected one recurring charge on every offering, got {:?}",
+            offering.recurring
+        );
+        let (amount, frequency) = &offering.recurring[0];
+        assert_eq!(
+            frequency, "Hourly",
+            "case {case}: expected an hourly recurring charge, got {frequency:?}"
+        );
+        assert!(
+            (amount - expected_hourly).abs() <= PRICE_TOLERANCE,
+            "case {case}: expected a recurring charge of about {expected_hourly}, got {amount}"
+        );
+        if offering.offering_type == ALL_UPFRONT {
             assert_eq!(
-                offering.usage_price, 0.0,
-                "case {case}: a heavy-utilization offering charges nothing per running hour, got {}",
-                offering.usage_price
-            );
-            assert_eq!(
-                offering.recurring.len(),
-                1,
-                "case {case}: expected one recurring charge, got {:?}",
-                offering.recurring
-            );
-            let (amount, frequency) = &offering.recurring[0];
-            assert_eq!(
-                frequency, "Hourly",
-                "case {case}: expected an hourly recurring charge, got {frequency:?}"
-            );
-            assert!(
-                (amount - expected_hourly).abs() <= PRICE_TOLERANCE,
-                "case {case}: expected a recurring charge of about {expected_hourly}, got {amount}"
+                *amount, 0.0,
+                "case {case}: paying the whole term upfront leaves a recurring charge of nothing, got {amount}"
             );
         } else {
             assert!(
-                offering.recurring.is_empty(),
-                "case {case}: recurring charges are only in effect for the heavy-utilization offering, got {:?}",
-                offering.recurring
-            );
-            assert!(
-                (offering.usage_price - expected_hourly).abs() <= PRICE_TOLERANCE,
-                "case {case}: expected a usage price of about {expected_hourly}, got {}",
-                offering.usage_price
+                *amount > 0.0,
+                "case {case}: a term not paid in full upfront carries an hourly charge, got {amount}"
             );
         }
 
@@ -364,15 +370,12 @@ async fn every_offering_charges_the_term_cost_the_way_its_offering_type_says() {
             offering.effective_hourly()
         );
 
-        // Only an offering an exchange can target is `Upgradable`.
-        let expected_class = if offering.node_type.starts_with(EXCHANGE_TARGET_PREFIX) {
-            "Upgradable"
-        } else {
-            "Regular"
-        };
+        // Every offering of this catalog is bought outright, whatever its node
+        // type: the offerings an exchange may move onto are a catalog of their
+        // own.
         assert_eq!(
-            offering.offering_class, expected_class,
-            "case {case}: expected the offering class {expected_class}, got {:?}",
+            offering.offering_class, REGULAR,
+            "case {case}: expected the offering class {REGULAR}, got {:?}",
             offering.offering_class
         );
     }
@@ -428,8 +431,8 @@ async fn an_offering_id_selects_the_one_offering_it_names() {
     let catalog = offerings(&emulator, "the whole catalog", &[]).await;
 
     // Rows differ along which offering the id names: the first and the last of
-    // the catalog, an exchange-target one, a heavy-utilization one and a
-    // three-year one.
+    // the catalog, one of an exchange-target node type, a fully-upfront one and
+    // a three-year one.
     let wanted: Vec<(&str, &Offering)> = vec![
         ("the first offering", &catalog[0]),
         (
@@ -437,18 +440,18 @@ async fn an_offering_id_selects_the_one_offering_it_names() {
             catalog.last().expect("the catalog is not empty"),
         ),
         (
-            "an exchange-target offering",
+            "an offering of an exchange-target node type",
             catalog
                 .iter()
                 .find(|offering| offering.node_type.starts_with(EXCHANGE_TARGET_PREFIX))
                 .expect("the catalog offers a dc2 node type"),
         ),
         (
-            "a heavy-utilization offering",
+            "a fully-upfront offering",
             catalog
                 .iter()
-                .find(|offering| offering.offering_type == HEAVY_UTILIZATION)
-                .expect("the catalog offers the heavy-utilization type"),
+                .find(|offering| offering.offering_type == ALL_UPFRONT)
+                .expect("the catalog offers the fully-upfront payment option"),
         ),
         (
             "a three-year offering",

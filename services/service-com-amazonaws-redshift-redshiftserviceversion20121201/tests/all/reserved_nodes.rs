@@ -18,7 +18,7 @@
 //! change a read makes is the payment confirmation the clock already owed.
 //!
 //! Each table row differs along what the rule generalises over: which offering is
-//! bought (node type, term, utilization), how many nodes the purchase reserves,
+//! bought (node type, term, payment option), how many nodes the purchase reserves,
 //! how many reservations the account holds, and how the page is asked for.
 //!
 //! The helpers this suite owns are `pub(crate)` so the sibling reserved-node
@@ -211,43 +211,43 @@ async fn a_purchase_is_reported_by_a_later_describe() {
         "case before any purchase: expected no reservation, got {none_held:?}"
     );
 
-    // Rows differ along which offering is bought — node type, term and
-    // utilization — and along how many nodes the purchase reserves, including the
+    // Rows differ along which offering is bought — node type, term and payment
+    // option — and along how many nodes the purchase reserves, including the
     // request that names no `NodeCount` at all.
     let rows: [(&str, &str, &str, &str, Option<i32>); 5] = [
         (
-            "the smallest node, one year, light utilization, no NodeCount",
+            "the smallest node, one year, nothing upfront, no NodeCount",
             "dc2.large",
             ONE_YEAR,
-            "Light Utilization",
+            "No Upfront",
             None,
         ),
         (
-            "a heavy-utilization offering with recurring charges",
+            "a fully-upfront offering of the largest dense-compute node",
             "dc2.8xlarge",
             ONE_YEAR,
-            "Heavy Utilization",
+            "All Upfront",
             Some(3),
         ),
         (
             "the largest node for three years",
             "ra3.16xlarge",
             THREE_YEARS,
-            "Medium Utilization",
+            "Partial Upfront",
             Some(10),
         ),
         (
             "a mid-sized node for three years",
             "ra3.xlplus",
             THREE_YEARS,
-            "Light Utilization",
+            "No Upfront",
             Some(1),
         ),
         (
-            "a reserve-group node, one year, medium utilization",
+            "a reserve-group node, one year, part upfront",
             "rg.large",
             ONE_YEAR,
-            "Medium Utilization",
+            "Partial Upfront",
             Some(2),
         ),
     ];
@@ -410,14 +410,14 @@ async fn an_id_selects_the_one_reservation_it_names() {
         &offerings,
         "dc2.large",
         ONE_YEAR,
-        "Light Utilization",
+        "No Upfront",
     );
     let second = offering_of(
         "a three-year offering",
         &offerings,
         "ra3.4xlarge",
         THREE_YEARS,
-        "Heavy Utilization",
+        "All Upfront",
     );
     let mut held: Vec<String> = Vec::new();
     for (case, offering, node_count) in [
@@ -498,7 +498,7 @@ async fn the_documented_max_records_window_and_marker_cursor_govern_the_page() {
         &offerings,
         "ra3.large",
         ONE_YEAR,
-        "Light Utilization",
+        "No Upfront",
     );
 
     // One more reservation than the smallest page the window allows, so a page is
@@ -629,7 +629,7 @@ async fn a_purchase_the_service_cannot_serve_is_refused() {
         &offerings,
         "rg.xlarge",
         ONE_YEAR,
-        "Heavy Utilization",
+        "All Upfront",
     );
     let offering_id = one("the probe offering", &offering, "ReservedNodeOfferingId");
 
@@ -703,7 +703,7 @@ async fn reading_the_reservations_changes_nothing_a_later_caller_sees() {
         &offerings,
         "rg.12xlarge",
         THREE_YEARS,
-        "Medium Utilization",
+        "Partial Upfront",
     );
 
     let bought = purchase(&emulator, &offering, Some(2), "the read purchase").await;

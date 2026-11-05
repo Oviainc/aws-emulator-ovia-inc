@@ -10,8 +10,8 @@
 //! The suite asserts RULES over tables of inputs rather than one recorded
 //! request:
 //!
-//! * the read reports one entry per source type that raises Amazon Redshift
-//!   events, in the order the model's `SourceType` enum lists them, and every
+//! * the read reports one entry per source type its own `SourceType` vocabulary
+//!   admits, in the order that vocabulary lists them, and every
 //!   event it carries is published under a category and a severity this service
 //!   publishes;
 //! * a `SourceType` selects exactly the entry for that type, in the published
@@ -25,19 +25,20 @@
 //! * a selection is a FILTER over the one published catalog: the per-source-type
 //!   reads together cover the unfiltered read exactly once, entry for entry;
 //! * cross-operation agreement: a category and a severity the catalog publishes
-//!   are exactly what a subscription scoped to that source type may name.
+//!   are exactly what a subscription scoped to that source type may name (for
+//!   the source types the model lets a subscription be scoped to).
 
 use crate::cluster_lifecycle::{all_text, Answer, Emulator};
 use crate::maintenance_tracks::elements;
 
-/// The source types that raise Amazon Redshift events, in the order the model
+/// The source types a SUBSCRIPTION can be scoped to, in the order the model
 /// lists them, written out here rather than read off the production helper so a
 /// wrong entry fails this suite.
 ///
 /// Source: `smithy_query(query="shape", shape="SourceType")` — the enum's values
 /// `cluster`, `cluster-parameter-group`, `cluster-security-group`,
 /// `cluster-snapshot`, `scheduled-action`.
-const PUBLISHED_SOURCE_TYPES: [&str; 5] = [
+const SUBSCRIBABLE_SOURCE_TYPES: [&str; 5] = [
     "cluster",
     "cluster-parameter-group",
     "cluster-security-group",
@@ -49,9 +50,10 @@ const PUBLISHED_SOURCE_TYPES: [&str; 5] = [
 /// enumerates them, written out here rather than read off the production helper
 /// so a wrong entry fails this suite.
 ///
-/// Wider than [`PUBLISHED_SOURCE_TYPES`] — the types the model's `SourceType`
+/// Wider than [`SUBSCRIBABLE_SOURCE_TYPES`] — the types the model's `SourceType`
 /// enum lists, which is what a SUBSCRIPTION can be scoped to — by
-/// `reserved-node`, which the refusal enumerates among the valid types.
+/// `reserved-node`, which the refusal enumerates among the valid types. This IS
+/// the set the unfiltered read reports an entry for.
 const ADMITTED_SOURCE_TYPES: [&str; 6] = [
     "cluster",
     "cluster-security-group",
@@ -168,8 +170,8 @@ async fn the_published_catalog_is_what_an_unfiltered_read_reports() {
     let reported = reported_catalog(&answer.body);
     assert_eq!(
         reported_source_types(&answer.body),
-        PUBLISHED_SOURCE_TYPES.map(str::to_string).to_vec(),
-        "case read an empty emulator: expected one entry per published source type, got body {}",
+        ADMITTED_SOURCE_TYPES.map(str::to_string).to_vec(),
+        "case read an empty emulator: expected one entry per admitted source type, got body {}",
         answer.body
     );
 
@@ -274,7 +276,7 @@ async fn each_source_type_publishes_the_catalogued_events_of_its_resource() {
     // event categories and event messages"), whose identifiers are numbered by
     // category — 1000 configuration, 2000 management, 3000 monitoring, 5000
     // pending.
-    let rows: [(&str, &str, &[&str], &str); 5] = [
+    let rows: [(&str, &str, &[&str], &str); 6] = [
         ("cluster", "REDSHIFT-EVENT-2000", &["management"], "INFO"),
         (
             "cluster-parameter-group",
@@ -298,6 +300,12 @@ async fn each_source_type_publishes_the_catalogued_events_of_its_resource() {
             "scheduled-action",
             "REDSHIFT-EVENT-5200",
             &["pending"],
+            "INFO",
+        ),
+        (
+            "reserved-node",
+            "REDSHIFT-EVENT-2300",
+            &["management"],
             "INFO",
         ),
     ];
@@ -384,7 +392,7 @@ async fn a_source_type_selects_exactly_that_entry_in_the_published_spelling() {
     // form however a caller spelled it, the same rule the subscription path
     // resolves a `SourceType` under.
     let mut rows: Vec<(String, String, &str)> = Vec::new();
-    for source_type in PUBLISHED_SOURCE_TYPES {
+    for source_type in ADMITTED_SOURCE_TYPES {
         rows.push((
             format!("the published spelling of {source_type}"),
             source_type.to_string(),
@@ -480,8 +488,7 @@ async fn a_value_outside_the_admitted_vocabulary_is_refused_on_the_input() {
 
     // Every value the refusal enumerates IS accepted, in each spelling the read
     // resolves: the enumerated set is the admitted set, not a longer or shorter
-    // list. An admitted type this service catalogues no event for selects
-    // nothing and is reported as an empty catalog, never refused.
+    // list, and each selects its own entry of the one published catalog.
     for admitted in ADMITTED_SOURCE_TYPES {
         for (case, requested) in [
             ("the admitted spelling", admitted.to_string()),
@@ -497,11 +504,7 @@ async fn a_value_outside_the_admitted_vocabulary_is_refused_on_the_input() {
                 answer.error_code(),
                 answer.body
             );
-            let expected = if PUBLISHED_SOURCE_TYPES.contains(&admitted) {
-                vec![admitted.to_string()]
-            } else {
-                Vec::new()
-            };
+            let expected = vec![admitted.to_string()];
             assert_eq!(
                 reported_source_types(&answer.body),
                 expected,
@@ -524,22 +527,17 @@ async fn a_selection_filters_the_one_catalog_and_repeats_unchanged() {
     );
     let whole = reported_catalog(&unfiltered.body);
 
-    // One row per selection a caller can make: no `SourceType` at all, each
-    // published source type, and an ADMITTED type this service catalogues no
-    // event for. A selection FILTERS the one catalog, so each row's expected
-    // answer is read off the unfiltered body rather than written out a second
-    // time. (A value outside the admitted vocabulary is not a selection at all:
-    // it is refused on the input, which
+    // One row per selection a caller can make: no `SourceType` at all, and each
+    // source type the read admits. A selection FILTERS the one catalog, so each
+    // row's expected answer is read off the unfiltered body rather than written
+    // out a second time. (A value outside the admitted vocabulary is not a
+    // selection at all: it is refused on the input, which
     // [`a_value_outside_the_admitted_vocabulary_is_refused_on_the_input`] pins.)
     let mut selections: Vec<(String, Option<String>)> =
         vec![("the whole catalog".to_string(), None)];
-    for source_type in PUBLISHED_SOURCE_TYPES {
+    for source_type in ADMITTED_SOURCE_TYPES {
         selections.push((format!("select {source_type}"), Some(source_type.to_string())));
     }
-    selections.push((
-        "select an admitted type with no catalogued event".to_string(),
-        Some("reserved-node".to_string()),
-    ));
 
     let mut covered: Vec<CatalogEntry> = Vec::new();
     for (case, requested) in &selections {
@@ -597,11 +595,16 @@ async fn what_the_catalog_publishes_is_what_a_subscription_may_name() {
     // Every (source type, category, severity) the catalog publishes is accepted
     // by `CreateEventSubscription` scoped to that source type: a client that
     // enumerates the catalog before building a subscription can use what it read.
+    // Only the source types the model lets a subscription be scoped to
+    // (`SUBSCRIBABLE_SOURCE_TYPES`) can be subscribed to at all.
     let mut subscriptions = 0usize;
     for entry in reported_catalog(&answer.body) {
         let Some(source_type) = entry.source_type.clone() else {
             continue;
         };
+        if !SUBSCRIBABLE_SOURCE_TYPES.contains(&source_type.as_str()) {
+            continue;
+        }
         for event in &entry.events {
             let severity = event
                 .severity

@@ -219,11 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The unique identifier of the DC2 Reserved Node offering to be used for
-        // the exchange": an id the catalog does not publish is the modelled
+        // the exchange": an id NEITHER published catalog carries is the modelled
         // "Specified offering does not exist", worded as every other operation
-        // reading this one catalog words it.
+        // reading these catalogs words it.
         let Some(target) = store
-            .reserved_node_offering(&input.target_reserved_node_offering_id)
+            .published_reserved_node_offering(&input.target_reserved_node_offering_id)
             .cloned()
         else {
             return Err(

@@ -124,15 +124,17 @@ fn listed_names(xml: &str) -> Vec<String> {
 /// `MaintenanceTrackName` — "Possible values are `current` and `trailing`" — and
 /// on the structure itself: `current` applies "the most recently certified
 /// maintenance release", `trailing` "the previously certified maintenance
-/// release". This service certifies the one engine build
-/// `state::PUBLISHED_ENGINE_BUILDS` publishes, so both tracks apply that build.
+/// release". Those are two DIFFERENT releases of
+/// `state::CERTIFIED_ENGINE_BUILDS`, so the two tracks report different
+/// `DatabaseVersion` values and a client can tell them apart.
 const PUBLISHED_TRACKS: [&str; 2] = ["current", "trailing"];
 
-/// The operations a track you can switch to supports, in the hyphenated form
-/// `SupportedOperation$OperationName` names an operation by: the model's
-/// operations whose input carries a `MaintenanceTrackName` and acts on a cluster
-/// that already exists (`ModifyCluster`, `RestoreFromClusterSnapshot`).
-const SWITCH_OPERATIONS: [&str; 2] = ["modify-cluster", "restore-from-cluster-snapshot"];
+/// The operations a track you can switch to supports, in the order the service
+/// reports them and in the hyphenated form `SupportedOperation$OperationName`
+/// names an operation by: the model's operations whose input carries a
+/// `MaintenanceTrackName` and acts on a cluster that already exists
+/// (`RestoreFromClusterSnapshot`, `ModifyCluster`).
+const SWITCH_OPERATIONS: [&str; 2] = ["restore-from-cluster-snapshot", "modify-cluster"];
 
 /// Names the catalog does not publish, spanning the ways a name can be wrong:
 /// wrong case, a track AWS retired, a name of another shape entirely, one that is
@@ -164,23 +166,39 @@ async fn the_published_track_catalog_is_what_a_read_reports() {
         answer.status, answer.body
     );
 
-    let latest_build = *state::certified_engine_builds()
-        .last()
-        .expect("case published catalog: expected a certified engine build");
+    // `current` applies the most recently certified release and `trailing` the
+    // one certified before it, so the two carry different builds — and every
+    // `UpdateTarget` carries the build of the track it points AT, which is what
+    // a client diffing the two tracks reads.
+    let builds = state::certified_engine_builds();
+    assert!(
+        builds.len() > 1,
+        "case published catalog: expected more than one certified release, got {builds:?}"
+    );
+    let latest = builds[builds.len() - 1].to_string();
+    let previous = builds[builds.len() - 2].to_string();
+    assert_ne!(
+        latest, previous,
+        "case published catalog: the two tracks must apply different releases, got {latest} twice"
+    );
+    let release_of = |track: &str| {
+        if track == "current" {
+            latest.clone()
+        } else {
+            previous.clone()
+        }
+    };
     let expected: Vec<Track> = PUBLISHED_TRACKS
         .into_iter()
         .map(|track| Track {
             name: Some(track.to_string()),
-            // One certified release, so every track applies that build —
-            // asserted against `PUBLISHED_ENGINE_BUILDS`, so the version a track
-            // reports and the one `DescribeClusterVersions` offers agree.
-            database_version: Some(latest_build.to_string()),
+            database_version: Some(release_of(track)),
             update_targets: PUBLISHED_TRACKS
                 .into_iter()
                 .filter(|target| *target != track)
                 .map(|target| Target {
                     name: Some(target.to_string()),
-                    database_version: Some(latest_build.to_string()),
+                    database_version: Some(release_of(target)),
                     supported_operations: SWITCH_OPERATIONS.map(str::to_string).to_vec(),
                 })
                 .collect(),
