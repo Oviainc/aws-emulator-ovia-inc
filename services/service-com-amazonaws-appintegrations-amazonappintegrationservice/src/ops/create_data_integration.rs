@@ -6,6 +6,11 @@
 //! resolves the required `KmsKey` against KMS, and stores everything the request
 //! carried so `GetDataIntegration` reports the identical values this call returned.
 //!
+//! It also persists the one value the SERVICE decides rather than the caller: the kind
+//! of integration this is ([`crate::state::INTEGRATION_TYPE_IMPORT`]), which the read
+//! path reports. `CreateDataIntegration` models no member for it, and this response does
+//! not report it either — only the read does.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -352,6 +357,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             description: input.description,
             kms_key: input.kms_key,
+            // The kind of integration this create mints is the SERVICE's to decide, not
+            // the caller's: `CreateDataIntegration` models no member for it and every
+            // integration it creates pulls data from a source into the service.
+            integration_type: crate::state::INTEGRATION_TYPE_IMPORT.to_string(),
             source_uri: input.source_uri,
             // `ScheduleConfig` on the way in is `ScheduleConfiguration` on the way out:
             // one stored value, reported under the name each shape gives it.
@@ -390,7 +399,7 @@ fn created_response(record: &crate::state::DataIntegrationRecord) -> CreateDataI
         kms_key: Some(record.kms_key.clone()),
         source_uri: record.source_uri.clone(),
         schedule_configuration: record.schedule_configuration.clone(),
-        tags: record.modeled_tags(),
+        tags: Some(record.modeled_tags()),
         client_token: record.client_token.clone(),
         file_configuration: record.file_configuration.clone(),
         object_configuration: record.object_configuration.clone(),

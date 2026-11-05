@@ -172,6 +172,11 @@ fn round_trip_cases() -> Vec<Case> {
 
 /// Every member of a `CreateApplication` body, as `GetApplication` must report it.
 /// `ClientToken` names the request, not the resource, so it is not a reported member.
+///
+/// A member the create did NOT send is reported whenever the service fills it in: the
+/// three collections and the tag map read back empty, `IframeConfig` reads back as the
+/// empty structure, `ApplicationType` as the type the service assigns, and `IsService`
+/// as the model's default. Only the members the service has no default for stay absent.
 fn assert_reports_the_created_members(label: &str, reply: &Reply, sent: &Value) {
     assert_eq!(
         reply.status, 200,
@@ -190,18 +195,39 @@ fn assert_reports_the_created_members(label: &str, reply: &Reply, sent: &Value) 
             reply.field(member)
         );
     }
-    // A member the create did not send is reported only where the model gives it a
-    // default: `IsService` defaults to false, every other optional member is absent.
+    let sent_is_service = sent
+        .get("IsService")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // What each server-defaulted member reads back as when the create named none of
+    // them: an empty collection, an empty structure, or the assigned application type.
+    let defaults: Vec<(&str, Value)> = vec![
+        ("Subscriptions", json!([])),
+        ("Publications", json!([])),
+        ("Permissions", json!([])),
+        ("Tags", json!({})),
+        ("IframeConfig", json!({})),
+        (
+            "ApplicationType",
+            json!(if sent_is_service { "SERVICE" } else { "STANDARD" }),
+        ),
+    ];
+    for (member, default) in defaults {
+        if !sent.contains_key(member) {
+            assert_eq!(
+                reply.field(member),
+                Some(&default),
+                "case {label:?}: expected {member} to be reported as the service-assigned \
+                 default {default} for a create that sent none, got {:?}",
+                reply.field(member)
+            );
+        }
+    }
+    // A member the service assigns no default to is absent until a caller sets it.
     for member in [
         "Description",
-        "Subscriptions",
-        "Publications",
-        "Permissions",
-        "Tags",
         "InitializationTimeout",
         "ApplicationConfig",
-        "IframeConfig",
-        "ApplicationType",
         "AuthConfig",
     ] {
         if !sent.contains_key(member) {
@@ -215,10 +241,6 @@ fn assert_reports_the_created_members(label: &str, reply: &Reply, sent: &Value) 
     }
     let reported_is_service = reply
         .field("IsService")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let sent_is_service = sent
-        .get("IsService")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     assert_eq!(

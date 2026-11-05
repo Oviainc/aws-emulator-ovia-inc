@@ -241,18 +241,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(subscriptions) = input.subscriptions {
             applied += 1;
-            changed |= record.subscriptions.as_deref() != Some(subscriptions.as_slice());
-            record.subscriptions = Some(subscriptions);
+            changed |= record.subscriptions != subscriptions;
+            record.subscriptions = subscriptions;
         }
         if let Some(publications) = input.publications {
             applied += 1;
-            changed |= record.publications.as_deref() != Some(publications.as_slice());
-            record.publications = Some(publications);
+            changed |= record.publications != publications;
+            record.publications = publications;
         }
         if let Some(permissions) = input.permissions {
             applied += 1;
-            changed |= record.permissions.as_deref() != Some(permissions.as_slice());
-            record.permissions = Some(permissions);
+            changed |= record.permissions != permissions;
+            record.permissions = permissions;
         }
         if let Some(is_service) = input.is_service {
             applied += 1;
@@ -271,13 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(iframe_config) = input.iframe_config {
             applied += 1;
-            changed |= record.iframe_config.as_ref() != Some(&iframe_config);
-            record.iframe_config = Some(iframe_config);
+            changed |= record.iframe_config != iframe_config;
+            record.iframe_config = iframe_config;
         }
         if let Some(application_type) = input.application_type {
             applied += 1;
-            changed |= record.application_type.as_deref() != Some(application_type.as_str());
-            record.application_type = Some(application_type);
+            changed |= record.application_type != application_type;
+            record.application_type = application_type;
         }
         if let Some(auth_config) = input.auth_config {
             applied += 1;

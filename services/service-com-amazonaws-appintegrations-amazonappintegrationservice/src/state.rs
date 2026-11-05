@@ -163,15 +163,47 @@ pub fn data_integration_association_not_found(identifier: &str) -> String {
     )
 }
 
-/// The persisted tags as the modelled `TagMap`, or `None` when the resource carries
-/// none: the model constrains `TagMap` to 1..200 entries, so an untagged resource
-/// reports no member rather than an empty map.
-pub fn modeled_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
-    if tags.is_empty() {
-        return None;
-    }
-    Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+/// The persisted tags as the modelled `TagMap`.
+///
+/// An untagged resource reports an EMPTY map, never an absent member: "this resource
+/// has no tags" is an answer the service owns, and a client that reads an absent member
+/// cannot tell it from "the tag set was not reported". The model constrains `TagMap` to
+/// 1..200 entries, yet the recorded AWS responses in corpus `simparity-wire-aws-v1`
+/// carry `"Tags": {}` for an untagged application and for an untagged data integration,
+/// so the wire is the authority for the empty case and every read path of this service
+/// reports it the same way.
+pub fn modeled_tags(tags: &BTreeMap<String, String>) -> HashMap<String, String> {
+    tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
+
+/// The `ApplicationType` of an application whose create named none, which is a value
+/// the SERVICE assigns rather than one the caller supplies: `STANDARD` for an ordinary
+/// application, and `SERVICE` for one the deprecated `IsService` flag marks as a
+/// service — the model deprecates `IsService` "in favor of ApplicationType", so the two
+/// members name one fact about the application. Both are values of the modelled enum
+/// (`smithy_query(query="shape", shape="ApplicationType")`: STANDARD | SERVICE |
+/// MCP_SERVER | A2A_SERVER).
+pub fn assigned_application_type(is_service: bool) -> &'static str {
+    if is_service {
+        APPLICATION_TYPE_SERVICE
+    } else {
+        APPLICATION_TYPE_STANDARD
+    }
+}
+
+/// The two `ApplicationType` values this service assigns on its own (see
+/// [`assigned_application_type`]); the other two are only ever a caller's choice.
+pub const APPLICATION_TYPE_STANDARD: &str = "STANDARD";
+pub const APPLICATION_TYPE_SERVICE: &str = "SERVICE";
+
+/// The `IntegrationType` this service assigns an integration that `CreateDataIntegration`
+/// minted: that operation creates an integration which PULLS data from an external
+/// source into the service ("the URI of the data source", "the configuration for what
+/// files should be pulled from the source"), and such an integration is classified as an
+/// import. It is a constant of that class, not a per-run value: the recorded AWS
+/// `GetDataIntegration` responses in corpus `simparity-wire-aws-v1` report it for the
+/// integrations the corpus creates.
+pub const INTEGRATION_TYPE_IMPORT: &str = "IMPORT";
 
 /// The persisted `EventFilter` of an event integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +236,7 @@ impl EventIntegrationRecord {
     }
 
     /// This record's tags as the modelled `TagMap` (see [`modeled_tags`]).
-    pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
+    pub fn modeled_tags(&self) -> HashMap<String, String> {
         modeled_tags(&self.tags)
     }
 
@@ -216,7 +248,7 @@ impl EventIntegrationRecord {
             description: self.description.clone(),
             event_filter: Some(self.modeled_event_filter()),
             event_bridge_bus: Some(self.event_bridge_bus.clone()),
-            tags: self.modeled_tags(),
+            tags: Some(self.modeled_tags()),
         }
     }
 }
@@ -238,15 +270,21 @@ pub struct ApplicationRecord {
     pub namespace: String,
     pub description: Option<String>,
     pub application_source_config: ApplicationSourceConfig,
-    pub subscriptions: Option<Vec<Subscription>>,
-    pub publications: Option<Vec<Publication>>,
-    pub permissions: Option<Vec<String>>,
+    /// The members below that are NOT optional are the ones this service fills in for
+    /// an application whose create named none of them, so a read reports the stored
+    /// default rather than nothing at all: the three collections start EMPTY, the
+    /// iframe configuration starts as the empty structure, and the application type
+    /// starts as the one [`assigned_application_type`] assigns. An update replaces each
+    /// of them whole, exactly as it replaces a value a create did supply.
+    pub subscriptions: Vec<Subscription>,
+    pub publications: Vec<Publication>,
+    pub permissions: Vec<String>,
     pub tags: BTreeMap<String, String>,
     pub is_service: bool,
     pub initialization_timeout: Option<i32>,
     pub application_config: Option<ApplicationConfig>,
-    pub iframe_config: Option<IframeConfig>,
-    pub application_type: Option<String>,
+    pub iframe_config: IframeConfig,
+    pub application_type: String,
     pub auth_config: Option<AuthConfig>,
     pub client_token: Option<String>,
     pub created_time: SystemTime,
@@ -255,7 +293,7 @@ pub struct ApplicationRecord {
 
 impl ApplicationRecord {
     /// This record's tags as the modelled `TagMap` (see [`modeled_tags`]).
-    pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
+    pub fn modeled_tags(&self) -> HashMap<String, String> {
         modeled_tags(&self.tags)
     }
 }
@@ -270,6 +308,9 @@ pub struct DataIntegrationRecord {
     pub name: String,
     pub description: Option<String>,
     pub kms_key: String,
+    /// How this service classifies the integration — a value it assigns, not one the
+    /// create carries (see [`INTEGRATION_TYPE_IMPORT`]).
+    pub integration_type: String,
     pub source_uri: Option<String>,
     pub schedule_configuration: Option<ScheduleConfiguration>,
     pub file_configuration: Option<FileConfiguration>,
@@ -287,7 +328,7 @@ pub struct DataIntegrationRecord {
 
 impl DataIntegrationRecord {
     /// This record's tags as the modelled `TagMap` (see [`modeled_tags`]).
-    pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
+    pub fn modeled_tags(&self) -> HashMap<String, String> {
         modeled_tags(&self.tags)
     }
 

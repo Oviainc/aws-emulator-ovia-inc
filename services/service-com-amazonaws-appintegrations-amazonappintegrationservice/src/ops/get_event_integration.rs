@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             event_integration_arn: Some(record.arn.clone()),
             event_bridge_bus: Some(record.event_bridge_bus.clone()),
             event_filter: Some(record.modeled_event_filter()),
-            tags: record.modeled_tags(),
+            tags: Some(record.modeled_tags()),
         })
     }
 }

@@ -7,6 +7,12 @@
 //! minted. The record is the only source `GetApplication` reads, so nothing here
 //! reaches a later reader without being persisted first.
 //!
+//! Where the request names none of them, this operation also persists the values the
+//! SERVICE fills in: an empty `Subscriptions`, `Publications` and `Permissions`, an
+//! empty `IframeConfig`, and the `ApplicationType` the service assigns an application
+//! of this kind ([`crate::state::assigned_application_type`]). They are stored, not
+//! defaulted on the way out, so every read path reports one value.
+//!
 //! An application's identity is its (`Namespace`, `Name`) pair: a create whose pair
 //! is already taken is refused with `DuplicateResourceException` (HTTP 409) and
 //! persists nothing. A create past this emulator's stored-application bound is
@@ -258,9 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace: input.namespace,
             description: input.description,
             application_source_config: input.application_source_config,
-            subscriptions: input.subscriptions,
-            publications: input.publications,
-            permissions: input.permissions,
+            subscriptions: input.subscriptions.unwrap_or_default(),
+            publications: input.publications.unwrap_or_default(),
+            permissions: input.permissions.unwrap_or_default(),
             tags: input
                 .tags
                 .unwrap_or_default()
@@ -269,8 +275,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             is_service: input.is_service,
             initialization_timeout: input.initialization_timeout,
             application_config: input.application_config,
-            iframe_config: input.iframe_config,
-            application_type: input.application_type,
+            iframe_config: input.iframe_config.unwrap_or_default(),
+            // The members this service fills in when the request names none: a
+            // collection the caller left unset is stored EMPTY and the iframe
+            // configuration as the empty structure (both above), and the application
+            // type as the one the service assigns an application of this kind — so
+            // every one of them is a stored value a read reports, not an absence.
+            application_type: input
+                .application_type
+                .unwrap_or_else(|| crate::state::assigned_application_type(input.is_service).to_string()),
             auth_config: input.auth_config,
             client_token: input.client_token.clone(),
             created_time: now,

@@ -163,7 +163,6 @@ fn assert_reports_request(label: &str, reply: &Reply, case: &Case, kms_key: &str
         ("ScheduleConfig", "ScheduleConfiguration"),
         ("FileConfiguration", "FileConfiguration"),
         ("ObjectConfiguration", "ObjectConfiguration"),
-        ("Tags", "Tags"),
     ] {
         assert_eq!(
             reply.field(reported_member),
@@ -173,6 +172,15 @@ fn assert_reports_request(label: &str, reply: &Reply, case: &Case, kms_key: &str
             reply.field(reported_member)
         );
     }
+    // `Tags` is a member the SERVICE fills in: an untagged integration reports the empty
+    // map rather than no member at all.
+    let expected_tags = request.get("Tags").cloned().unwrap_or_else(|| json!({}));
+    assert_eq!(
+        reply.field("Tags"),
+        Some(&expected_tags),
+        "case {label:?}: expected Tags {expected_tags}, got {:?}",
+        reply.field("Tags")
+    );
 
     let id = reply
         .string("Id")
@@ -229,6 +237,14 @@ async fn a_created_data_integration_is_reported_by_get_and_list_exactly_as_store
                 fetched.status, fetched.body
             );
             assert_reports_request(&format!("{label} (get {form})"), &fetched, &case, &kms_key);
+            // The kind of integration is reported by the read, from what the create
+            // persisted: `CreateDataIntegration` mints an import integration.
+            assert_eq!(
+                fetched.string("IntegrationType").as_deref(),
+                Some("IMPORT"),
+                "case {label:?} {form}: expected the service-assigned IntegrationType, got {:?}",
+                fetched.field("IntegrationType")
+            );
             assert_eq!(
                 fetched.string("Id"),
                 Some(id.clone()),

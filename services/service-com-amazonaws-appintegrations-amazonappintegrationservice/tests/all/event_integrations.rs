@@ -217,14 +217,11 @@ fn assert_reported_case(label: &str, reply: &Reply, expected: &Case, region: &st
         "case {label:?}: expected the persisted Description, got {:?}",
         reply.string("Description")
     );
-    let expected_tags = if expected.tags.is_empty() {
-        None
-    } else {
-        Some(json!(expected.tags))
-    };
+    // An untagged integration reports an EMPTY tag map, not an absent member.
+    let expected_tags = json!(expected.tags);
     assert_eq!(
-        reply.field("Tags").cloned(),
-        expected_tags,
+        reply.field("Tags"),
+        Some(&expected_tags),
         "case {label:?}: expected Tags {expected_tags:?}, got {:?}",
         reply.field("Tags")
     );

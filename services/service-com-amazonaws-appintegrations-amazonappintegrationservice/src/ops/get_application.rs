@@ -11,6 +11,17 @@
 //! `ResourceNotFoundException` (HTTP 404), worded by
 //! [`crate::state::application_not_found`] like every other 404 of this service.
 //!
+//! ## What a read always reports
+//!
+//! Every member this SERVICE fills in is reported whether or not the create named it:
+//! `Publications`, `Subscriptions` and `Permissions` read back as the empty list, `Tags`
+//! as the empty map, `IframeConfig` as the empty structure, and `ApplicationType` as the
+//! type the service assigned the application (see
+//! [`crate::state::assigned_application_type`]) — so a client can tell "none" from "not
+//! reported". A member the service assigns no default to (`Description`,
+//! `InitializationTimeout`, `ApplicationConfig`, `AuthConfig`) stays absent until a
+//! caller sets it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,19 +213,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace: Some(record.namespace.clone()),
             description: record.description.clone(),
             application_source_config: Some(record.application_source_config.clone()),
-            subscriptions: record.subscriptions.clone(),
-            publications: record.publications.clone(),
+            // The members the SERVICE fills in are always reported, whether or not the
+            // create named them: an unset collection reads back empty, an unset iframe
+            // configuration as the empty structure, an untagged application as the
+            // empty tag map, and the application type as the one the service assigned.
+            // `crate::state::ApplicationRecord` holds each of them as a value rather
+            // than an option, so this projection has nothing to default.
+            subscriptions: Some(record.subscriptions.clone()),
+            publications: Some(record.publications.clone()),
             created_time: Some(::aws_smithy_types::DateTime::from(record.created_time)),
             last_modified_time: Some(::aws_smithy_types::DateTime::from(
                 record.last_modified_time,
             )),
-            tags: record.modeled_tags(),
-            permissions: record.permissions.clone(),
+            tags: Some(record.modeled_tags()),
+            permissions: Some(record.permissions.clone()),
             is_service: record.is_service,
             initialization_timeout: record.initialization_timeout,
             application_config: record.application_config.clone(),
-            iframe_config: record.iframe_config.clone(),
-            application_type: record.application_type.clone(),
+            iframe_config: Some(record.iframe_config.clone()),
+            application_type: Some(record.application_type.clone()),
             auth_config: record.auth_config.clone(),
         })
     }

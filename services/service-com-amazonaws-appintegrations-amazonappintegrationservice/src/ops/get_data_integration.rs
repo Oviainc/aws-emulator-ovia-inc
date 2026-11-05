@@ -5,6 +5,19 @@
 //! Reports one stored data integration exactly as it is persisted. A pure read: it
 //! never writes, so what a later caller sees is unchanged by it.
 //!
+//! ## `IntegrationType`, a member added to this service's model
+//!
+//! The shipped model declares `GetDataIntegrationResponse` without an `IntegrationType`
+//! member, while the recorded AWS responses in corpus `simparity-wire-aws-v1` report the
+//! kind of integration that was read back. A schema-driven serializer cannot emit a
+//! member the model does not declare, so `IntegrationType` was ADDED to
+//! `smithy-model/com-amazonaws-appintegrations-amazonappintegrationservice.json`. The
+//! value is one the SERVICE assigns and the create persists (see
+//! [`crate::state::INTEGRATION_TYPE_IMPORT`]); this read only reports it.
+//!
+//! `Tags` is reported for every integration, as the empty map when it carries none (see
+//! [`crate::state::modeled_tags`]), so a client can tell "no tags" from "not reported".
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -64,6 +77,8 @@
 //!   unique identifier.
 //! * `KmsKey` (NonBlankString, len 1..255, pattern \S) — The KMS key ARN for the
 //!   DataIntegration.
+//! * `IntegrationType` (NonBlankString, len 1..255, pattern \S) — The type of the
+//!   DataIntegration. ADDED to this service's model (see above).
 //! * `Name` (Name, len 1..255, pattern ^[a-zA-Z0-9\/\._\-]+$) — The name of the
 //!   DataIntegration.
 //! * `ObjectConfiguration` (ObjectConfiguration) — The configuration for what data should be
@@ -186,9 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: Some(record.name.clone()),
             description: record.description.clone(),
             kms_key: Some(record.kms_key.clone()),
+            integration_type: Some(record.integration_type.clone()),
             source_uri: record.source_uri.clone(),
             schedule_configuration: record.schedule_configuration.clone(),
-            tags: record.modeled_tags(),
+            tags: Some(record.modeled_tags()),
             file_configuration: record.file_configuration.clone(),
             object_configuration: record.object_configuration.clone(),
         })
