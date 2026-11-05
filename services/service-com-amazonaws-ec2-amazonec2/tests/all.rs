@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `CreateDefaultVpc` creates and what it refuses: the default VPC of the Region the
+// request is signed for — the /16, a default subnet in every Availability Zone of that Region
+// and the VPC's default security group — and the `DefaultVpcAlreadyExists` refusal a Region
+// that already has one answers. Declared beside `prefix_lists` for the reason the note above
+// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
+// inserts its lines.
+#[path = "all/create_default_vpc.rs"]
+mod create_default_vpc;
 // What `ReplaceNetworkAclEntry` overwrites: the one rule a network ACL holds at a rule number
 // in a direction, replaced in place and read back through `DescribeNetworkAcls`, beside the
 // rule a replacement may not write and the refusals it answers. Declared beside

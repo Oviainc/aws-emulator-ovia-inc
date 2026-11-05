@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDefaultVpc
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDefaultVpc`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates the Region's default VPC — a `/16` at
+//! [`crate::state::DEFAULT_VPC_CIDR_BLOCK`] with a default subnet in every Availability Zone
+//! of the Region and that VPC's default security group — and refuses with
+//! `DefaultVpcAlreadyExists` when the account already has one there.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDefaultVpc::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +133,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDefaultVpc` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDefaultVpcErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        // Which Region's default VPC this is about: the Region of the request's own
+        // credential scope, the way every other operation of this crate reads it. A default
+        // VPC is per Region, and its subnets' zones and its group's ARN name that Region.
+        let region = state::request_region(ctx.parts());
+
+        // Decided before the store is even reached, because the Region of a credential scope
+        // is caller-controlled text: a Region the catalog does not hold has no Availability
+        // Zone to put a default subnet in, and a default VPC without its subnets is not a
+        // default VPC, so a string merely shaped like a Region code is refused rather than
+        // served a network with nothing in it.
+        if !state::is_catalog_region(&region) {
+            return Err(state::unsupported_operation(format!(
+                "Default VPCs are not supported in the Region '{region}'"
+            )));
+        }
+
+        let mut store = state_handle.lock();
+
+        // "You cannot have more than one default VPC per Region" (`CreateDefaultVpc`), and
+        // the account has held one in every Region since it existed: "when you create an AWS
+        // account, we create a default VPC for you in each AWS Region" (Amazon VPC User
+        // Guide, "Default VPCs"). So the Region's own index answers the question — a
+        // READ, which is why this refusal writes nothing: a Region whose network no call has
+        // materialised yet is still a Region the account has a default VPC in, and only a
+        // Region whose default VPC was DELETED has none.
+        if store.holds_or_owes_default_vpc(&region) {
+            return Err(state::default_vpc_already_exists());
+        }
+
+        // Past here the account has no default VPC in this Region, so this request creates
+        // one: "if you deleted your previous default VPC, you can create a default VPC".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDefaultVpc"))
+        // Every ceiling the WHOLE network would have to clear, each answered with its own
+        // quota code, and all of them asked before anything is written so a store at a
+        // ceiling stores nothing rather than a VPC without the subnets and the group that
+        // make it a default VPC.
+        if !store.has_vpc_capacity() {
+            return Err(state::vpc_limit_exceeded());
+        }
+        if !store.has_subnet_capacity_for(state::availability_zones_in_region(&region).len()) {
+            return Err(state::subnet_limit_exceeded());
+        }
+        if !store.has_security_group_capacity() {
+            return Err(state::security_group_limit_exceeded());
+        }
+        // The Region's default DHCP option set, which the VPC inherits and the first VPC of
+        // a Region mints: a count ceiling of its own, and bytes charged against the crate's
+        // one byte budget.
+        if !store.has_dhcp_option_set_capacity(&region) {
+            return Err(state::dhcp_options_limit_exceeded());
+        }
+        let payload_bytes = store.unheld_default_dhcp_options_bytes(&region);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The network itself — the ONLY write this handler makes, on the success path alone
+        // and after every gate above. It goes through the one way this crate writes a
+        // default VPC, which is what keeps a created default VPC identical to the one a
+        // fresh account holds: the `/16`, a default subnet in each zone of the Region, the
+        // default security group, and the Region's record of which VPC is its default now.
+        // The VPC is answered `pending`, with the instant the clock owes it `available`
+        // recorded beside it.
+        let Some(vpc_id) = store.create_default_network(&region) else {
+            return Err(state::internal_error(
+                "the default network this Region has room for could not be written",
+            ));
+        };
+
+        // The answer is the record as it was stored, so `CreateDefaultVpc` and
+        // `DescribeVpcs` cannot drift apart.
+        let Some(vpc) = store.vpcs.get(&vpc_id).cloned() else {
+            return Err(state::internal_error(
+                "the default VPC just created could not be read back",
+            ));
+        };
+        Ok(CreateDefaultVpcOutput { vpc: Some(vpc) })
     }
 }
