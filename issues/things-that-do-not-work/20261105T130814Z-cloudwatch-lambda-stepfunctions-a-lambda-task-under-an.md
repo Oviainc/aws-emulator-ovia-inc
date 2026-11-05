@@ -1,0 +1,40 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-invoke-denied-role-fails-execution-function-series-empty
+Issue-Key: cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-invoke-denied-role-fails-execution-function-series-empty|_stats#24|Timeout|return cw.get_metric_statistics(
+Issue-Commit: 4ea4135ffc45124de73d742abfb17fa157c26a91
+
+# cloudwatch__lambda__stepfunctions: a Lambda Task under an execution role denied lambda:InvokeFunction never reaches a terminal FAILED execution, so the denied function's AWS/States LambdaFunctions* counters are never readable
+
+> _Note: this issue was identified against the code base at commit `4ea4135ffc45124de73d742abfb17fa157c26a91`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeExecution
+
+## Description
+Cause 1 of 1: the Step Functions Task-state Lambda integration performs no authorization of the state machine's execution role, so an execution whose role carries no lambda:InvokeFunction grant never terminates as FAILED, and the CloudWatch series the denied task must move (and must NOT move) can never be contrasted.
+
+AWS: StartExecution is accepted for a state machine whose roleArn is not permitted lambda:InvokeFunction on the task's target function; Step Functions then assumes that role, the Invoke is refused, the Task fails and the execution reaches a terminal status. DescribeExecution (Smithy: sfn#DescribeExecution output members status -> ExecutionStatus enum, error -> SensitiveError @length max 256, cause -> SensitiveCause @length max 32768) then reports status FAILED with error exactly `Lambda.AWSLambdaException` and a cause that is Lambda's 403 authorization text. That message's fixed text is `... is not authorized to perform: lambda:InvokeFunction on resource: ...`; its variable parts are the assumed-role principal ARN and the target function ARN taken from the request and the emulator's own state (never the literal principal/function of one recording). For the metric side the Smithy models say nothing about publication, so: recorded behavior only — real AWS still counts the refused task in the function's AWS/States family under Dimensions exactly [LambdaFunctionArn] (LambdaFunctionsScheduled 1, LambdaFunctionsStarted 1, LambdaFunctionsFailed 1) and in AWS/States ExecutionsFailed 1 under [StateMachineArn], while leaving LambdaFunctionsSucceeded under [LambdaFunctionArn], ExecutionsSucceeded under [StateMachineArn] and AWS/Lambda Invocations for that function with no positive Sum. Granting lambda:InvokeFunction to the same role afterwards lets the same state machine succeed and return the handler's payload.
+
+Emulator: nothing on that path is observable. The replay ends with `Error: Check timed out after 60.0s` (verdict [mismatch]): the denied execution does not settle into a terminal FAILED status with error `Lambda.AWSLambdaException`, so the poll for a terminal status and the subsequent poll for the moved/unmoved metric sums never complete. No authorization decision is taken for the execution role before the integration call, and no AWS/States LambdaFunctions* data points attributed to [LambdaFunctionArn] are produced.
+
+Why: a client relying on AWS's behavior cannot distinguish a denied workflow from one that never ran. Negative least-privilege tests are unverifiable, Catch/Retry branches keyed on Lambda.AWSLambdaException are unreachable, DescribeExecution pollers block instead of reading a terminal status, and alarms over AWS/States LambdaFunctionsFailed / ExecutionsFailed stay silent for a workflow real AWS refuses.
+
+Fix: the Step Functions execution/Task-dispatch path (the component that resolves the state machine's roleArn and dispatches the Lambda integration for both bare-function-ARN and optimized `arn:aws:states:::lambda:invoke` Resource forms) must authorize the integration action/resource under the assumed execution role, fail the task with error `Lambda.AWSLambdaException` and the authorization cause, drive the execution to the terminal FAILED status reported by DescribeExecution, and emit the corresponding AWS/States LambdaFunctionsScheduled/Started/Failed points under the [LambdaFunctionArn] dimension plus ExecutionsFailed under [StateMachineArn]. Two open issues describe neighbouring symptoms of this area but do not carry this check's replay key: 20261105T081644Z-cloudwatch-lambda-stepfunctions-a-lambda-task-whose-function.md (handler exception not failing the task; its key is the _poll/_warm site of an earlier run) and 20261101T210635Z-cloudwatch-lambda-sfn-step-functions-lambda-task-work.md (the [LambdaFunctionArn] metric family never materialising). The replay now hangs at a different site than either key, so this is filed as a surviving cause rather than as covered by them.
+
+Traces: cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-invoke-denied-role-fails-execution-function-series-empty.
+
+## Evidence
+Expected: DescribeExecution on the execution started against the state machine whose role has no lambda:InvokeFunction grant returns status `FAILED`, error `Lambda.AWSLambdaException`, and a cause containing the fixed text `not authorized to perform: lambda:InvokeFunction` with the assumed-role principal and the target function ARN filled in from the request/state; GetMetricStatistics then reads, over the execution window, AWS/States LambdaFunctionsScheduled = 1, LambdaFunctionsStarted = 1 and LambdaFunctionsFailed = 1 under Dimensions [LambdaFunctionArn = <denied function>], AWS/States ExecutionsFailed = 1 under [StateMachineArn = <denied machine>], and no positive Sum for AWS/States LambdaFunctionsSucceeded under [LambdaFunctionArn], AWS/States ExecutionsSucceeded under [StateMachineArn], or AWS/Lambda Invocations under [FunctionName]; after put_role_policy grants lambda:InvokeFunction, a new execution of the SAME machine ends SUCCEEDED with the handler's payload as output.
+
+Actual: `Error: Check timed out after 60.0s` (verdict [mismatch]) — the denied execution never reaches a terminal FAILED status with that error/cause, so the terminal-status poll and the metric-sum poll never settle and no verdict is produced. The report lists this check under `### cloudwatch__lambda__stepfunctions` and marks it neither ALREADY FILED nor OWNED.
+
+## Steps to Reproduce
+1. Create two IAM roles trusted by states.amazonaws.com: a control role with `lambda:InvokeFunction` allowed on the control function (and its :* alias form), and a subject role with NO lambda:InvokeFunction statement.
+2. Create two python3.12 Lambda functions whose handler returns {'echo': event['n']} (one control, one subject) and wait for them to become Active.
+3. Create two STANDARD state machines, each with a single Task state whose Resource is the corresponding bare function ARN and End: true — one with the control role, one with the subject (denied) role.
+4. StartExecution on the control machine with input {"mode":"ok","n":7} and poll DescribeExecution until terminal: it SUCCEEDS.
+5. StartExecution on the denied machine with the same input and poll DescribeExecution until terminal. Expected: status FAILED, error `Lambda.AWSLambdaException`, cause naming `not authorized to perform: lambda:InvokeFunction` on the subject function ARN. Observed against the emulator: no terminal FAILED outcome arrives, so the poll runs to the harness budget.
+6. Call GetMetricStatistics (Period 60, Statistics [Sum]) over the execution window for AWS/States LambdaFunctionsScheduled/Started/Failed/Succeeded with Dimensions [LambdaFunctionArn], AWS/States ExecutionsFailed/ExecutionsSucceeded with [StateMachineArn], and AWS/Lambda Invocations with [FunctionName]: the denied-path counters AWS publishes never appear.
+7. put_role_policy the lambda:InvokeFunction grant onto the subject role and StartExecution the same denied machine again: it must now reach SUCCEEDED with output {"echo": 9}.
