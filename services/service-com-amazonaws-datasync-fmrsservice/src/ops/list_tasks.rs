@@ -154,28 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let after_seq = match input.next_token.as_deref().map(decode_cursor) {
-            None => 0,
-            Some(Some(seq)) => seq,
-            Some(None) => {
-                return Err(ListTasksErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some("NextToken is not a token this service issued.".to_string()),
-                        error_code: None,
-                        datasync_error_code: None,
-                    },
-                )
-                .into())
-            }
-        };
-
-        // `MaxResults` is modelled `0..100`; a request that declares no page size, or
-        // declares one that carries nothing, gets the largest page the member admits.
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .filter(|max| *max > 0)
-            .unwrap_or(crate::state::LIST_TASKS_DEFAULT_PAGE_SIZE);
+        let after_seq =
+            crate::state::listing::resume_after(input.next_token.as_deref()).map_err(refused)?;
+        let page_size = crate::state::listing::page_size(input.max_results);
 
         let filters = input.filters.unwrap_or_default();
         let mut store = state.lock();
@@ -209,9 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListTasksOutput {
             tasks: Some(tasks),
+
             // Only a truncated page has a next one; the final page carries no token.
             next_token: if truncated {
-                page_ended_after.map(encode_cursor)
+                page_ended_after.map(crate::state::listing::encode_cursor)
             } else {
                 None
             },
@@ -219,25 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The opaque `NextToken` for a page that ended after creation sequence `seq`.
-///
-/// Hex-encoded, so the token matches the member's modelled
-/// `^[a-zA-Z0-9=_-]+$` pattern and carries no meaning a client could construct.
-fn encode_cursor(seq: u64) -> String {
-    hex::encode(format!("{CURSOR_VERSION}:{seq}"))
+/// This operation's modelled client error, from a shared listing refusal.
+fn refused(refusal: crate::state::listing::FilterRefusal) -> ListTasksError {
+    ListTasksErrorModeled::InvalidRequestException(refusal.into_invalid_request()).into()
 }
-
-/// The creation sequence a `NextToken` resumes after, or `None` when the token is not
-/// one [`encode_cursor`] produced.
-fn decode_cursor(token: &str) -> Option<u64> {
-    let decoded = hex::decode(token).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    decoded.strip_prefix(CURSOR_VERSION)?.strip_prefix(':')?.parse().ok()
-}
-
-/// Stamped into every cursor so a token from an older encoding is rejected rather
-/// than misread.
-const CURSOR_VERSION: &str = "v1";
 
 /// Whether `task` satisfies every filter in `filters` (a request with none matches all
 /// tasks, which is what makes `Filters` optional).
@@ -264,103 +231,34 @@ fn matches_filter(
     task: &crate::state::Task,
     filter: &TaskFilter,
 ) -> Result<bool, ListTasksError> {
+    use crate::state::listing;
     match filter.name.as_str() {
         "LocationId" => {
             // A negated operator is the negation of its positive form, so it must hold
             // for BOTH of the task's locations: a task "not on" a location is one
             // neither side of which is that location.
-            let (positive, negated) = match filter.operator.as_str() {
-                "NotEquals" => ("Equals", true),
-                "NotContains" => ("Contains", true),
-                other => (other, false),
-            };
-            let source = text_matches(positive, &task.source_location_arn, &filter.values);
+            let (positive, negated) = listing::negated(&filter.operator);
+            let source =
+                listing::text_matches(positive, &task.source_location_arn, &filter.values);
             let destination =
-                text_matches(positive, &task.destination_location_arn, &filter.values);
+                listing::text_matches(positive, &task.destination_location_arn, &filter.values);
             match (source, destination) {
                 (Some(source), Some(destination)) => Ok((source || destination) != negated),
-                _ => Err(unsupported_operator(&filter.operator, &filter.name)),
+                _ => Err(refused(listing::FilterRefusal::unsupported_operator(
+                    &filter.operator,
+                    &filter.name,
+                ))),
             }
         }
-        "CreationTime" => {
-            let created = crate::state::as_timestamp(task.creation_time).as_secs_f64();
-            let mut bounds = Vec::with_capacity(filter.values.len());
-            for value in &filter.values {
-                let Some(parsed) = parse_instant(value) else {
-                    return Err(ListTasksErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(format!(
-                                "Filter CreationTime value {value} is not a timestamp."
-                            )),
-                            error_code: None,
-                            datasync_error_code: None,
-                        },
-                    )
-                    .into());
-                };
-                bounds.push(parsed);
-            }
-            number_matches(&filter.operator, created, &bounds)
-                .ok_or_else(|| unsupported_operator(&filter.operator, &filter.name))
-        }
-        other => Err(ListTasksErrorModeled::InvalidRequestException(
-            InvalidRequestException {
-                message: Some(format!("Filter name {other} is not supported by ListTasks.")),
-                error_code: None,
-                datasync_error_code: None,
-            },
+        "CreationTime" => listing::creation_time_matches(
+            &filter.name,
+            &filter.operator,
+            task.creation_time,
+            &filter.values,
         )
-        .into()),
+        .map_err(refused),
+        other => Err(refused(listing::FilterRefusal::unsupported_filter_name(
+            other, "ListTasks",
+        ))),
     }
-}
-
-/// A refusal for an operator the filtered attribute cannot be compared with.
-fn unsupported_operator(operator: &str, name: &str) -> ListTasksError {
-    ListTasksErrorModeled::InvalidRequestException(InvalidRequestException {
-        message: Some(format!(
-            "Operator {operator} cannot be used with filter name {name}."
-        )),
-        error_code: None,
-        datasync_error_code: None,
-    })
-    .into()
-}
-
-/// `attribute` against `values` under a textual operator, or `None` when the modelled
-/// `Operator` is one that only orders numbers.
-///
-/// The operators are the positive members of the model's `Operator` enum: `Equals`,
-/// `In`, `Contains` and `BeginsWith`. A multi-valued filter matches when any value
-/// matches. Callers apply `NotEquals`/`NotContains` by negating the positive form.
-fn text_matches(operator: &str, attribute: &str, values: &[String]) -> Option<bool> {
-    match operator {
-        "Equals" | "In" => Some(values.iter().any(|value| value == attribute)),
-        "Contains" => Some(values.iter().any(|value| attribute.contains(value.as_str()))),
-        "BeginsWith" => Some(values.iter().any(|value| attribute.starts_with(value.as_str()))),
-        _ => None,
-    }
-}
-
-/// `attribute` against `values` under an operator that orders numbers, or `None` when
-/// the modelled `Operator` is one that only compares text.
-fn number_matches(operator: &str, attribute: f64, values: &[f64]) -> Option<bool> {
-    match operator {
-        "Equals" | "In" => Some(values.contains(&attribute)),
-        "NotEquals" => Some(values.iter().all(|value| *value != attribute)),
-        "GreaterThan" => Some(values.iter().any(|value| attribute > *value)),
-        "GreaterThanOrEqual" => Some(values.iter().any(|value| attribute >= *value)),
-        "LessThan" => Some(values.iter().any(|value| attribute < *value)),
-        "LessThanOrEqual" => Some(values.iter().any(|value| attribute <= *value)),
-        _ => None,
-    }
-}
-
-/// A filter value read as an instant: epoch seconds, or an RFC 3339 date-time.
-fn parse_instant(value: &str) -> Option<f64> {
-    if let Ok(seconds) = value.parse::<f64>() {
-        return Some(seconds);
-    }
-    ::aws_smithy_types::DateTime::from_str(value, ::aws_smithy_types::date_time::Format::DateTime)
-        .ok()
-        .map(|parsed| parsed.as_secs_f64())
 }

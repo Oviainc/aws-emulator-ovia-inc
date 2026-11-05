@@ -19,6 +19,8 @@ mod bounded_stores;
 mod efs_location;
 #[path = "all/location_deletion.rs"]
 mod location_deletion;
+#[path = "all/location_listing.rs"]
+mod location_listing;
 #[path = "all/object_storage_location.rs"]
 mod object_storage_location;
 #[path = "all/state_roundtrip.rs"]

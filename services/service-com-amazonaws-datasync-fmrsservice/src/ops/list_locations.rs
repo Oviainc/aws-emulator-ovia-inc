@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the transfer locations this service holds, in creation order, applying
+//! the request's `Filters` and truncating at `MaxResults`. The `NextToken` it returns
+//! is an opaque cursor carrying the creation sequence the next page resumes after, so a
+//! page boundary is exact even when a location is deleted between pages; the final page
+//! carries no token. A token this service did not issue is `InvalidRequestException`
+//! (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLocations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLocationsErrorModeled::InternalException(InternalException {
+                message: Some(
+                    "the DataSync emulator could not reach its state store".to_string(),
+                ),
+                error_code: None,
+            })
+            .into());
+        };
+
+        let after_seq =
+            crate::state::listing::resume_after(input.next_token.as_deref()).map_err(refused)?;
+        let page_size = crate::state::listing::page_size(input.max_results);
+        let filters = input.filters.unwrap_or_default();
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // Every location the request asks for, in creation order, from the cursor on.
+        let mut matching: Vec<(u64, LocationListEntry)> = Vec::new();
+        for location in store.locations_in_creation_order() {
+            if location.seq <= after_seq {
+                continue;
+            }
+            if !matches_all_filters(location, &filters)? {
+                continue;
+            }
+            matching.push((
+                location.seq,
+                LocationListEntry {
+                    location_arn: Some(location.arn.clone()),
+                    location_uri: Some(location.location_uri.clone()),
+                },
+            ));
+        }
+        drop(store);
+
+        let truncated = matching.len() > page_size;
+        matching.truncate(page_size);
+        let page_ended_after = matching.last().map(|(seq, _)| *seq);
+        let locations: Vec<LocationListEntry> =
+            matching.into_iter().map(|(_, entry)| entry).collect();
+
+        Ok(ListLocationsOutput {
+            locations: Some(locations),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(crate::state::listing::encode_cursor)
+            } else {
+                None
+            },
+        })
     }
+}
+
+/// This operation's modelled client error, from a shared listing refusal.
+fn refused(refusal: crate::state::listing::FilterRefusal) -> ListLocationsError {
+    ListLocationsErrorModeled::InvalidRequestException(refusal.into_invalid_request()).into()
+}
+
+/// Whether `location` satisfies every filter in `filters` (a request with none matches
+/// all locations, which is what makes `Filters` optional).
+fn matches_all_filters(
+    location: &crate::state::Location,
+    filters: &[LocationFilter],
+) -> Result<bool, ListLocationsError> {
+    for filter in filters {
+        if !matches_filter(location, filter)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `location` satisfies one filter.
+///
+/// The modelled `LocationFilterName` admits `LocationUri`, `LocationType` and
+/// `CreationTime`. `LocationUri` is compared against the location's stored URI as text.
+/// `LocationType` is compared against the kind of storage the location addresses,
+/// with the separators of a multi-word type name normalised away on both sides so a
+/// request spelling one with a hyphen, an underscore or nothing at all names the same
+/// kind. `CreationTime` is compared as an instant, not as text.
+fn matches_filter(
+    location: &crate::state::Location,
+    filter: &LocationFilter,
+) -> Result<bool, ListLocationsError> {
+    use crate::state::listing;
+    match filter.name.as_str() {
+        "LocationUri" => {
+            listing::text_matches_signed(&filter.operator, &location.location_uri, &filter.values)
+                .ok_or_else(|| {
+                    refused(listing::FilterRefusal::unsupported_operator(
+                        &filter.operator,
+                        &filter.name,
+                    ))
+                })
+        }
+        "LocationType" => {
+            let kind = normalized_type(location.config.kind().type_name());
+            let values: Vec<String> = filter.values.iter().map(|v| normalized_type(v)).collect();
+            listing::text_matches_signed(&filter.operator, &kind, &values).ok_or_else(|| {
+                refused(listing::FilterRefusal::unsupported_operator(
+                    &filter.operator,
+                    &filter.name,
+                ))
+            })
+        }
+        "CreationTime" => listing::creation_time_matches(
+            &filter.name,
+            &filter.operator,
+            location.creation_time,
+            &filter.values,
+        )
+        .map_err(refused),
+        other => Err(refused(listing::FilterRefusal::unsupported_filter_name(
+            other,
+            "ListLocations",
+        ))),
+    }
+}
+
+/// A `LocationType` name with its case and separators normalised, so the one spelling
+/// of a kind this service stores compares equal to however a request spells it.
+fn normalized_type(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
 }

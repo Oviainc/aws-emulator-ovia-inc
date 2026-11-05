@@ -257,11 +257,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::LocationSecret::None
             };
 
-            let location_arn = store.mint_location_arn(&region);
+            let (location_arn, seq) = store.mint_location_arn(&region);
             store.locations.insert(
                 location_arn.clone(),
                 crate::state::Location {
                     arn: location_arn.clone(),
+                    seq,
                     location_uri,
                     subdirectory: input.subdirectory,
                     agent_arns: input.agent_arns.unwrap_or_default(),

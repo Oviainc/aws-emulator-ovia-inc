@@ -13,6 +13,8 @@
 //! * the modelled defaults ([`default_options`]) and the per-execution overlay
 //!   ([`overlay_options`]) that `CreateTask`, `StartTaskExecution` and the two
 //!   `Describe*` operations must agree on.
+//! * the paging and filtering every `List*` operation shares ([`listing`]): the opaque
+//!   cursor, the page size and the modelled comparison operators.
 //! * the object storage location members a `CreateLocationObjectStorage` and an
 //!   `UpdateLocationObjectStorage` have to resolve the same way
 //!   ([`DEFAULT_SERVER_PROTOCOL`], [`default_server_port`] and
@@ -20,6 +22,8 @@
 //!
 //! Resource ids are minted from monotonic counters held here, so every ARN this
 //! service hands out is also stored here and can be resolved again.
+
+pub mod listing;
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -55,11 +59,12 @@ const ARN_NAMESPACE: &str = "datasync";
 /// (`^(arn:…:secretsmanager:<region>:<account>:secret:.*|)$`).
 const SECRETS_MANAGER_ARN_NAMESPACE: &str = "secretsmanager";
 
-/// `ListTasks`' page size when the request declares none.
+/// A `List*` operation's page size when the request declares none.
 ///
-/// `MaxResults` is modelled `0..100`, so 100 is the largest page the service will
-/// ever return and is what an unspecified page size resolves to.
-pub const LIST_TASKS_DEFAULT_PAGE_SIZE: usize = 100;
+/// `MaxResults` is modelled `0..100` on every one of this service's list operations, so
+/// 100 is the largest page the service will ever return and is what an unspecified page
+/// size resolves to.
+pub const LIST_DEFAULT_PAGE_SIZE: usize = 100;
 
 /// A RESOURCE GUARD, not an AWS-published quota: every create call appends one record to
 /// one of this service's stores, which live in memory for the lifetime of the process and
@@ -151,6 +156,22 @@ impl LocationKind {
             format!("{scheme}://{global_id}/")
         } else {
             format!("{scheme}://{global_id}/{prefix}/")
+        }
+    }
+
+    /// How the modelled `LocationType` filter names this kind of location.
+    ///
+    /// The filter compares the kind of storage a location addresses — the shape's own
+    /// documentation filters Amazon S3 locations with `"Values": "S3"` — so each kind
+    /// contributes the upper-case name of its storage. A comparison normalises the
+    /// separators in a multi-word name away, so a request spelling one with a hyphen,
+    /// an underscore or nothing at all names the same kind.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::S3 => "S3",
+            Self::AzureBlob => "AZURE_BLOB",
+            Self::ObjectStorage => "OBJECT_STORAGE",
+            Self::Efs => "EFS",
         }
     }
 
@@ -319,6 +340,9 @@ impl LocationConfig {
 #[derive(Debug, Clone)]
 pub struct Location {
     pub arn: String,
+    /// The creation sequence this location was minted with — the order `ListLocations`
+    /// pages over, and what its opaque cursor resumes after.
+    pub seq: u64,
     pub location_uri: String,
     pub subdirectory: Option<String>,
     pub agent_arns: Vec<String>,
@@ -526,10 +550,15 @@ pub struct ComAmazonawsDatasyncFmrsserviceState {
 }
 
 impl ComAmazonawsDatasyncFmrsserviceState {
-    /// Mint the next `LocationArn`: `location/loc-<17 lowercase alphanumerics>`.
-    pub fn mint_location_arn(&mut self, region: &str) -> String {
+    /// Mint the next `LocationArn` and its creation sequence:
+    /// `location/loc-<17 lowercase alphanumerics>`.
+    pub fn mint_location_arn(&mut self, region: &str) -> (String, u64) {
         self.next_location_seq += 1;
-        emulator_arn(region, &format!("location/loc-{:017x}", self.next_location_seq))
+        let seq = self.next_location_seq;
+        (
+            emulator_arn(region, &format!("location/loc-{seq:017x}")),
+            seq,
+        )
     }
 
     /// Mint the next `TaskArn` and its creation sequence: `task/task-<17 hex digits>`.
@@ -760,6 +789,13 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         let mut tasks: Vec<&Task> = self.tasks.values().collect();
         tasks.sort_by_key(|task| task.seq);
         tasks
+    }
+
+    /// Locations in creation order — the order `ListLocations` pages over.
+    pub fn locations_in_creation_order(&self) -> Vec<&Location> {
+        let mut locations: Vec<&Location> = self.locations.values().collect();
+        locations.sort_by_key(|location| location.seq);
+        locations
     }
 }
 

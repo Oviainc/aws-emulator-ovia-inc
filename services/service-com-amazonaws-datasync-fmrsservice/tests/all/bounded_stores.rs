@@ -146,6 +146,9 @@ async fn the_location_store_is_bounded() {
                 arn.clone(),
                 state::Location {
                     arn,
+                    // The filler records sit before every minted location in creation
+                    // order, which is what `ListLocations` pages over.
+                    seq: 0,
                     location_uri: "azure-blob://filler.blob.core.windows.net/filler/".to_string(),
                     subdirectory: None,
                     agent_arns: Vec::new(),
