@@ -86,6 +86,11 @@ mod describe_ipam_pools;
 // through.
 #[path = "all/describe_ipam_resource_discoveries.rs"]
 mod describe_ipam_resource_discoveries;
+// What `DescribeIpamResourceDiscoveryAssociations` reports: the associations the store holds,
+// narrowed to the ids and filters the request carries, paged in association-id order, and the
+// `associate-complete` move the clock owes one it is read through.
+#[path = "all/describe_ipam_resource_discovery_associations.rs"]
+mod describe_ipam_resource_discovery_associations;
 // The entries (rules) of a network ACL: what `CreateNetworkAclEntry` stores on a stored ACL
 // and in which order, what `DeleteNetworkAclEntry` takes off it, and the not-found answer
 // every read of a `DeleteNetworkAcl`-ed ACL gets. Declared beside `prefix_lists` for the

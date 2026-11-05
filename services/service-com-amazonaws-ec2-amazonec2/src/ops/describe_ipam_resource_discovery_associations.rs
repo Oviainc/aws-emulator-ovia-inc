@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIpamResourceDiscoveryAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIpamResourceDiscoveryAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIpamResourceDiscoveryAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the IPAM resource discovery associations [`crate::state`] holds — the
+//! whole store by default, or the subset the request's `IpamResourceDiscoveryAssociationIds`
+//! and `Filters` select, one `MaxResults`-sized page at a time. A reporting operation: the
+//! only write it makes is to materialise the state transitions the clock has ALREADY made due
+//! (an association's `associate-in-progress` -> `associate-complete`), which were owed at the
+//! same instant whether or not anybody called. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,438 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIpamResourceDiscoveryAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIpamResourceDiscoveryAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — an association
+        // reports "the IPAM home Region" (`IpamResourceDiscoveryAssociation$IpamRegion`) off the
+        // IPAM it links, so the store is not per-Region. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+        use crate::state::{
+            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+        };
+
+        // "Specify the pagination token from a previous request to retrieve the next page of
+        // results" (`DescribeIpamResourceDiscoveryAssociationsRequest$NextToken`) — anything
+        // else is refused rather than read as an id, and it is refused before any other member
+        // is looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "The resource discovery association IDs" (`$IpamResourceDiscoveryAssociationIds`) is a
+        // plain `ValueStringList` with no modelled `@length`, and every id named is looked up,
+        // so the count is capped the way every other describe in this crate caps its own id
+        // list — before any work proportional to it.
+        let requested: &[String] = input
+            .ipam_resource_discovery_association_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request names {} IPAM resource discovery association ids, above the \
+                 maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored associations and the model
+        // bounds none of them (`Filters` is a plain `FilterList`), so the request-controlled
+        // factors are capped here, before any work proportional to them is done — and their
+        // PRODUCT is charged to one [`MatchBudget`] below, which is the bound the per-factor
+        // caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not resolve is refused whether or not any
+        // association would have matched it, so an unsupported filter can never read as "no
+        // results". Each filter's values are parsed into their wildcard patterns ONCE here, not
+        // once per candidate.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is bounded
+            // too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // The FORM of every id the request names, before anything is resolved: "not an id of
+        // this kind" is a fact about the request, so it is answered `.Malformed` ahead of the
+        // DryRun arm below and never as a missing association — the order every resource of
+        // this crate is held to ([`crate::state::require_well_formed_id`]).
+        for association_id in requested {
+            require_well_formed_ipam_resource_discovery_association_id(association_id)?;
+        }
+
+        // "A check for whether you have the required permissions for the action without
+        // actually making the request" (`$DryRun`). Every caller of this emulator is permitted,
+        // so a dry run reports that outcome and reads nothing. It sits AFTER every parameter has
+        // been validated: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call
+        // `DescribeIpamResourceDiscoveries` makes: an association
+        // `AssociateIpamResourceDiscovery` answered as `associate-in-progress` is
+        // `associate-complete` once its due instant has passed, whether or not anybody called,
+        // so applying it here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // An id that names no association of the account is an error, not an absent row — which
+        // is what lets a client tell a dangling reference from an association it simply cannot
+        // see. The request's OWN list decides which refusal is answered, so the id it names is
+        // the first one the caller asked for that could not be resolved rather than whichever
+        // sorts first.
+        let wanted_ids: ::std::collections::BTreeSet<&str> =
+            requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = requested.iter().find(|association_id| {
+            !store
+                .ipam_resource_discovery_associations
+                .contains_key(association_id.as_str())
+        }) {
+            return Err(invalid_ipam_resource_discovery_association_id_not_found(
+                unknown,
+            ));
+        }
+
+        // Everything the account holds, narrowed to the ids named, with every filter then
+        // holding ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`). Every comparison is charged to ONE budget, so the PRODUCT of stored
+        // associations, filters, values, held values and value length is bounded however the
+        // caller combines them — which is also what bounds how long this holds the state lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIpamResourceDiscoveryAssociations"))
+        // Both maps are borrowed once here: "the resource discovery status"
+        // (`IpamResourceDiscoveryAssociation$ResourceDiscoveryStatus`) is a fact about the
+        // DISCOVERY as it stands now, so it is read off the stored discovery for each candidate
+        // rather than taken from the association record, and the filters compare what this
+        // report carries rather than a value the report does not.
+        let associations = &store.ipam_resource_discovery_associations;
+        let discoveries = &store.ipam_resource_discoveries;
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<IpamResourceDiscoveryAssociation> = Vec::new();
+        for association in associations.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted_ids.is_empty()
+                && !association
+                    .ipam_resource_discovery_association_id
+                    .as_deref()
+                    .is_some_and(|id| wanted_ids.contains(id))
+            {
+                continue;
+            }
+            // The status this report carries for the discovery, read off that discovery now.
+            let status = reported_resource_discovery_status(
+                discoveries,
+                association.ipam_resource_discovery_id.as_deref(),
+            );
+            if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(association, status, name)
+            }) {
+                selected.push(IpamResourceDiscoveryAssociation {
+                    resource_discovery_status: Some(status.to_string()),
+                    ..association.clone()
+                });
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `IpamResourceDiscoveryAssociationId` order, which the cursor below names a
+        // position in. The store is an ordered map, so its iteration order already satisfies
+        // this sort; doing it here establishes the invariant the cursor depends on at the point
+        // of use rather than inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| {
+            left.ipam_resource_discovery_association_id
+                .cmp(&right.ipam_resource_discovery_association_id)
+        });
+
+        // That order is both the stable paging order and the cursor, so a token naming the id
+        // the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|association| {
+                association
+                    .ipam_resource_discovery_association_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of resource discovery associations to return in one page of
+        // results" (`$MaxResults`). A request that names none gets the largest page this
+        // service serves, so the `NextToken` path below behaves the same whether or not a page
+        // size was asked for. The model's `range 5..1000` has already refused anything outside
+        // it, so the only value that cannot convert is one the boundary validator would have
+        // rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeIpamResourceDiscoveryAssociationsResult$NextToken`): a token only when an
+        // association follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|association| association.ipam_resource_discovery_association_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeIpamResourceDiscoveryAssociationsOutput {
+            ipam_resource_discovery_associations: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
 }
+
+/// `InvalidIpamResourceDiscoveryAssociationId.Malformed` (HTTP 400): the request named
+/// something that is not an IPAM resource discovery association id at all, so there is nothing
+/// to look up — this resource's member of the `Invalid<Kind>.Malformed` family every id-taking
+/// operation of this crate answers
+/// (`crate::state::INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED` is the discovery's).
+pub const INVALID_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_MALFORMED: &str =
+    "InvalidIpamResourceDiscoveryAssociationId.Malformed";
+
+/// `InvalidIpamResourceDiscoveryAssociationId.NotFound` (HTTP 400): the request named a
+/// well-formed association id this account holds no association for — this resource's member of
+/// the `Invalid<Kind>.NotFound` family.
+pub const INVALID_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_NOT_FOUND: &str =
+    "InvalidIpamResourceDiscoveryAssociationId.NotFound";
+
+/// Refuse an `IpamResourceDiscoveryAssociationId` whose FORM is not one this service issues:
+/// HTTP 400 [`INVALID_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_MALFORMED`].
+///
+/// The first of the two questions an operation taking an association id asks, and the one that
+/// is asked BEFORE `DryRun` — the ordering [`crate::state::require_well_formed_id`] owns,
+/// reached here under this resource's own prefix and code.
+pub fn require_well_formed_ipam_resource_discovery_association_id<E>(
+    id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    crate::state::require_well_formed_id(
+        crate::state::IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX,
+        id,
+        INVALID_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_MALFORMED,
+    )
+}
+
+/// Refuse a well-formed association id this account holds no association for: HTTP 400
+/// [`INVALID_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_NOT_FOUND`], worded by the one writer of
+/// that refusal ([`crate::state::id_not_found`]).
+pub fn invalid_ipam_resource_discovery_association_id_not_found<E>(
+    id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::state::id_not_found(
+        INVALID_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_NOT_FOUND,
+        &format!(
+            "{} ID",
+            crate::state::RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY_ASSOCIATION
+        ),
+        id,
+    )
+}
+
+/// The status this report carries for the discovery an association links: "the resource
+/// discovery status" (`IpamResourceDiscoveryAssociation$ResourceDiscoveryStatus`), one of the
+/// two values the model's `IpamAssociatedResourceDiscoveryStatus` enum admits
+/// (`crate::ops::types::IPAM_ASSOCIATED_RESOURCE_DISCOVERY_STATUS_VALUES` is `active` and
+/// `not-found`).
+///
+/// It is a fact about the DISCOVERY at the instant of the read, not one frozen when the
+/// association was made, so it is derived here from the stored discovery: "`active` —
+/// Connection or permissions required to read the results of the resource discovery are intact"
+/// holds once that discovery's own creation is complete, and "`not-found` — Connection or
+/// permissions required to read the results of the resource discovery are broken" is what a
+/// caller is told while they are not — a discovery the store no longer holds (its owner deleted
+/// it or stopped sharing it, which is the cause the member's documentation names) or one whose
+/// creation has not completed yet, neither of which has results to read. A discovery of this
+/// store is in one of those two conditions and no other
+/// ([`crate::state::IPAM_STATE_CREATE_IN_PROGRESS`] until its due instant,
+/// [`crate::state::IPAM_STATE_CREATE_COMPLETE`] after it).
+fn reported_resource_discovery_status(
+    discoveries: &::std::collections::BTreeMap<String, IpamResourceDiscovery>,
+    discovery_id: Option<&str>,
+) -> &'static str {
+    let readable = discovery_id
+        .and_then(|discovery_id| discoveries.get(discovery_id))
+        .is_some_and(|discovery| {
+            discovery.state.as_deref() == Some(crate::state::IPAM_STATE_CREATE_COMPLETE)
+        });
+    if readable {
+        crate::state::IPAM_RESOURCE_DISCOVERY_STATUS_ACTIVE
+    } else {
+        IPAM_RESOURCE_DISCOVERY_STATUS_NOT_FOUND
+    }
+}
+
+/// "`not-found` - Connection or permissions required to read the results of the resource
+/// discovery are broken" (`IpamResourceDiscoveryAssociation$ResourceDiscoveryStatus`): the other
+/// member of the modelled `IpamAssociatedResourceDiscoveryStatus` enum, beside the `active` one
+/// `crate::state` names for the writers that store an association
+/// ([`crate::state::IPAM_RESOURCE_DISCOVERY_STATUS_ACTIVE`]).
+pub const IPAM_RESOURCE_DISCOVERY_STATUS_NOT_FOUND: &str = "not-found";
+
+/// The filter names this operation resolves.
+///
+/// `DescribeIpamResourceDiscoveryAssociationsRequest$Filters` documents no list of its own —
+/// "The resource discovery association filters" is all of it
+/// (`smithy_query(query="doc",shape="DescribeIpamResourceDiscoveryAssociationsRequest",member="Filters")`)
+/// — so the names are the ones EC2's filtering convention gives: each member of the resource
+/// the operation reports, spelled in kebab-case. This list is therefore derived mechanically
+/// from the `IpamResourceDiscoveryAssociation` shape
+/// (`smithy_query(query="shape",shape="IpamResourceDiscoveryAssociation")`), one entry per
+/// member, plus the `tag-key` / `tag-value` / `tag:<key>` set every EC2 describe accepts — the
+/// way `crate::ops::describe_ipam_resource_discoveries` derives the discovery's own list. Every
+/// entry must be answered by [`filter_values`].
+const IPAM_RESOURCE_DISCOVERY_ASSOCIATION_FILTERS: [&str; 12] = [
+    "ipam-arn",
+    "ipam-id",
+    "ipam-region",
+    "ipam-resource-discovery-association-arn",
+    "ipam-resource-discovery-association-id",
+    "ipam-resource-discovery-id",
+    "is-default",
+    "owner-id",
+    "resource-discovery-status",
+    "state",
+    "tag-key",
+    "tag-value",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as the
+/// filter value" (`IpamResourceDiscoveryAssociation$Tags`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// Is `name` a filter this operation resolves? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no tag,
+/// so it is as unresolvable as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || IPAM_RESOURCE_DISCOVERY_ASSOCIATION_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this association, as this report carries
+/// them — `status` being the one member the report derives rather than reads off the record
+/// ([`reported_resource_discovery_status`]), so a filter selects exactly what the response
+/// shows.
+///
+/// A filter naming an attribute this association does not carry compares against NO values, so
+/// it selects nothing. A boolean is compared as the wire spells it, which is how a client would
+/// send the filter value, so it is the only value built here rather than borrowed from the
+/// record.
+fn filter_values<'a>(
+    association: &'a IpamResourceDiscoveryAssociation,
+    status: &'a str,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return association
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "ipam-arn" => text(association.ipam_arn.as_deref()),
+        "ipam-id" => text(association.ipam_id.as_deref()),
+        "ipam-region" => text(association.ipam_region.as_deref()),
+        "ipam-resource-discovery-association-arn" => {
+            text(association.ipam_resource_discovery_association_arn.as_deref())
+        }
+        "ipam-resource-discovery-association-id" => {
+            text(association.ipam_resource_discovery_association_id.as_deref())
+        }
+        "ipam-resource-discovery-id" => text(association.ipam_resource_discovery_id.as_deref()),
+        "is-default" => association
+            .is_default
+            .map(|default| Cow::Borrowed(if default { "true" } else { "false" }))
+            .into_iter()
+            .collect(),
+        "owner-id" => text(association.owner_id.as_deref()),
+        "resource-discovery-status" => text(Some(status)),
+        "state" => text(association.state.as_deref()),
+        "tag-key" => association
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "tag-value" => association
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // unresolvable name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+// The AND/OR evaluation of the whole `Filters` member is
+// `crate::state::matches_every_filter`, the one place this crate defines it: "if you specify
+// multiple filters, the filters are joined with an AND" (`Filter`), and within one filter "if
+// you specify multiple values for a filter, the values are joined with an OR"
+// (`Filter$Values`), each value matched case-sensitively with EC2's `*`/`?` wildcards and every
+// comparison charged to the call's one `crate::state::MatchBudget`. Only the per-operation
+// lookup differs, which is `filter_values` above.
