@@ -72,7 +72,7 @@ fn base64url(bytes: &[u8]) -> String {
 
 /// One ACME account key pair, as a client holds one: the `alg` it signs with, the public
 /// half as the JWK a registration embeds, and the private half to sign with.
-enum AccountKey {
+pub(crate) enum AccountKey {
     /// ECDSA on a NIST curve, signing in the fixed `R || S` form JWS uses.
     Ecdsa {
         algorithm: &'static str,
@@ -94,7 +94,7 @@ enum AccountKey {
 
 impl AccountKey {
     /// A fresh ECDSA key pair on the curve `algorithm` is defined over.
-    fn ecdsa(algorithm: &'static str) -> Self {
+    pub(crate) fn ecdsa(algorithm: &'static str) -> Self {
         let (signing, curve, coordinate_bytes): (
             &'static ::ring::signature::EcdsaSigningAlgorithm,
             &'static str,
@@ -186,7 +186,7 @@ impl AccountKey {
 
     /// This key's PUBLIC half, as the JWK a registration embeds (RFC 7518 §6, RFC 8037
     /// §2).
-    fn jwk(&self) -> Value {
+    pub(crate) fn jwk(&self) -> Value {
         match self {
             Self::Ecdsa {
                 curve,
@@ -249,7 +249,7 @@ impl AccountKey {
 }
 
 /// Which key a JWS identifies itself by (RFC 8555 §6.2).
-enum Identification<'a> {
+pub(crate) enum Identification<'a> {
     /// The key itself, as a registration carries it.
     Jwk,
     /// The account that holds it, as every other request carries it.
@@ -260,7 +260,7 @@ enum Identification<'a> {
 /// over both (RFC 7515 §7.2.2).
 ///
 /// `payload` of `None` is the empty payload of a POST-as-GET (RFC 8555 §6.3).
-fn jws(
+pub(crate) fn jws(
     key: &AccountKey,
     identification: &Identification<'_>,
     nonce: &str,
@@ -290,7 +290,12 @@ fn jws(
 ///
 /// `mac_key` is signed with as the octets the credential's base64url text encodes, which
 /// is how a client reads what `GetAcmeExternalAccountBindingCredentials` handed it.
-fn external_account_binding(key_id: &str, mac_key: &str, url: &str, account_jwk: &Value) -> Value {
+pub(crate) fn external_account_binding(
+    key_id: &str,
+    mac_key: &str,
+    url: &str,
+    account_jwk: &Value,
+) -> Value {
     let protected = base64url(
         json!({ "alg": "HS256", "kid": key_id, "url": url })
             .to_string()
@@ -313,7 +318,7 @@ fn external_account_binding(key_id: &str, mac_key: &str, url: &str, account_jwk:
 
 /// POST `body` to `url` exactly as an ACME client does: the URL's own host, the JOSE
 /// media type, and NO AWS credential of any kind.
-async fn post(
+pub(crate) async fn post(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
@@ -332,7 +337,7 @@ async fn post(
 
 /// One response header, as text. Field names are matched case-insensitively, as HTTP
 /// defines them (RFC 9110 §5.1).
-fn header(response: &::http::Response<Bytes>, name: &str) -> String {
+pub(crate) fn header(response: &::http::Response<Bytes>, name: &str) -> String {
     response
         .headers()
         .get(name)

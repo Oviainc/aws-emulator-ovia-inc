@@ -41,6 +41,8 @@ mod acme_endpoint_lifecycle;
 mod acme_endpoint_list;
 #[path = "all/acme_endpoint_update.rs"]
 mod acme_endpoint_update;
+#[path = "all/acme_endpoint_url_reaches_the_caller.rs"]
+mod acme_endpoint_url_reaches_the_caller;
 #[path = "all/acme_external_account_binding_credentials.rs"]
 mod acme_external_account_binding_credentials;
 #[path = "all/acme_external_account_binding_delete.rs"]
@@ -117,6 +119,8 @@ mod pending_validation_and_tag_envelopes;
 mod refusal_codes_and_search_projection;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
+#[path = "all/renew_certificate_issued_target_set.rs"]
+mod renew_certificate_issued_target_set;
 #[path = "all/requested_certificate_transition_spans.rs"]
 mod requested_certificate_transition_spans;
 #[path = "all/resend_validation_email.rs"]

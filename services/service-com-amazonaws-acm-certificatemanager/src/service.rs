@@ -18,7 +18,7 @@
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
 //!   request's resolved route key against this service's signing name. EDITED HERE: it
-//!   also claims a request addressed to an ACME enrollment host (see "The ACME HTTP
+//!   also claims a request addressed to this service's ACME surface (see "The ACME HTTP
 //!   surface" below).
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. EDITED HERE: a request to a published ACME URL that presents a SigV4
@@ -54,10 +54,17 @@
 //! than the control-plane resolver, which cannot name a service from the enrollment
 //! label and answers `404 UnknownService` — for a URL this service handed out.
 //!
+//! A caller that reached this emulator at its OWN endpoint resolves neither of those
+//! hostnames, so the same ACME surface is published to it on the endpoint it is already
+//! talking to, with the plane, the Region and the endpoint's id in the PATH
+//! ([`crate::state::acme_local_endpoint_base_url`]) — the addressing an ACME client that
+//! dials the advertised URL verbatim reaches.
+//!
 //! Three seams carry it, and nothing else changes:
 //!
-//! - [`Service::can_handle`] also claims a request whose host is an enrollment host
-//!   ([`acme_http::enrollment_region_of_parts`]), which is what routes it here at all.
+//! - [`Service::can_handle`] also claims a request addressed to that surface
+//!   ([`acme_http::addresses_acme_surface_of_parts`]), which is what routes it here at
+//!   all.
 //! - [`Service::override_routing_error`] serves the request that presents NO
 //!   credential. An ACME client holds none, and an ACME interaction names no modelled
 //!   operation by construction, so the router reaches exactly this seam for it — BEFORE
@@ -548,12 +555,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         {
             return true;
         }
-        // And a request addressed to an ACME enrollment host, the hostname this service
-        // PUBLISHES in every ACME endpoint's `EndpointUrl`, whose first label is not
-        // this service's signing name and which no route key can therefore name. See
-        // the module docs: without this the router answers `404 UnknownService` for a
-        // URL this service handed out.
-        acme_http::enrollment_region_of_parts(parts).is_some()
+        // And a request addressed to this service's ACME surface — the enrollment host
+        // this service PUBLISHES in every ACME endpoint's `EndpointUrl`, whose first
+        // label is not this service's signing name, or the reserved path that surface is
+        // published at on the emulator's OWN endpoint. Neither can be named by a route
+        // key. See the module docs: without this the router answers `404 UnknownService`
+        // for a URL this service handed out.
+        acme_http::addresses_acme_surface_of_parts(parts)
     }
 
     fn override_operation(

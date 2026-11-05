@@ -205,7 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeAcmeEndpointOutput {
-            acme_endpoint: Some(crate::state::acme_endpoint_detail(endpoint)),
+            // The `EndpointUrl` reported is the address the ACME surface is published at
+            // for THIS caller: an ACME client is configured with this exact URL and dials
+            // it, so it names the endpoint the caller reached this service on.
+            acme_endpoint: Some(crate::state::acme_endpoint_detail(
+                endpoint,
+                crate::state::reached_emulator_endpoint_of_parts(ctx.parts()).as_deref(),
+            )),
         })
     }
 }

@@ -22,9 +22,9 @@
 //!    an imported certificate has none of: the change is refused rather than accepted
 //!    and dropped;
 //! 5. `RenewCertificate` renews an ELIGIBLE certificate — "only exported private
-//!    certificates can be renewed" — and refuses every other with the modelled error
-//!    for its condition, while an eligible one is renewed on the record every reader
-//!    projects.
+//!    certificates can be renewed" — out of the ISSUED certificates its `CertificateArn`
+//!    addresses, and refuses every other with the modelled error for its condition,
+//!    while an eligible one is renewed on the record every reader projects.
 //!
 //! The tables span the statuses and types a stored certificate can be in when each call
 //! arrives, and every row reads the record back with `DescribeCertificate` so a refusal
@@ -611,9 +611,11 @@ async fn renewing_a_certificate_acm_does_not_renew_is_refused() {
             "ValidationException",
         ),
         (
+            // A request ACM has not finished is not one of the ISSUED certificates this
+            // operation renews, so the ARN names no certificate it can resolve.
             "a request ACM has not finished",
             pending.clone(),
-            "RequestInProgressException",
+            "ResourceNotFoundException",
         ),
         (
             "an ARN naming no certificate",

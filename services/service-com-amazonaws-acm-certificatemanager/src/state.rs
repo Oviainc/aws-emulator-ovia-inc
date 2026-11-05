@@ -64,11 +64,15 @@
 //! records the instant of
 //! ([`acme_external_account_binding_revoked_message`]).
 //!
-//! Every URL those two records carry is minted here, on the Region's ACME enrollment
-//! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id as the first path
-//! segment ([`acme_endpoint_url`], [`acme_account_url`]) — and read back by
-//! [`parse_acme_request_path`] and [`acme_enrollment_region`], so the ACME HTTP surface
-//! `crate::service::acme_http` serves resolves a published URL to the record behind it.
+//! Every URL those two records carry is minted here, at the address the CALLER reached
+//! this service on ([`acme_resource_url_at`]): the Region's ACME enrollment host
+//! ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id as the first path segment
+//! ([`acme_endpoint_url`], [`acme_account_url`]) for a caller that resolves AWS's own
+//! hostnames, and the emulator's own endpoint with the plane, the Region and that id in
+//! the path ([`acme_local_endpoint_base_url`]) for one that reached this emulator
+//! directly — and read back by [`parse_acme_request_path`], [`acme_enrollment_region`]
+//! and [`parse_acme_local_path`], so the ACME HTTP surface `crate::service::acme_http`
+//! serves resolves a published URL to the record behind it on either address.
 //!
 //! Beside the certificates sits the account-level singleton
 //! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
@@ -2532,6 +2536,124 @@ pub fn parse_acme_request_path(path: &str) -> Option<AcmeRequestPath> {
     })
 }
 
+/// The emulator's OWN endpoint a request reached, as this service's `Host`-carrying
+/// callers reach it — `service_common`'s one reading of it, read off the buffered request
+/// parts a handler is handed.
+///
+/// A URL this service hands a client has to resolve back to where that client is already
+/// talking, or it names an address the client cannot reach: an ACME client is a library
+/// that takes the directory URL and dials it, and rewrites no host. A caller that reached
+/// this emulator at its own endpoint resolves no AWS hostname, so what it is told is that
+/// endpoint ([`acme_resource_url_at`]).
+pub fn reached_emulator_endpoint_of_parts(parts: &::http::request::Parts) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// The base URL of one endpoint's ACME surface on the emulator's own `endpoint`:
+/// `https://<endpoint>/_aws/acm-acme-enroll/<region>/<endpoint_id>`.
+///
+/// It carries exactly what the published address carries, with the Region moved from the
+/// enrollment host into the path: the plane is named by [`ACME_ENROLLMENT_HOST_LABEL`]
+/// behind the reserved path segment every data plane this emulator serves on its own
+/// endpoint sits under (`service_common::data_plane_addressing`), so a path under that
+/// segment naming another plane is never read as this one's, and the Region and the
+/// endpoint id are the two halves of the endpoint's ARN.
+pub fn acme_local_endpoint_base_url(endpoint: &str, region: &str, endpoint_id: &str) -> String {
+    format!(
+        "https://{endpoint}/{}/{ACME_ENROLLMENT_HOST_LABEL}/{region}/{endpoint_id}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
+/// The URL of one ACME resource of one endpoint, at the address the caller being answered
+/// reached this service on: the emulator's own endpoint when that is where the caller is
+/// talking ([`reached_emulator_endpoint_of_parts`], [`acme_local_endpoint_base_url`]), and
+/// the Region's published enrollment host ([`acme_resource_url`]) otherwise.
+///
+/// Every URL this service publishes — `AcmeEndpoint$EndpointUrl`, the resource map inside
+/// the directory, and an account's own URL — is minted through this one function, so the
+/// address the client is told is the address the answer it fetched came from.
+pub fn acme_resource_url_at(
+    local_endpoint: Option<&str>,
+    region: &str,
+    endpoint_id: &str,
+    resource: &str,
+) -> String {
+    match local_endpoint {
+        Some(endpoint) => format!(
+            "{}/{resource}",
+            acme_local_endpoint_base_url(endpoint, region, endpoint_id)
+        ),
+        None => acme_resource_url(region, endpoint_id, resource),
+    }
+}
+
+/// [`acme_endpoint_url`] at the address the caller reached ([`acme_resource_url_at`]).
+pub fn acme_endpoint_url_at(
+    local_endpoint: Option<&str>,
+    region: &str,
+    endpoint_id: &str,
+) -> String {
+    acme_resource_url_at(local_endpoint, region, endpoint_id, ACME_DIRECTORY_RESOURCE)
+}
+
+/// [`acme_account_url`] at the address the caller reached ([`acme_resource_url_at`]).
+pub fn acme_account_url_at(
+    local_endpoint: Option<&str>,
+    region: &str,
+    endpoint_id: &str,
+    account_id: &str,
+) -> String {
+    acme_resource_url_at(
+        local_endpoint,
+        region,
+        endpoint_id,
+        &format!("{ACME_ACCOUNT_RESOURCE}/{account_id}"),
+    )
+}
+
+/// The Region, endpoint and resource a path on the EMULATOR's own endpoint names, or
+/// `None` when the path is not one [`acme_resource_url_at`] mints there.
+///
+/// The inverse of [`acme_local_endpoint_base_url`], so what is recognised is exactly what
+/// is published.
+pub fn parse_acme_local_path(path: &str) -> Option<(String, AcmeRequestPath)> {
+    let rest = acme_local_plane_path(path)?;
+    let (region, rest) = ::service_common::data_plane_addressing::first_segment(rest)?;
+    if !is_acme_region(region) {
+        return None;
+    }
+    Some((region.to_string(), parse_acme_request_path(rest)?))
+}
+
+/// Whether `path` addresses this service's ACME plane on the emulator's own endpoint at
+/// all — the reserved namespace segment and the plane that names this surface, whatever
+/// follows them.
+///
+/// It is what the service CLAIMS such a request on: a path on this plane is this
+/// service's to answer however the rest of it reads, so a client holding a URL this
+/// service published is never answered by the front door's "unknown service".
+pub fn addresses_acme_local_plane(path: &str) -> bool {
+    acme_local_plane_path(path).is_some()
+}
+
+/// The path BENEATH this service's ACME plane prefix, or `None` for a path that is not on
+/// it: the one reading of that prefix, by exact segment equality.
+fn acme_local_plane_path(path: &str) -> Option<&str> {
+    let (namespace, rest) = ::service_common::data_plane_addressing::first_segment(path)?;
+    if namespace != ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = ::service_common::data_plane_addressing::first_segment(rest)?;
+    (plane == ACME_ENROLLMENT_HOST_LABEL).then_some(rest)
+}
+
 /// The `ResourceNotFoundException` message for an ACME endpoint ARN that no stored
 /// record answers to, built from the ARN the request asked for.
 ///
@@ -2550,7 +2672,17 @@ pub fn acme_endpoint_not_found_message(acme_endpoint_arn: &str) -> String {
 /// Every ACM resource is addressed by an ARN of that one form, so the framing is parsed
 /// in one place and each resource type only names its own `<type>/` prefix.
 fn acm_arn_resource(arn: &str) -> Option<&str> {
-    acm_arn_fields(arn).map(|(_account, resource)| resource)
+    acm_arn_fields(arn).map(|(_region, _account, resource)| resource)
+}
+
+/// The Region segment of an ACM ARN, or `None` when `arn` is not an ACM ARN at all.
+///
+/// Every ARN this service mints carries the Region the resource lives in
+/// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:...`), which is the half of the framing that says
+/// WHERE the resource is — and for an ACME endpoint the Region whose enrollment host its
+/// ACME surface is published on ([`acme_endpoint_url`]).
+pub fn acm_arn_region(arn: &str) -> Option<&str> {
+    acm_arn_fields(arn).map(|(region, _account, _resource)| region)
 }
 
 /// The account segment of an ACM ARN, or `None` when `arn` is not an ACM ARN at all.
@@ -2559,7 +2691,7 @@ fn acm_arn_resource(arn: &str) -> Option<&str> {
 /// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:...`), so this is the half of the framing
 /// that says WHOSE resource the ARN names.
 pub fn acm_arn_account(arn: &str) -> Option<&str> {
-    acm_arn_fields(arn).map(|(account, _resource)| account)
+    acm_arn_fields(arn).map(|(_region, account, _resource)| account)
 }
 
 /// Whether `arn` names a resource of the account this emulator serves.
@@ -2574,16 +2706,16 @@ pub fn arn_is_in_caller_account(arn: &str) -> bool {
     acm_arn_account(arn).is_some_and(|account| account == ::engine::emulator_account_id())
 }
 
-/// The account and the resource part of an ACM ARN
+/// The Region, the account and the resource part of an ACM ARN
 /// (`arn:<partition>:acm:<region>:<account>:<type>/<id>`), or `None` when `arn` is not
 /// an ACM ARN at all.
-fn acm_arn_fields(arn: &str) -> Option<(&str, &str)> {
+fn acm_arn_fields(arn: &str) -> Option<(&str, &str, &str)> {
     let mut fields = arn.split(':');
     let (
         Some("arn"),
         Some(partition),
         Some(SIGNING_NAME),
-        Some(_region),
+        Some(region),
         Some(account),
         Some(resource),
         None,
@@ -2602,7 +2734,7 @@ fn acm_arn_fields(arn: &str) -> Option<(&str, &str)> {
     if partition.is_empty() || !account.bytes().all(|b| b.is_ascii_digit()) || account.is_empty() {
         return None;
     }
-    Some((account, resource))
+    Some((region, account, resource))
 }
 
 /// The id in an ACM ARN whose resource type is `resource_type`, or `None` when `arn`
@@ -3736,10 +3868,18 @@ pub fn renewal_summary(cert: &Certificate) -> Option<RenewalSummary> {
 /// certificates it issues — a create that named none leaves the member absent rather
 /// than reporting an empty list (`TagList` has a minimum length of 1, so an empty list
 /// is not a value the member can take).
-pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
+///
+/// `EndpointUrl` is the address the ACME surface of this endpoint is published at for the
+/// CALLER being answered ([`acme_published_endpoint_url`]): an ACME client is configured
+/// with that exact URL and dials it, so it names the endpoint this caller reached rather
+/// than an address only a client that resolves AWS's own hostnames could reach.
+pub fn acme_endpoint_detail(
+    endpoint: &AcmeEndpointRecord,
+    local_endpoint: Option<&str>,
+) -> AcmeEndpoint {
     AcmeEndpoint {
         acme_endpoint_arn: Some(endpoint.arn.clone()),
-        endpoint_url: Some(endpoint.endpoint_url.clone()),
+        endpoint_url: Some(acme_published_endpoint_url(endpoint, local_endpoint)),
         status: Some(endpoint.status.clone()),
         failure_reason: endpoint.failure_reason.clone(),
         authorization_behavior: Some(endpoint.authorization_behavior.clone()),
@@ -3752,15 +3892,41 @@ pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
     }
 }
 
+/// The URL this endpoint's ACME directory is published at for a caller that reached
+/// `local_endpoint`: the stored published URL ([`AcmeEndpointRecord::endpoint_url`]) for
+/// a caller that resolves AWS's own hostnames, and the same resource of the same endpoint
+/// on the endpoint THIS caller reached for one that reached this emulator directly
+/// ([`acme_endpoint_url_at`]).
+///
+/// Both are derived from the endpoint's own ARN — the Region and the id it carries — so
+/// the two addresses name one endpoint and neither carries anything the caller sent.
+pub fn acme_published_endpoint_url(
+    endpoint: &AcmeEndpointRecord,
+    local_endpoint: Option<&str>,
+) -> String {
+    let (Some(local), Some(region), Some(endpoint_id)) = (
+        local_endpoint,
+        acm_arn_region(&endpoint.arn),
+        acme_endpoint_id_from_arn(&endpoint.arn),
+    ) else {
+        return endpoint.endpoint_url.clone();
+    };
+    acme_endpoint_url_at(Some(local), region, endpoint_id)
+}
+
 /// A stored ACME endpoint as `ListAcmeEndpoints`' `AcmeEndpointSummary`.
 ///
 /// `AcmeEndpointSummary` declares exactly the members `AcmeEndpoint` does, so one
 /// endpoint is reported identically whether it is read one at a time or listed: the
 /// summary is projected from the same record, member for member, through
 /// [`acme_endpoint_detail`] — including the two members that are present only when the
-/// record carries them (`FailureReason`, `CertificateTags`).
-pub fn acme_endpoint_summary(endpoint: &AcmeEndpointRecord) -> AcmeEndpointSummary {
-    let detail = acme_endpoint_detail(endpoint);
+/// record carries them (`FailureReason`, `CertificateTags`) and the `EndpointUrl` minted
+/// at the address the caller reached.
+pub fn acme_endpoint_summary(
+    endpoint: &AcmeEndpointRecord,
+    local_endpoint: Option<&str>,
+) -> AcmeEndpointSummary {
+    let detail = acme_endpoint_detail(endpoint, local_endpoint);
     AcmeEndpointSummary {
         acme_endpoint_arn: detail.acme_endpoint_arn,
         endpoint_url: detail.endpoint_url,

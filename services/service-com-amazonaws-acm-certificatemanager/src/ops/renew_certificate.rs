@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RenewCertificate
-//! IMPLEMENTED: resolves the `CertificateArn` against this service's certificate store
+//! IMPLEMENTED: resolves the `CertificateArn` against this service's ISSUED certificates
 //! and starts ACM's managed renewal of the record stored under it, refusing an ARN that
-//! names no ACM certificate, an ARN naming no stored certificate, a certificate ACM has
-//! not finished issuing, and a certificate ACM does not renew, each with the modelled
-//! error that reports exactly that condition.
+//! names no ACM certificate, an ARN naming no stored certificate, an ARN under which
+//! there is no ISSUED certificate, a renewal this operation has already started, and a
+//! certificate ACM does not renew, each with the modelled error that reports exactly
+//! that condition.
 //!
 //! "Renews an ELIGIBLE ACM certificate" (this operation's doc), and "only exported
 //! private certificates can be renewed with the RenewCertificate command"
@@ -223,15 +224,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A renewal re-issues a certificate ACM has ALREADY issued ("renews an eligible
+        // ACM certificate", this operation's doc, and `RenewalEligibility` is reported
+        // only of a certificate that is issued), so this operation's `CertificateArn`
+        // addresses one of ACM's ISSUED certificates: a record in any other
+        // `CertificateStatus` — one still awaiting its domain validation, one past that
+        // without being issued, or one that is no longer issued — is an ARN under which
+        // the certificate this argument names is not found, even though the ARN itself
+        // resolves. That is the condition `ResourceNotFoundException` reports ("the
+        // specified certificate cannot be found"), with the sentence `ExportCertificate`
+        // already renders for a miss on that same set
+        // ([`crate::state::issued_certificate_not_found_message`]). The verdict is read
+        // off the stored record and writes nothing, so every concurrent caller takes it
+        // and the certificate is left in the status it was in.
+        if certificate.status != crate::state::STATUS_ISSUED {
+            return Err(RenewCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::issued_certificate_not_found_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "The certificate request is in process and the certificate in your account
-        // has not yet been issued" (`RequestInProgressException` doc) is the condition
-        // of a request ACM is still working on: one whose validation has not settled,
-        // and one whose renewal this operation already started and has not finished. In
-        // both the answer is to wait, not to change the request — which is what sets
-        // this refusal apart from the one below.
-        if certificate.status == crate::state::STATUS_PENDING_VALIDATION
-            || certificate.renewal_in_progress()
-        {
+        // has not yet been issued" (`RequestInProgressException` doc) is left to the one
+        // condition on an ISSUED certificate that it reports: a renewal this operation
+        // already started and has not finished, where the answer is to wait rather than
+        // to change the request — which is what sets this refusal apart from the two
+        // around it.
+        if certificate.renewal_in_progress() {
             return Err(RenewCertificateErrorModeled::RequestInProgressException(
                 RequestInProgressException {
                     message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),

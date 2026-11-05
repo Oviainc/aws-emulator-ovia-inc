@@ -123,6 +123,24 @@ pub fn reached_endpoint_host(
         .unwrap_or_else(|| format!("{endpoint_prefix}.{region}.amazonaws.com"))
 }
 
+/// The EMULATOR's OWN endpoint a request reached, or `None` for a request addressed to a
+/// host that names some service — which is a caller that resolves AWS's own hostnames.
+///
+/// The counterpart of [`reached_endpoint_host`] for a URL whose whole point is that the
+/// client DIALS it as given (an ACME directory handed to certbot, a data-plane endpoint a
+/// stock client is configured with): such a caller resolves nothing but the endpoint it is
+/// already talking to, so `Some(endpoint)` is the address to publish — with the resource's
+/// identity in the PATH, under [`EMULATOR_PATH_NAMESPACE`] — and `None` is the caller that
+/// is told the service's own published host instead.
+///
+/// Composed from the two readings above, so no service writes a second rule for which
+/// host a request addressed or which host names a service.
+#[must_use]
+pub fn reached_emulator_endpoint(uri: &str, host_header: Option<&str>) -> Option<String> {
+    let host = addressed_host(uri, host_header)?;
+    (is_host_shaped(&host) && !names_a_service(&host)).then_some(host)
+}
+
 /// Whether `host` is a non-empty `host[:port]` written with the characters a hostname, an
 /// IP literal and a port carry, and no longer than a DNS name may be.
 #[must_use]
@@ -196,6 +214,33 @@ mod tests {
             let answered = reached_endpoint_host(uri, *header, "amplify", "us-east-1");
             assert_eq!(
                 answered, *expected,
+                "case ({uri:?}, {header:?}): expected {expected:?}, got {answered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_reaches_the_emulator_endpoint_only_when_the_host_names_no_service() {
+        // The rows span what the reading generalises over: every shape of address the
+        // emulator's own endpoint takes (an IPv4 literal with and without a port, a
+        // loopback name, a bracketed IPv6 literal), a host that names a service's own
+        // endpoint, a host-shaped value on an absolute URI, a value no host is shaped
+        // like, and a request naming no host at all.
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("/apps", Some("127.0.0.1:9297"), Some("127.0.0.1:9297")),
+            ("/apps", Some("127.0.0.1"), Some("127.0.0.1")),
+            ("/apps", Some("localhost:9297"), Some("localhost:9297")),
+            ("/apps", Some("[::1]:9297"), Some("[::1]:9297")),
+            ("/apps", Some("s3.us-west-2.amazonaws.com"), None),
+            ("https://localhost:9297/apps", None, Some("localhost:9297")),
+            ("/apps", Some("host with spaces"), None),
+            ("/apps", None, None),
+        ];
+        for (uri, header, expected) in cases {
+            let answered = reached_emulator_endpoint(uri, *header);
+            assert_eq!(
+                answered.as_deref(),
+                *expected,
                 "case ({uri:?}, {header:?}): expected {expected:?}, got {answered:?}"
             );
         }

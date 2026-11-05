@@ -218,8 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // depend on a projected member being present.
         let mut last_key: Option<&String> = None;
         let mut summaries: Vec<AcmeEndpointSummary> = Vec::new();
+        // The endpoint THIS caller reached, which is the address every `EndpointUrl` the
+        // page reports is published at: a URL an ACME client dials verbatim has to
+        // resolve back to where the caller is already talking.
+        let local_endpoint = crate::state::reached_emulator_endpoint_of_parts(ctx.parts());
         for (arn, endpoint) in remaining.by_ref().take(limit) {
-            summaries.push(crate::state::acme_endpoint_summary(endpoint));
+            summaries.push(crate::state::acme_endpoint_summary(
+                endpoint,
+                local_endpoint.as_deref(),
+            ));
             last_key = Some(arn);
         }
         // A token is issued only when an endpoint is left beyond this page, and it names
