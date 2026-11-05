@@ -35,11 +35,14 @@
 //! # Services still carrying their own copy
 //!
 //! This correction predates this module and is inlined in the service crates that needed it
-//! before there was anywhere shared to put it; searching for the span rather than a file name
-//! finds them (`grep -rln 'fn frame_empty_body' services/*/src/`). Those copies are to be
-//! MIGRATED onto this module and are left in place only because this change does not own
-//! those services' issues, each being covered by its own suite. Nothing new should inline the
-//! rule again — call this module.
+//! before there was anywhere shared to put it. Search for the SPAN rather than for a list
+//! that would drift: the body is a status comparison against 204 followed by an empty
+//! `SdkBody` and a `content-length` of `0`, and it appears both as a function of its own
+//! (spelled `frame_empty_body` in some crates and `frame_empty_answer` in others, each beside
+//! a `NO_CONTENT_STATUS` of its own) and inline inside a response wrapper, where no symbol
+//! name finds it. Those copies are to be MIGRATED onto this module and are left in place only
+//! because this change does not own those services' issues, each being covered by its own
+//! suite. Nothing new should inline the rule again — call this module.
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use aws_smithy_types::body::SdkBody;

@@ -41,11 +41,11 @@ use crate::resource_tagging::{
     agent_arn, contact_arn, fresh_config, label, list_tags, reported_tags, tag_resource,
     taggable_resources, tags_of, Taggable,
 };
-use crate::tag_mutation_no_content::TAG_MUTATION_SUCCESS_STATUS;
 use crate::scheduling_loop::{
     create_config, harness, harness_serving, send, Reply, ABSENT_CONFIG_ARN,
     ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID, REGION, STATION,
 };
+use crate::tag_mutation_no_content::TAG_MUTATION_SUCCESS_STATUS;
 
 /// The longest `tagKeys` list the model admits (`smithy_query(query="shape",
 /// shape="TagKeys")` — a list of `length` 0..500), and so the bound this suite asserts at
