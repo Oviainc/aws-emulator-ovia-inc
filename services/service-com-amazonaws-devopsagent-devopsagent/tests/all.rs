@@ -21,6 +21,8 @@ mod asset_file_updates;
 mod asset_files;
 #[path = "all/asset_metadata_and_deletion.rs"]
 mod asset_metadata_and_deletion;
+#[path = "all/asset_versions.rs"]
+mod asset_versions;
 #[path = "all/assets.rs"]
 mod assets;
 #[path = "all/backlog_task_refusal_arms.rs"]

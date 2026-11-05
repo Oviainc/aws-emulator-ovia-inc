@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the revisions one asset has: every earlier revision it still retains,
+//! then the revision it is at, each with the instant the asset reached it and the
+//! instant it was last changed. Reporting only — the listing is computed from the
+//! stored asset and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +121,15 @@ impl From<ListAssetVersionsErrorModeled> for ListAssetVersionsError {
 /// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
 /// crate names no concrete engine type: a migrated service that needs state picks a
 /// concrete engine where it mounts the service, not here.
+/// The page size a request that names no `maxResults` is served.
+///
+/// CHOSEN: `maxResults` carries `@range(1..100)` and no `@default`, so the model
+/// states no default; the largest page it admits is what a request that asks for no
+/// bound gets, which serves one asset's whole retained history
+/// ([`crate::state::MAX_ASSET_VERSIONS_RETAINED`] earlier revisions plus the one it
+/// is at) in a single page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
 pub struct ListAssetVersions<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
@@ -155,18 +160,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetVersions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `maxResults` carries `@range(1..100)`, so a value outside the range is
+        // refused before this handler runs; a request that names none is served
+        // `DEFAULT_MAX_RESULTS`.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize);
+
+        // A `nextToken` this service did not issue cannot name a position in the
+        // listing: refuse it with the modelled client error.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_version_token(token).ok_or_else(|| {
+                ListAssetVersionsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a pagination token issued by this service"
+                        .to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "nextToken".to_string(),
+                        message: "malformed pagination token".to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // `@readonly`: the listing is computed from state and writes nothing.
+        let store = state.lock();
+
+        // The asset plane authorises the caller against the named Agent Space before it
+        // can know whether anything inside it exists, so an `agentSpaceId` that names
+        // no space is an authorization failure; only inside a space the caller reaches
+        // is a missing asset reported as one.
+        let space = store.agent_spaces.get(&input.agent_space_id).ok_or_else(|| {
+            ListAssetVersionsErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+            })
+        })?;
+        let asset = space.assets.get(&input.asset_id).ok_or_else(|| {
+            ListAssetVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::asset_not_found_message(&input.asset_id),
+            })
+        })?;
+
+        // A revision is identified by its version number, and the numbers one asset
+        // moves through only ever grow, so the history is listed in that order: the
+        // oldest retained revision first, the one the asset is at last.
+        let versions = asset.versions_to_api();
+        let start = match resume_after {
+            None => 0,
+            // The cursor is exclusive: resume at the first revision after it. A cursor
+            // whose revision is no longer retained resumes at the next one still
+            // stored, which is why the position is found by comparison rather than by
+            // an index baked into the token.
+            Some(cursor) => versions
+                .iter()
+                .position(|item| item.version > cursor)
+                .unwrap_or(versions.len()),
+        };
+        let total = versions.len();
+        let items: Vec<AssetVersionMetadata> =
+            versions.into_iter().skip(start).take(page_size).collect();
+        let more_follow = start + items.len() < total;
+        let next_token = items
+            .last()
+            .filter(|_| more_follow)
+            .map(|last| crate::state::encode_next_token(&last.version.to_string()));
+
+        Ok(ListAssetVersionsOutput { items, next_token })
     }
 }

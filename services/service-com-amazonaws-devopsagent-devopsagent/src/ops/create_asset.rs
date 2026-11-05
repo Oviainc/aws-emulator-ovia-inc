@@ -246,6 +246,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version: crate::state::INITIAL_ASSET_VERSION,
             created_at: now,
             updated_at: now,
+            // The asset's first revision is created with the asset itself.
+            version_created_at: now,
             files,
             prior_versions: ::std::collections::BTreeMap::new(),
             source_url,

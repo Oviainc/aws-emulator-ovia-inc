@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AgentSpace, Asset, AssetFile, AssetFileBody, IamAuthConfiguration, IdcAuthConfiguration,
-    IdpAuthConfiguration, Recommendation, RecommendationContent, Recurrence, ReferenceOutput,
-    ScheduleCondition, ScheduleSpec, Task, Trigger, TriggerCondition,
+    AgentSpace, Asset, AssetFile, AssetFileBody, AssetVersionMetadata, IamAuthConfiguration,
+    IdcAuthConfiguration, IdpAuthConfiguration, Recommendation, RecommendationContent, Recurrence,
+    ReferenceOutput, ScheduleCondition, ScheduleSpec, Task, Trigger, TriggerCondition,
 };
 
 /// The most AgentSpaces this emulator stores for the account before
@@ -858,16 +858,21 @@ pub struct AssetRecord {
     pub version: i32,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// When the asset reached the revision [`Self::version`] names.
+    ///
+    /// A revision is created when the asset moves to it, which for the asset's
+    /// first revision is the asset's own creation, so when each revision came into
+    /// being is tracked per revision rather than read off the asset.
+    pub version_created_at: SystemTime,
     /// The files this asset holds, by path: the content of the revision
     /// [`Self::version`] names.
     pub files: BTreeMap<String, AssetFileRecord>,
-    /// The content this asset held as of each earlier revision, by that revision's
-    /// version number.
+    /// Every earlier revision of this asset, by that revision's version number.
     ///
     /// A revision of an asset is a snapshot of its content, so the content a
     /// revision was read with stays readable at that version once a later one
     /// supersedes it. Bounded by [`MAX_ASSET_VERSIONS_RETAINED`].
-    pub prior_versions: BTreeMap<i32, BTreeMap<String, AssetFileRecord>>,
+    pub prior_versions: BTreeMap<i32, AssetRevisionRecord>,
     /// The external source the asset's content is imported from, when the create
     /// named one instead of supplying the content inline. Held so a read reports
     /// where the content comes from; nothing is fetched, because this emulator
@@ -914,8 +919,36 @@ impl AssetRecord {
         if version == self.version {
             Some(&self.files)
         } else {
-            self.prior_versions.get(&version)
+            self.prior_versions
+                .get(&version)
+                .map(|revision| &revision.files)
         }
+    }
+
+    /// The modelled metadata of every revision this asset still has, oldest first.
+    ///
+    /// One entry per revision the asset holds: the earlier ones it retains, then
+    /// the revision it is at. A revision's `createdAt` is the instant the asset
+    /// reached it and its `updatedAt` the instant of the last change made while it
+    /// was the asset's current revision — so the revision the asset is at reports
+    /// the asset's own `updatedAt`, and a superseded one keeps the instant it was
+    /// last changed. A revision no longer retained
+    /// ([`MAX_ASSET_VERSIONS_RETAINED`]) is not reported, because nothing of it is
+    /// readable any more.
+    pub fn versions_to_api(&self) -> Vec<AssetVersionMetadata> {
+        self.prior_versions
+            .iter()
+            .map(|(version, revision)| AssetVersionMetadata {
+                version: *version,
+                created_at: to_date_time(revision.created_at),
+                updated_at: to_date_time(revision.updated_at),
+            })
+            .chain(::std::iter::once(AssetVersionMetadata {
+                version: self.version,
+                created_at: to_date_time(self.version_created_at),
+                updated_at: to_date_time(self.updated_at),
+            }))
+            .collect()
     }
 
     /// Move this asset to its next revision, freezing the content it holds now as
@@ -927,7 +960,17 @@ impl AssetRecord {
     /// keeps reporting the one it was read with. The oldest retained revision is
     /// dropped once the history is longer than [`MAX_ASSET_VERSIONS_RETAINED`].
     pub fn begin_next_version(&mut self, now: SystemTime) -> i32 {
-        self.prior_versions.insert(self.version, self.files.clone());
+        self.prior_versions.insert(
+            self.version,
+            AssetRevisionRecord {
+                created_at: self.version_created_at,
+                // The revision being left was last changed when the asset was, so
+                // its `updatedAt` is the one the asset carries before this change
+                // moves on to the next revision.
+                updated_at: self.updated_at,
+                files: self.files.clone(),
+            },
+        );
         while self.prior_versions.len() > MAX_ASSET_VERSIONS_RETAINED {
             let oldest = self.prior_versions.keys().next().copied();
             match oldest {
@@ -938,12 +981,28 @@ impl AssetRecord {
             }
         }
         self.version = self.version.saturating_add(1);
+        self.version_created_at = now;
         self.updated_at = now;
         for file in self.files.values_mut() {
             file.version = self.version;
         }
         self.version
     }
+}
+
+/// One superseded revision of an asset: the content it held, and when that
+/// revision came into being and was last changed.
+///
+/// A revision is frozen once the asset moves past it, so both instants and the
+/// files stay as they were for as long as the revision is retained.
+#[derive(Debug, Clone)]
+pub struct AssetRevisionRecord {
+    /// When the asset reached this revision.
+    pub created_at: SystemTime,
+    /// The last change made to the asset while this was the revision it was at.
+    pub updated_at: SystemTime,
+    /// The files this asset's content held as of this revision, by path.
+    pub files: BTreeMap<String, AssetFileRecord>,
 }
 
 /// One persisted file of an asset's content.
@@ -1414,6 +1473,18 @@ const MINTED_SEQUENCE_WIDTH: usize = 16;
 /// round-trips through [`decode_next_token`].
 pub fn encode_next_token(last_id: &str) -> String {
     format!("{PAGE_TOKEN_PREFIX}{}", hex::encode(last_id.as_bytes()))
+}
+
+/// The asset revision a pagination token this service issued over one asset's
+/// version history resumes after, or `None` when the token is not one it issued.
+///
+/// A cursor in that listing names a revision by its version number, which is what
+/// makes a token that decodes to anything else a token this service did not issue
+/// rather than a resume point past every revision.
+pub fn decode_version_token(token: &str) -> Option<i32> {
+    let body = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
+    let cursor = String::from_utf8(hex::decode(body).ok()?).ok()?;
+    cursor.parse().ok()
 }
 
 /// The cursor a token carries, or `None` when the token is not one this service
