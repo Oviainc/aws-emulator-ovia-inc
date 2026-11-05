@@ -3113,12 +3113,20 @@ static ACCESS_POINT_NAME_MEMBER: Schema = Schema::new_member(
 /// policy, because none was ever put on it (or it was deleted).
 ///
 /// The message is fixed text, naming no access point: it is what the service
-/// answers for every access point that carries no policy.
-pub fn no_such_access_point_policy<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
+/// answers for every access point that carries no policy. WHICH access point
+/// was asked about travels in the member beside it
+/// ([`ACCESS_POINT_NAME_MEMBER`]) — the same member [`no_such_access_point`]
+/// carries, because both refusals are about the access point the request
+/// addressed.
+pub fn no_such_access_point_policy<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure_naming(
         "NoSuchAccessPointPolicy",
         404,
-        "The specified accesspoint policy does not exist".to_string(),
+        "The specified accesspoint policy does not exist",
+        vec![crate::scaffolded::ErrorDetail::new(
+            &ACCESS_POINT_NAME_MEMBER,
+            name,
+        )],
     )
 }
 

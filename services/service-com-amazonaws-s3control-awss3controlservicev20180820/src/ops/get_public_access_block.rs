@@ -109,8 +109,10 @@ impl From<GetPublicAccessBlockErrorModeled> for GetPublicAccessBlockError {
 /// The prose `NoSuchPublicAccessBlockConfiguration` carries.
 ///
 /// INVARIANT OF THE REQUEST: it names neither the account the call resolved to
-/// nor any other request value, so no account identifier is surfaced in an
-/// error body. The wire `<Code>` and the 404 status are what a client branches
+/// nor any other request value, so the sentence is the same for every account
+/// that holds no configuration. WHICH account was asked about travels in the
+/// `AccountId` member beside it, which is where a client reads the offending
+/// identity. The wire `<Code>` and the 404 status are what a client branches
 /// on; this sentence is prose for a human.
 const NO_SUCH_CONFIGURATION_MESSAGE: &str = "The public access block configuration was not found";
 
@@ -165,6 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetPublicAccessBlockErrorModeled::NoSuchPublicAccessBlockConfiguration(
                     NoSuchPublicAccessBlockConfiguration {
                         message: Some(NO_SUCH_CONFIGURATION_MESSAGE.to_string()),
+                        // The account the refusal is ABOUT: the one the request
+                        // addressed, so a client reads it out of the refusal
+                        // rather than out of its own request.
+                        account_id: Some(input.account_id.clone()),
                     },
                 )
                 .into(),

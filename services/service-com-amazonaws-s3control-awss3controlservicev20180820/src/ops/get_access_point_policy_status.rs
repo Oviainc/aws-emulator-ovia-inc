@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the two codes: an access point that does not exist is a different
         // failure from one that carries no policy.
         let Some(policy) = record.policy.as_deref() else {
-            return Err(crate::state::no_such_access_point_policy());
+            return Err(crate::state::no_such_access_point_policy(&input.name));
         };
 
         Ok(GetAccessPointPolicyStatusOutput {

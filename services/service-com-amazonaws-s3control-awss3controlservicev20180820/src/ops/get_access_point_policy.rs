@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An access point with no policy is a different failure from an access
         // point that does not exist, and a client branches on the two codes.
         let Some(policy) = record.policy.clone() else {
-            return Err(crate::state::no_such_access_point_policy());
+            return Err(crate::state::no_such_access_point_policy(&input.name));
         };
 
         Ok(GetAccessPointPolicyOutput {

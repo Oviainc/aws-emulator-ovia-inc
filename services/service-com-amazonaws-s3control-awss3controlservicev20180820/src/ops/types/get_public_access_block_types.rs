@@ -23,9 +23,42 @@ pub struct GetPublicAccessBlockOutput {
     pub public_access_block_configuration: Option<PublicAccessBlockConfiguration>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#NoSuchPublicAccessBlockConfiguration")]
+/// What `GetPublicAccessBlock` refuses an account that holds no configuration
+/// with: the modelled `NoSuchPublicAccessBlockConfiguration`, plus `AccountId`.
+///
+/// Member set and order from `smithy_query(query="shape",
+/// shape="com.amazonaws.s3control#NoSuchPublicAccessBlockConfiguration")`,
+/// which declares `Message` alone, plus `AccountId` — RECORDED BEHAVIOUR
+/// rather than modelled: the refusal names the ACCOUNT whose configuration was
+/// asked about, which is where a client reads the offending identity instead of
+/// re-parsing the request it sent. The model declares no such member, so the
+/// shape is hand-written (see `types::unmodelled_member_wire`) and the member
+/// is appended LAST.
 #[derive(Debug, Clone, Default)]
 pub struct NoSuchPublicAccessBlockConfiguration {
     pub message: Option<String>,
+    pub account_id: Option<String>,
 }
+
+s3c_error_schema_and_codec!(
+    NoSuchPublicAccessBlockConfiguration,
+    SCHEMA_NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION,
+    "com.amazonaws.s3control#NoSuchPublicAccessBlockConfiguration",
+    "com.amazonaws.s3control",
+    "NoSuchPublicAccessBlockConfiguration",
+    (M_MESSAGE, message, "Message", 0, opt, string),
+    (M_ACCOUNT_ID, account_id, "AccountId", 1, opt, string),
+);
+
+impl std::fmt::Display for NoSuchPublicAccessBlockConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", Self::shape_name())?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for NoSuchPublicAccessBlockConfiguration {}
 

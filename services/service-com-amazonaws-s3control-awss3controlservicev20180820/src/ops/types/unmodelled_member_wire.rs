@@ -13,7 +13,10 @@
 //! the member list), a `SCHEMA` naming them in that order, the
 //! `<STRUCT>_SCHEMA` static and the `SerializableStruct` /
 //! `DeserializableStruct` pair — from a member list this file gives, so the
-//! extra member can be appended to it.
+//! extra member can be appended to it. An ERROR shape takes the same treatment
+//! through its own macro, which emits the items the derive emits for one of
+//! those instead (the `SCHEMA_<ERROR>` static an `#[operation_error]` enum arm
+//! names, `shape_name`, and the serializer).
 //!
 //! The model's own members keep the indices and the order the model gives
 //! them, and an unmodelled member is appended LAST, so a later model refresh
@@ -161,6 +164,64 @@ macro_rules! s3c_member_value {
     };
     ($slot:ident, $wire:literal, opt) => {
         $slot
+    };
+}
+
+/// The schemas, the wire name and the serializer for one ERROR structure, from
+/// the member list given here: what `#[smithy_macros::smithy(shape = ...)]`
+/// emits for an error shape, for a member list that may carry a member the
+/// on-disk model does not declare.
+///
+/// The items are the ones an `#[smithy_macros::operation_error]` enum arm
+/// names: the `SCHEMA_<ERROR>` static — a `Schema` BY VALUE, which is what that
+/// expansion takes a reference to — and the `shape_name` the wire error code is
+/// read from, plus the serializer that writes the members. No deserializer: a
+/// refusal this service answers is only ever written.
+///
+/// Each member entry is as [`s3c_schema_and_codec`]'s, in the model's member
+/// order with an unmodelled member last. `Display` and `std::error::Error` stay
+/// with the structure: how a refusal READS is per-error prose rather than wire
+/// layout.
+macro_rules! s3c_error_schema_and_codec {
+    (
+        $ty:ident, $schema_static:ident, $shape:literal, $ns:literal, $local:literal,
+        $( ( $cname:ident, $field:ident, $wire:literal, $idx:literal, $presence:tt, $($kind:tt)+ ) ),+ $(,)?
+    ) => {
+        impl $ty {
+            $(
+                pub const $cname: ::aws_smithy_schema::Schema =
+                    s3c_member_schema!($ns, $local, $wire, $idx, $($kind)+);
+            )+
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static($shape, $ns, $local),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[$(&Self::$cname,)+],
+                );
+
+            /// The wire error code this refusal is matched on: the error
+            /// shape's own name.
+            pub const fn shape_name() -> &'static str {
+                $local
+            }
+        }
+
+        pub static $schema_static: ::aws_smithy_schema::Schema = $ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                $(
+                    s3c_write_present_member!(
+                        s, self, Self::$cname, $field, $presence, $($kind)+
+                    );
+                )+
+                Ok(())
+            }
+        }
     };
 }
 

@@ -51,6 +51,8 @@ mod multi_region_access_point_lifecycle;
 mod multi_region_access_point_sub_resources;
 #[path = "all/public_access_block.rs"]
 mod public_access_block;
+#[path = "all/refusal_resource_members.rs"]
+mod refusal_resource_members;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
