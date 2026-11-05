@@ -283,7 +283,9 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         // "specif[ies] a version or alias to invoke a published version of the function",
         // and an invocation that names none runs the unpublished version, which is what
         // the output's `ExecutedVersion` reports as `$LATEST`. So the refusal for a pair
-        // that resolves to nothing names that qualified resource, built from the request.
+        // that resolves to nothing names that qualified resource, built from the request by
+        // the one construction every invoking operation shares
+        // (`crate::state::addressed_function_arn`).
         let reference =
             crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
                 invalid_parameter(format!(
@@ -293,15 +295,8 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
                     input.function_name
                 ))
             })?;
-        let addressed_version = reference
-            .qualifier
-            .clone()
-            .or_else(|| input.qualifier.clone())
-            .unwrap_or_else(|| crate::state::VERSION_LATEST.to_string());
-        let addressed_arn = format!(
-            "{}:{addressed_version}",
-            crate::state::function_arn(&region, &reference.name)
-        );
+        let addressed_arn =
+            crate::state::addressed_arn_of(&region, &reference, input.qualifier.as_deref());
 
         let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(

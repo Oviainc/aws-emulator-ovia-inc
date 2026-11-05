@@ -345,10 +345,16 @@ async fn a_confirmation_invokes_the_pools_post_confirmation_function() {
         if !expected_code.is_empty() {
             // The refusal states the trigger and the error Lambda itself reported for the
             // function the pool named — both taken from the request's own pool and from
-            // what Lambda answered.
+            // what Lambda answered. An INVOCATION's not-found refusal names the ARN it
+            // resolved, qualifier included, and the trigger names no qualifier, so the
+            // unpublished version is the one it resolved
+            // (`lambda::state::addressed_function_arn`).
             assert_eq!(
                 message(&answer),
-                format!("PostConfirmation failed with error Function not found: {configured}."),
+                format!(
+                    "PostConfirmation failed with error Function not found: {configured}:\
+                     $LATEST."
+                ),
                 "case {case:?}: expected the trigger failure to name the function Lambda could \
                  not find, got {answer}"
             );
@@ -403,7 +409,7 @@ async fn every_confirming_operation_invokes_the_trigger() {
     );
     assert_eq!(
         message(&answer),
-        format!("PostConfirmation failed with error Function not found: {absent}."),
+        format!("PostConfirmation failed with error Function not found: {absent}:$LATEST."),
         "case \"ConfirmSignUp with an absent trigger function\": expected the failure to name \
          the function, got {answer}"
     );
@@ -458,7 +464,7 @@ async fn every_confirming_operation_invokes_the_trigger() {
     );
     assert_eq!(
         message(&answer),
-        format!("PostConfirmation failed with error Function not found: {absent}."),
+        format!("PostConfirmation failed with error Function not found: {absent}:$LATEST."),
         "case \"ConfirmForgotPassword with an absent trigger function\": expected the failure to \
          name the function, got {answer}"
     );

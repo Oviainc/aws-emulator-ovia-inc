@@ -4493,6 +4493,46 @@ pub fn resolve_durable_execution<'a>(
     }
 }
 
+/// The ARN one INVOCATION addresses: the function the `FunctionName`/`Qualifier` pair names,
+/// at the version it resolves.
+///
+/// `Qualifier` "specif[ies] a version or alias to invoke a published version of the
+/// function", and an invocation naming none runs the unpublished version — which is what an
+/// invocation's answer reports as `ExecutedVersion` — so the qualifier is the one the name
+/// carries, else the `Qualifier` parameter's, else [`VERSION_LATEST`]. ONE construction,
+/// shared by every operation that INVOKES (`Invoke`, `InvokeWithResponseStream`), because
+/// the resource they address is the same one: a refusal naming no single resolved ARN is
+/// what a client comparing it against the ARN it invoked cannot match.
+///
+/// `None` is a `FunctionName` that names no function at all, which the resolution refuses as
+/// malformed instead.
+#[must_use]
+pub fn addressed_function_arn(
+    region: &str,
+    function_name: &str,
+    qualifier: Option<&str>,
+) -> Option<String> {
+    let reference = parse_function_reference(function_name)?;
+    Some(addressed_arn_of(region, &reference, qualifier))
+}
+
+/// [`addressed_function_arn`] for a caller that has ALREADY parsed the reference, so no
+/// caller carries a second reading of the same `FunctionName` — and none needs a fallback
+/// for a parse that cannot fail twice.
+#[must_use]
+pub fn addressed_arn_of(
+    region: &str,
+    reference: &FunctionReference,
+    qualifier: Option<&str>,
+) -> String {
+    let addressed = reference
+        .qualifier
+        .as_deref()
+        .or(qualifier)
+        .unwrap_or(VERSION_LATEST);
+    format!("{}:{addressed}", function_arn(region, &reference.name))
+}
+
 /// Why a `FunctionName`/`Qualifier` pair names no record.
 #[derive(Debug, Clone)]
 pub enum ResolveFailure {

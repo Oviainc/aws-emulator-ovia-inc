@@ -808,10 +808,14 @@ async fn a_package_the_registration_cannot_use_registers_nothing() {
             "nothing-staged-here.zip",
         ),
         (
+            // A bucket that is not there establishes nothing about the object, so what the
+            // registration reports is what Amazon S3 answered the read with — the one
+            // wording every read of a caller-addressed object carries
+            // (`state::template_url`).
             "a bucket Amazon S3 does not hold",
             "My::Failing::Bucketless",
             "s3://no-such-package-bucket/package.zip",
-            "no-such-package-bucket",
+            "The specified bucket does not exist",
         ),
     ];
 

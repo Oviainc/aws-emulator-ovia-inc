@@ -473,6 +473,16 @@ struct Unresolvable {
     message: String,
 }
 
+/// The `ValidationError` message CloudFormation answers for a read Amazon S3 refused without
+/// establishing that the object is absent: what Amazon S3 said, and the line that error is
+/// documented on.
+fn s3_error(message: &str) -> String {
+    format!(
+        "S3 error: {message}\nFor more information check \
+         http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
+    )
+}
+
 #[tokio::test]
 async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
     let (router, _engine) = router_with_engine();
@@ -482,6 +492,8 @@ async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
 
     let rows: Vec<Unresolvable> = vec![
         Unresolvable {
+            // A key the bucket does not hold is an absence CloudFormation could see, and
+            // reports as that.
             case: "a key the staging bucket does not hold",
             url: Style::VirtualHostedRegional.url("absent.template.json"),
             message: format!(
@@ -490,12 +502,24 @@ async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
             ),
         },
         Unresolvable {
+            // The same absence, for a well-formed version id the bucket holds no version
+            // under: the code Amazon S3 named for it travels into the same sentence.
+            case: "an object version the staging bucket does not hold",
+            url: format!(
+                "{}?versionId=3HL4kqtJlcpXroDTDmJ1rmSpXd3dIbrH",
+                Style::VirtualHostedRegional.url(key)
+            ),
+            message: format!(
+                "S3 object does not exist. Bucket: {STAGING_BUCKET}, Key: {key}. Error: \
+                 NoSuchVersion"
+            ),
+        },
+        Unresolvable {
+            // A bucket that is not there establishes nothing about an object, so what
+            // CloudFormation reports is what Amazon S3 answered.
             case: "a bucket nothing created",
             url: format!("https://no-such-staging-bucket.s3.{REGION}.amazonaws.com/{key}"),
-            message: format!(
-                "S3 object does not exist. Bucket: no-such-staging-bucket, Key: {key}. \
-                 Error: NoSuchBucket"
-            ),
+            message: s3_error("The specified bucket does not exist"),
         },
         Unresolvable {
             case: "a scheme the documentation does not support",

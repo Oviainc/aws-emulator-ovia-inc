@@ -40,10 +40,21 @@
 //!
 //! ## What the read refuses
 //!
-//! An object Amazon S3 will not hand over — a key or a bucket it does not hold, a read it
-//! refuses — is the `ValidationError` CloudFormation answers for the request's own
-//! reference, naming the bucket and key the URL addressed and the code Amazon S3 gave; text
-//! that addresses no object at all is refused before anything is read.
+//! An object Amazon S3 will not hand over is the `ValidationError` CloudFormation answers
+//! for the request's own reference, and WHICH refusal it is decides how that is worded — two
+//! sentences, each CloudFormation's own:
+//!
+//! * a key or a version the bucket does not hold is an object CloudFormation could see was
+//!   ABSENT, reported as that, naming the bucket and key the URL addressed and the code
+//!   Amazon S3 gave ([`unreadable_object`]);
+//! * every OTHER refusal — a bucket that is not there, a read Amazon S3 will not serve, a
+//!   body that stopped mid-stream — is reported as what Amazon S3 ANSWERED, under the prefix
+//!   CloudFormation reports another service's refusal under and followed by the line that
+//!   error is documented on ([`s3_error`]); where Amazon S3 worded nothing, what it
+//!   classified the refusal as stands in its place, so no refusal this module cannot place
+//!   becomes a claim that the object is not there.
+//!
+//! Text that addresses no object at all is refused before anything is read.
 //!
 //! ## Bounds
 //!
@@ -78,13 +89,58 @@ const NOT_A_READABLE_OBJECT: &str =
 /// read, and nothing on the other end identified the problem.
 const UNIDENTIFIED_FAILURE: &str = "InternalFailure";
 
-/// The refusal for an object Amazon S3 would not hand over, worded as CloudFormation words
+/// The refusal for an object AMAZON S3 SAID IS NOT THERE, worded as CloudFormation words
 /// it: the bucket and key the request's own URL addressed, and the code Amazon S3 named.
+///
+/// This is the sentence for an absence CloudFormation could SEE — a key or a version the
+/// bucket does not hold ([`ABSENT_OBJECT_CODES`]). A refusal that reports no absence is
+/// worded by [`s3_error`] instead, because it establishes nothing about the object.
 fn unreadable_object(object: &Object, code: &str) -> String {
     format!(
         "S3 object does not exist. Bucket: {}, Key: {}. Error: {code}",
         object.bucket, object.key
     )
+}
+
+/// The line CloudFormation puts after an Amazon S3 refusal it reports, pointing at the
+/// Amazon S3 error-response documentation the code it carries is listed in.
+const S3_ERROR_REFERENCE: &str =
+    "For more information check http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html";
+
+/// The `ValidationError` message CloudFormation answers for a read Amazon S3 refused without
+/// establishing that the object is absent: what AMAZON S3 ANSWERED, under the prefix
+/// CloudFormation reports another service's refusal under, and then the line that error is
+/// documented on.
+///
+/// The message is Amazon S3's, not this module's: CloudFormation reports what it was told by
+/// the service it asked, so nothing here names the bucket, the key or the error code — a
+/// read that was refused says only that it was refused.
+fn s3_error(message: &str) -> String {
+    format!("S3 error: {message}\n{S3_ERROR_REFERENCE}")
+}
+
+/// The Amazon S3 error codes that report an object the bucket does NOT HOLD — a key, or a
+/// version of one — which is the one refusal CloudFormation words as the object's absence
+/// ([`unreadable_object`]) rather than as what Amazon S3 answered.
+const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchKey", "NoSuchVersion"];
+
+/// What Amazon S3 answered a refused read with, as the message CloudFormation reports for
+/// it: an object the bucket does not hold as that object's absence, and every other refusal
+/// — a bucket that is not there, a read Amazon S3 will not serve — as the sentence Amazon S3
+/// itself worded for it.
+///
+/// A refusal that carried NO message is reported as what it DID identify: the code, which is
+/// Amazon S3's own classification of it, and [`UNIDENTIFIED_FAILURE`] where it carried
+/// neither — the read was not served, and nothing on the other end identified the problem.
+/// Only a code that reports an absence is reported AS an absence, so no refusal is turned
+/// into a claim that the object is not there.
+fn refused_read_message(object: &Object, code: Option<&str>, message: Option<&str>) -> String {
+    match (code, message) {
+        (Some(code), _) if ABSENT_OBJECT_CODES.contains(&code) => unreadable_object(object, code),
+        (_, Some(message)) => s3_error(message),
+        (Some(code), None) => s3_error(code),
+        (None, None) => s3_error(UNIDENTIFIED_FAILURE),
+    }
 }
 
 /// The Amazon S3 object a `TemplateURL` addresses.
@@ -139,8 +195,9 @@ pub async fn read(
 ) -> Result<String, String> {
     let body = read_bytes(ctx, region, object, max_bytes, too_long).await?;
     // What the reference addressed is TEXT; an object that is not valid UTF-8 carries none, so
-    // it is not what this reference addressed.
-    String::from_utf8(body).map_err(|_| unreadable_object(object, UNIDENTIFIED_FAILURE))
+    // it is not what this reference addressed. The object itself WAS handed over, so this
+    // reports the read that could not be served rather than the object's absence.
+    String::from_utf8(body).map_err(|_| s3_error(UNIDENTIFIED_FAILURE))
 }
 
 /// The BYTES of one Amazon S3 object, read the same way [`read`] reads its text, for a member
@@ -166,10 +223,10 @@ pub async fn read_bytes(
         .send()
         .await
         .map_err(|error| {
-            // The object the caller's own URL addressed was not handed over, under the code
-            // Amazon S3 named for it (`NoSuchKey` for a key it does not hold, `NoSuchBucket`
-            // for a bucket it does not hold).
-            unreadable_object(object, error.code().unwrap_or(UNIDENTIFIED_FAILURE))
+            // The object the caller's own URL addressed was not handed over: which refusal
+            // Amazon S3 gave is what decides how CloudFormation words it
+            // ([`refused_read_message`]).
+            refused_read_message(object, error.code(), error.message())
         })?;
     // The length the object REPORTS, before a single byte of it is held.
     if read
@@ -182,7 +239,9 @@ pub async fn read_bytes(
         .body
         .collect()
         .await
-        .map_err(|_| unreadable_object(object, UNIDENTIFIED_FAILURE))?
+        // The object WAS handed over and the body then stopped: nothing established that
+        // it is absent, so the refusal is reported as the refusal it was.
+        .map_err(|_| s3_error(UNIDENTIFIED_FAILURE))?
         .into_bytes();
     if body.len() > max_bytes {
         return Err(too_long.to_string());
@@ -436,6 +495,77 @@ mod tests {
                 parsed.as_ref().err().map(String::as_str),
                 Some(*refusal),
                 "case {case:?}: expected the refusal {refusal:?}, got {parsed:?}"
+            );
+        }
+    }
+
+    /// What Amazon S3 answered a refused read with, as the message CloudFormation reports
+    /// for it — one row per refusal class: the object's absence as absence, a bucket that is
+    /// not there and a read Amazon S3 will not serve as what it said, and a refusal carrying
+    /// no message of its own (which no wire call can produce, so only this reaches it) as the
+    /// absence sentence under the code it did carry.
+    #[test]
+    fn a_refused_read_is_reported_as_the_class_of_refusal_it_was() {
+        let object = Object {
+            bucket: "assets".to_string(),
+            key: "templates/main.json".to_string(),
+            version: None,
+        };
+        let rows: &[(&str, Option<&str>, Option<&str>, String)] = &[
+            (
+                "a key the bucket does not hold",
+                Some("NoSuchKey"),
+                Some("The specified key does not exist."),
+                "S3 object does not exist. Bucket: assets, Key: templates/main.json. Error: \
+                 NoSuchKey"
+                    .to_string(),
+            ),
+            (
+                "a version the bucket does not hold",
+                Some("NoSuchVersion"),
+                None,
+                "S3 object does not exist. Bucket: assets, Key: templates/main.json. Error: \
+                 NoSuchVersion"
+                    .to_string(),
+            ),
+            (
+                "a bucket that is not there",
+                Some("NoSuchBucket"),
+                Some("The specified bucket does not exist"),
+                "S3 error: The specified bucket does not exist\nFor more information check \
+                 http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
+                    .to_string(),
+            ),
+            (
+                "a read Amazon S3 will not serve",
+                Some("AccessDenied"),
+                Some("Access Denied"),
+                "S3 error: Access Denied\nFor more information check \
+                 http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
+                    .to_string(),
+            ),
+            (
+                "a refusal that classified itself but worded nothing",
+                Some("AccessDenied"),
+                None,
+                "S3 error: AccessDenied\nFor more information check \
+                 http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
+                    .to_string(),
+            ),
+            (
+                "a refusal that identified nothing at all",
+                None,
+                None,
+                "S3 error: InternalFailure\nFor more information check \
+                 http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
+                    .to_string(),
+            ),
+        ];
+        for (case, code, message, expected) in rows {
+            let reported = refused_read_message(&object, *code, *message);
+            assert_eq!(
+                reported, *expected,
+                "case {case:?}: expected {expected:?}, got {reported:?}"
             );
         }
     }

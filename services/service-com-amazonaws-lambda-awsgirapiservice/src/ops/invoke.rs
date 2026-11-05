@@ -406,6 +406,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
+        // The resource an INVOCATION addresses is a function AT a version, so the refusal
+        // for a pair that resolves to nothing names that QUALIFIED resource — the ARN this
+        // invocation resolved, built from the request by the one construction every
+        // invoking operation shares (`crate::state::addressed_function_arn`).
+        let addressed_arn = crate::state::addressed_function_arn(
+            &region,
+            &input.function_name,
+            input.qualifier.as_deref(),
+        );
         let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -426,7 +435,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ResolveFailure::NotFound(message) => {
                 InvokeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     r#type: None,
-                    message: Some(message),
+                    message: Some(
+                        addressed_arn
+                            .as_ref()
+                            .map_or(message, |arn| format!("Function not found: {arn}")),
+                    ),
                 })
             }
         })?;

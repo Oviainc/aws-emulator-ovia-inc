@@ -541,8 +541,8 @@ async fn validate_template_refuses_a_body_it_cannot_report_on() {
             )],
             status: 400,
             code: "ValidationError",
-            message: "S3 object does not exist. Bucket: a-bucket, Key: a-template.json. \
-                      Error: NoSuchBucket"
+            message: "S3 error: The specified bucket does not exist\nFor more information \
+                      check http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
                 .to_string(),
         },
     ];

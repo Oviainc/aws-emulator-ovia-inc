@@ -644,8 +644,9 @@ async fn a_request_naming_no_template_or_two_is_refused() {
             case: "a template URL naming no object this account can read",
             request: vec![member("TemplateURL", "https://example.s3.amazonaws.com/t.json")],
             expected_status: 400,
-            expected_message: "S3 object does not exist. Bucket: example, Key: t.json. \
-                               Error: NoSuchBucket",
+            expected_message: "S3 error: The specified bucket does not exist\nFor more \
+                               information check \
+                               http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html",
         },
     ];
     for Row {
