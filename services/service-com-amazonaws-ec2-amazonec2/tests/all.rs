@@ -1434,6 +1434,11 @@ mod security_group_rule_refusal_wording;
 // in. Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/deleted_resources_stop_resolving.rs"]
 mod deleted_resources_stop_resolving;
+// What `DeletePublicIpv4Pool` removes: the pool id that stops resolving for the describe, the
+// network border group that narrows which pool the delete finds, and the address ranges that
+// must leave the pool first. Declared at the tail of this file, which is where every new ec2
+#[path = "all/delete_public_ipv4_pool.rs"]
+mod delete_public_ipv4_pool;
 // What `GetConsoleOutput` serves for one instance: that instance's console as text,
 // base64-encoded, beside the instant it was last written — and what it refuses. Declared at
 // the tail of this file, which is where every new ec2 suite inserts its lines.

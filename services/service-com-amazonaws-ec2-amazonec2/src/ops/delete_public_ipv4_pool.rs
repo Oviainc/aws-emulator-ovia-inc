@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePublicIpv4Pool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePublicIpv4Pool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePublicIpv4Pool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: this operation deletes one public IPv4 address pool the account holds —
+//! this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +133,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePublicIpv4Pool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePublicIpv4PoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePublicIpv4Pool"))
+        // `ctx` carries request metadata only, and this operation reads none of it: a pool
+        // is named by its own id, which is the key the store holds it under, and the network
+        // border group a request may narrow that lookup by is compared against the group the
+        // POOL is advertised from rather than against the Region the call was signed for.
+        // The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the public IPv4 pool you want to delete" (`$PoolId`) — the one resource
+        // this call acts on. The member is modelled `clientOptional`, so a request that sends
+        // it EMPTY reaches this handler as an empty string (one that leaves it out entirely
+        // is refused by the request walk before this runs) and is refused for the parameter
+        // it is missing rather than looked up as a pool named "".
+        let pool_id = input.pool_id.as_str();
+        if pool_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter poolId",
+            ));
+        }
+
+        // "A check for whether you have the required permissions for the action without
+        // actually making the request" (`$DryRun`). What is checked is the CALLER's
+        // permissions, not the account's pools, so it is answered before the store is read at
+        // all: a dry run neither looks a pool up nor deletes one, and answers
+        // `DryRunOperation` even for a pool the account does not hold.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A release of the address range a pool belongs to was owed at its due instant
+        // whether or not anybody called, and it takes the pool with it — so a pool whose
+        // release has fallen due is already gone, and this delete finds nothing to delete.
+        store.materialize_due_transitions();
+
+        // The pool to delete, looked up by its id and NARROWED by the network border group
+        // the request names: "The Availability Zone (AZ) or Local Zone (LZ) network border
+        // group that the resource that the IP address is assigned to is in. Defaults to an AZ
+        // network border group" (`$NetworkBorderGroup`) — the member identifies WHERE the
+        // pool is advertised from, so a request naming a group this pool is not advertised
+        // from names no pool of the account there, and a request naming none takes the pool
+        // wherever it is advertised from. A pool the account holds no record of under that
+        // reading is a refusal, never a no-op: a delete that removed nothing must not answer
+        // as though it had.
+        let holds_ranges = match store.public_ipv4_pools.get(pool_id) {
+            Some(record)
+                if input
+                    .network_border_group
+                    .as_deref()
+                    .is_none_or(|group| record.network_border_group.as_deref() == Some(group)) =>
+            {
+                !record.cidrs.is_empty()
+            }
+            _ => return Err(state::invalid_public_ipv4_pool_not_found(pool_id)),
+        };
+
+        // A pool is the CONTAINER for the address ranges a caller brought to AWS, and a range
+        // leaves it through `DeprovisionPublicIpv4PoolCidr` — the documented teardown order
+        // is to take every CIDR out of the pool first and delete the pool after. So a pool
+        // that still holds a range is refused the way this crate refuses every delete a
+        // resource's own dependencies forbid (`DependencyViolation`, HTTP 400, as
+        // `DeleteIpamPool` refuses a pool with CIDRs provisioned to it): deleting it would
+        // take address space the account still owns out of the one store that reports it,
+        // leaving a BYOIP range naming a pool no reader can find.
+        if holds_ranges {
+            return Err(state::dependency_violation(format!(
+                "The pool '{pool_id}' has CIDRs provisioned to it. Deprovision the CIDRs \
+                 before deleting the pool."
+            )));
+        }
+
+        // The pool leaves the store through the store's own remover, the one path that gives
+        // the bytes it held back to the budget, so no delete can drop a record uncharged. It
+        // answers `false` only for a pool the store does not hold, which the lookup above has
+        // already ruled out.
+        if !store.remove_public_ipv4_pool(pool_id) {
+            return Err(state::internal_error(
+                "the public IPv4 pool read a moment ago could not be deleted",
+            ));
+        }
+
+        Ok(DeletePublicIpv4PoolOutput {
+            // "Information about the result of deleting the public IPv4 pool"
+            // (`$ReturnValue`): the pool is gone from the store this handler just wrote, so
+            // what the caller is told is that the delete happened.
+            return_value: Some(true),
+        })
     }
 }
