@@ -529,7 +529,7 @@ where
                 return query_coercion::serialization_exception(&message);
             }
             let refused = violations_of::<O>(svc.definition().protocol(), req);
-            if let Some(stated) = validation::refusal(O::NAME, &refused) {
+            if let Some(stated) = validation::refusal(O::NAME, O::INPUT_SCHEMA, &refused) {
                 return svc
                     .definition()
                     .refusal_response(ProtocolError::Invalid(refused), Some(stated), req);

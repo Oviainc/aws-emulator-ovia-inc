@@ -16,12 +16,12 @@
 //! member does not support, or a value outside the member's type is refused with a
 //! modelled error and changes nothing. A response type the API holds no customization for
 //! is patched from the response API Gateway generates for it, and what the patch produces
-//! is a developer's customization, which is what `defaultResponse` reports. The three
-//! updateable members are `statusCode`, typed `StatusCode` and so constrained to
-//! `^[1-5]\d\d$`, and the two string-to-string maps `responseParameters` and
-//! `responseTemplates` (`smithy_query(query="operation",
-//! operation="UpdateGatewayResponse")`); `responseType` is the record's identity and
-//! `defaultResponse` the service's own report, so neither is patchable.
+//! is a developer's customization, which is what `defaultResponse` reports. The two
+//! updateable members are the string-to-string maps `responseParameters` and
+//! `responseTemplates` and the single-valued `statusCode`, which takes a `replace`
+//! (`smithy_query(query="operation", operation="UpdateGatewayResponse")`);
+//! `responseType` is the record's identity and `defaultResponse` the service's own report,
+//! so neither is patchable.
 //!
 //! The tables span what the rule generalises over: which member the path names, that
 //! member's kind (single-valued, map entry), the op (`add`, `replace`, `remove`), how many
@@ -96,17 +96,55 @@ type Row = (
 async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() {
     let rows: Vec<Row> = vec![
         (
-            "a status code replaced on a customization",
+            "a template replaced on a customization",
             "INTEGRATION_TIMEOUT",
             Some(json!({
                 "statusCode": "504",
                 "responseTemplates": { "application/json": "{\"message\":\"timeout\"}" }
             })),
-            vec![replace("/statusCode", "503")],
+            vec![replace(
+                "/responseTemplates/application~1json",
+                "{\"message\":\"the back end timed out\"}",
+            )],
             json!({
                 "responseType": "INTEGRATION_TIMEOUT",
-                "statusCode": "503",
-                "responseTemplates": { "application/json": "{\"message\":\"timeout\"}" },
+                "statusCode": "504",
+                "responseTemplates": {
+                    "application/json": "{\"message\":\"the back end timed out\"}"
+                },
+                "defaultResponse": false
+            }),
+        ),
+        (
+            "a status code replaced on a customization",
+            "BAD_REQUEST_PARAMETERS",
+            Some(json!({ "statusCode": "400" })),
+            vec![replace("/statusCode", "422")],
+            json!({
+                "responseType": "BAD_REQUEST_PARAMETERS",
+                "statusCode": "422",
+                "defaultResponse": false
+            }),
+        ),
+        (
+            "a 1xx status code the modelled pattern admits",
+            "WAF_FILTERED",
+            None,
+            vec![replace("/statusCode", "100")],
+            json!({
+                "responseType": "WAF_FILTERED",
+                "statusCode": "100",
+                "defaultResponse": false
+            }),
+        ),
+        (
+            "a 599 status code, the pattern's upper published bound",
+            "RESOURCE_NOT_FOUND",
+            None,
+            vec![replace("/statusCode", "599")],
+            json!({
+                "responseType": "RESOURCE_NOT_FOUND",
+                "statusCode": "599",
                 "defaultResponse": false
             }),
         ),
@@ -146,7 +184,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             }),
         ),
         (
-            "three ops in one request, over all three members",
+            "two ops over both map members in one request",
             "THROTTLED",
             None,
             vec![
@@ -160,24 +198,27 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
                     "/responseTemplates/text~1plain",
                     Some("slow down"),
                 ),
-                replace("/statusCode", "502"),
             ],
             json!({
                 "responseType": "THROTTLED",
-                "statusCode": "502",
+                "statusCode": generated_status_code("THROTTLED"),
                 "responseParameters": { "gatewayresponse.header.Retry-After": "'60'" },
                 "responseTemplates": { "text/plain": "slow down" },
                 "defaultResponse": false
             }),
         ),
         (
-            "two ops on one member, the later one winning",
+            "two ops on one map entry, the later one winning",
             "QUOTA_EXCEEDED",
             None,
-            vec![replace("/statusCode", "429"), replace("/statusCode", "402")],
+            vec![
+                op("add", "/responseTemplates/text~1plain", Some("too many")),
+                replace("/responseTemplates/text~1plain", "quota reached"),
+            ],
             json!({
                 "responseType": "QUOTA_EXCEEDED",
-                "statusCode": "402",
+                "statusCode": generated_status_code("QUOTA_EXCEEDED"),
+                "responseTemplates": { "text/plain": "quota reached" },
                 "defaultResponse": false
             }),
         ),
@@ -218,47 +259,35 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             }),
         ),
         (
-            "a removed status code falls back to the one the type generates",
-            "ACCESS_DENIED",
-            Some(json!({ "statusCode": "402" })),
-            vec![op("remove", "/statusCode", None)],
-            json!({
-                "responseType": "ACCESS_DENIED",
-                // From the suite's own published catalog, so the expectation stays tied
-                // to the table rather than to one copied value.
-                "statusCode": generated_status_code("ACCESS_DENIED"),
-                "defaultResponse": false
-            }),
-        ),
-        (
-            "a removed status code on a type that generates none leaves it unset",
+            "a map entry added on a type that generates no status code of its own",
             "DEFAULT_5XX",
-            Some(json!({ "statusCode": "500" })),
-            vec![op("remove", "/statusCode", None)],
+            None,
+            vec![op(
+                "add",
+                "/responseTemplates/application~1json",
+                Some("{\"message\":$context.error.messageString}"),
+            )],
             json!({
                 "responseType": "DEFAULT_5XX",
+                "responseTemplates": {
+                    "application/json": "{\"message\":$context.error.messageString}"
+                },
                 "defaultResponse": false
             }),
         ),
         (
-            "a 1xx status code the modelled pattern admits",
-            "WAF_FILTERED",
-            None,
-            vec![replace("/statusCode", "100")],
+            "a parameter added on a customization that keeps its status code",
+            "ACCESS_DENIED",
+            Some(json!({ "statusCode": "402" })),
+            vec![op(
+                "add",
+                "/responseParameters/gatewayresponse.header.X-Reason",
+                Some("'denied'"),
+            )],
             json!({
-                "responseType": "WAF_FILTERED",
-                "statusCode": "100",
-                "defaultResponse": false
-            }),
-        ),
-        (
-            "a 599 status code, the pattern's upper published bound",
-            "RESOURCE_NOT_FOUND",
-            None,
-            vec![replace("/statusCode", "599")],
-            json!({
-                "responseType": "RESOURCE_NOT_FOUND",
-                "statusCode": "599",
+                "responseType": "ACCESS_DENIED",
+                "statusCode": "402",
+                "responseParameters": { "gatewayresponse.header.X-Reason": "'denied'" },
                 "defaultResponse": false
             }),
         ),
@@ -383,9 +412,9 @@ async fn a_patch_this_resource_does_not_support_is_refused_and_changes_nothing()
     });
 
     // Rows span the ways a patch can miss this resource: a path naming a member that is
-    // not updateable (the record's identity, the service's own flag), a path naming no
-    // member at all, a path reaching INTO the single-valued member, a map path naming no
-    // key, an op no member of this resource supports, an add or replace carrying no
+    // not patchable (the record's identity, the service's own flag), a path naming no
+    // member at all, a path reaching INTO a member that is not a map, a map path naming no
+    // key, an op a member of this resource does not take, an add or replace carrying no
     // value, and a status code outside the modelled `^[1-5]\d\d$` pattern — one past each
     // published bound and the lengths and forms it does not admit.
     let mut refused: Vec<(String, Vec<Value>)> = vec![
@@ -414,18 +443,37 @@ async fn a_patch_this_resource_does_not_support_is_refused_and_changes_nothing()
             vec![op("add", "/responseParameters", Some("'*'"))],
         ),
         (
-            "add /statusCode with no value".to_string(),
-            vec![op("add", "/statusCode", None)],
-        ),
-        (
             "replace /responseTemplates/application~1json with no value".to_string(),
             vec![op("replace", "/responseTemplates/application~1json", None)],
         ),
         (
             "a supported op after an unsupported one".to_string(),
-            vec![replace("/statusCode", "503"), replace("/responseType", "DEFAULT_4XX")],
+            vec![
+                op(
+                    "add",
+                    "/responseTemplates/text~1plain",
+                    Some("never stored"),
+                ),
+                replace("/responseType", "DEFAULT_4XX"),
+            ],
         ),
     ];
+    // The status code takes a `replace` and no other op, whatever value rides along — one
+    // the modelled `^[1-5]\d\d$` pattern admits as much as one it does not.
+    for kind in ["add", "remove"] {
+        for value in [Some("503"), Some("099"), None] {
+            refused.push((
+                format!("{kind} /statusCode with {value:?}"),
+                vec![op(kind, "/statusCode", value)],
+            ));
+        }
+    }
+    for status in ["099", "600", "000", "999", "20", "2000", "abc", "5033"] {
+        refused.push((
+            format!("replace /statusCode with {status}"),
+            vec![replace("/statusCode", status)],
+        ));
+    }
     for kind in ["move", "copy", "test"] {
         refused.push((
             format!("{kind} /statusCode"),
@@ -434,12 +482,6 @@ async fn a_patch_this_resource_does_not_support_is_refused_and_changes_nothing()
         refused.push((
             format!("{kind} /responseTemplates/application~1json"),
             vec![op(kind, "/responseTemplates/application~1json", Some("{}"))],
-        ));
-    }
-    for status in ["099", "600", "000", "999", "20", "2000", "abc", "5033"] {
-        refused.push((
-            format!("replace /statusCode with {status}"),
-            vec![replace("/statusCode", status)],
         ));
     }
 
@@ -459,7 +501,11 @@ async fn a_patch_this_resource_does_not_support_is_refused_and_changes_nothing()
 async fn an_unresolvable_identifier_is_refused_on_the_identifier_it_names() {
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "update-gateway-response-identifiers").await;
-    let operations = vec![replace("/statusCode", "503")];
+    let operations = vec![op(
+        "add",
+        "/responseTemplates/application~1json",
+        Some("{\"message\":\"timeout\"}"),
+    )];
 
     // An API id naming no API is a 404 on the identifier the URI resolves; the two
     // identifiers differ in kind, so each is refused on its own rule.

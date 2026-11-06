@@ -346,9 +346,11 @@ async fn a_patch_sets_the_member_its_path_names_and_the_stage_reads_back() {
 
 #[tokio::test]
 async fn a_method_path_with_no_settings_yet_takes_the_documented_defaults() {
-    // Rows span the two spellings of a `methodSettings` key the patch path produces: the
-    // stage-wide wildcard and one method of one resource (its path's slash escaped with
-    // `~1`, as `PatchOperation$path` documents).
+    // Rows span the spellings of a method path the patch takes, and the key each
+    // produces: the stage-wide wildcard, one method of one resource and one of a nested
+    // resource spelled in two reference tokens (keyed as the pointer spelled them, the
+    // resource path's `~1` escapes included, as `PatchOperation$path` documents), and the
+    // whole method path spelled in ONE token, which is keyed decoded.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("every method of the stage", "/*/*", "*/*"),
         ("one method of one resource", "/~1pets/GET", "~1pets/GET"),

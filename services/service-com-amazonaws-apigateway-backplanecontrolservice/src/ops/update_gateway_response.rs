@@ -14,6 +14,11 @@
 //! customization, so it is stored and reported with `defaultResponse: false`, exactly as
 //! `PutGatewayResponse` stores one.
 //!
+//! A gateway response's `statusCode` takes a `replace` and nothing else — an `add` or a
+//! `remove` of it names no edit this resource makes, and `PutGatewayResponse` is what sets
+//! the code of a response the API holds no customization for — so a pointer naming it
+//! under any other op is refused as a patch path; see the note above `apply_patch`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -105,24 +110,26 @@ use crate::state::{
 };
 
 // The `path` values `UpdateGatewayResponse` accepts are the ones `apply_patch` below has
-// an arm for: one per updateable member of the `GatewayResponse` shape. `responseType` is
-// the response's identity — it is the URI label that addresses this very record — so it is
-// reported but not patchable, the way `UpdateMethodResponse` treats a method response's
-// `statusCode`; `defaultResponse` is the service's own report of whether the response is
-// generated or customized, not a member a caller sets.
+// an arm for: the two MAP members of the `GatewayResponse` shape, and its `statusCode`
+// under a `replace`. `responseType` is the response's identity — it is the URI label that
+// addresses this very record — so it is reported but not patchable, the way
+// `UpdateMethodResponse` treats a method response's `statusCode`; `defaultResponse` is the
+// service's own report of whether the response is generated or customized, not a member a
+// caller sets.
+//
+// Which ops one pointer takes is part of that table: a recorded refusal of `/statusCode`
+// under an op other than `replace` names the PATH and nothing of the op, so this operation
+// keys every unapplicable entry on its pointer (`UnsupportedOpRefusal::Path`, passed where
+// the request's list is read).
 
 /// Apply one patch to a COPY of the gateway response `response_type` reports.
 ///
-/// `statusCode` is single-valued and the other two members are MAPS, so a path addressing
-/// one of them names ONE entry (`/responseTemplates/application~1json`), and the edit is
-/// the service's shared map-patch semantics ([`patch_string_map`]): `add` and `replace`
-/// set the entry, `remove` drops it, and `move`/`copy`/`test` name nothing on such a
-/// member.
-fn apply_patch(
-    entry: &mut GetGatewayResponseOutput,
-    patch: &Patch,
-    response_type: &str,
-) -> Result<(), PatchFailure> {
+/// Two of the three patchable pointers are MAPS, so a path addressing one of them names
+/// ONE entry (`/responseTemplates/application~1json`), and the edit is the service's
+/// shared map-patch semantics ([`patch_string_map`]): `add` and `replace` set the entry,
+/// `remove` drops it, and `move`/`copy`/`test` name nothing on such a member. The status
+/// code is single-valued and takes a `replace` only.
+fn apply_patch(entry: &mut GetGatewayResponseOutput, patch: &Patch) -> Result<(), PatchFailure> {
     match patch.member() {
         // "The HTTP status code for this GatewayResponse"
         // (`GatewayResponse$statusCode`), typed `StatusCode` and so constrained to
@@ -131,7 +138,7 @@ fn apply_patch(
         "statusCode" => {
             patch.require_single_valued()?;
             match patch.op {
-                PatchOpKind::Add | PatchOpKind::Replace => {
+                PatchOpKind::Replace => {
                     let value = patch.require_value()?;
                     if !crate::state::is_status_code(value) {
                         return Err(PatchFailure::BadRequest(format!(
@@ -141,15 +148,13 @@ fn apply_patch(
                     }
                     entry.status_code = Some(value.to_string());
                 }
-                // A gateway response carries the status code of its response type
-                // wherever that type has one, which is the rule `PutGatewayResponse`
-                // resolves an absent `statusCode` by: dropping the customized code
-                // restores the generated one, and for the two types that have none
-                // (`DEFAULT_4XX`, `DEFAULT_5XX`) leaves the member unset.
-                PatchOpKind::Remove => {
-                    entry.status_code =
-                        crate::state::default_gateway_status_code(response_type).map(str::to_string);
-                }
+                // Every other op: the member is SET by a `replace` and by
+                // `PutGatewayResponse`, and by nothing else — an `add` puts no entry
+                // anywhere and a `remove` would leave the response with no code to answer
+                // with. The recorded evidence is an `add` of this pointer, answered with
+                // the PATH refusal while a `replace` of it is served; the op set the
+                // pointer takes is read from that pair rather than per op, so a recording
+                // of a `remove` of it would be what narrows this arm again.
                 _ => return Err(patch.unsupported_op()),
             }
             Ok(())
@@ -312,8 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
-        let patches =
-            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+        let patches = crate::state::parse_patches_refused_with_op(
+            input.patch_operations.as_ref(),
+            crate::state::InvalidPathRefusal::PathOnly,
+            crate::state::UnsupportedOpRefusal::Path,
+        )
+        .map_err(patch_failure)?;
 
         let mut store = state.lock();
         let api = store
@@ -335,7 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::default_gateway_response(&input.response_type));
 
         for patch in &patches {
-            apply_patch(&mut updated, patch, &input.response_type).map_err(patch_failure)?;
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
         }
 
         // A request that asks for no edit changes nothing — so an uncustomized type is

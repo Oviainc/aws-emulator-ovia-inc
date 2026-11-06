@@ -27,11 +27,15 @@
 //!
 //! Two paths of this surface are not a plain member of the `Stage` shape:
 //!
-//! * the per-method settings. A method-setting path is the method-setting KEY followed
-//!   by the setting it writes (`/~1pets/GET/metrics/enabled`), the key being
-//!   `{resource-path}/{HTTP-METHOD}` or `*/*` as `Stage$methodSettings` documents, so
-//!   the setting is read off the END of the path and the key is reported exactly as the
-//!   path addressed it — see [`apply_method_setting_patch`].
+//! * the per-method settings. A method-setting path is the TWO reference tokens naming
+//!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), the
+//!   key being `{resource-path}/{HTTP-METHOD}` or `*/*` as `Stage$methodSettings`
+//!   documents — so a `/` inside the resource path is escaped `~1` in the PATH while the
+//!   separator before the HTTP method is a real one, the KEY carries the method path
+//!   unescaped, and a pointer that escapes that separator too names no method at all — see
+//!   [`apply_method_setting_patch`], [`METHOD_PATH_TOKENS`] and [`method_settings_key`].
+//! * a pointer that is no member of the `Stage` shape is read as such a method path, so
+//!   it is refused as one — see [`STAGE_INVALID_PATCH_PATH`].
 //! * `accessLogSettings` and `canarySettings`, structures whose own members are
 //!   addressed the way a top-level member is, and which a `remove` of the structure
 //!   itself turns off.
@@ -339,6 +343,47 @@ const ACCESS_LOG_REQUIRED_CONTEXT_VARIABLE: &str = "$context.requestId";
 const STAGE_INVALID_PATCH_OPERATION: &str =
     "Invalid patch operation specified. Must be one of: 'replace', 'remove', 'copy'";
 
+/// The pointers a STAGE publishes, in the order API Gateway's own refusal enumerates
+/// them: the stage's own members, the per-method settings spelled as the TEMPLATE the
+/// service publishes (`/{resourcePath}/{httpMethod}/<group>/<setting>`, placeholders and
+/// all), and the two collections it keys by name.
+///
+/// This is fixed text of the refusal below, not a table the dispatch reads: which pointer
+/// a stage applies is each arm of [`apply_stage_patch`] and of
+/// [`apply_method_setting_patch`], and the enumeration is what the SERVICE prints.
+const STAGE_PATCH_PATHS: &[&str] = &[
+    "/deploymentId",
+    "/description",
+    "/cacheClusterEnabled",
+    "/cacheClusterSize",
+    "/clientCertificateId",
+    "/accessLogSettings",
+    "/{resourcePath}/{httpMethod}/metrics/enabled",
+    "/{resourcePath}/{httpMethod}/logging/dataTrace",
+    "/{resourcePath}/{httpMethod}/logging/loglevel",
+    "/{resourcePath}/{httpMethod}/throttling/burstLimit",
+    "/{resourcePath}/{httpMethod}/throttling/rateLimit",
+    "/{resourcePath}/{httpMethod}/caching/ttlInSeconds",
+    "/{resourcePath}/{httpMethod}/caching/enabled",
+    "/{resourcePath}/{httpMethod}/caching/dataEncrypted",
+    "/{resourcePath}/{httpMethod}/caching/requireAuthorizationForCacheControl",
+    "/{resourcePath}/{httpMethod}/caching/unauthorizedCacheControlHeaderStrategy",
+    "/variables/{variable_name}",
+    "/documentationVersion",
+    "/canarySettings/percentTraffic",
+    "/canarySettings/deploymentId",
+    "/canarySettings/stageVariableOverrides/{variable_name}",
+    "/canarySettings/useStageCache",
+    "/tracingEnabled",
+];
+
+/// How a stage words a refusal of a patch path it cannot apply: every pointer that is no
+/// member of the `Stage` shape is read as a per-method setting's path, so the sentence
+/// names the rejected path as such and then enumerates [`STAGE_PATCH_PATHS`] — the one
+/// set, whichever `op` named the path.
+const STAGE_INVALID_PATCH_PATH: crate::state::InvalidPathRefusal =
+    crate::state::InvalidPathRefusal::MethodSettingPath(STAGE_PATCH_PATHS);
+
 /// The pointers a patch may name inside a stage's `accessLogSettings`, spelled from the
 /// stage root: the two members the `AccessLogSettings` shape declares
 /// (`smithy_query(query="shape", shape="AccessLogSettings")` — `destinationArn` and
@@ -478,7 +523,7 @@ fn add_names_an_entry(patch: &Patch) -> bool {
         // A method's settings, which the stage holds no entry for until one is added. A
         // single-valued member of the `Stage` shape names no setting, so it answers here
         // too.
-        _ => method_setting_tail(patch).is_some(),
+        _ => method_setting(patch).is_some(),
     }
 }
 
@@ -819,51 +864,104 @@ const METHOD_SETTING_NAMES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The setting a method path's TAIL names, with how many reference tokens the method
-/// path itself takes. `None` for a tail that names no setting.
+/// How many reference tokens of a method-setting path name the METHOD when the pointer
+/// spells the resource path and the HTTP method separately: "method paths defined as
+/// {resource_path}/{http_method} for an individual method override, or /\*/\* for
+/// overriding all methods in the stage" (`Stage$methodSettings`), with every `/` INSIDE
+/// the resource path escaped `~1` the way a JSON Pointer requires.
+const METHOD_PATH_TOKENS: usize = 2;
+
+/// The method a patch path names and the setting it writes, or `None` for a path that
+/// names no setting of a method.
 ///
-/// A published name is two reference tokens (`metrics/enabled`) and a member name is one
-/// (`metricsEnabled`), so the tail is tried at both widths — the WIDER first, because
-/// every published name ends with its own member name and matching the shorter one first
-/// would swallow the group token into the method path. The answer is always the PUBLISHED
-/// name, so one setting is applied in one place however the request spelled it.
-fn method_setting_tail(patch: &Patch) -> Option<(usize, &'static str)> {
-    for width in [2usize, 1] {
-        let Some(depth) = patch
-            .tokens
-            .len()
-            .checked_sub(width)
-            .filter(|depth| *depth > 0)
-        else {
-            continue;
-        };
-        // The log level is the one setting with two spellings of its published name in
-        // circulation, so `loglevel` and `logLevel` are normalised to the published one.
-        let named = match patch.tokens[depth..].join("/").as_str() {
-            "logging/logLevel" => Some("logging/loglevel"),
-            tail => METHOD_SETTING_NAMES
-                .iter()
-                .find(|(published, member)| *published == tail || *member == tail)
-                .map(|(published, _)| *published),
-        };
-        if let Some(named) = named {
-            return Some((depth, named));
+/// A pointer spells the method in one of the two ways API Gateway reads:
+///
+/// * as its own two reference tokens, `/{resource_path}/{http_method}/…` — the separator
+///   before the method is a real one and the resource path's own `/` is escaped — and then
+///   the setting, in either spelling [`METHOD_SETTING_NAMES`] lists. The method is keyed as
+///   the pointer spelled it (`~1pets/GET`), escapes included;
+/// * as ONE token carrying the whole method path, `/{escaped_method_path}/{setting}`, and
+///   then the setting's own member name. That token has to be decoded for the method to be
+///   read out of it at all, so the method is keyed decoded (`/pets/GET`) — which is why the
+///   two spellings of one method are two entries of the map rather than one, as a recorded
+///   stage patched both ways shows.
+///
+/// A pointer that is neither — a one-token method path followed by a GROUPED setting name,
+/// a tail that names no setting, a path that stops at the method, a method path whose
+/// resource half is no resource path — names no setting of a method, and so never becomes
+/// a `methodSettings` entry: a key the method the request named does not resolve to is a
+/// setting no invoke of that method would ever consult.
+fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
+    if let Some(tail) = patch
+        .tokens
+        .get(METHOD_PATH_TOKENS..)
+        .filter(|tail| !tail.is_empty())
+    {
+        if let Some(setting) = named_setting(&tail.join("/")) {
+            if !names_a_resource(patch.tokens.first()?) {
+                return None;
+            }
+            return Some((spelled_method_path(patch)?, setting));
         }
     }
-    None
+    let [method_path, setting] = patch.tokens.as_slice() else {
+        return None;
+    };
+    // The grouped spelling of a setting is two reference tokens, so a one-token method
+    // path can only be followed by the setting's member name — which is the only spelling
+    // one token can match. The answer is the published name either way.
+    let setting = named_setting(setting)?;
+    // Decoded, that one token has to BE a method path: a resource path, and then the HTTP
+    // method after the `/` the escape stood for.
+    let (resource_path, _) = method_path.rsplit_once('/')?;
+    if !names_a_resource(resource_path) {
+        return None;
+    }
+    Some((method_path.clone(), setting))
 }
 
-/// The `methodSettings` key a patch's path addresses: the first `depth` segments of the
-/// path exactly as the request spelled them, escapes included, because that is the key
-/// the patch addressed.
-fn method_settings_key(patch: &Patch, depth: usize) -> Option<String> {
+/// Whether `resource_path` is the resource half of a method path: a RESOURCE path, which
+/// "begins with a '/'" as `Resource$path` spells one — so a pointer escapes that `/` as
+/// `~1` — or the token that stands for every resource of the stage.
+///
+/// A method path names a method of the API the stage serves, so a token that is no resource
+/// path names no method, whatever setting follows it: the resource path has to be spelled
+/// the way the API's own resources are, which is also the spelling the data plane resolves
+/// a method's settings by ([`crate::service::invoke`]).
+fn names_a_resource(resource_path: &str) -> bool {
+    resource_path.starts_with('/') || resource_path == EVERY_RESOURCE
+}
+
+/// The method-path token that stands for EVERY resource, and for every method, of the
+/// stage: `Stage$methodSettings` documents the whole-stage key as `/*/*`.
+const EVERY_RESOURCE: &str = "*";
+
+/// The PUBLISHED name of the setting `tail` spells, in either spelling, or `None` when it
+/// names no setting.
+fn named_setting(tail: &str) -> Option<&'static str> {
+    // The log level is the one setting with two spellings of its published name in
+    // circulation, so `loglevel` and `logLevel` are normalised to the published one.
+    match tail {
+        "logging/logLevel" => Some("logging/loglevel"),
+        tail => METHOD_SETTING_NAMES
+            .iter()
+            .find(|(published, member)| *published == tail || *member == tail)
+            .map(|(published, _)| *published),
+    }
+}
+
+/// The `methodSettings` key the two leading SEGMENTS of this patch's path name: the method
+/// path exactly as the request spelled it, escapes included, because that is the method
+/// path the patch addressed. `None` for a path that names no method.
+fn spelled_method_path(patch: &Patch) -> Option<String> {
     let raw: Vec<&str> = patch
         .path
         .strip_prefix('/')
         .unwrap_or(&patch.path)
         .split('/')
         .collect();
-    raw.get(..depth).map(|segments| segments.join("/"))
+    raw.get(..METHOD_PATH_TOKENS)
+        .map(|segments| segments.join("/"))
 }
 
 /// The `BadRequestException` message API Gateway refuses a `remove` of a method setting
@@ -897,13 +995,19 @@ fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), Pa
             patch.path.strip_prefix('/').unwrap_or(&patch.path),
         ))
     };
-    let named = method_setting_tail(patch);
-    let key = method_settings_key(patch, named.map_or(patch.tokens.len(), |(depth, _)| depth))
-        .ok_or_else(refuse)?;
-    let Some((_, setting)) = named else {
-        return entry
-            .method_settings
-            .remove(&key)
+    let Some((key, setting)) = method_setting(patch) else {
+        // The path names the method and nothing beyond it, so the whole entry goes — under
+        // either spelling of the method path, because either is a key the stage may hold.
+        // A path that names neither a setting of a method nor a method alone takes nothing
+        // away.
+        if patch.tokens.len() != METHOD_PATH_TOKENS {
+            return Err(refuse());
+        }
+        let spelled = spelled_method_path(patch).ok_or_else(refuse)?;
+        let decoded = patch.tokens.join("/");
+        return [spelled, decoded]
+            .iter()
+            .find_map(|key| entry.method_settings.remove(key))
             .map(|_| ())
             .ok_or_else(refuse);
     };
@@ -945,10 +1049,9 @@ fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), Pa
 /// `/{resource_path}/{http_method}/{group}/{setting}`, or `/*/*/{group}/{setting}` for
 /// every method of the stage.
 ///
-/// The tail names the setting — in either spelling [`METHOD_SETTING_NAMES`] lists — and
-/// everything before it the method, which is the `methodSettings` key the stage reports
-/// — spelled exactly as the request spelled it, escapes included, because that is the key
-/// the patch addressed.
+/// Which method the pointer names, which setting it writes and the `methodSettings` key
+/// the stage reports it under are [`method_setting`]'s; a pointer that names no setting of
+/// a method is refused as a path.
 fn apply_method_setting_patch(
     entry: &mut StageEntry,
     patch: &Patch,
@@ -959,7 +1062,7 @@ fn apply_method_setting_patch(
     if matches!(patch.op, PatchOpKind::Remove) {
         return remove_method_setting(entry, patch);
     }
-    let Some((depth, setting)) = method_setting_tail(patch) else {
+    let Some((method_path, setting)) = method_setting(patch) else {
         return Err(patch.unsupported_path());
     };
     // The account-level logging role is a precondition of the CONFIGURATION, checked
@@ -970,9 +1073,6 @@ fn apply_method_setting_patch(
             ACCOUNT_CLOUDWATCH_ROLE_REQUIRED.to_string(),
         ));
     }
-    let Some(method_path) = method_settings_key(patch, depth) else {
-        return Err(patch.unsupported_path());
-    };
     if !entry.method_settings.contains_key(&method_path) {
         crate::state::bound_entries(
             "methodSettings",
@@ -1103,8 +1203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reaches the records at all.
         let patches = crate::state::parse_patches_refused_with_op(
             input.patch_operations.as_ref(),
-            crate::state::InvalidPathRefusal::PathOnly,
-            STAGE_INVALID_PATCH_OPERATION,
+            STAGE_INVALID_PATCH_PATH,
+            crate::state::UnsupportedOpRefusal::Ops(STAGE_INVALID_PATCH_OPERATION),
         )
         .map_err(patch_failure)?;
 

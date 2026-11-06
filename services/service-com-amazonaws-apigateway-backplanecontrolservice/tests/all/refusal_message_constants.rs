@@ -128,7 +128,9 @@ async fn a_patch_path_the_resource_cannot_be_addressed_by_is_refused_with_the_pa
     // service assigns, a member no shape declares, a pointer reaching into a single-valued
     // member, a pointer naming a map member with no key, and a path that is no JSON Pointer
     // at all. The operations that enumerate their published paths instead — which is most
-    // of the `Update*` surface — are the `patch_path_refusal_templates` suite's.
+    // of the `Update*` surface — are the `patch_path_refusal_templates` suite's, and a
+    // stage, whose own sentence enumerates every pointer it publishes, is pinned by
+    // `stage_canary_and_patch_grammar`.
     let rows: Vec<(&str, String, &str)> = vec![
         (
             "UpdateRestApi names a service-assigned member",
@@ -146,9 +148,9 @@ async fn a_patch_path_the_resource_cannot_be_addressed_by_is_refused_with_the_pa
             "/name/first",
         ),
         (
-            "UpdateStage names a map member with no key",
-            format!("/restapis/{api}/stages/prod"),
-            "/variables",
+            "UpdateGatewayResponse names a map member with no key",
+            format!("/restapis/{api}/gatewayresponses/DEFAULT_4XX"),
+            "/responseTemplates",
         ),
         (
             "UpdateMethodResponse names the response's own identity",

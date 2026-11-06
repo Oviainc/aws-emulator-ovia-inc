@@ -1940,12 +1940,14 @@ fn cache_plan(
 /// `matched_path` of this stage: the entry keyed by THAT method, else the one that names
 /// every method of the stage, else none at all.
 ///
-/// A `methodSettings` key is "the method path" a patch addressed —
-/// `{resource_path}/{http_method}`, with the path's own `/` written as the JSON Pointer
-/// escape ([`ESCAPED_PATH_SEPARATOR`]) — or [`EVERY_METHOD_SETTINGS_KEY`], and the stage
-/// stores it exactly as the patch spelled it. Both spellings of the method's own key are
-/// tried, the escaped one first, because a patch that addressed the path with a literal
-/// separator stored it that way; the whole-stage key is the fallback, which is what makes a
+/// A `methodSettings` key is the method path a patch addressed —
+/// `{resource_path}/{http_method}`, with the resource path's own `/` written as the JSON
+/// Pointer escape ([`ESCAPED_PATH_SEPARATOR`]) where the pointer spelled the method path in
+/// two reference tokens and decoded where it spelled it in one — or
+/// [`EVERY_METHOD_SETTINGS_KEY`]. Both spellings of the method's own key are tried, the
+/// escaped one first, and they are the only two `UpdateStage` can store: a pointer whose
+/// resource half is no resource path names no method there, so no stored key can fail to
+/// resolve here. The whole-stage key is the fallback, which is what makes a
 /// `/*/*/caching/enabled` patch cache every method.
 fn method_settings_in_force<'s>(
     stage: &'s StageEntry,
@@ -1954,8 +1956,7 @@ fn method_settings_in_force<'s>(
 ) -> Option<&'s MethodSetting> {
     let verb = method_key(verb);
     let escaped = matched_path.replace('/', ESCAPED_PATH_SEPARATOR);
-    let literal = matched_path.trim_start_matches('/');
-    [format!("{escaped}/{verb}"), format!("{literal}/{verb}")]
+    [format!("{escaped}/{verb}"), format!("{matched_path}/{verb}")]
         .iter()
         .find_map(|key| stage.method_settings.get(key))
         .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))

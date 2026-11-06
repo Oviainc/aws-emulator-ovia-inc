@@ -482,9 +482,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
-        // reaches the records at all.
-        let patches =
-            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+        // reaches the records at all. An integration holds a patch entry it cannot apply
+        // against the PATH — see [`crate::state::UnsupportedOpRefusal::Path`].
+        let patches = crate::state::parse_patches_refused_with_op(
+            input.patch_operations.as_ref(),
+            crate::state::InvalidPathRefusal::PathOnly,
+            crate::state::UnsupportedOpRefusal::Path,
+        )
+        .map_err(patch_failure)?;
 
         let verb = method_key(&input.http_method);
         let mut store = state.lock();

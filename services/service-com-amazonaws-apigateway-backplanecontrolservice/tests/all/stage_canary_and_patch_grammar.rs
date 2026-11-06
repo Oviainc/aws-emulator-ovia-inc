@@ -26,6 +26,7 @@
 
 use serde_json::{json, Value};
 
+use crate::patch_entry_precedence::stage_invalid_patch_path;
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
@@ -734,10 +735,13 @@ async fn an_add_names_one_entry_of_a_collection_a_stage_keys_by_name() {
         "UpdateStage",
     );
 
-    // The POINTER is judged first: one the stage has no member for is refused as a
-    // pointer, whichever op carried it.
+    // The POINTER is judged first: one the stage has no member for is read as a method
+    // setting's path and refused as one, whichever op carried it.
     for (path, expected) in [
-        ("/sim2realNoSuchField", "Invalid patch path /sim2realNoSuchField".to_string()),
+        (
+            "/sim2realNoSuchField",
+            stage_invalid_patch_path("/sim2realNoSuchField"),
+        ),
         (
             "/accessLogSettings/sim2realNoSuchField",
             "Invalid accessLogSettings path. Must be one of : \

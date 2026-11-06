@@ -280,13 +280,17 @@ async fn a_customization_a_patch_created_is_cleared_the_same_way() {
             "a patch of an uncustomized type",
             "UNAUTHORIZED",
             None,
-            vec![replace("/statusCode", "401")],
+            vec![json!({
+                "op": "add",
+                "path": "/responseParameters/gatewayresponse.header.X-Reason",
+                "value": "'unauthorized'"
+            })],
         ),
         (
             "a patch over a put",
             "INTEGRATION_FAILURE",
             Some(json!({ "statusCode": "504" })),
-            vec![replace("/statusCode", "502")],
+            vec![replace("/responseTemplates/application~1json", "{}")],
         ),
         (
             "a patch adding a map entry",

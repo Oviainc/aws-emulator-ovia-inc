@@ -46,7 +46,11 @@ use crate::usage_plan_lifecycle::create_usage_plan;
 /// The one sentence API Gateway refuses an `op` the resource supports no path for with:
 /// `move`, `copy` and `test` name nothing on these resources, so there is no permitted-path
 /// set to enumerate for them.
-const INVALID_OP: &str = "Invalid patch operation specified. Must be 'add'|'remove'|'replace'";
+///
+/// `pub(crate)` so a sibling suite asserts the one sentence rather than keeping a copy of
+/// it (the `patch_entry_precedence` suite does).
+pub(crate) const INVALID_OP: &str =
+    "Invalid patch operation specified. Must be 'add'|'remove'|'replace'";
 
 /// The sentence a STAGE refuses such an op with: a stage takes a `copy` (the canary
 /// promotion `PatchOperation$from` documents), so the ops it enumerates — and the wording

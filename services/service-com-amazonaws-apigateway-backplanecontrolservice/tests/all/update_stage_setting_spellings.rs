@@ -11,11 +11,12 @@
 //! `CreateRestApi` / `CreateDeployment` / `GetStage` helpers are this crate's existing
 //! harness, reused from `rest_api_lifecycle` and `stage_lifecycle`.
 //!
-//! The rule under test: a method-setting path is the method path followed by the setting
-//! it writes, and the setting may be addressed by its published name or by its modelled
-//! member name — both write the SAME member of the SAME `methodSettings` entry, keyed by
-//! the method path exactly as the request spelled it. A tail that names no setting at all
-//! is refused and changes nothing.
+//! The rule under test: a method-setting path spells the method either in TWO reference
+//! tokens (`/~1pets/GET/…`) or in one (`/~1pets~1GET/…`), and the setting may be addressed
+//! by its published name or by its modelled member name — both write the SAME member of
+//! the entry the method is keyed by, which is the method path as the pointer spelled it
+//! where it took two tokens and the decoded path where it took one. A path that leaves no
+//! setting beyond the method, or whose tail names none, is refused and changes nothing.
 //!
 //! Asserted over a TABLE rather than one recorded call: every setting of the
 //! `MethodSetting` shape in both spellings, each with a value that differs from the one a
@@ -162,7 +163,8 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
 
     for (published, member, value, expected) in setting_catalog() {
         // One method path per spelling, so each row proves which setting the spelling
-        // wrote rather than merely that something changed.
+        // wrote rather than merely that something changed. The key is the method path as
+        // the pointer spelled it.
         let published_key = format!("~1{member}-published/GET");
         let member_key = format!("~1{member}-member/GET");
         for (spelling, path, key) in [
@@ -200,18 +202,23 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
 }
 
 #[tokio::test]
-async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_path_as_addressed() {
-    // Rows differ along how a client spells the method path: a child resource with its
-    // leading slash escaped, the root resource, the whole path escaped inside one
-    // reference token, and the `*/*` wildcard `Stage$methodSettings` documents for every
-    // method of the stage.
+async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_it_names() {
+    // Rows differ along how a client spells the method path: a child resource and a nested
+    // one with the resource path's slashes escaped and the method in its own token, the
+    // root resource, the whole method path inside ONE token (which is keyed decoded), and
+    // the `*/*` wildcard `Stage$methodSettings` documents for every method of the stage.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("a child resource", "/~1pets/GET/metricsEnabled", "~1pets/GET"),
         ("the root resource", "/~1/GET/metricsEnabled", "~1/GET"),
         (
-            "one escaped method path",
-            "/pets~1GET/metricsEnabled",
-            "pets~1GET",
+            "a nested resource path",
+            "/~1pets~1{petId}/GET/metricsEnabled",
+            "~1pets~1{petId}/GET",
+        ),
+        (
+            "the whole method path in one token",
+            "/~1pets~1POST/metricsEnabled",
+            "/pets/POST",
         ),
         ("every method", "/*/*/metricsEnabled", "*/*"),
     ];
@@ -260,9 +267,11 @@ async fn a_tail_that_names_no_setting_is_refused_and_changes_nothing() {
     .await;
     let baseline = get_stage(&gateway, &api, "prod").await.body;
 
-    // Rows span the ways a method-setting path can name no setting: a member name that
-    // is not one, a published name whose group and name do not go together, a path that
-    // stops at the method, and a setting with no method path before it.
+    // Rows span the ways a method-setting path can name no setting of a method: a member
+    // name that is not one, a published name whose group and name do not go together, a
+    // path that stops at the method, a setting with no method path before it, and a
+    // one-token method path followed by a GROUPED setting name, which is the spelling where
+    // the tokens beyond the method name no setting at all.
     let cases: Vec<(&str, &str)> = vec![
         ("a member name no setting has", "/~1pets/GET/bogusSetting"),
         ("a group that has no such name", "/~1pets/GET/metrics/bogus"),
@@ -270,6 +279,14 @@ async fn a_tail_that_names_no_setting_is_refused_and_changes_nothing() {
         ("a path that stops at the method", "/~1pets/GET"),
         ("a setting with no method path", "/metricsEnabled"),
         ("a published name with no method path", "/metrics/enabled"),
+        (
+            "a one-token method path with a grouped setting name",
+            "/~1pets~1GET/throttling/rateLimit",
+        ),
+        (
+            "a one-token method path with no setting at all",
+            "/~1pets~1GET",
+        ),
     ];
 
     for (case, path) in cases {

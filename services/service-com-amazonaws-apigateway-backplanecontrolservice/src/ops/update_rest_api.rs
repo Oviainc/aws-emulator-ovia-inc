@@ -135,6 +135,16 @@ use crate::ops::create_rest_api::accepted_compression_size;
 // `TagResource`/`UntagResource`, so none of them is patchable; the API's resources have
 // their own operations.
 
+/// The sentence API Gateway refuses an `op` an API's own pointers cannot take with.
+///
+/// The ops a `RestApi` takes are `add`, `replace` and `remove`, and this operation
+/// enumerates exactly those three — bracketed, in the service's own order — where the
+/// resources that word the same refusal with quoted alternatives use
+/// [`crate::state::INVALID_PATCH_OPERATION`]: the wording belongs to the OPERATION, and a
+/// recorded refusal of each of the two shows the two sentences side by side.
+const REST_API_INVALID_PATCH_OPERATION: &str =
+    "Invalid patch operation specified. Must be one of: [add, replace, remove]";
+
 /// Apply one patch to a COPY of a stored API.
 fn apply_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailure> {
     match patch.member() {
@@ -301,8 +311,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
-        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
-            .map_err(patch_failure)?;
+        let patches = crate::state::parse_patches_refused_with_op(
+            input.patch_operations.as_ref(),
+            crate::state::InvalidPathRefusal::PathOnly,
+            crate::state::UnsupportedOpRefusal::Ops(REST_API_INVALID_PATCH_OPERATION),
+        )
+        .map_err(patch_failure)?;
 
         let mut store = state.lock();
 

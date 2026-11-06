@@ -23,18 +23,21 @@
 //!    starts at the first input member, which names no operation. [`input_root`] is
 //!    that root; it is derived per operation, which the recordings prove by showing a
 //!    DIFFERENT root for the same member path on `UpdateRestApi`, `UpdateApiKey` and
-//!    `UpdateDocumentationVersion`.
+//!    `UpdateDocumentationVersion`. A member bound to the QUERY STRING is the exception:
+//!    it is named by its own member name alone, with no root at all — see
+//!    [`binds_to_query`].
 //! 2. **A `@pattern` is emitted without the whole-value anchors.** The public Smithy
 //!    model writes AWS's implicit whole-value match as an explicit `^…$` pair
 //!    (`smithy_query(query="shape", shape="com.amazonaws.apigateway#StatusCode")` gives
 //!    `^[1-5]\d\d$`); the service emits the expression itself, `[1-5]\d\d`. The pair is
 //!    dropped from the RENDERING only — the check still runs the model's own pattern.
 //! 3. **An enum value set is listed in the order the service declares the enum in**,
-//!    which is not always the order the public model lists (see [`OP_VALUE_SET`]).
+//!    which is not always the order the public model lists (see [`DECLARED_VALUE_SETS`]).
 //!
 //! Status (400) is the framework's own choice for a constraint failure and is left
 //! alone; the error code and the constructed sentence are this service's.
 
+use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{path, ViolationKind};
 use smithy_server_runtime::{Refused, Violation};
 
@@ -77,23 +80,36 @@ const SELF_VALIDATED_MEMBERS: [(&str, &str, &str); 1] = [(
     crate::ops::create_authorizer::INVALID_AUTHORIZER_TYPE,
 )];
 
-/// The one enum of this service whose value set the recordings show in an order the
-/// public Smithy model does not list it in.
+/// The enums of this service whose value set the recordings show in an order the public
+/// Smithy model does not list it in.
 ///
 /// `PatchOperation$op` targets `com.amazonaws.apigateway#Op`, which
 /// `smithy_query(query="shape", shape="com.amazonaws.apigateway#Op")` declares as
-/// `[add, remove, replace, move, copy, test]`. Every recorded refusal of an invalid
-/// `op` — on `UpdateDocumentationVersion`, on `UpdateRestApi` and on `UpdateApiKey`,
-/// three different operations — lists the set as below instead. The order is therefore
-/// a property of the ENUM SHAPE (the order the service's own model declares its
-/// values in), not of any one request, and is recorded as such: a value set is rendered
-/// in the service's declared order, which for every other enum of this service is the
-/// order the public model preserves.
-const OP_VALUE_SET: [&str; 6] = ["add", "remove", "move", "test", "replace", "copy"];
+/// `[add, remove, replace, move, copy, test]`, and `PutRestApiRequest$mode` targets
+/// `com.amazonaws.apigateway#PutMode`, declared `[merge, overwrite]`. Every recorded
+/// refusal of an invalid `op` — on `UpdateDocumentationVersion`, on `UpdateRestApi` and on
+/// `UpdateApiKey`, three different operations — and the recorded refusal of an invalid
+/// `mode` list their sets as below instead. The order is therefore a property of the ENUM
+/// SHAPE (the order the service's own model declares its values in), not of any one
+/// request, and is recorded as such: a value set is rendered in the service's declared
+/// order, which for every other enum of this service is the order the public model
+/// preserves.
+const DECLARED_VALUE_SETS: [&[&str]; 2] = [
+    &["add", "remove", "move", "test", "replace", "copy"],
+    &["overwrite", "merge"],
+];
 
 /// This service's wording for the violations the framework found on `operation`'s
 /// request, or `None` when there are none to word.
-pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refused> {
+///
+/// `input_schema` is the operation's own input schema, which is what says how each
+/// violated member TRAVELS — the one request-shaped fact a clause of this service depends
+/// on (see [`binds_to_query`]).
+pub(super) fn refusal(
+    operation: &str,
+    input_schema: &'static Schema,
+    violations: &[Violation],
+) -> Option<Refused> {
     // A member the OPERATION checks itself is its own semantic refusal, and that refusal
     // is one sentence of the operation's own: the constraint envelope reports which
     // constraint a value broke, which is not what such a refusal says.
@@ -106,7 +122,7 @@ pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refus
     let root = input_root(operation);
     let stated: Vec<Violation> = violations
         .iter()
-        .map(|violation| as_stated(&root, violation))
+        .map(|violation| as_stated(&root, input_schema, violation))
         .collect();
     // The envelope — `1 validation error detected: <clause>` / `N validation errors
     // detected: <clause>; <clause>` — and each clause's own frame are the framework's,
@@ -148,16 +164,44 @@ fn input_root(operation: &str) -> String {
     format!("{}Input", path::member(operation))
 }
 
-/// One violation as this service states it: the path rooted at the input shape, the
-/// constraint rendered the way the service renders it, the value as the framework
-/// echoed it (already elided to the framework's cap).
-fn as_stated(root: &str, violation: &Violation) -> Violation {
+/// One violation as this service states it: the path rooted at the input shape — unless
+/// the member travels in the QUERY STRING, which is named on its own — the constraint
+/// rendered the way the service renders it, the value as the framework echoed it (already
+/// elided to the framework's cap).
+fn as_stated(root: &str, input_schema: &'static Schema, violation: &Violation) -> Violation {
+    let path = if binds_to_query(input_schema, &violation.path) {
+        violation.path.clone()
+    } else {
+        format!("{root}.{}", violation.path)
+    };
     Violation {
-        path: format!("{root}.{}", violation.path),
+        path,
         kind: as_rendered(&violation.kind),
         value: violation.value.clone(),
         sensitive: violation.sensitive,
     }
+}
+
+/// Whether `violation_path` names a member `input_schema` carries in the QUERY STRING.
+///
+/// Read off the member's own `@httpQuery` binding, so the MODEL decides: the clause for
+/// such a member names it alone, while a member that travels in the body or in the URI
+/// path is named from the operation's input shape — the recorded refusal of
+/// `PutRestApi`'s `mode`, a `@httpQuery` member, names `mode`, where the recorded refusals
+/// of `PutGatewayResponse`'s `statusCode` (a body member) and `PutIntegrationResponse`'s
+/// (a `@httpLabel`) are both rooted. A nested path is placed by its FIRST segment, the
+/// top-level member the whole subtree hangs off, exactly as the shared front-door
+/// placement does it.
+fn binds_to_query(input_schema: &Schema, violation_path: &str) -> bool {
+    // `split` always yields at least one item, so this is the whole path when it has no
+    // `.` in it.
+    let member_name = violation_path.split('.').next().unwrap_or_default();
+    input_schema.members().iter().any(|member| {
+        member
+            .member_name()
+            .is_some_and(|name| path::member(name) == member_name)
+            && member.http_query().is_some()
+    })
 }
 
 /// A violated constraint as this service renders it: a pattern without its whole-value
@@ -244,12 +288,14 @@ fn ends_with_escape(text: &str) -> bool {
 /// `values` in the order the service declares the enum they came from.
 ///
 /// A value set is identified by the values it holds (a runtime `Violation` carries the
-/// set, not the shape it came from), so the one enum this service declares in an order
-/// the public model does not list is recognised by its own value set. Every other value
+/// set, not the shape it came from), so the enums this service declares in an order the
+/// public model does not list are recognised by their own value sets. Every other value
 /// set is already in its declared order and is passed through.
 fn declared_order(values: &[String]) -> Vec<String> {
-    if is_set_of(values, &OP_VALUE_SET) {
-        return OP_VALUE_SET.iter().map(|value| (*value).to_string()).collect();
+    for declared in DECLARED_VALUE_SETS {
+        if is_set_of(values, declared) {
+            return declared.iter().map(|value| (*value).to_string()).collect();
+        }
     }
     values.to_vec()
 }
@@ -269,6 +315,27 @@ mod tests {
     //! `tests/all/validation_message_rules.rs`.
 
     use super::*;
+
+    /// The input schema of the operation a row names: what says how each member of it
+    /// travels, which is the one request-shaped fact [`refusal`] reads.
+    fn schema_of(operation: &str) -> &'static Schema {
+        match operation {
+            "CreateAuthorizer" => crate::ops::types::CREATE_AUTHORIZER_INPUT_SCHEMA,
+            "CreateDocumentationPart" => crate::ops::types::CREATE_DOCUMENTATION_PART_INPUT_SCHEMA,
+            "CreateRestApi" => crate::ops::types::CREATE_REST_API_INPUT_SCHEMA,
+            "GetRestApi" => crate::ops::types::GET_REST_API_INPUT_SCHEMA,
+            "PutIntegrationResponse" => crate::ops::types::PUT_INTEGRATION_RESPONSE_INPUT_SCHEMA,
+            "PutRestApi" => crate::ops::types::PUT_REST_API_INPUT_SCHEMA,
+            "UpdateRestApi" => crate::ops::types::UPDATE_REST_API_INPUT_SCHEMA,
+            other => panic!("no schema is wired for {other:?}"),
+        }
+    }
+
+    /// The refusal `operation` states for `violations`, through that operation's own
+    /// input schema.
+    fn stated_refusal(operation: &str, violations: &[Violation]) -> Option<Refused> {
+        refusal(operation, schema_of(operation), violations)
+    }
 
     /// A path is rooted at the operation's own input shape, for every operation name
     /// shape this service's model holds.
@@ -328,21 +395,34 @@ mod tests {
         }
     }
 
+    /// The order each enum of [`DECLARED_VALUE_SETS`] is listed in, for the test rows
+    /// below.
+    const OP_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[0];
+    const PUT_MODE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[1];
+
     /// A value set is listed in the service's declared order: the recorded order for
-    /// `Op`, the model's own order for every other enum.
+    /// `Op` and for `PutMode`, the model's own order for every other enum.
     #[test]
     fn an_enum_value_set_is_listed_in_the_services_declared_order() {
         // (case, the set as the model declares it, the set as the service lists it)
-        let rows: [(&str, &[&str], &[&str]); 4] = [
+        let rows: [(&str, &[&str], &[&str]); 6] = [
             (
                 "Op, in the model's declaration order",
                 &["add", "remove", "replace", "move", "copy", "test"],
-                &OP_VALUE_SET,
+                OP_VALUE_SET,
+            ),
+            ("Op, already in the service's order", OP_VALUE_SET, OP_VALUE_SET),
+            // Source: `smithy_query(query="shape",
+            // shape="com.amazonaws.apigateway#PutMode")` declares `[merge, overwrite]`.
+            (
+                "PutMode, in the model's declaration order",
+                &["merge", "overwrite"],
+                PUT_MODE_VALUE_SET,
             ),
             (
-                "Op, already in the service's order",
-                &OP_VALUE_SET,
-                &OP_VALUE_SET,
+                "PutMode, already in the service's order",
+                PUT_MODE_VALUE_SET,
+                PUT_MODE_VALUE_SET,
             ),
             // Source: `smithy_query(query="shape",
             // shape="com.amazonaws.apigateway#ApiKeySourceType")`.
@@ -431,7 +511,7 @@ mod tests {
         ];
 
         for (case, found, expected) in rows {
-            let stated = refusal("UpdateRestApi", std::slice::from_ref(&found))
+            let stated = stated_refusal("UpdateRestApi", std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
             assert_eq!(
                 stated.code, VALIDATION_EXCEPTION,
@@ -492,7 +572,7 @@ mod tests {
                 value: Some("THREE".to_string()),
                 sensitive: false,
             };
-            let stated = refusal(operation, std::slice::from_ref(&found))
+            let stated = stated_refusal(operation, std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
             assert_eq!(
                 stated.code, expected,
@@ -506,7 +586,7 @@ mod tests {
     /// answered here.
     #[test]
     fn no_violations_is_no_refusal() {
-        let stated = refusal("GetRestApi", &[]);
+        let stated = stated_refusal("GetRestApi", &[]);
         assert!(
             stated.is_none(),
             "case no violations: expected None, got {stated:?}"
@@ -557,7 +637,7 @@ mod tests {
         ];
 
         for (case, found) in rows {
-            let stated = refusal("CreateAuthorizer", &found)
+            let stated = stated_refusal("CreateAuthorizer", &found)
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
             assert_eq!(
                 stated.code, BAD_REQUEST_EXCEPTION,
@@ -573,7 +653,7 @@ mod tests {
 
         // The same member on another operation stays on the envelope, so the sentence is
         // this member's and not the name's.
-        let elsewhere = refusal(
+        let elsewhere = stated_refusal(
             "CreateDocumentationPart",
             std::slice::from_ref(&outside_the_catalog),
         )
@@ -583,5 +663,71 @@ mod tests {
             "case another operation: expected the constraint envelope, got {:?}",
             elsewhere.message
         );
+    }
+
+    /// A violated member is named from the operation's input shape unless it travels in
+    /// the QUERY STRING, which is named alone.
+    #[test]
+    fn a_query_bound_member_is_named_without_the_input_shape_root() {
+        // (case, operation, the violated member's path, the clause's member path) — the
+        // rows span the three ways a member of this service travels: the query string, the
+        // URI path and the body, plus a nested path under each.
+        let rows: [(&str, &str, &str, &str); 5] = [
+            // `PutRestApiRequest$mode` is `@httpQuery("mode")`
+            // (`smithy_query(query="operation", operation="PutRestApi")`).
+            ("a query member", "PutRestApi", "mode", "mode"),
+            // `restApiId` is the `@httpLabel` of the same operation, so one request can
+            // show both spellings at once.
+            (
+                "a URI label of the same operation",
+                "PutRestApi",
+                "restApiId",
+                "putRestApiInput.restApiId",
+            ),
+            (
+                "a body member",
+                "CreateRestApi",
+                "name",
+                "createRestApiInput.name",
+            ),
+            (
+                "a nested body member",
+                "CreateRestApi",
+                "endpointConfiguration.types.0.member",
+                "createRestApiInput.endpointConfiguration.types.0.member",
+            ),
+            (
+                "a member no schema of the operation declares",
+                "PutRestApi",
+                "sim2realNoSuchMember",
+                "putRestApiInput.sim2realNoSuchMember",
+            ),
+        ];
+
+        for (case, operation, path, expected) in rows {
+            let found = Violation {
+                path: path.to_string(),
+                kind: ViolationKind::EnumValue(
+                    ["merge", "overwrite"]
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                ),
+                value: Some("append".to_string()),
+                sensitive: false,
+            };
+            let stated = stated_refusal(operation, std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            let clause = format!(
+                "1 validation error detected: Value 'append' at '{expected}' failed to \
+                 satisfy constraint: Member must satisfy enum value set: \
+                 [overwrite, merge]"
+            );
+            assert_eq!(
+                stated.message, clause,
+                "case {case:?}: expected {clause:?}, got {:?}",
+                stated.message
+            );
+        }
     }
 }
