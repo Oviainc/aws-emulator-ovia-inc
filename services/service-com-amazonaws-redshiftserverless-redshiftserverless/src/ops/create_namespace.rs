@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the 409 the shape's `@httpError` names. See
                 // [`crate::state::namespace_already_exists`].
                 Err(crate::scaffolded::Scaffolded::restated(
-                    crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
                     CreateNamespaceErrorModeled::ConflictException(ConflictException {
                         message: crate::state::namespace_already_exists(occupied.key()),
                     }),

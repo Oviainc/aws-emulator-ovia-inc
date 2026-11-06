@@ -219,13 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let Some(record) = state.workgroups.get_mut(&input.workgroup_name) else {
-            return Err(UpdateWorkgroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no workgroup named {}", input.workgroup_name),
+            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+            // answered with the status this service answers a resource-name refusal with.
+            // See [`crate::state::workgroup_not_found`].
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+                UpdateWorkgroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::workgroup_not_found(&input.workgroup_name),
                     resource_name: Some(input.workgroup_name.clone()),
-                },
-            )
-            .into());
+                }),
+            ));
         };
 
         // Every mutable member of `Workgroup` this operation models, applied only when

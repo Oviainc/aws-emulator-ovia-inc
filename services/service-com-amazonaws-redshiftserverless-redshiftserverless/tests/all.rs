@@ -25,3 +25,5 @@ mod snapshot_restore;
 mod state_roundtrip;
 #[path = "all/usage_limit_lifecycle.rs"]
 mod usage_limit_lifecycle;
+#[path = "all/usage_limit_payload_and_name_refusals.rs"]
+mod usage_limit_payload_and_name_refusals;

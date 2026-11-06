@@ -147,6 +147,41 @@ pub const DEFAULT_USAGE_LIMIT_PERIOD: &str = "monthly";
 /// takes when the limit is reached. The default is log."
 pub const DEFAULT_USAGE_LIMIT_BREACH_ACTION: &str = "log";
 
+/// The usage types a limit can be taken out on, from
+/// `smithy_query(query="shape", shape="UsageLimitUsageType")`: compute consumed by the
+/// serverless workgroup, and data transferred for cross-Region data sharing.
+pub const USAGE_TYPE_SERVERLESS_COMPUTE: &str = "serverless-compute";
+/// See [`USAGE_TYPE_SERVERLESS_COMPUTE`].
+pub const USAGE_TYPE_CROSS_REGION_DATASHARING: &str = "cross-region-datasharing";
+
+/// The metered dimension `amount` is counted in when the limit caps serverless compute:
+/// `CreateUsageLimitRequest$amount` is "in Redshift Processing Units (RPU) consumed per
+/// hour" for a time-based limit, which is the compute the workgroup used. The token is the
+/// one the recorded usage-limit payloads carry for a `serverless-compute` limit.
+pub const LIMIT_TYPE_COMPUTE_USED: &str = "compute-used";
+
+/// The metered dimension `amount` is counted in when the limit caps cross-Region data
+/// sharing: `CreateUsageLimitRequest$amount` is then "in terabytes (TB) of data transferred
+/// between Regions in cross-account sharing", i.e. data. Redshift words that dimension the
+/// same way on a provisioned usage limit, whose `LimitType` must be `data-scanned` whenever
+/// the feature being limited is `cross-region-datasharing`.
+pub const LIMIT_TYPE_DATA_SCANNED: &str = "data-scanned";
+
+/// The metered dimension a limit over `usage_type` counts its `amount` in.
+///
+/// A usage-limit payload reports the feature being limited (which restates the request's
+/// `usageType`) beside the dimension the `amount` is expressed in, so a client knows what
+/// unit the number is in without looking the feature up. `None` for a usage type this
+/// service knows no dimension for, which the modelled `UsageLimitUsageType` enum admits
+/// none of: the boundary validator refuses any other value before a handler runs.
+pub fn usage_limit_limit_type(usage_type: &str) -> Option<&'static str> {
+    match usage_type {
+        USAGE_TYPE_SERVERLESS_COMPUTE => Some(LIMIT_TYPE_COMPUTE_USED),
+        USAGE_TYPE_CROSS_REGION_DATASHARING => Some(LIMIT_TYPE_DATA_SCANNED),
+        _ => None,
+    }
+}
+
 /// The `NamespaceStatus` values this slice reports
 /// (`smithy_query(query="shape", shape="NamespaceStatus")` -> AVAILABLE, MODIFYING,
 /// DELETING). There is no `CREATING`: a namespace holds no compute, so it is available as
@@ -170,27 +205,38 @@ pub fn port_in_documented_range(port: i32) -> bool {
         .any(|(low, high)| (*low..=*high).contains(&port))
 }
 
-/// The HTTP status this service answers a namespace-NAME refusal with — a name already
+/// The HTTP status this service answers a resource-NAME refusal with — a name already
 /// taken, or one that resolves to nothing — whatever the modelled error's `@httpError`
-/// names. From the recorded `CreateNamespace` / `GetNamespace` refusals, which carry the
-/// modelled error shape with this status. See [`namespace_not_found`].
-pub const NAMESPACE_NAME_REFUSAL_STATUS: u16 = 400;
+/// names. From the recorded `CreateNamespace` / `GetNamespace` / `GetWorkgroup` refusals,
+/// which all carry the modelled error shape with this status: the `@httpError` 404 of
+/// `ResourceNotFoundException` is the error's documented status, not the one this service
+/// sends when the input that resolves to nothing is a resource NAME. See
+/// [`namespace_not_found`] and [`workgroup_not_found`].
+pub const RESOURCE_NAME_REFUSAL_STATUS: u16 = 400;
 
 /// How this service states that a namespace name resolves to nothing.
 ///
-/// The recorded traffic answers an unresolvable namespace NAME with HTTP **400** carrying
-/// the modelled `ResourceNotFoundException` shape — the model's `@httpError` 404 is the
-/// error's documented status, not the one this service sends for a namespace name — and
-/// words the refusal from the name the request asked for. Every operation that addresses a
-/// namespace by name refuses a miss this way, so the sentence lives here once; the status
-/// is restated through [`crate::scaffolded::Scaffolded::restated`].
+/// The recorded traffic answers an unresolvable namespace NAME with
+/// [`RESOURCE_NAME_REFUSAL_STATUS`] carrying the modelled `ResourceNotFoundException`
+/// shape, and words the refusal from the name the request asked for. Every operation that
+/// addresses a namespace by name refuses a miss this way, so the sentence lives here
+/// once; the status is restated through [`crate::scaffolded::Scaffolded::restated`].
 pub fn namespace_not_found(name: &str) -> String {
     format!("Serverless namespace {name} not found.")
 }
 
+/// How this service states that a workgroup name resolves to nothing: the same
+/// [`RESOURCE_NAME_REFUSAL_STATUS`] carrying the same modelled `ResourceNotFoundException`
+/// shape as [`namespace_not_found`], because a workgroup is addressed by NAME exactly as a
+/// namespace is. Every operation that addresses a workgroup by name refuses a miss this
+/// way, so the sentence lives here once.
+pub fn workgroup_not_found(name: &str) -> String {
+    format!("no workgroup named {name}")
+}
+
 /// How this service states that a namespace name is already taken: HTTP **400** carrying
 /// the modelled `ConflictException` shape, worded from the name the request asked for. See
-/// [`namespace_not_found`] for the status.
+/// [`RESOURCE_NAME_REFUSAL_STATUS`] for the status.
 pub fn namespace_already_exists(name: &str) -> String {
     format!("The namespace {name} already exists.")
 }
@@ -241,13 +287,34 @@ pub fn snapshot_arn(region: &str, snapshot_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("snapshot/{snapshot_id}"))
 }
 
-/// `arn:aws:redshift-serverless:<region>:<account>:usage-limit/<usageLimitId>`.
+/// `arn:aws:redshift-serverless:<region>:<account>:usagelimit/<usageLimitId>`.
+///
+/// The resource type is one unhyphenated word — the form the recorded `CreateUsageLimit` /
+/// `GetUsageLimit` responses carry, and the only part of the ARN that is not supplied by
+/// the environment (partition and service prefix aside): region, account and id come from
+/// the request and from state.
 pub fn usage_limit_arn(region: &str, usage_limit_id: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("usage-limit/{usage_limit_id}"),
-    )
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("usagelimit/{usage_limit_id}"))
+}
+
+/// How this service states that a `usageLimitId` resolves to no usage limit.
+///
+/// A usage limit is addressed by the id the service minted for it, so an id that names
+/// nothing is a bad INPUT rather than a resource the call addressed: the recorded refusal
+/// is the modelled `ValidationException` at its `@httpError` 400, worded with one variable
+/// slot — the `usageLimitId` the request carried. Every operation that addresses a usage
+/// limit by id refuses a miss this way, so the sentence lives here once.
+pub fn usage_limit_id_does_not_exist(usage_limit_id: &str) -> String {
+    format!("The usage limit ID is not valid. {usage_limit_id} does not exist")
+}
+
+/// How this service states that a usage limit's `amount` is not a positive number, the
+/// rule `CreateUsageLimitRequest$amount` / `UpdateUsageLimitRequest$amount` document ("The
+/// value must be a positive number") and that `Long` carries no `@range` for, so no
+/// boundary validator can refuse it. Both operations refuse it the same way, so the
+/// sentence lives here once.
+pub fn usage_limit_amount_not_positive(amount: i64) -> String {
+    format!("amount {amount} must be a positive number")
 }
 
 /// The DNS address of the endpoint a workgroup serves:

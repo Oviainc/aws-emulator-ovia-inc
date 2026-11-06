@@ -685,7 +685,7 @@ async fn a_usage_limit_is_refused_unless_its_resource_arn_resolves() {
         assert_eq!(
             limit["usageLimitArn"],
             json!(format!(
-                "arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:usage-limit/{id}"
+                "arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:usagelimit/{id}"
             )),
             "case CreateUsageLimit({request}): got {:?}",
             limit["usageLimitArn"]

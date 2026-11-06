@@ -144,9 +144,12 @@ pub struct NetworkInterface {
     pub ipv6_address: Option<String>,
 }
 
-// `Namespace` and `Workgroup` are the TWO shapes in this module whose schemas are written
-// out below rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason
-// is a single trait the vendored codegen does not read: `@timestampFormat`.
+// `Namespace`, `Workgroup` and `UsageLimit` are the THREE shapes in this module whose
+// schemas are written out below rather than produced by
+// `#[smithy_macros::smithy(shape = ...)]`.
+//
+// For `Namespace` and `Workgroup` the reason is a single trait the vendored codegen does
+// not read: `@timestampFormat`.
 //
 // Both shapes carry `date-time` timestamps — `smithy_query(query="shape",
 // shape="Namespace,Workgroup")` reports `"timestampFormat": "date-time"` on
@@ -158,19 +161,24 @@ pub struct NetworkInterface {
 // RFC 3339 string. The schemas below differ from the macro's output in exactly that one
 // chain call, which [`schema_for`] attaches for the `date_time` member kind.
 //
-// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the fix
-// belongs there, not here, because every `@timestampFormat` member of every service has the
-// same defect and `vendor/` is outside what a fix may change. Once `vendor/smithy-macros`
-// emits `with_timestamp_format`, delete the three macros and the two
-// `schema_and_codec_for!` blocks and put `#[smithy_macros::smithy(shape = ...)]` back on
-// the two structs — `tests/all/namespace_response_fidelity.rs` pins the wire form, so it
-// fails if the attribute does not carry it.
+// REMOVE THAT PART OF THIS BLOCK when the vendored codegen learns
+// `smithy.api#timestampFormat`: the fix belongs there, not here, because every
+// `@timestampFormat` member of every service has the same defect and `vendor/` is outside
+// what a fix may change. Once `vendor/smithy-macros` emits `with_timestamp_format`, delete
+// the `Namespace` and `Workgroup` `schema_and_codec_for!` blocks and put
+// `#[smithy_macros::smithy(shape = ...)]` back on the two structs —
+// `tests/all/namespace_response_fidelity.rs` pins the wire form, so it fails if the
+// attribute does not carry it.
+//
+// `UsageLimit`'s reason is different and does not go away with the codegen: the shape the
+// published model declares is NARROWER than the payload the service sends, and the macro
+// can only emit members the model declares. See the note above `UsageLimit` itself.
 
 /// One member's schema, as the macro would emit it, plus the `@timestampFormat` chain call
 /// it cannot: one rule per member kind, each expanding to the whole `Schema` expression.
 ///
-/// `$kind` is the member's shape kind — `string`, `boolean`, `integer`, `date_time`,
-/// `list_of_string`, `list_of(T)` (a list of structures) or `struct_of(T)`.
+/// `$kind` is the member's shape kind — `string`, `boolean`, `integer`, `long`,
+/// `date_time`, `list_of_string`, `list_of(T)` (a list of structures) or `struct_of(T)`.
 macro_rules! schema_for {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -212,6 +220,9 @@ macro_rules! shape_type_for {
     (integer) => {
         ::aws_smithy_schema::ShapeType::Integer
     };
+    (long) => {
+        ::aws_smithy_schema::ShapeType::Long
+    };
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
     };
@@ -230,6 +241,7 @@ macro_rules! write_member {
     ($s:ident, $m:expr, $v:expr, string) => { $s.write_string($m, $v.as_str())?; };
     ($s:ident, $m:expr, $v:expr, boolean) => { $s.write_boolean($m, *$v)?; };
     ($s:ident, $m:expr, $v:expr, integer) => { $s.write_integer($m, *$v)?; };
+    ($s:ident, $m:expr, $v:expr, long) => { $s.write_long($m, *$v)?; };
     ($s:ident, $m:expr, $v:expr, date_time) => { $s.write_timestamp($m, $v)?; };
     ($s:ident, $m:expr, $v:expr, list_of_string) => {
         $s.write_list($m, &|__sl| {
@@ -255,6 +267,7 @@ macro_rules! read_member {
     ($d:ident, $m:expr, string) => { $d.read_string($m)? };
     ($d:ident, $m:expr, boolean) => { $d.read_boolean($m)? };
     ($d:ident, $m:expr, integer) => { $d.read_integer($m)? };
+    ($d:ident, $m:expr, long) => { $d.read_long($m)? };
     ($d:ident, $m:expr, date_time) => { $d.read_timestamp($m)? };
     ($d:ident, $m:expr, list_of_string) => {{
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
@@ -563,7 +576,17 @@ pub struct SnapshotCopyConfiguration {
     pub destination_kms_key_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.redshiftserverless#UsageLimit")]
+/// The usage limit object.
+///
+/// The member set is the model's (`smithy_query(query="shape", shape="UsageLimit")`) PLUS
+/// the two members the recorded `CreateUsageLimit` / `GetUsageLimit` payloads carry that
+/// the published model does not declare: `featureType`, the feature the limit is taken out
+/// over, and `limitType`, the metered dimension `amount` is counted in. Because the model
+/// declares neither, `#[smithy_macros::smithy(shape = ...)]` cannot emit them — a
+/// macro-built codec writes only the members the model lists — so the schema and the codec
+/// are written out here instead, exactly as the macro would emit them for a shape that did
+/// declare all nine. See [`crate::state::usage_limit_limit_type`] for where the values come
+/// from.
 #[derive(Debug, Clone, Default)]
 pub struct UsageLimit {
     pub usage_limit_id: Option<String>,
@@ -573,7 +596,34 @@ pub struct UsageLimit {
     pub amount: Option<i64>,
     pub period: Option<String>,
     pub breach_action: Option<String>,
+    pub feature_type: Option<String>,
+    pub limit_type: Option<String>,
 }
+
+schema_and_codec_for!(
+    UsageLimit,
+    USAGE_LIMIT_SCHEMA,
+    "com.amazonaws.redshiftserverless#UsageLimit",
+    "com.amazonaws.redshiftserverless",
+    "UsageLimit",
+    (M_USAGE_LIMIT_ID, usage_limit_id, "usageLimitId", 0, string),
+    (
+        M_USAGE_LIMIT_ARN,
+        usage_limit_arn,
+        "usageLimitArn",
+        1,
+        string
+    ),
+    (M_RESOURCE_ARN, resource_arn, "resourceArn", 2, string),
+    (M_USAGE_TYPE, usage_type, "usageType", 3, string),
+    (M_AMOUNT, amount, "amount", 4, long),
+    (M_PERIOD, period, "period", 5, string),
+    (M_BREACH_ACTION, breach_action, "breachAction", 6, string),
+    // The two members beyond the model's seven; their indexes continue the model's
+    // numbering, so no member index is used twice.
+    (M_FEATURE_TYPE, feature_type, "featureType", 7, string),
+    (M_LIMIT_TYPE, limit_type, "limitType", 8, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.redshiftserverless#ConfigParameter")]
 #[derive(Debug, Clone, Default)]

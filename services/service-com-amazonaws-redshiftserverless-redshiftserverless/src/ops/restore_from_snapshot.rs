@@ -248,13 +248,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // afterwards, and this operation creates no workgroup, so it has to exist
             // already.
             if !state.workgroups.contains_key(&input.workgroup_name) {
-                return Err(RestoreFromSnapshotErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("no workgroup named {}", input.workgroup_name),
-                        resource_name: Some(input.workgroup_name.clone()),
-                    },
-                )
-                .into());
+                // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+                // answered with the status this service answers a resource-name refusal
+                // with. See [`crate::state::workgroup_not_found`].
+                return Err(crate::scaffolded::Scaffolded::restated(
+                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+                    RestoreFromSnapshotErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::workgroup_not_found(&input.workgroup_name),
+                            resource_name: Some(input.workgroup_name.clone()),
+                        },
+                    ),
+                ));
             }
 
             // A namespace with a change already in flight cannot take a second one.

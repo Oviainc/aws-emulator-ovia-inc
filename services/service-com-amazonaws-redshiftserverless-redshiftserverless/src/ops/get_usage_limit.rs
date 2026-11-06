@@ -3,8 +3,11 @@
 //! @op GetUsageLimit
 //! IMPLEMENTED: reports the usage limit `usageLimitId` names out of
 //! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::usage_limits`],
-//! exactly as `CreateUsageLimit` stored it, and answers 404 when the store holds no
-//! limit under that id. A `@readonly` operation: it writes nothing.
+//! exactly as `CreateUsageLimit` stored it. An id that names no usage limit — one that
+//! never existed, or one `DeleteUsageLimit` has removed — is a bad input rather than a
+//! resource this call addressed, so it is refused with the modelled 400
+//! `ValidationException` (see [`crate::state::usage_limit_id_does_not_exist`]). A
+//! `@readonly` operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -150,10 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let Some(usage_limit) = state.usage_limits.get(&input.usage_limit_id) else {
-            return Err(GetUsageLimitErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no usage limit with the id {}", input.usage_limit_id),
-                    resource_name: Some(input.usage_limit_id.clone()),
+            // The id is the input that is wrong, not a resource this call addressed, so
+            // the refusal is the modelled `ValidationException` at its own 400 rather
+            // than the `ResourceNotFoundException` the operation also models.
+            return Err(GetUsageLimitErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::usage_limit_id_does_not_exist(&input.usage_limit_id),
                 },
             )
             .into());

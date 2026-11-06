@@ -894,7 +894,10 @@ async fn a_restore_that_addresses_nothing_is_refused_and_restores_nothing() {
                     "snapshotName": snapshot,
                 })
             },
-            expected_status: 404,
+            // A resource NAME that resolves to nothing carries the modelled
+            // `ResourceNotFoundException` with HTTP 400, the status this service answers a
+            // name refusal with.
+            expected_status: 400,
             expected_code: "ResourceNotFoundException",
         },
     ];

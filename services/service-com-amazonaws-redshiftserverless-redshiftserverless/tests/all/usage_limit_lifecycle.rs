@@ -227,7 +227,7 @@ async fn a_created_usage_limit_is_reported_back_for_every_modelled_combination()
         assert_eq!(
             created["usageLimitArn"],
             json!(format!(
-                "arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:usage-limit/{id}"
+                "arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:usagelimit/{id}"
             )),
             "case {case:?}: usageLimitArn got {:?}",
             created["usageLimitArn"]
@@ -344,7 +344,7 @@ async fn a_usage_limit_arn_carries_the_region_the_request_is_signed_for() {
         assert_eq!(
             body["usageLimit"]["usageLimitArn"],
             json!(format!(
-                "arn:aws:redshift-serverless:{region}:{ACCOUNT}:usage-limit/{id}"
+                "arn:aws:redshift-serverless:{region}:{ACCOUNT}:usagelimit/{id}"
             )),
             "region {region:?}: usageLimitArn got {:?}",
             body["usageLimit"]["usageLimitArn"]
@@ -584,7 +584,7 @@ async fn a_second_limit_over_the_same_resource_usage_type_and_period_conflicts()
 }
 
 #[tokio::test]
-async fn an_unknown_usage_limit_id_is_not_found() {
+async fn an_unknown_usage_limit_id_is_refused_as_invalid() {
     let router = emulator();
     let (_, workgroup_arn) = resources(&router, "get-unknown").await;
     let (_, body) = call(
@@ -609,15 +609,17 @@ async fn an_unknown_usage_limit_id_is_not_found() {
             "00000000-0000-4000-8000-000000000000".to_string(),
         ),
         ("an empty-looking id", "0".to_string()),
-        ("the ARN instead of the id", format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:usage-limit/{created}")),
+        ("the ARN instead of the id", format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:usagelimit/{created}")),
         ("the id with one character appended", format!("{created}0")),
     ];
     for (case, id) in &cases {
         let (status, body) = call(&router, "GetUsageLimit", json!({ "usageLimitId": id })).await;
+        // An id that resolves to nothing is a bad INPUT, not a resource the call
+        // addressed: the modelled `ValidationException` at its 400.
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected 404 ResourceNotFoundException, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} with {body}"
         );
     }
 

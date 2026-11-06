@@ -6,6 +6,12 @@
 //! keyed by that id, and answers with the record it stored, so `GetUsageLimit` reports
 //! exactly these bytes back.
 //!
+//! The stored record carries the whole payload this service emits for a usage limit,
+//! `featureType` and `limitType` included: the feature being limited and the metered
+//! dimension its `amount` is counted in, both derived from the submitted `usageType` (see
+//! [`crate::state::usage_limit_limit_type`]), so every read and every listing reports them
+//! too.
+//!
 //! A limit is taken out over a Redshift Serverless resource the account holds — the ARN
 //! of one of its namespaces or workgroups — and one (resourceArn, usageType, period)
 //! triple carries at most one limit, so a second create over the same triple is a
@@ -168,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.amount <= 0 {
             return Err(CreateUsageLimitErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!("amount {} must be a positive number", input.amount),
+                    message: crate::state::usage_limit_amount_not_positive(input.amount),
                 },
             )
             .into());
@@ -223,14 +229,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let usage_limit_id = crate::state::new_resource_id();
+        // `featureType` restates the feature the limit is taken out over — the submitted
+        // `usageType` — and `limitType` names the metered dimension `amount` is counted
+        // in, which follows from that same usage type. See
+        // [`crate::state::usage_limit_limit_type`].
+        let limit_type = crate::state::usage_limit_limit_type(&input.usage_type)
+            .map(::std::string::ToString::to_string);
         let usage_limit = UsageLimit {
             usage_limit_arn: Some(crate::state::usage_limit_arn(&region, &usage_limit_id)),
             usage_limit_id: Some(usage_limit_id.clone()),
             resource_arn: Some(input.resource_arn),
+            feature_type: Some(input.usage_type.clone()),
             usage_type: Some(input.usage_type),
             amount: Some(input.amount),
             period: Some(period),
             breach_action: Some(breach_action),
+            limit_type,
         };
 
         // The answer comes out of the STORED record, so what this caller reads is what a

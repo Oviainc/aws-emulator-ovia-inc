@@ -2,8 +2,10 @@
 
 //! @op GetWorkgroup
 //! IMPLEMENTED: reports the workgroup stored under `workgroupName`, exactly as
-//! `CreateWorkgroup` / `UpdateWorkgroup` stored it; an unknown name is a 404
-//! `ResourceNotFoundException`.
+//! `CreateWorkgroup` / `UpdateWorkgroup` stored it; a name that resolves to nothing is the
+//! modelled `ResourceNotFoundException` answered with
+//! [`crate::state::RESOURCE_NAME_REFUSAL_STATUS`], the status this service sends for a
+//! resource NAME that names nothing.
 //!
 //! A read materialises nothing of its own, but it does apply the status transition the
 //! clock has already made due (see [`crate::state::WorkgroupRecord::settle`]) — that
@@ -152,13 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let Some(record) = state.workgroups.get(&input.workgroup_name) else {
-            return Err(GetWorkgroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no workgroup named {}", input.workgroup_name),
+            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+            // answered with the status this service answers a resource-name refusal with.
+            // See [`crate::state::workgroup_not_found`].
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+                GetWorkgroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::workgroup_not_found(&input.workgroup_name),
                     resource_name: Some(input.workgroup_name.clone()),
-                },
-            )
-            .into());
+                }),
+            ));
         };
 
         Ok(GetWorkgroupOutput {

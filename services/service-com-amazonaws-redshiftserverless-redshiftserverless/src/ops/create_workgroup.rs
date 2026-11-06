@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // namespace-name refusal with; see [`crate::state::namespace_not_found`].
         if !state.namespaces.contains_key(&input.namespace_name) {
             return Err(crate::scaffolded::Scaffolded::restated(
-                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
                 CreateWorkgroupErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: crate::state::namespace_not_found(&input.namespace_name),

@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // answered with the status this service answers any namespace-name refusal
                 // with. See [`crate::state::namespace_not_found`].
                 return Err(crate::scaffolded::Scaffolded::restated(
-                    crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
                     CreateSnapshotErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
                             message: crate::state::namespace_not_found(&input.namespace_name),
@@ -354,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
         if !state.namespaces.contains_key(&input.namespace_name) {
             return Err(crate::scaffolded::Scaffolded::restated(
-                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
                 CreateSnapshotErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: crate::state::namespace_not_found(&input.namespace_name),
                     resource_name: Some(input.namespace_name.clone()),

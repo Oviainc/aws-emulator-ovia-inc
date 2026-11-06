@@ -419,7 +419,7 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "GetWorkgroup after the delete: got {status} with {body}"
     );
     let (status, body) = call(&router, "ListWorkgroups", json!({})).await;
@@ -1004,9 +1004,9 @@ async fn a_name_outside_the_modelled_constraint_is_refused() {
 
 #[tokio::test]
 async fn an_unknown_name_is_refused_on_every_name_addressed_operation() {
-    // A namespace NAME that resolves to nothing carries the modelled
+    // A resource NAME that resolves to nothing carries the modelled
     // `ResourceNotFoundException` with HTTP 400, the status this service answers a
-    // namespace-name refusal with; a workgroup name keeps the 404 its `@httpError` names.
+    // name refusal with, whether the name is a namespace's or a workgroup's.
     let router = emulator();
     let cases: [(&str, Value, u16, &str); 6] = [
         (
@@ -1030,19 +1030,19 @@ async fn an_unknown_name_is_refused_on_every_name_addressed_operation() {
         (
             "GetWorkgroup",
             json!({ "workgroupName": "absent-wg" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "UpdateWorkgroup",
             json!({ "workgroupName": "absent-wg" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "DeleteWorkgroup",
             json!({ "workgroupName": "absent-wg" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
     ];
