@@ -290,9 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Every kind is therefore asked about rather than only the first that can be reported: a run
 /// is addressed THROUGH the build workflow it belongs to, so today a policy holding a run
-/// always still holds that workflow and the run's own kind is reported only if a workflow is
-/// ever removed while its runs are not. The row is what keeps this a decision about the
-/// artifacts the store holds rather than one about the order they happen to be removed in.
+/// always still holds that workflow, and the `test result` row below reports its kind only if
+/// a workflow is ever removed while its runs are not. Keeping that row is what makes this a
+/// decision about the artifacts the store holds rather than about the order they happen to be
+/// removed in.
 fn held_artifact(
     store: &crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState,
     base_arn: &str,

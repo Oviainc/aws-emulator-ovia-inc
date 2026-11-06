@@ -59,12 +59,13 @@ pub const BUILD_WORKFLOW_STAGE_AFTER: Duration = Duration::from_secs(3);
 ///
 /// Derived from that one span rather than written out, and derived WITHOUT narrowing it to
 /// whole seconds, so the two constants cannot drift and a sub-second stage span stays the
-/// quarter of this one. A span no `Duration` can hold four of would leave this one stage
-/// long, which is a shorter progression rather than a wrapped one.
+/// quarter of this one. A stage span so large that four of them are no `Duration` is a
+/// progression [`AutomatedReasoningPolicyBuildWorkflowClock::armed_at`] could not arm either,
+/// so it fails the BUILD rather than standing for a shorter progression here.
 pub const BUILD_WORKFLOW_COMPLETE_AFTER: Duration =
     match BUILD_WORKFLOW_STAGE_AFTER.checked_mul(4) {
         Some(whole) => whole,
-        None => BUILD_WORKFLOW_STAGE_AFTER,
+        None => panic!("the build workflow stage span must admit the four stages of a build"),
     };
 
 /// `AutomatedReasoningPolicyBuildWorkflowStatus$SCHEDULED` — the status a build workflow a
