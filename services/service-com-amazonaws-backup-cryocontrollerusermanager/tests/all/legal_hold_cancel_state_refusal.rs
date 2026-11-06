@@ -179,6 +179,13 @@ async fn a_cancel_blocked_by_the_holds_state_reports_that_state() {
             "case {case:?}: expected the stored status interpolated into the sentence, \
              got {refused:?}"
         );
+        // `Type` is the one other member the shape declares (`smithy_query`
+        // shape `InvalidResourceStateException`: optional Code/Message/Type/
+        // Context) and this condition states none of it.
+        assert!(
+            refused.get("Type").is_none(),
+            "case {case:?}: this condition states no Type, got {refused:?}"
+        );
 
         // A refused cancellation writes nothing: the hold is still in the state
         // that refused it, and a second attempt is refused identically.
@@ -194,6 +201,40 @@ async fn a_cancel_blocked_by_the_holds_state_reports_that_state() {
             "case {case:?}: the same refusal must repeat, got {repeat_status} {repeated:?}"
         );
     }
+}
+
+/// The positive control: a hold the clock has put in force IS released, with no
+/// refusal members at all — so the refusal above follows the hold's STATE and
+/// not the operation.
+#[tokio::test]
+async fn a_hold_in_force_is_released_rather_than_refused() {
+    let router = router();
+    let (status, created) = create_legal_hold(&router, "in force").await;
+    assert_eq!(
+        status, 200,
+        "expected CreateLegalHold 200, got {status} {created:?}"
+    );
+    let id = string_at(&created, "LegalHoldId");
+    std::thread::sleep(PAST_LEGAL_HOLD_SETTLE);
+
+    let (status, errortype, released) =
+        cancel_legal_hold(&router, &id, "?cancelDescription=in-force").await;
+    assert_eq!(
+        (status, errortype.as_str()),
+        (201, "<unset>"),
+        "a hold in force is released, got {status} {released:?}"
+    );
+    for member in ["Code", "Context", "Message"] {
+        assert!(
+            released.get(member).is_none(),
+            "a released hold's answer states no {member}, got {released:?}"
+        );
+    }
+    let after = stored_status(&router, &id).await;
+    assert_eq!(
+        after, STATUS_CANCELED,
+        "the released hold reports the cancellation, got {after:?}"
+    );
 }
 
 /// The reported state is READ FROM STATE, not fixed: the same request refused
