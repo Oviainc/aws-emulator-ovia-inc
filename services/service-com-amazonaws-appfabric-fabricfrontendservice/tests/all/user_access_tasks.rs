@@ -17,7 +17,10 @@
 //! * a poll answers POSITIONALLY — one result per ENTRY of `taskIdList`, in
 //!   request order, repeats included, because the model declares that list
 //!   without `@uniqueItems`;
-//! * an app bundle or a task id the store does not hold is the modelled
+//! * a task id the named bundle holds no record for is ONE ENTRY's outcome —
+//!   the entry carries that id and the service's `taskError` and the poll still
+//!   answers 200 (see `user_access_task_reporting` for the whole class);
+//! * an app bundle the store does not hold is the modelled
 //!   `ResourceNotFoundException` (HTTP 404), in either `Identifier` form.
 //!
 //! The harness (the router, `Answer`, `encode`, `arn_of`) is the one
@@ -35,6 +38,28 @@ use crate::app_bundle_ingestion_lifecycle::{
 /// poll reporting `email` can only have read it back out of the started task.
 const EMAIL: &str = "ada.lovelace@example.com";
 
+/// The `errorCode` AppFabric puts on a start call's item for an application
+/// tenant it holds no authentication token for.
+pub(crate) const NO_AUTHENTICATION_TOKEN_CODE: &str = "notfound";
+
+/// The whole `errorMessage` of that item: FIXED text, the same whichever
+/// application, tenant or email the item is for.
+pub(crate) const NO_AUTHENTICATION_TOKEN_MESSAGE: &str =
+    "No authentication token was found for this user. User needs to authorize.";
+
+/// The `errorCode` of the per-entry `taskError` a poll reports for a task id the
+/// named app bundle holds no record for.
+pub(crate) const NO_TASK_RECORD_CODE: &str = "404";
+
+/// The fixed text of that `taskError`'s message, which the requested id follows.
+pub(crate) const NO_TASK_RECORD_MESSAGE_PREFIX: &str =
+    "Couldn't find a record within current appBundle with the given taskId: ";
+
+/// The whole message a poll reports for the unresolvable id `task_id`.
+pub(crate) fn no_task_record_message(task_id: &str) -> String {
+    format!("{NO_TASK_RECORD_MESSAGE_PREFIX}{task_id}")
+}
+
 /// The values the model's `ResultStatus` enum carries
 /// (`RESULT_STATUS_VALUES` in the generated types), so a reported status can be
 /// checked against the modelled set rather than against one expected value.
@@ -46,7 +71,7 @@ const RESULT_STATUS_VALUES: &[&str] = &["COMPLETED", "EXPIRED", "FAILED", "IN_PR
 const PAST_THE_SETTLE_SPAN: std::time::Duration = std::time::Duration::from_millis(900);
 
 /// An app bundle to hang authorizations off, as its ARN.
-async fn app_bundle(emulator: &Emulator) -> String {
+pub(crate) async fn app_bundle(emulator: &Emulator) -> String {
     let created = emulator.create_app_bundle(json!({})).await;
     assert_eq!(
         created.status, 201,
@@ -59,14 +84,14 @@ async fn app_bundle(emulator: &Emulator) -> String {
 /// The display name this suite gives the tenant of `app`, distinct from the
 /// tenant identifier so a poll reporting `tenantDisplayName` cannot be reporting
 /// the identifier instead.
-fn display_name(tenant: &str) -> String {
+pub(crate) fn display_name(tenant: &str) -> String {
     format!("{tenant} (display)")
 }
 
 /// Create one app authorization under `bundle`, and connect it when `connected`.
 /// Its ARN is returned so a caller can assert against the authorization it set
 /// up.
-async fn authorization(emulator: &Emulator, bundle: &str, app: &str, tenant: &str, connected: bool) -> String {
+pub(crate) async fn authorization(emulator: &Emulator, bundle: &str, app: &str, tenant: &str, connected: bool) -> String {
     let created = emulator
         .call(
             "POST",
@@ -113,7 +138,7 @@ async fn authorization(emulator: &Emulator, bundle: &str, app: &str, tenant: &st
 }
 
 /// `POST /useraccess/start`.
-async fn start_tasks(emulator: &Emulator, bundle: &str, email: &str) -> Answer {
+pub(crate) async fn start_tasks(emulator: &Emulator, bundle: &str, email: &str) -> Answer {
     emulator
         .call(
             "POST",
@@ -124,7 +149,7 @@ async fn start_tasks(emulator: &Emulator, bundle: &str, email: &str) -> Answer {
 }
 
 /// `POST /useraccess/batchget`.
-async fn poll_tasks(emulator: &Emulator, bundle: &str, task_ids: &[String]) -> Answer {
+pub(crate) async fn poll_tasks(emulator: &Emulator, bundle: &str, task_ids: &[String]) -> Answer {
     emulator
         .call(
             "POST",
@@ -135,7 +160,7 @@ async fn poll_tasks(emulator: &Emulator, bundle: &str, task_ids: &[String]) -> A
 }
 
 /// The `userAccessTasksList` of a start response.
-fn task_items(answer: &Answer) -> Vec<Value> {
+pub(crate) fn task_items(answer: &Answer) -> Vec<Value> {
     answer
         .body
         .get("userAccessTasksList")
@@ -145,7 +170,7 @@ fn task_items(answer: &Answer) -> Vec<Value> {
 }
 
 /// The `userAccessResultsList` of a poll response.
-fn result_items(answer: &Answer) -> Vec<Value> {
+pub(crate) fn result_items(answer: &Answer) -> Vec<Value> {
     answer
         .body
         .get("userAccessResultsList")
@@ -155,7 +180,7 @@ fn result_items(answer: &Answer) -> Vec<Value> {
 }
 
 /// A string member of a JSON object, or `""`.
-fn member(value: &Value, name: &str) -> String {
+pub(crate) fn member(value: &Value, name: &str) -> String {
     value
         .get(name)
         .and_then(Value::as_str)
@@ -165,16 +190,15 @@ fn member(value: &Value, name: &str) -> String {
 
 /// The applications and tenants one bundle is set up with, and whether each
 /// authorization is connected.
-type Setup<'a> = &'a [(&'a str, &'a str, bool)];
+pub(crate) type Setup<'a> = &'a [(&'a str, &'a str, bool)];
 
 /// RULE: `StartUserAccessTasks` reports exactly one item per app authorization
 /// the named app bundle holds, in the order the authorizations were created,
 /// carrying that authorization's `app` and tenant id. An authorization that has
 /// completed the connect handshake gets a task started for it (a distinct
-/// `UUID`-shaped `taskId`, no `error`); one that has not is reported with the
-/// modelled `error` and NO `taskId`, because AppFabric reaches an application
-/// only through a connected authorization. A bundle holding no authorizations
-/// starts no tasks.
+/// `UUID`-shaped `taskId`, no `error`); one that has not holds no authentication
+/// token for the user, so it is reported with the service's fixed `error` and NO
+/// `taskId`. A bundle holding no authorizations starts no tasks.
 ///
 /// The table spans the number of authorizations (0, 1, 2, 3), which applications
 /// they are for, whether two share one application or one tenant, and every
@@ -258,13 +282,16 @@ async fn a_start_call_reports_one_item_per_app_authorization_in_creation_order()
                     item.get("taskId").is_none(),
                     "case {case:?}: item {index} started no task, so it must carry no taskId, got {item}"
                 );
-                let error_code = item
+                let error = item
                     .get("error")
-                    .map(|error| member(error, "errorCode"))
-                    .unwrap_or_default();
-                assert!(
-                    !error_code.is_empty(),
-                    "case {case:?}: item {index} started no task, so it must carry an error, got {item}"
+                    .unwrap_or_else(|| panic!("case {case:?}: expected an error in item {index}: {item}"));
+                assert_eq!(
+                    (member(error, "errorCode"), member(error, "errorMessage")),
+                    (
+                        NO_AUTHENTICATION_TOKEN_CODE.to_string(),
+                        NO_AUTHENTICATION_TOKEN_MESSAGE.to_string()
+                    ),
+                    "case {case:?}: item {index} started no task, so it must carry the service's fixed no-token error, got {item}"
                 );
             }
         }
@@ -667,24 +694,15 @@ async fn a_poll_answers_one_result_per_requested_entry_in_request_order() {
         }
     }
 
-    // One past each published bound, and a repeat that cannot dodge the refusal
-    // for an id the bundle does not hold.
+    // One past each published LENGTH bound: the list itself is outside what the
+    // model accepts, so nothing of it is answered. (An id the bundle holds no
+    // record for is NOT a refusal — see `user_access_task_reporting`.)
     let refused: Vec<(&str, Vec<String>, u16)> = vec![
         ("no entries at all — below the modelled minimum", Vec::new(), 400),
         (
             "one entry past the modelled maximum",
             vec![task_ids[0].clone(); MAX_TASK_IDS_PER_POLL + 1],
             400,
-        ),
-        (
-            "an unknown id named twice",
-            vec![unknown_uuid(), unknown_uuid()],
-            404,
-        ),
-        (
-            "a known id named twice beside an unknown one",
-            vec![task_ids[0].clone(), task_ids[0].clone(), unknown_uuid()],
-            404,
         ),
     ];
     for (case, ids, expected) in refused {
@@ -715,10 +733,11 @@ async fn a_poll_answers_one_result_per_requested_entry_in_request_order() {
 }
 
 /// RULE: a poll resolves a task id only within the bundle that holds it, so an
-/// id no start call minted — and an id minted under ANOTHER bundle — is refused
-/// with the modelled `ResourceNotFoundException` (HTTP 404) naming that task. A
-/// poll of ids the bundle does hold reports one result per ENTRY of the
-/// requested list, in request order.
+/// id no start call minted — and an id minted under ANOTHER bundle — is reported
+/// as an entry carrying that id and the service's "no record in this appBundle"
+/// `taskError`, with no task of the other bundle leaking into the answer. A poll
+/// of ids the bundle does hold reports one result per ENTRY of the requested
+/// list, in request order.
 #[tokio::test]
 async fn a_task_id_resolves_only_within_its_own_bundle() {
     let emulator = Emulator::new();
@@ -744,49 +763,86 @@ async fn a_task_id_resolves_only_within_its_own_bundle() {
         "the set-up bundles must hold 2 and 1 tasks, got {first_ids:?} and {second_ids:?}"
     );
 
-    // (case, the ids polled under the FIRST bundle, the id the refusal must name)
-    let refused: Vec<(&str, Vec<String>, String)> = vec![
+    // (case, the ids polled under the FIRST bundle, the ids that bundle holds no
+    // record for)
+    let unresolvable: Vec<(&str, Vec<String>, Vec<String>)> = vec![
         (
             "an id no start call minted",
             vec![unknown_uuid()],
-            unknown_uuid(),
+            Vec::new(),
         ),
         (
             "an id minted under another bundle",
             vec![second_ids[0].clone()],
-            second_ids[0].clone(),
+            vec![second_ids[0].clone()],
         ),
         (
             "one of this bundle's ids together with another bundle's",
             vec![first_ids[0].clone(), second_ids[0].clone()],
-            second_ids[0].clone(),
+            vec![second_ids[0].clone()],
         ),
     ];
-    for (case, ids, named) in refused {
+    for (case, ids, from_other_bundle) in unresolvable {
         let answer = poll_tasks(&emulator, &first, &ids).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected HTTP 404, got {} with body {}",
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with body {}",
             answer.status, answer.body
         );
-        assert!(
-            answer.error_code().contains("ResourceNotFoundException"),
-            "case {case:?}: expected a ResourceNotFoundException, got {:?} with body {}",
-            answer.error_code(),
-            answer.body
-        );
+        let results = result_items(&answer);
         assert_eq!(
-            member(&answer.body, "resourceId"),
-            named,
-            "case {case:?}: the refusal must name the task it could not find, got {}",
-            answer.body
+            results.len(),
+            ids.len(),
+            "case {case:?}: expected one result per requested entry ({}), got {results:?}",
+            ids.len()
         );
-        assert_eq!(
-            member(&answer.body, "resourceType"),
-            "UserAccessTask",
-            "case {case:?}: the refusal must report the resource kind, got {}",
-            answer.body
-        );
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(
+                member(result, "taskId"),
+                ids[index],
+                "case {case:?}: result {index} must report the id requested at that position, got {result}"
+            );
+            let held_here = first_ids.contains(&ids[index]);
+            let task_error = result.get("taskError").map(|error| {
+                (member(error, "errorCode"), member(error, "errorMessage"))
+            });
+            if held_here {
+                assert_eq!(
+                    member(result, "tenantId"),
+                    "tenant-first",
+                    "case {case:?}: result {index} must report this bundle's own task, got {result}"
+                );
+            } else {
+                assert_eq!(
+                    task_error,
+                    Some((
+                        NO_TASK_RECORD_CODE.to_string(),
+                        no_task_record_message(&ids[index])
+                    )),
+                    "case {case:?}: result {index} must report the no-record taskError for {:?}, got {result}",
+                    ids[index]
+                );
+                // Nothing of the OTHER bundle's task leaks into this answer.
+                for absent in ["app", "tenantId", "tenantDisplayName", "resultStatus", "email"] {
+                    assert!(
+                        result.get(absent).is_none(),
+                        "case {case:?}: result {index} names no task here, so it must report no {absent}, got {result}"
+                    );
+                }
+            }
+        }
+        // The other bundle's own poll is unaffected: its task is still its own.
+        if !from_other_bundle.is_empty() {
+            let elsewhere = poll_tasks(&emulator, &second, &from_other_bundle).await;
+            assert_eq!(
+                result_items(&elsewhere)
+                    .first()
+                    .map(|result| member(result, "tenantId")),
+                Some("tenant-second".to_string()),
+                "case {case:?}: the id must still resolve under the bundle that holds it, got {}",
+                elsewhere.body
+            );
+        }
     }
 
     // (case, the ids polled, the ids the poll must report in order)

@@ -81,6 +81,8 @@ mod spent_client_token_decision;
 mod state_roundtrip;
 #[path = "all/update_app_authorization_contract.rs"]
 mod update_app_authorization_contract;
+#[path = "all/user_access_task_reporting.rs"]
+mod user_access_task_reporting;
 #[path = "all/user_access_tasks.rs"]
 mod user_access_tasks;
 #[path = "all/validation_refusal_shape.rs"]

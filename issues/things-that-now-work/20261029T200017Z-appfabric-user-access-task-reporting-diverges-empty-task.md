@@ -13,6 +13,25 @@ Issue-Commit: 3660361421cece15e150541af9cef0f01b201b94
 
 # AppFabric user-access-task reporting diverges: empty task list and a 404 where AWS reports per-item taskError
 
+## Resolution note
+
+Both causes this issue owns are fixed:
+
+- Cause 1: the start call's item for an application tenant with no authentication token now
+  carries the service's fixed error (`notfound` / "No authentication token was found for this
+  user. User needs to authorize."), built with no value of the request or of the store;
+  the fan-out already reports one item per application tenant of the bundle.
+- Cause 2: a polled task id the named app bundle holds no record for is now that entry's own
+  `UserAccessResultItem` (the requested id plus the `taskError`) with the call answering 200.
+
+RESIDUAL, tracked elsewhere: the replayed fixture step `task#15` still reports an empty
+`userAccessTasksList` because its `setup#2` `CreateAppAuthorization(app=PAGERDUTY)` is refused
+by the application allowlist, so the bundle holds no app authorization for the fan-out to
+report. That refusal is cause 1 of the still-open issue
+`20261029T200017Z-appfabric-refusal-paths-use-the-wrong-error-class.md`, which owns the
+supported-application set; this issue's `Issue-Key`
+`appfabric|StartUserAccessTasks|2xx->2xx|$.userAccessTasksList[*]` clears once that lands.
+
 > _Note: this issue was identified against the code base at commit `3660361421cece15e150541af9cef0f01b201b94`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

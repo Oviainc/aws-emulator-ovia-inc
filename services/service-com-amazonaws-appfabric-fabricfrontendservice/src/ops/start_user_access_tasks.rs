@@ -2,9 +2,9 @@
 
 //! @op StartUserAccessTasks
 //!
-//! This operation is IMPLEMENTED: it fans out over the named app bundle's app
-//! authorizations, starts one user access task per `Connected` one and persists it under
-//! the bundle, where `BatchGetUserAccessTasks` polls it back.
+//! This operation is IMPLEMENTED: it fans out over the named app bundle's application
+//! tenants (its app authorizations), reports one item per tenant, and persists a task for
+//! each tenant it could start one for, where `BatchGetUserAccessTasks` polls it back.
 //!
 //! ## Shape of an operation
 //!
@@ -115,19 +115,19 @@ impl From<StartUserAccessTasksErrorModeled> for StartUserAccessTasksError {
 /// before any task is minted.
 ///
 /// A user access task is started per authorization, and what decides each
-/// reported item is the authorization's (`app`, tenant) pair, the status its
-/// refusal reports and whether it has completed the connect handshake — so those
-/// fields are all this call needs, and holding them by name keeps the snapshot
-/// readable where a tuple would not be.
+/// reported item is the authorization's (`app`, tenant) pair and whether it has
+/// completed the connect handshake — so those fields are all this call needs,
+/// and holding them by name keeps the snapshot readable where a tuple would not
+/// be.
 struct Authorization {
     app: String,
     tenant_identifier: String,
     tenant_display_name: String,
-    status: String,
     /// Whether the authorization had completed the connect handshake when it was
     /// snapshotted, as `crate::state::AppAuthorizationRecord::is_connected`
-    /// decides it — AppFabric reaches an application only through such an
-    /// authorization, so this is what the fan-out below mints a task on.
+    /// decides it — AppFabric searches an application tenant only with the
+    /// authentication token such an authorization holds, so this is what the
+    /// fan-out below mints a task on.
     connected: bool,
 }
 
@@ -144,7 +144,6 @@ impl Authorization {
                 app: authorization.app.clone(),
                 tenant_identifier: authorization.tenant_identifier.clone(),
                 tenant_display_name: authorization.tenant_display_name.clone(),
-                status: authorization.status_at(now).to_string(),
                 connected: authorization.is_connected(now),
             })
             .collect()
@@ -184,14 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     /// Start one user access task per app authorization the named bundle holds.
     ///
-    /// A task searches ONE application tenant for the email address, and
-    /// AppFabric reaches an application only through an app authorization of
-    /// that tenant which has completed the connect handshake — so the bundle's
-    /// authorizations are what this call fans out over: a `Connected` one gets a
-    /// task minted under the bundle (reported with its `taskId`), and one that
-    /// is not yet connected is reported with the modelled `error` and no task.
-    /// A bundle holding no authorizations therefore starts no tasks and reports
-    /// an empty list, and a bundle the store does not hold is the modelled
+    /// A task searches ONE application tenant for the email address, and the
+    /// application tenants of a bundle are the (`app`, tenant) pairs its app
+    /// authorizations name — so the bundle's authorizations are what this call
+    /// fans out over, reporting ONE item per pair whether or not a task could be
+    /// started for it. A pair whose authorization has completed the connect
+    /// handshake gets a task minted under the bundle (reported with its
+    /// `taskId`); a pair that holds no authentication token for the user yet is
+    /// reported with the modelled `error` and no `taskId` (see
+    /// [`crate::state::user_access_no_authentication_token`]), so a caller is
+    /// told what it still owes rather than handed a shorter list. A bundle
+    /// holding no authorizations names no application tenant and so reports an
+    /// empty list, and a bundle the store does not hold is the modelled
     /// `ResourceNotFoundException`.
     async fn handle(
         &self,
@@ -293,10 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     app: authorization.app.clone(),
                     tenant_id: authorization.tenant_identifier.clone(),
                     task_id: None,
-                    error: Some(crate::state::user_access_task_not_started(
-                        &authorization.app,
-                        &authorization.status,
-                    )),
+                    error: Some(crate::state::user_access_no_authentication_token()),
                 }),
             }
         }

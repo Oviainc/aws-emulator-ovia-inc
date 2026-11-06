@@ -665,33 +665,68 @@ pub fn user_access_search_not_performed(app: &str) -> TaskError {
     }
 }
 
-/// The `TaskError` `StartUserAccessTasks` reports for an app authorization it
-/// could not start a task against.
+/// The `TaskError` `StartUserAccessTasks` reports for an application tenant it
+/// started no task for.
 ///
-/// AppFabric reaches an application only through an app authorization that has
-/// completed the connect handshake (authorize → connect → query), so a bundle's
-/// authorization that is not `Connected` yields an item carrying this error and
-/// NO `taskId` — the modelled shape of "this application was not searched".
-pub fn user_access_task_not_started(app: &str, status: &str) -> TaskError {
+/// AppFabric searches an application tenant for a user only with an
+/// authentication token for that user, which the tenant's app authorization
+/// holds once it has completed the connect handshake (authorize → connect →
+/// query). Until then there is no token to search with, so the fan-out reports
+/// that tenant with this error and NO `taskId`, telling the caller the user
+/// still has to authorize. Both the code and the sentence are FIXED: the service
+/// words this error the same way whichever application, tenant or held status
+/// the item is for, so nothing of the request or of the store is interpolated
+/// into it.
+pub fn user_access_no_authentication_token() -> TaskError {
     TaskError {
-        error_code: Some("AppAuthorizationNotConnected".to_string()),
-        error_message: Some(format!(
-            "The app authorization for {app} is {status}, not \
-             {APP_AUTHORIZATION_STATUS_CONNECTED}, so no user access task was started for it."
-        )),
+        error_code: Some(TASK_ERROR_CODE_NO_TOKEN.to_string()),
+        error_message: Some(
+            "No authentication token was found for this user. User needs to authorize."
+                .to_string(),
+        ),
     }
 }
 
-/// A modelled `ResourceNotFoundException` for a user access task the bundle does
-/// not hold — a constant sentence, for the reason [`app_bundle_not_found`]
-/// states, with the polled task id in the modelled `resourceId`.
-pub fn user_access_task_not_found(task_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: "The specified user access task does not exist".to_string(),
-        resource_id: task_id.to_string(),
-        resource_type: "UserAccessTask".to_string(),
+/// The `errorCode` AppFabric puts on the start-call `TaskError` above: the
+/// service reports the missing authentication token as this fixed token, which
+/// is what a client switches on.
+const TASK_ERROR_CODE_NO_TOKEN: &str = "notfound";
+
+/// The `UserAccessResultItem` a poll reports for a task id the named app bundle
+/// holds no record for.
+///
+/// `BatchGetUserAccessTasks` is a BATCH poll: an id it cannot resolve is one
+/// ENTRY's outcome, not a failure of the whole request, so the entry is answered
+/// in place with the id that was asked for and the `taskError` saying the bundle
+/// holds no record for it — which is what the all-optional member set of
+/// `UserAccessResultItem` is for. Every other member stays absent: with no task
+/// record, nothing knows the application, the tenant or the searched address.
+pub fn user_access_task_record_not_found(task_id: &str) -> UserAccessResultItem {
+    UserAccessResultItem {
+        app: None,
+        tenant_id: None,
+        tenant_display_name: None,
+        task_id: Some(task_id.to_string()),
+        result_status: None,
+        email: None,
+        user_id: None,
+        user_full_name: None,
+        user_first_name: None,
+        user_last_name: None,
+        user_status: None,
+        task_error: Some(TaskError {
+            error_code: Some(TASK_ERROR_CODE_NO_RECORD.to_string()),
+            error_message: Some(format!(
+                "Couldn't find a record within current appBundle with the given taskId: {task_id}"
+            )),
+        }),
     }
 }
+
+/// The `errorCode` the per-entry `taskError` above carries: the service reports
+/// the status of the missing-record condition as the code, the same for every
+/// unresolvable id.
+const TASK_ERROR_CODE_NO_RECORD: &str = "404";
 
 /// An ingestion, as `CreateIngestion` stored it.
 #[derive(Debug, Clone)]

@@ -30,6 +30,7 @@ use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, is_v4_uuid, Answer, 
 use crate::ingestion_authorization_refusal_wording::{
     NOT_CONNECTED_MESSAGE, NO_AUTHORIZATION_MESSAGE,
 };
+use crate::user_access_tasks::{NO_AUTHENTICATION_TOKEN_CODE, NO_AUTHENTICATION_TOKEN_MESSAGE};
 
 /// The email address every start call below searches for.
 const EMAIL: &str = "grace.hopper@example.com";
@@ -244,7 +245,8 @@ fn member(value: &Value, name: &str) -> String {
 /// other state — including none at all — `CreateIngestion` is refused with the
 /// modelled `ValidationException` (HTTP 400) carrying the service's fixed
 /// sentence for the step the caller still owes, and the start call reports that
-/// authorization with the modelled `error` and no `taskId`.
+/// authorization with the modelled `error` — the service's own fixed no-token
+/// error — and no `taskId`.
 ///
 /// The table spans every set-up that reaches each state (never created, created
 /// and not connected, connected, connected then invalidated by an applied
@@ -385,13 +387,26 @@ async fn one_connect_handshake_rule_decides_both_dependent_operations() {
                     item.get("taskId").is_none(),
                     "case {case:?}: an authorization that is not connected must start no task, got {item}"
                 );
-                let error_message = item
+                let error = item
                     .get("error")
-                    .map(|error| member(error, "errorMessage"))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| panic!("case {case:?}: expected an error in {item}"));
+                assert_eq!(
+                    (
+                        member(error, "errorCode"),
+                        member(error, "errorMessage")
+                    ),
+                    (
+                        NO_AUTHENTICATION_TOKEN_CODE.to_string(),
+                        NO_AUTHENTICATION_TOKEN_MESSAGE.to_string()
+                    ),
+                    "case {case:?}: the reported item must carry the service's fixed no-token error, got {item}"
+                );
+                let error_message = member(error, "errorMessage");
                 assert!(
-                    error_message.contains(app) && error_message.contains(APP_AUTHORIZATION_STATUS_PENDING_CONNECT),
-                    "case {case:?}: the reported error must name the app and the held status, got {item}"
+                    !error_message.contains(app)
+                        && !error_message.contains(tenant)
+                        && !error_message.contains(APP_AUTHORIZATION_STATUS_PENDING_CONNECT),
+                    "case {case:?}: the sentence must carry no value of the request or the store, got {error_message:?}"
                 );
             }
         }

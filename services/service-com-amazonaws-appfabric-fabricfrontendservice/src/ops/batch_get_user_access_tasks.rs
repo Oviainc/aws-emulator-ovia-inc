@@ -152,17 +152,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// `list` of `UUID` with `@length(1..50)` and no `@uniqueItems`, so the
     /// request is a sequence rather than a set and the response is what a caller
     /// lines its own ids up against — collapsing a repeated id would hand back
-    /// fewer items than ids and break that alignment. A task id the bundle does
-    /// not hold, and a bundle the store does not hold, are the modelled
-    /// `ResourceNotFoundException`.
+    /// fewer items than ids and break that alignment.
     ///
-    /// An id the bundle holds no task for is a MISSING RESOURCE, not a task
-    /// outcome: the model documents `UserAccessResultItem$taskError` as
-    /// "information about an error returned from a user access task", so it
-    /// belongs to a task that exists and ran, and `app`/`tenantId`/`email` of a
-    /// task nothing started are not knowable. Reporting such an id as an item
-    /// would therefore have to invent a task, so it is refused with the modelled
-    /// `ResourceNotFoundException` (HTTP 404) naming that id instead.
+    /// An id the bundle holds no task for is ONE ENTRY'S OUTCOME, not a failure
+    /// of the request: this is a batch, so the entry is answered in place with
+    /// the id that was asked for and the `taskError` saying the bundle holds no
+    /// record for it (see
+    /// [`crate::state::user_access_task_record_not_found`]), and the call still
+    /// answers 200 with every other entry's result. That is what the
+    /// all-optional member set of `UserAccessResultItem` is for: an entry may
+    /// report only an id and an error. The modelled `ResourceNotFoundException`
+    /// is left for the one thing the whole request names — an
+    /// `appBundleIdentifier` the store does not hold.
     async fn handle(
         &self,
         input: Self::Input,
@@ -191,16 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant cannot be reported in two different statuses by one poll.
         let now = ::std::time::SystemTime::now();
         // One item per ENTRY, not per distinct id: the requested list is a
-        // sequence the caller lines the answer up against.
+        // sequence the caller lines the answer up against, and an id this bundle
+        // holds no task for keeps its own position.
         let mut items = Vec::with_capacity(input.task_id_list.len());
         for task_id in &input.task_id_list {
-            let Some(task) = bundle.user_access_tasks.get(task_id) else {
-                return Err(BatchGetUserAccessTasksErrorModeled::ResourceNotFoundException(
-                    crate::state::user_access_task_not_found(task_id),
-                )
-                .into());
-            };
-            items.push(task.to_result_item(now));
+            items.push(match bundle.user_access_tasks.get(task_id) {
+                Some(task) => task.to_result_item(now),
+                None => crate::state::user_access_task_record_not_found(task_id),
+            });
         }
 
         Ok(BatchGetUserAccessTasksOutput {
