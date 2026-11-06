@@ -752,22 +752,31 @@ async fn a_function_reports_the_layer_versions_it_was_created_with() {
     let cases: Vec<(&str, Value, Option<Value>)> = vec![
         ("no-layers", Value::Null, None),
         (
+            // `UncompressedCodeSize` is the size of the layer archive's CONTENTS: the
+            // archives these rows publish are bytes this emulator cannot read as an
+            // archive, so there is nothing to expand and the member reports 0 beside the
+            // stored size. The member tracking a real archive's contents is pinned in
+            // `function_layer_unzipped_size`.
             "one-layer",
             json!([first]),
-            Some(json!([{ "Arn": first, "CodeSize": first_size }])),
+            Some(json!([
+                { "Arn": first, "CodeSize": first_size, "UncompressedCodeSize": 0 },
+            ])),
         ),
         (
             "two-layers-in-order",
             json!([second, first]),
             Some(json!([
-                { "Arn": second, "CodeSize": second_size },
-                { "Arn": first, "CodeSize": first_size },
+                { "Arn": second, "CodeSize": second_size, "UncompressedCodeSize": 0 },
+                { "Arn": first, "CodeSize": first_size, "UncompressedCodeSize": 0 },
             ])),
         ),
         (
             "aws-managed-layer",
             json!([managed]),
-            Some(json!([{ "Arn": managed, "CodeSize": 0 }])),
+            Some(json!([
+                { "Arn": managed, "CodeSize": 0, "UncompressedCodeSize": 0 },
+            ])),
         ),
     ];
 
@@ -1333,8 +1342,10 @@ async fn deleting_a_layer_version_a_function_refers_to_leaves_that_function_alon
     let first = layer_version_arn("referenced", 1);
     let second = layer_version_arn("referenced", 2);
     let expected_layers = json!([
-        { "Arn": first, "CodeSize": archive_size(&archives, 1) },
-        { "Arn": second, "CodeSize": archive_size(&archives, 2) },
+        // The archives here are bytes this emulator cannot read as an archive, so the
+        // expanded size of their contents is 0 (see `function_layer_unzipped_size`).
+        { "Arn": first, "CodeSize": archive_size(&archives, 1), "UncompressedCodeSize": 0 },
+        { "Arn": second, "CodeSize": archive_size(&archives, 2), "UncompressedCodeSize": 0 },
     ]);
 
     let created = json_call(

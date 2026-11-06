@@ -112,6 +112,22 @@ pub fn capacity_provider_not_found_message(capacity_provider_name: &str) -> Stri
     )
 }
 
+/// The sentence a create is refused with when this account already holds a capacity
+/// provider under the name the request carried.
+///
+/// Two fixed sentences — the conflict, and the rule that makes it one — whose only variable
+/// part is the ARN of the provider that already exists, which is the one
+/// [`capacity_provider_arn`] mints for that name in the Region the caller signed for.
+/// Nothing of the request is echoed: the name travels in the ARN the store holds for the
+/// existing provider.
+#[must_use]
+pub fn capacity_provider_already_exists_message(capacity_provider_arn: &str) -> String {
+    format!(
+        "A capacity provider with ARN {capacity_provider_arn} already exists. Capacity \
+         provider names must be unique within your account."
+    )
+}
+
 /// Why a request naming an operator role this service cannot manage compute with is
 /// refused.
 ///

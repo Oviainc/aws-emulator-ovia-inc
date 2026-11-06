@@ -430,12 +430,14 @@ fn cases() -> Vec<Case> {
             label: "layer-attached",
             package: Package::Zip,
             // A layer Lambda itself provides belongs to no account, so it needs no
-            // `PublishLayerVersion` behind it and reports the `CodeSize` default.
+            // `PublishLayerVersion` behind it and this emulator holds no archive of it to
+            // measure: both reported sizes are the member defaults.
             patch: json!({ "Layers": ["arn:aws:lambda:::awslayer:AWSLambdaInsightsExtension"] }),
             expected: json!({
                 "Layers": [{
                     "Arn": "arn:aws:lambda:::awslayer:AWSLambdaInsightsExtension",
                     "CodeSize": 0,
+                    "UncompressedCodeSize": 0,
                 }],
             }),
         },

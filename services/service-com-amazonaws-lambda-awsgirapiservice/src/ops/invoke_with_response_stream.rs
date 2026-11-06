@@ -358,13 +358,11 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             )));
         }
         // "The JSON that you want to provide to your Lambda function as input": a body
-        // that is not JSON is refused with the modelled 400, and an absent or empty one is
-        // the documented no-event invocation.
-        if !payload.is_empty() && ::serde_json::from_slice::<::serde_json::Value>(payload).is_err()
-        {
-            return Err(invalid_request_content(
-                "Could not parse request body into json".to_string(),
-            ));
+        // that is not JSON is refused with the modelled 400 carrying the parse diagnostic
+        // (`crate::state::invocation_payload`), and an absent or empty one is the
+        // documented no-event invocation.
+        if let Some(message) = crate::state::unparseable_payload_message(payload) {
+            return Err(invalid_request_content(message));
         }
 
         let function_arn = record.versioned_arn(&version);

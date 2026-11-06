@@ -620,6 +620,13 @@ pub struct TracingConfigResponse {
 #[smithy_macros::smithy(shape = "com.amazonaws.lambda#Layer")]
 #[derive(Debug, Clone, Default)]
 pub struct Layer {
+    /// The size of the layer version's archive once expanded. The member was added to
+    /// this service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot declares no such member on this shape, while AWS carries it on every
+    /// layer a function's configuration reports — and its value is projected by
+    /// [`crate::state::FunctionRecord::reported`], from the size
+    /// [`crate::state::FunctionLayer`] measured off the attached layer version's archive.
+    pub uncompressed_code_size: i64,
     pub arn: Option<String>,
     pub code_size: i64,
     pub signing_profile_version_arn: Option<String>,

@@ -320,15 +320,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The JSON that you want to provide to your Lambda function as input": a body
-        // that is not JSON is refused with the modelled 400, and an empty one is the
-        // no-event invocation, exactly as `Invoke` treats its own payload.
-        if !input.invoke_args.is_empty()
-            && ::serde_json::from_slice::<::serde_json::Value>(&input.invoke_args).is_err()
-        {
+        // that is not JSON is refused with the modelled 400 carrying the parse diagnostic
+        // (`crate::state::invocation_payload`), and an empty one is the no-event
+        // invocation, exactly as `Invoke` treats its own payload.
+        if let Some(message) = crate::state::unparseable_payload_message(&input.invoke_args) {
             return Err(InvokeAsyncErrorModeled::InvalidRequestContentException(
                 InvalidRequestContentException {
                     r#type: None,
-                    message: Some("Could not parse request body into json".to_string()),
+                    message: Some(message),
                 },
             )
             .into());

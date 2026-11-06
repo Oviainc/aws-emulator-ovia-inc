@@ -45,6 +45,8 @@ mod async_invocation;
 mod asynchronous_invoke_run;
 #[path = "all/capacity_provider_bounds.rs"]
 mod capacity_provider_bounds;
+#[path = "all/capacity_provider_duplicate_name.rs"]
+mod capacity_provider_duplicate_name;
 #[path = "all/capacity_provider_listing.rs"]
 mod capacity_provider_listing;
 #[path = "all/capacity_provider_managed_function_state.rs"]
@@ -145,6 +147,8 @@ mod function_configuration;
 mod function_configuration_quotas;
 #[path = "all/function_last_update_status_reason.rs"]
 mod function_last_update_status_reason;
+#[path = "all/function_layer_unzipped_size.rs"]
+mod function_layer_unzipped_size;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
 #[path = "all/function_recursion_config.rs"]
@@ -175,6 +179,8 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/invocation_count_series.rs"]
 mod invocation_count_series;
+#[path = "all/invocation_refusal_diagnostics.rs"]
+mod invocation_refusal_diagnostics;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
 #[path = "all/kinesis_event_source_delivery.rs"]

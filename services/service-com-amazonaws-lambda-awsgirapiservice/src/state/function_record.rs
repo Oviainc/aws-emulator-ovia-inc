@@ -767,6 +767,12 @@ impl FunctionRecord {
                     .map(|layer| Layer {
                         arn: Some(layer.arn.clone()),
                         code_size: layer.code_size,
+                        // `UncompressedCodeSize` is the size of that layer version's
+                        // archive once expanded, which is what a client sums its layers'
+                        // sizes over to see how much of Lambda's unzipped-size limit the
+                        // function has left; it is measured off the stored archive when the
+                        // version is attached (`crate::state::FunctionLayer`).
+                        uncompressed_code_size: layer.uncompressed_code_size,
                         ..Layer::default()
                     })
                     .collect()

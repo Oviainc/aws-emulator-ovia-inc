@@ -274,7 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateCapacityProviderErrorModeled::ResourceConflictException(
                 ResourceConflictException {
                     r#type: None,
-                    message: Some(format!("Capacity provider already exists: {}", existing.arn)),
+                    message: Some(
+                        crate::state::capacity_provider::capacity_provider_already_exists_message(
+                            &existing.arn,
+                        ),
+                    ),
                 },
             )
             .into());

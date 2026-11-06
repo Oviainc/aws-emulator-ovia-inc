@@ -171,6 +171,12 @@ const REPORTED_ENUM_ORDERS: &[&[&str]] = &[
     // com.amazonaws.lambda#UpdateRuntimeOn (`Auto | Manual | FunctionUpdate` in the
     // model), reported by AWS as:
     &["FunctionUpdate", "Manual", "Auto"],
+    // com.amazonaws.lambda#InvocationType (`Event | RequestResponse | DryRun` in the
+    // model), reported by AWS as below. Source: the answers the corpus units
+    // `lambda-batch-diag-submit-wrapper-function-handle-mistakes`,
+    // `lambda-function-invocation-paths` and `lambda-lsrno-traj-invoke-reproduces-timeout`
+    // carry for an `InvocationType` outside its value set.
+    &["DryRun", "RequestResponse", "Event"],
 ];
 
 /// `allowed` in the order this service reports that enum in, or in the order the model
