@@ -21,7 +21,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::{
     AsyncInvocationOutcome, AsyncInvocationRecord, ComAmazonawsLambdaAwsgirapiserviceState,
-    ASYNC_NOT_EXECUTED_REASON, MAX_QUEUED_ASYNC_INVOCATIONS,
+    ASYNC_NOT_DELIVERED_REASON, MAX_QUEUED_ASYNC_INVOCATIONS,
 };
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -196,16 +196,24 @@ fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
     }
 }
 
-/// Move every queued event's delivery attempt into the past, the same way.
-fn make_attempts_due(engine: &Arc<engine::InMemoryEngine>) {
+/// Hold one event for `name` that NO delivery attempt ever claimed, with its attempt
+/// instant already in the past: what an event accepted where nothing could deliver it looks
+/// like by the time the clock has made its attempt due.
+fn hold_undelivered_event(engine: &Arc<engine::InMemoryEngine>, name: &str, payload: &[u8]) {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let mut store = state.lock();
-    let past = SystemTime::now() - Duration::from_secs(1);
-    for function in store.functions.values_mut() {
-        for invocation in &mut function.async_invocations {
-            invocation.attempt_due = past;
-        }
-    }
+    let function = store
+        .functions
+        .get_mut(name)
+        .expect("the function must be held");
+    function.async_invocations.push_back(AsyncInvocationRecord {
+        version: "$LATEST".to_string(),
+        request_id: "undelivered-event".to_string(),
+        payload: payload.to_vec(),
+        received: "2026-01-01T00:00:00.000Z".to_string(),
+        attempt_due: SystemTime::now() - Duration::from_secs(1),
+        outcome: AsyncInvocationOutcome::Queued,
+    });
 }
 
 /// Create a function and bring it to `Active`, which is the state an invocation needs.
@@ -229,6 +237,32 @@ fn queued(engine: &Arc<engine::InMemoryEngine>, name: &str) -> Vec<AsyncInvocati
         .get(name)
         .map(|function| function.async_invocations.iter().cloned().collect())
         .unwrap_or_default()
+}
+
+/// How long a test waits for a delivery attempt to settle the event it queued. The attempt
+/// becomes due a quarter of a second after the accepting call, so this is many times the
+/// span it waits for and still bounds the test.
+const DELIVERY_BUDGET: Duration = Duration::from_secs(20);
+
+/// The outcome the delivery attempt for `name`'s single queued event settled on, waited for
+/// rather than slept for.
+async fn settled_outcome(
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+) -> AsyncInvocationOutcome {
+    let deadline = std::time::Instant::now() + DELIVERY_BUDGET;
+    loop {
+        let outcome = queued(engine, name).first().map(|event| event.outcome.clone());
+        match outcome {
+            Some(AsyncInvocationOutcome::Queued | AsyncInvocationOutcome::Delivering) | None => {}
+            Some(settled) => return settled,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delivery attempt for {name} never settled within {DELIVERY_BUDGET:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// A short, printable rendering of a payload, so a failure names the actual value
@@ -521,7 +555,7 @@ async fn invoke_async_refuses_what_it_cannot_accept_and_queues_nothing() {
 }
 
 #[tokio::test]
-async fn a_queued_event_records_that_it_never_ran_once_its_attempt_is_due() {
+async fn a_queued_event_is_delivered_to_its_function_and_the_entry_records_the_attempt() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
     create_active_function(&router, &engine, "queued", false).await;
@@ -549,10 +583,43 @@ async fn a_queued_event_records_that_it_never_ran_once_its_attempt_is_due() {
         events[0].outcome
     );
 
-    // What waiting for the delivery attempt would do, without waiting. The emulator runs
-    // no deployment package, so the attempt that came due ended with the function never
-    // executing, and the queue entry says exactly that.
-    make_attempts_due(&engine);
+    // The delivery attempt the queueing owes: the event is handed to the function and the
+    // attempt's own outcome lands on the entry. This package is 64 deterministic bytes
+    // rather than an archive, so the attempt could not read it — which is still an ATTEMPT
+    // that was made, not an event nobody ever delivered.
+    let settled = settled_outcome(&engine, "queued").await;
+    let AsyncInvocationOutcome::Failed(reason) = &settled else {
+        panic!("expected the attempt to report why the function could not run, got {settled:?}")
+    };
+    assert!(
+        reason.contains("could not be read"),
+        "expected the reason to name the unreadable deployment package, got {reason:?}"
+    );
+
+    let held = queued(&engine, "queued");
+    assert_eq!(
+        held.len(),
+        1,
+        "expected the one event to still be held, got {}",
+        held.len()
+    );
+    assert!(
+        held[0].payload == br#"{"event":true}"#.to_vec(),
+        "expected the event to keep its payload, got {}",
+        render(&held[0].payload)
+    );
+}
+
+#[tokio::test]
+async fn an_event_no_attempt_claimed_records_that_nothing_delivered_it() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    create_active_function(&router, &engine, "queued", false).await;
+
+    // An event whose attempt instant the clock has already passed and which no delivery
+    // attempt ever took: what an acceptance in a process with no asynchronous runtime
+    // leaves behind. The next request materialises what the clock owes on it.
+    hold_undelivered_event(&engine, "queued", br#"{"event":true}"#);
     let read = get_function_configuration(&router, "queued").await;
     assert_eq!(
         read.status,
@@ -571,14 +638,9 @@ async fn a_queued_event_records_that_it_never_ran_once_its_attempt_is_due() {
     );
     assert_eq!(
         settled[0].outcome,
-        AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string()),
+        AsyncInvocationOutcome::Failed(ASYNC_NOT_DELIVERED_REASON.to_string()),
         "expected the due attempt to record why the event never ran, got {:?}",
         settled[0].outcome
-    );
-    assert!(
-        settled[0].payload == br#"{"event":true}"#.to_vec(),
-        "expected the event to keep its payload, got {}",
-        render(&settled[0].payload)
     );
 }
 

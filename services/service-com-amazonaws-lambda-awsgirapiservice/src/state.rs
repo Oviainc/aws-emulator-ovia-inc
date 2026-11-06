@@ -40,11 +40,12 @@
 //! "202 Accepted ... the request is queued for invocation", so what it persists is the
 //! queued event itself — on [`FunctionRecord::async_invocations`], one
 //! [`AsyncInvocationRecord`] per accepted event, against the version it was addressed
-//! to. The event is never executed here (this emulator has no in-process runtime for a
-//! deployment package), so the entry's outcome settles into
-//! [`AsyncInvocationOutcome::Failed`] once its delivery attempt is due, carrying the
-//! reason; nothing invents a result, a log tail or a duration for a function that did
-//! not run.
+//! to. What FOLLOWS the accepting call is the delivery: the event is handed to the
+//! function and its handler runs, through the same in-process engine a synchronous
+//! invocation runs on, so whatever the handler performs becomes observable shortly after
+//! the call that queued it (see [`async_invocation::deliver`]). The entry keeps what the
+//! attempt came to; nothing invents a result, a log tail or a duration for a function
+//! that did not run.
 //!
 //! The durable-execution slice hangs off the same record too, in
 //! [`FunctionRecord::durable_executions`]: one [`DurableExecutionRecord`] per execution
@@ -1951,77 +1952,6 @@ impl Default for RuntimeManagementConfigRecord {
     }
 }
 
-/// What has become of one queued asynchronous invocation.
-///
-/// A queued event is NOT a run: the queue is the only thing an asynchronous
-/// invocation's accepting call ("A success response (202 Accepted) indicates that the
-/// request is queued for invocation") promises, and this emulator has no in-process
-/// runtime that can run a deployment package. So an entry starts [`Self::Queued`] and,
-/// once its first delivery attempt is due, settles into [`Self::Failed`] carrying the
-/// reason it never ran. Nothing here ever reports a result, a log tail or a duration
-/// for a function that did not execute.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AsyncInvocationOutcome {
-    /// Accepted and waiting for its delivery attempt, which is due at
-    /// [`AsyncInvocationRecord::attempt_due`].
-    Queued,
-    /// The delivery attempt came due and the event was never executed; the string is
-    /// why.
-    Failed(String),
-}
-
-/// One asynchronous invocation this emulator accepted for a function.
-///
-/// Held per function on [`FunctionRecord::async_invocations`], because Lambda queues an
-/// asynchronous event against the function version it was addressed to.
-#[derive(Debug, Clone)]
-pub struct AsyncInvocationRecord {
-    /// The version label the event was addressed to (`$LATEST` or a published version).
-    pub version: String,
-    /// The event payload, exactly as the caller supplied it.
-    pub payload: Vec<u8>,
-    /// ISO-8601 instant the event was accepted for invocation.
-    pub received: String,
-    /// When the first delivery attempt becomes due; see [`ASYNC_DELIVERY_DELAY`].
-    pub attempt_due: SystemTime,
-    /// What has become of the event.
-    pub outcome: AsyncInvocationOutcome,
-}
-
-/// How long after an asynchronous invocation is accepted its first delivery attempt
-/// becomes due.
-///
-/// An EMULATOR-CHOSEN span, like [`ACTIVATION_DELAY`]: Lambda publishes no latency for
-/// the asynchronous event queue. It is deliberately non-zero, so a caller that looks
-/// straight after the accepting call still sees the event [`AsyncInvocationOutcome::Queued`].
-pub const ASYNC_DELIVERY_DELAY: Duration = Duration::from_millis(250);
-
-/// Why a queued asynchronous invocation never ran, recorded on the entry when its
-/// delivery attempt comes due.
-pub const ASYNC_NOT_EXECUTED_REASON: &str =
-    "the event was accepted and queued, but no in-process runtime in this emulator can \
-     run the function's deployment package, so it was never executed";
-
-/// Why an accepted asynchronous invocation never ran when Lambda's recursive-loop
-/// guardrail stopped it: the function's recursive loop detection configuration is
-/// [`recursion::RECURSIVE_LOOP_TERMINATE`] and the chain this invocation belongs to had
-/// already come back round into the function, so Lambda "stops your function being
-/// invoked" instead of delivering the event. Recorded on the entry at the moment the
-/// invocation is stopped, because there is no delivery attempt still to come.
-pub const ASYNC_RECURSION_STOPPED_REASON: &str =
-    "the invocation was stopped by Lambda's recursive loop detection: the request chain it \
-     belongs to had already invoked this function, and the function's recursive loop \
-     detection configuration is Terminate, so the event was never delivered";
-
-/// The most queued asynchronous invocations this emulator keeps for one function.
-///
-/// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the queue is in
-/// memory and every accepted event adds its payload to it, so past this point the
-/// oldest entry is dropped rather than the store growing without bound. Dropping the
-/// oldest does not change what any call answers — the accepting call reports only that
-/// the event was queued, and no operation reads the queue back out.
-pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
-
 /// The most durable executions this emulator keeps for one function.
 ///
 /// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the executions
@@ -2875,6 +2805,13 @@ impl CapacityProviderRecord {
 /// records ([`ComAmazonawsLambdaAwsgirapiserviceState::event_source_mappings`]) stays here
 /// beside the function slice, and so do the pollers that read a mapping's source.
 pub mod event_source_mapping;
+/// The asynchronous-invocation queue: the record one accepted event is held as, the
+/// outcomes it moves through, and the delivery that hands it to the function.
+///
+/// Held in its own module for the same reason as the slice above; every item is
+/// re-exported here, so a handler names them as `crate::state::…`.
+pub mod async_invocation;
+pub use async_invocation::*;
 pub use event_source_mapping::{
     created_event_source_mapping_state, default_batch_size, default_batching_window_seconds,
     event_source_is_mappable_by_this_account, event_source_mapping_arn, event_source_vendor,

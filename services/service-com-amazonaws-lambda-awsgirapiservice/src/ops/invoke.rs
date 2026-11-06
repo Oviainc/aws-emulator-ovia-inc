@@ -9,7 +9,11 @@
 //! has permission to invoke the function"), and `Event`, whose answer is the QUEUEING
 //! receipt — "Event – Invoke the function asynchronously […] The API response only
 //! includes a status code" — so the event is queued against the resolved version
-//! exactly as `InvokeAsync` queues one, and the accepted status is answered.
+//! exactly as `InvokeAsync` queues one, and the accepted status is answered. The queued
+//! event is then DELIVERED to the function off the response path: the handler runs with
+//! it, through the same in-process engine a synchronous invocation runs through, so
+//! whatever the handler itself performs becomes observable shortly after the accepting
+//! call (`crate::state::async_invocation`).
 //!
 //! An accepted `Event` invocation of a DURABLE function — one whose resolved
 //! configuration carries a `DurableConfig` — or one that names a `DurableExecutionName`
@@ -591,7 +595,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Lambda stopped. The entry records that outcome at once rather than waiting
             // for a delivery attempt that will never be made.
             if stopped {
-                record.record_stopped_async_invocation(&version, payload, now);
+                record.record_stopped_async_invocation(
+                    &version,
+                    &crate::state::mint_request_id(),
+                    payload,
+                    now,
+                );
                 drop(store);
                 crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
                 return Ok(InvokeOutput {
@@ -606,10 +615,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // call promises is the QUEUEING — "A success response (202 Accepted)
             // indicates that the request is queued for invocation" — so that is what is
             // performed and persisted here, one queue entry against the version this
-            // call resolved, through the same state as `InvokeAsync`'s. Nothing about a
-            // run is reported, because nothing has run: the entry records that outcome
-            // itself once its delivery attempt comes due
-            // (`crate::state::FunctionRecord::materialize`).
+            // call resolved, through the same state as `InvokeAsync`'s. The function is
+            // then INVOKED with that event, off the response path and after the queueing
+            // delay, and the entry keeps what the run came to
+            // (`crate::state::async_invocation::deliver`).
             //
             // `ExecutedVersion` is withheld: it is "the version of the function that
             // executed", and no version has executed when the event is merely queued.
@@ -635,14 +644,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A repeat that named an execution already started is the SAME invocation,
             // not a second one — "Lambda returns the existing execution instead of
             // creating a duplicate" — so it queues no second event either.
-            if !started.deduplicated {
-                record.queue_async_invocation(&version, payload, now);
-            }
+            //
+            // The event the queue holds is the one the function is then INVOKED with:
+            // "Event – Invoke the function asynchronously", so the delivery is made once
+            // the store is released, and the entry the delivery records its outcome on is
+            // the one carrying this invocation's own request id.
+            let delivered = (!started.deduplicated).then(|| {
+                let invocation = crate::state::Invocation {
+                    function_name: function_name.clone(),
+                    executed_version: executed_version.clone(),
+                    invoked_function_arn: function_arn.clone(),
+                    region: region.clone(),
+                    runtime: resolved_config.runtime.clone(),
+                    handler: resolved_config.handler.clone(),
+                    variables: resolved_config.environment.clone(),
+                    memory_size: resolved_config.memory_size,
+                    timeout: resolved_config.timeout,
+                    zip_bytes: record.code_of(&version).zip_bytes.clone(),
+                    payload: payload.clone(),
+                    client_context: client_context.clone(),
+                    tenant_id: input.tenant_id.clone(),
+                    request_id: crate::state::mint_request_id(),
+                };
+                record.queue_async_invocation(&version, &invocation.request_id, payload, now);
+                invocation
+            });
             drop(store);
             // The de-duplicated repeat is the SAME invocation answered again rather than a
             // second one, so it is not counted a second time either.
-            if !started.deduplicated {
+            if let Some(invocation) = delivered {
                 crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+                crate::state::async_invocation::deliver(&state, invocation);
             }
             return Ok(InvokeOutput {
                 status_code: ACCEPTED_STATUS,

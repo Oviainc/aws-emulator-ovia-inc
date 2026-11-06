@@ -28,7 +28,7 @@ use super::{
     AsyncInvocationRecord, CapacityProviderVersion, CodeRecord, DurableExecutionRecord,
     DurableExecutionStart, FunctionConfig, FunctionScalingConfigRecord, FunctionUrlConfigRecord,
     FunctionVersionRecord, PolicyRecord, ProvisionedConcurrencyRecord, RequestChainRecord,
-    RuntimeManagementConfigRecord, ASYNC_DELIVERY_DELAY, ASYNC_NOT_EXECUTED_REASON,
+    RuntimeManagementConfigRecord, ASYNC_DELIVERY_DELAY, ASYNC_NOT_DELIVERED_REASON,
     ASYNC_RECURSION_STOPPED_REASON, DEFAULT_LOG_FORMAT, DURABLE_EXECUTION_ARN_INFIX,
     EVENT_TYPE_EXECUTION_STARTED, EXECUTION_STATUS_RUNNING, LAST_UPDATE_STATUS_IN_PROGRESS,
     LAST_UPDATE_STATUS_SUCCESSFUL, MAX_DURABLE_EXECUTIONS, MAX_QUEUED_ASYNC_INVOCATIONS,
@@ -179,15 +179,17 @@ impl FunctionRecord {
             self.last_update_due = None;
         }
         // The same rule for the asynchronous event queue: a queued event whose delivery
-        // attempt the clock has already made due has had that attempt, and this emulator
-        // runs no deployment package, so the attempt ended without the function ever
-        // executing. The outcome would have been owed at the same instant even if nobody
-        // had called.
+        // attempt the clock has already made due and which NOTHING claimed has had no
+        // attempt at all, so it was never executed. The outcome would have been owed at the
+        // same instant even if nobody had called. An event a delivery attempt did claim is
+        // left alone: that attempt records what the run came to
+        // ([`super::async_invocation::deliver`]), and the clock owes nothing about a run
+        // that is under way.
         for invocation in &mut self.async_invocations {
             if invocation.outcome == AsyncInvocationOutcome::Queued && now >= invocation.attempt_due
             {
                 invocation.outcome =
-                    AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
+                    AsyncInvocationOutcome::Failed(ASYNC_NOT_DELIVERED_REASON.to_string());
             }
         }
         // And the same rule for every provisioned concurrency allocation under way: the
@@ -263,14 +265,25 @@ impl FunctionRecord {
     }
 
     /// Queue one asynchronous invocation of `version` carrying `payload`, accepted at
-    /// `now`.
+    /// `now` under the request id `request_id`.
+    ///
+    /// The id is the one the RUN this event is delivered to is given as its
+    /// `context.aws_request_id`, so the delivery attempt finds the entry it has to record
+    /// its outcome on by it.
     ///
     /// The queue is bounded by [`MAX_QUEUED_ASYNC_INVOCATIONS`]: once it is full the
     /// oldest entry makes room for the newest, so accepting an event never fails for
     /// want of memory.
-    pub fn queue_async_invocation(&mut self, version: &str, payload: Vec<u8>, now: SystemTime) {
+    pub fn queue_async_invocation(
+        &mut self,
+        version: &str,
+        request_id: &str,
+        payload: Vec<u8>,
+        now: SystemTime,
+    ) {
         self.hold_async_invocation(AsyncInvocationRecord {
             version: version.to_string(),
+            request_id: request_id.to_string(),
             payload,
             received: iso8601(now),
             attempt_due: now + ASYNC_DELIVERY_DELAY,
@@ -289,11 +302,13 @@ impl FunctionRecord {
     pub fn record_stopped_async_invocation(
         &mut self,
         version: &str,
+        request_id: &str,
         payload: Vec<u8>,
         now: SystemTime,
     ) {
         self.hold_async_invocation(AsyncInvocationRecord {
             version: version.to_string(),
+            request_id: request_id.to_string(),
             payload,
             received: iso8601(now),
             attempt_due: now,

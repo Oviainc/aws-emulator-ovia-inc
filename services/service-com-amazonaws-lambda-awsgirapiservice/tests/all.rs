@@ -41,6 +41,8 @@ mod alias_version_not_found_sentence;
 mod alias_write_not_found_sentence;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
+#[path = "all/asynchronous_invoke_run.rs"]
+mod asynchronous_invoke_run;
 #[path = "all/capacity_provider_bounds.rs"]
 mod capacity_provider_bounds;
 #[path = "all/capacity_provider_listing.rs"]

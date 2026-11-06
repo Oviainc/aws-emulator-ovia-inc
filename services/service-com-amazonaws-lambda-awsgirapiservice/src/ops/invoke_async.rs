@@ -5,10 +5,11 @@
 //! store holds and queued against the version it was addressed to, and the call answers
 //! the documented "202 Accepted", which "indicates that the request is queued for
 //! invocation" (the model's own `InvokeAsyncResponse` documentation) and says nothing
-//! about the run. The queued event is persisted on the function record; this emulator
-//! has no in-process runtime for a deployment package, so the queue entry settles into
-//! its failed outcome once its delivery attempt is due, carrying the reason it never
-//! ran, and no result, log tail or duration is ever reported for it.
+//! about the run. The queued event is persisted on the function record and then DELIVERED
+//! to the function off the response path: the handler runs with it, through the same
+//! in-process engine a synchronous invocation runs through, and the queue entry keeps what
+//! the run came to (`crate::state::async_invocation`). No result, log tail or duration is
+//! ever reported to the caller, which was answered before the run happened.
 //!
 //! An invocation Lambda's recursive-loop guardrail STOPS is accepted the same way and
 //! never delivered: the event is held with the outcome that records the guardrail stopped
@@ -335,9 +336,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Queueing the event is the whole of what this call promises, and it is what is
         // persisted: "A success response (202 Accepted) indicates that the request is
-        // queued for invocation." Nothing about the run is reported, because nothing has
-        // run — the queue entry records that outcome itself once its delivery attempt
-        // comes due (see `FunctionRecord::materialize`).
+        // queued for invocation." Nothing about the run is reported to the caller, because
+        // nothing has run when the answer is given; the function is invoked with the event
+        // once the store is released, and the queue entry keeps what that run came to (see
+        // `crate::state::async_invocation::deliver`).
         //
         // Whether the invocation happens at all is Lambda's recursive-loop guardrail's
         // decision, taken here for the same reason as on `Invoke`: an invocation arriving
@@ -350,21 +352,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let chain = crate::state::request_chain(ctx);
         let stopped = crate::state::guardrail(record, chain.as_deref(), now)
             == crate::state::Guardrail::Stopped;
+        // The configuration the invocation RESOLVED — a published version's frozen one, or
+        // the unpublished version's — which is what the run is performed under.
+        let resolved_config = record
+            .config_of(&version)
+            .cloned()
+            .unwrap_or_else(|| record.config.clone());
         let function_name = record.config.name.clone();
         let resource = crate::state::invoked_resource(&function_name, &version);
-        if stopped {
-            record.record_stopped_async_invocation(&version, input.invoke_args, now);
+        let request_id = crate::state::mint_request_id();
+        let delivered = if stopped {
+            record.record_stopped_async_invocation(&version, &request_id, input.invoke_args, now);
+            None
         } else {
-            record.queue_async_invocation(&version, input.invoke_args, now);
-        }
+            // The event the queue holds is the one the function is INVOKED with, so
+            // everything that run needs is copied out of the record while it is still held:
+            // the run itself happens with no store guard, on a task of its own.
+            let invocation = crate::state::Invocation {
+                function_name: function_name.clone(),
+                // "The version of the function that executed" — the version this call
+                // resolved, which for an unqualified `FunctionName` is the unpublished one.
+                executed_version: record
+                    .resolved_version(&version)
+                    .unwrap_or_else(|| version.clone()),
+                invoked_function_arn: record.versioned_arn(&version),
+                region: region.clone(),
+                runtime: resolved_config.runtime.clone(),
+                handler: resolved_config.handler.clone(),
+                variables: resolved_config.environment.clone(),
+                memory_size: resolved_config.memory_size,
+                timeout: resolved_config.timeout,
+                zip_bytes: record.code_of(&version).zip_bytes.clone(),
+                payload: input.invoke_args.clone(),
+                // This operation carries neither member, so the run is given neither: a
+                // `ClientContext` and a `TenantId` reach a function only when the call that
+                // invoked it named one.
+                client_context: None,
+                tenant_id: None,
+                request_id: request_id.clone(),
+            };
+            record.queue_async_invocation(&version, &request_id, input.invoke_args, now);
+            Some(invocation)
+        };
         drop(store);
-        if stopped {
-            crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
-        } else {
+        if let Some(invocation) = delivered {
             // An invocation nothing stopped is one Lambda ADMITTED to the function, which is
             // metered as one `Invocations` datapoint of the function and of the resource this
             // call addressed (`crate::state::metrics`), exactly as `Invoke` meters its own.
             crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+            crate::state::async_invocation::deliver(&state, invocation);
+        } else {
+            crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
         }
 
         Ok(InvokeAsyncOutput {
