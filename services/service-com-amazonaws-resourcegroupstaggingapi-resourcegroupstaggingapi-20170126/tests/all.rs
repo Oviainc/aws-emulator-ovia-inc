@@ -39,3 +39,6 @@ mod arn_parameter_refusal_wording;
 
 #[path = "all/pagination_termination.rs"]
 mod pagination_termination;
+
+#[path = "all/elb_tagged_resource_index.rs"]
+mod elb_tagged_resource_index;

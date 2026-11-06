@@ -15508,6 +15508,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
+ "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-glue-awsglue",
  "service-com-amazonaws-kms-trentservice",

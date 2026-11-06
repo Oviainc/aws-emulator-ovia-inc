@@ -33,6 +33,7 @@ hex = { workspace = true }
 service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-glue-awsglue = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }

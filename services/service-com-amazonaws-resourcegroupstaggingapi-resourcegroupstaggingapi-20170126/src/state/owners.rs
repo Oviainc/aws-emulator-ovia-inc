@@ -44,6 +44,7 @@ use std::time::SystemTime;
 // workspace resolves them at stays in one place.
 use service_com_amazonaws_apigateway_backplanecontrolservice as owner_apigateway;
 use service_com_amazonaws_ecs_amazonec2containerservicev20141113 as owner_ecs;
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as owner_elb;
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
 use service_com_amazonaws_glue_awsglue as owner_glue;
 use service_com_amazonaws_kms_trentservice as owner_kms;
@@ -196,6 +197,15 @@ fn plain_tag_pairs(list: &[owner_events::ops::types::Tag]) -> Tags {
         .collect()
 }
 
+/// The [`Tags`] of a tag map an owning service already holds as key -> value, in the
+/// one ordered form this crate handles tags in (the shape Elastic Load Balancing
+/// stores a resource's tags as).
+fn pairs(map: &std::collections::HashMap<String, String>) -> Tags {
+    map.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// Resolve `arn` against the service that owns its namespace, applying `change`
 /// to that service's own tag map when one is supplied and the resource is there.
 ///
@@ -211,6 +221,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
         "apigateway" => apigateway(engine, arn, change),
         "sqs" => sqs(engine, arn, change),
         "ecs" => ecs(engine, arn, change),
+        "elasticloadbalancing" => elasticloadbalancing(engine, arn, change),
         "events" => events(engine, arn, change),
         "glue" => glue(engine, arn, change),
         "kms" => kms(engine, arn, change),
@@ -271,6 +282,30 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
         for instance in state.container_instances.values() {
             record(instance.arn.clone(), option_tag_pairs!(instance.tags));
+        }
+    }
+    if let Some(state) = owner_elb::state::service_state(engine) {
+        // Every resource that service holds a tag set for, each under the ARN it
+        // minted for it — which already carries the Region the resource lives in, so
+        // the caller's Region filter applies to these rows exactly as it does to any
+        // other owner's.
+        let state = state.lock();
+        for load_balancer in state.load_balancers.values() {
+            record(load_balancer.arn.clone(), pairs(&load_balancer.tags));
+        }
+        for target_group in state.target_groups.values() {
+            record(target_group.arn.clone(), pairs(&target_group.tags));
+        }
+        for listener in state.listeners.values() {
+            record(listener.arn.clone(), pairs(&listener.tags));
+            // A rule's record lives on its listener, and its own ARN is the one that
+            // service minted for it.
+            for rule in &listener.rules {
+                record(rule.arn.clone(), pairs(&rule.tags));
+            }
+        }
+        for trust_store in state.trust_stores.values() {
+            record(trust_store.arn.clone(), pairs(&trust_store.tags));
         }
     }
     if let Some(state) = owner_events::state::service_state(engine) {
@@ -474,6 +509,80 @@ fn ecs<Eng: Send + Sync + 'static>(
             "ResourceNotFoundException",
             owner_ecs::state::resource_not_found_message(&arn.arn),
         )
+    }
+}
+
+/// Elastic Load Balancing: a load balancer, a target group, a listener, a listener
+/// rule or a trust store — the resources that service documents as taggable ("You can
+/// tag your Application Load Balancers, Network Load Balancers, Gateway Load
+/// Balancers, target groups, trust stores, listeners, and rules", its `AddTags`) — each
+/// holding its own tag set, which is therefore the set this API reads and writes.
+///
+/// The ARN is read by that service's OWN reader of a tagging `ResourceArn`
+/// ([`owner_elb::state::taggable_resource`]) and resolved through its own tag
+/// accessors, so the kinds this API can tag, the record each ARN resolves to and the
+/// `NotFound` a missing one earns are that service's own, with no second copy here to
+/// drift from them. A value in this namespace of no resource type that service
+/// addresses is left [`Resolution::Unowned`], the answer every namespace no linked
+/// owner serves gets, so this crate's own store stays its tag home.
+fn elasticloadbalancing<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_elb::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    let Some(kind) = owner_elb::state::taggable_resource(&arn.arn) else {
+        return Resolution::Unowned;
+    };
+    let mut state = state.lock();
+    // A tag write never brings a resource into being, so an ARN that service holds no
+    // record for is a per-resource failure carrying the `NotFound` of the kind the ARN
+    // itself declares — that error's own awsQuery code, the 400 it is modelled with,
+    // and the wording that service composes for the kind.
+    let Some(stored) = state.tags_of_mut(&arn.arn) else {
+        return absent(
+            elb_not_found_code(kind),
+            owner_elb::state::taggable_not_found_message(kind, &arn.arn),
+        );
+    };
+    let mut held = pairs(stored);
+    if let Some(change) = change {
+        if let Err(would_hold) = change.apply(&mut held) {
+            return Resolution::TooManyTags(would_hold);
+        }
+        // In place, for the reason `option_tag_list!` gives: a key the change does not
+        // name keeps the exact value that service stored for it.
+        match change {
+            Change::Upsert { tags: upserts, .. } => {
+                for (key, value) in upserts.iter() {
+                    stored.insert(key.clone(), value.clone());
+                }
+            }
+            Change::Remove(keys) => {
+                for key in keys.iter() {
+                    stored.remove(key);
+                }
+            }
+        }
+    }
+    Resolution::Present { tags: Some(held) }
+}
+
+/// The wire error code Elastic Load Balancing refuses an absent resource of each
+/// taggable kind with: the `awsQueryError` of that kind's modelled `NotFound`
+/// exception, which is what a client reads back from that service — not the shape name
+/// (`smithy_query(query="shape", shape="TargetGroupNotFoundException")` and its
+/// siblings on that service's model).
+fn elb_not_found_code(kind: owner_elb::state::TaggableResource) -> &'static str {
+    use owner_elb::state::TaggableResource;
+    match kind {
+        TaggableResource::LoadBalancer => "LoadBalancerNotFound",
+        TaggableResource::TargetGroup => "TargetGroupNotFound",
+        TaggableResource::Listener => "ListenerNotFound",
+        TaggableResource::Rule => "RuleNotFound",
+        TaggableResource::TrustStore => "TrustStoreNotFound",
     }
 }
 
