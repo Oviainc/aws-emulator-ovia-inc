@@ -549,6 +549,52 @@ pub const PREFIX_LIST_REFERENCE_STATE_PENDING: &str = "pending";
 /// `available` member.
 pub const PREFIX_LIST_REFERENCE_STATE_AVAILABLE: &str = "available";
 
+/// A prefix list reference the service is taking back out of its route table: that enum's
+/// `deleting` member, which is what `DeleteTransitGatewayPrefixListReference` answers with
+/// until the removal falls due.
+pub const PREFIX_LIST_REFERENCE_STATE_DELETING: &str = "deleting";
+
+/// What the clock owes one stored prefix list reference next.
+///
+/// The `deleting` member of `TransitGatewayPrefixListReferenceState` is deliberately not a
+/// move but the state a reference SITS in while its removal is owed: once the removal has
+/// been carried out the pair is not a route of that route table at all, and the state catalog
+/// has no word for "not a route" — the same reading as [`PropagationMove::Removed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixListReferenceMove {
+    /// `pending` -> `available`: the route is in the table.
+    Available,
+    /// `deleting` -> reported no longer: the route is out of the table.
+    Removed,
+}
+
+/// The move the clock owes one prefix list reference: a [`ClockTransition`] to the next
+/// [`PrefixListReferenceMove`].
+pub type PrefixListReferenceTransition = ClockTransition<PrefixListReferenceMove>;
+
+/// Refuse a prefix list the named transit gateway route table holds no reference (route) for:
+/// HTTP 400 [`INVALID_ROUTE_NOT_FOUND`].
+///
+/// A prefix list reference IS a route — "Deletes a reference (route) to a prefix list in a
+/// specified transit gateway route table"
+/// (`DeleteTransitGatewayPrefixListReference`) — so this is EC2's code for a route it cannot
+/// resolve in a route table that DOES exist, which is a different answer from the route
+/// table's own `.NotFound` and lets a client tell "no such route table" from "no such route
+/// in it". The counterpart of [`local_gateway_route_not_found`] on the transit gateway side.
+pub fn transit_gateway_prefix_list_reference_not_found<E>(
+    route_table_id: &str,
+    prefix_list_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_NOT_FOUND,
+        400,
+        format!(
+            "The route to the prefix list '{prefix_list_id}' does not exist in the transit \
+             gateway route table '{route_table_id}'"
+        ),
+    )
+}
+
 /// One prefix list reference of one transit gateway route table: the modelled
 /// [`TransitGatewayPrefixListReference`] every operation that reports one answers with, plus
 /// the move the clock owes it.
@@ -561,7 +607,7 @@ pub struct TransitGatewayPrefixListReferenceRecord {
     /// The reference as the model shapes it, carrying the state reached so far.
     pub view: TransitGatewayPrefixListReference,
     /// The move the clock owes this reference, while one is owed.
-    pub pending: Option<PendingStateMove>,
+    pub pending: Option<PrefixListReferenceTransition>,
 }
 
 /// What one stored prefix list reference costs against the crate's byte budget: the fixed
@@ -632,12 +678,47 @@ impl ComAmazonawsEc2Amazonec2State {
             (route_table_id.to_string(), prefix_list_id.to_string()),
             TransitGatewayPrefixListReferenceRecord {
                 view: view.clone(),
-                pending: Some(PendingStateMove::starting_now(
-                    PREFIX_LIST_REFERENCE_STATE_AVAILABLE,
+                pending: Some(PrefixListReferenceTransition::starting_now(
+                    PrefixListReferenceMove::Available,
                 )),
             },
         );
         Some(view)
+    }
+
+    /// Start the delete of the reference to `prefix_list_id` in `route_table_id`, and answer it
+    /// as it now stands — or `None` when the store holds no reference for that pair.
+    ///
+    /// The ONE place a prefix list reference's delete is started, on the same contract as
+    /// [`TransitGatewayPropagationRecord::begin_move`]: the reference goes into
+    /// [`PREFIX_LIST_REFERENCE_STATE_DELETING`] NOW, with its REMOVAL owed to the clock one
+    /// [`TRANSITION_DELAY`] later ([`PrefixListReferenceMove::Removed`], applied by
+    /// [`Self::materialize_due_transitions`], which also gives the record's bytes back to the
+    /// store's budget). The span is never zero, so a caller reading straight after the delete
+    /// still sees the route in its `deleting` state rather than gone.
+    ///
+    /// A reference whose removal is ALREADY owed is answered as it stands and its due instant
+    /// is left where it was: the route is on its way out either way, so a second delete does
+    /// not push its removal further off.
+    pub fn begin_transit_gateway_prefix_list_reference_delete(
+        &mut self,
+        route_table_id: &str,
+        prefix_list_id: &str,
+    ) -> Option<TransitGatewayPrefixListReference> {
+        let record = self
+            .transit_gateway_prefix_list_references
+            .get_mut(&(route_table_id.to_string(), prefix_list_id.to_string()))?;
+        if record
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.to != PrefixListReferenceMove::Removed)
+        {
+            record.view.state = Some(PREFIX_LIST_REFERENCE_STATE_DELETING.to_string());
+            record.pending = Some(PrefixListReferenceTransition::starting_now(
+                PrefixListReferenceMove::Removed,
+            ));
+        }
+        Some(record.view.clone())
     }
 
     /// The prefix list references of one transit gateway route table, in prefix-list-id

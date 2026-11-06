@@ -1565,16 +1565,41 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         // The end of the `pending` a `CreateTransitGatewayPrefixListReference` answers with:
         // the route is in the table once the move falls due, whether or not anybody called
-        // again, exactly like every other move above.
-        for record in self.transit_gateway_prefix_list_references.values_mut() {
-            if let Some(state) = record
+        // again, exactly like every other move above. The end of the `deleting` a
+        // `DeleteTransitGatewayPrefixListReference` answers with is the other way round — the
+        // pair is not a route of that table any more, so the record goes, and its bytes go
+        // back to the store's budget. The removals are collected first, the way the
+        // propagations above collect theirs, because the map cannot be written while it is
+        // borrowed for the walk.
+        let mut removed_references: Vec<(String, String)> = Vec::new();
+        for (key, record) in &mut self.transit_gateway_prefix_list_references {
+            let Some(due) = record
                 .pending
                 .as_ref()
-                .and_then(|pending| pending.due_by(now))
-                .map(str::to_string)
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to)
+            else {
+                continue;
+            };
+            match due {
+                PrefixListReferenceMove::Removed => removed_references.push(key.clone()),
+                PrefixListReferenceMove::Available => {
+                    record.view.state = Some(PREFIX_LIST_REFERENCE_STATE_AVAILABLE.to_string());
+                    record.pending = None;
+                }
+            }
+        }
+        for (route_table_id, prefix_list_id) in removed_references {
+            if self
+                .transit_gateway_prefix_list_references
+                .remove(&(route_table_id.clone(), prefix_list_id.clone()))
+                .is_some()
             {
-                record.view.state = Some(state);
-                record.pending = None;
+                // Exactly what the create charged for the record.
+                self.release_stored_bytes(transit_gateway_prefix_list_reference_payload_bytes(
+                    &route_table_id,
+                    &prefix_list_id,
+                ));
             }
         }
         let connections = &mut self.vpc_endpoint_connections;

@@ -1184,7 +1184,11 @@
 //! reports one answers with, so the create and the read cannot describe one reference
 //! differently, plus the move the clock owes it: a create answers `pending`
 //! ([`PREFIX_LIST_REFERENCE_STATE_PENDING`]) and the clock owes it `available`
-//! [`TRANSITION_DELAY`] later, on the same clock as every other move above.
+//! [`TRANSITION_DELAY`] later, on the same clock as every other move above. A delete is the
+//! other end of that life: the reference answers `deleting`
+//! ([`PREFIX_LIST_REFERENCE_STATE_DELETING`]) and the clock owes its REMOVAL
+//! ([`PrefixListReferenceMove::Removed`]) one span later, because a pair the table no longer
+//! routes is not a route of it at all.
 //!
 //! ## Transit gateway metering policies
 //!
