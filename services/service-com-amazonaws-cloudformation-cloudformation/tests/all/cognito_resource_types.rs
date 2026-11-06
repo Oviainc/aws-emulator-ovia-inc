@@ -29,19 +29,25 @@
 //!
 //! Most of these types have no provisioner, so each is declared-only
 //! (`unprovisioned_resources.rs` pins that: nothing is called in the owning service and the
-//! stack completes). The one that DOES — `AWS::Cognito::UserPoolGroup`, which is created
-//! through the owning service's own `CreateGroup` — cannot be created from a declaration
-//! that states none of its properties, because the pool a group belongs to is one of them:
-//! such a row's stack FAILS, naming the property the type requires. What this suite asserts
-//! either way is only what the rule is about — that a template may DECLARE the type at all,
-//! and that the declared resource is recorded under the type it declared.
+//! stack completes). The ones that DO are created through the owning service's own API, which
+//! this crate's harness mounts beside CloudFormation: `AWS::Cognito::UserPoolGroup`, which
+//! cannot be created from a declaration that states none of its properties, because the pool
+//! a group belongs to is one of them — such a row's stack FAILS, naming the property the type
+//! requires — and `AWS::Cognito::IdentityPool`, whose create needs no property of the
+//! declaration and whose identity that service ASSIGNS, so its row carries the `REGION:GUID`
+//! pool id rather than a name CloudFormation computed. What this suite asserts either way is
+//! only what the rule is about — that a template may DECLARE the type at all, and that the
+//! declared resource is recorded under the type it declared.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::{
     is_recognized, AWS_RESOURCE_TYPES,
 };
+use service_com_amazonaws_cloudformation_cloudformation::state::template::identity_is_service_assigned;
 use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::REGION;
 
 use crate::stack_lifecycle::{
     call, create_stack, describe_stack, member, resource_event_reason, router,
@@ -100,8 +106,16 @@ const PUBLISHED: &[&str] = &[
 ///
 /// A group is identified by the pair `(UserPoolId, GroupName)`, so a declaration naming no
 /// pool describes no group `CreateGroup` could make: the provisioner refuses it, naming
-/// that property, rather than sending a request the owning service would reject.
-const REQUIRES_A_PROPERTY: &[(&str, &str)] = &[("AWS::Cognito::UserPoolGroup", "UserPoolId")];
+/// that property, rather than sending a request the owning service would reject. A role
+/// attachment is in the same position: it configures ONE identity pool, which its
+/// `IdentityPoolId` names.
+const REQUIRES_A_PROPERTY: &[(&str, &str)] = &[
+    ("AWS::Cognito::UserPoolGroup", "UserPoolId"),
+    (
+        "AWS::Cognito::IdentityPoolRoleAttachment",
+        "IdentityPoolId",
+    ),
+];
 
 /// The property a property-free declaration of `resource_type` cannot be created without,
 /// or `None` for a type this emulator leaves declared-only.
@@ -257,6 +271,19 @@ async fn every_published_cognito_type_may_be_declared_and_is_recorded() {
             reported[0].logical_id
         );
         let physical_id = reported[0].physical_id.clone().unwrap_or_default();
+        // The physical id a declared-only resource carries is the one CloudFormation's
+        // naming rules computed. A type this emulator really PROVISIONS and whose identity
+        // its owning service ASSIGNS carries that service's own identifier instead — for an
+        // identity pool the `REGION:GUID` id `CreateIdentityPool` minted, which is what
+        // `Ref` returns for the type.
+        if identity_is_service_assigned(resource_type) {
+            assert!(
+                !physical_id.contains(&stack_name) && physical_id.contains(':'),
+                "case {resource_type:?}: expected the identifier the owning service assigned, \
+                 got {physical_id:?}"
+            );
+            continue;
+        }
         assert!(
             physical_id.contains(&stack_name) && physical_id.contains("Subject"),
             "case {resource_type:?}: expected a generated physical id built from the stack \
@@ -436,16 +463,24 @@ async fn the_reported_principal_tag_template_deploys() {
         "case {case:?}: expected one OutputValue per OutputKey {keys:?}, got {values:?} in \
          {body}"
     );
-    // Each one resolves to the referenced resource's physical id: the pool's is the name
-    // its `IdentityPoolName` property declares, and the mapping, which the template leaves
-    // unnamed, carries the generated `<stack name>-<logical id>-<unique id>`.
+    // Each one resolves to the referenced resource's physical id: the pool's is the
+    // `REGION:GUID` id the owning service MINTED for it ("Ref returns the Amazon Cognito
+    // identity pool ID", which is the handle every cognito-identity operation takes), and
+    // the mapping, which the template leaves unnamed, carries the generated
+    // `<stack name>-<logical id>-<unique id>`.
     let resolved: Vec<(String, String)> = keys.iter().cloned().zip(values.iter().cloned()).collect();
     for (key, value) in &resolved {
         match key.as_str() {
-            "PoolId" => assert_eq!(
-                value, "principal-tag-pool",
-                "case {case:?}: expected output {key:?} to resolve to the declared identity \
-                 pool name, got {value:?}"
+            "PoolId" => assert!(
+                value
+                    .split_once(':')
+                    .is_some_and(|(region, guid)| region == REGION
+                        && !guid.is_empty()
+                        && guid
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')),
+                "case {case:?}: expected output {key:?} to resolve to the REGION:GUID pool id \
+                 the owning service minted, got {value:?}"
             ),
             "Mapping" => assert!(
                 value.starts_with(&format!("{stack_name}-PrincipalTags-")),

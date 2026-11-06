@@ -17,6 +17,8 @@ mod ambiguous_role_resolution;
 mod anonymous_credential_exchange;
 #[path = "all/anonymous_credential_vend.rs"]
 mod anonymous_credential_vend;
+#[path = "all/aws_refusal_wording.rs"]
+mod aws_refusal_wording;
 #[path = "all/basic_flow_gate.rs"]
 mod basic_flow_gate;
 #[path = "all/constraint_refusal_wording.rs"]
@@ -37,6 +39,8 @@ mod developer_credentials_authorization;
 mod developer_identity_tokens;
 #[path = "all/iam_oidc_federation.rs"]
 mod iam_oidc_federation;
+#[path = "all/identity_data_events.rs"]
+mod identity_data_events;
 #[path = "all/identity_link_lifecycle.rs"]
 mod identity_link_lifecycle;
 #[path = "all/identity_pool_flow.rs"]
@@ -67,6 +71,8 @@ mod minted_token_identity_binding;
 mod open_id_token;
 #[path = "all/principal_tag_attribute_map.rs"]
 mod principal_tag_attribute_map;
+#[path = "all/provider_configured_mappings.rs"]
+mod provider_configured_mappings;
 #[path = "all/redeemed_token_methods.rs"]
 mod redeemed_token_methods;
 #[path = "all/resource_not_found_precedence.rs"]

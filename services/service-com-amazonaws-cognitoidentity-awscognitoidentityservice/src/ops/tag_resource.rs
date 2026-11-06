@@ -283,12 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
             assigned.insert(tag_key.clone(), tag_value.clone());
         }
         if assigned.len() > crate::state::MAX_TAGS_PER_IDENTITY_POOL {
-            return Err(invalid_parameter(format!(
-                "Assigning these tags would leave identity pool '{identity_pool_id}' with {} \
-                 tags: an identity pool can have as many as {} tags.",
-                assigned.len(),
-                crate::state::MAX_TAGS_PER_IDENTITY_POOL
-            )));
+            return Err(invalid_parameter(
+                crate::state::too_many_user_tags_message(),
+            ));
         }
 
         // A call carrying no tags assigns nothing, so it leaves the record untouched —

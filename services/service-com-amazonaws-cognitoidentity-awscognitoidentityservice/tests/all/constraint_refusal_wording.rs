@@ -73,7 +73,15 @@ const PRINCIPAL_TAGS_MAX: usize = 50;
 #[tokio::test]
 async fn a_refusal_about_a_collection_quotes_the_collection_the_request_sent() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("constraint-refusal-collections", true).await;
+    let pool_id = emulator
+        .pool_with_providers(
+            "constraint-refusal-collections",
+            true,
+            // The provider the principal-tag rows below write a mapping for: a mapping is
+            // stored only for a provider the pool declares.
+            &["graph.facebook.com"],
+        )
+        .await;
 
     // One row over the DeleteIdentities list: a batch past the modelled maximum is refused
     // quoting every id submitted, in the order the request carried them.
@@ -281,7 +289,9 @@ async fn a_constraint_an_element_broke_is_stated_at_the_collection() {
 #[tokio::test]
 async fn a_map_key_outside_its_shape_is_refused_with_the_constraints_a_key_must_satisfy() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("constraint-refusal-map-keys", true).await;
+    let pool_id = emulator
+        .pool_with_providers("constraint-refusal-map-keys", true, &["graph.facebook.com"])
+        .await;
     let authenticated = role_arn("Cognito_constraintRefusalAuth_Role");
 
     // `RolesMap`'s key shape is `RoleType` (`length 1..128`,

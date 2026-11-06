@@ -130,6 +130,66 @@ impl Emulator {
             .to_string()
     }
 
+    /// Create a pool that DECLARES `providers` in its federated-provider configuration, and
+    /// return its minted `IdentityPoolId`.
+    ///
+    /// A call that writes a provider's principal-tag attribute map is served only for a
+    /// provider the pool's own configuration declares, so a suite that writes one needs the
+    /// pool to declare the provider it writes for. Each name is declared under the member
+    /// that names a provider of its kind: an Amazon Cognito user pool
+    /// (`cognito-idp.<region>.amazonaws.com/<UserPoolId>`) under `CognitoIdentityProviders`,
+    /// an ARN under `SamlProviderARNs`, and any other provider name under
+    /// `SupportedLoginProviders` — which is modelled `length 0..10`, so past that a name is
+    /// declared as the OpenID Connect provider of that issuer instead.
+    pub(crate) async fn pool_with_providers(
+        &self,
+        name: &str,
+        allow_unauthenticated: bool,
+        providers: &[&str],
+    ) -> String {
+        let mut request = Map::new();
+        request.insert("IdentityPoolName".to_string(), json!(name));
+        request.insert(
+            "AllowUnauthenticatedIdentities".to_string(),
+            json!(allow_unauthenticated),
+        );
+        let mut user_pools: Vec<Value> = Vec::new();
+        let mut saml: Vec<Value> = Vec::new();
+        let mut public: Map<String, Value> = Map::new();
+        let mut oidc: Vec<Value> = Vec::new();
+        for provider in providers {
+            if provider.starts_with("cognito-idp.") {
+                user_pools.push(json!({"ProviderName": provider, "ClientId": "declaredclient"}));
+            } else if provider.starts_with("arn:") {
+                saml.push(json!(provider));
+            } else if public.len() < 10 {
+                public.insert((*provider).to_string(), json!("declared-app-id"));
+            } else {
+                oidc.push(json!(format!(
+                    "arn:aws:iam::{}:oidc-provider/{provider}",
+                    engine::emulator_account_id()
+                )));
+            }
+        }
+        if !user_pools.is_empty() {
+            request.insert("CognitoIdentityProviders".to_string(), json!(user_pools));
+        }
+        if !saml.is_empty() {
+            request.insert("SamlProviderARNs".to_string(), json!(saml));
+        }
+        if !public.is_empty() {
+            request.insert("SupportedLoginProviders".to_string(), Value::Object(public));
+        }
+        if !oidc.is_empty() {
+            request.insert("OpenIdConnectProviderARNs".to_string(), json!(oidc));
+        }
+        let created = self.ok("CreateIdentityPool", &Value::Object(request)).await;
+        created["IdentityPoolId"]
+            .as_str()
+            .expect("CreateIdentityPool returns an IdentityPoolId")
+            .to_string()
+    }
+
     /// Mint an identity with the given `Logins` map (absent when `logins` is `None`).
     pub(crate) async fn identity(&self, pool_id: &str, logins: Option<Value>) -> String {
         let mut request = Map::new();

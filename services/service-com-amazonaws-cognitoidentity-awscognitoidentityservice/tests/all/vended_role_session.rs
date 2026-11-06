@@ -560,8 +560,9 @@ async fn a_role_that_does_not_admit_this_pool_vends_nothing() {
     }
 
     // Nothing was assumed, so no assume was recorded: the failed-assume path of a real
-    // account records no assume event, successful or failed. The vend itself IS recorded —
-    // it is the call the caller made — carrying the error code it was answered with.
+    // account records no assume event, successful or failed. The vend itself is an identity
+    // data-plane call, which CloudTrail delivers no management event for either, so a
+    // refused vend leaves the log empty.
     let assumes = emulator.recorded_named("AssumeRoleWithWebIdentity");
     assert!(
         assumes.is_empty(),
@@ -569,21 +570,9 @@ async fn a_role_that_does_not_admit_this_pool_vends_nothing() {
     );
     let vends = emulator.recorded_named("GetCredentialsForIdentity");
     assert!(
-        !vends.is_empty(),
-        "every vend, refused or served, is recorded, got {vends:?}"
+        vends.is_empty(),
+        "a vend is a data event and is recorded nowhere, got {vends:?}"
     );
-    for vend in &vends {
-        assert_eq!(
-            vend.get("errorCode"),
-            Some(&json!("InvalidIdentityPoolConfigurationException")),
-            "a refused vend is recorded with the error code it answered, got {vend}"
-        );
-        assert_eq!(
-            vend.get("responseElements"),
-            Some(&Value::Null),
-            "a vend's record carries no response elements, got {vend}"
-        );
-    }
 }
 
 /// RULE, audit side: a served vend is recorded as STS's own `AssumeRoleWithWebIdentity`
@@ -715,23 +704,11 @@ async fn a_served_vend_is_audited_as_an_sts_web_identity_assume() {
         rows.len(),
         "each vend records exactly one assume, got {recorded:?}"
     );
-    // And the vend itself is recorded as this service's own call, once per vend.
+    // The vend ITSELF is an identity data-plane call, which CloudTrail delivers no
+    // management event for: only the assume it made is in the log.
     let vends = emulator.recorded_named("GetCredentialsForIdentity");
-    assert_eq!(
-        vends.len(),
-        rows.len(),
-        "each vend is recorded once as this service's own call, got {vends:?}"
+    assert!(
+        vends.is_empty(),
+        "a vend is a data event and is recorded nowhere, got {vends:?}"
     );
-    for vend in &vends {
-        assert_eq!(
-            vend.get("eventSource"),
-            Some(&json!("cognito-identity.amazonaws.com")),
-            "a vend's record names this service as its source, got {vend}"
-        );
-        assert_eq!(
-            vend.get("errorCode"),
-            None,
-            "a served vend's record carries no error code, got {vend}"
-        );
-    }
 }

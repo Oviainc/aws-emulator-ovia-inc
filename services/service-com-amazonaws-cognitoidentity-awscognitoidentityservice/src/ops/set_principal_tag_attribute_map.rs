@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetPrincipalTagAt
         };
 
         let mut store = state.lock();
-        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
             return Err(
                 SetPrincipalTagAttributeMapErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -261,6 +261,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetPrincipalTagAt
                 )
                 .into(),
             );
+        };
+
+        // A principal-tag attribute map maps the CLAIMS of a token one identity provider
+        // issued onto the session tags of the role an identity of this pool assumes, so the
+        // provider it is written for has to be one the pool's own federated-provider
+        // configuration declares ([`crate::state::IdentityPool::names_federated_provider`]).
+        // A name that configuration does not carry — the pool's own developer provider, a
+        // provider never added to it — names nothing that will ever present a token here, so
+        // the mapping is refused as the bad input parameter it is rather than stored against
+        // a provider that cannot produce the claims it maps.
+        if !pool.names_federated_provider(&input.identity_provider_name) {
+            return Err(invalid_parameter(
+                crate::state::provider_not_configured_message(&input.identity_provider_name),
+            ));
         }
 
         // The provider's whole mapping is replaced: whatever a previous call stored for

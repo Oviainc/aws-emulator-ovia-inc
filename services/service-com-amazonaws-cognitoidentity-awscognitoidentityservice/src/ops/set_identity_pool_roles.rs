@@ -108,6 +108,18 @@ const ROLES_MEMBER_PATH: &str = "roles";
 const ROLE_TYPE_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
 const ROLE_TYPE_PATTERN: &str = "^(un)?authenticated$";
 
+/// The `RoleMappingType` value whose mapping picks the role from the token's claims through
+/// RULES, and so is the one that requires a `RulesConfiguration`
+/// (`crate::ops::types::ROLE_MAPPING_TYPE_VALUES`).
+const RULES_ROLE_MAPPING_TYPE: &str = "Rules";
+
+/// How AWS words the refusal of a `Rules` mapping that carries no `RulesConfiguration` —
+/// "If you specify Rules as the role mapping type, RulesConfiguration is required"
+/// (`RoleMapping$RulesConfiguration`, this service's model). Fixed text with no request- or
+/// state-derived part: what is missing is a member of the request, which the caller already
+/// holds, so the refusal names neither the provider the mapping is keyed by nor the pool.
+const RULES_CONFIGURATION_REQUIRED_MESSAGE: &str = "RuleConfiguration is required for Rules";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -416,11 +428,13 @@ fn validated_role_mappings(
             Some(_) => {}
         }
         // `RoleMapping$RulesConfiguration`, from the model: "If you specify Rules as the
-        // role mapping type, RulesConfiguration is required."
-        if mapping.r#type == "Rules" && mapping.rules_configuration.is_none() {
-            return Err(invalid_parameter(format!(
-                "RoleMappings['{provider}'].RulesConfiguration is required when Type is 'Rules'."
-            )));
+        // role mapping type, RulesConfiguration is required." The refusal is the fixed
+        // sentence AWS words that condition with, naming neither the provider the mapping is
+        // keyed by nor the member it is missing twice over.
+        if mapping.r#type == RULES_ROLE_MAPPING_TYPE && mapping.rules_configuration.is_none() {
+            return Err(invalid_parameter(
+                RULES_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
+            ));
         }
         if let Some(configuration) = &mapping.rules_configuration {
             if configuration.rules.len() > crate::state::MAX_RULES_PER_IDENTITY_PROVIDER {

@@ -862,5 +862,7 @@ mod cloudformation_updates_lambda_functions;
 mod cloudformation_sam_http_api_definitions;
 #[path = "all/opensearch_vpc_endpoint_vpc_membership.rs"]
 mod opensearch_vpc_endpoint_vpc_membership;
+#[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
+mod cloudformation_provisions_cognito_identity_pools;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;

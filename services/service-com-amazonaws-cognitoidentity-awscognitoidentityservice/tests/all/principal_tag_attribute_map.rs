@@ -23,6 +23,22 @@ use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID};
 /// `IdentityProviderName` (len 1..128) names.
 const USER_POOL_PROVIDER: &str = "cognito-idp.us-east-1.amazonaws.com/us-east-1_abcdefghi";
 
+/// The federated providers the pools below DECLARE, which is what makes a mapping for one
+/// of them a mapping this service stores: a user pool, a public login provider and an
+/// OpenID Connect issuer, so the rows span the provider kinds a pool can be fronted by.
+const DECLARED_PROVIDERS: [&str; 3] = [
+    USER_POOL_PROVIDER,
+    "graph.facebook.com",
+    "accounts.google.com",
+];
+
+/// A pool declaring [`DECLARED_PROVIDERS`], and answering its minted `IdentityPoolId`.
+async fn declared_pool(emulator: &Emulator, name: &str, allow_unauthenticated: bool) -> String {
+    emulator
+        .pool_with_providers(name, allow_unauthenticated, &DECLARED_PROVIDERS)
+        .await
+}
+
 /// The `SetPrincipalTagAttributeMap` request for one mapping: each optional member is sent
 /// only when the row carries it, so a row with `None` exercises the member's absence.
 fn set_request(
@@ -151,7 +167,7 @@ fn mappings() -> Vec<(&'static str, Option<bool>, Option<Value>)> {
 #[tokio::test]
 async fn the_mapping_a_set_stores_is_the_mapping_a_get_reports() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-round-trip", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-round-trip", true).await;
 
     for (case, use_defaults, principal_tags) in mappings() {
         let answered = emulator
@@ -209,7 +225,7 @@ async fn the_mapping_a_set_stores_is_the_mapping_a_get_reports() {
 #[tokio::test]
 async fn a_set_replaces_the_whole_mapping() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-replace", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-replace", true).await;
 
     // Each row is applied on top of the one before it, so every row is also a case of
     // replacing a mapping that is already stored.
@@ -249,14 +265,10 @@ async fn a_set_replaces_the_whole_mapping() {
 async fn a_mapping_belongs_to_one_pool_and_provider() {
     let emulator = Emulator::new();
     let pools = [
-        emulator.pool("principal-tags-first", true).await,
-        emulator.pool("principal-tags-second", false).await,
+        declared_pool(&emulator, "principal-tags-first", true).await,
+        declared_pool(&emulator, "principal-tags-second", false).await,
     ];
-    let providers = [
-        USER_POOL_PROVIDER,
-        "graph.facebook.com",
-        "accounts.google.com",
-    ];
+    let providers = DECLARED_PROVIDERS;
 
     for (pool_index, pool_id) in pools.iter().enumerate() {
         for (provider_index, provider) in providers.iter().enumerate() {
@@ -337,10 +349,10 @@ async fn a_mapping_belongs_to_one_pool_and_provider() {
 #[tokio::test]
 async fn a_mapping_that_is_not_stored_is_not_found() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-missing", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-missing", true).await;
     // A pool whose id is well formed but was never created, and one whose mapping was set
     // and whose pool was then deleted, are the same case: nothing is stored.
-    let deleted_pool_id = emulator.pool("principal-tags-deleted", true).await;
+    let deleted_pool_id = declared_pool(&emulator, "principal-tags-deleted", true).await;
     emulator
         .ok(
             "SetPrincipalTagAttributeMap",
@@ -411,7 +423,7 @@ async fn a_mapping_that_is_not_stored_is_not_found() {
 #[tokio::test]
 async fn a_key_that_is_not_a_tag_key_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-refusals", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-refusals", true).await;
 
     // The mapping every refusal below must leave untouched.
     let stored = json!({"department": "custom:department"});
@@ -486,7 +498,7 @@ async fn a_key_that_is_not_a_tag_key_is_refused_and_changes_nothing() {
 #[tokio::test]
 async fn a_map_past_the_modelled_maximum_is_refused() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-too-many", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-too-many", true).await;
 
     let (status, body) = emulator
         .call(
@@ -523,7 +535,7 @@ async fn a_map_past_the_modelled_maximum_is_refused() {
 #[tokio::test]
 async fn the_defaults_replace_a_custom_mapping_rather_than_merging_with_it() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-defaults", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-defaults", true).await;
 
     // Each row is a custom map that must NOT survive the call asking for the defaults: one
     // mapping a tag the defaults also carry, one mapping a tag they do not, one mapping a
@@ -625,7 +637,7 @@ async fn the_defaults_replace_a_custom_mapping_rather_than_merging_with_it() {
 #[tokio::test]
 async fn a_key_outside_the_modelled_bounds_is_refused_naming_the_member_and_the_constraint() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-messages", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-messages", true).await;
 
     let cases: Vec<(&str, Value)> = vec![
         (
@@ -704,27 +716,31 @@ async fn a_key_outside_the_modelled_bounds_is_refused_naming_the_member_and_the_
 #[tokio::test]
 async fn a_pool_holds_a_bounded_number_of_provider_mappings() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-ceiling", true).await;
-
     // The ceiling this emulator keeps per pool, from
     // `crate::state::MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL`.
     let ceiling = 50;
-    for index in 0..ceiling {
+    // A mapping is stored only for a provider the pool DECLARES, so the pool declares one
+    // more provider than the ceiling admits mappings for: what refuses the last call is the
+    // ceiling and not the pool's configuration.
+    let declared: Vec<String> = (0..=ceiling)
+        .map(|index| format!("provider-{index}.example.com"))
+        .collect();
+    let names: Vec<&str> = declared.iter().map(String::as_str).collect();
+    let pool_id = emulator
+        .pool_with_providers("principal-tags-ceiling", true, &names)
+        .await;
+
+    for name in &names[..ceiling] {
         emulator
             .ok(
                 "SetPrincipalTagAttributeMap",
-                &set_request(
-                    &pool_id,
-                    &format!("provider-{index}.example.com"),
-                    None,
-                    Some(&tags(1)),
-                ),
+                &set_request(&pool_id, name, None, Some(&tags(1))),
             )
             .await;
     }
 
     // One provider past the ceiling is refused, and nothing is stored for it.
-    let past = "provider-past.example.com";
+    let past = names[ceiling];
     let (status, body) = emulator
         .call(
             "SetPrincipalTagAttributeMap",
@@ -761,12 +777,7 @@ async fn a_pool_holds_a_bounded_number_of_provider_mappings() {
         let answered = emulator
             .ok(
                 "SetPrincipalTagAttributeMap",
-                &set_request(
-                    &pool_id,
-                    "provider-0.example.com",
-                    None,
-                    Some(&replacement),
-                ),
+                &set_request(&pool_id, names[0], None, Some(&replacement)),
             )
             .await;
         assert_eq!(
@@ -776,7 +787,9 @@ async fn a_pool_holds_a_bounded_number_of_provider_mappings() {
     }
 
     // The ceiling is per POOL: another pool starts with none of its own.
-    let other_pool_id = emulator.pool("principal-tags-ceiling-other", true).await;
+    let other_pool_id = emulator
+        .pool_with_providers("principal-tags-ceiling-other", true, &[past])
+        .await;
     let answered = emulator
         .ok(
             "SetPrincipalTagAttributeMap",
@@ -797,7 +810,7 @@ async fn a_pool_holds_a_bounded_number_of_provider_mappings() {
 #[tokio::test]
 async fn an_invalid_request_is_refused_before_the_pool_is_looked_up() {
     let emulator = Emulator::new();
-    let stored_pool_id = emulator.pool("principal-tags-ordering", true).await;
+    let stored_pool_id = declared_pool(&emulator, "principal-tags-ordering", true).await;
 
     for (case, principal_tags) in [
         ("a key past the modelled maximum", json!({repeated('k', 129): "custom:a"})),
@@ -855,7 +868,7 @@ async fn an_invalid_request_is_refused_before_the_pool_is_looked_up() {
 #[tokio::test]
 async fn reading_a_mapping_changes_nothing() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("principal-tags-reads", true).await;
+    let pool_id = declared_pool(&emulator, "principal-tags-reads", true).await;
     let principal_tags = json!({"tenant": "custom:tenant", "clientID": "aud"});
     emulator
         .ok(

@@ -7,9 +7,9 @@
 //! session of the pool's resolved role, so the assume is recorded in the account's
 //! management-event history as STS's own `AssumeRoleWithWebIdentity` event — naming the
 //! role it assumed, the pool it was assumed for and the identity it was assumed on behalf
-//! of — and the vend itself is recorded as this service's own `GetCredentialsForIdentity`
-//! event. A vend the role's trust policy does NOT admit assumes nothing, so it records the
-//! refused vend and no assume at all.
+//! of. The vend ITSELF is one of the identity data-plane calls, which CloudTrail delivers no
+//! management event for, so it is in the history nowhere. A vend the role's trust policy does
+//! NOT admit assumes nothing, so it records no assume at all either.
 //!
 //! RULE, the control-plane leg: a Cognito Identity control-plane call is a management
 //! event of that service, so `cloudtrail:LookupEvents` reports it under the operation's
@@ -481,20 +481,13 @@ fn a_vended_session_and_its_assume_are_auditable() {
                 );
             }
 
-            // Both vends are auditable as this service's own call, and the refused one
-            // carries the error code its caller was answered with. "The most recent event
-            // is listed first" (`LookupEvents`), so the refused vend is the first row.
+            // Neither vend is in the management-event history: a vend is an identity
+            // data-plane call, and CloudTrail delivers no management event for one — only the
+            // assume it made is there.
             let vends = lookup(&router, &runtime, "EventName", "GetCredentialsForIdentity");
-            assert_eq!(vends.len(), 2, "both vends are recorded, got {vends:?}");
-            let codes: Vec<Option<&str>> = vends
-                .iter()
-                .map(|event| event.get("errorCode").and_then(Value::as_str))
-                .collect();
-            assert_eq!(
-                codes,
-                vec![Some("InvalidIdentityPoolConfigurationException"), None],
-                "the refused vend is recorded with its own error code and the served one \
-                 without any, got {vends:?}"
+            assert!(
+                vends.is_empty(),
+                "a vend is a data event and reaches no management-event record, got {vends:?}"
             );
 
             // And no secret of the session reaches the log.

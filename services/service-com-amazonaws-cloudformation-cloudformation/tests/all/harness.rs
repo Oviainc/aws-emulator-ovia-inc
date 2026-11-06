@@ -88,6 +88,14 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // Amazon Cognito Identity, for the `AWS::Cognito::IdentityPool` and the
+    // `AWS::Cognito::IdentityPoolRoleAttachment` a stack really creates there, so a suite
+    // that deploys one reads the pool and its roles back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_cognitoidentity_awscognitoidentityservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 

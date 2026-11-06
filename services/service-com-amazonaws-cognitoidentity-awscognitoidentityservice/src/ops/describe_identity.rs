@@ -219,7 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DescribeIdentity<
         let Some(identity) = store.identities.get(&input.identity_id) else {
             return Err(DescribeIdentityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                    message: Some(crate::state::identity_not_found_message(
+                        &input.identity_id,
+                    )),
                 },
             )
             .into());

@@ -216,6 +216,35 @@ impl IdentityPool {
             .any(|arn| arn == provider_name)
     }
 
+    /// Whether this pool's FEDERATED-PROVIDER configuration declares `provider_name`: an
+    /// identity provider that can authenticate a user of this pool and present a login for
+    /// it.
+    ///
+    /// Four stored members hold such a provider, and every one of them is one a `Logins`
+    /// entry can be keyed by: `SupportedLoginProviders`, "the supported login providers"
+    /// keyed by provider name; `CognitoIdentityProviders`, each naming an Amazon Cognito
+    /// user pool; `SamlProviderARNs` and `OpenIdConnectProviderARNs`, each naming the
+    /// provider by the ARN of its IAM registration — whose issuer is the name a login of it
+    /// is made under, so either spelling resolves ([`oidc_provider_arn_issuer`]).
+    ///
+    /// The pool's own `DeveloperProviderName` is NOT one of them: a developer provider is
+    /// this account's own back end rather than a federated provider, and it issues no token
+    /// a provider's claims could be read from.
+    pub fn names_federated_provider(&self, provider_name: &str) -> bool {
+        self.supported_login_providers
+            .iter()
+            .flatten()
+            .any(|(named, _)| named == provider_name)
+            || self.names_cognito_identity_provider(provider_name)
+            || self.names_open_id_connect_provider(provider_name)
+            || self.names_saml_provider(provider_name)
+            || self
+                .open_id_connect_provider_arns
+                .iter()
+                .flatten()
+                .any(|arn| arn == provider_name)
+    }
+
     /// Whether `logins` carries at least one entry made in the name of a PUBLIC provider —
     /// any provider that is not this pool's own developer one.
     pub fn logins_name_a_public_provider(&self, logins: &HashMap<String, String>) -> bool {
@@ -664,6 +693,17 @@ pub fn developer_user_not_found_message(developer_user_identifier: &str) -> Stri
     format!("User '{developer_user_identifier}' not found.")
 }
 
+/// How AWS reports an IDENTITY this service holds no record of — the resource a request
+/// naming an `IdentityId` addresses.
+///
+/// The one part taken from the request is the id it named, which the caller sent itself, so
+/// the refusal discloses nothing the caller did not already hold; the rest is fixed text,
+/// naming neither the identity pool the call addressed nor anything else of this account's
+/// state. Shared, so every operation that reports an identity missing words it alike.
+pub fn identity_not_found_message(identity_id: &str) -> String {
+    format!("Identity '{identity_id}' not found.")
+}
+
 /// How AWS words the refusal of a call that names an identity the caller has not proven it
 /// may act for: one already linked to a login, reached with no login of it at all.
 ///
@@ -672,6 +712,15 @@ pub fn developer_user_not_found_message(developer_user_identifier: &str) -> Stri
 /// every operation that decides access to an identity answers alike.
 pub fn forbidden_identity_message(identity_id: &str) -> String {
     format!("Access to Identity '{identity_id}' is forbidden.")
+}
+
+/// How AWS words the refusal of a request naming an identity provider the identity pool's
+/// own federated-provider configuration does not declare.
+///
+/// The one part taken from the request is the provider name it carried, which the caller
+/// sent itself; the rest is fixed text, naming none of the providers the pool really holds.
+pub fn provider_not_configured_message(identity_provider_name: &str) -> String {
+    format!("Provider {identity_provider_name} not configured for Identity Pool")
 }
 
 /// How AWS words the refusal of a `Logins` map that names no PUBLIC provider at all — one
@@ -804,6 +853,18 @@ pub const DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE: &str = "You do not have access
 /// `InvalidParameterException` — the only client-input error the tagging operations model
 /// for a quota of the resource.
 pub const MAX_TAGS_PER_IDENTITY_POOL: usize = 50;
+
+/// How AWS words the refusal of a tag write that would take a pool past that ceiling: it
+/// names the ceiling ([`MAX_TAGS_PER_IDENTITY_POOL`], the published limit) and says that the
+/// RESULTING tag set is what breaks it, which is what makes re-assigning keys the pool
+/// already holds admissible however many the call carries.
+///
+/// Its one variable part is the limit itself; it names neither the pool the call addressed
+/// nor how many tags that pool would have ended up with, so nothing of this account's state
+/// is in it.
+pub fn too_many_user_tags_message() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS_PER_IDENTITY_POOL} user tags.")
+}
 
 /// The tag-key prefix AWS reserves for its own tags. AWS's tagging rules state that the
 /// `aws:` prefix is reserved for AWS use and that a user cannot create, edit or delete a
@@ -3016,63 +3077,9 @@ pub const STS_EVENT_SOURCE: &str = "sts.amazonaws.com";
 pub const EVENT_SOURCE: &str = "cognito-identity.amazonaws.com";
 
 /// What a vend reports about itself for its own audit record.
-pub struct ServedVend<'a> {
-    /// The identity the vend was asked for.
-    pub identity_id: &'a str,
-    /// The `Logins` provider NAMES the request presented. The tokens they carry are the
-    /// caller's secrets and are never recorded.
-    pub providers: &'a [String],
-    /// The `CustomRoleArn` the request named, if any.
-    pub custom_role_arn: Option<&'a str>,
-}
-
-/// The CloudFormation-style type name of the resource a vend's audit record refers to.
+/// The CloudFormation-style type name of the resource an audit record of this service refers
+/// to.
 const IDENTITY_POOL_RESOURCE_TYPE_NAME: &str = "AWS::Cognito::IdentityPool";
-
-/// Record the vend itself in the account's management-event log, whatever it answered, so
-/// CloudTrail's `LookupEvents` reports the call — with the error code and message its
-/// caller was answered with when it was refused.
-///
-/// No secret is written: the provider TOKENS the request carried and the session the
-/// response carried are both left out, which is why the record carries no
-/// `responseElements` at all.
-///
-/// The caller of this operation presents no credential — "This is a public API. You do not
-/// need any credentials to call this API" (this operation's own doc) — so the record of an
-/// unsigned vend names no access key and no principal this emulator could resolve, which
-/// is what [`record_served_call`] reads off the request itself.
-pub fn record_vend<Eng: Send + Sync + 'static, T, E>(
-    engine: &Eng,
-    parts: &http::request::Parts,
-    vend: &ServedVend<'_>,
-    outcome: &Result<T, E>,
-) where
-    E: ::smithy_server_runtime::OperationError + ::std::fmt::Display,
-{
-    let providers = (!vend.providers.is_empty()).then(|| vend.providers.to_vec());
-    record_served_call(
-        engine,
-        parts,
-        &ServedCall {
-            operation: "GetCredentialsForIdentity",
-            // The Region the call was served in is the identity's own, which its
-            // `REGION:GUID` id carries: the request names none, being unsigned.
-            region: region_of(vend.identity_id),
-            // A vend mints and stores a session, so it is not a reporting call.
-            read_only: false,
-            // The resource the call acted on is the pool the identity belongs to,
-            // whatever the call answered.
-            identity_pool_id: identity_pool_of(engine, vend.identity_id),
-            request_parameters: ::service_common::management_events::recorded_members([
-                ("identityId", ::serde_json::json!(vend.identity_id)),
-                ("logins", ::serde_json::json!(providers)),
-                ("customRoleArn", ::serde_json::json!(vend.custom_role_arn)),
-            ]),
-            response_elements: None,
-        },
-        outcome,
-    );
-}
 
 /// What a handler of this service reports about the call it has just served, for that
 /// call's own audit record.
@@ -3101,10 +3108,18 @@ pub struct ServedCall<'a> {
 /// answered, so CloudTrail's `LookupEvents` reports it — with the error code and message
 /// its caller was answered with when it was refused.
 ///
-/// EVERY call is recorded, a reporting one included, because the log is the account's
-/// record of the API calls that were MADE and not a projection of this service's
-/// resources: what a reporting call reports is untouched by its own record, and a client
-/// auditing identity-pool administration reads the reads as well as the writes (an
+/// What is recorded is this service's ADMINISTRATION of identity pools: the calls a client
+/// makes with AWS developer credentials. The IDENTITY DATA PLANE — the operations the model
+/// marks `@optionalAuth` (`GetId`, `GetOpenIdToken`, `GetCredentialsForIdentity`,
+/// `UnlinkIdentity`), served to an end user holding no AWS credential at all — is not: those
+/// calls are data events, and CloudTrail delivers no management event for one, so their
+/// handlers call nothing here. The `sts:AssumeRoleWithWebIdentity` a served vend makes IS a
+/// management event of STS and is recorded as that ([`record_vended_assume`]).
+///
+/// Of the calls that ARE recorded, every one is, a reporting one included, because the log
+/// is the account's record of the API calls that were MADE and not a projection of this
+/// service's resources: what a reporting call reports is untouched by its own record, and a
+/// client auditing identity-pool administration reads the reads as well as the writes (an
 /// event's `readOnly` is what tells the two apart, and what a lookup filters on).
 ///
 /// Recording is best-effort by design, as every other recorder in this tree: an engine

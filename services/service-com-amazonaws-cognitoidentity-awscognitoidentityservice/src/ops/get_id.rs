@@ -169,49 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The call AWS audits is this one, whatever it answers: the record is written from
-        // the outcome, so a refused call is recorded with the error code its caller was
-        // answered with. The caller of this operation presents no credential ("You do not
-        // need to use Amazon Web Services credentials to call this API", this operation's
-        // own doc), so the record names no principal this emulator could resolve.
-        let request_parameters = ::service_common::management_events::recorded_members([
-            ("accountId", ::serde_json::json!(input.account_id)),
-            (
-                "identityPoolId",
-                ::serde_json::json!(input.identity_pool_id),
-            ),
-            (
-                "logins",
-                ::serde_json::json!(crate::state::recorded_login_providers(
-                    input.logins.as_ref()
-                )),
-            ),
-        ]);
-        // Being unsigned, the request names no Region: the pool's own id carries the one
-        // the call is served in.
-        let region = crate::state::region_of(&input.identity_pool_id).to_string();
-        let identity_pool_id = Some(input.identity_pool_id.clone());
-        let outcome = self.mint(input, ctx).await;
-        crate::state::record_served_call(
-            &*self.engine,
-            ctx.parts(),
-            &crate::state::ServedCall {
-                operation: Self::NAME,
-                region: &region,
-                // `GetId` mints and stores an identity, so it is not a reporting call.
-                read_only: false,
-                identity_pool_id,
-                request_parameters,
-                response_elements: outcome.as_ref().ok().map(|output| {
-                    ::service_common::management_events::recorded_members([(
-                        "identityId",
-                        ::serde_json::json!(output.identity_id),
-                    )])
-                }),
-            },
-            &outcome,
-        );
-        outcome
+        // This call writes NO management event
+        // ([`crate::state::record_served_call`]): it is one of the identity data-plane
+        // operations, which CloudTrail does not deliver management events for.
+        self.mint(input, ctx).await
     }
 }
 

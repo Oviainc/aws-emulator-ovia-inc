@@ -230,23 +230,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The call AWS audits is this one, whatever it answers: the record is written from
-        // the outcome, so a refused vend is recorded with the error code its caller was
-        // answered with. The assume the served vend makes is STS's own event and is
-        // recorded where it happens.
-        let outcome = self.vend(&input, ctx).await;
-        let providers = crate::state::recorded_login_providers(input.logins.as_ref());
-        crate::state::record_vend(
-            &*self.engine,
-            ctx.parts(),
-            &crate::state::ServedVend {
-                identity_id: &input.identity_id,
-                providers: providers.as_deref().unwrap_or_default(),
-                custom_role_arn: input.custom_role_arn.as_deref(),
-            },
-            &outcome,
-        );
-        outcome
+        // This call writes NO management event of this service
+        // ([`crate::state::record_served_call`]): it is one of the identity data-plane
+        // operations, which CloudTrail does not deliver management events for. The assume
+        // the served vend makes IS a management event — STS's own — and is recorded where it
+        // happens.
+        self.vend(&input, ctx).await
     }
 }
 
@@ -290,7 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             let Some(identity) = store.identities.get(&input.identity_id) else {
                 return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                        message: Some(crate::state::identity_not_found_message(
+                            &input.identity_id,
+                        )),
                     },
                 )
                 .into());

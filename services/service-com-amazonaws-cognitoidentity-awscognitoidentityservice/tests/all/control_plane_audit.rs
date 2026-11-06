@@ -3,14 +3,17 @@
 //! What the account's management-event log holds after a call to this service: the audit
 //! leg of every operation, which is what `cloudtrail:LookupEvents` serves back.
 //!
-//! RULE: every call this service SERVES is recorded once in the account's
-//! management-event log — the one store in the shared engine CloudTrail reads — carrying
+//! RULE: every ADMINISTRATIVE call this service serves — one made with AWS developer
+//! credentials — is recorded once in the account's management-event log, the one store in
+//! the shared engine CloudTrail reads, carrying
 //! `eventSource` `cognito-identity.amazonaws.com`, the operation's own `eventName`, the
 //! Region the call was served in, `readOnly` saying whether the call only reported state,
 //! `requestParameters` echoing the members the request carried, and, for a refused call,
 //! the error code and message its caller was answered with. A `Logins` token and a minted
 //! OpenID token are secrets (`IdentityProviderToken` and `OIDCToken` are `@sensitive`) and
-//! reach no record.
+//! reach no record. The identity DATA PLANE — the `@optionalAuth` operations an end user
+//! holding no AWS credential calls — is recorded nowhere, which its own suite
+//! (`identity_data_events`) asserts.
 //!
 //! Each case asserts that rule over a TABLE spanning the class, its rows differing along
 //! what the rule generalises over: which operation was called, whether it reports or
@@ -107,7 +110,10 @@ async fn served(
     (status, body, event)
 }
 
-/// Create a pool and answer its id, with the members the audited suite needs.
+/// Create a pool and answer its id, with the members the audited suite needs: the developer
+/// provider the developer-identity operations name, and the public login provider the
+/// principal-tag mapping is written for — a mapping is stored only for a provider the pool
+/// declares.
 async fn audited_pool(emulator: &Emulator, name: &str) -> String {
     emulator
         .ok(
@@ -116,6 +122,7 @@ async fn audited_pool(emulator: &Emulator, name: &str) -> String {
                 "IdentityPoolName": name,
                 "AllowUnauthenticatedIdentities": true,
                 "DeveloperProviderName": DEVELOPER_PROVIDER,
+                "SupportedLoginProviders": {LOGIN_PROVIDER: "audited-app-id"},
             }),
         )
         .await["IdentityPoolId"]
@@ -131,10 +138,6 @@ async fn every_served_call_is_recorded_with_its_name_source_and_parameters() {
     let emulator = Emulator::new();
     let pool_id = audited_pool(&emulator, "audited-pool").await;
     let doomed_pool_id = audited_pool(&emulator, "audited-doomed-pool").await;
-    let identity_id = emulator.identity(&pool_id, None).await;
-    let federated_id = emulator
-        .identity(&pool_id, Some(json!({LOGIN_PROVIDER: LOGIN_TOKEN})))
-        .await;
     let developer_identity = emulator
         .ok(
             "GetOpenIdTokenForDeveloperIdentity",
@@ -186,6 +189,10 @@ async fn every_served_call_is_recorded_with_its_name_source_and_parameters() {
                 "IdentityPoolName": "audited-renamed",
                 "AllowUnauthenticatedIdentities": true,
                 "DeveloperProviderName": DEVELOPER_PROVIDER,
+                // An update REPLACES the pool's configuration, and a row below writes this
+                // provider's principal-tag mapping — which is served only for a provider the
+                // pool declares — so the update restates it.
+                "SupportedLoginProviders": {LOGIN_PROVIDER: "audited-app-id"},
             }),
             false,
             vec![
@@ -296,13 +303,6 @@ async fn every_served_call_is_recorded_with_its_name_source_and_parameters() {
             ],
         ),
         (
-            "a minted identity",
-            "GetId",
-            json!({"IdentityPoolId": &pool_id}),
-            false,
-            vec![("identityPoolId", json!(&pool_id))],
-        ),
-        (
             "a developer token",
             "GetOpenIdTokenForDeveloperIdentity",
             json!({
@@ -316,28 +316,6 @@ async fn every_served_call_is_recorded_with_its_name_source_and_parameters() {
                 // The provider NAMES only: a `Logins` value is a secret by the model.
                 ("logins", json!([DEVELOPER_PROVIDER])),
                 ("tokenDuration", json!(600)),
-            ],
-        ),
-        (
-            "an open-id token",
-            "GetOpenIdToken",
-            json!({"IdentityId": &identity_id}),
-            false,
-            vec![("identityId", json!(&identity_id))],
-        ),
-        (
-            "an unlink of a federated login",
-            "UnlinkIdentity",
-            json!({
-                "IdentityId": &federated_id,
-                "Logins": {LOGIN_PROVIDER: LOGIN_TOKEN},
-                "LoginsToRemove": [LOGIN_PROVIDER],
-            }),
-            false,
-            vec![
-                ("identityId", json!(&federated_id)),
-                ("logins", json!([LOGIN_PROVIDER])),
-                ("loginsToRemove", json!([LOGIN_PROVIDER])),
             ],
         ),
         (
@@ -456,13 +434,6 @@ async fn a_refused_call_is_recorded_with_the_code_its_caller_was_answered_with()
         (
             "a role read of a pool nothing created",
             "GetIdentityPoolRoles",
-            json!({"IdentityPoolId": ABSENT_POOL_ID}),
-            400,
-            "ResourceNotFoundException",
-        ),
-        (
-            "an identity in a pool nothing created",
-            "GetId",
             json!({"IdentityPoolId": ABSENT_POOL_ID}),
             400,
             "ResourceNotFoundException",

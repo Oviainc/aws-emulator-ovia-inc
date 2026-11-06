@@ -274,14 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> LookupDeveloperId
 
         // An identity the request names must be one of THIS pool's: an identity belongs
         // to the pool that minted it and never moves, so a request reaching an identity
-        // of another pool is refused as one the caller may not reach here, while an
-        // identity no pool holds is simply not stored.
+        // of another pool is refused as one the caller may not resolve a developer identity
+        // for — the one fixed sentence every refusal of this operation about an identity it
+        // may not resolve carries — while an identity no pool holds is simply not stored.
         if let Some(identity_id) = &input.identity_id {
             let Some(identity) = store.identities.get(identity_id) else {
                 return Err(
                     LookupDeveloperIdentityErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!("Identity '{identity_id}' not found.")),
+                            message: Some(crate::state::identity_not_found_message(identity_id)),
                         },
                     )
                     .into(),
@@ -291,7 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> LookupDeveloperId
                 return Err(
                     LookupDeveloperIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
-                            message: Some(crate::state::forbidden_identity_message(identity_id)),
+                            message: Some(
+                                crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),

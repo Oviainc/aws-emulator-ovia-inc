@@ -1,0 +1,3339 @@
+// SPDX-License-Identifier: CC0-1.0
+
+use super::*;
+
+/// What `Ref` returns for a resource of this type, and what `Fn::GetAtt` reads off it.
+///
+/// Source: the "Return values" section the AWS CloudFormation resource and property type
+/// reference publishes for each type — `Ref` returns the topic ARN for
+/// `AWS::SNS::Topic`, the queue URL for `AWS::SQS::Queue`, the bucket name for
+/// `AWS::S3::Bucket`, and so on, with `Fn::GetAtt` reading the listed attributes. A type
+/// this catalogue does not carry gets its physical NAME as its physical resource id,
+/// which is what the majority of types return, and no attributes: `Fn::GetAtt` against it
+/// yields no value rather than a guessed one.
+///
+/// An attribute whose documented return value is a LIST (an
+/// `As2ServiceManagedEgressIpAddresses`, say) is not carried either: the attribute map is
+/// string-valued, and reporting one element of a list as the whole of it would be worse
+/// than reporting no value.
+///
+/// The whole declared resource is in scope, not just its type and name, because a few
+/// published return values are functions of the resource's own properties — a DB
+/// endpoint's port is the one the template declared, or the declared engine's default —
+/// and those properties are evaluated through the template's intrinsics, which is what the
+/// `scope` and the `budget` are for.
+pub(super) fn return_values(
+    declared: &DeclaredResource,
+    name: &str,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> (String, BTreeMap<String, String>) {
+    let region = scope.stack.region;
+    let resource_type = declared.resource_type.as_str();
+    let properties = &declared.properties;
+    let mut attributes = BTreeMap::new();
+    match resource_type {
+        // "Ref returns the report group name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in CodeBuild itself, which then answers with the
+        // report group's own ARN — the same ARN this computes, since both are built from
+        // the one account id this emulator mints and the group's name, which is how
+        // CodeBuild keys a report group (`report_group_arn` in its own state module).
+        CODEBUILD_REPORT_GROUP => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    CODEBUILD_ARN_NAMESPACE,
+                    region,
+                    &format!("report-group/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName. This is the type
+        // `super::provisioning` creates in Amazon SNS itself, which then answers with the
+        // topic's own ARN — the same ARN this computes, since both are built from the one
+        // account id this emulator mints and the topic's name, which is how SNS keys a
+        // topic (`topic_arn` in its own state module).
+        SNS_TOPIC => {
+            let arn = ::emulator_server::emulator_arn("sns", region, name);
+            attributes.insert("TopicArn".to_string(), arn.clone());
+            attributes.insert("TopicName".to_string(), name.to_string());
+            (arn, attributes)
+        }
+        // "Ref returns the queue URL"; Fn::GetAtt: Arn, QueueName, QueueUrl. This is the
+        // type `super::provisioning` creates in Amazon SQS itself, which then reports the
+        // queue's own url back over the `QueueUrl` attribute — the same url this computes,
+        // since both are built from the one account id and the queue's name.
+        SQS_QUEUE => {
+            let url = format!(
+                "https://sqs.{region}.{URL_SUFFIX}/{}/{name}",
+                ::emulator_server::emulator_account_id()
+            );
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("sqs", region, name),
+            );
+            attributes.insert("QueueName".to_string(), name.to_string());
+            attributes.insert("QueueUrl".to_string(), url.clone());
+            (url, attributes)
+        }
+        // "Ref returns the ARN of the activity"; Fn::GetAtt: Arn, Name. This is the type
+        // `super::provisioning` creates in AWS Step Functions itself, which then answers
+        // with the activity's own ARN — the same ARN this computes, since both are built
+        // from the one account id this emulator mints and the activity's name, which is how
+        // Step Functions keys an activity (`activity_arn` in its own state module). The ARN
+        // namespace is that model's `arnNamespace`, `states`, not its CloudFormation name.
+        STEP_FUNCTIONS_ACTIVITY => {
+            let arn = ::emulator_server::emulator_arn(
+                STEP_FUNCTIONS_ARN_NAMESPACE,
+                region,
+                &format!("activity:{name}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Name".to_string(), name.to_string());
+            (arn, attributes)
+        }
+        // "Ref returns the user pool ID"; Fn::GetAtt: Arn
+        // ("arn:aws:cognito-idp:us-east-1:123412341234:userpool/us-east-1_123412341"),
+        // ProviderName ("The provider name of the Amazon Cognito user pool") and
+        // ProviderURL ("The URL of the provider of the Amazon Cognito user pool"). The
+        // provider name is the pool's endpoint host and its identity
+        // (`cognito-idp.<region>.amazonaws.com/<user pool id>`) — the name an identity
+        // pool's `CognitoIdentityProviders`, a principal-tag mapping's
+        // `IdentityProviderName` and a `Logins` entry all name the pool by — and the
+        // provider URL is that same host and identity as an `https` URL, which is the
+        // issuer an OpenID relying party reads. Both are built from the resource's OWN
+        // identity, so whatever a `Ref` to the pool answers, the provider the pool
+        // publishes names that same pool; making that identity the id the owning service
+        // mints is the business of the open issue on service-assigned physical ids
+        // (`20261023T114649Z-cloudformation-outputs-carry-no-outputvalue-failed-resources-never`).
+        // "Ref returns the Amazon Resource Name (ARN) of the domain"; Fn::GetAtt: Arn,
+        // Name, Owner. This is the type `super::provisioning` creates in CodeArtifact
+        // itself, which then answers with the domain's own ARN and owning account — the same
+        // values this computes, since both are built from the one account id this emulator
+        // mints and the domain's name, which is how CodeArtifact keys a domain (`domain_arn`
+        // in that service's own state module).
+        CODEARTIFACT_DOMAIN => {
+            let arn = ::emulator_server::emulator_arn(
+                CODEARTIFACT_ARN_NAMESPACE,
+                region,
+                &format!("domain/{name}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Name".to_string(), name.to_string());
+            attributes.insert(
+                "Owner".to_string(),
+                ::emulator_server::emulator_account_id().to_string(),
+            );
+            (arn, attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the repository"; Fn::GetAtt: Arn,
+        // DomainOwner, Name. A repository ARN NESTS inside the domain that holds it
+        // (`repository/<domain>/<name>`), so it is built on the domain the declaration's
+        // `DomainName` names — a declaration that names none leaves the repository with
+        // CloudFormation's own generated identity rather than an ARN built on a domain
+        // nothing named, exactly as an index of no vector bucket does.
+        CODEARTIFACT_REPOSITORY => {
+            let domain = properties
+                .get("DomainName")
+                .and_then(|value| text(value, scope, 0, budget));
+            attributes.insert(
+                "DomainOwner".to_string(),
+                ::emulator_server::emulator_account_id().to_string(),
+            );
+            attributes.insert("Name".to_string(), name.to_string());
+            match domain {
+                Some(domain) => {
+                    let arn = ::emulator_server::emulator_arn(
+                        CODEARTIFACT_ARN_NAMESPACE,
+                        region,
+                        &format!("repository/{domain}/{name}"),
+                    );
+                    attributes.insert("Arn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
+        COGNITO_USER_POOL => {
+            let host = format!("{COGNITO_IDP_ARN_NAMESPACE}.{region}.{URL_SUFFIX}");
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    COGNITO_IDP_ARN_NAMESPACE,
+                    region,
+                    &format!("userpool/{name}"),
+                ),
+            );
+            attributes.insert("ProviderName".to_string(), format!("{host}/{name}"));
+            attributes.insert("ProviderURL".to_string(), format!("https://{host}/{name}"));
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName,
+        // DualStackDomainName, RegionalDomainName, WebsiteURL — each one a DNS name S3
+        // serves the bucket under, in the form that type's "Return values" section
+        // publishes an example of: `DomainName`
+        // "mystack-mybucket-kdwwxmddtr2g.s3.amazonaws.com" (the IPv4 DNS name),
+        // `DualStackDomainName`
+        // "mystack-mybucket-kdwwxmddtr2g.s3.dualstack.us-east-2.amazonaws.com" (the IPv6
+        // one), `RegionalDomainName`
+        // "mystack-mybucket-kdwwxmddtr2g.s3.us-east-2.amazonaws.com" and `WebsiteURL`
+        // "http://mystack-mybucket-kdwwxmddtr2g.s3-website-us-east-2.amazonaws.com" (the
+        // bucket's website endpoint). An Amazon S3 bucket ARN carries neither a region nor
+        // an account id (`arn:aws:s3:::<bucket>`).
+        S3_BUCKET => {
+            attributes.insert("Arn".to_string(), format!("arn:{PARTITION}:s3:::{name}"));
+            attributes.insert("DomainName".to_string(), format!("{name}.s3.{URL_SUFFIX}"));
+            attributes.insert(
+                "DualStackDomainName".to_string(),
+                format!("{name}.s3.dualstack.{region}.{URL_SUFFIX}"),
+            );
+            attributes.insert(
+                "RegionalDomainName".to_string(),
+                format!("{name}.s3.{region}.{URL_SUFFIX}"),
+            );
+            attributes.insert(
+                "WebsiteURL".to_string(),
+                format!("http://{name}.s3-website-{region}.{URL_SUFFIX}"),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the vector bucket ARN": this type's primary identifier is its
+        // `VectorBucketArn`, which is also its one published `Fn::GetAtt` attribute. It is
+        // the type `super::provisioning` creates in Amazon S3 Vectors itself, which then
+        // answers with the bucket's own ARN — the same ARN this computes, since both are
+        // built from the one account id this emulator mints and the bucket's name, which is
+        // how S3 Vectors keys a vector bucket (`bucket_arn` in that service's own state
+        // module).
+        S3VECTORS_VECTOR_BUCKET => {
+            let arn = ::emulator_server::emulator_arn(
+                S3VECTORS_ARN_NAMESPACE,
+                region,
+                &format!("{S3VECTORS_BUCKET_SEGMENT}{name}"),
+            );
+            attributes.insert("VectorBucketArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the vector index ARN", and an index ARN NESTS inside the ARN of the
+        // vector bucket that holds it (`bucket/<bucket>/index/<name>`), so it is resolved
+        // once that bucket's identity is known ([`resolve_dependent_identities`]). The
+        // declaration names the bucket the two ways S3 Vectors' own API addresses one — by
+        // name or by ARN ([`declared_vector_bucket`]) — and one that names neither leaves
+        // the index with CloudFormation's own generated identity rather than an ARN built
+        // on a bucket nothing named.
+        S3VECTORS_INDEX => {
+            let bucket = declared_vector_bucket(properties, scope, budget);
+            match bucket {
+                Some(bucket) => {
+                    let arn = ::emulator_server::emulator_arn(
+                        S3VECTORS_ARN_NAMESPACE,
+                        region,
+                        &format!("{S3VECTORS_BUCKET_SEGMENT}{bucket}/index/{name}"),
+                    );
+                    attributes.insert("IndexArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
+        // "Ref returns the distribution ID"; Fn::GetAtt: DomainName, Id. CloudFront
+        // ASSIGNS both — the type has no name property for a template to set — so a
+        // declaration reports identifiers of CLOUDFRONT's forms rather than
+        // CloudFormation's `<stack>-<logical id>-<unique id>` name (the case
+        // AWS::Transfer::Server and AWS::RUM::AppMonitor are in): an id is
+        // [`cloudfront_assigned_id`] and the domain name
+        // [`cloudfront_distribution_domain_name`].
+        CLOUDFRONT_DISTRIBUTION => {
+            let id = cloudfront_assigned_id(CLOUDFRONT_DISTRIBUTION_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "DomainName".to_string(),
+                cloudfront_distribution_domain_name(name),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the origin access control's unique identifier"; Fn::GetAtt: Id.
+        // Service-assigned in the same form a distribution id takes.
+        CLOUDFRONT_ORIGIN_ACCESS_CONTROL => {
+            let id = cloudfront_assigned_id(CLOUDFRONT_ORIGIN_ACCESS_CONTROL_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the CloudFront origin access identity"; Fn::GetAtt: Id,
+        // S3CanonicalUserId. The id is service-assigned in the form
+        // `CloudFrontOriginAccessIdentity$Id` documents ("for example, E74FTE3AJFJ256A"),
+        // and the canonical user id is the one S3 knows the identity by, in the
+        // [`S3_CANONICAL_USER_ID_HEX_CHARS`] lowercase hex characters S3 writes one in.
+        CLOUDFRONT_ORIGIN_ACCESS_IDENTITY => {
+            let id = cloudfront_assigned_id(CLOUDFRONT_ORIGIN_ACCESS_IDENTITY_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "S3CanonicalUserId".to_string(),
+                derived_digits(
+                    CLOUDFRONT_S3_CANONICAL_USER_ID_SALT,
+                    name,
+                    S3_CANONICAL_USER_ID_HEX_CHARS,
+                    Alphabet::Lower,
+                ),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the cache policy's unique identifier"; Fn::GetAtt: Id,
+        // LastModifiedTime. CloudFront identifies each of its three policy kinds by a
+        // UUID it mints, so that is what `Ref` and `Id` report. `LastModifiedTime` is NOT
+        // carried: it is the instant the policy was last changed, which this module has no
+        // value for, and an invented timestamp would be worse than no value.
+        CLOUDFRONT_CACHE_POLICY | CLOUDFRONT_ORIGIN_REQUEST_POLICY
+        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the RestApi ID"; Fn::GetAtt: RestApiId, RootResourceId. API Gateway
+        // ASSIGNS both ids — a template names the API but not its identifier — in the form
+        // [`api_gateway_assigned_id`] describes, and the root resource is a resource of the
+        // API, so it carries an id of its own rather than the API's.
+        APIGATEWAY_REST_API => {
+            let id = api_gateway_assigned_id(APIGATEWAY_REST_API_ID_SALT, name);
+            attributes.insert("RestApiId".to_string(), id.clone());
+            attributes.insert(
+                "RootResourceId".to_string(),
+                api_gateway_assigned_id(APIGATEWAY_ROOT_RESOURCE_ID_SALT, name),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the resource ID"; Fn::GetAtt: ResourceId.
+        APIGATEWAY_RESOURCE => {
+            let id = api_gateway_assigned_id(APIGATEWAY_RESOURCE_ID_SALT, name);
+            attributes.insert("ResourceId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the deployment ID"; Fn::GetAtt: DeploymentId.
+        APIGATEWAY_DEPLOYMENT => {
+            let id = api_gateway_assigned_id(APIGATEWAY_DEPLOYMENT_ID_SALT, name);
+            attributes.insert("DeploymentId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the API ID"; Fn::GetAtt: ApiEndpoint ("The default endpoint for an
+        // API"). API Gateway v2 ASSIGNS the id — a template names the api but not its
+        // identifier — so the id is of the form [`api_gateway_assigned_id`] describes and
+        // the endpoint is the `{api-id}.execute-api.{region}.amazonaws.com` host
+        // `Api$ApiEndpoint` documents, under the scheme the declared `ProtocolType`
+        // speaks. Both are REPLACED by the ones that service really minted once the
+        // resource is created there ([`super::provisioner`]), which is what
+        // [`identity_is_service_assigned`] names this type for.
+        APIGATEWAYV2_API => {
+            let id = api_gateway_assigned_id(APIGATEWAYV2_API_ID_SALT, name);
+            attributes.insert(
+                "ApiEndpoint".to_string(),
+                apigatewayv2_api_endpoint(&id, region, properties, scope, budget),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the API mapping ID"; Fn::GetAtt: ApiMappingId. The same
+        // service-assigned shape, replaced by the id `CreateApiMapping` mints.
+        APIGATEWAYV2_API_MAPPING => {
+            let id = api_gateway_assigned_id(APIGATEWAYV2_API_MAPPING_ID_SALT, name);
+            attributes.insert("ApiMappingId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the domain name"; Fn::GetAtt: DomainNameArn, RegionalDomainName,
+        // RegionalHostedZoneId. The physical id is the domain name the template states
+        // (the type's own identifier, read through [`declared_name_property`]); the ARN is
+        // the one API Gateway names a custom domain by (its own REST path,
+        // `/domainnames/{name}`, under the `apigateway` ARN namespace that service's model
+        // declares), and the regional domain name is the
+        // `d-{id}.execute-api.{region}.amazonaws.com` host a caller aliases their DNS
+        // record to. `RegionalHostedZoneId` is NOT carried: it names a Route 53 zone this
+        // emulator neither owns nor can look up, and an invented zone id is one a caller
+        // could put in a real alias record.
+        APIGATEWAYV2_DOMAIN_NAME => {
+            attributes.insert(
+                "DomainNameArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    APIGATEWAYV2_ARN_NAMESPACE,
+                    region,
+                    &format!("/domainnames/{name}"),
+                ),
+            );
+            attributes.insert(
+                "RegionalDomainName".to_string(),
+                apigatewayv2_regional_domain_name(name, region),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the table name"; Fn::GetAtt: Arn.
+        "AWS::DynamoDB::Table" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("dynamodb", region, &format!("table/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the function name"; Fn::GetAtt: Arn.
+        "AWS::Lambda::Function" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("lambda", region, &format!("function:{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the log group name"; Fn::GetAtt: Arn. A CloudWatch Logs log-group
+        // ARN ends in `:*` ("such as
+        // arn:aws:logs:us-east-1:123456789012:log-group:/mystack-testgroup-12ABC1AB12A1:*").
+        "AWS::Logs::LogGroup" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "logs",
+                    region,
+                    &format!("log-group:{name}:*"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the server"; Fn::GetAtt: Arn,
+        // ServerId ("the service-assigned ID of the server that is created") and the
+        // list-valued As2ServiceManagedEgressIpAddresses, which is not carried. The
+        // template names no server — AWS::Transfer::Server has no name property — so the
+        // id is the service-assigned `s-` + 17 hexadecimal form.
+        TRANSFER_SERVER => {
+            let server_id = generated_service_id("s", name, TRANSFER_ID_HEX_DIGITS);
+            let arn =
+                ::emulator_server::emulator_arn("transfer", region, &format!("server/{server_id}"));
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("ServerId".to_string(), server_id);
+            (arn, attributes)
+        }
+        // The same shape one type along: "Ref returns the Amazon Resource Name (ARN)";
+        // Fn::GetAtt: Arn, WorkflowId. Transfer's `WorkflowId` is `w-` + 17 characters of
+        // `[a-z0-9]` (model pattern `^w-([a-z0-9]{17})$`), which hexadecimal satisfies.
+        "AWS::Transfer::Workflow" => {
+            let workflow_id = generated_service_id("w", name, TRANSFER_ID_HEX_DIGITS);
+            let arn = ::emulator_server::emulator_arn(
+                "transfer",
+                region,
+                &format!("workflow/{workflow_id}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("WorkflowId".to_string(), workflow_id);
+            (arn, attributes)
+        }
+        // "Ref returns the AWS::IAM::AccessKey resource's access key ID"; Fn::GetAtt:
+        // SecretAccessKey — "the secret access key for the specified AWS::IAM::AccessKey
+        // resource". IAM MINTS both: `CreateAccessKey` takes no identifier and answers the
+        // key id and the secret it generated, and the secret "is returned only in response
+        // to CreateAccessKey", so neither is a value these naming rules can compute. The
+        // identifier a declaration reports until that create answers is the name
+        // CloudFormation generated for the resource ([`identity_is_service_assigned`] names
+        // the type, so [`super::provisioning::reconcile`] adopts the minted id over it), and
+        // the secret is a stand-in that same walk re-points at what IAM answered — never an
+        // invented credential.
+        IAM_ACCESS_KEY => {
+            attributes.insert(
+                "SecretAccessKey".to_string(),
+                service_assigned_document(name, "SecretAccessKey"),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the role name"; Fn::GetAtt: Arn. IAM is a global service, so its
+        // ARNs carry no region.
+        "AWS::IAM::Role" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("iam", "", &format!("role/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the rule name"; Fn::GetAtt: Arn. An EventBridge rule ARN names the
+        // bus the rule is bound to unless that is the account's `default` bus
+        // (`arn:aws:events:<region>:<account>:rule/[<bus>/]<name>`), which is the form the
+        // `events` service mints for the rule this stack provisions.
+        EVENTS_RULE => {
+            let bus = properties
+                .get("EventBusName")
+                .and_then(|value| text(value, scope, 0, budget))
+                .map(|bus| event_bus_name(&bus))
+                .filter(|bus| !bus.is_empty() && bus != DEFAULT_EVENT_BUS)
+                .map(|bus| format!("{bus}/"))
+                .unwrap_or_default();
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("events", region, &format!("rule/{bus}{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the name of the parameter"; Fn::GetAtt: Type, Value — the two
+        // required properties of the declaration, which is what the parameter Systems
+        // Manager holds carries.
+        SSM_PARAMETER => {
+            for attribute in ["Type", "Value"] {
+                if let Some(declared) = properties
+                    .get(attribute)
+                    .and_then(|value| text(value, scope, 0, budget))
+                {
+                    attributes.insert(attribute.to_string(), declared);
+                }
+            }
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the schedule group name"; Fn::GetAtt: Arn (and the group's State,
+        // CreationDate and LastModificationDate, which are EventBridge Scheduler's own to
+        // decide and are not computed here). This is the type `super::provisioning`
+        // creates in that service, which keys a group by its name and mints the same ARN
+        // from the Region and that name (`schedule_group_arn` in its own state module).
+        SCHEDULER_SCHEDULE_GROUP => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    SCHEDULER_ARN_NAMESPACE,
+                    region,
+                    &format!("schedule-group/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the schedule name"; Fn::GetAtt: Arn. A schedule ARN nests the
+        // schedule inside the GROUP that holds it (`schedule/<group>/<name>`), and a
+        // declaration naming no group is in the account's `default` group — the same ARN
+        // EventBridge Scheduler mints for the schedule this stack provisions
+        // (`schedule_arn` in its own state module).
+        SCHEDULER_SCHEDULE => {
+            let group = properties
+                .get("GroupName")
+                .and_then(|value| text(value, scope, 0, budget))
+                .filter(|group| !group.is_empty())
+                .unwrap_or_else(|| DEFAULT_SCHEDULE_GROUP.to_string());
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    SCHEDULER_ARN_NAMESPACE,
+                    region,
+                    &format!("schedule/{group}/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the repository name"; Fn::GetAtt: Arn. Amazon ECR Public is a
+        // partition-wide service, so the ARN carries no region — the same form the
+        // `ecr-public` service mints for the repository this stack provisions, which is
+        // what lets the two be compared.
+        ECR_PUBLIC_REPOSITORY => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("ecr-public", "", &format!("repository/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the delivery stream name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in Amazon Data Firehose itself, which then
+        // reports the stream's own ARN back over this attribute.
+        FIREHOSE_DELIVERY_STREAM => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "firehose",
+                    region,
+                    &format!("deliverystream/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the stream name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in Amazon Kinesis Data Streams itself, which then
+        // reports the stream's own ARN back over this attribute — the same ARN this
+        // computes, since both are built from the one account id this emulator mints and
+        // the stream's name, which is how that service keys a stream (`stream_arn` in its
+        // own state module).
+        KINESIS_STREAM => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("kinesis", region, &format!("stream/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the repository name"; Fn::GetAtt: Arn, RepositoryUri. The URI is
+        // the registry host of the account and Region plus the repository's name
+        // ("The format is `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`"),
+        // which is what a container image reference built from this stack's output pulls
+        // from — and exactly what Amazon ECR's own `CreateRepository` answers.
+        ECR_REPOSITORY => {
+            // "A repository name must start with a letter and can only contain lowercase
+            // letters, numbers, hyphens, underscores, and forward slashes"
+            // (`RepositoryName`'s pattern is lower case only), which is the character set
+            // [`naming_rules`] already holds a GENERATED name to; a name the template
+            // declared is reported exactly as it wrote it.
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("ecr", region, &format!("repository/{name}")),
+            );
+            attributes.insert(
+                "RepositoryUri".to_string(),
+                format!(
+                    "{}.dkr.ecr.{region}.{URL_SUFFIX}/{name}",
+                    ::emulator_server::emulator_account_id()
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the cluster name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in Amazon ECS itself, so the cluster a stack's
+        // output names is one `ecs ListTasks` finds.
+        ECS_CLUSTER => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("ecs", region, &format!("cluster/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the name of the cluster"; Fn::GetAtt: Arn, CertificateAuthorityData,
+        // ClusterSecurityGroupId, EncryptionConfigKeyArn, Endpoint, OpenIdConnectIssuerUrl.
+        // This is the type `super::provisioning` creates in Amazon EKS itself, so the
+        // cluster a stack's output names is one `eks describe-cluster` finds — and every
+        // attribute but the ARN is a value only that service can produce (the API server's
+        // endpoint, the cluster CA, the OIDC issuer, the security group it made for the
+        // control plane), so each stands in until the create reports what EKS really
+        // answered.
+        EKS_CLUSTER => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(EKS_ARN_NAMESPACE, region, &format!("cluster/{name}")),
+            );
+            for attribute in [
+                "CertificateAuthorityData",
+                "ClusterSecurityGroupId",
+                "EncryptionConfigKeyArn",
+                "Endpoint",
+                "OpenIdConnectIssuerUrl",
+            ] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the association ARN"; Fn::GetAtt: AssociationArn, AssociationId.
+        // Amazon EKS ASSIGNS both — `CreatePodIdentityAssociation` takes the cluster, the
+        // namespace, the service account and the role and answers the association it minted
+        // — so a declaration reports a stand-in until `super::provisioning` has created the
+        // association and reported the ARN and the id that service really assigned.
+        EKS_POD_IDENTITY_ASSOCIATION => {
+            let arn = ::emulator_server::emulator_arn(
+                EKS_ARN_NAMESPACE,
+                region,
+                &format!("podidentityassociation/{name}"),
+            );
+            attributes.insert("AssociationArn".to_string(), arn.clone());
+            attributes.insert(
+                "AssociationId".to_string(),
+                service_assigned_document(name, "AssociationId"),
+            );
+            (arn, attributes)
+        }
+        // "Ref returns the compute environment ARN"; Fn::GetAtt: ComputeEnvironmentArn.
+        // This is the type `super::provisioning` creates in AWS Batch itself, so the
+        // environment a stack's output names is one `batch describe-compute-environments`
+        // finds — under the same ARN that service mints from the Region and the name
+        // (`compute_environment_arn` in its own state module).
+        BATCH_COMPUTE_ENVIRONMENT => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("compute-environment/{name}"),
+            );
+            attributes.insert("ComputeEnvironmentArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the job queue ARN"; Fn::GetAtt: JobQueueArn. The same shape one
+        // type along, on the ARN AWS Batch mints for a queue (`job_queue_arn`).
+        BATCH_JOB_QUEUE => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("job-queue/{name}"),
+            );
+            attributes.insert("JobQueueArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // And one more: "Ref returns the service environment ARN"; Fn::GetAtt:
+        // ServiceEnvironmentArn (`service_environment_arn`).
+        BATCH_SERVICE_ENVIRONMENT => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("service-environment/{name}"),
+            );
+            attributes.insert("ServiceEnvironmentArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the task definition";
+        // Fn::GetAtt: TaskDefinitionArn.
+        //
+        // A task definition is identified by its FAMILY and a revision, not by a name
+        // property ("the family and revision (family:revision)"), so the family is the
+        // declared `Family` — evaluated through the template's intrinsics, as every
+        // declared name is — and the revision is the FIRST one, which is the revision the
+        // registration a stack declaring a family makes carries. A later registration of
+        // the same family is numbered by Amazon ECS, and nothing here re-reads that
+        // number.
+        ECS_TASK_DEFINITION => {
+            let family = properties
+                .get("Family")
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_else(|| name.to_string());
+            let arn = ::emulator_server::emulator_arn(
+                "ecs",
+                region,
+                &format!("task-definition/{family}:{FIRST_TASK_DEFINITION_REVISION}"),
+            );
+            attributes.insert("TaskDefinitionArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the ARN of the load balancer"; Fn::GetAtt: DNSName,
+        // LoadBalancerFullName, LoadBalancerName (CanonicalHostedZoneID is a value AWS
+        // allocated per Region — nothing computes it — and SecurityGroups is list-valued,
+        // so neither is carried).
+        //
+        // Both the ARN and the DNS name carry an id Elastic Load Balancing ASSIGNS
+        // (`.../loadbalancer/app/<name>/<id>`, `<name>-<id>.<region>.elb.amazonaws.com`,
+        // prefixed `internal-` for an internal scheme), in the same 16-character form that
+        // service mints, and the ARN's type segment is the one its own ARNs carry: `app`
+        // for an Application Load Balancer, `net` for a Network one, `gwy` for a Gateway
+        // one.
+        ELB_LOAD_BALANCER => {
+            let id = service_assigned_label(ELB_LOAD_BALANCER_ID_SALT, name, ELB_ID_HEX_DIGITS);
+            let type_code = load_balancer_type_code(properties, scope, budget);
+            let path = format!("{type_code}/{name}/{id}");
+            let internal = properties
+                .get("Scheme")
+                .and_then(|value| text(value, scope, 0, budget))
+                .as_deref()
+                == Some(ELB_SCHEME_INTERNAL);
+            let prefix = if internal { "internal-" } else { "" };
+            attributes.insert(
+                "DNSName".to_string(),
+                format!("{prefix}{name}-{id}.{region}.elb.{URL_SUFFIX}"),
+            );
+            attributes.insert("LoadBalancerFullName".to_string(), path.clone());
+            attributes.insert("LoadBalancerName".to_string(), name.to_string());
+            (
+                ::emulator_server::emulator_arn(
+                    "elasticloadbalancing",
+                    region,
+                    &format!("loadbalancer/{path}"),
+                ),
+                attributes,
+            )
+        }
+        // "Ref returns the ARN of the target group"; Fn::GetAtt: TargetGroupArn,
+        // TargetGroupFullName, TargetGroupName (LoadBalancerArns is list-valued, so it is
+        // not carried). The full name is the ARN's own resource path,
+        // `targetgroup/<name>/<id>`, with the same service-assigned id form.
+        ELB_TARGET_GROUP => {
+            let id = service_assigned_label(ELB_TARGET_GROUP_ID_SALT, name, ELB_ID_HEX_DIGITS);
+            let path = format!("targetgroup/{name}/{id}");
+            let arn =
+                ::emulator_server::emulator_arn("elasticloadbalancing", region, &path);
+            attributes.insert("TargetGroupArn".to_string(), arn.clone());
+            attributes.insert("TargetGroupFullName".to_string(), path);
+            attributes.insert("TargetGroupName".to_string(), name.to_string());
+            (arn, attributes)
+        }
+        // "Ref returns the DBClusterIdentifier"; Fn::GetAtt: DBClusterArn,
+        // DBClusterResourceId, Endpoint.Address, Endpoint.Port, ReadEndpoint.Address
+        // (MasterUserSecret.SecretArn is left out: it names a secret only RDS's own
+        // managed-password integration creates, which this emulator does not have). The
+        // endpoints are the published Aurora forms, `<identifier>.cluster-<label>` and
+        // `<identifier>.cluster-ro-<label>` under the regional RDS suffix.
+        "AWS::RDS::DBCluster" => {
+            let label = service_assigned_label(
+                RDS_ENDPOINT_LABEL_SALT,
+                name,
+                RDS_ENDPOINT_LABEL_HEX_DIGITS,
+            );
+            attributes.insert(
+                "DBClusterArn".to_string(),
+                ::emulator_server::emulator_arn("rds", region, &format!("cluster:{name}")),
+            );
+            attributes.insert(
+                "DBClusterResourceId".to_string(),
+                generated_upper_resource_id("cluster", name, RDS_RESOURCE_ID_DIGITS),
+            );
+            attributes.insert(
+                "Endpoint.Address".to_string(),
+                format!("{name}.cluster-{label}.{region}.rds.{URL_SUFFIX}"),
+            );
+            if let Some(port) = database_port(properties, scope, budget) {
+                attributes.insert("Endpoint.Port".to_string(), port);
+            }
+            attributes.insert(
+                "ReadEndpoint.Address".to_string(),
+                format!("{name}.cluster-ro-{label}.{region}.rds.{URL_SUFFIX}"),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the DBInstanceIdentifier"; Fn::GetAtt: DBInstanceArn, DbiResourceId,
+        // Endpoint.Address, Endpoint.Port (Endpoint.HostedZoneId is a value AWS allocated
+        // per Region — nothing computes it — so it is left out rather than invented).
+        "AWS::RDS::DBInstance" => {
+            let label = service_assigned_label(
+                RDS_ENDPOINT_LABEL_SALT,
+                name,
+                RDS_ENDPOINT_LABEL_HEX_DIGITS,
+            );
+            attributes.insert(
+                "DBInstanceArn".to_string(),
+                ::emulator_server::emulator_arn("rds", region, &format!("db:{name}")),
+            );
+            attributes.insert(
+                "DbiResourceId".to_string(),
+                generated_upper_resource_id("db", name, RDS_RESOURCE_ID_DIGITS),
+            );
+            attributes.insert(
+                "Endpoint.Address".to_string(),
+                format!("{name}.{label}.{region}.rds.{URL_SUFFIX}"),
+            );
+            if let Some(port) = database_port(properties, scope, budget) {
+                attributes.insert("Endpoint.Port".to_string(), port);
+            }
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the ARN of the secret"; Fn::GetAtt: Id, which is that same ARN. A
+        // Secrets Manager secret ARN ends in a service-assigned six-character suffix
+        // (`arn:aws:secretsmanager:<region>:<account>:secret:<name>-<suffix>`), so the
+        // resource id is of THAT form rather than the name.
+        "AWS::SecretsManager::Secret" => {
+            let suffix =
+                service_assigned_label(SECRET_ARN_SUFFIX_SALT, name, SECRET_ARN_SUFFIX_CHARACTERS);
+            let arn = ::emulator_server::emulator_arn(
+                "secretsmanager",
+                region,
+                &format!("secret:{name}-{suffix}"),
+            );
+            attributes.insert("Id".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // The Amazon EC2 VPC-network types ([`EC2_VPC`] and its siblings), each of which
+        // publishes "Ref returns the ID of …" and one `Fn::GetAtt` attribute that IS that
+        // id: a VPC's `VpcId`, a subnet's `SubnetId`, a security group's `GroupId`, an
+        // internet gateway's `InternetGatewayId`, and the plain `Id` the types that publish
+        // no narrower name carry. The id is the `<prefix>-` + 17 hexadecimal form Amazon
+        // EC2 assigns, never the name CloudFormation computed, because EC2 takes no name on
+        // any of these creates ([`ec2_network_identity`]).
+        EC2_VPC => {
+            let id = ec2_network_identity("vpc", "VpcId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_SUBNET => {
+            let id = ec2_network_identity("subnet", "SubnetId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_SECURITY_GROUP => {
+            let id = ec2_network_identity("sg", "GroupId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_INTERNET_GATEWAY => {
+            let id = ec2_network_identity("igw", "InternetGatewayId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_ROUTE_TABLE => {
+            let id = ec2_network_identity("rtb", "RouteTableId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_NAT_GATEWAY => {
+            let id = ec2_network_identity("nat", "NatGatewayId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_DHCP_OPTIONS => {
+            let id = ec2_network_identity("dopt", "DhcpOptionsId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_VPN_GATEWAY => {
+            let id = ec2_network_identity("vgw", "VPNGatewayId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_NETWORK_ACL => {
+            let id = ec2_network_identity("acl", "Id", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_NETWORK_INTERFACE => {
+            let id = ec2_network_identity("eni", "Id", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_VPC_ENDPOINT => {
+            let id = ec2_network_identity("vpce", "Id", name, &mut attributes);
+            (id, attributes)
+        }
+        // An Amazon EBS volume, whose identity Amazon EC2 assigns the same way: "Ref returns
+        // the volume ID", and the type's one `Fn::GetAtt` attribute IS that id.
+        EC2_VOLUME => {
+            let id = ec2_network_identity("vol", "VolumeId", name, &mut attributes);
+            (id, attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN)"; Fn::GetAtt: Name. A service ARN
+        // carries the CLUSTER that hosts it (`service/<cluster>/<name>`), which the
+        // declaration names by short name or by cluster ARN and which defaults to the
+        // `default` cluster — so the cluster is resolved once the resource the declaration
+        // names has an identity ([`resolve_dependent_identities`]). The `Arn`/`ServiceArn`
+        // the convention adds is that same ARN, since it is the service's physical id.
+        ECS_SERVICE => {
+            let cluster = properties
+                .get("Cluster")
+                .and_then(|value| text(value, scope, 0, budget))
+                .map(|reference| ecs_cluster_name(&reference))
+                .unwrap_or_else(|| ECS_DEFAULT_CLUSTER.to_string());
+            attributes.insert("Name".to_string(), name.to_string());
+            (
+                ::emulator_server::emulator_arn(
+                    "ecs",
+                    region,
+                    &format!("service/{cluster}/{name}"),
+                ),
+                attributes,
+            )
+        }
+        // "Ref returns the ARN of the listener"; Fn::GetAtt: ListenerArn. A listener's ARN
+        // nests inside the ARN of the load balancer its declaration names
+        // (`listener/<type>/<lb>/<lb id>/<listener id>`), so it is resolved once that load
+        // balancer's identity is known ([`resolve_dependent_identities`]); a declaration
+        // naming none leaves the listener with CloudFormation's own generated identity
+        // rather than an ARN built on a value that is not one.
+        ELB_LISTENER => {
+            let listener_arn = properties
+                .get("LoadBalancerArn")
+                .and_then(|value| text(value, scope, 0, budget))
+                .and_then(|parent| {
+                    nested_elb_arn(
+                        &parent,
+                        ELB_LOAD_BALANCER_SEGMENT,
+                        ELB_LISTENER_SEGMENT,
+                        &service_assigned_label(ELB_LISTENER_ID_SALT, name, ELB_ID_HEX_DIGITS),
+                    )
+                });
+            match listener_arn {
+                Some(arn) => {
+                    attributes.insert("ListenerArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
+        // "Ref returns the rule ARN"; Fn::GetAtt: IsDefault, RuleArn. A rule's ARN nests
+        // inside its listener's the same way. `IsDefault` is false for a rule a template
+        // declares: a listener's default rule is created WITH the listener (it is that
+        // listener's `DefaultActions`), never as a resource of its own.
+        ELB_LISTENER_RULE => {
+            let rule_arn = properties
+                .get("ListenerArn")
+                .and_then(|value| text(value, scope, 0, budget))
+                .and_then(|parent| {
+                    nested_elb_arn(
+                        &parent,
+                        ELB_LISTENER_SEGMENT,
+                        ELB_LISTENER_RULE_SEGMENT,
+                        &service_assigned_label(
+                            ELB_LISTENER_RULE_ID_SALT,
+                            name,
+                            ELB_ID_HEX_DIGITS,
+                        ),
+                    )
+                });
+            attributes.insert("IsDefault".to_string(), false.to_string());
+            match rule_arn {
+                Some(arn) => {
+                    attributes.insert("RuleArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
+        // The Amazon Bedrock AgentCore types. Source for each one's identifiers: the
+        // AgentCore control-plane model, whose `arnReference` traits name these very
+        // resource types — `MemoryArn` references `AWS::BedrockAgentCore::Memory`,
+        // `GatewayArn` `AWS::BedrockAgentCore::Gateway`, `AgentRuntimeArn`
+        // `AWS::BedrockAgentCore::Runtime`, `WorkloadIdentityArnType`
+        // `AWS::BedrockAgentCore::WorkloadIdentity`, and `CodeInterpreterArn` /
+        // `BrowserArn` the two sandbox types — and whose create responses publish
+        // the members a CloudFormation resource of that type returns. `Ref` returns the
+        // resource's own identifier (the type's primary identifier) and `Fn::GetAtt` reads
+        // the identifier and the ARN, each in the form the model's pattern fixes; the
+        // members those responses carry that describe a resource's RUNNING state (a
+        // status, a timestamp, a failure reason, a gateway's URL) are not carried, because
+        // nothing here provisioned a resource to be in a state.
+        //
+        // "Ref returns the memory id"; Fn::GetAtt: MemoryId, MemoryArn.
+        "AWS::BedrockAgentCore::Memory" => {
+            let id = generated_service_id(
+                &agentcore_label(name, memory_label_char, false, 'm'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("memory/{id}"),
+            );
+            attributes.insert("MemoryId".to_string(), id.clone());
+            attributes.insert("MemoryArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the agent runtime id"; Fn::GetAtt: AgentRuntimeId,
+        // AgentRuntimeArn, AgentRuntimeVersion. A create answers version `1`
+        // (`AgentRuntimeVersion` is `^([1-9][0-9]{0,4})$`, and the first version of a
+        // runtime is its first), which is a value of the declared resource rather than of
+        // its running state.
+        "AWS::BedrockAgentCore::Runtime" => {
+            let id = generated_service_id(
+                &agentcore_label(name, runtime_label_char, false, 'r'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("runtime/{id}"),
+            );
+            attributes.insert("AgentRuntimeId".to_string(), id.clone());
+            attributes.insert("AgentRuntimeArn".to_string(), arn);
+            attributes.insert(
+                "AgentRuntimeVersion".to_string(),
+                FIRST_AGENTCORE_RUNTIME_VERSION.to_string(),
+            );
+            (id, attributes)
+        }
+        // The two SANDBOX types, the same shape one resource along. `CodeInterpreterId`
+        // and `BrowserId` are `^[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10}$` — the agent
+        // runtime's label alphabet exactly, hence `runtime_label_char` — and their ARN
+        // patterns admit `code-interpreter(-custom)?` / `browser(-custom)?`: the bare
+        // segment is the service's built-in `aws.codeinterpreter.v1` /
+        // `aws.browser.v1` sandbox, so a sandbox a template declares is a
+        // customer-created one and carries the `-custom` segment.
+        //
+        // "Ref returns the code interpreter id"; Fn::GetAtt: CodeInterpreterId,
+        // CodeInterpreterArn.
+        "AWS::BedrockAgentCore::CodeInterpreter" => {
+            let id = generated_service_id(
+                &agentcore_label(name, runtime_label_char, false, 'c'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("code-interpreter-custom/{id}"),
+            );
+            attributes.insert("CodeInterpreterId".to_string(), id.clone());
+            attributes.insert("CodeInterpreterArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the browser id"; Fn::GetAtt: BrowserId, BrowserArn.
+        "AWS::BedrockAgentCore::Browser" => {
+            let id = generated_service_id(
+                &agentcore_label(name, runtime_label_char, false, 'b'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("browser-custom/{id}"),
+            );
+            attributes.insert("BrowserId".to_string(), id.clone());
+            attributes.insert("BrowserArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the gateway id"; Fn::GetAtt: GatewayId, GatewayArn. A gateway
+        // identifier is lower case only (`GatewayId`: `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$`).
+        "AWS::BedrockAgentCore::Gateway" => {
+            let id = generated_service_id(
+                &agentcore_label(name, gateway_label_char, true, 'g'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("gateway/{id}"),
+            );
+            attributes.insert("GatewayId".to_string(), id.clone());
+            attributes.insert("GatewayArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the name"; Fn::GetAtt: Name, WorkloadIdentityArn. A workload
+        // identity is named, not id'd: `CreateWorkloadIdentity` takes a `name`
+        // (`^[A-Za-z0-9_.-]+$`) and answers that name plus the ARN, whose shape the model
+        // leaves unpatterned, so it is built in this service's own ARN form.
+        "AWS::BedrockAgentCore::WorkloadIdentity" => {
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("workload-identity-directory/default/workload-identity/{name}"),
+            );
+            attributes.insert("Name".to_string(), name.to_string());
+            attributes.insert("WorkloadIdentityArn".to_string(), arn);
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the app monitor name"; Fn::GetAtt: Id ("The unique ID of the new
+        // app monitor"). CloudWatch RUM ASSIGNS that id — the template cannot name it —
+        // and its form is fixed by RUM's own Smithy model: `AppMonitorId` is
+        // `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`,
+        // `length 36..36`, so the resource reports an identifier of THAT form rather than
+        // CloudFormation's `<stack>-<logical id>-<unique id>` name (the same case
+        // AWS::Transfer::Server is in above).
+        "AWS::RUM::AppMonitor" => {
+            attributes.insert("Id".to_string(), generated_uuid("rum/appmonitor", name));
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the alarm name"; Fn::GetAtt: Arn. A CloudWatch alarm's ARN spells
+        // its resource with a COLON
+        // (`arn:aws:cloudwatch:<region>:<account>:alarm:<alarm name>`), which is why the
+        // type is catalogued rather than left to the uniform `<type>/<name>` convention.
+        "AWS::CloudWatch::Alarm" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("cloudwatch", region, &format!("alarm:{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the name of the metric stream"; Fn::GetAtt: Arn, CreationDate,
+        // LastUpdateDate, State. Only the ARN is a function of the resource's identity (a
+        // metric stream's ARN spells its resource `metric-stream/<name>`, which is what
+        // CloudWatch's own `PutMetricStream` answers); the other three are values the
+        // OWNING service decides when it creates the stream — two instants of its clock and
+        // the state its lifecycle is in — so they are reported only where that service
+        // reports them (`super::provisioner` records what the create answered) rather than
+        // minted here.
+        CLOUDWATCH_METRIC_STREAM => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "cloudwatch",
+                    region,
+                    &format!("metric-stream/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the experiment template ID"; Fn::GetAtt: Id. FIS ASSIGNS that id —
+        // the type has no name property for a template to set — so a declaration reports an
+        // identifier of FIS's own shape (its `EXT` prefix and its 12-character suffix, each
+        // character one FIS's own minting admits) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name (the case AWS::Transfer::Server and
+        // AWS::RUM::AppMonitor are in). The characters here are uppercase hexadecimal, a
+        // subset of the base-36 alphabet FIS mints from: a stand-in, since this is also the
+        // type `super::provisioning` creates in FIS itself, which reports the id IT minted
+        // back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a resource FIS created.
+        FIS_EXPERIMENT_TEMPLATE => {
+            let id = format!(
+                "{FIS_TEMPLATE_ID_PREFIX}{}",
+                derived_digits(
+                    FIS_TEMPLATE_ID_PREFIX,
+                    name,
+                    FIS_TEMPLATE_ID_DIGITS,
+                    Alphabet::Upper,
+                )
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the detector's id"; Fn::GetAtt: Id. GuardDuty ASSIGNS that id —
+        // `CreateDetector` takes no identifier of any kind — so a declaration reports an
+        // identifier of GuardDuty's own shape (32 lowercase hexadecimal characters) rather
+        // than CloudFormation's `<stack>-<logical id>-<unique id>` name. This is also the
+        // type `super::provisioning` creates in GuardDuty itself, which reports the id IT
+        // minted back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a detector GuardDuty created.
+        GUARDDUTY_DETECTOR => {
+            let id = derived_digits(
+                DETECTOR_ID_SALT,
+                name,
+                DETECTOR_ID_HEX_DIGITS,
+                Alphabet::Lower,
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the IPSet's id"; Fn::GetAtt: Id. GuardDuty ASSIGNS that id —
+        // `CreateIPSet` takes the list's name, format and location and answers with the
+        // `ipSetId` it minted — so a declaration reports an identifier of GuardDuty's own
+        // shape (32 lowercase hexadecimal characters, as a detector id is) rather than
+        // CloudFormation's `<stack>-<logical id>-<unique id>` name, which no GuardDuty call
+        // would accept as an `IpSetId`. This is also the type `super::provisioning` creates
+        // in GuardDuty itself, which reports the id IT minted back over the `Id` attribute
+        // — and THAT id, not this one, is what the stack reports for a list GuardDuty
+        // created.
+        GUARDDUTY_IP_SET => {
+            let id = derived_digits(IP_SET_ID_SALT, name, DETECTOR_ID_HEX_DIGITS, Alphabet::Lower);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the hosted zone ID"; Fn::GetAtt: Id, NameServers. Route 53 ASSIGNS
+        // that id — `CreateHostedZone` takes no identifier, and the zone's `Name` is only
+        // the DNS name it answers for — so a declaration reports an identifier of Route 53's
+        // own shape rather than the name, which no operation of that service would accept as
+        // a zone id. `NameServers` is a LIST, so no attribute carries it. This is also the
+        // type `super::provisioning` creates in Route 53 itself, which reports the id IT
+        // minted back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a zone Route 53 created.
+        ROUTE53_HOSTED_ZONE => {
+            let id = format!(
+                "{HOSTED_ZONE_ID_PREFIX}{}",
+                derived_digits(
+                    HOSTED_ZONE_ID_SALT,
+                    name,
+                    HOSTED_ZONE_ID_DIGITS,
+                    Alphabet::Upper,
+                )
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the health check ID"; Fn::GetAtt: HealthCheckId. Route 53 ASSIGNS
+        // that id — `CreateHealthCheck` takes no identifier, and the type declares no name
+        // at all — so a declaration reports an identifier of Route 53's own shape (the
+        // 8-4-4-4-12 lowercase hex a health check id takes) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name, which no operation of that service would
+        // accept as a health check id. This is also the type `super::provisioning` creates
+        // in Route 53 itself, which reports the id IT minted back over the `HealthCheckId`
+        // attribute — and THAT id, not this one, is what the stack reports for a health
+        // check Route 53 created.
+        ROUTE53_HEALTH_CHECK => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("HealthCheckId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the key ID"; Fn::GetAtt: Arn, KeyId. KMS ASSIGNS that id —
+        // `CreateKey` takes no identifier — so a declaration reports an identifier of KMS's
+        // own shape (a version-4 UUID) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name, with the key ARN built from it the way
+        // KMS builds one (`key/<key id>`). This is also the type `super::provisioning`
+        // creates in KMS itself, which reports the id IT minted and the ARN it built back
+        // over these attributes — and THOSE, not the ones computed here, are what the stack
+        // reports for a key KMS created.
+        KMS_KEY => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(KMS_ARN_NAMESPACE, region, &format!("key/{id}")),
+            );
+            attributes.insert("KeyId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the ARN of the cluster" for both kinds of Amazon MSK cluster, and
+        // that ARN is the type's one published `Fn::GetAtt` attribute too. Amazon MSK
+        // MINTS it: its resource path is `cluster/<name>/<id>`, where the id is the
+        // service's own, so what is computed here is an ARN of that published shape with a
+        // stand-in id derived from the resource's name. These are also the types
+        // `super::provisioning` creates in Amazon MSK itself, which reports the ARN IT
+        // minted back as the resource's identity — and THAT ARN, not this one, is what the
+        // stack reports for a cluster MSK created.
+        MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => {
+            let arn = ::emulator_server::emulator_arn(
+                MSK_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "cluster/{name}/{}-{MSK_CLUSTER_ARN_ORDINAL}",
+                    generated_uuid(resource_type, name)
+                ),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the Amazon MQ broker ID"; Fn::GetAtt: Arn ("the broker's ARN").
+        // Amazon MQ MINTS that id — `CreateBroker` takes a broker NAME and answers with the
+        // `brokerId` it generated — so a declaration reports an identifier of Amazon MQ's
+        // own shape (`b-` followed by 128 bits in the 8-4-4-4-12 grouping its broker ids
+        // carry) rather than CloudFormation's `<stack>-<logical id>-<unique id>` name, with
+        // the broker ARN built from it the way Amazon MQ builds one
+        // (`broker:<name>:<broker id>`). This is also the type `super::provisioning` creates
+        // in Amazon MQ itself, which reports the id IT minted and the ARN it built back as
+        // the resource's identity — and THOSE, not the ones computed here, are what the
+        // stack reports for a broker Amazon MQ created, which is what
+        // [`identity_is_service_assigned`] names this type for.
+        MQ_BROKER => {
+            let id = format!("{MQ_BROKER_ID_PREFIX}{}", generated_uuid(resource_type, name));
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    MQ_ARN_NAMESPACE,
+                    region,
+                    &format!("broker:{name}:{id}"),
+                ),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the backup vault name"; Fn::GetAtt: BackupVaultArn, BackupVaultName.
+        // This is the type `super::provisioning` creates in AWS Backup itself, which then
+        // answers with the vault's own ARN — the same ARN this computes, since both are
+        // built from the one account id this emulator mints and the vault's name, which is
+        // how AWS Backup keys a vault (`backup_vault_arn` in that service's own state
+        // module). (A plan and a selection of the same namespace carry no arm here: each
+        // one's identifier and ARN are MINTED by AWS Backup, so there is nothing for these
+        // naming rules to compute — see [`identity_is_service_assigned`].)
+        BACKUP_VAULT => {
+            attributes.insert(
+                "BackupVaultArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    BACKUP_ARN_NAMESPACE,
+                    region,
+                    &format!("backup-vault:{name}"),
+                ),
+            );
+            attributes.insert("BackupVaultName".to_string(), name.to_string());
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the private CA"; Fn::GetAtt: Arn,
+        // CertificateSigningRequest. Both are Amazon Web Services Private CA's OWN: it
+        // mints the ARN (`identity_is_service_assigned` names the type) and it builds the
+        // certification request from the key it generated, so neither is a value these
+        // naming rules can compute — each is a stand-in
+        // ([`super::provisioning::repoint_references`] re-points it at what that service
+        // answered once the CA has been created).
+        ACMPCA_CERTIFICATE_AUTHORITY => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    ACMPCA_ARN_NAMESPACE,
+                    region,
+                    &format!("certificate-authority/{name}"),
+                ),
+            );
+            attributes.insert(
+                "CertificateSigningRequest".to_string(),
+                service_assigned_document(name, "CertificateSigningRequest"),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the ARN of the issued certificate"; Fn::GetAtt: Arn, Certificate.
+        // The ARN carries the serial that service allocated and the body is the
+        // certificate it signed, so both are stand-ins here too.
+        ACMPCA_CERTIFICATE => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    ACMPCA_ARN_NAMESPACE,
+                    region,
+                    &format!("certificate-authority/{name}/certificate/{name}"),
+                ),
+            );
+            attributes.insert(
+                "Certificate".to_string(),
+                service_assigned_document(name, "Certificate"),
+            );
+            (name.to_string(), attributes)
+        }
+        // Fn::GetAtt: CompleteCertificateChain — the certificate the CA was activated with
+        // beside the chain above it, which is that service's to assemble. The resource IS
+        // the activation of ONE private CA, and `CertificateAuthorityArn` is the property
+        // naming it, so that ARN is what identifies the resource.
+        ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => {
+            attributes.insert(
+                "CompleteCertificateChain".to_string(),
+                service_assigned_document(name, "CompleteCertificateChain"),
+            );
+            let identity = properties
+                .get("CertificateAuthorityArn")
+                .and_then(|declared| text(declared, scope, 0, budget))
+                .unwrap_or_else(|| name.to_string());
+            (identity, attributes)
+        }
+        _ => (name.to_string(), attributes),
+    }
+}
+
+/// The ARN namespace Amazon Web Services Private CA mints its resources under (that
+/// model's `awsService.arnNamespace`), which is `acm-pca` rather than the `ACMPCA` its
+/// resource types are spelled with.
+pub(super) const ACMPCA_ARN_NAMESPACE: &str = "acm-pca";
+
+/// The stand-in a published return value only the OWNING SERVICE can produce — a
+/// certification request, a certificate body, a certificate chain — is resolved to before
+/// that service has been asked for it.
+///
+/// A document is not a value these naming rules can compute, and an output or another
+/// resource's property may name it before the resource exists, so the attribute carries a
+/// value that names the resource and the attribute it stands for.
+/// [`super::provisioning::repoint_references`] re-points it at what the owning service
+/// really answered, exactly as it re-points a minted identifier. It is deliberately NOT a
+/// well-formed PEM body: a request that reaches a service still carrying it is refused by
+/// that service rather than taken for a certificate.
+pub(super) fn service_assigned_document(name: &str, attribute: &str) -> String {
+    format!("the {attribute} of {name} is not available until it has been created")
+}
+
+/// The NAMES of the `Fn::GetAtt` attributes a resource of this type publishes — the other
+/// half of the catalogue [`return_values`] above keys, read without a resource.
+///
+/// Source: the very same per-type "Return values" sections. Which attributes a type
+/// publishes is a property of the TYPE, while the values [`return_values`] computes are
+/// properties of one provisioned resource, so the extension registry can report what a
+/// published resource type's schema DEFINES
+/// ([`crate::state::resource_schema`](crate::state::resource_schema)) with no stack having
+/// declared one. A type this emulator carries no return values for publishes no
+/// attributes, and gets the empty list.
+///
+/// This is the same split [`declared_name_property`] is in: an arm added to
+/// [`return_values`] has to be added here too, which
+/// `published_attribute_names_are_the_catalogued_return_values` in this module's tests
+/// enforces — it compares this list, type by type, against the attributes the arm actually
+/// inserts. The order is the sorted order a resource's own attribute map holds them in, so
+/// a document built from them is byte-for-byte the same on every read.
+pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        ACMPCA_CERTIFICATE_AUTHORITY => &["Arn", "CertificateSigningRequest"],
+        ACMPCA_CERTIFICATE => &["Arn", "Certificate"],
+        ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => &["CompleteCertificateChain"],
+        BACKUP_VAULT => &["BackupVaultArn", "BackupVaultName"],
+        "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
+        SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
+        "AWS::S3::Bucket" => &[
+            "Arn",
+            "DomainName",
+            "DualStackDomainName",
+            "RegionalDomainName",
+            "WebsiteURL",
+        ],
+        S3VECTORS_VECTOR_BUCKET => &["VectorBucketArn"],
+        S3VECTORS_INDEX => &["IndexArn"],
+        "AWS::DynamoDB::Table" => &["Arn"],
+        "AWS::Lambda::Function" => &["Arn"],
+        "AWS::Logs::LogGroup" => &["Arn"],
+        TRANSFER_SERVER => &["Arn", "ServerId"],
+        "AWS::Transfer::Workflow" => &["Arn", "WorkflowId"],
+        IAM_ACCESS_KEY => &["SecretAccessKey"],
+        "AWS::IAM::Role" => &["Arn"],
+        ECR_PUBLIC_REPOSITORY => &["Arn"],
+        FIREHOSE_DELIVERY_STREAM => &["Arn"],
+        KINESIS_STREAM => &["Arn"],
+        ECR_REPOSITORY => &["Arn", "RepositoryUri"],
+        ECS_CLUSTER => &["Arn"],
+        EKS_CLUSTER => &[
+            "Arn",
+            "CertificateAuthorityData",
+            "ClusterSecurityGroupId",
+            "EncryptionConfigKeyArn",
+            "Endpoint",
+            "OpenIdConnectIssuerUrl",
+        ],
+        EKS_POD_IDENTITY_ASSOCIATION => &["AssociationArn", "AssociationId"],
+        BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
+        BATCH_JOB_QUEUE => &["JobQueueArn"],
+        BATCH_SERVICE_ENVIRONMENT => &["ServiceEnvironmentArn"],
+        ECS_TASK_DEFINITION => &["TaskDefinitionArn"],
+        ELB_LOAD_BALANCER => &["DNSName", "LoadBalancerFullName", "LoadBalancerName"],
+        ELB_TARGET_GROUP => &["TargetGroupArn", "TargetGroupFullName", "TargetGroupName"],
+        "AWS::RDS::DBCluster" => &[
+            "DBClusterArn",
+            "DBClusterResourceId",
+            "Endpoint.Address",
+            "Endpoint.Port",
+            "ReadEndpoint.Address",
+        ],
+        "AWS::RDS::DBInstance" => &[
+            "DBInstanceArn",
+            "DbiResourceId",
+            "Endpoint.Address",
+            "Endpoint.Port",
+        ],
+        "AWS::SecretsManager::Secret" => &["Id"],
+        EC2_VPC => &["VpcId"],
+        EC2_SUBNET => &["SubnetId"],
+        EC2_SECURITY_GROUP => &["GroupId"],
+        EC2_INTERNET_GATEWAY => &["InternetGatewayId"],
+        EC2_ROUTE_TABLE => &["RouteTableId"],
+        EC2_NAT_GATEWAY => &["NatGatewayId"],
+        EC2_DHCP_OPTIONS => &["DhcpOptionsId"],
+        EC2_VPN_GATEWAY => &["VPNGatewayId"],
+        EC2_NETWORK_ACL | EC2_NETWORK_INTERFACE | EC2_VPC_ENDPOINT => &["Id"],
+        EC2_VOLUME => &["VolumeId"],
+        ECS_SERVICE => &["Name"],
+        ELB_LISTENER => &["ListenerArn"],
+        ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
+        "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
+        "AWS::BedrockAgentCore::Runtime" => {
+            &["AgentRuntimeArn", "AgentRuntimeId", "AgentRuntimeVersion"]
+        }
+        "AWS::BedrockAgentCore::CodeInterpreter" => &["CodeInterpreterArn", "CodeInterpreterId"],
+        "AWS::BedrockAgentCore::Browser" => &["BrowserArn", "BrowserId"],
+        "AWS::BedrockAgentCore::Gateway" => &["GatewayArn", "GatewayId"],
+        "AWS::BedrockAgentCore::WorkloadIdentity" => &["Name", "WorkloadIdentityArn"],
+        "AWS::RUM::AppMonitor" => &["Id"],
+        "AWS::CloudWatch::Alarm" => &["Arn"],
+        CODEBUILD_REPORT_GROUP => &["Arn"],
+        CLOUDWATCH_METRIC_STREAM => &["Arn"],
+        CODEARTIFACT_DOMAIN => &["Arn", "Name", "Owner"],
+        CODEARTIFACT_REPOSITORY => &["Arn", "DomainOwner", "Name"],
+        COGNITO_USER_POOL => &["Arn", "ProviderName", "ProviderURL"],
+        FIS_EXPERIMENT_TEMPLATE => &["Id"],
+        CLOUDFRONT_DISTRIBUTION => &["DomainName", "Id"],
+        CLOUDFRONT_ORIGIN_ACCESS_CONTROL => &["Id"],
+        CLOUDFRONT_ORIGIN_ACCESS_IDENTITY => &["Id", "S3CanonicalUserId"],
+        CLOUDFRONT_CACHE_POLICY | CLOUDFRONT_ORIGIN_REQUEST_POLICY
+        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => &["Id"],
+        APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
+        APIGATEWAY_RESOURCE => &["ResourceId"],
+        APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
+        APIGATEWAYV2_API => &["ApiEndpoint"],
+        APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
+        APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
+        GUARDDUTY_DETECTOR | GUARDDUTY_IP_SET => &["Id"],
+        ROUTE53_HEALTH_CHECK => &["HealthCheckId"],
+        ROUTE53_HOSTED_ZONE => &["Id"],
+        KMS_KEY => &["Arn", "KeyId"],
+        MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
+        MQ_BROKER => &["Arn"],
+        EVENTS_RULE => &["Arn"],
+        SSM_PARAMETER => &["Type", "Value"],
+        STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
+        SCHEDULER_SCHEDULE_GROUP | SCHEDULER_SCHEDULE => &["Arn"],
+        _ => &[],
+    }
+}
+
+/// Whether the PHYSICAL ID of a resource of this type is assigned by the service that owns
+/// it rather than derived from what the template declares.
+///
+/// For such a type the identifier in force is the one that service minted: it cannot be
+/// recomputed from the template, so a later deployment of the same declaration carries the
+/// recorded one forward instead of replacing the resource
+/// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
+/// of its declared or generated name, which any deployment recomputes identically.
+///
+/// Nine types this emulator provisions are in that position: an experiment template's id
+/// is minted by FIS (`Ref` returns it, and the type has no name property at all), an AWS
+/// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
+/// an Amazon Managed Grafana workspace's id is minted by `CreateWorkspace` (`Ref` returns
+/// the workspace id, a `^g-[0-9a-f]{10}$` value), where that type's `Name` is only what the
+/// create asks for, an Amazon EMR cluster's is the `j-` job-flow id `RunJobFlow` mints
+/// ("Ref returns the cluster ID"), where the type's `Name` is only the name the flow runs
+/// under, a GuardDuty detector's is minted by `CreateDetector`, which takes no identifier
+/// at all, an OpenSearch Serverless collection's `Ref` is the `CollectionId` its create
+/// mints — a template declares the collection's NAME, never that id — and an ACM ACME
+/// endpoint's is the `AcmeEndpointArn` `CreateAcmeEndpoint` mints, that type declaring no
+/// name or identifier property either, and each kind of Amazon MSK cluster's is the
+/// `ClusterArn` its create answers with ("Ref returns the ARN of the cluster"), whose
+/// resource path carries an identifier Amazon MSK mints beside the declared cluster name.
+///
+/// The three Route 53 Resolver types are in the same position: that service mints a
+/// `rslvr-`-prefixed id for an endpoint, a rule and a rule association, none of its creates
+/// takes one, and each type's `Ref` returns that id — the `Name` such a type declares is
+/// only "a friendly name that lets you easily find [it] in the Resolver dashboard". Its
+/// three DNS Firewall types are the same case ([`ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST`] and
+/// its siblings): a domain list, a rule group and a rule group association each carry the
+/// `rslvr-`-prefixed id that service minted, which is what their `Ref` returns and what
+/// every call on them takes.
+///
+/// An API Gateway v2 api and an api mapping are two more: `CreateApi` and
+/// `CreateApiMapping` take no identifier and answer the `ApiId` / `ApiMappingId` that
+/// service assigned, and each type's `Ref` returns that id — the `Name` an api declares is
+/// only what the api is called, and a mapping declares no name at all. The integration, the
+/// route, the deployment and the authorizer of an api are in exactly that position
+/// ([`APIGATEWAYV2_INTEGRATION`] and its siblings): each create answers the id that service
+/// minted, which is what the type's `Ref` returns and what the api's other resources name it
+/// by — a route's `Target` names its integration as `integrations/<IntegrationId>` and its
+/// `AuthorizerId` names an authorizer by the minted id, and no name could stand in for
+/// either. (A custom `AWS::ApiGatewayV2::DomainName` is NOT one of them: its identifier is
+/// the domain name the template states; nor is an `AWS::ApiGatewayV2::Stage`, whose
+/// identifier is the stage name it states.)
+///
+/// An AWS Transfer Family server is one more: `CreateServer` takes no identifier and
+/// answers the `ServerId` it assigned, and that type's `Ref` returns the server's ARN,
+/// which carries that id — so neither the id nor the ARN can be recomputed from the
+/// template.
+///
+/// The four WAFv2 types are in that position too ([`WAFV2_WEB_ACL`] and its siblings): each
+/// create answers an `Id` that service minted, and the entity's ARN carries it, so a
+/// deployment can recompute neither.
+///
+/// A KMS key is one more: `CreateKey` takes no identifier and answers the `KeyId` KMS
+/// assigned, that type's `Ref` returns the key id, and the key ARN that identifier is
+/// embedded in is what a queue's `KmsMasterKeyId` (or any other reference to the key)
+/// resolves through.
+///
+/// An Amazon Route 53 hosted zone is one more: `CreateHostedZone` takes no identifier and
+/// answers the `Z…` id Route 53 assigned, and "Ref returns the hosted zone ID" — the zone's
+/// `Name` is only the DNS name it answers for, and no operation of that service takes a name
+/// where it takes a zone id. (An `AWS::Route53::RecordSet` is NOT one of them: "Ref returns
+/// the record name", which is the `Name` its own declaration states.)
+pub fn identity_is_service_assigned(resource_type: &str) -> bool {
+    resource_type == APIGATEWAYV2_API
+        // An Amazon EKS pod identity association is one more: that create takes no
+        // identifier and answers the ARN and the id Amazon EKS minted for the association,
+        // and "Ref returns the association ARN" — a template declares the cluster, the
+        // namespace, the service account and the role, never the association's own id.
+        || resource_type == EKS_POD_IDENTITY_ASSOCIATION
+        // An IAM access key is one more: "Ref returns the AWS::IAM::AccessKey resource's
+        // access key ID", `CreateAccessKey` takes no identifier — the declaration states
+        // only the user the key belongs to — and that id is what every IAM operation on a
+        // key takes (`UpdateAccessKey$AccessKeyId`, `DeleteAccessKey$AccessKeyId`) and what
+        // a client signs requests with, so the identifier in force is the one IAM minted.
+        || resource_type == IAM_ACCESS_KEY
+        // An IAM managed policy is one more: "Ref returns the ARN of the managed policy",
+        // the handle every IAM operation on one takes (`GetPolicy$PolicyArn`,
+        // `AttachRolePolicy$PolicyArn`), and `CreatePolicy` is what answers it — built from
+        // the account and the path IAM created the policy under rather than from the name
+        // the template declared.
+        || resource_type == "AWS::IAM::ManagedPolicy"
+        || resource_type == APIGATEWAYV2_API_MAPPING
+        || resource_type == APIGATEWAYV2_INTEGRATION
+        || resource_type == APIGATEWAYV2_ROUTE
+        || resource_type == APIGATEWAYV2_DEPLOYMENT
+        || resource_type == APIGATEWAYV2_AUTHORIZER
+        // An Amazon SNS subscription's identity is the ARN `Subscribe` answers with: it
+        // carries an id SNS mints per subscription, which no naming rule could compute.
+        || resource_type == SNS_SUBSCRIPTION
+        || resource_type == FIS_EXPERIMENT_TEMPLATE
+        || resource_type == WAF_REGIONAL_IP_SET
+        || resource_type == WAFV2_WEB_ACL
+        || resource_type == WAFV2_RULE_GROUP
+        || resource_type == WAFV2_IP_SET
+        || resource_type == WAFV2_REGEX_PATTERN_SET
+        || resource_type == GRAFANA_WORKSPACE
+        || resource_type == EMR_CLUSTER
+        || resource_type == GUARDDUTY_DETECTOR
+        // A GuardDuty trusted IP list is the same case: `CreateIPSet` takes no identifier
+        // for the list — the `Name` a declaration states is only the user-friendly name of
+        // the IPSet — and answers the `IpSetId` GuardDuty minted, which is what that
+        // type's `Ref` returns and what every GuardDuty call on the list takes.
+        || resource_type == GUARDDUTY_IP_SET
+        || resource_type == KMS_KEY
+        || resource_type == AOSS_COLLECTION
+        || resource_type == ACM_ACME_ENDPOINT
+        // An ACM certificate is the same case: `RequestCertificate` takes no identifier
+        // and answers the `CertificateArn` ACM minted, and that type's `Ref` returns that
+        // ARN — a template declares the domain the certificate covers, never its id.
+        || resource_type == ACM_CERTIFICATE
+        // An Amazon Web Services Private CA certificate authority is the same case:
+        // `CreateCertificateAuthority` takes no identifier and answers the
+        // `CertificateAuthorityArn` that service minted, and "Ref returns the Amazon
+        // Resource Name (ARN) of the private CA" — a template declares the CA's key, its
+        // signing algorithm and its subject, never its id.
+        || resource_type == ACMPCA_CERTIFICATE_AUTHORITY
+        // A certificate that private CA issued is one more: `IssueCertificate` takes no
+        // identifier and answers the `CertificateArn` it minted — which carries the SERIAL
+        // that service allocated, so no naming rule could compute it — and that type's
+        // `Ref` returns that ARN. A template declares the certification request and the
+        // validity, never the certificate's id.
+        || resource_type == ACMPCA_CERTIFICATE
+        || resource_type == MSK_CLUSTER
+        || resource_type == MSK_SERVERLESS_CLUSTER
+        || resource_type == ROUTE53RESOLVER_ENDPOINT
+        || resource_type == ROUTE53RESOLVER_RULE
+        || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
+        || resource_type == ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST
+        || resource_type == ROUTE53RESOLVER_FIREWALL_RULE_GROUP
+        || resource_type == ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION
+        || resource_type == ROUTE53_HOSTED_ZONE
+        // An Amazon Route 53 health check is one more: `CreateHealthCheck` takes no
+        // identifier and answers the id Route 53 assigned, "Ref returns the health check
+        // ID", and that id is what `GetHealthCheck` and a record set's own `HealthCheckId`
+        // take — the type declares no name a rule could compute it from.
+        || resource_type == ROUTE53_HEALTH_CHECK
+        // An Amazon RDS Proxy target group is one more: a proxy comes up WITH the one
+        // target group it has, so a declaration of this type states the proxy and the
+        // databases the group routes to, never an identifier — and that type's `Ref`
+        // returns the `TargetGroupArn` Amazon RDS minted for the group, which is what
+        // every call that reports one carries.
+        || resource_type == RDS_DB_PROXY_TARGET_GROUP
+        || resource_type == TRANSFER_SERVER
+        // An Amazon MQ broker is one more: `CreateBroker` takes the broker's NAME and
+        // answers with the `brokerId` Amazon MQ generated for it, which is the id that
+        // type's `Ref` returns and the one every `mq` operation addresses a broker by.
+        || resource_type == MQ_BROKER
+        // An AWS Backup plan and one of its resource selections are two more:
+        // `CreateBackupPlan` takes no identifier and answers the `BackupPlanId` it minted
+        // (which is what that type's `Ref` returns), and `CreateBackupSelection` answers
+        // the `SelectionId` it assigned to the selection it created. A template declares
+        // the plan's BODY and the selection's, never either id. (An `AWS::Backup::
+        // BackupVault` is NOT one of them: its identifier is the vault name the template
+        // states.)
+        || resource_type == BACKUP_PLAN
+        || resource_type == BACKUP_SELECTION
+        // An Amazon EC2 VPC, a subnet of one and a security group of one are three more:
+        // `CreateVpc`, `CreateSubnet` and `CreateSecurityGroup` take no identifier at all —
+        // EC2 assigns each resource an id of its own published form — and "Ref returns the
+        // ID of the VPC" / "Ref returns the subnet ID" / "Ref returns the ID of the security
+        // group", so the identifier in force is the one that service answered. The `vpc-`/
+        // `subnet-`/`sg-` value [`ec2_network_identity`] computes is the stand-in a
+        // declaration is resolved against before any of them exists, which the deployment
+        // then re-points at the id EC2 minted. (A security group's NAME is still
+        // CloudFormation's — that is what the create is made under — which is why
+        // [`declared_name_property`] names the property a declaration states it in.)
+        || resource_type == EC2_VPC
+        || resource_type == EC2_SUBNET
+        || resource_type == EC2_SECURITY_GROUP
+        // An Amazon EBS volume is a fourth: `CreateVolume` takes no identifier either — the
+        // declaration states the volume's zone, size and type — Amazon EC2 assigns the
+        // `vol-` id, and "Ref returns the volume ID", so the identifier in force is the one
+        // that service answered.
+        || resource_type == EC2_VOLUME
+        // An Amazon SES receipt rule is one more, for the same reason read from the other
+        // side: "Ref returns the receipt rule name", and a declaration states that name
+        // inside the type's `Rule` property rather than through a name property of its own,
+        // so the naming rules here cannot reach it. The create is what answers the name the
+        // rule was created under, and the record keeps it — a re-deploy of the same template
+        // then sees the rule the stack already has rather than one to create again.
+        || resource_type == SES_RECEIPT_RULE
+        // An AWS X-Ray sampling rule is one more, and in exactly that position: the rule's
+        // identity is the `RuleARN` `CreateSamplingRule` minted, which a declaration never
+        // states, and the NAME a declaration states lives inside that type's own
+        // `SamplingRule` property rather than in a name property the naming rules here
+        // could read. So the identifier in force is the one X-Ray answered with, and a
+        // re-deploy of the same template carries it forward rather than replacing the rule.
+        || resource_type == XRAY_SAMPLING_RULE
+        // An Amazon Cognito identity pool is one more: `CreateIdentityPool` takes only the
+        // pool's NAME — "a string that you provide" — and answers the `IdentityPoolId` it
+        // minted (modelled `@pattern ^[\w-]+:[0-9a-f-]+$`, the `REGION:GUID` form), and "Ref
+        // returns the Amazon Cognito identity pool ID", which is the handle every
+        // cognito-identity operation takes (`GetId`, `DescribeIdentityPool`,
+        // `SetIdentityPoolRoles`). No naming rule could compute that GUID, so the identifier
+        // in force is the one that service answered. The pool's own NAME is its `Name`
+        // attribute, which the create reports.
+        || resource_type == COGNITO_IDENTITY_POOL
+}
+
+/// The type of an IAM access key: the long-term credential of an IAM user, under the
+/// namespace the IAM model's own `awsService.cloudFormationName` (`IAM`) spells.
+///
+/// "Ref returns the AWS::IAM::AccessKey resource's access key ID", and `Fn::GetAtt` reads
+/// `SecretAccessKey` — "the secret access key for the specified AWS::IAM::AccessKey
+/// resource". IAM mints both, which is why [`identity_is_service_assigned`] names this type
+/// and why neither value is computed here ([`return_values`]).
+pub const IAM_ACCESS_KEY: &str = "AWS::IAM::AccessKey";
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
+/// The middle segment is the Firehose model's own `awsService.cloudFormationName`
+/// (`smithy_query(query="service_info")` on that service's model).
+pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Kinesis data stream — a
+/// different service from the Firehose one above, whose middle segment is the Kinesis
+/// model's own `awsService.cloudFormationName` (`Kinesis`).
+///
+/// "Ref returns the stream name", which is the name the owning service creates the stream
+/// under, so a GENERATED one is held to that service's own rules for it ([`naming_rules`])
+/// and the identity is not service-assigned.
+pub const KINESIS_STREAM: &str = "AWS::Kinesis::Stream";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the Amazon Bedrock resources an
+/// agent estate declares. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`Bedrock`).
+///
+/// Each one's owning API — Amazon Bedrock Agent's build-time service — identifies the
+/// resource by a ten-character identifier IT mints (`CreateKnowledgeBase` answers a
+/// `knowledgeBaseId`, `CreateAgent` an `agentId`) and takes a new name on the matching
+/// update, which is why [`name_is_create_only`] names these types.
+pub const BEDROCK_KNOWLEDGE_BASE: &str = "AWS::Bedrock::KnowledgeBase";
+pub const BEDROCK_AGENT: &str = "AWS::Bedrock::Agent";
+pub const BEDROCK_AGENT_ALIAS: &str = "AWS::Bedrock::AgentAlias";
+pub const BEDROCK_DATA_SOURCE: &str = "AWS::Bedrock::DataSource";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
+/// resources a stack creates. The middle segment is that service's own
+/// `awsService.cloudFormationName` (`OpenSearchServerless`).
+pub const AOSS_COLLECTION: &str = "AWS::OpenSearchServerless::Collection";
+pub const AOSS_SECURITY_POLICY: &str = "AWS::OpenSearchServerless::SecurityPolicy";
+
+/// The type of an Amazon OpenSearch Service domain — a different service from the
+/// serverless one above, whose own model is reached by the `es` signing name. Its middle
+/// segment is the one the resource-type namespace publishes (`OpenSearchService`) rather
+/// than that model's shorter `awsService.cloudFormationName` (`OpenSearch`).
+///
+/// "Ref returns the domain name", which is the name the owning service creates the domain
+/// under — so a GENERATED one is held to that service's own rules for it
+/// ([`naming_rules`]) and the identity is not service-assigned.
+pub const OPENSEARCH_DOMAIN: &str = "AWS::OpenSearchService::Domain";
+
+/// The type of an Amazon S3 bucket, whose middle segment is that model's own
+/// `cloudFormationName` the same way. "Ref returns the bucket name" for this type, so a
+/// bucket's physical resource id is the name its owning service creates it under — which
+/// is why [`naming_rules`] holds a GENERATED one to S3's bucket naming rules.
+pub const S3_BUCKET: &str = "AWS::S3::Bucket";
+
+/// The types of the two Amazon S3 Vectors resources a stack creates. The middle segment is
+/// that model's own sdk identity (`smithy_query(query="service_info",
+/// model_path="services/service-com-amazonaws-s3vectors-s3vectors/smithy-model/\
+/// com-amazonaws-s3vectors-s3vectors.json")` reports `sdkId: S3Vectors`), beside the
+/// sibling bucket variants `AWS::S3::Bucket` and `AWS::S3Tables::TableBucket`.
+///
+/// Each type's primary identifier is its own ARN — a vector bucket is
+/// `bucket/<name>` and an index `bucket/<bucket>/index/<name>` under the ARN namespace
+/// below — so `Ref` resolves to the ARN its owning service keys the resource by, which is
+/// what `GetVectorBucket`/`GetIndex` take as `vectorBucketArn`/`indexArn`.
+pub const S3VECTORS_VECTOR_BUCKET: &str = "AWS::S3Vectors::VectorBucket";
+pub const S3VECTORS_INDEX: &str = "AWS::S3Vectors::Index";
+
+/// Amazon S3 Vectors' ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`s3vectors`) rather than the `S3Vectors` its resource types are spelled with.
+pub const S3VECTORS_ARN_NAMESPACE: &str = "s3vectors";
+
+/// The segment a vector bucket occupies in an Amazon S3 Vectors ARN, from the
+/// `VectorBucketArn` pattern that model declares
+/// (`…:s3vectors:<region>:<account>:bucket/<name>`).
+pub const S3VECTORS_BUCKET_SEGMENT: &str = "bucket/";
+
+/// The type of an Amazon EMR cluster: the EMR model carries
+/// `awsService.cloudFormationName: EMR`. "Ref returns the cluster ID", the `j-` job-flow id
+/// `RunJobFlow` mints, which is why [`identity_is_service_assigned`] names this type.
+pub const EMR_CLUSTER: &str = "AWS::EMR::Cluster";
+
+/// The type of an AWS Transfer Family server: that model carries
+/// `awsService.cloudFormationName: Transfer`. "Ref returns the Amazon Resource Name (ARN)
+/// of the server", and `Fn::GetAtt` reads `Arn` and `ServerId` — "the service-assigned ID
+/// of the server that is created". Transfer Family MINTS both (`CreateServer` takes no
+/// identifier and answers the `ServerId` it assigned), which is why
+/// [`identity_is_service_assigned`] names this type: the ARN a `Ref` resolves to is the one
+/// that service created the server under, not one these naming rules computed.
+pub const TRANSFER_SERVER: &str = "AWS::Transfer::Server";
+
+/// The types of the two kinds of Amazon MSK cluster a stack creates: the Amazon MSK model
+/// carries `awsService.cloudFormationName: MSK`, and the namespace publishes one type per
+/// kind of cluster — a provisioned one, whose brokers the declaration sizes, and a
+/// serverless one, which has none.
+///
+/// For both, "Ref returns the ARN of the cluster", which is also each type's one published
+/// `Fn::GetAtt` attribute. Amazon MSK MINTS that ARN (its resource path is
+/// `cluster/<name>/<id>`, where the id is the service's own), which is why
+/// [`identity_is_service_assigned`] names both types.
+pub const MSK_CLUSTER: &str = "AWS::MSK::Cluster";
+pub const MSK_SERVERLESS_CLUSTER: &str = "AWS::MSK::ServerlessCluster";
+
+/// Amazon MSK's ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`kafka`) rather than the `MSK` its resource types are spelled with.
+pub const MSK_ARN_NAMESPACE: &str = "kafka";
+
+/// The type of an Amazon MQ broker: that middle segment is the Amazon MQ model's own
+/// `awsService.cloudFormationName` (`AmazonMQ`).
+///
+/// "Ref returns the Amazon MQ broker ID", and `Fn::GetAtt` reads `Arn` — the broker's own
+/// ARN. Amazon MQ MINTS that id (`CreateBroker` takes the broker's name and answers with
+/// the `brokerId` it generated, which is the `@httpLabel` every operation on a broker is
+/// addressed by), which is why [`identity_is_service_assigned`] names this type: the id a
+/// `Ref` resolves to is the one that service created the broker under, not one these naming
+/// rules computed.
+pub const MQ_BROKER: &str = "AWS::AmazonMQ::Broker";
+
+/// Amazon MQ's ARN namespace, which is its model's own `awsService.arnNamespace` (`mq`)
+/// rather than the `AmazonMQ` its resource type is spelled with.
+pub const MQ_ARN_NAMESPACE: &str = "mq";
+
+/// What an Amazon MQ broker id begins with (`b-` followed by 128 bits in the 8-4-4-4-12
+/// grouping `BrokerId`'s own documented form carries).
+///
+/// The id built on it here is a PLACEHOLDER, and one that is never reported for a broker
+/// that exists: the id a created broker carries is the one Amazon MQ minted, which
+/// [`super::provisioning::reconcile`] adopts over this one. What this value is for is the
+/// shape of the identifier a declaration reports BEFORE its create answers.
+pub(super) const MQ_BROKER_ID_PREFIX: &str = "b-";
+
+/// The 1-based ordinal an Amazon MSK cluster ARN ends with
+/// (`cluster/<name>/<id>-<ordinal>`), as the stand-in identifier computed here carries it.
+///
+/// A PLACEHOLDER, and one that is never reported for a cluster that exists: the ARN a
+/// created cluster carries is the one Amazon MSK minted, where the ordinal is that
+/// service's own count of the clusters it has registered, and
+/// [`super::provisioning::reconcile`] adopts that ARN over this one. What this value is
+/// for is the shape of the identifier a declaration reports BEFORE its create answers.
+pub(super) const MSK_CLUSTER_ARN_ORDINAL: u32 = 1;
+
+/// The same for an Amazon SQS queue: the SQS model carries
+/// `awsService.cloudFormationName: SQS`.
+pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
+
+/// The provisioned-cluster type of Amazon Redshift: the Redshift model carries
+/// `awsService.cloudFormationName: Redshift`.
+///
+/// "Ref returns the name of the cluster" — a cluster's `ClusterIdentifier` — so this
+/// resource's identity is CloudFormation's to compute, under that property
+/// ([`declared_name_property`]) and Amazon Redshift's own rules for it
+/// ([`naming_rules`]).
+pub const REDSHIFT_CLUSTER: &str = "AWS::Redshift::Cluster";
+
+/// The two resource types that carry a QUEUE's access policy: the one that applies a
+/// document to a list of queues, and the one that belongs to a single queue.
+///
+/// Neither is a resource of Amazon SQS's own — a queue's policy is its `Policy` ATTRIBUTE —
+/// so neither carries a [`return_values`] arm: the default applies and the physical
+/// resource id is the name CloudFormation generated for the resource, which is what "Ref
+/// returns the policy ID" for these types means here.
+pub const SQS_QUEUE_POLICY: &str = "AWS::SQS::QueuePolicy";
+pub const SQS_QUEUE_INLINE_POLICY: &str = "AWS::SQS::QueueInlinePolicy";
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of a SageMaker model package group —
+/// the model registry's container for the versioned model packages registered into it, and
+/// the carrier of the registry's resource policy. The middle segment is the SageMaker
+/// model's own `awsService.cloudFormationName`
+/// (`smithy_query(query="service_info")` on that service's model reports `SageMaker`).
+///
+/// This type deliberately carries NO [`return_values`] arm, so the default applies: its
+/// physical resource id is the group's NAME. That is what every SageMaker model-registry
+/// operation addresses the group by — `ModelPackageGroupName` is modelled `EntityName`,
+/// name-only on the policy operations — so the name is the identifier a client can use,
+/// and it is what the provisioner passes to `CreateModelPackageGroup`. The group's ARN is
+/// not computed here either: `Arn`/`ModelPackageGroupArn` are the ARN SageMaker itself
+/// answered, which the provisioner records on the resource, rather than one minted from a
+/// pattern. SageMaker's own model says nothing about this type's `Ref`, so the identifier a
+/// client can resolve is preferred over a guess at CloudFormation's.
+pub const SAGEMAKER_MODEL_PACKAGE_GROUP: &str = "AWS::SageMaker::ModelPackageGroup";
+
+/// An Amazon CloudWatch metric stream's resource type (the CloudWatch model:
+/// `cloudFormationName: CloudWatch`). This is the type `super::provisioning` creates in
+/// CloudWatch itself, through that service's own `PutMetricStream`.
+pub const CLOUDWATCH_METRIC_STREAM: &str = "AWS::CloudWatch::MetricStream";
+
+/// An Amazon CloudWatch dashboard's resource type. This is the type `super::provisioning`
+/// creates in CloudWatch itself, through that service's own `PutDashboard`.
+pub const CLOUDWATCH_DASHBOARD: &str = "AWS::CloudWatch::Dashboard";
+
+/// The same for an Amazon SNS topic: the SNS model carries
+/// `awsService.cloudFormationName: SNS`.
+pub const SNS_TOPIC: &str = "AWS::SNS::Topic";
+
+/// An Amazon SNS subscription's resource type, under the same namespace: the type a
+/// template declares a subscriber of a topic with, beside the topic's own inline
+/// `Subscription` list.
+///
+/// It carries no [`return_values`] arm, so the computed physical id is the generated name
+/// — a stand-in that the create replaces with the subscription ARN Amazon SNS mints, which
+/// is this type's published return value ("Ref returns the subscription ARN") and the
+/// identifier `Unsubscribe`/`SetSubscriptionAttributes` address a subscription by.
+pub const SNS_SUBSCRIPTION: &str = "AWS::SNS::Subscription";
+
+/// The two resource types that carry a TOPIC's access policy: the one that applies a
+/// document to a list of topics, and the one that belongs to a single topic.
+///
+/// Neither is a resource of Amazon SNS's own — a topic's policy is its `Policy` ATTRIBUTE —
+/// so neither carries a [`return_values`] arm: the default applies and the physical resource
+/// id is the name CloudFormation generated for the resource, exactly as it is for the two
+/// queue-policy types ([`SQS_QUEUE_POLICY`]).
+pub const SNS_TOPIC_POLICY: &str = "AWS::SNS::TopicPolicy";
+pub const SNS_TOPIC_INLINE_POLICY: &str = "AWS::SNS::TopicInlinePolicy";
+
+/// An Amazon SES configuration set's resource type (the SES model:
+/// `awsService.cloudFormationName: SES`). This is the type `super::provisioning` creates
+/// in Amazon SES itself, through that service's own `CreateConfigurationSet`.
+///
+/// It deliberately carries NO [`return_values`] arm, so the default applies and its
+/// physical resource id is the set's NAME — which is that type's published return value
+/// ("Ref returns the configuration set name") and the identifier every operation of the
+/// owning service addresses a configuration set by (`ConfigurationSetName`, on
+/// `DescribeConfigurationSet` and `DeleteConfigurationSet` alike). The type publishes no
+/// `Fn::GetAtt` attribute, so it carries no entry in [`published_attribute_names`] either.
+pub const SES_CONFIGURATION_SET: &str = "AWS::SES::ConfigurationSet";
+
+/// An Amazon SES receipt rule set's resource type, under the same namespace. This is the
+/// type `super::provisioning` creates in Amazon SES itself, through that service's own
+/// `CreateReceiptRuleSet`.
+///
+/// It carries NO [`return_values`] arm either, so its physical resource id is the set's
+/// NAME — that type's published return value ("Ref returns the rule set name") and the
+/// identifier every operation of the owning service addresses a receipt rule set by
+/// (`RuleSetName`, on `DescribeReceiptRuleSet`, `SetActiveReceiptRuleSet` and
+/// `DeleteReceiptRuleSet` alike). The name property it is read from is unconventional, so
+/// the type is registered in [`declared_name_property`].
+pub const SES_RECEIPT_RULE_SET: &str = "AWS::SES::ReceiptRuleSet";
+
+/// One receipt rule OF such a set, under the same namespace: the type a template declares a
+/// rule of a rule set with, created through the owning service's own `CreateReceiptRule`.
+///
+/// Its published return value is the RULE's name ("Ref returns the receipt rule name"),
+/// which a declaration states INSIDE the type's `Rule` property rather than through a name
+/// property of its own — so no naming rule here computes it and
+/// [`identity_is_service_assigned`] names this type: the identifier in force is the one the
+/// create answered with.
+pub const SES_RECEIPT_RULE: &str = "AWS::SES::ReceiptRule";
+
+/// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
+///
+/// Spelled as AWS's own CloudFormation resource reference publishes it, under the `ECR`
+/// namespace beside the private registry's `AWS::ECR::Repository`, rather than from the
+/// ECR Public model's `awsService.cloudFormationName` (`ECRPUBLIC`): the type is what a
+/// template spells.
+pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
+
+/// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
+pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
+
+/// An AWS CodeBuild report group's resource type (CodeBuild's model:
+/// `awsService.cloudFormationName: CodeBuild`). This is the type `super::provisioning`
+/// creates in CodeBuild itself, through that service's own `CreateReportGroup`.
+///
+/// Its physical resource id is the report group's NAME — that type's published return
+/// value ("Ref returns the report group name"), which is also the `Name` property a
+/// declaration states it under ([`physical_name`]) and the one value
+/// `CreateReportGroup` takes to key the group by. [`return_values`] carries its one
+/// published attribute, `Arn`: the ARN CodeBuild forms for a report group is that
+/// service's own `report-group/<name>` path under the single account id this emulator
+/// mints, so the value computed here and the one the create answers with are the same
+/// ARN — the position [`SNS_TOPIC`] is in.
+pub const CODEBUILD_REPORT_GROUP: &str = "AWS::CodeBuild::ReportGroup";
+
+/// The ARN namespace of the CodeBuild service, from its model's `aws.api#service`
+/// `arnNamespace` — the service segment of every ARN it forms.
+pub const CODEBUILD_ARN_NAMESPACE: &str = "codebuild";
+
+/// An AWS CodeCommit repository's resource type (that model:
+/// `awsService.cloudFormationName: CodeCommit`). This is the type `super::provisioning`
+/// creates in CodeCommit itself, through that service's own `CreateRepository`.
+///
+/// It deliberately carries NO [`return_values`] arm, so the default applies and its
+/// physical resource id is the repository's NAME — which is that type's published return
+/// value ("Ref returns the repository name") and the identifier every CodeCommit operation
+/// addresses a repository by (`repositoryName`, on `GetRepository`,
+/// `PutRepositoryTriggers` and `DeleteRepository` alike). Its published attributes are not
+/// computed here either: the ARN and the two clone URLs are the ones CodeCommit itself
+/// answered the create with — the clone URLs name the endpoint this emulator serves the
+/// repository's git transport on, which no pattern here could mint — and the provisioner
+/// records them on the resource.
+pub const CODECOMMIT_REPOSITORY: &str = "AWS::CodeCommit::Repository";
+
+/// An AWS CodeArtifact domain's resource type (that model:
+/// `awsService.cloudFormationName: CodeArtifact`). This is the type `super::provisioning`
+/// creates in CodeArtifact itself, through that service's own `CreateDomain`.
+///
+/// It carries a [`return_values`] arm because its `Ref` is NOT its name: "Ref returns the
+/// Amazon Resource Name (ARN) of the domain", and the name is one of the three values
+/// `Fn::GetAtt` reads off it (`Arn`, `Name`, `Owner` — the type's read-only properties).
+/// That is what a repository's own declaration names the domain holding it by, since a
+/// `Ref` to the domain would hand `CreateRepository` an ARN rather than the domain name
+/// that call takes.
+pub const CODEARTIFACT_DOMAIN: &str = "AWS::CodeArtifact::Domain";
+
+/// An AWS CodeArtifact repository's resource type, under the same namespace, created
+/// through that service's own `CreateRepository` in the domain its declaration names.
+///
+/// Its `Ref` is its ARN too ("Ref returns the Amazon Resource Name (ARN) of the
+/// repository"), and its published attributes are `Arn`, `DomainOwner` and `Name`. The
+/// `DomainName` a declaration states is a create-only PROPERTY rather than one of them.
+pub const CODEARTIFACT_REPOSITORY: &str = "AWS::CodeArtifact::Repository";
+
+/// CodeArtifact's ARN namespace, which its own model carries as `awsService.arnNamespace`
+/// (`codeartifact`) — the service segment of a domain's and a repository's ARN, and the
+/// one that service's own state module builds both ARNs under.
+pub(super) const CODEARTIFACT_ARN_NAMESPACE: &str = "codeartifact";
+
+/// The type of an Amazon Cognito identity pool (the cognito-identity model's
+/// `awsService.cloudFormationName: Cognito`). This is the type `super::super::provisioning`
+/// creates in Amazon Cognito Identity itself.
+///
+/// It deliberately carries NO [`return_values`] arm: "Ref returns the Amazon Cognito
+/// identity pool ID" and that id is the owning service's to mint
+/// ([`identity_is_service_assigned`] names the type), so the identifier the naming rules
+/// compute is only the stand-in a declaration is resolved against until `CreateIdentityPool`
+/// answers — and the `Name` the type publishes through `Fn::GetAtt` is what that create
+/// reports for the pool.
+pub const COGNITO_IDENTITY_POOL: &str = "AWS::Cognito::IdentityPool";
+
+/// The type of the role attachment that binds an identity pool's IAM roles and role
+/// mappings to it — the `SetIdentityPoolRoles` call in template form.
+///
+/// It carries no [`return_values`] arm either, and its identity is NOT service-assigned: the
+/// attachment is not a resource of its own in the owning API (a pool has at most one role
+/// configuration, which each call replaces), so CloudFormation's own generated identifier is
+/// the physical id and the pool it configures stays a declared PROPERTY.
+pub const COGNITO_IDENTITY_POOL_ROLE_ATTACHMENT: &str =
+    "AWS::Cognito::IdentityPoolRoleAttachment";
+
+/// The type of an Amazon Cognito user-pool group: the cognito-idp model carries
+/// `awsService.cloudFormationName: Cognito`.
+///
+/// This type deliberately carries NO [`return_values`] arm, so the default applies and its
+/// physical resource id is the group's NAME — the identifier every operation of the owning
+/// service addresses a group by (`GetGroup`, `UpdateGroup` and `DeleteGroup` each take a
+/// `GroupName` beside the `UserPoolId` of the pool that holds it), and the one a template
+/// declares through [`declared_name_property`]. Its `UserPoolId` is the other half of that
+/// identity and stays a declared PROPERTY, which is what the provisioner's calls carry.
+pub const COGNITO_USER_POOL_GROUP: &str = "AWS::Cognito::UserPoolGroup";
+
+/// The type of an Amazon Cognito user pool (the cognito-idp model's
+/// `awsService.cloudFormationName: Cognito`), whose published return values
+/// [`return_values`] carries: a pool is how a federated identity pool, an app client and an
+/// OpenID relying party all name the same user pool, and each of them names it through one
+/// of those values.
+pub const COGNITO_USER_POOL: &str = "AWS::Cognito::UserPool";
+
+/// Amazon Cognito user pools' ARN namespace and endpoint prefix, which its own model
+/// carries as `awsService.arnNamespace` and `endpointPrefix` (`cognito-idp`) — the service
+/// segment of a pool's ARN and the host its pool endpoints are served under.
+pub(super) const COGNITO_IDP_ARN_NAMESPACE: &str = "cognito-idp";
+
+/// An Amazon ECS cluster's resource type (ECS's model: `cloudFormationName: ECS`). This
+/// is the type `super::provisioning` creates in Amazon ECS itself.
+pub const ECS_CLUSTER: &str = "AWS::ECS::Cluster";
+
+/// The three AWS Elastic Beanstalk resource types `super::provisioning` creates in
+/// Elastic Beanstalk itself (that model: `cloudFormationName: ElasticBeanstalk`).
+///
+/// Each deliberately carries NO [`return_values`] arm, so the default applies and the
+/// physical resource id is the resource's NAME — which is what each type's published
+/// return value is ("Ref returns the Elastic Beanstalk application name", "Ref returns
+/// the Elastic Beanstalk environment name", "Ref returns the auto-generated version
+/// label") and what every Elastic Beanstalk operation addresses the resource by. The
+/// environment's one published attribute, `EndpointURL`, is not computed here either: it
+/// is the endpoint Elastic Beanstalk itself answered the create with, which the
+/// provisioner records on the resource.
+///
+/// `AWS::ElasticBeanstalk::ConfigurationTemplate` is NOT among them: this emulator's
+/// `DeleteConfigurationTemplate` is still a stub, so a stack that created one could never
+/// delete it, and the type is left declared-only (which `super::provisioning` documents)
+/// rather than provisioned into a resource no stack deletion could remove.
+pub const ELASTIC_BEANSTALK_APPLICATION: &str = "AWS::ElasticBeanstalk::Application";
+/// See [`ELASTIC_BEANSTALK_APPLICATION`].
+pub const ELASTIC_BEANSTALK_APPLICATION_VERSION: &str =
+    "AWS::ElasticBeanstalk::ApplicationVersion";
+/// See [`ELASTIC_BEANSTALK_APPLICATION`].
+pub const ELASTIC_BEANSTALK_ENVIRONMENT: &str = "AWS::ElasticBeanstalk::Environment";
+
+/// An Amazon ECS task definition's resource type.
+pub const ECS_TASK_DEFINITION: &str = "AWS::ECS::TaskDefinition";
+
+/// An AWS Batch compute environment's resource type (that model:
+/// `cloudFormationName: Batch`). "Ref returns the compute environment ARN"; `Fn::GetAtt`:
+/// `ComputeEnvironmentArn`.
+pub const BATCH_COMPUTE_ENVIRONMENT: &str = "AWS::Batch::ComputeEnvironment";
+/// An AWS Batch job queue's resource type. "Ref returns the job queue ARN";
+/// `Fn::GetAtt`: `JobQueueArn`.
+pub const BATCH_JOB_QUEUE: &str = "AWS::Batch::JobQueue";
+/// An AWS Batch service environment's resource type. "Ref returns the service environment
+/// ARN"; `Fn::GetAtt`: `ServiceEnvironmentArn`.
+pub const BATCH_SERVICE_ENVIRONMENT: &str = "AWS::Batch::ServiceEnvironment";
+/// AWS Batch's ARN namespace, from its model's `awsService.arnNamespace`.
+pub(super) const BATCH_ARN_NAMESPACE: &str = "batch";
+
+/// Amazon EKS's ARN namespace, from its model's `awsService.arnNamespace`, which the ARNs
+/// of a cluster and of a pod identity association are built under.
+pub(super) const EKS_ARN_NAMESPACE: &str = "eks";
+
+/// The three CodeDeploy resource types `super::provisioning` creates in CodeDeploy itself
+/// (that model: `cloudFormationName: CodeDeploy`).
+///
+/// Each deliberately carries NO [`return_values`] arm, so the default applies and the
+/// physical resource id is the resource's NAME — which is what each type's published return
+/// value is ("Ref returns the application name", "Ref returns the deployment group name",
+/// "Ref returns the deployment configuration name") and the identifier every CodeDeploy
+/// operation addresses the resource by (`GetApplication` takes an `applicationName`,
+/// `GetDeploymentGroup` that name and a `deploymentGroupName`, `GetDeploymentConfig` a
+/// `deploymentConfigName`). A deployment group's `ApplicationName` is the other half of its
+/// identity and stays a declared PROPERTY, which is what the provisioner's calls carry.
+pub const CODEDEPLOY_APPLICATION: &str = "AWS::CodeDeploy::Application";
+/// See [`CODEDEPLOY_APPLICATION`].
+pub const CODEDEPLOY_DEPLOYMENT_GROUP: &str = "AWS::CodeDeploy::DeploymentGroup";
+/// See [`CODEDEPLOY_APPLICATION`].
+pub const CODEDEPLOY_DEPLOYMENT_CONFIG: &str = "AWS::CodeDeploy::DeploymentConfig";
+
+/// An Elastic Load Balancing v2 load balancer's resource type (that model's
+/// `cloudFormationName: ElasticLoadBalancingV2`).
+pub const ELB_LOAD_BALANCER: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
+
+/// An Elastic Load Balancing v2 target group's resource type.
+pub const ELB_TARGET_GROUP: &str = "AWS::ElasticLoadBalancingV2::TargetGroup";
+
+/// An AWS Fault Injection Service experiment template's resource type (the FIS model:
+/// `cloudFormationName: FIS`). This is the type `super::provisioning` creates in FIS
+/// itself, so the id a stack's output reports for it is the id FIS minted.
+pub const FIS_EXPERIMENT_TEMPLATE: &str = "AWS::FIS::ExperimentTemplate";
+
+/// An AWS WAF Classic regional IPSet's resource type (the AWS WAF Regional model:
+/// `cloudFormationName: WAFRegional`). This is a type `super::provisioning` creates in that
+/// service itself, and "Ref returns the IPSet ID" — an id only AWS WAF Classic mints — so
+/// the id a stack's output reports for it is the one that service answered with.
+pub const WAF_REGIONAL_IP_SET: &str = "AWS::WAFRegional::IPSet";
+
+/// The four WAF (WAFv2) resource types a stack creates in that service (the WAFv2 model:
+/// `cloudFormationName: WAFv2`).
+///
+/// Each one's identity is WAF's OWN to mint: its create takes the NAME and the scope the
+/// template declares and answers a `Summary` carrying the `Id` it assigned and the `ARN` it
+/// built from the scope, that name and that id — "a unique identifier for the … This ID is
+/// returned in the responses to create and list commands. You provide it to operations like
+/// update and delete" (`WebACLSummary$Id` and its siblings). So the identifiers a stack
+/// publishes for one are the ones that service answered with, which is what
+/// `GetWebACL`/`GetIPSet`/`GetRuleGroup`/`GetRegexPatternSet` resolve and what
+/// `AssociateWebACL` takes, rather than values these naming rules computed.
+pub const WAFV2_WEB_ACL: &str = "AWS::WAFv2::WebACL";
+pub const WAFV2_RULE_GROUP: &str = "AWS::WAFv2::RuleGroup";
+pub const WAFV2_IP_SET: &str = "AWS::WAFv2::IPSet";
+pub const WAFV2_REGEX_PATTERN_SET: &str = "AWS::WAFv2::RegexPatternSet";
+
+/// The type that puts one of those web ACLs IN FRONT OF a protected resource (the same
+/// model, `cloudFormationName: WAFv2`).
+///
+/// It is no entity of AWS WAF's own: it is the BINDING `AssociateWebACL` makes and
+/// `DisassociateWebACL` removes, and what identifies the binding is the pair it binds — so
+/// its physical resource id is that pair rather than a name no call of that service takes
+/// ([`composite_identity_properties`]).
+pub const WAFV2_WEB_ACL_ASSOCIATION: &str = "AWS::WAFv2::WebACLAssociation";
+
+/// The type of an Amazon EKS access entry: the access one IAM principal has to one cluster
+/// (the Amazon EKS model's `awsService.cloudFormationName: EKS`).
+///
+/// Another binding identified by the pair it binds: every operation on an access entry
+/// addresses it by the cluster and the principal, which are that operation's two
+/// `@httpLabel`s, so this type's physical resource id is that pair too
+/// ([`composite_identity_properties`]).
+pub const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
+
+/// The type of an Amazon EKS cluster: the Kubernetes control plane that service runs (the
+/// Amazon EKS model's `awsService.cloudFormationName: EKS`).
+///
+/// "Ref returns the name of the cluster", which is also the handle every Amazon EKS
+/// operation on one takes (`DescribeCluster$name`) and the `Name` property a declaration
+/// states, so the physical resource id the naming rules compute for the type is already the
+/// identifier in force.
+pub const EKS_CLUSTER: &str = "AWS::EKS::Cluster";
+
+/// The type of an Amazon EKS pod identity association: the IAM role one Kubernetes service
+/// account of one cluster assumes (same model).
+///
+/// `CreatePodIdentityAssociation` takes no identifier — a declaration states the cluster,
+/// the namespace, the service account and the role — and answers the association's own ARN
+/// and id, which is why this type's identity is the owning service's
+/// ([`identity_is_service_assigned`]).
+pub const EKS_POD_IDENTITY_ASSOCIATION: &str = "AWS::EKS::PodIdentityAssociation";
+
+/// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
+pub(super) const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
+
+/// The properties whose values ARE a resource's physical resource id, in the order they are
+/// joined in, for a type whose primary identifier is COMPOSITE; the empty list for every
+/// type a single value identifies.
+///
+/// Such a type declares no resource of its own: it is a binding BETWEEN resources, and what
+/// identifies a binding is what it binds — so the physical resource id of one, which is
+/// what `Ref` returns, is those property values joined with
+/// [`COMPOSITE_IDENTITY_SEPARATOR`]:
+///
+/// * `AWS::WAFv2::WebACLAssociation` is `<ResourceArn>|<WebACLArn>`, the pair
+///   `AssociateWebACL` takes and `DisassociateWebACL` removes;
+/// * `AWS::EKS::AccessEntry` is `<ClusterName>|<PrincipalArn>`, the pair every Amazon EKS
+///   operation on an access entry addresses one by.
+///
+/// Because the identity IS the pair, a declaration that re-points either side of it names a
+/// DIFFERENT resource: the deployment replaces the one the stack has
+/// ([`super::provisioning::is_same_resource`]) and the new `Ref` names the new pair, and the
+/// record the stack's own deletion acts on carries exactly the pair to unbind. Every part is
+/// a create-only property of its type for that same reason
+/// ([`replacement_properties`]).
+pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        WAFV2_WEB_ACL_ASSOCIATION => &["ResourceArn", "WebACLArn"],
+        EKS_ACCESS_ENTRY => &["ClusterName", "PrincipalArn"],
+        _ => &[],
+    }
+}
+
+/// The physical resource id a type's composite primary identifier makes of one RESOLVED
+/// property document ([`composite_identity_properties`]).
+///
+/// `None` for a type that has no such identifier, and for a declaration that leaves one of
+/// its parts out or states it as something other than a scalar: that declaration names no
+/// pair at all, so the resource keeps the identity the naming rules computed and the owning
+/// service's own validation of the missing member is what judges it.
+pub fn composite_identity(resource_type: &str, properties: &Value) -> Option<String> {
+    let parts = composite_identity_properties(resource_type);
+    if parts.is_empty() {
+        return None;
+    }
+    let properties = properties.as_object()?;
+    let values: Option<Vec<String>> = parts
+        .iter()
+        .map(|part| properties.get(*part).and_then(scalar_text))
+        .collect();
+    Some(values?.join(COMPOSITE_IDENTITY_SEPARATOR))
+}
+
+/// Give a resource the physical id its type's composite primary identifier makes it, where
+/// its type has one.
+///
+/// A composite identity is a function of the resource's RESOLVED properties — the other
+/// resources the binding names resolve to their own identifiers first — so this is applied
+/// where those are filled in ([`resolve_properties`]) rather than where the naming rules run.
+/// A type with no composite identifier is left exactly as it is.
+pub(super) fn adopt_composite_identity(resource: &mut StoredResource) {
+    let Some(identity) = composite_identity(&resource.resource_type, &resource.properties) else {
+        return;
+    };
+    adopt_identity(resource, identity);
+}
+
+/// The three AWS Backup resource types a stack creates in that service (the AWS Backup
+/// model: `cloudFormationName: Backup`).
+///
+/// A VAULT is keyed by the name the template states: "Ref returns the backup vault name",
+/// which is the `@httpLabel` `CreateBackupVault`, `DescribeBackupVault` and
+/// `DeleteBackupVault` all address one by, so its physical id is that name
+/// ([`naming_rules`] holds a generated one to the name form that service publishes).
+///
+/// A PLAN's and a SELECTION's identifiers are AWS Backup's OWN to mint — `Ref` of a plan
+/// returns the `BackupPlanId` `CreateBackupPlan` answered with, and `CreateBackupSelection`
+/// answers the `SelectionId` it assigned, neither create taking an identifier — so what a
+/// stack reports for one is the id that service answered with, which is what
+/// `GetBackupPlan`, `ListBackupSelections` and `GetBackupSelection` resolve. That is what
+/// [`identity_is_service_assigned`] names both types for.
+pub const BACKUP_VAULT: &str = "AWS::Backup::BackupVault";
+pub const BACKUP_PLAN: &str = "AWS::Backup::BackupPlan";
+pub const BACKUP_SELECTION: &str = "AWS::Backup::BackupSelection";
+
+/// AWS Backup's ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`backup`) — the service segment of a backup vault ARN.
+pub const BACKUP_ARN_NAMESPACE: &str = "backup";
+
+/// An Amazon Managed Grafana workspace's resource type (that service's model:
+/// `cloudFormationName: Grafana`). This is a type `super::provisioning` creates in that
+/// service itself, and `Ref` of the type returns the workspace id — a `^g-[0-9a-f]{10}$`
+/// value only Amazon Managed Grafana mints — so the id a stack's output reports for it is
+/// the one that service answered with.
+pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
+
+/// The three AWS Glue Data Catalog and crawler resource types a stack declares beside its
+/// job definitions (that service's model: `cloudFormationName: Glue`). Each is a type
+/// `super::provisioning` creates in AWS Glue itself, and each one's `Ref` returns the NAME
+/// the declaration states — a database's and a table's inside the input structure the
+/// owning API takes it in ([`declared_name_path`]), a crawler's as its own `Name` property
+/// — which is the identifier every AWS Glue operation on one of them addresses it by, so
+/// none of the three has a service-assigned identity.
+pub const GLUE_DATABASE: &str = "AWS::Glue::Database";
+pub const GLUE_TABLE: &str = "AWS::Glue::Table";
+pub const GLUE_CRAWLER: &str = "AWS::Glue::Crawler";
+
+/// An Amazon GuardDuty detector's resource type (the GuardDuty model:
+/// `cloudFormationName: GuardDuty`). This is a type `super::provisioning` creates in
+/// GuardDuty itself, and "Ref returns the detector's id" — `CreateDetector` takes no
+/// identifier and MINTS one — so the id a stack's output reports for it is the one that
+/// service answered with.
+pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
+
+/// An Amazon GuardDuty trusted IP list's resource type (the same
+/// `cloudFormationName: GuardDuty`). This is a type `super::provisioning` creates in
+/// GuardDuty itself, and `Ref` returns the IPSet's id — `CreateIPSet` takes no identifier
+/// and MINTS one, which is the `IpSetId` `GetIPSet`, `UpdateIPSet` and `DeleteIPSet`
+/// address the list by — so the id a stack reports for the resource is the one that
+/// service answered with. That is what [`identity_is_service_assigned`] names it for.
+pub const GUARDDUTY_IP_SET: &str = "AWS::GuardDuty::IPSet";
+
+/// The two Amazon RDS Proxy resource types a stack creates in that service (the Amazon RDS
+/// model: `cloudFormationName: RDS`).
+///
+/// `AWS::RDS::DBProxy`'s `Ref` returns the `DBProxyName` the declaration states, which is
+/// the identifier every Amazon RDS call on a proxy takes — so it has no service-assigned
+/// identity. `AWS::RDS::DBProxyTargetGroup`'s does: a proxy comes up with the one target
+/// group it has, and that type's `Ref` returns the `TargetGroupArn` Amazon RDS minted for
+/// it, which no naming rule could compute — which is what
+/// [`identity_is_service_assigned`] names it for.
+pub const RDS_DB_PROXY: &str = "AWS::RDS::DBProxy";
+pub const RDS_DB_PROXY_TARGET_GROUP: &str = "AWS::RDS::DBProxyTargetGroup";
+
+/// An AWS X-Ray sampling rule's resource type (the X-Ray model:
+/// `cloudFormationName: XRay`). This is a type `super::provisioning` creates in X-Ray
+/// itself, and the type's identity is the `RuleARN` `CreateSamplingRule` MINTS — a
+/// declaration states the rule's name, never its ARN, and that ARN is what every X-Ray
+/// call on a rule can address it by — so the identifier a stack reports for the resource
+/// is the one that service answered with ([`identity_is_service_assigned`] names it for
+/// exactly that).
+pub const XRAY_SAMPLING_RULE: &str = "AWS::XRay::SamplingRule";
+
+/// A KMS key's resource type (the KMS model: `cloudFormationName: KMS`). This is a type
+/// `super::provisioning` creates in KMS itself, and "Ref returns the key ID" — `CreateKey`
+/// takes no identifier and MINTS the key id — so the id a stack reports for the resource,
+/// and the ARN built from it, are the ones KMS answered with and the ones
+/// `kms DescribeKey` (and every service that resolves a `KmsMasterKeyId`) resolves.
+pub const KMS_KEY: &str = "AWS::KMS::Key";
+
+/// A KMS alias's resource type (the same `cloudFormationName: KMS`). This is a type
+/// `super::provisioning` creates in KMS itself, and "Ref returns the alias name" — the
+/// `AliasName` the declaration states, which is what `CreateAlias` creates the alias under
+/// and what every operation taking a `KeyId` resolves to the key the alias points at. The
+/// type publishes no `Fn::GetAtt` attribute, so the name is the whole of what a stack
+/// reports for one, and no naming rule computes it: an alias KMS would refuse the name of
+/// is the refusal that service answers, which is what the deployment reports.
+pub const KMS_ALIAS: &str = "AWS::KMS::Alias";
+
+/// KMS's ARN namespace, which is its model's own `awsService.arnNamespace` (`kms`) — the
+/// service segment of a key ARN.
+pub const KMS_ARN_NAMESPACE: &str = "kms";
+
+/// The three Route 53 Resolver resource types a stack creates in that service (the
+/// Route 53 Resolver model: `cloudFormationName: Route53Resolver`).
+///
+/// Each one's identifier is Route 53 Resolver's OWN to mint — `Ref` of an endpoint returns
+/// its `rslvr-out-…`/`rslvr-in-…` id, of a rule its `rslvr-rr-…` id and of a rule
+/// association its `rslvr-rrassoc-…` id, and none of the three creates takes an identifier
+/// — so the id a stack's output reports for one is the id that service answered with, which
+/// is what `GetResolverEndpoint`, `GetResolverRule` and `GetResolverRuleAssociation`
+/// resolve.
+pub const ROUTE53RESOLVER_ENDPOINT: &str = "AWS::Route53Resolver::ResolverEndpoint";
+pub const ROUTE53RESOLVER_RULE: &str = "AWS::Route53Resolver::ResolverRule";
+pub const ROUTE53RESOLVER_RULE_ASSOCIATION: &str =
+    "AWS::Route53Resolver::ResolverRuleAssociation";
+
+/// The three Route 53 Resolver DNS Firewall resource types a stack creates in that service
+/// (the same `cloudFormationName: Route53Resolver`).
+///
+/// Each one's identifier is Route 53 Resolver's OWN to mint, exactly as for the three types
+/// above: `Ref` of a domain list returns its `rslvr-fdl-…` id, of a rule group its
+/// `rslvr-frg-…` id and of a rule group association its `rslvr-frgassoc-…` id, and none of
+/// the three calls that make them takes an identifier — a `Name` such a type declares is only
+/// "a name that lets you identify [it], to manage and use it". So the id a stack's output
+/// reports for one is the id that service answered with, which is what
+/// `GetFirewallDomainList`, `GetFirewallRuleGroup` and `GetFirewallRuleGroupAssociation`
+/// resolve.
+pub const ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST: &str =
+    "AWS::Route53Resolver::FirewallDomainList";
+pub const ROUTE53RESOLVER_FIREWALL_RULE_GROUP: &str = "AWS::Route53Resolver::FirewallRuleGroup";
+pub const ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION: &str =
+    "AWS::Route53Resolver::FirewallRuleGroupAssociation";
+
+/// The two Amazon Route 53 resource types a stack creates in that service (the Route 53
+/// model: `cloudFormationName: Route53`).
+///
+/// A hosted zone's identifier is Route 53's OWN to mint: "Ref returns the hosted zone ID",
+/// `CreateHostedZone` takes no identifier and answers the `Z…` id it assigned, and that id
+/// — not the zone's DNS name, which is only what the zone is CALLED — is what every
+/// operation on the zone takes (`GetHostedZone$Id`, `TestDNSAnswer$HostedZoneId` and a
+/// record set's own `HostedZoneId`, each a `ResourceId` of at most 32 characters). A record
+/// set's identifier is CloudFormation's: "Ref returns the record name", which is the `Name`
+/// its declaration states.
+pub const ROUTE53_HOSTED_ZONE: &str = "AWS::Route53::HostedZone";
+pub const ROUTE53_RECORD_SET: &str = "AWS::Route53::RecordSet";
+
+/// A health check of Amazon Route 53's, the third type a stack creates in that service.
+///
+/// Its identifier is Route 53's own to mint the same way a hosted zone's is: "Ref returns
+/// the health check ID", `CreateHealthCheck` takes no identifier and answers the id it
+/// assigned, and that id — not any name, since the type declares none — is what every
+/// operation on the health check takes (`GetHealthCheck$HealthCheckId`,
+/// `UpdateHealthCheck$HealthCheckId` and a record set's own `HealthCheckId`).
+pub const ROUTE53_HEALTH_CHECK: &str = "AWS::Route53::HealthCheck";
+
+/// The first character of a hosted zone id, and how many follow it.
+///
+/// Route 53 publishes a hosted zone id as `Z` followed by uppercase alphanumerics
+/// (`Z1D633PJN98FT9` in `ChangeResourceRecordSets`' own examples), inside the 32-character
+/// bound its `ResourceId` shape fixes. What [`return_values`] computes is a STAND-IN of that
+/// shape: this is also the type `super::provisioning` creates in Route 53 itself, which
+/// answers with the id IT minted — and THAT id is what the stack reports for a zone Route 53
+/// created.
+pub(super) const HOSTED_ZONE_ID_PREFIX: &str = "Z";
+pub(super) const HOSTED_ZONE_ID_DIGITS: usize = 14;
+
+/// What the digest behind that stand-in is salted with: the resource TYPE, so the digits are
+/// this type's own and cannot collide with another arm's for a resource of the same name
+/// ([`derived_digits`] — "the `salt` keeps two identifiers OF ONE resource … from being the
+/// same digits").
+pub(super) const HOSTED_ZONE_ID_SALT: &str = "route53-hosted-zone";
+
+/// An AWS Certificate Manager ACME endpoint's resource type (the ACM model:
+/// `cloudFormationName: CertificateManager`). This is a type `super::provisioning`
+/// creates in ACM itself, and the identifier the provider reports for it is the
+/// `AcmeEndpointArn` ACM minted — an ARN `CreateAcmeEndpoint` ASSIGNS, which no naming
+/// rule could compute — so the identifier a stack reports for the resource is the value
+/// `acm DescribeAcmeEndpoint` resolves.
+pub const ACM_ACME_ENDPOINT: &str = "AWS::CertificateManager::AcmeEndpoint";
+
+/// An AWS Certificate Manager certificate's resource type (the same model's
+/// `cloudFormationName: CertificateManager`). This is a type `super::provisioning` creates
+/// in ACM itself, and the identifier the provider reports for it is the `CertificateArn`
+/// ACM minted — an ARN `RequestCertificate` ASSIGNS, which no naming rule could compute —
+/// so the identifier a stack reports for the resource is the value `acm DescribeCertificate`
+/// resolves ("Ref returns the certificate ARN").
+pub const ACM_CERTIFICATE: &str = "AWS::CertificateManager::Certificate";
+
+/// An Amazon Web Services Private CA certificate authority's resource type (the acm-pca
+/// model: `cloudFormationName: ACMPCA`). This is a type `super::provisioning` creates in
+/// that service itself, and the identifier the provider reports for it is the
+/// `CertificateAuthorityArn` acm-pca minted — an ARN `CreateCertificateAuthority` ASSIGNS,
+/// which no naming rule could compute — so the identifier a stack reports and exports for
+/// the resource is the one `acm-pca DescribeCertificateAuthority` resolves ("Ref returns
+/// the Amazon Resource Name (ARN) of the private CA").
+pub const ACMPCA_CERTIFICATE_AUTHORITY: &str = "AWS::ACMPCA::CertificateAuthority";
+
+/// The certificate an `AWS::ACMPCA::Certificate` has a private CA issue (the same acm-pca
+/// model). `IssueCertificate` ASSIGNS its `CertificateArn` — "Ref returns the ARN of the
+/// issued certificate" — so the identifier a stack reports for the resource is the one
+/// `acm-pca GetCertificate` serves, and the certificate BODY it issued is this type's other
+/// published return value (`Fn::GetAtt Certificate`).
+pub const ACMPCA_CERTIFICATE: &str = "AWS::ACMPCA::Certificate";
+
+/// The activation of a private CA with a certificate issued for it (the same acm-pca
+/// model): the type whose deployment imports that certificate into the CA and puts the CA
+/// in the status the declaration asks for. Its identity IS the CA it activates — that is
+/// the one resource the activation exists about — and its published return value is the
+/// complete chain the CA then presents (`Fn::GetAtt CompleteCertificateChain`).
+pub const ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION: &str =
+    "AWS::ACMPCA::CertificateAuthorityActivation";
+
+/// An Amazon EventBridge rule's resource type (the EventBridge model:
+/// `cloudFormationName: Events`). This is a type `super::provisioning` creates in
+/// EventBridge itself, and "Ref returns the rule name", so the rule a stack's output names
+/// is the one `events DescribeRule` answers with.
+pub const EVENTS_RULE: &str = "AWS::Events::Rule";
+
+/// The event bus a rule declaring none is bound to — "if you omit this, the default event
+/// bus is used" (`PutRule$EventBusName`) — and the one bus whose name a rule ARN does not
+/// carry a segment for.
+pub(super) const DEFAULT_EVENT_BUS: &str = "default";
+
+/// The bus NAME an `EventBusName` property names.
+///
+/// EventBridge's `EventBusNameOrArn` admits either a bare name or an event-bus ARN, so an
+/// ARN is reduced to everything after its `event-bus/` resource-type segment — the whole
+/// remainder, not the text after the last `/`, because a bus name may itself carry `/`.
+pub(super) fn event_bus_name(declared: &str) -> String {
+    match declared.split_once(":event-bus/") {
+        Some((_, name)) => name.to_string(),
+        None => declared.to_string(),
+    }
+}
+
+/// The ARN namespace AWS Step Functions mints its resources under: that model's
+/// `awsService.arnNamespace`, which is `states` rather than the `StepFunctions` its
+/// resource types are spelled with.
+pub const STEP_FUNCTIONS_ARN_NAMESPACE: &str = "states";
+
+/// An AWS Step Functions activity's resource type (the Step Functions model:
+/// `cloudFormationName: StepFunctions`, `arnNamespace: states`). This is a type
+/// `super::provisioning` creates in Step Functions itself, and "Ref returns the ARN of the
+/// activity", so the handle a stack publishes for one is the ARN `sfn DescribeActivity`
+/// answers with.
+pub const STEP_FUNCTIONS_ACTIVITY: &str = "AWS::StepFunctions::Activity";
+
+/// A Systems Manager Parameter Store parameter's resource type (the SSM model:
+/// `cloudFormationName: SSM`). This is a type `super::provisioning` creates in Systems
+/// Manager itself, and "Ref returns the name of the parameter", so the parameter a stack
+/// declares is the one `ssm GetParameter` answers with.
+pub const SSM_PARAMETER: &str = "AWS::SSM::Parameter";
+
+/// An EventBridge Scheduler schedule group's resource type (that model:
+/// `cloudFormationName: Scheduler`, `arnNamespace: scheduler`). This is a type
+/// `super::provisioning` creates in EventBridge Scheduler itself, and "Ref returns the
+/// schedule group name", so the group a stack declares is the one
+/// `scheduler GetScheduleGroup` answers with.
+pub const SCHEDULER_SCHEDULE_GROUP: &str = "AWS::Scheduler::ScheduleGroup";
+
+/// An EventBridge Scheduler schedule's resource type. Also created in that service, and
+/// "Ref returns the schedule name", so the schedule a stack declares is one
+/// `scheduler ListSchedules` reports under its group.
+pub const SCHEDULER_SCHEDULE: &str = "AWS::Scheduler::Schedule";
+
+/// The ARN namespace EventBridge Scheduler mints its resources under (that model's
+/// `awsService.arnNamespace`).
+pub const SCHEDULER_ARN_NAMESPACE: &str = "scheduler";
+
+/// The schedule group a schedule declaring none lands in: `GetSchedule$GroupName` — "the
+/// name of the schedule group associated with this schedule. If you omit this, the default
+/// schedule group is used" — whose name is `default`, and the group whose name a schedule's
+/// ARN still carries a segment for (`schedule/<group>/<name>`).
+pub const DEFAULT_SCHEDULE_GROUP: &str = "default";
+
+/// How many characters the id Amazon GuardDuty mints for a detector carries: 32 lowercase
+/// hexadecimal, the form that service's own `mint_id` produces (`DETECTOR_ID_LEN` in
+/// `services/service-com-amazonaws-guardduty-guarddutyapiservice/src/state.rs`).
+pub(super) const DETECTOR_ID_HEX_DIGITS: usize = 32;
+
+/// The salt the stand-in detector id is derived under (see [`derived_digits`]), so it
+/// cannot collide with another identifier derived for the same resource.
+pub(super) const DETECTOR_ID_SALT: &str = "guardduty/detector-id";
+
+/// The salt the stand-in IPSet id is derived under (see [`derived_digits`]), so the
+/// identifier computed for a trusted IP list cannot collide with the one computed for a
+/// detector of the same name. The WIDTH is [`DETECTOR_ID_HEX_DIGITS`]: GuardDuty mints an
+/// `IpSetId` with the same `mint_id` it mints a detector id with.
+pub(super) const IP_SET_ID_SALT: &str = "guardduty/ip-set-id";
+
+/// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
+/// FIS's own `TEMPLATE_ID_PREFIX`).
+pub(super) const FIS_TEMPLATE_ID_PREFIX: &str = "EXT";
+
+/// How many characters follow [`FIS_TEMPLATE_ID_PREFIX`] in an experiment-template id:
+/// FIS's own `ID_SUFFIX_LEN`, the width of the base-36 suffix every id it mints carries.
+pub(super) const FIS_TEMPLATE_ID_DIGITS: usize = 12;
+
+/// The `AWS::CloudFront::Distribution` resource type: one CloudFront distribution.
+pub const CLOUDFRONT_DISTRIBUTION: &str = "AWS::CloudFront::Distribution";
+
+/// The `AWS::CloudFront::OriginAccessControl` resource type: the origin access control an
+/// origin is read through.
+pub const CLOUDFRONT_ORIGIN_ACCESS_CONTROL: &str = "AWS::CloudFront::OriginAccessControl";
+
+/// The `AWS::CloudFront::CloudFrontOriginAccessIdentity` resource type: the legacy origin
+/// access identity an Amazon S3 bucket policy names by canonical user id.
+pub const CLOUDFRONT_ORIGIN_ACCESS_IDENTITY: &str =
+    "AWS::CloudFront::CloudFrontOriginAccessIdentity";
+
+/// CloudFront's three policy resource types, each identified by a UUID CloudFront mints.
+pub const CLOUDFRONT_CACHE_POLICY: &str = "AWS::CloudFront::CachePolicy";
+pub const CLOUDFRONT_ORIGIN_REQUEST_POLICY: &str = "AWS::CloudFront::OriginRequestPolicy";
+pub const CLOUDFRONT_RESPONSE_HEADERS_POLICY: &str = "AWS::CloudFront::ResponseHeadersPolicy";
+
+/// The Amazon API Gateway resource types whose published `Ref` is a SERVICE-ASSIGNED id
+/// rather than a name a template states: a REST API, a resource of one, and a deployment
+/// of one.
+pub const APIGATEWAY_REST_API: &str = "AWS::ApiGateway::RestApi";
+pub const APIGATEWAY_RESOURCE: &str = "AWS::ApiGateway::Resource";
+pub const APIGATEWAY_DEPLOYMENT: &str = "AWS::ApiGateway::Deployment";
+
+/// `AWS::ApiGateway::DomainName`: a custom domain name of the REST control plane, which a
+/// stack creates in API Gateway itself ([`super::provisioner`]).
+///
+/// "Ref returns the domain name" — the name the template states in its own `DomainName`
+/// property, which is this type's identifier ([`declared_name_property`]) — while every
+/// attribute the type publishes (the CloudFront distribution an edge-optimized domain is
+/// served by, the host a regional one is served on, the ARN API Gateway names the domain
+/// by) is a value only that service assigns, so each is read off the create's answer rather
+/// than computed by the naming rules ([`return_values`] carries no arm for this type).
+pub const APIGATEWAY_DOMAIN_NAME: &str = "AWS::ApiGateway::DomainName";
+
+/// The Amazon API Gateway v2 resource types a stack creates in that service.
+///
+/// `AWS::ApiGatewayV2::Api`: "Ref returns the API ID", and `Fn::GetAtt` reads
+/// `ApiEndpoint` — the API Gateway v2 service MINTS both (`CreateApi` takes no identifier
+/// and answers the `ApiId` it assigned together with the endpoint it serves the api on),
+/// which is why [`identity_is_service_assigned`] names this type.
+///
+/// `AWS::ApiGatewayV2::ApiMapping`: "Ref returns the API mapping ID", which
+/// `CreateApiMapping` mints the same way, and which is also this type's one published
+/// `Fn::GetAtt` attribute.
+///
+/// `AWS::ApiGatewayV2::DomainName`: "Ref returns the domain name" — the name the template
+/// states, which is this type's own identifier — and `Fn::GetAtt` reads
+/// `RegionalDomainName` and `RegionalHostedZoneId`, the two values that service resolves
+/// for the regional endpoint it serves the domain on.
+pub const APIGATEWAYV2_API: &str = "AWS::ApiGatewayV2::Api";
+pub const APIGATEWAYV2_API_MAPPING: &str = "AWS::ApiGatewayV2::ApiMapping";
+pub const APIGATEWAYV2_DOMAIN_NAME: &str = "AWS::ApiGatewayV2::DomainName";
+
+/// The Amazon API Gateway v2 resource types whose resources live INSIDE an api — the ones a
+/// stack declares to make the api it deployed serve anything at all.
+///
+/// `AWS::ApiGatewayV2::Integration`: "Ref returns the integration ID",
+/// `AWS::ApiGatewayV2::Route`: "Ref returns the route ID",
+/// `AWS::ApiGatewayV2::Deployment`: "Ref returns the deployment ID" and
+/// `AWS::ApiGatewayV2::Authorizer`: "Ref returns the authorizer ID" — each of those ids is
+/// MINTED by API Gateway v2 (its create takes no identifier and answers the one it
+/// assigned), which is why [`identity_is_service_assigned`] names all four.
+///
+/// `AWS::ApiGatewayV2::Stage` is not one of them: "Ref returns the stage name", the name the
+/// template states, which is this type's own identifier.
+pub const APIGATEWAYV2_INTEGRATION: &str = "AWS::ApiGatewayV2::Integration";
+pub const APIGATEWAYV2_ROUTE: &str = "AWS::ApiGatewayV2::Route";
+pub const APIGATEWAYV2_STAGE: &str = "AWS::ApiGatewayV2::Stage";
+pub const APIGATEWAYV2_DEPLOYMENT: &str = "AWS::ApiGatewayV2::Deployment";
+pub const APIGATEWAYV2_AUTHORIZER: &str = "AWS::ApiGatewayV2::Authorizer";
+
+/// How many characters follow the `E` of a CloudFront-assigned identifier.
+///
+/// CloudFront mints a distribution id, an origin access control id and an origin access
+/// identity id in one shape: `E` and 13 more characters — the form
+/// `CloudFrontOriginAccessIdentity$Id` documents by example ("for example,
+/// E74FTE3AJFJ256A") and the one this emulator's own CloudFront service mints an id in.
+pub(super) const CLOUDFRONT_ID_BODY_LEN: usize = 13;
+
+/// How many characters an API-Gateway-assigned identifier carries: ten, the width of the
+/// `RestApi`, `Resource` and `Deployment` ids API Gateway mints (and the width this
+/// emulator's own API Gateway service mints one in).
+pub(super) const APIGATEWAY_ID_LEN: usize = 10;
+
+/// How many lowercase hexadecimal characters an Amazon S3 canonical user id carries: 64,
+/// the width S3 writes one in (and the width this emulator's CloudFront service mints the
+/// canonical user id of an origin access identity in).
+pub(super) const S3_CANONICAL_USER_ID_HEX_CHARS: usize = 64;
+
+/// The salts the identifiers above are derived under — one per identifier, so two ids of
+/// ONE resource are never the same digits (see [`derived_digits`]).
+pub(super) const CLOUDFRONT_DISTRIBUTION_ID_SALT: &str = "cloudfront/distribution-id";
+pub(super) const CLOUDFRONT_DISTRIBUTION_DOMAIN_SALT: &str = "cloudfront/distribution-domain-label";
+pub(super) const CLOUDFRONT_ORIGIN_ACCESS_CONTROL_ID_SALT: &str = "cloudfront/origin-access-control-id";
+pub(super) const CLOUDFRONT_ORIGIN_ACCESS_IDENTITY_ID_SALT: &str = "cloudfront/origin-access-identity-id";
+pub(super) const CLOUDFRONT_S3_CANONICAL_USER_ID_SALT: &str = "cloudfront/s3-canonical-user-id";
+pub(super) const APIGATEWAY_REST_API_ID_SALT: &str = "apigateway/rest-api-id";
+pub(super) const APIGATEWAY_ROOT_RESOURCE_ID_SALT: &str = "apigateway/root-resource-id";
+pub(super) const APIGATEWAY_RESOURCE_ID_SALT: &str = "apigateway/resource-id";
+pub(super) const APIGATEWAY_DEPLOYMENT_ID_SALT: &str = "apigateway/deployment-id";
+pub(super) const APIGATEWAYV2_API_ID_SALT: &str = "apigatewayv2/api-id";
+pub(super) const APIGATEWAYV2_API_MAPPING_ID_SALT: &str = "apigatewayv2/api-mapping-id";
+pub(super) const APIGATEWAYV2_DOMAIN_LABEL_SALT: &str = "apigatewayv2/regional-domain-label";
+
+/// An identifier of the shape CloudFront ASSIGNS one in: `E` followed by
+/// [`CLOUDFRONT_ID_BODY_LEN`] uppercase characters.
+///
+/// The characters are uppercase hexadecimal, a subset of the base-36 alphabet CloudFront
+/// mints from — a stand-in of the right shape, stable across reads for the reason
+/// [`derived_digits`] gives.
+pub(super) fn cloudfront_assigned_id(salt: &str, name: &str) -> String {
+    format!(
+        "E{}",
+        derived_digits(salt, name, CLOUDFRONT_ID_BODY_LEN, Alphabet::Upper)
+    )
+}
+
+/// The domain name CloudFront serves a distribution on: `d<label>.cloudfront.net`.
+///
+/// `Distribution$DomainName` is "The domain name that corresponds to the distribution …
+/// such as d111111abcdef8.cloudfront.net" — a generated label under CloudFront's own
+/// `cloudfront.net` zone, in the lowercase a DNS label takes. It is a DIFFERENT value from
+/// the distribution's id, so it is derived under its own salt.
+pub(super) fn cloudfront_distribution_domain_name(name: &str) -> String {
+    format!(
+        "d{}.{CLOUDFRONT_DOMAIN_SUFFIX}",
+        derived_digits(
+            CLOUDFRONT_DISTRIBUTION_DOMAIN_SALT,
+            name,
+            CLOUDFRONT_ID_BODY_LEN,
+            Alphabet::Lower,
+        )
+    )
+}
+
+/// The DNS zone CloudFront serves a distribution's own domain name under — not
+/// [`URL_SUFFIX`], which is where the AWS service endpoints live.
+pub(super) const CLOUDFRONT_DOMAIN_SUFFIX: &str = "cloudfront.net";
+
+/// An identifier of the shape API Gateway ASSIGNS one in: [`APIGATEWAY_ID_LEN`] lowercase
+/// characters, drawn from the same derivation as every other identifier here.
+pub(super) fn api_gateway_assigned_id(salt: &str, name: &str) -> String {
+    derived_digits(salt, name, APIGATEWAY_ID_LEN, Alphabet::Lower)
+}
+
+/// The URI an API Gateway v2 api is invoked on: "The URI of the API, of the form
+/// `{api-id}.execute-api.{region}.amazonaws.com`" (`Api$ApiEndpoint`), under the scheme
+/// the api's protocol speaks — a WEBSOCKET api is reached over `wss`, an HTTP api over
+/// `https`.
+///
+/// The protocol comes from the resource's own declared `ProtocolType`, evaluated through
+/// the template's intrinsics like any other property, and an api whose declaration names
+/// none is an HTTP one, that being the only other value of the modelled enum.
+pub(super) fn apigatewayv2_api_endpoint(
+    api_id: &str,
+    region: &str,
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> String {
+    let websocket = properties
+        .get("ProtocolType")
+        .and_then(|value| text(value, scope, 0, budget))
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case(APIGATEWAYV2_WEBSOCKET_PROTOCOL));
+    let scheme = if websocket { "wss" } else { "https" };
+    format!("{scheme}://{api_id}.execute-api.{region}.{URL_SUFFIX}")
+}
+
+/// The `ProtocolType` whose apis are reached over the WebSocket scheme, out of the
+/// `HTTP | WEBSOCKET` enum API Gateway v2's model declares.
+pub(super) const APIGATEWAYV2_WEBSOCKET_PROTOCOL: &str = "WEBSOCKET";
+
+/// The ARN namespace API Gateway v2's resources live in, which is that model's own
+/// `awsService.arnNamespace` (`apigateway`) rather than the `ApiGatewayV2` its resource
+/// types are spelled with.
+pub(super) const APIGATEWAYV2_ARN_NAMESPACE: &str = "apigateway";
+
+/// The regional host API Gateway serves a custom domain name on
+/// (`DomainNameConfiguration$ApiGatewayDomainName`): the
+/// `d-{id}.execute-api.{region}.amazonaws.com` form a caller aliases their own DNS record
+/// to, with the id derived here for the reason [`derived_digits`] gives and replaced by
+/// the one API Gateway v2 really assigned once the domain is created there.
+pub(super) fn apigatewayv2_regional_domain_name(name: &str, region: &str) -> String {
+    format!(
+        "d-{}.execute-api.{region}.{URL_SUFFIX}",
+        api_gateway_assigned_id(APIGATEWAYV2_DOMAIN_LABEL_SALT, name)
+    )
+}
+
+/// The revision a task definition registered for a family the account does not hold yet
+/// carries: "the first task definition that you registered to a family is given a revision
+/// of 1".
+pub(super) const FIRST_TASK_DEFINITION_REVISION: u32 = 1;
+
+/// How many characters the id Elastic Load Balancing assigns a load balancer, a target
+/// group or a listener carries: 16 lowercase hexadecimal, the form that service's own
+/// `mint_id` produces (`.../app/my-load-balancer/50dc6c495c0c9188`).
+pub(super) const ELB_ID_HEX_DIGITS: usize = 16;
+
+/// The salts those ids are derived under (see [`service_assigned_label`]) — one PER KIND,
+/// because Elastic Load Balancing keeps the two name spaces apart (a load balancer and a
+/// target group may carry the same name) while the ids it assigns them are distinct.
+pub(super) const ELB_LOAD_BALANCER_ID_SALT: &str = "elasticloadbalancing/loadbalancer-id";
+pub(super) const ELB_TARGET_GROUP_ID_SALT: &str = "elasticloadbalancing/targetgroup-id";
+
+/// The `Scheme` value of an INTERNAL load balancer, whose DNS name carries the
+/// `internal-` prefix.
+pub(super) const ELB_SCHEME_INTERNAL: &str = "internal";
+
+/// The segment a load balancer's ARN carries for its `Type`: "`app` for an Application
+/// Load Balancer, `net` for a Network Load Balancer, `gwy` for a Gateway Load Balancer",
+/// with `application` the modelled default for the property.
+pub(super) fn load_balancer_type_code(
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> &'static str {
+    match properties
+        .get("Type")
+        .and_then(|value| text(value, scope, 0, budget))
+        .as_deref()
+    {
+        Some("network") => "net",
+        Some("gateway") => "gwy",
+        _ => "app",
+    }
+}
+
+/// Fill in each resource's evaluated `Properties`, against the whole set of resources the
+/// template declares.
+///
+/// This is the request the service that owns a resource is asked to create it with
+/// ([`super::provisioning`](crate::state::provisioning)), so every intrinsic function in
+/// the properties is evaluated here: a property naming another resource (a stream's
+/// `RoleARN` from an `Fn::GetAtt`) carries that resource's value, and one that cannot be
+/// evaluated is DROPPED rather than sent as a guess — which is also what CloudFormation's
+/// own `AWS::NoValue` means ("removes the corresponding resource property").
+///
+/// `resources` is what [`provision`] produced for `template`. A declaration whose
+/// `Condition` excluded it has no record there, so each record is matched to its
+/// declaration by LOGICAL ID rather than by position.
+pub fn resolve_properties(
+    template: &Template,
+    resources: &mut [StoredResource],
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) {
+    for resource in resources.iter_mut() {
+        let Some(declared) = template
+            .resources
+            .iter()
+            .find(|declared| declared.logical_id == resource.logical_id)
+        else {
+            continue;
+        };
+        resource.properties =
+            resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null);
+        // A type whose primary identifier is COMPOSITE takes its physical id from that
+        // resolved document: this is the first point at which the resources the binding
+        // names have resolved to the identifiers they really carry.
+        adopt_composite_identity(resource);
+    }
+}
+
+/// One template value with every intrinsic function it carries evaluated, preserving the
+/// objects and arrays around them; `None` for a value that cannot be evaluated at all.
+///
+/// The one entry point for evaluating a value OUTSIDE a deployment: comparing what two
+/// revisions of a template declare for one property has to compare the values each would
+/// really deploy, since a property that reads `!Ref Size` is a different value under a
+/// different parameter value while the template text is the same.
+pub fn resolve(value: &Value, scope: &Scope<'_>, budget: &mut Budget) -> Option<Value> {
+    resolved_value(value, scope, 0, budget)
+}
+
+/// One template value with every intrinsic function it carries evaluated, preserving the
+/// objects and arrays around them; `None` for a value that cannot be evaluated at all.
+pub(super) fn resolved_value(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Value> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    budget.spend(1)?;
+    match value {
+        Value::Object(members) => {
+            // An intrinsic function is a single-member object whose name is the
+            // function's; anything else is a property map.
+            if let Some((name, argument)) = sole_intrinsic(members) {
+                // Through the SAME guard the output path uses: the value's size is held
+                // to `MAX_RESOLVED_TEXT_BYTES` and its bytes are charged against the
+                // deployment's budget, so evaluating a property cannot amplify what
+                // evaluating an output cannot.
+                let resolved = intrinsic(name, argument, scope, depth, budget)?;
+                return match bounded(resolved, budget)? {
+                    Resolved::Text(text) => Some(Value::String(text)),
+                    Resolved::List(items) => {
+                        Some(Value::Array(items.into_iter().map(Value::String).collect()))
+                    }
+                };
+            }
+            Some(Value::Object(
+                members
+                    .iter()
+                    .filter_map(|(key, member)| {
+                        Some((
+                            key.clone(),
+                            resolved_value(member, scope, depth + 1, budget)?,
+                        ))
+                    })
+                    .collect(),
+            ))
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            Some(Value::Array(
+                items
+                    .iter()
+                    .filter_map(|item| resolved_value(item, scope, depth + 1, budget))
+                    .collect(),
+            ))
+        }
+        scalar => {
+            budget.spend_text(scalar_text(scalar).map_or(1, |text| text.len()))?;
+            Some(scalar.clone())
+        }
+    }
+}
+
+/// The intrinsic function a single-member object names, if it names one: `Ref`, or one of
+/// the `Fn::`-prefixed functions.
+pub(super) fn sole_intrinsic(members: &Map<String, Value>) -> Option<(&str, &Value)> {
+    let mut entries = members.iter();
+    let (name, argument) = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    (name == "Ref" || name.starts_with("Fn::")).then_some((name.as_str(), argument))
+}
+
+/// How many hexadecimal characters the service-assigned label of an Amazon RDS endpoint
+/// carries: an RDS endpoint's middle label is 12 characters
+/// (`mydb.cluster-c7g8h9i0j1k2.us-east-1.rds.amazonaws.com`).
+pub(super) const RDS_ENDPOINT_LABEL_HEX_DIGITS: usize = 12;
+
+/// The salt an RDS endpoint label is derived under (see [`service_assigned_label`]).
+pub(super) const RDS_ENDPOINT_LABEL_SALT: &str = "rds/endpoint";
+
+/// The salt a Secrets Manager secret ARN's suffix is derived under, so a secret's ARN
+/// suffix and any endpoint label of the same name are different digits.
+pub(super) const SECRET_ARN_SUFFIX_SALT: &str = "secretsmanager/secret";
+
+/// How many characters an Amazon RDS immutable resource id carries after its prefix:
+/// `DbClusterResourceId`/`DbiResourceId` are published as `cluster-`/`db-` plus 26
+/// characters.
+pub(super) const RDS_RESOURCE_ID_DIGITS: usize = 26;
+
+/// How many characters the service-assigned suffix of a Secrets Manager secret ARN
+/// carries: "Secrets Manager automatically adds a hyphen and six random characters after
+/// the secret name at the end of the ARN".
+pub(super) const SECRET_ARN_SUFFIX_CHARACTERS: usize = 6;
+
+/// How many hexadecimal characters an Amazon EC2 resource id carries after its prefix: the
+/// current (long) id form is 17 (`sg-0123456789abcdef0`).
+pub(super) const EC2_ID_HEX_DIGITS: usize = 17;
+
+/// The Amazon EC2 VPC-network resource types whose published `Ref` return value is an EC2
+/// resource IDENTIFIER rather than a name.
+///
+/// Amazon EC2 takes no name on any of these creates: it ASSIGNS the resource an identifier
+/// of its own published form (`vpc-`, `subnet-`, `sg-`, `igw-`, … followed by
+/// [`EC2_ID_HEX_DIGITS`] hexadecimal characters). A declaration of one of these types
+/// therefore names the resource nowhere, and CloudFormation's
+/// `<stack name>-<logical id>-<unique id>` name is no identifier any EC2 API would take for
+/// it — which is what each type's own "Return values" section says: "Ref returns the ID of
+/// the VPC", "Ref returns the subnet ID", "Ref returns the ID of the security group", "Ref
+/// returns the ID of the internet gateway", and so on.
+///
+/// [`ec2_network_identity`] is what gives a resource of one of them an identifier of that
+/// form, so a property of another resource that references it (a Resolver endpoint's
+/// `IpAddresses[].SubnetId`, a DB subnet group's `SubnetIds`) carries a value the owning
+/// service's own API accepts instead of a name it refuses.
+///
+/// For the three types this emulator really CREATES in Amazon EC2 — [`EC2_VPC`],
+/// [`EC2_SUBNET`] and [`EC2_SECURITY_GROUP`] ([`super::provisioner`]) — that computed value
+/// is only the STAND-IN a declaration is resolved against before any of those resources
+/// exists: [`identity_is_service_assigned`] names all three, so the identifier in force is
+/// the one EC2 answered its create with. For the rest it is still the identifier the stack
+/// reports, because nothing here holds such a resource yet.
+pub const EC2_VPC: &str = "AWS::EC2::VPC";
+pub const EC2_SUBNET: &str = "AWS::EC2::Subnet";
+pub const EC2_SECURITY_GROUP: &str = "AWS::EC2::SecurityGroup";
+pub const EC2_INTERNET_GATEWAY: &str = "AWS::EC2::InternetGateway";
+pub const EC2_ROUTE_TABLE: &str = "AWS::EC2::RouteTable";
+pub const EC2_NETWORK_ACL: &str = "AWS::EC2::NetworkAcl";
+pub const EC2_NETWORK_INTERFACE: &str = "AWS::EC2::NetworkInterface";
+pub const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
+pub const EC2_VPC_ENDPOINT: &str = "AWS::EC2::VPCEndpoint";
+pub const EC2_DHCP_OPTIONS: &str = "AWS::EC2::DHCPOptions";
+pub const EC2_VPN_GATEWAY: &str = "AWS::EC2::VPNGateway";
+
+/// `AWS::EC2::Volume`: an Amazon EBS volume. It is not a VPC-network type, but its identity
+/// is read exactly the same way — `CreateVolume` takes no name, Amazon EC2 assigns the
+/// `vol-…` identifier and "Ref returns the volume ID" — so a declaration of one carries an
+/// identifier of that form rather than a generated name, and
+/// [`identity_is_service_assigned`] names the type because the identifier in force is the
+/// one that service answered its create with.
+pub const EC2_VOLUME: &str = "AWS::EC2::Volume";
+
+/// The identifier Amazon EC2 assigns a declared resource of one of the VPC-network types
+/// above: `<prefix>-` plus [`EC2_ID_HEX_DIGITS`] lowercase hexadecimal characters, derived
+/// from the resource's name ([`generated_service_id`]) so it is stable across reads and
+/// across a re-deployment of the same declaration.
+///
+/// `identifier_attribute` is the `Fn::GetAtt` attribute that type publishes FOR that
+/// identifier (`VpcId`, `SubnetId`, `GroupId`, `Id`, …), recorded with the same value — so
+/// the id a `Ref` answers and the id that attribute answers cannot disagree. A published
+/// attribute that is the PROPERTY the template declared (a VPC's `CidrBlock`, a subnet's
+/// `AvailabilityZone` and `VpcId`) is attached from the declaration itself
+/// ([`attach_attributes`]), and one that is ANOTHER EC2 resource's identifier (a VPC's
+/// `DefaultSecurityGroup` and `DefaultNetworkAcl`) is left out: nothing here holds that
+/// resource, and reporting an id for one that does not exist would be worse than reporting
+/// none.
+pub(super) fn ec2_network_identity(
+    prefix: &str,
+    identifier_attribute: &str,
+    name: &str,
+    attributes: &mut BTreeMap<String, String>,
+) -> String {
+    let id = generated_service_id(prefix, name, EC2_ID_HEX_DIGITS);
+    attributes.insert(identifier_attribute.to_string(), id.clone());
+    id
+}
+
+/// The `AWS::ECS::Service` resource type: a service running on an ECS cluster.
+pub(super) const ECS_SERVICE: &str = "AWS::ECS::Service";
+
+/// An Elastic Load Balancing v2 listener's and listener rule's resource types. Each one's
+/// published identifier NESTS inside its parent's ARN, which is what [`nested_elb_arn`]
+/// builds and why [`identity_depends_on_another_resource`] names them.
+pub(super) const ELB_LISTENER: &str = "AWS::ElasticLoadBalancingV2::Listener";
+pub(super) const ELB_LISTENER_RULE: &str = "AWS::ElasticLoadBalancingV2::ListenerRule";
+
+/// The salts a listener's and a rule's assigned ids are derived under, beside the load
+/// balancer's and the target group's (see [`service_assigned_label`]).
+pub(super) const ELB_LISTENER_ID_SALT: &str = "elasticloadbalancing/listener-id";
+pub(super) const ELB_LISTENER_RULE_ID_SALT: &str = "elasticloadbalancing/listener-rule-id";
+
+/// The ARN resource segment of each Elastic Load Balancing v2 resource kind, which is what
+/// a nested ARN replaces: a listener's is `listener/app/<lb>/<lb id>/<listener id>` and a
+/// rule's `listener-rule/app/<lb>/<lb id>/<listener id>/<rule id>`.
+pub(super) const ELB_LOAD_BALANCER_SEGMENT: &str = "loadbalancer";
+pub(super) const ELB_LISTENER_SEGMENT: &str = "listener";
+pub(super) const ELB_LISTENER_RULE_SEGMENT: &str = "listener-rule";
+
+/// The cluster an ECS service belongs to when its declaration names none. Every ECS
+/// `cluster` member documents it: "If you do not specify a cluster, the default cluster is
+/// assumed", and that cluster is named `default`.
+pub(super) const ECS_DEFAULT_CLUSTER: &str = "default";
+
+/// The ARN of a resource Elastic Load Balancing nests inside another: `parent`'s ARN with
+/// `segment` in place of `parent_segment` and `id` appended, which is the form a
+/// listener's ARN takes inside its load balancer's and a rule's inside its listener's.
+///
+/// `None` where `parent` is not an Elastic Load Balancing ARN of the expected kind — the
+/// declaration names no parent, or names one this emulator could not resolve — so the
+/// nested resource keeps the identity CloudFormation's naming rules gave it rather than
+/// one built on a value that is not an ARN.
+pub(super) fn nested_elb_arn(
+    parent: &str,
+    parent_segment: &str,
+    segment: &str,
+    id: &str,
+) -> Option<String> {
+    let marker = format!(":{parent_segment}/");
+    if !parent.starts_with(&format!("arn:{PARTITION}:elasticloadbalancing:"))
+        || !parent.contains(&marker)
+    {
+        return None;
+    }
+    Some(format!(
+        "{}/{id}",
+        parent.replacen(&marker, &format!(":{segment}/"), 1)
+    ))
+}
+
+/// The cluster NAME an ECS resource's `Cluster` property names: every such member takes
+/// "the short name or full Amazon Resource Name (ARN) of the cluster", and a cluster ARN's
+/// resource portion is `cluster/<name>`.
+pub(super) fn ecs_cluster_name(reference: &str) -> String {
+    match reference.rsplit_once(":cluster/") {
+        Some((_, name)) => name.to_string(),
+        None => reference.to_string(),
+    }
+}
+
+/// The vector bucket an `AWS::S3Vectors::Index` declaration holds its index in: the
+/// `VectorBucketName` it names, or the bucket its `VectorBucketArn` names.
+///
+/// Those are the two ways Amazon S3 Vectors' own API addresses a vector bucket — "you can
+/// either use both the vector bucket name and the index name, or you can use the vector
+/// index ARN" is how its reads put it, and `CreateIndex` takes `vectorBucketName` or
+/// `vectorBucketArn` — so a declaration spelling either names the same bucket.
+///
+/// `None` where the declaration names neither, or names one this module could not evaluate:
+/// there is then no bucket to nest the index's ARN inside.
+pub(super) fn declared_vector_bucket(
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Option<String> {
+    let named = properties
+        .get("VectorBucketName")
+        .and_then(|value| text(value, scope, 0, budget))
+        .filter(|name| !name.is_empty());
+    if named.is_some() {
+        return named;
+    }
+    properties
+        .get("VectorBucketArn")
+        .and_then(|value| text(value, scope, 0, budget))
+        .as_deref()
+        .and_then(vector_bucket_of_arn)
+}
+
+/// The bucket name an Amazon S3 Vectors vector-bucket ARN carries:
+/// `arn:aws:s3vectors:<region>:<account>:bucket/<name>` names `<name>`.
+///
+/// `None` for anything that is not one — the resource portion past the fifth `:` has to be
+/// exactly one `bucket/<name>` segment, which is what that model's `VectorBucketArn`
+/// pattern fixes — so an index's ARN is never nested inside a value that is not a vector
+/// bucket's.
+pub(super) fn vector_bucket_of_arn(arn: &str) -> Option<String> {
+    let bucket = arn
+        .splitn(6, ':')
+        .nth(5)?
+        .strip_prefix(S3VECTORS_BUCKET_SEGMENT)?;
+    (!bucket.is_empty() && !bucket.contains('/')).then(|| bucket.to_string())
+}
+
+/// A service-assigned identifier of the canonical UUID form, derived from `name` under
+/// `domain`.
+///
+/// Some resource types report an identifier their owning service generates as a UUID (a
+/// CloudWatch RUM app monitor's `Id`). The 16 bytes come from a SHA-256 digest of the
+/// pair, with byte 6's high nibble set to `4` (the version) and byte 8's two high bits to
+/// `10` (the RFC 4122 variant), exactly the layout a version-4 generator writes. It is a
+/// function of the resource's own name — itself derived from the stack id and the logical
+/// id — so the id is stable across reads and across a later update of the same stack, and
+/// two resources of one stack never collide.
+pub(super) fn generated_uuid(domain: &str, name: &str) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(b"/");
+    hasher.update(name.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Outputs and intrinsic functions
+// ---------------------------------------------------------------------------
+
+/// Everything an intrinsic function resolves against.
+#[derive(Debug, Clone, Copy)]
+pub struct Scope<'a> {
+    pub stack: StackScope<'a>,
+    /// The parameter values in force on the stack, keyed by `ParameterKey`.
+    pub parameters: &'a BTreeMap<String, String>,
+    /// The TYPE each parameter was declared with, which decides whether a `Ref` to it
+    /// resolves to one value or to a list of them.
+    pub parameter_types: &'a BTreeMap<String, String>,
+    /// The stack's resources, keyed by logical id.
+    pub resources: &'a BTreeMap<String, StoredResource>,
+    /// The template's `Mappings` section.
+    pub mappings: &'a Value,
+    /// The template's `Conditions` section.
+    pub conditions: &'a Value,
+    /// The exported output values a `Fn::ImportValue` resolves against, keyed by export
+    /// name: "the value of an output exported by another stack". An export name this map
+    /// does not carry is not exported in the account and Region the deployment runs in, so
+    /// the import resolves to nothing.
+    pub imports: &'a BTreeMap<String, String>,
+}
+
+/// Evaluate every output a template declares, in `OutputKey` order (the protocol fixes no
+/// order for `Stack$Outputs`).
+///
+/// One entry per output the stack HAS — an output the template declares under a
+/// `Condition` that evaluates false is not one of them ("output values that are
+/// conditionally created"), and a condition this module cannot evaluate leaves the output
+/// reported rather than dropping it. Whether or not its value could be evaluated does not
+/// change that: the output exists because the template declares it, and
+/// [`StoredOutput::value`] is `None` where this module cannot compute the value rather
+/// than carrying an invented one. The `budget` is the deployment's — shared with
+/// [`provision`] — so the work of a whole request is bounded, not just each output's.
+pub fn evaluate_outputs(
+    template: &Template,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Vec<StoredOutput> {
+    let mut outputs = Vec::with_capacity(template.outputs.len());
+    for declared in &template.outputs {
+        let reported = declared.condition.as_deref().is_none_or(|condition| {
+            condition_holds(condition, scope, 0, budget).unwrap_or(true)
+        });
+        if !reported {
+            continue;
+        }
+        outputs.push(StoredOutput {
+            key: declared.key.clone(),
+            value: text(&declared.value, scope, 0, budget),
+            description: declared.description.clone(),
+            export_name: declared
+                .export_name
+                .as_ref()
+                .and_then(|name| text(name, scope, 0, budget)),
+        });
+    }
+    outputs
+}
+
+/// Every export name a template IMPORTS: the resolved argument of each `Fn::ImportValue`
+/// its resources and its outputs name, in the order the template declares them and without
+/// repeats.
+///
+/// This is the stack's half of the cross-stack reference index `ListImports` reports —
+/// "the stacks that are importing an exported output value" — so it is computed where the
+/// template is deployed, from the document that really deploys, and charged to that
+/// deployment's own budget like every other pass over a caller-sized body. An argument
+/// that is itself an expression is evaluated, so an import whose name a `Fn::Sub` or a
+/// parameter decides is the export name it really resolved to.
+///
+/// DECLARATION ORDER, because a deployment that cannot resolve an import reports the FIRST
+/// one it could not ([`super::StoredStack::unresolved_import_failure`]), which is the one
+/// the template names first — the index the names also feed is keyed by name, so the order
+/// is nothing to it.
+pub fn imported_export_names(
+    template: &Template,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for resource in &template.resources {
+        collect_imports(&resource.declaration, scope, 0, budget, &mut found);
+    }
+    for output in &template.outputs {
+        collect_imports(&output.value, scope, 0, budget, &mut found);
+        if let Some(export_name) = &output.export_name {
+            collect_imports(export_name, scope, 0, budget, &mut found);
+        }
+    }
+    found
+}
+
+/// Collect every `Fn::ImportValue` argument inside one declaration, bounded by the
+/// deployment's depth limit and its shared budget: ONE pass over the node, whatever the
+/// document carries. A name already collected is not collected twice, so the walk answers
+/// each imported name once, at the position it was first named.
+pub(super) fn collect_imports(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+    found: &mut Vec<String>,
+) {
+    if depth > MAX_INTRINSIC_DEPTH || budget.spend(1).is_none() {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_imports(item, scope, depth + 1, budget, found);
+            }
+        }
+        Value::Object(members) => {
+            for (name, argument) in members {
+                if name == FN_IMPORT_VALUE {
+                    if let Some(export_name) = text(argument, scope, depth + 1, budget) {
+                        if !found.contains(&export_name) {
+                            found.push(export_name);
+                        }
+                    }
+                }
+                collect_imports(argument, scope, depth + 1, budget, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An evaluated expression: CloudFormation's intrinsic functions produce either a string
+/// or a list of strings (`Fn::Split`, `Fn::GetAZs`), and the list form is only ever
+/// consumed by another function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Resolved {
+    Text(String),
+    List(Vec<String>),
+}
+
+/// Evaluate an expression to the text CloudFormation substitutes for it, or `None` when
+/// this module cannot evaluate it — or when the deployment's work budget is spent.
+pub(super) fn text(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<String> {
+    match evaluate(value, scope, depth, budget)? {
+        Resolved::Text(text) => Some(text),
+        // A list is not a value an output or a name can carry.
+        Resolved::List(_) => None,
+    }
+}
+
+/// Evaluate one expression.
+pub(super) fn evaluate(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Resolved> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    // One unit for visiting this node, before anything it might cost: this is what makes
+    // the TOTAL work of a deployment finite however the template composes its functions.
+    budget.spend(1)?;
+    match value {
+        Value::Null => None,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => scalar_text(value)
+            .map(Resolved::Text)
+            .and_then(|resolved| bounded(resolved, budget)),
+        Value::Array(items) => {
+            if items.len() > MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            let mut resolved = Vec::with_capacity(items.len());
+            for item in items {
+                resolved.push(text(item, scope, depth + 1, budget)?);
+            }
+            bounded(Resolved::List(resolved), budget)
+        }
+        Value::Object(members) => {
+            // An intrinsic function is an object with exactly one member, whose name is
+            // the function's.
+            let mut entries = members.iter();
+            let (name, argument) = entries.next()?;
+            if entries.next().is_some() {
+                return None;
+            }
+            intrinsic(name, argument, scope, depth, budget)
+                .and_then(|resolved| bounded(resolved, budget))
+        }
+    }
+}
+
+/// Refuse an evaluated value past [`MAX_RESOLVED_TEXT_BYTES`], and charge the deployment's
+/// budget for the bytes it carries, so no composition of functions grows one — or copies
+/// one — without limit.
+pub(super) fn bounded(resolved: Resolved, budget: &mut Budget) -> Option<Resolved> {
+    let size = match &resolved {
+        Resolved::Text(text) => text.len(),
+        Resolved::List(items) => items.iter().map(String::len).sum(),
+    };
+    budget.spend_text(size)?;
+    (size <= MAX_RESOLVED_TEXT_BYTES).then_some(resolved)
+}

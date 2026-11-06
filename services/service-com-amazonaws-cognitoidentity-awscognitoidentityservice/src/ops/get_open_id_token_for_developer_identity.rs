@@ -349,10 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                 return Err(
                     GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!(
-                                "Identity '{identity_id}' not found in identity pool '{}'.",
-                                input.identity_pool_id
-                            )),
+                            message: Some(crate::state::identity_not_found_message(identity_id)),
                         },
                     )
                     .into(),

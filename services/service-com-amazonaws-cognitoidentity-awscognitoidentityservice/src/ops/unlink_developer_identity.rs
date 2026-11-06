@@ -259,9 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
                 return Err(
                     UnlinkDeveloperIdentityErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!(
-                                "Identity '{}' not found.",
-                                input.identity_id
+                            message: Some(crate::state::identity_not_found_message(
+                                &input.identity_id,
                             )),
                         },
                     )

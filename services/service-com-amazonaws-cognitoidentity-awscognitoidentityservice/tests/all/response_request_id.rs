@@ -190,6 +190,9 @@ async fn every_response_names_the_request_it_answers() {
             &json!({
                 "IdentityPoolName": "named-responses",
                 "AllowUnauthenticatedIdentities": true,
+                // A principal-tag mapping is stored only for a provider the pool declares,
+                // and one row below writes one for this provider.
+                "SupportedLoginProviders": {"graph.facebook.com": "named-app-id"},
             }),
         )
         .await["IdentityPoolId"]

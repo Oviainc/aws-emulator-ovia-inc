@@ -198,6 +198,7 @@ use serde_json::Value;
 use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
+mod cognito_identity_pool;
 mod dynamodb_table;
 mod ec2_vpc_network;
 mod lambda_function;
@@ -547,6 +548,10 @@ pub(super) enum Owner {
     /// VPC, and the Elastic IP address. Which of them it is travels with the owner, so the
     /// algorithm resolves the type once and every call below is about that same resource.
     Ec2VpcNetwork(ec2_vpc_network::Kind),
+    /// One of the two Amazon Cognito Identity types [`cognito_identity_pool`] creates: the
+    /// identity pool, and the role attachment that binds the pool's IAM roles to it. Which
+    /// of them it is travels with the owner, as for the Amazon EC2 types above.
+    CognitoIdentityPool(cognito_identity_pool::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -566,6 +571,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = ec2_vpc_network::kind_of(resource_type) {
         return Some(Owner::Ec2VpcNetwork(kind));
+    }
+    if let Some(kind) = cognito_identity_pool::kind_of(resource_type) {
+        return Some(Owner::CognitoIdentityPool(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -601,6 +609,9 @@ impl Owner {
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::create(ctx, region, kind, resource, propagated).await
             }
+            Self::CognitoIdentityPool(kind) => {
+                cognito_identity_pool::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -631,6 +642,9 @@ impl Owner {
             // has yet to come into being — the case [`lambda_function::readiness`] states for
             // a function and an `AWS::RDS::DBInstance` for a database.
             Self::Ec2VpcNetwork(_) => Ok(Readiness::Ready),
+            // A pool exists, and its role configuration is in force, from the moment the
+            // owning service's own call answers.
+            Self::CognitoIdentityPool(_) => Ok(cognito_identity_pool::ready()),
         }
     }
 
@@ -662,6 +676,10 @@ impl Owner {
             // address and allocation id, an attachment nothing at all), and the create
             // answered it, so there is nothing to read once the resource is up.
             Self::Ec2VpcNetwork(_) => Ok(BTreeMap::new()),
+            // A pool's `Name` is the one its own create answered with, and a role attachment
+            // publishes no attribute this emulator computes, so there is nothing left to
+            // read once either resource is up.
+            Self::CognitoIdentityPool(_) => Ok(BTreeMap::new()),
         }
     }
 
@@ -690,6 +708,9 @@ impl Owner {
             // attachment or address is still being removed in — so there is nothing to wait
             // for either.
             Self::Ec2VpcNetwork(_) => Ok(Removal::Gone),
+            // `DeleteIdentityPool` takes the pool away as it answers, and the call that
+            // clears a pool's roles leaves nothing behind either.
+            Self::CognitoIdentityPool(_) => Ok(Removal::Gone),
         }
     }
 
@@ -728,6 +749,9 @@ impl Owner {
             // does not serve yet — so a changed declaration is reported as not applied
             // rather than as a success that dropped the caller's change.
             Self::Ec2VpcNetwork(_) => Ok(None),
+            Self::CognitoIdentityPool(kind) => {
+                cognito_identity_pool::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -761,6 +785,9 @@ impl Owner {
             // here yet — as for every other type of that service ([`Provisioner::retag`]'s
             // own default) — so nothing is asked about them.
             Self::Ec2VpcNetwork(_) => Ok(()),
+            // A pool's tags are replaced by its own update call, which carries the
+            // declaration's whole configuration, so nothing is asked about them here.
+            Self::CognitoIdentityPool(_) => Ok(()),
         }
     }
 
@@ -800,6 +827,12 @@ impl Owner {
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::delete(ctx, region, kind, resource).await
             }
+            // Amazon Cognito Identity takes no snapshot of a pool on the way out: there is no
+            // such call, so a `Snapshot` deletion policy on either type deletes the resource
+            // with no snapshot invented for it.
+            Self::CognitoIdentityPool(kind) => {
+                cognito_identity_pool::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -838,6 +871,9 @@ impl Owner {
             // property each one has is part of its identity or of the call that made it, so
             // there is no member a later read could find changed.
             Self::Ec2VpcNetwork(_) => Ok(None),
+            Self::CognitoIdentityPool(kind) => {
+                cognito_identity_pool::actual_configuration(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -854,6 +890,8 @@ impl Owner {
             Self::DynamodbTable => message.to_string(),
             // Amazon EC2's does the same.
             Self::Ec2VpcNetwork(_) => message.to_string(),
+            // Amazon Cognito Identity's does the same.
+            Self::CognitoIdentityPool(_) => message.to_string(),
         }
     }
 }
