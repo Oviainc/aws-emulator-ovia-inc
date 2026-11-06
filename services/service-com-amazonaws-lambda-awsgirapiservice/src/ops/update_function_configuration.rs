@@ -546,6 +546,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // SnapStart "create[s] a snapshot of the initialized execution environment when
+        // you publish a function version", which only a managed runtime carrying the
+        // snapshot/restore machinery can do, so a request applying it to any other runtime
+        // is refused before the configuration is written (see
+        // [`crate::state::runtime_supports_snap_start`]). The runtime asked about is the
+        // one the function would RUN on: the one this request installs, or the stored one
+        // it leaves alone.
+        if crate::state::applies_snap_start(
+            input
+                .snap_start
+                .as_ref()
+                .and_then(|snap_start| snap_start.apply_on.as_deref()),
+        ) {
+            let runtime = input
+                .runtime
+                .clone()
+                .or_else(|| record.config.runtime.clone());
+            if !crate::state::runtime_supports_snap_start(runtime.as_deref()) {
+                return Err(invalid_parameter(
+                    crate::state::snap_start_unsupported_message(runtime.as_deref()),
+                ));
+            }
+        }
+
         // Every member the request carries replaces the stored value, and every member
         // it omits leaves the stored value alone.
         let config = &mut record.config;

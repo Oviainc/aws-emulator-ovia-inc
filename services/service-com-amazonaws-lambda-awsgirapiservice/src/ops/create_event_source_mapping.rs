@@ -515,6 +515,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An Amazon DocumentDB change stream is consumed INSIDE one database of the
+        // cluster — `DocumentDBEventSourceConfig$DatabaseName` is "The name of the database
+        // to consume within the DocumentDB cluster" — so a mapping onto such a cluster that
+        // names no database names nothing to read. The member is optional in the MODEL,
+        // because one operation serves every source, so the requirement is stated here; it
+        // is a statement about the REQUEST, decided before the source is resolved or the
+        // execution role is asked about at all.
+        if vendor == Some(crate::state::EVENT_SOURCE_VENDOR_DOCUMENT_DB)
+            && input
+                .document_db_event_source_config
+                .as_ref()
+                .and_then(|config| config.database_name.as_deref())
+                .is_none_or(str::is_empty)
+        {
+            return Err(invalid_parameter(absent_required_nested_member(
+                DOCUMENT_DB_EVENT_SOURCE_CONFIG_MEMBER,
+                DATABASE_NAME_MEMBER,
+            )));
+        }
+
         let mut store = state.lock();
         // Every mapping this store reports is first brought up to whatever the clock has
         // already made due, so a mapping whose deletion is due is gone before this call
@@ -816,6 +836,11 @@ const NO_TUMBLING_WINDOW: i32 = 0;
 const STARTING_POSITION_MEMBER: &str = "StartingPosition";
 /// See [`STARTING_POSITION_MEMBER`].
 const STARTING_POSITION_TIMESTAMP_MEMBER: &str = "StartingPositionTimestamp";
+/// See [`STARTING_POSITION_MEMBER`]: the structure a DocumentDB mapping's own settings
+/// arrive in, and the setting inside it that such a mapping requires.
+const DOCUMENT_DB_EVENT_SOURCE_CONFIG_MEMBER: &str = "DocumentDBEventSourceConfig";
+/// See [`DOCUMENT_DB_EVENT_SOURCE_CONFIG_MEMBER`].
+const DATABASE_NAME_MEMBER: &str = "DatabaseName";
 
 /// The account field of an ARN FORMAT: the twelve-digit example id an ARN written as a
 /// SHAPE carries, beside the placeholder names of its resource half, in every format AWS
@@ -838,6 +863,21 @@ const EXAMPLE_ACCOUNT_ID: &str = "123456789012";
 /// with; the final stop is how Lambda ends it.
 fn absent_required_member(member: &str) -> String {
     let path = ::aws_smithy_schema_server::constraints::path::member(member);
+    format!(
+        "{}.",
+        ::aws_smithy_schema_server::missing_member_message(&path)
+    )
+}
+
+/// [`absent_required_member`] for a member the request carries INSIDE a structure, whose
+/// path is the structure's member path and then its own — the same spelling the constraint
+/// walk produces for a violation found inside a structure.
+fn absent_required_nested_member(structure: &str, member: &str) -> String {
+    let path = format!(
+        "{}.{}",
+        ::aws_smithy_schema_server::constraints::path::member(structure),
+        ::aws_smithy_schema_server::constraints::path::member(member)
+    );
     format!(
         "{}.",
         ::aws_smithy_schema_server::missing_member_message(&path)

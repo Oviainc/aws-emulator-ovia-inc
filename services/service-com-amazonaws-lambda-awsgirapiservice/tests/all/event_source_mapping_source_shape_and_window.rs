@@ -285,6 +285,11 @@ const STARTING_POSITION_PATH: &str = "startingPosition";
 /// See [`STARTING_POSITION_PATH`].
 const STARTING_POSITION_TIMESTAMP_PATH: &str = "startingPositionTimestamp";
 
+/// See [`STARTING_POSITION_PATH`]: the member a mapping onto a DocumentDB cluster
+/// requires, nested in the structure it arrives in (`DocumentDBEventSourceConfig`,
+/// `DatabaseName`).
+const DOCUMENT_DB_DATABASE_NAME_PATH: &str = "documentDBEventSourceConfig.databaseName";
+
 /// The whole refusal a request that left out a required member answers: AWS's
 /// validation-error envelope over that member's path.
 fn absent_member_refusal(member_path: &str) -> String {
@@ -378,6 +383,37 @@ fn member_rows() -> Vec<MemberRow> {
             case: "a self-managed kafka cluster, which needs no starting position",
             event_source: None,
             extras: self_managed_cluster(),
+            absent: None,
+        },
+        // A DocumentDB change stream is consumed inside ONE database of the cluster, so a
+        // mapping onto one requires the name of that database wherever the rest of the
+        // request is acceptable.
+        MemberRow {
+            case: "a documentdb change stream naming no database",
+            event_source: Some(DOCDB_SOURCE),
+            extras: json!({}),
+            absent: Some(DOCUMENT_DB_DATABASE_NAME_PATH),
+        },
+        MemberRow {
+            case: "a documentdb change stream whose configuration names no database",
+            event_source: Some(DOCDB_SOURCE),
+            extras: json!({ "DocumentDBEventSourceConfig": { "CollectionName": "orders" } }),
+            absent: Some(DOCUMENT_DB_DATABASE_NAME_PATH),
+        },
+        MemberRow {
+            case: "a documentdb change stream naming the database it consumes",
+            event_source: Some(DOCDB_SOURCE),
+            extras: json!({ "DocumentDBEventSourceConfig": { "DatabaseName": "orders" } }),
+            absent: None,
+        },
+        MemberRow {
+            case: "a documentdb change stream read from a stated timestamp",
+            event_source: Some(DOCDB_SOURCE),
+            extras: json!({
+                "StartingPosition": "AT_TIMESTAMP",
+                "StartingPositionTimestamp": 1_700_000_000,
+                "DocumentDBEventSourceConfig": { "DatabaseName": "orders" },
+            }),
             absent: None,
         },
     ]
@@ -548,7 +584,9 @@ fn window_rows() -> Vec<WindowRow> {
         WindowRow {
             case: "a documentdb change stream, which no tumbling window applies to",
             event_source: Some(DOCDB_SOURCE),
-            extras: json!({}),
+            // A mapping onto a DocumentDB cluster names the database it consumes inside
+            // it, which is what makes the create acceptable at all.
+            extras: json!({ "DocumentDBEventSourceConfig": { "DatabaseName": "orders" } }),
             window: Window::Absent,
         },
         WindowRow {

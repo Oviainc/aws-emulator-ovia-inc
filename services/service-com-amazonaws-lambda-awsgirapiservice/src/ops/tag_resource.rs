@@ -23,7 +23,9 @@
 //! ([`crate::state::tag_keys_are_storable`]): a key in the `aws:` namespace is AWS's own,
 //! an empty key names nothing, and a key named twice in one request says two things about
 //! one tag. Such a request is refused with the modelled 400 and leaves the resource's tag
-//! set untouched.
+//! set untouched. A request naming NO tag at all applies none, so it too is refused
+//! ([`crate::state::EMPTY_TAGS_MESSAGE`]) rather than answered as a write that stored
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -195,6 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What Lambda will STORE a tag under is judged before anything is looked up or
         // written: a key must be named, must not be in the namespace AWS keeps for its
         // own tags, and must be named only once.
+        if input.tags.is_empty() {
+            return Err(TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(crate::state::EMPTY_TAGS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
         if !crate::state::tag_keys_are_storable(input.tags.keys().map(String::as_str)) {
             return Err(invalid_tags());
         }

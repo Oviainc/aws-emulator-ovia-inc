@@ -301,12 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .unwrap_or_default();
         if additional_version_weights.len() > crate::state::MAX_ALIAS_ADDITIONAL_VERSIONS {
-            return Err(invalid_parameter(format!(
-                "RoutingConfig.AdditionalVersionWeights names {} versions, and an alias \
-                 splits its invocations between the version it invokes and at most {} other",
-                additional_version_weights.len(),
-                crate::state::MAX_ALIAS_ADDITIONAL_VERSIONS
-            )));
+            return Err(invalid_parameter(
+                crate::state::TOO_MANY_ADDITIONAL_VERSIONS_MESSAGE.to_string(),
+            ));
         }
         for additional in additional_version_weights.keys() {
             // The map's own key shape (`AdditionalVersion`, pattern `^[0-9]+$`) admits
@@ -324,11 +321,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // unpublished version is not one: its code and configuration keep changing
             // under the weights.
             if input.function_version == crate::state::VERSION_LATEST {
-                return Err(invalid_parameter(format!(
-                    "An alias that routes invocations to a second version cannot invoke the \
-                     unpublished {latest} version",
-                    latest = crate::state::VERSION_LATEST
-                )));
+                return Err(invalid_parameter(
+                    crate::state::WEIGHTED_ALIAS_ON_UNPUBLISHED_MESSAGE.to_string(),
+                ));
             }
             if *additional == input.function_version {
                 return Err(invalid_parameter(format!(
@@ -341,6 +336,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Function not found: {}",
                     record.versioned_arn(additional)
                 )));
+            }
+            // One alias is one identity for the clients that invoke it, so the versions it
+            // splits its invocations between have to run AS the same principal: a request
+            // whose two versions carry different execution roles asks for an alias whose
+            // permissions depend on which way an invocation was routed.
+            if let Some(message) = crate::state::weighted_versions_role_refusal(
+                record,
+                &input.function_version,
+                additional,
+            ) {
+                return Err(invalid_parameter(message));
             }
         }
 

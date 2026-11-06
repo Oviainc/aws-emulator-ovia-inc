@@ -109,6 +109,10 @@ mod invoke_media_type;
 /// module's own header.
 mod opaque_members;
 
+/// WHERE this service answers for a resource-based policy that is too large, and why that
+/// answer is not stated at this layer; see the module's own header.
+mod policy_length;
+
 /// Whether the resource-based policy a policy READ reports grants public access, which that
 /// read states beside the document; see the module's own header.
 pub mod public_access;

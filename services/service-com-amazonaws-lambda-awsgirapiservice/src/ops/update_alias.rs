@@ -303,12 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         if let Some(weights) = additional_version_weights.as_ref() {
             if weights.len() > crate::state::MAX_ALIAS_ADDITIONAL_VERSIONS {
-                return Err(invalid_parameter(format!(
-                    "RoutingConfig.AdditionalVersionWeights names {} versions, and an alias \
-                     splits its invocations between the version it invokes and at most {} other",
-                    weights.len(),
-                    crate::state::MAX_ALIAS_ADDITIONAL_VERSIONS
-                )));
+                return Err(invalid_parameter(
+                    crate::state::TOO_MANY_ADDITIONAL_VERSIONS_MESSAGE.to_string(),
+                ));
             }
             for additional in weights.keys() {
                 // The map's own key shape (`AdditionalVersion`, pattern `^[0-9]+$`)
@@ -323,11 +320,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )));
                 }
                 if target_version == crate::state::VERSION_LATEST {
-                    return Err(invalid_parameter(format!(
-                        "An alias that routes invocations to a second version cannot invoke the \
-                         unpublished {latest} version",
-                        latest = crate::state::VERSION_LATEST
-                    )));
+                    return Err(invalid_parameter(
+                        crate::state::WEIGHTED_ALIAS_ON_UNPUBLISHED_MESSAGE.to_string(),
+                    ));
                 }
                 if *additional == target_version {
                     return Err(invalid_parameter(format!(
@@ -340,6 +335,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Function not found: {}",
                         record.versioned_arn(additional)
                     )));
+                }
+                // The versions one alias splits its invocations between run AS the same
+                // principal, exactly as `CreateAlias` requires of them.
+                if let Some(message) = crate::state::weighted_versions_role_refusal(
+                    record,
+                    &target_version,
+                    additional,
+                ) {
+                    return Err(invalid_parameter(message));
                 }
             }
         }

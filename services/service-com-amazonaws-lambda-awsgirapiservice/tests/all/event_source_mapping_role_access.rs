@@ -286,7 +286,13 @@ pub(crate) fn stream_refusal(event_source_arn: &str, actions: &[&str], tail: &st
 
 /// How it words the refusal of a role that may not make one call on a QUEUE.
 fn queue_refusal(action: &str) -> String {
-    format!("The function execution role does not have permissions to call {action} on SQS")
+    call_refusal(action, "SQS")
+}
+
+/// How AWS words the refusal of a role that may not make one CALL on the named source:
+/// the call it may not make, and the service it would have been made to.
+fn call_refusal(action: &str, service: &str) -> String {
+    format!("The function execution role does not have permissions to call {action} on {service}")
 }
 
 /// A statement allowing `actions` of `namespace` on `resource`.
@@ -432,11 +438,20 @@ fn rows() -> Vec<Row> {
             refusal: None,
         },
         Row {
-            // A cluster is reached through its own credentials and network rather than by
-            // reading the named resource, so this gate states no reads for it.
+            // A cluster is reached through a DESCRIBE of the named resource first, so the
+            // role that may not make it is refused by the call that names the cluster.
             case: "an msk cluster, with only logs granted",
             event_source: MSK_SOURCE,
             statements: json!([logs_only()]),
+            refusal: Some(call_refusal("DescribeClusterV2", "MSK")),
+        },
+        Row {
+            case: "an msk cluster, with the cluster describe granted on it",
+            event_source: MSK_SOURCE,
+            statements: json!([
+                logs_only(),
+                allow("kafka", &["DescribeClusterV2"], MSK_SOURCE)
+            ]),
             refusal: None,
         },
         Row {

@@ -407,6 +407,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let code = package_code(&package_type, &input)?;
 
+        // SnapStart "create[s] a snapshot of the initialized execution environment when
+        // you publish a function version", which only a managed runtime carrying the
+        // snapshot/restore machinery can do, so a function the request asks for it on with
+        // any other runtime is refused before anything is created (see
+        // [`crate::state::runtime_supports_snap_start`]).
+        if crate::state::applies_snap_start(
+            input
+                .snap_start
+                .as_ref()
+                .and_then(|snap_start| snap_start.apply_on.as_deref()),
+        ) && !crate::state::runtime_supports_snap_start(input.runtime.as_deref())
+        {
+            return Err(invalid_parameter(
+                crate::state::snap_start_unsupported_message(input.runtime.as_deref()),
+            ));
+        }
+
         // AWS's published Lambda quotas "Function timeout: 900 seconds (15 minutes)" and
         // "Function memory allocation: 128 MB to 10,240 MB" are narrower than the model's
         // `Timeout` (1..5400) and `MemorySize` (128..32768) ranges, so the wider bounds the

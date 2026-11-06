@@ -106,6 +106,13 @@ const POLICY_REVISION_REFUSAL: &str = "The Revision Id provided does not match t
 const CONFIGURATION_REVISION_REFUSAL: &str = "The Revision Id provided does not match the latest \
      Revision Id. Call the GetFunction/GetAlias API to retrieve the latest Revision Id";
 
+/// The refusal the operations whose resource is a LAYER VERSION give that precondition:
+/// the same rule, naming the resource it is about and the API that reports its latest
+/// revision, which for a layer version's policy is `GetLayerVersion`.
+const LAYER_VERSION_REVISION_REFUSAL: &str = "The Revision Id provided does not match the latest \
+     Revision Id for the layer version. Call the GetLayerVersion API to retrieve the latest \
+     Revision Id";
+
 /// The refusal a tag write past the quota gets.
 const TAG_QUOTA_REFUSAL: &str = "Number of tags exceeds resource tag limit.";
 
@@ -1141,7 +1148,7 @@ async fn a_stale_revision_is_refused_by_the_sentence_naming_the_api_that_reports
                 })
             },
             stale: "00000000-0000-0000-0000-000000000000",
-            expected: CONFIGURATION_REVISION_REFUSAL,
+            expected: LAYER_VERSION_REVISION_REFUSAL,
         },
         RevisionCase {
             label: "RemoveLayerVersionPermission at a revision the policy is not at",
@@ -1154,7 +1161,7 @@ async fn a_stale_revision_is_refused_by_the_sentence_naming_the_api_that_reports
             },
             body: |_| Value::Null,
             stale: "0d0d0d0d-1e1e-2f2f-3a3a-4b4b4b4b4b4b",
-            expected: CONFIGURATION_REVISION_REFUSAL,
+            expected: LAYER_VERSION_REVISION_REFUSAL,
         },
     ];
 
@@ -1197,11 +1204,15 @@ async fn a_stale_revision_is_refused_by_the_sentence_naming_the_api_that_reports
         }
     }
 
-    // The two sentences differ, which is what lets a caller tell a policy-revision
-    // conflict from a configuration-revision one.
+    // The three sentences differ, which is what lets a caller tell a policy-revision
+    // conflict from a configuration-revision one and from a layer-version one.
     assert_ne!(
         POLICY_REVISION_REFUSAL, CONFIGURATION_REVISION_REFUSAL,
         "the two documented branches are two different sentences"
+    );
+    assert_ne!(
+        LAYER_VERSION_REVISION_REFUSAL, CONFIGURATION_REVISION_REFUSAL,
+        "a layer version's precondition names its own resource and read"
     );
 
     // And every refused call left the policy at the revision it was already at.

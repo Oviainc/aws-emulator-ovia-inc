@@ -292,7 +292,7 @@ async fn get_function_configuration_reports_the_stored_configuration() {
             request: json!({
                 "FunctionName": "configured",
                 "Role": ROLE,
-                "Runtime": "nodejs20.x",
+                "Runtime": "python3.12",
                 "Handler": "app.main",
                 "Description": "a configured function",
                 "MemorySize": 2048,
@@ -306,7 +306,9 @@ async fn get_function_configuration_reports_the_stored_configuration() {
                 "SnapStart": { "ApplyOn": "PublishedVersions" },
                 "Code": { "ZipFile": zip_file(&code) },
             }),
-            runtime: Some("nodejs20.x"),
+            // SnapStart is applied here, so the runtime is one of the families that
+            // supports it (`crate::state::runtime_supports_snap_start`).
+            runtime: Some("python3.12"),
             package_type: "Zip",
             description: Some("a configured function"),
             log_format: "JSON",

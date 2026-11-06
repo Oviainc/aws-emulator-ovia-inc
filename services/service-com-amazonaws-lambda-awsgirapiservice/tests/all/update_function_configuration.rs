@@ -375,10 +375,18 @@ fn cases() -> Vec<Case> {
         Case {
             label: "snapstart-applied",
             package: Package::Zip,
-            patch: json!({ "SnapStart": { "ApplyOn": "PublishedVersions" } }),
+            // SnapStart is supported on the Python 3.12+ runtimes and not on the one the
+            // zip row is created with, so this row moves the runtime with it — the one
+            // patch that states two members, because the two settings are not independent
+            // (`crate::state::runtime_supports_snap_start`).
+            patch: json!({
+                "Runtime": "python3.12",
+                "SnapStart": { "ApplyOn": "PublishedVersions" },
+            }),
             // `OptimizationStatus` reports "whether SnapStart is activated for the
             // specified function version", and `$LATEST` is not a snapshotted version.
             expected: json!({
+                "Runtime": "python3.12",
                 "SnapStart": { "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off" },
             }),
         },

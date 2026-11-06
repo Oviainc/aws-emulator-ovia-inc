@@ -331,13 +331,17 @@ fn entry_order(function_name: &str, version: &str) -> Option<(String, u64)> {
 ///
 /// The marker a page answers is the ARN of its last entry, which carries the function
 /// name and the version label the order is built from, so it is read back through the one
-/// shared `FunctionName` reader rather than by indexing untrusted text. `None` for a
-/// value that names no function version at all.
+/// shared `FunctionName` reader rather than by indexing untrusted text. `None` for every
+/// other value: a marker is the token a previous page of THIS listing answered, which is
+/// always a qualified function-version ARN, so a value in any other form (a bare name, an
+/// unqualified ARN, an arbitrary token) names no position in the order and is refused
+/// rather than silently walked from nowhere.
 fn marker_order(marker: &str) -> Option<(String, u64)> {
     let reference = crate::state::parse_function_reference(marker)?;
-    let version = reference
-        .qualifier
-        .unwrap_or_else(|| crate::state::VERSION_LATEST.to_string());
+    if !reference.was_arn {
+        return None;
+    }
+    let version = reference.qualifier?;
     entry_order(&reference.name, &version)
 }
 

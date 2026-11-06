@@ -723,7 +723,10 @@ async fn the_resource_policy_operations_refuse_what_they_cannot_store_or_report(
             code: "InvalidParameterValueException",
         },
         // Past the modelled maximum of the member, which is the published quota: refused
-        // as the validation failure it is, before the handler sees it.
+        // as the validation failure it is, before the handler sees it. RECORDED: AWS
+        // answers this one `ValidationException` rather than the operation's own
+        // `PolicyLengthExceededException`, which it keeps for a policy a GRANT would push
+        // past the quota.
         RefusalCase {
             name: "a document past the published quota",
             arn: function_arn("known"),

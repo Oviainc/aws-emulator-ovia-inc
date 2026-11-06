@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     InvalidParameterValueException {
                         r#type: None,
                         message: Some(format!(
-                            "{} version cannot be deleted without deleting the function",
+                            "{} version cannot be deleted without deleting the function.",
                             crate::state::VERSION_LATEST
                         )),
                     },

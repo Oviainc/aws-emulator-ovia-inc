@@ -1432,7 +1432,8 @@ fn event_source_cases() -> Vec<EventSourceCase> {
         EventSourceCase {
             name: "a documentdb change stream cluster",
             event_source: "arn:aws:rds:us-east-1:000000000000:cluster:catalog-docdb",
-            request_extras: json!({}),
+            // A mapping onto a DocumentDB cluster names the database it consumes inside it.
+            request_extras: json!({ "DocumentDBEventSourceConfig": { "DatabaseName": "catalog" } }),
             mappable: true,
         },
         EventSourceCase {

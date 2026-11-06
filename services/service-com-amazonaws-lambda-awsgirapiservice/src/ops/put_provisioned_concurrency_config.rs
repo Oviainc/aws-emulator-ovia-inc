@@ -243,6 +243,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
 
+            // Provisioned concurrency keeps initialised environments of a version warm,
+            // and SnapStart restores each environment from a snapshot instead, so one
+            // version cannot be served both ways: the call that would add the second of
+            // the two is refused, as the CONFLICT with what that version already carries
+            // that it is ("The resource already exists, or another operation is in
+            // progress", which `ResourceConflictException` is the modelled 409 for).
+            if crate::state::applies_snap_start(
+                record
+                    .config_of(&qualifier)
+                    .and_then(|config| config.snap_start_apply_on.as_deref()),
+            ) {
+                return Err(resource_conflict(
+                    crate::state::PROVISIONED_CONCURRENCY_WITH_SNAP_START_MESSAGE.to_string(),
+                ));
+            }
+
             // This call REPLACES whatever the addressed qualifier holds, so the other
             // qualifiers' allocations are what stand beside the requested one.
             let provisioned_elsewhere = record.provisioned_concurrency_except(Some(&qualifier));

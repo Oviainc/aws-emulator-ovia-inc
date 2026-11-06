@@ -1602,6 +1602,17 @@ pub const CONFIGURATION_REVISION_PRECONDITION_MESSAGE: &str =
     "The Revision Id provided does not match the latest Revision Id. Call the \
      GetFunction/GetAlias API to retrieve the latest Revision Id";
 
+/// The same refusal on the operations whose resource is a LAYER VERSION
+/// (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`).
+///
+/// The rule `PreconditionFailedException` documents is "call the API that reports the
+/// latest revision of the resource you addressed", and for a layer version's policy that
+/// API is `GetLayerVersion` rather than `GetFunction`/`GetAlias` — so the sentence names
+/// the resource it is about and that API, and carries nothing of the request.
+pub const LAYER_VERSION_REVISION_PRECONDITION_MESSAGE: &str =
+    "The Revision Id provided does not match the latest Revision Id for the layer version. \
+     Call the GetLayerVersion API to retrieve the latest Revision Id";
+
 /// The qualifier a `FunctionName`/`Qualifier` pair NAMES, as opposed to the
 /// [`VERSION_LATEST`] an unqualified request resolves to. It may come from either, and
 /// [`resolve_function`] refuses a pair that names two different ones.
@@ -2354,6 +2365,47 @@ pub fn version_referenced_by_aliases_message(aliases: &[String]) -> String {
     )
 }
 
+/// The refusal a `RoutingConfig` naming more than
+/// [`MAX_ALIAS_ADDITIONAL_VERSIONS`] additional versions gets.
+///
+/// Fixed text naming the member and the ceiling: an alias splits its invocations between
+/// the version it invokes and ONE other, so the count the request sent says nothing the
+/// sentence needs.
+pub const TOO_MANY_ADDITIONAL_VERSIONS_MESSAGE: &str =
+    "Number of items in AdditionalVersionWeights cannot be greater than 1";
+
+/// The refusal a `RoutingConfig` on an alias that invokes the UNPUBLISHED version gets.
+///
+/// Traffic is shifted between two SNAPSHOTS of the function, and the unpublished version
+/// is not one: its code and configuration keep changing under the weights, which is why
+/// an alias that routes invocations to a second version has to invoke a published one.
+pub const WEIGHTED_ALIAS_ON_UNPUBLISHED_MESSAGE: &str =
+    "Weighted alias cannot be mapped to $LATEST";
+
+/// The refusal a `RoutingConfig` whose versions do not share one execution role gets.
+pub const WEIGHTED_ALIAS_ROLE_MISMATCH_MESSAGE: &str =
+    "Weighted alias cannot be mapped to versions with different execution roles";
+
+/// Whether the two versions an alias would split its invocations between run as DIFFERENT
+/// execution roles, and so the sentence refusing that alias — `None` when they run as the
+/// same role, and for a version this store holds no configuration for, which the caller
+/// has already refused as a version the function does not have.
+///
+/// An alias is ONE identity to the clients that invoke it, and a function RUNS AS the
+/// execution role its configuration names (`FunctionConfiguration$Role`), so two versions
+/// under one alias that name different roles would give that one identifier two sets of
+/// permissions, chosen by how an invocation happened to be routed.
+#[must_use]
+pub fn weighted_versions_role_refusal(
+    record: &FunctionRecord,
+    primary: &str,
+    additional: &str,
+) -> Option<String> {
+    let primary_role = &record.config_of(primary)?.role;
+    let additional_role = &record.config_of(additional)?.role;
+    (primary_role != additional_role).then(|| WEIGHTED_ALIAS_ROLE_MISMATCH_MESSAGE.to_string())
+}
+
 /// One alias of a function: "a function identifier that you can update to invoke a
 /// different version", as `CreateAlias` documents it.
 ///
@@ -2870,6 +2922,14 @@ pub use event_source_mapping::{
     STARTING_POSITION_AT_TIMESTAMP, STARTING_POSITION_LATEST, STARTING_POSITION_TRIM_HORIZON,
 };
 pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor};
+
+/// Which functions Lambda SnapStart can be applied to, and the refusals for asking for it
+/// where it does not hold.
+///
+/// Held in its own module so this one stays readable; every item is re-exported here, so a
+/// handler names them as `crate::state::…`.
+pub mod snap_start;
+pub use snap_start::*;
 
 
 /// Per-service state for com-amazonaws-lambda-awsgirapiservice. A handler reaches it through [`service_state`].
@@ -4058,6 +4118,31 @@ pub fn mint_revision_id() -> String {
 /// environment variables combined.
 pub const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
 
+/// What the environment budget is measured on: the variables as ONE serialized JSON
+/// object, which is the string AWS's refusal reports it measured.
+///
+/// The quota is on the set rather than on any one variable, so what counts is the whole
+/// mapping as it travels — every key, every value and the punctuation that separates them
+/// — and not the bare key and value bytes, which would admit a set AWS refuses. Written
+/// through `serde_json`, so a character a JSON string cannot hold literally contributes
+/// the bytes of its escape, exactly as it does on the wire.
+#[must_use]
+pub fn measured_environment(variables: &BTreeMap<String, String>) -> String {
+    ::serde_json::to_string(variables).unwrap_or_default()
+}
+
+/// The refusal a set of environment variables past [`MAX_ENVIRONMENT_BYTES`] gets.
+///
+/// Fixed text, with the string the quota was measured on as its one variable part, which
+/// is what tells a caller what was counted.
+#[must_use]
+pub fn environment_too_large_message(measured: &str) -> String {
+    format!(
+        "Lambda was unable to configure your environment variables because the environment \
+         variables you have provided exceeded the 4KB limit. String measured: {measured}"
+    )
+}
+
 /// The environment variables an `Environment` member asks a function to hold, ordered so
 /// a read reports them deterministically.
 ///
@@ -4071,15 +4156,9 @@ pub fn environment_variables(
         .and_then(|environment| environment.variables.clone())
         .map(|variables| variables.into_iter().collect())
         .unwrap_or_default();
-    let size: usize = variables
-        .iter()
-        .map(|(name, value)| name.len() + value.len())
-        .sum();
-    if size > MAX_ENVIRONMENT_BYTES {
-        return Err(format!(
-            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
-             environment variables combined, and this request's are {size} bytes"
-        ));
+    let measured = measured_environment(&variables);
+    if measured.len() > MAX_ENVIRONMENT_BYTES {
+        return Err(environment_too_large_message(&measured));
     }
     Ok(variables)
 }
@@ -4300,6 +4379,23 @@ pub const INVALID_TAGS_MESSAGE: &str = "One or more of your tags had a problem, 
      ensure none of your tag names start with \"aws:\", none are empty, and there are no \
      duplicate tags";
 
+/// Lambda's sentence for a tag ARN that qualifies a function with a version or an alias.
+///
+/// `Resource`'s own documentation states the rule — "Lambda does not support adding tags
+/// to function aliases or versions" — and the sentence says that and what to send instead,
+/// carrying nothing of the request: the caller already named the ARN it sent.
+pub const TAGS_ON_QUALIFIED_FUNCTION_MESSAGE: &str =
+    "Tags on function aliases and versions are not supported. Please specify a function \
+     ARN.";
+
+/// Lambda's sentence for a tag write that names no tag at all.
+///
+/// `TagResource`'s `Tags` is `@required` ("A list of tags to apply to the resource"), and
+/// a map with no entry applies none: there is nothing to store, so the request is refused
+/// rather than answered as a write that changed nothing. The sentence states the refusal
+/// and nothing about the request — it is the one AWS answers for this condition.
+pub const EMPTY_TAGS_MESSAGE: &str = "An error occurred and the request cannot be processed.";
+
 /// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
 ///
 /// Compared without regard to case, and by BYTES rather than by characters, so a key
@@ -4388,13 +4484,9 @@ pub fn resolve_resource_tags<'a>(
             )?;
             Ok(&mut record.tags)
         }
-        TaggableResourceRef::FunctionQualifier { qualifier, .. } => {
-            Err(TagResolveFailure::Invalid(format!(
-                "Tags are not supported for a function version or alias. The resource \
-                 '{resource}' qualifies the function with '{qualifier}'; specify the \
-                 unqualified function ARN instead."
-            )))
-        }
+        TaggableResourceRef::FunctionQualifier { .. } => Err(TagResolveFailure::Invalid(
+            TAGS_ON_QUALIFIED_FUNCTION_MESSAGE.to_string(),
+        )),
         TaggableResourceRef::CapacityProvider(provider) => {
             let record = store
                 .capacity_providers
@@ -4542,6 +4634,14 @@ pub enum ResolveFailure {
 ///
 /// The record is brought up to whatever the clock already made due before it is
 /// handed back, so every caller reports the same lifecycle state at the same instant.
+/// The refusal a request whose `FunctionName` qualifies one version and whose `Qualifier`
+/// names another gets.
+///
+/// Fixed text: both halves came from the caller, so the sentence states only that the
+/// qualifier DERIVED from the name is not the one the request specified.
+pub const DERIVED_QUALIFIER_MISMATCH_MESSAGE: &str =
+    "The derived qualifier from the function name does not match the specified qualifier.";
+
 pub fn resolve_function<'a>(
     store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
     function_name: &str,
@@ -4561,10 +4661,12 @@ pub fn resolve_function<'a>(
     // request carrying two different ones names no single resource.
     let version = match (reference.qualifier.as_deref(), qualifier) {
         (Some(from_name), Some(from_query)) if from_name != from_query => {
-            return Err(ResolveFailure::Malformed(format!(
-                "The function name '{function_name}' qualifies version '{from_name}', which \
-                 does not match the Qualifier parameter '{from_query}'"
-            )))
+            // The sentence is AWS's fixed text for this condition and carries NOTHING of
+            // the request: the caller sent both halves, so naming them back says no more
+            // than that the two disagree.
+            return Err(ResolveFailure::Malformed(
+                DERIVED_QUALIFIER_MISMATCH_MESSAGE.to_string(),
+            ))
         }
         (Some(from_name), _) => from_name.to_string(),
         (None, Some(from_query)) => from_query.to_string(),
@@ -4656,9 +4758,17 @@ fn layer_name_of(layer_name: &str) -> Result<String, ResolveFailure> {
 /// which is the state every layer-sharing bootstrap starts from. The READ of the version
 /// itself (`GetLayerVersion`, `GetLayerVersionByArn`) answers the canonical
 /// [`RESOURCE_NOT_FOUND_MESSAGE`] instead, as AWS does for it.
-fn no_such_layer_version(name: &str, version_number: i64) -> ResolveFailure {
+///
+/// What identifies the version is its FULL `LayerVersionArn` — the ARN of the layer with
+/// the version number appended, which is the identifier every answer about a layer version
+/// carries ([`LayerRecord::version_arn`]) — and the sentence is a sentence, so it ends in a
+/// stop. The ARN is built for the Region the request was made in, because that is the
+/// Region whose layers it addressed, and a name this account never published has no stored
+/// ARN to read one off.
+fn no_such_layer_version(region: &str, name: &str, version_number: i64) -> ResolveFailure {
     ResolveFailure::NotFound(format!(
-        "Layer version {name}:{version_number} does not exist"
+        "Layer version {arn}:{version_number} does not exist.",
+        arn = layer_arn(region, name)
     ))
 }
 
@@ -4671,18 +4781,19 @@ pub fn resolve_layer_version<'a>(
     store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
     layer_name: &str,
     version_number: i64,
+    region: &str,
 ) -> Result<ResolvedLayerVersion<'a>, ResolveFailure> {
     let name = layer_name_of(layer_name)?;
 
     let record = store
         .layers
         .get_mut(&name)
-        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+        .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     let arn = record.version_arn(version_number);
     let version = record
         .versions
         .get_mut(&version_number)
-        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+        .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     Ok(ResolvedLayerVersion { arn, version })
 }
 
@@ -4692,18 +4803,19 @@ pub fn resolve_layer_version_ref<'a>(
     store: &'a ComAmazonawsLambdaAwsgirapiserviceState,
     layer_name: &str,
     version_number: i64,
+    region: &str,
 ) -> Result<ResolvedLayerVersionRef<'a>, ResolveFailure> {
     let name = layer_name_of(layer_name)?;
 
     let record = store
         .layers
         .get(&name)
-        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+        .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     let arn = record.version_arn(version_number);
     let version = record
         .versions
         .get(&version_number)
-        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+        .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     Ok(ResolvedLayerVersionRef { arn, version })
 }
 

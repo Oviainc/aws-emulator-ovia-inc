@@ -7,7 +7,7 @@
 //! The rule under test: that refusal is `ResourceNotFoundException` at HTTP 404 carrying
 //! the resource family's own missing-sub-resource message, NEVER the resource-identifying
 //! refusal a request whose own resource does not resolve gets (`Function not found:
-//! <arn>`, `Layer version <name>:<n> does not exist`). The two are therefore
+//! <arn>`, `Layer version <layer-version-arn> does not exist.`). The two are therefore
 //! distinguishable, which is what a client reconciling grants branches on: "this function
 //! holds no policy yet" is not "this function does not exist", and the first is the state
 //! every add-permission/get-policy bootstrap starts from.

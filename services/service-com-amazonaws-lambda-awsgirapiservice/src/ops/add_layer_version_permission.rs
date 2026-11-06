@@ -189,8 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The grant is attached to the stored layer version, whose ARN carries the
-        // region it was published in, so no request metadata takes part in the answer.
-        let _ = ctx;
+        // region it was published in; the Region of the REQUEST is what names the layer
+        // version a refusal reports, since a name this account never published has no
+        // stored ARN to read one off.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AddLayerVersionPermissionErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -199,11 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         let resolved = crate::state::resolve_layer_version(
             &mut store,
             &input.layer_name,
             input.version_number,
+            &region,
         )
         .map_err(|failure| match failure {
             crate::state::ResolveFailure::Malformed(message) => {
@@ -273,9 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Only update the policy if the revision ID matches the ID specified." The id
         // to match is the policy's own, which is the one `GetLayerVersionPolicy`
         // reports; a version with no policy yet is at no revision, so any expectation
-        // fails against it. `PreconditionFailedException` puts every operation but
-        // `AddPermission`/`RemovePermission` on its second branch, so the refusal is the
-        // sentence naming `GetFunction`/`GetAlias`.
+        // fails against it. The refusal names the resource it is about and the API that
+        // reports its latest revision, which for a layer version's policy is
+        // `GetLayerVersion` (`crate::state::LAYER_VERSION_REVISION_PRECONDITION_MESSAGE`).
         if let Some(expected) = input.revision_id.as_deref() {
             let current = resolved
                 .version
@@ -288,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         PreconditionFailedException {
                             r#type: None,
                             message: Some(
-                                crate::state::CONFIGURATION_REVISION_PRECONDITION_MESSAGE
+                                crate::state::LAYER_VERSION_REVISION_PRECONDITION_MESSAGE
                                     .to_string(),
                             ),
                         },

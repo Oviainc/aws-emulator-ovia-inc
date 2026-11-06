@@ -180,16 +180,22 @@ const KINESIS_CONSUMER_SEGMENT: &str = "/consumer/";
 /// made on.
 ///
 /// Only the sources whose reads are plain resource-level calls on the source itself are
-/// here. An Amazon MSK cluster, an Amazon MQ broker and an Amazon DocumentDB change stream
-/// are reached through a cluster's or broker's own credentials and network, so what a role
-/// has to be granted for them is not a read of the named resource and their refusals are
-/// worded per source; those sources are left to the change that implements their polling.
+/// here. An Amazon DocumentDB change stream is reached through the cluster's own
+/// credentials and network, so what a role has to be granted for it is not a read of the
+/// named resource; that source is left to the change that implements its polling.
 ///
 /// A shard source is consumed by the SAME three calls whichever of the two services holds
 /// it — describe the source, open an iterator on a shard, get that shard's records — so
 /// those three are what a mapping onto one is decided on, and a role granted exactly them on
 /// the source is accepted. The other actions in a sentence are the rest of the grant AWS
 /// advises writing.
+///
+/// An Amazon MSK cluster and an Amazon MQ broker are each consumed through a DESCRIBE of the
+/// named resource first — Lambda reads the cluster's bootstrap brokers, or the broker's
+/// endpoints, before it can connect at all — so that describe is the call a mapping onto one
+/// is decided on, and the rest of what AWS's own managed execution-role policy for the
+/// source grants (`AWSLambdaMSKExecutionRole`, the Amazon MQ execution-role policy) is the
+/// grant the sentence advises.
 const EVENT_SOURCE_ACCESS: &[EventSourceAccess] = &[
     EventSourceAccess {
         vendor: super::EVENT_SOURCE_VENDOR_KINESIS,
@@ -230,6 +236,25 @@ const EVENT_SOURCE_ACCESS: &[EventSourceAccess] = &[
             polls("GetQueueAttributes"),
         ],
         refusal: Refusal::Call { service: "SQS" },
+    },
+    EventSourceAccess {
+        vendor: super::EVENT_SOURCE_VENDOR_KAFKA,
+        // An Amazon MSK cluster's own actions are named under the Apache Kafka namespace,
+        // which is the vendor field of its ARNs too.
+        namespace: super::EVENT_SOURCE_VENDOR_KAFKA,
+        actions: &[
+            polls("DescribeClusterV2"),
+            advises("DescribeCluster"),
+            advises("GetBootstrapBrokers"),
+            advises("ListScramSecrets"),
+        ],
+        refusal: Refusal::Call { service: "MSK" },
+    },
+    EventSourceAccess {
+        vendor: super::EVENT_SOURCE_VENDOR_MQ,
+        namespace: super::EVENT_SOURCE_VENDOR_MQ,
+        actions: &[polls("DescribeBroker")],
+        refusal: Refusal::Call { service: "MQ" },
     },
 ];
 

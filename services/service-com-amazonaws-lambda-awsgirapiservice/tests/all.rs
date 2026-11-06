@@ -79,6 +79,8 @@ mod code_signing_configs;
 mod collection_element_refusals;
 #[path = "all/concurrency_quota_refusal_rules.rs"]
 mod concurrency_quota_refusal_rules;
+#[path = "all/control_plane_request_rules.rs"]
+mod control_plane_request_rules;
 #[path = "all/durable_execution_bound.rs"]
 mod durable_execution_bound;
 #[path = "all/durable_execution_history.rs"]

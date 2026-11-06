@@ -148,9 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A pure report: the answer depends on the stored version alone and on no
-        // request metadata.
-        let _ = ctx;
+        // A pure report: the answer depends on the stored version alone. The Region of
+        // the REQUEST names the layer version a refusal reports, since a name this account
+        // never published has no stored ARN to read one off.
+        let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLayerVersionPolicyErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -164,6 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &store,
             &input.layer_name,
             input.version_number,
+            &region,
         )
         .map_err(|failure| match failure {
             crate::state::ResolveFailure::Malformed(message) => {
