@@ -33,22 +33,25 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mapping_role_access::{
-    allow, create_function_as, given_role, iam, logs_only, KINESIS_READS,
+    allow, create_function_as, given_role, iam, logs_only, KINESIS_READS, QUEUE_READS,
 };
 use crate::event_source_mappings::{
     call, call_sqs, create_mapping, create_queue, get_mapping, queue_message_counts, router_on,
 };
+// The stream fixture and the Kinesis calls are the ones the shard-source suites already
+// publish, so every suite over that surface drives the same wire.
+use crate::kinesis_event_source_delivery::{given_stream, put_records};
 
-/// The reads a reader of an Amazon SQS QUEUE makes on it, which a mapping onto one is
-/// decided on. Source: the actions AWS's own managed execution-role policy for that event
-/// source (`AWSLambdaSQSQueueExecutionRole`) grants on the queue.
-const QUEUE_READS: [&str; 3] = ["ReceiveMessage", "DeleteMessage", "GetQueueAttributes"];
+/// The calls consuming a SHARD source takes, which a mapping onto one is decided on — the
+/// `decided_on_source` entries of that source's catalog entry in
+/// `src/state/event_source_authorization.rs`, which is narrower than the whole grant
+/// [`KINESIS_READS`] advises.
+const SHARD_READS: [&str; 3] = ["GetRecords", "GetShardIterator", "DescribeStream"];
 
 /// The `State` a mapping reports once it is polling its event source.
 const STATE_ENABLED: &str = "Enabled";
@@ -103,24 +106,6 @@ fn emulator_with_streams() -> MultiServiceRouter {
         )),
     );
     router
-}
-
-/// One Kinesis call, the way a client makes it.
-async fn kinesis(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", "kinesis.us-east-1.amazonaws.com")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("Kinesis_20131202.{operation}"))
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
 }
 
 /// Replace the role's one inline policy with `statements`, or DELETE it outright when the
@@ -282,7 +267,8 @@ impl Grant {
                     .copied()
                     .collect(),
                 arn,
-            ),            Self::DeniedBeside(denied) => Some(json!([
+            ),
+            Self::DeniedBeside(denied) => Some(json!([
                 logs_only(),
                 allow(namespace, reads, arn),
                 {
@@ -520,15 +506,13 @@ async fn a_stream_mapping_reads_only_while_its_execution_role_may_read_the_strea
     // service's API rather than a queue's. What a pass came to is read off the mapping
     // itself: a pass that read a batch reports its attempt at it, and a pass that read
     // nothing has no attempt to report.
-    for (index, row) in rows(&["GetRecords", "GetShardIterator", "DescribeStream"])
-        .into_iter()
-        .enumerate()
-    {
+    for (index, row) in rows(&SHARD_READS).into_iter().enumerate() {
         let case = row.case.as_str();
         let router = emulator_with_streams();
         let stream = format!("poll-auth-stream-{index}");
-        let arn = given_stream(&router, case, &stream).await;
-        let other_arn = given_stream(&router, case, &format!("poll-auth-other-{index}")).await;
+        let arn = given_stream(&router, case, &stream, 1).await;
+        let other_arn =
+            given_stream(&router, case, &format!("poll-auth-other-{index}"), 1).await;
         let role_name = format!("poll-auth-stream-role-{index}");
         let role = given_role(
             &router,
@@ -555,15 +539,11 @@ async fn a_stream_mapping_reads_only_while_its_execution_role_may_read_the_strea
             &router,
             case,
             &role_name,
-            row.grant.statements(
-                "kinesis",
-                &["GetRecords", "GetShardIterator", "DescribeStream"],
-                &arn,
-                &other_arn,
-            ),
+            row.grant
+                .statements("kinesis", &SHARD_READS, &arn, &other_arn),
         )
         .await;
-        put_record(&router, case, &stream).await;
+        put_records(&router, case, &stream, 1).await;
 
         if row.polls {
             let result = processing_result_within_budget(&router, case, &uuid).await;
@@ -586,59 +566,6 @@ async fn a_stream_mapping_reads_only_while_its_execution_role_may_read_the_strea
             tokio::time::sleep(LOOK_AGAIN).await;
         }
     }
-}
-
-/// A single-shard stream, waited out to `ACTIVE`; answers its ARN.
-async fn given_stream(router: &MultiServiceRouter, case: &str, name: &str) -> String {
-    let (status, created) = kinesis(
-        router,
-        "CreateStream",
-        &json!({ "StreamName": name, "ShardCount": 1 }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected CreateStream {name:?} to answer 200, got {status} {created}"
-    );
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        let (status, summary) =
-            kinesis(router, "DescribeStreamSummary", &json!({ "StreamName": name })).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected DescribeStreamSummary to answer 200, got {status} {summary}"
-        );
-        let description = &summary["StreamDescriptionSummary"];
-        if description["StreamStatus"] == json!("ACTIVE") {
-            return description["StreamARN"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case:?}: no StreamARN in {summary}"))
-                .to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the stream {name:?} never became ACTIVE: {summary}"
-        );
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
-}
-
-/// Put one record to the stream `name` names.
-async fn put_record(router: &MultiServiceRouter, case: &str, name: &str) {
-    let (status, written) = kinesis(
-        router,
-        "PutRecord",
-        &json!({
-            "StreamName": name,
-            "PartitionKey": case,
-            "Data": base64::engine::general_purpose::STANDARD.encode(case.as_bytes()),
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected PutRecord to answer 200, got {status} {written}"
-    );
 }
 
 /// Wait until the mapping `uuid` names reports a `LastProcessingResult`, answering what it

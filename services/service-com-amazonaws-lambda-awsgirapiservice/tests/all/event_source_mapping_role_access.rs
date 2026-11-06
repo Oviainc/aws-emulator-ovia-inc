@@ -88,7 +88,7 @@ pub(crate) const DYNAMODB_READS: [&str; 4] = [
 ];
 
 /// The same, for an Amazon SQS queue. Source: `AWSLambdaSQSQueueExecutionRole`.
-const QUEUE_READS: [&str; 3] = ["ReceiveMessage", "DeleteMessage", "GetQueueAttributes"];
+pub(crate) const QUEUE_READS: [&str; 3] = ["ReceiveMessage", "DeleteMessage", "GetQueueAttributes"];
 
 /// Percent-encode one component of an `application/x-www-form-urlencoded` body, which is
 /// how IAM's `awsQuery` parameters travel.
