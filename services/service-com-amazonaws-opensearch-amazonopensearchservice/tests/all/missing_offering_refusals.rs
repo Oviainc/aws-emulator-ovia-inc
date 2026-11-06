@@ -153,9 +153,20 @@ async fn an_offering_the_catalog_publishes_resolves_through_the_same_operations(
     let emulator = Emulator::new();
     let catalog = whole_catalog(&emulator, "the published catalog").await;
 
+    // The catalog this Region publishes is what the rows below are drawn from, so a
+    // listing that reports nothing is a regression in the catalog rather than a row to
+    // skip: it is named here instead of underflowing the index arithmetic.
+    assert!(
+        !catalog.is_empty(),
+        "case the published catalog: expected the Region's offerings, got an empty listing"
+    );
+
     // Several offerings of the catalog, drawn from its ends and its middle, so the
-    // resolved case is asserted over more than one row of it.
-    let indices = [0, catalog.len() / 2, catalog.len() - 1];
+    // resolved case is asserted over more than one row of it. A catalog too short to
+    // have three distinct rows contributes each of them once.
+    let mut indices = vec![0, catalog.len() / 2, catalog.len() - 1];
+    indices.sort_unstable();
+    indices.dedup();
     for (nth, index) in indices.into_iter().enumerate() {
         let case = format!("offering {index} of {}", catalog.len());
         let id = string_member(&catalog[index], "ReservedInstanceOfferingId", &case);
