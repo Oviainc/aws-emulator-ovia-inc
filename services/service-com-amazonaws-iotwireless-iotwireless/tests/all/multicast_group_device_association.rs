@@ -573,7 +573,10 @@ async fn an_absent_group_or_device_is_not_found() {
         // The whole message is the template for the end that could not be resolved,
         // filled with the id the request supplied, so a reworded prefix fails too.
         let expected_message = if missing == "MulticastGroup" {
-            format!("MulticastGroup {missing_id} not found")
+            format!(
+                "Cannot complete the step because resource is not found, with resource type \
+                 MulticastGroup, resource Id {missing_id}"
+            )
         } else {
             format!("No wireless device with WirelessDeviceId {missing_id}")
         };

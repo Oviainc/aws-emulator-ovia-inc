@@ -185,11 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: Some(group.id.clone()),
             name: group.name.clone(),
             description: group.description.clone(),
-            // `MulticastGroupStatus` reports where the group's multicast SESSION stands;
-            // the session operations are not implemented here, so no session has ever
-            // been scheduled for a group this emulator holds and there is no status to
-            // report rather than one invented for work nothing ran.
-            status: None,
+            // `MulticastGroupStatus` is the group's service-assigned lifecycle state, kept
+            // on the record the create wrote, so the read reports where the group stands
+            // rather than leaving a poller with nothing to observe.
+            status: Some(group.status.clone()),
             lo_ra_wan: Some(lorawan),
             created_at: Some(::aws_smithy_types::DateTime::from(group.created_at)),
         })

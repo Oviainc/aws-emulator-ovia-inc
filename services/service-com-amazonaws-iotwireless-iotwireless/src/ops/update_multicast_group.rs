@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMulticastGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMulticastGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: patches a stored multicast group. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMulticastGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member the request carries replaces the stored one; an omitted member keeps
+//! the value the group already had.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +142,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMulticastGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMulticastGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMulticastGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMulticastGroupError::from(
+                UpdateMulticastGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let mut store = state.lock();
+        // `Id` is this operation's `@httpLabel`, so it ADDRESSES the group to patch; an
+        // id the account does not hold is the modelled 404, worded by the one helper
+        // every multicast-group-addressing operation refuses through.
+        let group = store.multicast_groups.get_mut(&input.id).ok_or_else(|| {
+            UpdateMulticastGroupError::from(
+                UpdateMulticastGroupErrorModeled::ResourceNotFoundException(
+                    crate::state::multicast_group_not_found(&input.id),
+                ),
+            )
+        })?;
+
+        // Every member the request CARRIED replaces the stored one, and a member it
+        // omitted leaves the stored value as it was — so patching only the description
+        // keeps the group's name and its whole downlink session plan. The same rule
+        // applies INSIDE the `LoRaWAN` block, one member at a time, so a patch that
+        // re-points the RF region does not discard the session parameters the create
+        // supplied. `Id`, `Arn` and `CreatedAt` are the group's identity rather than
+        // patchable members, and `Status` is service-assigned: this operation carries no
+        // value for any of them.
+        if let Some(name) = input.name {
+            group.name = Some(name);
+        }
+        if let Some(description) = input.description {
+            group.description = Some(description);
+        }
+        if let Some(lorawan) = input.lo_ra_wan {
+            // A member the request CARRIED is a value the caller chose, even when it is
+            // an empty structure: `DefaultSessionParameters: {}` asks for the group's
+            // own plan to be dropped, and the completion below then re-derives it from
+            // the region, which is where a plan with nothing supplied comes from anyway.
+            if let Some(rf_region) = lorawan.rf_region {
+                group.lorawan.rf_region = Some(rf_region);
+            }
+            if let Some(dl_class) = lorawan.dl_class {
+                group.lorawan.dl_class = Some(dl_class);
+            }
+            if let Some(gateways) = lorawan.participating_gateways {
+                group.lorawan.participating_gateways = Some(gateways);
+            }
+            if let Some(session_parameters) = lorawan.default_session_parameters {
+                group.lorawan.default_session_parameters = Some(session_parameters);
+            }
+        }
+        // A patch that re-points the region, or that supplies half a session plan, leaves
+        // the group with the same completed plan a create would have given it, so the
+        // completion rule holds for every write rather than only the first one.
+        crate::state::complete_default_session_parameters(&mut group.lorawan);
+
+        Ok(UpdateMulticastGroupOutput {})
     }
 }

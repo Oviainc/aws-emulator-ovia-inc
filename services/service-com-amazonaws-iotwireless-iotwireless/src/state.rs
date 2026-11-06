@@ -756,9 +756,14 @@ pub struct MulticastGroup {
     pub arn: String,
     pub name: Option<String>,
     pub description: Option<String>,
-    /// The LoRaWAN settings the create carried, reported back by the group's reader.
+    /// The LoRaWAN settings the create carried, reported back by the group's reader and
+    /// patched member by member by the group's update.
     pub lorawan: LoRaWANMulticast,
     pub tags: Vec<Tag>,
+    /// `MulticastGroupStatus`, as [`MULTICAST_GROUP_STATUS_PENDING`] documents the value
+    /// a created group carries. Service-assigned lifecycle state, never a request value:
+    /// the create and the update take no `Status` member.
+    pub status: String,
     /// When the group was created, reported as `GetMulticastGroup`'s `CreatedAt`.
     pub created_at: SystemTime,
     /// The devices whose association with this group has been REQUESTED, counted as
@@ -771,6 +776,83 @@ pub struct MulticastGroup {
     /// `forget_multicast_group_requests_for`, so nothing counts a device the store no
     /// longer holds, and the set stays bounded by the device store.
     pub requested_devices: BTreeSet<String>,
+}
+
+/// The `MulticastGroupStatus` a created multicast group carries: the group exists, and
+/// no multicast session has been scheduled for it.
+///
+/// `MulticastGroupStatus` is a plain string in the model
+/// (`smithy_query(query="shape", shape="MulticastGroupStatus")` lists no enum values),
+/// so the token is this service's own name for that initial lifecycle state. A group
+/// leaves it only when a session is scheduled on it, which the session operations do;
+/// they are still scaffolded, so a stored group keeps reporting this and nothing invents
+/// progress no session made.
+pub const MULTICAST_GROUP_STATUS_PENDING: &str = "Pending";
+
+/// The downlink channel each LoRaWAN regional plan reserves for class B/C downlinks, as
+/// `(SupportedRfRegion, DlDr, DlFreq in Hz)` — the plan's second receive window, which
+/// is the channel a multicast downlink goes out on.
+///
+/// One row per value of `SupportedRfRegion`
+/// (`smithy_query(query="shape", shape="SupportedRfRegion")`), so every region a group
+/// can name has a plan here and none is served by a special case; the const assertion
+/// below fails the build if the model ever adds a region this table does not answer for.
+///
+/// Sources, row by row:
+///
+/// * each frequency is the plan's published class B/C downlink (RX2) channel — 869.525
+///   MHz for EU868, 434.665 MHz for EU433, 505.3 MHz for CN470, 786 MHz for CN779,
+///   869.1 MHz for RU864, 921.9 MHz for KR920, 866.55 MHz for IN865, 923.3 MHz for the
+///   two 500 kHz plans (US915, AU915), and 923.2 MHz for AS923-1 shifted by that plan's
+///   published per-group offsets for AS923-2/3/4 (-1.80, -6.60 and -5.90 MHz);
+/// * each data rate is the one that channel is used at in its plan: the lowest data rate
+///   (0) in the 125 kHz plans, 2 in the AS923 plans and in IN865, and 9 in the two 500
+///   kHz plans, whose downlink-only data rates start above the uplink ones.
+///
+/// Every row is inside the published ranges of `DlDr` (0..15) and `DlFreq`
+/// (100000000..1000000000), which the model declares.
+const REGION_DOWNLINK_DEFAULTS: &[(&str, i32, i32)] = &[
+    ("EU868", 0, 869_525_000),
+    ("US915", 9, 923_300_000),
+    ("AU915", 9, 923_300_000),
+    ("AS923-1", 2, 923_200_000),
+    ("AS923-2", 2, 921_400_000),
+    ("AS923-3", 2, 916_600_000),
+    ("AS923-4", 2, 917_300_000),
+    ("EU433", 0, 434_665_000),
+    ("CN470", 0, 505_300_000),
+    ("CN779", 0, 786_000_000),
+    ("RU864", 0, 869_100_000),
+    ("KR920", 0, 921_900_000),
+    ("IN865", 2, 866_550_000),
+];
+
+/// The table above answers for the WHOLE modelled catalog: one row per
+/// `SupportedRfRegion`, checked at compile time against the model-generated value list so
+/// a region a later model adds cannot silently fall through to no downlink channel.
+const _: () = assert!(
+    REGION_DOWNLINK_DEFAULTS.len() == crate::ops::types::SUPPORTED_RF_REGION_VALUES.len()
+);
+
+/// Complete a multicast group's `DefaultSessionParameters` the way the service does when
+/// a write leaves them out: each member the request did not supply takes the value of
+/// the group's RF region's downlink channel, so a stored group always carries the whole
+/// downlink session plan a multicast session needs and its reader never answers a null
+/// data rate or frequency.
+///
+/// A member the request DID supply is left exactly as submitted. A group that names no
+/// RF region gets nothing: there is no regional plan to take a legal downlink channel
+/// from, and a frequency invented without one would be a channel no device listens on.
+pub fn complete_default_session_parameters(lorawan: &mut LoRaWANMulticast) {
+    let Some((_, dl_dr, dl_freq)) = REGION_DOWNLINK_DEFAULTS
+        .iter()
+        .find(|(region, _, _)| Some(*region) == lorawan.rf_region.as_deref())
+    else {
+        return;
+    };
+    let parameters = lorawan.default_session_parameters.get_or_insert_default();
+    parameters.dl_dr = parameters.dl_dr.or(Some(*dl_dr));
+    parameters.dl_freq = parameters.dl_freq.or(Some(*dl_freq));
 }
 
 /// A FUOTA task: the firmware image a set of wireless devices is updated with, and the
@@ -842,11 +924,7 @@ pub fn wireless_device_not_found(id: &str) -> ResourceNotFoundException {
 /// One function, so every operation that addresses a FUOTA task by `Id` refuses a
 /// missing one with the same body.
 pub fn fuota_task_not_found(id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("FuotaTask {id} not found")),
-        resource_id: Some(id.to_string()),
-        resource_type: Some("FuotaTask".to_string()),
-    }
+    resource_not_found("FuotaTask", id)
 }
 
 /// The `ResourceNotFoundException` body for a multicast group the account does not hold.
@@ -855,11 +933,7 @@ pub fn fuota_task_not_found(id: &str) -> ResourceNotFoundException {
 /// reader, and the association operations that resolve one — refuses a missing one with
 /// the same body.
 pub fn multicast_group_not_found(id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("MulticastGroup {id} not found")),
-        resource_id: Some(id.to_string()),
-        resource_type: Some("MulticastGroup".to_string()),
-    }
+    resource_not_found("MulticastGroup", id)
 }
 
 /// A network analyzer configuration: the trace settings, and the wireless devices,
@@ -1271,9 +1345,9 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
 /// The cap cannot bind in practice, which is why evicting the oldest entry is a safe
 /// last resort rather than a behaviour change: at most one token is recorded per stored
 /// resource, a resource's tokens are dropped with it where its delete is implemented
-/// (`forget_*_tokens_for`, which the destination and wireless-device deletes call —
-/// the device-profile, multicast-group and wireless-gateway deletes are still
-/// scaffolded, so those three
+/// (`forget_*_tokens_for`, which the destination, wireless-device and multicast-group
+/// deletes call — the device-profile and wireless-gateway deletes are still
+/// scaffolded, so those two
 /// maps release a token only when the whole store is dropped), and each
 /// token cap equals its resource ceiling — so the map can only reach `cap` when every
 /// entry in it names a resource the store accepted and the resource store is itself
@@ -1469,6 +1543,37 @@ impl ComAmazonawsIotwirelessIotwirelessState {
         for group in self.multicast_groups.values_mut() {
             group.requested_devices.remove(device_id);
         }
+    }
+
+    /// Take multicast group `id` out of the store, with everything that only existed
+    /// because the group did: the memberships the devices held in it, and the idempotency
+    /// tokens that minted it.
+    ///
+    /// `None` for a group the store does not hold, which is what lets the delete refuse an
+    /// unknown `Id` from the same call that removes a known one. The device memberships go
+    /// because a device cannot belong to a group the account no longer holds — a stale
+    /// `multicast_group_id` would otherwise keep answering
+    /// `ListWirelessDevices?multicastGroupId=` and counting towards a group re-created
+    /// under the same id.
+    pub fn remove_multicast_group(&mut self, id: &str) -> Option<MulticastGroup> {
+        let removed = self.multicast_groups.remove(id)?;
+        for device in self.wireless_devices.values_mut() {
+            if device.multicast_group_id.as_deref() == Some(id) {
+                device.multicast_group_id = None;
+            }
+        }
+        self.forget_multicast_group_tokens_for(id);
+        Some(removed)
+    }
+
+    /// Drop every idempotency token that minted multicast group `id`, so a token never
+    /// outlives the resource it names.
+    pub fn forget_multicast_group_tokens_for(&mut self, id: &str) {
+        forget_tokens_for(
+            &mut self.multicast_group_tokens,
+            &mut self.multicast_group_token_order,
+            id,
+        );
     }
 
     /// What a `CreateMulticastGroup` `ClientRequestToken` already minted, if anything.

@@ -217,13 +217,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_multicast_group_id();
+        // The group's own copy of the submitted LoRaWAN block, completed with the
+        // downlink channel of the region it names where the request supplied no session
+        // parameters of its own: `DefaultSessionParameters` is the group's session plan,
+        // which the service assigns, not merely request input echoed back.
+        let mut lorawan = input.lo_ra_wan.clone();
+        crate::state::complete_default_session_parameters(&mut lorawan);
         let group = crate::state::MulticastGroup {
             arn: crate::state::multicast_group_arn(&region, &id),
             id: id.clone(),
             name: input.name.clone(),
             description: input.description.clone(),
-            lorawan: input.lo_ra_wan.clone(),
+            lorawan,
             tags: input.tags.clone().unwrap_or_default(),
+            // `Status` is service-assigned lifecycle state, not a request value: this
+            // operation takes no `Status` member, so the group is stamped with the state a
+            // group that has no multicast session yet is in, and its reader reports it.
+            status: crate::state::MULTICAST_GROUP_STATUS_PENDING.to_string(),
             created_at: ::std::time::SystemTime::now(),
             // Nothing has asked for a membership in a group this call is minting.
             requested_devices: ::std::collections::BTreeSet::new(),
