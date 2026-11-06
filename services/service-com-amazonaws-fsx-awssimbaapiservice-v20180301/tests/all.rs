@@ -15,15 +15,21 @@
 mod backup_lifecycle;
 #[path = "all/constraint_refusals.rs"]
 mod constraint_refusals;
+#[path = "all/create_file_system_from_backup.rs"]
+mod create_file_system_from_backup;
 #[path = "all/create_file_system_resolves_ec2_subnets.rs"]
 mod create_file_system_resolves_ec2_subnets;
 #[path = "all/create_file_system_validation.rs"]
 mod create_file_system_validation;
+#[path = "all/disk_iops_configuration.rs"]
+mod disk_iops_configuration;
 #[path = "all/describe_backups_filter_selection.rs"]
 mod describe_backups_filter_selection;
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/open_zfs_root_volume.rs"]
+mod open_zfs_root_volume;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

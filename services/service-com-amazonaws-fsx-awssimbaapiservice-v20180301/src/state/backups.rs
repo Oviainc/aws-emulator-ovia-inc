@@ -159,6 +159,11 @@ pub struct BackupRecord {
     /// is deleted": the live record may change or be removed afterwards, and a backup still
     /// describes what it was taken from.
     pub file_system: FileSystemRecord,
+    /// The volumes that file system had when the backup was taken, as their records stood
+    /// at that moment — a copy, for the same reason as `file_system`. A backup of an
+    /// OpenZFS file system is a backup of its volumes' data too, so a restore of it
+    /// provisions volumes configured as these were.
+    pub volumes: Vec<super::VolumeRecord>,
     /// The modelled `ResourceType` of what was backed up.
     pub resource_type: String,
     pub pending: Option<PendingTransition>,
@@ -436,17 +441,10 @@ pub fn volume_not_found_message(volume_id: &str) -> String {
 }
 
 /// The `BadRequest$Message` for a `DescribeBackups` `Filter` whose name this listing does
-/// not select by: the name the request carried, and the names it accepts.
-///
-/// The accepted names are rendered from [`BACKUP_FILTER_NAMES`] itself rather than written
-/// out again, so the sentence cannot drift from what the handler applies. Clamped to the
-/// modelled `ErrorMessage` `length 1..256`, because the name comes from the request.
+/// not select by, from the shared wording in
+/// [`super::unsupported_filter_name_message_for`] with this listing's own accepted names.
 pub fn unsupported_filter_name_message(filter_name: &str) -> String {
-    within_error_message_length(format!(
-        "The filter name '{filter_name}' is not supported by DescribeBackups. The supported \
-         names are {}.",
-        BACKUP_FILTER_NAMES.join(", ")
-    ))
+    super::unsupported_filter_name_message_for("DescribeBackups", BACKUP_FILTER_NAMES, filter_name)
 }
 
 /// A fixed-size digest of a `CreateBackup` call's parameters, for the
@@ -468,18 +466,8 @@ pub fn backup_parameter_fingerprint(
     hex::encode(Sha256::digest(rendered.as_bytes()))
 }
 
-/// The pagination scope of one `DescribeBackups` listing.
-///
-/// A cursor only means something over the same ordered set of keys, so a token minted for
-/// one selection is not accepted for another: the requested `BackupIds` and the `Filters`
-/// both take part. They are caller-supplied text of unbounded shape, so the scope is their
-/// DIGEST — a fixed-length, separator-free string — rather than the values themselves.
-/// `selected` must be sorted and deduplicated, and `filters` normalised the same way, so
-/// one selection written in a different order is the same scope.
+/// The pagination scope of one `DescribeBackups` listing, from the shared
+/// [`super::filtered_page_scope`] under this listing's own name.
 pub fn backups_page_scope(selected: &[String], filters: &[(String, Vec<String>)]) -> String {
-    if selected.is_empty() && filters.is_empty() {
-        return "backups".to_string();
-    }
-    let rendered = format!("{selected:?}|{filters:?}");
-    format!("backups/{}", hex::encode(Sha256::digest(rendered.as_bytes())))
+    super::filtered_page_scope("backups", selected, filters)
 }

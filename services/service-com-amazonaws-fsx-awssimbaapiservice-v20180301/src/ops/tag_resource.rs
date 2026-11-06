@@ -160,7 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_id = match &found {
             // Whichever FSx resource the ARN names: tags live on the resource, and every
             // type carries one tag map.
-            ResourceLookup::FileSystem(id) | ResourceLookup::Backup(id) => id.clone(),
+            ResourceLookup::FileSystem(id)
+            | ResourceLookup::Backup(id)
+            | ResourceLookup::Volume(id) => id.clone(),
             ResourceLookup::NotFound(resource_id) => {
                 return Err(TagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),

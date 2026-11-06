@@ -15,10 +15,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::types::{
     CreateFileSystemLustreConfiguration, CreateFileSystemOntapConfiguration,
     CreateFileSystemOpenZFSConfiguration, CreateFileSystemWindowsConfiguration,
-    DataRepositoryConfiguration, FileSystem, FileSystemLustreMetadataConfiguration,
+    DataRepositoryConfiguration, DiskIopsConfiguration, FileSystem,
+    FileSystemLustreMetadataConfiguration,
     LustreFileSystemConfiguration, LustreLogConfiguration, OntapFileSystemConfiguration,
     OpenZFSFileSystemConfiguration, SelfManagedActiveDirectoryAttributes, Tag,
     UpdateFileSystemLustreConfiguration, UpdateFileSystemOntapConfiguration,
@@ -47,6 +50,31 @@ pub const DEFAULT_STORAGE_TYPE: &str = "SSD";
 /// `NetworkType` default. AWS documents "The default is IPV4" on
 /// `CreateFileSystem$NetworkType`.
 pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
+
+/// `DiskIopsConfigurationMode` values, from the modelled enum
+/// (`smithy_query(query="shape", shape="DiskIopsConfigurationMode")`:
+/// AUTOMATIC | USER_PROVISIONED).
+pub const DISK_IOPS_MODE_AUTOMATIC: &str = "AUTOMATIC";
+/// See [`DISK_IOPS_MODE_AUTOMATIC`].
+pub const DISK_IOPS_MODE_USER_PROVISIONED: &str = "USER_PROVISIONED";
+
+/// The SSD IOPS a file system is provisioned per GiB of storage capacity while its
+/// disk-IOPS mode is `AUTOMATIC`. AWS documents the rate twice: `DiskIopsConfiguration`
+/// ("By default, Amazon FSx automatically provisions 3 IOPS per GB of storage capacity")
+/// and `DiskIopsConfiguration$Iops` ("calculated as `StorageCapacity` * 3 * `HAPairs` (3
+/// IOPS per GB of `StorageCapacity`)").
+pub const AUTOMATIC_IOPS_PER_GIB: i64 = 3;
+
+/// The high-availability pairs a file system is powered by when its configuration names
+/// none, from `CreateFileSystemOntapConfiguration$HAPairs` ("The default value is 1").
+/// ONTAP is the only configuration that models the member; the other file-system types
+/// are powered by one pair.
+pub const DEFAULT_HA_PAIRS: i32 = 1;
+
+/// The largest `Iops` the modelled `DiskIopsConfiguration$Iops` long can report, from its
+/// own `range 0..2147483647`: the computed `AUTOMATIC` value stays inside the member it is
+/// reported in.
+pub const MAX_DISK_IOPS: i64 = 2_147_483_647;
 
 /// The region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -221,6 +249,45 @@ impl FileSystemRecord {
             network_type: Some(self.network_type.clone()),
         }
     }
+
+    /// Materialise the provisioned disk-IOPS configuration of every per-type configuration
+    /// this record carries, from the record's own storage capacity.
+    ///
+    /// The ONE place the documented default is applied, so a file system HAS the member
+    /// from the moment it is created and keeps it in step with its capacity: a store that
+    /// kept the request's omission would report a file system with no provisioned SSD IOPS,
+    /// which AWS never does. Called on every path that writes a record's capacity or its
+    /// per-type configuration, so the stored record — and therefore every read of it, the
+    /// copy a backup keeps included — agrees with it.
+    ///
+    /// Lustre is left out because the modelled `LustreFileSystemConfiguration` has no
+    /// `DiskIopsConfiguration` member at all; `FileSystemLustreMetadataConfiguration$Iops`
+    /// is a different, metadata-only value with its own modes.
+    pub fn materialize_provisioned_disk_iops(&mut self) {
+        let storage_capacity = self.storage_capacity;
+        if let Some(windows) = self.windows_configuration.as_mut() {
+            windows.disk_iops_configuration = provisioned_disk_iops(
+                windows.disk_iops_configuration.as_ref(),
+                storage_capacity,
+                None,
+            );
+        }
+        if let Some(ontap) = self.ontap_configuration.as_mut() {
+            let ha_pairs = ontap.ha_pairs;
+            ontap.disk_iops_configuration = provisioned_disk_iops(
+                ontap.disk_iops_configuration.as_ref(),
+                storage_capacity,
+                ha_pairs,
+            );
+        }
+        if let Some(open_zfs) = self.open_zfs_configuration.as_mut() {
+            open_zfs.disk_iops_configuration = provisioned_disk_iops(
+                open_zfs.disk_iops_configuration.as_ref(),
+                storage_capacity,
+                None,
+            );
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-fsx-awssimbaapiservice-v20180301. A handler reaches it through [`service_state`].
@@ -277,6 +344,15 @@ pub struct ComAmazonawsFsxAwssimbaapiserviceV20180301State {
     /// Insertion order of `deleted_backup_tokens`, oldest first — what lets that map be
     /// bounded, exactly as `token_order` bounds the first one.
     deleted_backup_token_order: VecDeque<String>,
+    /// Stored volumes, keyed by `VolumeId`. A `BTreeMap` for the same reason as
+    /// `file_systems`: `DescribeVolumes` pages over it, and minted ids sort in creation
+    /// order. See [`volumes`] for the record and which volumes this slice holds. BOUNDED by
+    /// [`MAX_VOLUMES`], and per file system by [`MAX_VOLUMES_PER_FILE_SYSTEM`]; write it
+    /// through [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::insert_volume`], which
+    /// enforces both.
+    pub volumes: BTreeMap<String, VolumeRecord>,
+    /// Source of minted `VolumeId`s.
+    pub next_volume_id_counter: u64,
 }
 
 /// What an FSx `ResourceARN` names, once resolved against the store.
@@ -286,6 +362,8 @@ pub enum ResourceLookup {
     FileSystem(String),
     /// A backup this service stores, by `BackupId`.
     Backup(String),
+    /// A volume this service stores, by `VolumeId`.
+    Volume(String),
     /// An ARN naming a resource type FSx owns that holds no record here:
     /// `ResourceNotFound`. Carries the resource id from the request's ARN, because the
     /// error's `Message` is built from the identifier the caller sent (see
@@ -317,6 +395,7 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
         self.settle_due_backup_transitions(now);
+        self.settle_due_volume_transitions(now);
         let mut removed: Vec<String> = Vec::new();
         for (id, record) in &mut self.file_systems {
             let Some(pending) = record.pending else {
@@ -335,6 +414,9 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
         }
         for id in removed {
             self.file_systems.remove(&id);
+            // A volume belongs to its file system, so the records go with it rather than
+            // outliving the file system that had them.
+            self.remove_volumes_of_file_system(&id);
             // A token whose file system is gone replays nothing, so it is released with
             // the record rather than held for the life of the process.
             self.forget_tokens_for(&id);
@@ -406,7 +488,11 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
         {
             return ResourceLookup::Backup(arn.resource_id);
         }
-        // An FSx resource type this slice does not store yet (a volume, an SVM) holds no
+        if arn.resource_type == VOLUME_RESOURCE_TYPE && self.volumes.contains_key(&arn.resource_id)
+        {
+            return ResourceLookup::Volume(arn.resource_id);
+        }
+        // An FSx resource type this slice does not store yet (a snapshot, an SVM) holds no
         // record either, because the operations that would create one are still 501 — so
         // there is genuinely no such resource. The id the ARN named travels with the
         // answer, so the error can name it.
@@ -425,6 +511,7 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
                 self.file_systems.get(id).map(|record| &record.tags)
             }
             ResourceLookup::Backup(id) => self.backups.get(id).map(|record| &record.tags),
+            ResourceLookup::Volume(id) => self.volumes.get(id).map(|record| &record.tags),
             ResourceLookup::NotFound(_) | ResourceLookup::NotFsxResource => None,
         }
     }
@@ -440,6 +527,7 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
                 self.file_systems.get_mut(id).map(|record| &mut record.tags)
             }
             ResourceLookup::Backup(id) => self.backups.get_mut(id).map(|record| &mut record.tags),
+            ResourceLookup::Volume(id) => self.volumes.get_mut(id).map(|record| &mut record.tags),
             ResourceLookup::NotFound(_) | ResourceLookup::NotFsxResource => None,
         }
     }
@@ -569,6 +657,12 @@ pub use ec2_subnets::resolve_requested_subnets;
 /// reaches it through `crate::state` like everything else here.
 mod backups;
 pub use backups::*;
+
+/// The volume slice: the volumes a file-system create provisions (an OpenZFS file
+/// system's root volume) and `DescribeVolumes` reads. Re-exported, so a handler reaches it
+/// through `crate::state` like everything else here.
+mod volumes;
+pub use volumes::*;
 
 /// Remember one `ClientRequestToken` replay in a bounded map, dropping the oldest once
 /// [`MAX_IDEMPOTENCY_TOKENS`] are held.
@@ -778,6 +872,51 @@ pub fn tags_page_scope(resource_id: &str) -> String {
     format!("tags/{resource_id}")
 }
 
+/// The pagination scope of one FILTERED listing (`DescribeBackups`, `DescribeVolumes`):
+/// the listing's own name for an unrestricted page, and the selection itself otherwise.
+///
+/// A cursor only means something over the same ordered set of keys, so a token minted for
+/// one selection is not accepted for another: the ids the request named and its `Filters`
+/// both take part. They are caller-supplied text of unbounded shape, so the scope is their
+/// DIGEST — a fixed-length, separator-free string — rather than the values themselves.
+/// `selected` must be sorted and deduplicated, and `filters` normalised the same way, so
+/// one selection written in a different order is the same scope.
+///
+/// Stated once here, so two listings cannot drift apart in how they scope a cursor.
+pub fn filtered_page_scope(
+    listing: &str,
+    selected: &[String],
+    filters: &[(String, Vec<String>)],
+) -> String {
+    if selected.is_empty() && filters.is_empty() {
+        return listing.to_string();
+    }
+    let rendered = format!("{selected:?}|{filters:?}");
+    format!(
+        "{listing}/{}",
+        hex::encode(Sha256::digest(rendered.as_bytes()))
+    )
+}
+
+/// The `BadRequest$Message` for a `Filter` whose name a listing does not select by: the
+/// name the request carried, and the names that listing accepts.
+///
+/// The accepted names are rendered from the listing's own slice rather than written out
+/// again, so the sentence cannot drift from what the handler applies. Clamped to the
+/// modelled `ErrorMessage` `length 1..256`, because the name comes from the request.
+/// Stated once here, so two listings cannot word the same refusal differently.
+pub fn unsupported_filter_name_message_for(
+    operation: &str,
+    supported: &[&str],
+    filter_name: &str,
+) -> String {
+    within_error_message_length(format!(
+        "The filter name '{filter_name}' is not supported by {operation}. The supported names \
+         are {}.",
+        supported.join(", ")
+    ))
+}
+
 /// The page size a request asks for, clamped to what the modelled output list can hold.
 pub fn page_size(max_results: Option<i32>, cap: usize) -> usize {
     match max_results.and_then(|requested| usize::try_from(requested).ok()) {
@@ -825,6 +964,44 @@ pub fn file_system_type_version(
 /// Matches the modelled `DNSName` pattern `^((fs|fc)i?-[0-9a-f]{8,}\..{4,253})$`.
 pub fn file_system_dns_name(file_system_id: &str, region: &str) -> String {
     format!("{file_system_id}.fsx.{region}.amazonaws.com")
+}
+
+/// The `DiskIopsConfiguration` a file system HAS, from the one its configuration carries
+/// (if any), its own stored storage capacity and its high-availability pairs.
+///
+/// The member is a SERVER-SIDE default, never an echo of the request: AWS documents that
+/// "by default, Amazon FSx automatically provisions 3 IOPS per GB of storage capacity", so
+/// a file system of a type that models the member always has one. A configuration that
+/// names no mode, or the `AUTOMATIC` mode, reports that rate applied to the file system's
+/// current capacity and HA pairs; `USER_PROVISIONED` reports the IOPS the caller
+/// provisioned, so an explicitly provisioned value is never overwritten.
+pub fn provisioned_disk_iops(
+    configured: Option<&DiskIopsConfiguration>,
+    storage_capacity: Option<i32>,
+    ha_pairs: Option<i32>,
+) -> Option<DiskIopsConfiguration> {
+    let mode = configured
+        .and_then(|config| config.mode.clone())
+        .unwrap_or_else(|| DISK_IOPS_MODE_AUTOMATIC.to_string());
+    if mode == DISK_IOPS_MODE_USER_PROVISIONED {
+        return Some(DiskIopsConfiguration {
+            mode: Some(mode),
+            iops: configured.and_then(|config| config.iops),
+        });
+    }
+    // The automatic value is the documented rate applied to the file system's OWN stored
+    // capacity, so a file system that states no storage capacity (a fully elastic one) has
+    // no SSD IOPS count to report rather than a made-up one.
+    let capacity = storage_capacity?;
+    let pairs = i64::from(ha_pairs.unwrap_or(DEFAULT_HA_PAIRS).max(DEFAULT_HA_PAIRS));
+    Some(DiskIopsConfiguration {
+        mode: Some(mode),
+        iops: Some(
+            (i64::from(capacity).saturating_mul(AUTOMATIC_IOPS_PER_GIB))
+                .saturating_mul(pairs)
+                .min(MAX_DISK_IOPS),
+        ),
+    })
 }
 
 /// The stored Windows configuration for a `CreateFileSystemWindowsConfiguration`.

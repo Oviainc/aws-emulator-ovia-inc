@@ -327,6 +327,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The disk-IOPS configuration is re-materialised from the record as it now stands:
+        // an update that changed the storage capacity or the HA pairs moves the
+        // `AUTOMATIC` IOPS count with it, and one that provisioned its own value keeps it.
+        record.materialize_provisioned_disk_iops();
+
         // An update is a customer-initiated change, which the modelled lifecycle calls
         // `UPDATING` ("The file system is undergoing a customer-initiated update"); the
         // clock owes it the way back to `AVAILABLE`.

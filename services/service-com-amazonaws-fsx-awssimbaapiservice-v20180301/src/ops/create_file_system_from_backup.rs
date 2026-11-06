@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFileSystemFromBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFileSystemFromBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFileSystemFromBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +152,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use sha2::{Digest, Sha256};
+
+use crate::state::{
+    backup_not_found_message, file_system_dns_name, fsx_arn, open_zfs_root_volume,
+    open_zfs_root_volume_from_record, resolve_requested_subnets, root_volume_tags,
+    stored_lustre_configuration, stored_open_zfs_configuration, stored_windows_configuration,
+    volume_count_limit_message, FileSystemRecord, IdempotentCreate, PendingTransition,
+    TransitionTarget, VolumeCountLimitReached, FILE_SYSTEM_RESOURCE_TYPE, LIFECYCLE_CREATING,
+    MAX_FILE_SYSTEMS, SERVICE_LIMIT_FILE_SYSTEM_COUNT, SERVICE_LIMIT_VOLUMES_PER_FILE_SYSTEM,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -237,18 +242,440 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFileSystemFromBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFileSystemFromBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFileSystemFromBackup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFileSystemFromBackupErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the FSx file-system store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `SubnetIds` list declares `length min 0`, so an EMPTY list satisfies
+        // the boundary validator and reaches here, but the restored file system has to be
+        // reachable from at least one subnet.
+        if input.subnet_ids.is_empty() {
+            return Err(CreateFileSystemFromBackupErrorModeled::InvalidNetworkSettings(
+                InvalidNetworkSettings {
+                    message: Some("SubnetIds must specify at least one subnet".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // Every ARN and DNS name is built for the region the caller signed for.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // The restored file system is placed in the subnets THIS request names — the
+        // backup's own subnets are a record of where the source lived — so each identifier
+        // is resolved against the subnets the account has, exactly as `CreateFileSystem`
+        // resolves them.
+        let resolved_subnets =
+            match resolve_requested_subnets(ctx, &region, &named_subnet_ids(&input)).await {
+                Ok(resolved) => resolved,
+                Err(invalid) => return Err(subnet_does_not_exist(&invalid)),
+            };
+
+        let fingerprint = restore_parameter_fingerprint(&input);
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // `@idempotencyToken`, as AWS documents it for this operation: "If a file system
+        // with the specified client request token exists and the parameters match, this
+        // operation returns the description of the file system. If a file system with the
+        // specified client request token exists but the parameters don't match, this call
+        // returns IncompatibleParameterError." The token is documented as a string the CLI
+        // and the SDKs fill in rather than as a requirement of the call (unlike
+        // `CreateFileSystem`, whose documentation requires one), so a request carrying none
+        // simply replays nothing. It is the same token space file-system creation uses, so
+        // one token cannot stand for two different file systems.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(previous) = store.idempotency_tokens.get(token).cloned() {
+                match store.file_systems.get(&previous.file_system_id) {
+                    Some(_) if previous.fingerprint != fingerprint => {
+                        return Err(
+                            CreateFileSystemFromBackupErrorModeled::IncompatibleParameterError(
+                                IncompatibleParameterError {
+                                    parameter: "ClientRequestToken".to_string(),
+                                    message: Some(format!(
+                                        "the client request token {token} was already used to \
+                                         create {} with different parameters",
+                                        previous.file_system_id
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    Some(record) => {
+                        return Ok(CreateFileSystemFromBackupOutput {
+                            file_system: Some(record.to_file_system()),
+                        });
+                    }
+                    // The file system that token created is gone, so the token replays
+                    // nothing: drop it and restore a new file system below.
+                    None => store.forget_idempotency_token(token),
+                }
+            }
+        }
+
+        // A restore is OF a backup the account has, and the file-system metadata that
+        // backup recorded is what every member the request does not override comes from.
+        let Some(backup) = store.backups.get(&input.backup_id).cloned() else {
+            return Err(CreateFileSystemFromBackupErrorModeled::BackupNotFound(BackupNotFound {
+                message: Some(backup_not_found_message(&input.backup_id)),
+            })
+            .into());
+        };
+        let source = backup.file_system;
+        let recorded_volumes = backup.volumes;
+        // The root volume the source file system had, which says WHICH of the recorded
+        // volumes the restored file system's own root volume is provisioned from. The
+        // record below inherits the source's configuration, so this is read before the id
+        // in it is replaced by the newly minted one.
+        let source_root_volume_id = source
+            .open_zfs_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.root_volume_id.clone());
+
+        if let Some(requested) = input.storage_capacity {
+            if let Some(refusal) = storage_capacity_refusal(requested, &source) {
+                return Err(refusal);
+            }
+        }
+
+        // The record store is bounded by the service's own published limit on file systems
+        // per account per Region, the same bound `CreateFileSystem` is checked against:
+        // a restore past it is refused with the modelled error instead of growing the store
+        // without end. Checked here, before an id is minted, and enforced again by
+        // `insert_file_system` below, which is the one write path.
+        if store.file_systems.len() >= MAX_FILE_SYSTEMS {
+            return Err(file_system_count_limit_exceeded());
+        }
+
+        let file_system_id = store.mint_file_system_id();
+        let mut record = FileSystemRecord {
+            file_system_id: file_system_id.clone(),
+            owner_id: ::emulator_server::emulator_account_id().to_string(),
+            creation_time: SystemTime::now(),
+            // A backup is of one file system, so what it restores to is a file system of
+            // that same type: the request has no member to state another.
+            file_system_type: source.file_system_type.clone(),
+            lifecycle: LIFECYCLE_CREATING.to_string(),
+            // "If you don't use the StorageCapacity parameter, the default is the backup's
+            // StorageCapacity value."
+            storage_capacity: input.storage_capacity.or(source.storage_capacity),
+            storage_type: input
+                .storage_type
+                .clone()
+                .unwrap_or_else(|| source.storage_type.clone()),
+            // The VPC of the subnets THIS request named, as their owner reports them.
+            vpc_id: resolved_subnets
+                .first()
+                .map(|subnet| subnet.vpc_id.clone())
+                .filter(|vpc_id| !vpc_id.is_empty()),
+            subnet_ids: input.subnet_ids.clone(),
+            security_group_ids: input.security_group_ids.clone().unwrap_or_default(),
+            network_interface_ids: Vec::new(),
+            dns_name: file_system_dns_name(&file_system_id, &region),
+            kms_key_id: input
+                .kms_key_id
+                .clone()
+                .or_else(|| source.kms_key_id.clone()),
+            resource_arn: fsx_arn(&region, FILE_SYSTEM_RESOURCE_TYPE, &file_system_id),
+            // "If you don't enter a newer Lustre version, it defaults to the backup's
+            // setting."
+            file_system_type_version: input
+                .file_system_type_version
+                .clone()
+                .or_else(|| source.file_system_type_version.clone()),
+            network_type: input
+                .network_type
+                .clone()
+                .unwrap_or_else(|| source.network_type.clone()),
+            windows_configuration: match input.windows_configuration.as_ref() {
+                Some(requested) => Some(stored_windows_configuration(requested, &input.subnet_ids)),
+                None => source.windows_configuration.clone().map(|mut inherited| {
+                    inherited.preferred_subnet_id =
+                        placed_preferred_subnet(&inherited.preferred_subnet_id, &input.subnet_ids);
+                    inherited
+                }),
+            },
+            lustre_configuration: match input.lustre_configuration.as_ref() {
+                Some(requested) => Some(stored_lustre_configuration(requested)),
+                None => source.lustre_configuration.clone(),
+            },
+            // The request models no ONTAP configuration — an ONTAP backup is of a volume,
+            // restored by `CreateVolumeFromBackup` — so there is nothing to override it
+            // with: a record that carries one keeps what the backup recorded.
+            ontap_configuration: source.ontap_configuration.clone().map(|mut inherited| {
+                inherited.preferred_subnet_id =
+                    placed_preferred_subnet(&inherited.preferred_subnet_id, &input.subnet_ids);
+                inherited
+            }),
+            open_zfs_configuration: match input.open_zfs_configuration.as_ref() {
+                Some(requested) => {
+                    Some(stored_open_zfs_configuration(requested, &input.subnet_ids))
+                }
+                None => source.open_zfs_configuration.clone().map(|mut inherited| {
+                    inherited.preferred_subnet_id =
+                        placed_preferred_subnet(&inherited.preferred_subnet_id, &input.subnet_ids);
+                    inherited
+                }),
+            },
+            // "The tags to be applied to the file system at file system creation": the
+            // restored file system carries the tags THIS request states. The backup's own
+            // tags belong to the backup.
+            tags: input
+                .tags
+                .iter()
+                .flatten()
+                .map(|tag| (tag.key.clone(), tag.value.clone()))
+                .collect::<BTreeMap<String, String>>(),
+            // "The CreateFileSystemFromBackup call returns while the file system's
+            // lifecycle state is still CREATING", so the clock owes it the way to
+            // `AVAILABLE`.
+            pending: Some(PendingTransition::due_now_plus_span(
+                TransitionTarget::Available,
+            )),
+        };
+
+        // The disk-IOPS configuration of the restored record: inherited from the backup
+        // when it provisioned its own value, and otherwise the documented default computed
+        // from the capacity this restore stored, which the request may have grown.
+        record.materialize_provisioned_disk_iops();
+
+        // The restored file system gets its OWN root volume — a new resource, minted and
+        // stored here, never the one the backup was taken of: configured as this request
+        // states, and otherwise as the volume the backup recorded was. So the
+        // `RootVolumeId` the restored file system reports resolves to a volume
+        // `DescribeVolumes` reads back, and it is not the source's id.
+        if record.open_zfs_configuration.is_some() {
+            let volume_id = store.mint_volume_id();
+            let tags = root_volume_tags(&record);
+            let requested_root = input
+                .open_zfs_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.root_volume_configuration.as_ref());
+            let recorded_root = recorded_volumes
+                .iter()
+                .find(|volume| Some(volume.volume_id.as_str()) == source_root_volume_id.as_deref())
+                .and_then(|volume| volume.open_zfs_configuration.as_ref());
+            let volume = match (requested_root, recorded_root) {
+                (Some(requested), _) => open_zfs_root_volume(
+                    volume_id.clone(),
+                    &file_system_id,
+                    &region,
+                    Some(requested),
+                    tags,
+                ),
+                (None, Some(recorded)) => open_zfs_root_volume_from_record(
+                    volume_id.clone(),
+                    &file_system_id,
+                    &region,
+                    recorded,
+                    tags,
+                ),
+                // A backup that recorded no volume of its own (one taken before this
+                // service stored them) restores a root volume with the documented
+                // defaults, the same one a create that states none gets.
+                (None, None) => open_zfs_root_volume(
+                    volume_id.clone(),
+                    &file_system_id,
+                    &region,
+                    None,
+                    tags,
+                ),
+            };
+            if let Err(limit) = store.insert_volume(volume) {
+                return Err(volume_count_limit_exceeded(limit));
+            }
+            if let Some(configuration) = record.open_zfs_configuration.as_mut() {
+                configuration.root_volume_id = Some(volume_id);
+            }
+        }
+
+        // The response is the STORED record, so it can never disagree with what the next
+        // `DescribeFileSystems` returns.
+        let file_system = record.to_file_system();
+        if store.insert_file_system(record).is_err() {
+            return Err(file_system_count_limit_exceeded());
+        }
+        if let Some(token) = input.client_request_token.clone() {
+            store.remember_idempotent_create(
+                token,
+                IdempotentCreate {
+                    file_system_id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(CreateFileSystemFromBackupOutput {
+            file_system: Some(file_system),
+        })
     }
+}
+
+/// The `FileSystemType` whose restore may grow the storage capacity, from the modelled
+/// `FileSystemType` enum (WINDOWS | LUSTRE | ONTAP | OPENZFS).
+const FILE_SYSTEM_TYPE_OPENZFS: &str = "OPENZFS";
+
+/// Every subnet identifier the request names, in the order it names them: the required
+/// `SubnetIds`, then the `PreferredSubnetId` of whichever per-type configuration the
+/// request carries. The same rule as `CreateFileSystem`'s, because a `PreferredSubnetId`
+/// is one of the subnets the file system is placed in.
+fn named_subnet_ids(input: &CreateFileSystemFromBackupInput) -> Vec<&str> {
+    let mut named: Vec<&str> = input.subnet_ids.iter().map(String::as_str).collect();
+    named.extend(
+        [
+            input
+                .windows_configuration
+                .as_ref()
+                .and_then(|config| config.preferred_subnet_id.as_deref()),
+            input
+                .open_zfs_configuration
+                .as_ref()
+                .and_then(|config| config.preferred_subnet_id.as_deref()),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    named
+}
+
+/// The preferred subnet of a configuration the restore INHERITED, placed in the subnets
+/// this request names.
+///
+/// AWS documents `PreferredSubnetID` as one of the subnets of `SubnetIds` — the one the
+/// file server lives in — so the backup's recorded subnet is only the new file system's
+/// preferred subnet when this request placed it there too; otherwise the restored file
+/// system reports a subnet it is actually in.
+fn placed_preferred_subnet(inherited: &Option<String>, subnet_ids: &[String]) -> Option<String> {
+    match inherited {
+        Some(preferred) if subnet_ids.iter().any(|id| id == preferred) => Some(preferred.clone()),
+        _ => subnet_ids.first().cloned(),
+    }
+}
+
+/// The documented refusal of a `StorageCapacity` a restore cannot be served at.
+///
+/// AWS documents the rule on `CreateFileSystemFromBackup$StorageCapacity`: the value "must
+/// be equal to or greater than the backup's storage capacity value", and "if used to
+/// create a file system other than OpenZFS, you must provide a value that matches the
+/// backup's StorageCapacity value. If you provide any other value, Amazon FSx responds
+/// with an HTTP status code 400 Bad Request" — which is the modelled `BadRequest`, "a
+/// generic error indicating a failure with a client request". A backup of a file system
+/// that stated no capacity has none to compare against, so nothing is refused for it.
+fn storage_capacity_refusal(
+    requested: i32,
+    source: &FileSystemRecord,
+) -> Option<CreateFileSystemFromBackupError> {
+    let backed_up = source.storage_capacity?;
+    let message = if source.file_system_type == FILE_SYSTEM_TYPE_OPENZFS {
+        if requested >= backed_up {
+            return None;
+        }
+        format!(
+            "StorageCapacity must be equal to or greater than the backup's storage capacity of \
+             {backed_up}."
+        )
+    } else {
+        if requested == backed_up {
+            return None;
+        }
+        format!(
+            "StorageCapacity must match the backup's storage capacity of {backed_up}."
+        )
+    };
+    Some(
+        CreateFileSystemFromBackupErrorModeled::BadRequest(BadRequest {
+            message: Some(message),
+        })
+        .into(),
+    )
+}
+
+/// The modelled refusal for a request naming a subnet the account does not have:
+/// `InvalidNetworkSettings` (client, HTTP 400) carrying the offending identifier in
+/// `InvalidSubnetId`, so the caller learns WHICH id was wrong.
+fn subnet_does_not_exist(subnet_id: &str) -> CreateFileSystemFromBackupError {
+    CreateFileSystemFromBackupErrorModeled::InvalidNetworkSettings(InvalidNetworkSettings {
+        message: Some(format!("The subnet ID '{subnet_id}' does not exist")),
+        invalid_subnet_id: Some(subnet_id.to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The modelled refusal for a restore that would take the account past
+/// [`MAX_FILE_SYSTEMS`]: `ServiceLimitExceeded` naming the `FILE_SYSTEM_COUNT` limit.
+fn file_system_count_limit_exceeded() -> CreateFileSystemFromBackupError {
+    CreateFileSystemFromBackupErrorModeled::ServiceLimitExceeded(ServiceLimitExceeded {
+        limit: SERVICE_LIMIT_FILE_SYSTEM_COUNT.to_string(),
+        message: Some(format!(
+            "this account already has the maximum of {MAX_FILE_SYSTEMS} file systems in this Region"
+        )),
+    })
+    .into()
+}
+
+/// The modelled refusal for a root volume that would take its file system past
+/// [`MAX_VOLUMES_PER_FILE_SYSTEM`], or the store past its own bound:
+/// `ServiceLimitExceeded` naming the `VOLUMES_PER_FILE_SYSTEM` limit, the one modelled
+/// `ServiceLimit` for volumes.
+fn volume_count_limit_exceeded(
+    limit: VolumeCountLimitReached,
+) -> CreateFileSystemFromBackupError {
+    CreateFileSystemFromBackupErrorModeled::ServiceLimitExceeded(ServiceLimitExceeded {
+        limit: SERVICE_LIMIT_VOLUMES_PER_FILE_SYSTEM.to_string(),
+        message: Some(volume_count_limit_message(limit)),
+    })
+    .into()
+}
+
+/// A fixed-size digest of a restore call's parameters, for the `@idempotencyToken`
+/// comparison.
+///
+/// Every input member except `ClientRequestToken` itself takes part, so two calls carrying
+/// one token are "the same parameters" exactly when every other member agrees. `Tags` is
+/// sorted first, so the same tag set in a different order compares equal. The members are
+/// rendered and then DIGESTED, so what the service remembers per token is 32 bytes
+/// whatever the request's size; the digest is only ever compared against another digest
+/// from this same function, and is never parsed, stored as a resource value, or returned.
+fn restore_parameter_fingerprint(input: &CreateFileSystemFromBackupInput) -> String {
+    let mut tags: Vec<(&str, &str)> = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+    // The rendering is `Debug`, which every one of these generated shapes derives. That is
+    // sound ONLY because the digest is compared against another digest from this same
+    // function in the same process: it is never persisted across builds, parsed, or
+    // returned, so a change in the generator's `Debug` output can at worst make one token
+    // replay look like a parameter change, never corrupt a stored resource.
+    let rendered = format!(
+        "{:?}|{:?}",
+        (
+            &input.backup_id,
+            input.storage_capacity,
+            &input.storage_type,
+            &input.subnet_ids,
+            &input.security_group_ids,
+            &input.kms_key_id,
+        ),
+        (
+            &input.file_system_type_version,
+            &input.network_type,
+            &tags,
+            &input.windows_configuration,
+            &input.lustre_configuration,
+            &input.open_zfs_configuration,
+        )
+    );
+    hex::encode(Sha256::digest(rendered.as_bytes()))
 }

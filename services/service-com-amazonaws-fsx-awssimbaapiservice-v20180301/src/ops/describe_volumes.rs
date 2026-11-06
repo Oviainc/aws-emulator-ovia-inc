@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVolumes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVolumes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVolumes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +76,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    decode_page_token, page_size, unsupported_volume_filter_name_message, volume_not_found_message,
+    volumes_page_scope, VolumeRecord, MAX_VOLUMES_PER_PAGE, VOLUME_FILTER_NAMES,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,17 +152,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVolumes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVolumesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVolumes"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeVolumesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the FSx volume store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A reporting operation, so this only materialises transitions the clock had
+        // already made due at this instant.
+        store.settle_due_transitions();
+
+        let requested = input.volume_ids.clone().unwrap_or_default();
+        let mut selected = requested.clone();
+        selected.sort();
+        selected.dedup();
+
+        // With ids named, the volumes they name ARE the selection, so the filters take no
+        // part in it and none in the page scope either.
+        let filters = if requested.is_empty() {
+            normalised_filters(input.filters.as_deref())
+        } else {
+            Vec::new()
+        };
+
+        // The ids of the selection, which the store's own bound ([`MAX_VOLUMES`]) caps.
+        let keys: Vec<String> = if requested.is_empty() {
+            for (name, _) in &filters {
+                if !VOLUME_FILTER_NAMES.contains(&name.as_str()) {
+                    return Err(DescribeVolumesErrorModeled::BadRequest(BadRequest {
+                        message: Some(unsupported_volume_filter_name_message(name)),
+                    })
+                    .into());
+                }
+            }
+            store
+                .volumes
+                .iter()
+                .filter(|(_, record)| matches_filters(record, &filters))
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            // An id that names no volume of the account is `VolumeNotFound` ("no Amazon FSx
+            // volumes were found based upon the supplied parameters") rather than a
+            // silently shorter list.
+            if let Some(missing) = requested.iter().find(|id| !store.volumes.contains_key(*id)) {
+                return Err(DescribeVolumesErrorModeled::VolumeNotFound(VolumeNotFound {
+                    // Built from the id the caller asked about, so the response says WHICH
+                    // of the requested ids is missing.
+                    message: Some(volume_not_found_message(missing)),
+                })
+                .into());
+            }
+            selected.clone()
+        };
+
+        // The page token is scoped to the SELECTION it was minted for, so a token from an
+        // unfiltered listing is not accepted for a filtered one (or for a different
+        // filter): a cursor only means anything over the same ordered set of keys.
+        let page_scope = volumes_page_scope(&selected, &filters);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match decode_page_token(&page_scope, token) {
+                Some(cursor) => Some(cursor),
+                // A token this service did not mint means nothing to it.
+                None => {
+                    return Err(DescribeVolumesErrorModeled::BadRequest(BadRequest {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                    })
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let (page, next_token) = crate::state::paginate(
+            &page_scope,
+            &keys,
+            resume_after.as_deref(),
+            page_size(input.max_results, MAX_VOLUMES_PER_PAGE),
+        );
+
+        Ok(DescribeVolumesOutput {
+            volumes: Some(
+                page.iter()
+                    .filter_map(|id| store.volumes.get(id))
+                    .map(VolumeRecord::to_volume)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The request's `Filters` as `(name, values)` pairs, in a normal form: each name's values
+/// sorted and deduplicated, and the pairs sorted by name.
+///
+/// So the same selection written in a different order is the same selection — which is what
+/// lets the page scope be built from it — and a filter that names nothing carries the empty
+/// name, which no supported name matches.
+fn normalised_filters(filters: Option<&[VolumeFilter]>) -> Vec<(String, Vec<String>)> {
+    let mut normalised: Vec<(String, Vec<String>)> = filters
+        .unwrap_or_default()
+        .iter()
+        .map(|filter| {
+            let mut values = filter.values.clone().unwrap_or_default();
+            values.sort();
+            values.dedup();
+            (filter.name.clone().unwrap_or_default(), values)
+        })
+        .collect();
+    normalised.sort();
+    normalised
+}
+
+/// Whether one stored volume satisfies every filter: a value of each, which is how AWS
+/// documents a filter — results meeting all applied filter requirements, over the values
+/// of any one of them.
+fn matches_filters(record: &VolumeRecord, filters: &[(String, Vec<String>)]) -> bool {
+    filters.iter().all(|(name, values)| {
+        record
+            .filtered_value(name)
+            .is_some_and(|stored| values.iter().any(|value| value == stored))
+    })
 }

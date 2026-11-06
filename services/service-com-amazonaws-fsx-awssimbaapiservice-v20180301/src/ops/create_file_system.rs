@@ -189,11 +189,13 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::state::{
-    file_system_dns_name, file_system_type_version, fsx_arn, resolve_requested_subnets,
-    stored_lustre_configuration, stored_ontap_configuration, stored_open_zfs_configuration,
-    stored_windows_configuration, FileSystemRecord, IdempotentCreate, PendingTransition,
-    TransitionTarget, DEFAULT_NETWORK_TYPE, DEFAULT_STORAGE_TYPE, FILE_SYSTEM_RESOURCE_TYPE,
-    LIFECYCLE_CREATING, MAX_FILE_SYSTEMS, SERVICE_LIMIT_FILE_SYSTEM_COUNT,
+    file_system_dns_name, file_system_type_version, fsx_arn, open_zfs_root_volume,
+    resolve_requested_subnets, root_volume_tags, stored_lustre_configuration,
+    stored_ontap_configuration, stored_open_zfs_configuration, stored_windows_configuration,
+    volume_count_limit_message, FileSystemRecord, IdempotentCreate, PendingTransition,
+    TransitionTarget, VolumeCountLimitReached, DEFAULT_NETWORK_TYPE, DEFAULT_STORAGE_TYPE,
+    FILE_SYSTEM_RESOURCE_TYPE, LIFECYCLE_CREATING, MAX_FILE_SYSTEMS,
+    SERVICE_LIMIT_FILE_SYSTEM_COUNT, SERVICE_LIMIT_VOLUMES_PER_FILE_SYSTEM,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -371,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let file_system_id = store.mint_file_system_id();
-        let record = FileSystemRecord {
+        let mut record = FileSystemRecord {
             file_system_id: file_system_id.clone(),
             owner_id: ::emulator_server::emulator_account_id().to_string(),
             creation_time: SystemTime::now(),
@@ -430,6 +432,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 TransitionTarget::Available,
             )),
         };
+
+        // The documented disk-IOPS default: a file system of a type that models
+        // `DiskIopsConfiguration` HAS one once it exists, computed from the capacity just
+        // stored, whether or not the request stated it. Applied to the record, so the
+        // response below and every later read of the record report the same value.
+        record.materialize_provisioned_disk_iops();
+
+        // An FSx for OpenZFS file system is created WITH a volume: its root volume, whose
+        // id the configuration reports and whose configuration this create states. It is a
+        // resource of its own, so it is MINTED and STORED here — the id the file system
+        // reports resolves to that stored record, which `DescribeVolumes` reads back.
+        if record.open_zfs_configuration.is_some() {
+            let volume_id = store.mint_volume_id();
+            let volume = open_zfs_root_volume(
+                volume_id.clone(),
+                &file_system_id,
+                &region,
+                input
+                    .open_zfs_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.root_volume_configuration.as_ref()),
+                root_volume_tags(&record),
+            );
+            if let Err(limit) = store.insert_volume(volume) {
+                return Err(volume_count_limit_exceeded(limit));
+            }
+            if let Some(configuration) = record.open_zfs_configuration.as_mut() {
+                configuration.root_volume_id = Some(volume_id);
+            }
+        }
 
         // The response is the STORED record, so it can never disagree with what the next
         // `DescribeFileSystems` returns.
@@ -502,6 +534,18 @@ fn file_system_count_limit_exceeded() -> CreateFileSystemError {
         message: Some(format!(
             "this account already has the maximum of {MAX_FILE_SYSTEMS} file systems in this Region"
         )),
+    })
+    .into()
+}
+
+/// The modelled refusal for a root volume that would take its file system past
+/// [`MAX_VOLUMES_PER_FILE_SYSTEM`], or the store past its own bound:
+/// `ServiceLimitExceeded` naming the `VOLUMES_PER_FILE_SYSTEM` limit, the one modelled
+/// `ServiceLimit` for volumes.
+fn volume_count_limit_exceeded(limit: VolumeCountLimitReached) -> CreateFileSystemError {
+    CreateFileSystemErrorModeled::ServiceLimitExceeded(ServiceLimitExceeded {
+        limit: SERVICE_LIMIT_VOLUMES_PER_FILE_SYSTEM.to_string(),
+        message: Some(volume_count_limit_message(limit)),
     })
     .into()
 }

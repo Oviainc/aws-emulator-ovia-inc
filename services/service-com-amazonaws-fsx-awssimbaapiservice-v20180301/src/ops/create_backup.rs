@@ -348,6 +348,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let backup_id = store.mint_backup_id();
+        // The file system's volumes as their records stand at this call; like the file
+        // system copy, nothing of this one is owed to the clock.
+        let backed_up_volumes: Vec<crate::state::VolumeRecord> = store
+            .volumes
+            .values()
+            .filter(|volume| volume.file_system_id == file_system_id)
+            .map(|volume| crate::state::VolumeRecord {
+                pending: None,
+                ..volume.clone()
+            })
+            .collect();
         let record = BackupRecord {
             backup_id: backup_id.clone(),
             lifecycle: BACKUP_LIFECYCLE_CREATING.to_string(),
@@ -366,6 +377,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 pending: None,
                 ..file_system
             },
+            // The volumes that file system has, likewise as they stand at this call: a
+            // backup of a file system is a backup of its volumes, and a restore of it
+            // provisions volumes configured as these are.
+            volumes: backed_up_volumes,
             resource_type: BACKUP_RESOURCE_TYPE_FILE_SYSTEM.to_string(),
             // "The CreateBackup operation returns while the backup's lifecycle state is
             // still CREATING."
