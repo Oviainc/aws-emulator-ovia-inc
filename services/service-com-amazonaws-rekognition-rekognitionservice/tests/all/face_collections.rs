@@ -240,7 +240,7 @@ pub(crate) fn one_face_png(seed: u32) -> Vec<u8> {
     one_face_portrait(seed).png()
 }
 
-async fn create_collection(router: &MultiServiceRouter, collection_id: &str) -> Reply {
+pub(crate) async fn create_collection(router: &MultiServiceRouter, collection_id: &str) -> Reply {
     call(
         router,
         "CreateCollection",
