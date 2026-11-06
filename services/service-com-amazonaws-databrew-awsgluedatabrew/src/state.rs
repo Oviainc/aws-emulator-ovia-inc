@@ -641,6 +641,32 @@ impl RecipeRecord {
         }
     }
 
+    /// Apply an `UpdateRecipe` request's definition onto this recipe's WORKING version
+    /// and stamp that version's last-modified pair, so a later read of the draft serves
+    /// what the update wrote.
+    ///
+    /// `UpdateRecipe` "modifies the definition of the LATEST_WORKING version" (model:
+    /// `UpdateRecipe`), so the draft is the only version it touches: a version a publish
+    /// froze keeps the definition it was frozen with, and the recipe's own members (the
+    /// name, the ARN, the tags, the project it is attached to) carry no member on this
+    /// request at all. It is a PUT carrying the whole definition (model: `UpdateRecipe`
+    /// `PUT /recipes/{Name}`, both definition members optional), so each definition
+    /// member is REPLACED by what the request carries: an omitted `Steps` leaves the
+    /// draft performing no step, exactly as an empty list does, and an omitted
+    /// `Description` leaves it with none — the same rule [`DatasetRecord::apply_update`]
+    /// applies to the other PUT update of a stored definition.
+    pub fn apply_working_update(
+        &mut self,
+        description: Option<String>,
+        steps: Vec<RecipeStep>,
+        at: SystemTime,
+        principal: String,
+    ) {
+        self.working.description = description;
+        self.working.steps = steps;
+        self.working.audit.modified(at, principal);
+    }
+
     /// The version a request's `RecipeVersion` names, or `None` when this recipe holds
     /// no such version.
     ///
@@ -678,16 +704,47 @@ impl RecipeRecord {
         format!("{}.0", highest.saturating_add(1))
     }
 
+    /// Renumber the working draft onto the highest major version this recipe holds
+    /// published.
+    ///
+    /// The draft's number is a FUNCTION of the publish history rather than a number of
+    /// its own: the working version is the first MINOR revision on top of the latest
+    /// published major version, which is why a recipe no publish has frozen a version
+    /// of sits at `0.1` ([`INITIAL_RECIPE_VERSION`]) — major 0, nothing published — and
+    /// a recipe whose newest published version is major X carries its draft at `X.1`.
+    /// So an operation that changes which versions this recipe holds published ends by
+    /// calling this — `publish` does, and a delete of a published version owes the same
+    /// — and the draft keeps its definition and its audit across the renumber: it is
+    /// the same draft, named for the major it now revises.
+    fn renumber_working(&mut self) {
+        // The HIGHEST published major, which is the same derivation
+        // [`RecipeRecord::next_published_version`] reads the history with, so the two
+        // never disagree about which major the recipe has reached.
+        let published_major = self
+            .published
+            .iter()
+            .filter_map(|held| version_major(&held.version))
+            .max()
+            .unwrap_or(0);
+        self.working.version = format!("{published_major}.1");
+    }
+
     /// Freeze this recipe's working version as a new published version, and answer the
     /// number it was frozen at.
     ///
-    /// Publishing is ADDITIVE: it copies the definition the working version holds into
-    /// a version of its own, numbered by [`RecipeRecord::next_published_version`] and
-    /// appended to [`RecipeRecord::published`] (oldest first, so it becomes
-    /// `LATEST_PUBLISHED`), while the working version carries on unchanged as the draft
+    /// Publishing is ADDITIVE to the version history: it copies the definition the
+    /// working version holds into a version of its own, numbered by
+    /// [`RecipeRecord::next_published_version`] and appended to
+    /// [`RecipeRecord::published`] (oldest first, so it becomes `LATEST_PUBLISHED`),
+    /// while the working version carries on with the same definition as the draft
     /// development continues on. `description` is the description the publish carried
     /// for this version; a publish that carried none freezes the definition's own
     /// description with it.
+    ///
+    /// The draft is RENUMBERED onto the major just frozen
+    /// ([`RecipeRecord::renumber_working`]): the draft revises the latest published
+    /// major version, so publishing `X.0` leaves it at `X.1`. Its definition and its
+    /// audit are untouched — a publish freezes a copy, it does not edit the draft.
     pub fn publish(
         &mut self,
         description: Option<String>,
@@ -706,6 +763,7 @@ impl RecipeRecord {
         };
         let version = frozen.version.clone();
         self.published.push(frozen);
+        self.renumber_working();
         version
     }
 }

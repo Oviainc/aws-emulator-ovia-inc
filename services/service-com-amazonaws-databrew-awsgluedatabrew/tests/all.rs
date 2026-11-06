@@ -33,6 +33,8 @@ mod recipe_lifecycle;
 mod recipe_publishing;
 #[path = "all/recipe_version_resolution.rs"]
 mod recipe_version_resolution;
+#[path = "all/recipe_working_update.rs"]
+mod recipe_working_update;
 #[path = "all/resource_not_found_message.rs"]
 mod resource_not_found_message;
 #[path = "all/schedule_delete.rs"]

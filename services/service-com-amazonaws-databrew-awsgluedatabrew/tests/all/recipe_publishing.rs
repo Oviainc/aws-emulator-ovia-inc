@@ -18,13 +18,8 @@
 //! error code and the JSON body a client sees, read back through `DescribeRecipe`.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_databrew_awsgluedatabrew::ComAmazonawsDatabrewAwsgluedatabrewState;
 
 use crate::databrew_harness::{label, Emulator, Reply, CALLER_PRINCIPAL};
-
-/// The version a recipe carries the moment it is created: the working draft, which no
-/// publish has frozen (`INITIAL_RECIPE_VERSION` in `src/state.rs`).
-const WORKING_VERSION: &str = "0.1";
 
 /// The alias naming the most recent published version (model: `Recipe$RecipeVersion`).
 const LATEST_PUBLISHED: &str = "LATEST_PUBLISHED";
@@ -270,14 +265,16 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
                     versionless.body
                 );
 
-                // The draft is untouched by the publish: same number, same definition,
-                // same body, and still no publish of its own to report.
+                // The draft keeps its definition and its body across the publish, and
+                // still has no publish of its own to report; its NUMBER follows the
+                // publish history, as the draft is the first minor revision on top of
+                // the major just frozen.
                 let draft = describe_recipe(&emulator, &name, Some(LATEST_WORKING)).await;
                 assert_eq!(
                     draft.text("RecipeVersion"),
-                    WORKING_VERSION,
-                    "case {case:?}: the draft keeps its own number across publish \
-                     {publish_index}, got {:?}",
+                    format!("{}.1", publish_index + 1),
+                    "case {case:?}: after publish {publish_index} the draft revises the major \
+                     just frozen, got {:?}",
                     draft.body["RecipeVersion"]
                 );
                 assert_eq!(
@@ -333,9 +330,8 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
 /// A version an earlier publish froze keeps the definition it was frozen with after the
 /// draft moves on: the frozen copy is independent of the working version.
 ///
-/// The draft is edited through the one shared store the handlers serve from, because
-/// `UpdateRecipe` is still a scaffold stub with its own issue; the reads below are still
-/// made over the wire.
+/// The draft is moved on with `UpdateRecipe`, the operation that modifies the working
+/// version, so every call below is made over the wire.
 #[tokio::test]
 async fn an_earlier_version_keeps_the_definition_it_was_frozen_with() {
     let emulator = Emulator::new();
@@ -363,19 +359,20 @@ async fn an_earlier_version_keeps_the_definition_it_was_frozen_with() {
         "case \"a redrafted recipe\": the first publish must answer 200"
     );
 
-    // The draft moves on, exactly as an edit of the working version would move it.
-    {
-        let state = emulator
-            .engine()
-            .state::<ComAmazonawsDatabrewAwsgluedatabrewState>();
-        let mut store = state.lock();
-        let recipe = store
-            .recipes
-            .get_mut(name)
-            .expect("the recipe under test must be stored");
-        recipe.working.description = Some("the second draft".to_string());
-        recipe.working.steps.clear();
-    }
+    // The draft moves on: `UpdateRecipe` replaces the working version's definition with
+    // the one this request carries.
+    let redrafted = emulator
+        .call(
+            "PUT",
+            &format!("/recipes/{}", label(name)),
+            Some(json!({"Description": "the second draft", "Steps": second_steps.clone()})),
+        )
+        .await;
+    assert_eq!(
+        redrafted.status, 200,
+        "case \"a redrafted recipe\": the update of the draft must answer 200, got {} {:?}",
+        redrafted.status, redrafted.body
+    );
 
     assert_eq!(
         publish_recipe(&emulator, name, None).await.status,
