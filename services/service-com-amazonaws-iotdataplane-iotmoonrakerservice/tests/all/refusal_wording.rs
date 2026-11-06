@@ -30,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use crate::publish_topic_and_payload_limits::encode_component;
+use crate::publish_topic_and_payload_limits::{encode_component, retained_topics};
 use crate::shadow_and_retained_message::{Answer, Harness};
 use service_com_amazonaws_iotdataplane_iotmoonrakerservice::state::{
     MAX_PUBLISH_PAYLOAD_BYTES, MAX_TOPIC_BYTES, MAX_TOPIC_PARTS,
@@ -244,6 +244,14 @@ async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to(
             case.name,
             case.expected,
             message(&read)
+        );
+        // The refused publish also retained nothing under that name: the read of this one
+        // name is a refusal, so the listing is what observes the store.
+        let listed = retained_topics(&harness).await;
+        assert!(
+            !listed.contains(&case.topic),
+            "case {:?}: a refused publish must retain nothing, got the topic among {listed:?}",
+            case.name
         );
     }
 

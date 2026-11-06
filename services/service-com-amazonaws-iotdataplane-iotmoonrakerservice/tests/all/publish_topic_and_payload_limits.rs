@@ -49,6 +49,36 @@ pub(crate) fn encode_component(value: &str) -> String {
     encoded
 }
 
+/// Every topic the retained-message listing reports — the store's own view of what is
+/// retained.
+///
+/// A read of ONE malformed topic name is refused before the store is consulted, so the
+/// listing is what observes the other half of that rule: a refused publish retained
+/// nothing under the name it was refused for.
+pub(crate) async fn retained_topics(harness: &Harness) -> Vec<String> {
+    let listed = harness.send("GET", "/retainedMessage", &[], Vec::new()).await;
+    assert_eq!(
+        listed.status,
+        200,
+        "expected the retained-message listing to answer 200, got {} with body {}",
+        listed.status,
+        String::from_utf8_lossy(&listed.body)
+    );
+    listed
+        .json()
+        .get("retainedTopics")
+        .and_then(Value::as_array)
+        .map(|summaries| {
+            summaries
+                .iter()
+                .filter_map(|summary| {
+                    summary.get("topic").and_then(Value::as_str).map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The `message` of a response body.
 fn message(answer: &Answer) -> String {
     answer
@@ -280,6 +310,15 @@ async fn a_publish_topic_is_weighed_against_the_part_and_the_byte_ceiling() {
                      publish, got {:?}",
                     case.name,
                     message(&read)
+                );
+                // …and the refused publish retained nothing under that name, which the
+                // listing is what can still observe now the single read is a refusal.
+                let listed = retained_topics(&harness).await;
+                assert!(
+                    !listed.contains(&case.topic),
+                    "case {:?}: a refused publish must retain nothing, got the topic among \
+                     {listed:?}",
+                    case.name
                 );
             }
         }
