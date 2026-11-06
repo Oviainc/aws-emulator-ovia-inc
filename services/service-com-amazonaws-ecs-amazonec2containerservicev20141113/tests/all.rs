@@ -33,6 +33,8 @@ mod cluster_capacity_and_statistics;
 mod cluster_mutations;
 #[path = "all/cluster_projection.rs"]
 mod cluster_projection;
+#[path = "all/cluster_scoped_capacity_providers.rs"]
+mod cluster_scoped_capacity_providers;
 #[path = "all/cluster_tombstone.rs"]
 mod cluster_tombstone;
 #[path = "all/container_instance_not_found.rs"]
@@ -51,6 +53,8 @@ mod daemon_task_definition_deletion;
 mod daemon_task_definitions;
 #[path = "all/daemons.rs"]
 mod daemons;
+#[path = "all/default_capacity_provider_strategy_placement.rs"]
+mod default_capacity_provider_strategy_placement;
 #[path = "all/delete_attributes.rs"]
 mod delete_attributes;
 #[path = "all/deployment_rollout_report_coupling.rs"]
@@ -67,6 +71,8 @@ mod ecs_wire;
 mod enum_value_refusals;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/exec_task_role_resolution.rs"]
+mod exec_task_role_resolution;
 #[path = "all/express_gateway_services.rs"]
 mod express_gateway_services;
 #[path = "all/forced_service_delete_status.rs"]
@@ -103,6 +109,10 @@ mod name_pattern_refusals;
 mod page_size_range_refusals;
 #[path = "all/primary_task_set.rs"]
 mod primary_task_set;
+// Pins the Managed Instances launch template's `monitoring` option; the module name
+// follows its file, as the layout rule requires.
+#[path = "all/probe_monitoring.rs"]
+mod probe_monitoring;
 #[path = "all/reserved_tag_prefix.rs"]
 mod reserved_tag_prefix;
 #[path = "all/resource_tags.rs"]

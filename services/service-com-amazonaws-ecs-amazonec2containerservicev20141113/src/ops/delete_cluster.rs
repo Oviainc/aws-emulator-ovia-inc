@@ -293,6 +293,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A CLUSTER-SCOPED capacity provider is a resource of the cluster itself
+        // (`CapacityProvider$cluster`: Managed Instances providers "can only be used
+        // within their associated cluster"), so it has to go before the cluster does: the
+        // delete is refused and NOTHING is dropped — the cluster keeps its status and its
+        // `capacityProviders` list. `ClusterContainsCapacityProviderException` is what an
+        // account-scoped association earns instead, so this one is the `ClientException`
+        // the operation also models. Decided LAST of the holds, so the refusals the
+        // workload earns — the services and the tasks still in the cluster, each with its
+        // own modelled shape — keep the precedence they already had.
+        if guard.cluster_has_cluster_scoped_capacity_providers(&cluster_name) {
+            return Err(DeleteClusterErrorModeled::ClientException(ClientException {
+                message: Some(
+                    crate::state::CLUSTER_CONTAINS_CLUSTER_SCOPED_PROVIDER_MESSAGE.to_string(),
+                ),
+            })
+            .into());
+        }
+
         // The resources the cluster held go with it. Nothing still wanted can be among
         // them: a service that is not deleted and a task still wanted RUNNING were both
         // refused above, so what is dropped here is a service already deleted and a task

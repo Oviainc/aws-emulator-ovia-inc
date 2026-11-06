@@ -22,6 +22,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        // The capacity a Managed Instances provider's create had Amazon ECS stand up: once
+        // the create is due the provider is usable, whether or not anybody called to look,
+        // so it reports `ACTIVE` with its create complete.
+        for provider in self.capacity_providers.values_mut() {
+            if let Some(due) = provider.active_due_at {
+                if due <= now {
+                    provider.active_due_at = None;
+                    provider.status = CAPACITY_PROVIDER_ACTIVE.to_string();
+                    provider.update_status =
+                        Some(CAPACITY_PROVIDER_CREATE_COMPLETE.to_string());
+                }
+            }
+        }
         for task in self.tasks.values_mut() {
             // The elastic network interface an `awsvpc` task was allocated is created and
             // then ATTACHED on its own clock, one documented step at a time
@@ -2376,6 +2389,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.services
             .values()
             .any(|service| service.cluster_name == cluster_name && service.is_active())
+    }
+
+    /// Whether `cluster_name` still carries a CLUSTER-SCOPED capacity provider: one
+    /// created for this cluster and not deleted.
+    ///
+    /// `CapacityProvider$cluster`: "Managed instances capacity providers are
+    /// cluster-scoped, meaning they can only be used within their associated cluster" — so
+    /// such a provider is a resource OF the cluster, and the cluster cannot go while it is
+    /// still there ([`CLUSTER_CONTAINS_CLUSTER_SCOPED_PROVIDER_MESSAGE`]). An Auto Scaling
+    /// group provider is held by the ACCOUNT and merely associated with clusters, so it
+    /// never holds one open; neither does a provider the caller already deleted.
+    pub fn cluster_has_cluster_scoped_capacity_providers(&self, cluster_name: &str) -> bool {
+        self.capacity_providers.values().any(|provider| {
+            provider.status != CAPACITY_PROVIDER_INACTIVE
+                && provider.cluster.as_deref() == Some(cluster_name)
+        })
     }
 
     /// Whether the service holds a `PRIMARY` task set — the one

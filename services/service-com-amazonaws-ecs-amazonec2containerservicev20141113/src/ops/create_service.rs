@@ -744,10 +744,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             // ECS Exec signs its session with the TASK's role, so a service that enables
-            // it needs the revision to declare one.
+            // it needs the revision to declare one: a service carries no `overrides`, so
+            // the revision is the only place its tasks' role can come from.
             if let Some(message) = crate::state::execute_command_violation(
                 input.enable_execute_command,
-                Some(definition),
+                definition.task_role_arn.as_deref(),
                 crate::state::EXECUTE_COMMAND_SERVICE_SUBJECT,
             ) {
                 return Err(CreateServiceErrorModeled::InvalidParameterException(

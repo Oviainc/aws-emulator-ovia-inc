@@ -12,6 +12,8 @@
 //!   revision declares can receive one (`ContainerOverride$name`: "The name of the
 //!   container that receives the override. This parameter is required if any override is
 //!   specified.");
+//! * the task role the placement names is the role the task assumes, in place of the one
+//!   the revision declared ([`resolved_task_role_arn`]);
 //! * the reservations an override replaces stay inside the TASK's own size —
 //!   `ContainerDefinition$cpu`: "the only requirement is that the total amount of CPU
 //!   reserved for all containers within a task be lower than the task-level `cpu` value";
@@ -75,6 +77,38 @@ pub fn container_memory_above_task_message(container_name: &str) -> String {
 /// carries neither the total it reached nor the limit it crossed.
 pub fn container_total_above_task_message(member: &str) -> String {
     format!("Sum of container '{member}' greater than task '{member}'.")
+}
+
+/// The role a `taskRoleArn` member names, or `None` when it names none: an absent member
+/// supplies no role, and neither does one spelling nothing but whitespace.
+pub fn declared_task_role_arn(task_role_arn: Option<&str>) -> Option<&str> {
+    task_role_arn
+        .map(str::trim)
+        .filter(|arn| !arn.is_empty())
+}
+
+/// The IAM role the task a placement launches assumes: the one its `overrides` name, and
+/// the one the STORED revision declares when the overrides name none.
+///
+/// `TaskOverride$taskRoleArn` is "The Amazon Resource Name (ARN) of the role that
+/// containers in this task can assume. All containers in this task are granted the
+/// permissions that are specified in this role" — an OVERRIDE, so it stands in place of
+/// the value the revision fixed ("instead of the default value from the task definition",
+/// as every other override member's doc puts it) and the revision's own `taskRoleArn` is
+/// the DEFAULT it replaces. So every rule keyed on the task's role is decided on this
+/// resolved value, and a placement that supplies the role itself needs nothing of the
+/// revision.
+///
+/// Spelled ONCE for both placements that carry a `TaskOverride`, so `RunTask` and
+/// `StartTask` resolve the same request to the same role.
+pub fn resolved_task_role_arn<'a>(
+    overrides: Option<&'a TaskOverride>,
+    definition: &'a TaskDefinitionRecord,
+) -> Option<&'a str> {
+    declared_task_role_arn(
+        overrides.and_then(|overrides| overrides.task_role_arn.as_deref()),
+    )
+    .or_else(|| declared_task_role_arn(definition.task_role_arn.as_deref()))
 }
 
 /// The override a `containerOverrides` list carries for ONE container of the revision, or

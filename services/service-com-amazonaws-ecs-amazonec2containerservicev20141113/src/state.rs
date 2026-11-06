@@ -42,6 +42,13 @@
 //! task transitions from the `RUNNING` state to `STOPPING`") and reaches `STOPPED`
 //! [`TRANSITION_SPAN`] later. Nothing sleeps: the due instant is stored and compared.
 //!
+//! A capacity provider Amazon ECS has to stand capacity UP for — a Managed Instances
+//! provider, which runs EC2 instances on the caller's behalf — is answered in
+//! [`CAPACITY_PROVIDER_PROVISIONING`] for the same reason, and its move to
+//! [`CAPACITY_PROVIDER_ACTIVE`] with the create [`CAPACITY_PROVIDER_CREATE_COMPLETE`] is
+//! owed by the clock ([`CapacityProviderRecord::active_due_at`]). A provider over an Auto
+//! Scaling group the caller already has stands nothing up and is `ACTIVE` at once.
+//!
 //! A service's task set is placed by the CALL that changes what the service wants
 //! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::scale_service`], driven by
 //! `CreateService` and `UpdateService`), and each task it places then crosses `PENDING`
@@ -601,9 +608,30 @@ pub const MAX_CLUSTER_CAPACITY_PROVIDERS: usize = 20;
 
 /// `CapacityProvider$status` for a provider that can be used in a cluster — that
 /// member's doc: "Only capacity providers in an `ACTIVE` state can be used in a
-/// cluster." `CreateCapacityProvider` answers with the provider already usable, so this
-/// is the status a create reports and no clock-owed transition leads to it.
+/// cluster." A provider over a caller's OWN Auto Scaling group is answered under it at
+/// once: the group already exists, so Amazon ECS has nothing to stand up for it and no
+/// clock-owed transition leads here.
 pub const CAPACITY_PROVIDER_ACTIVE: &str = "ACTIVE";
+
+/// `CapacityProvider$status` for a provider whose capacity Amazon ECS is still standing
+/// up (the status enum's own `PROVISIONING`, `smithy_query` query="shape"
+/// shape="CapacityProviderStatus").
+///
+/// A Managed Instances provider is created over infrastructure Amazon ECS runs on the
+/// caller's behalf — the instance launch template, the network it launches instances
+/// into, the infrastructure role it manages them with — so its create is answered under
+/// this NON-TERMINAL status and the move to [`CAPACITY_PROVIDER_ACTIVE`] is owed by the
+/// clock ([`TRANSITION_SPAN`]). Until then it is not a provider a cluster can use.
+pub const CAPACITY_PROVIDER_PROVISIONING: &str = "PROVISIONING";
+
+/// `CapacityProvider$updateStatus` while the create of a provider Amazon ECS has to stand
+/// up is still running — "The update status reason ... provides further details about the
+/// update status for the capacity provider", and the create is the first such update.
+pub const CAPACITY_PROVIDER_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// `CapacityProvider$updateStatus` once that create has finished: the terminal status of
+/// a created provider, reported from the instant it becomes usable.
+pub const CAPACITY_PROVIDER_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
 /// `CapacityProvider$status` for a deleted provider — that member's doc: "When a capacity
 /// provider is successfully deleted, it has an `INACTIVE` status." A tombstone under that
@@ -2382,6 +2410,17 @@ pub const CLUSTER_CONTAINS_SERVICES_MESSAGE: &str =
 /// every request that meets the condition.
 pub const CLUSTER_CONTAINS_TASKS_MESSAGE: &str = "You can't delete a cluster that has active tasks.";
 
+/// `ClientException$message` when `DeleteCluster` is asked to delete a cluster that still
+/// carries a CLUSTER-SCOPED capacity provider (an Amazon ECS Managed Instances provider,
+/// which "can only be used within their associated cluster"). The sentence is fixed text,
+/// naming neither the cluster nor the provider, and the refusal is a `ClientException`
+/// rather than `ClusterContainsCapacityProviderException`: that shape is what an
+/// ACCOUNT-scoped association earns, while a cluster-scoped provider is a resource of the
+/// cluster itself.
+pub const CLUSTER_CONTAINS_CLUSTER_SCOPED_PROVIDER_MESSAGE: &str =
+    "The Cluster cannot be deleted while Cluster Scoped Capacity Providers are attached \
+     to the cluster.";
+
 /// `InvalidParameterException$message` when `DeleteService` is asked to delete a service
 /// that is still scaled up. The operation's doc: "You can delete a service if you have no
 /// running tasks in it and the desired task count is zero" — a condition of the service,
@@ -2439,8 +2478,17 @@ pub struct CapacityProviderRecord {
     pub name: String,
     pub arn: String,
     /// `CapacityProvider$status`: [`CAPACITY_PROVIDER_ACTIVE`] for a provider that was
-    /// created and not deleted.
+    /// created and not deleted, and [`CAPACITY_PROVIDER_PROVISIONING`] while Amazon ECS
+    /// is still standing the provider's own capacity up.
     pub status: String,
+    /// `CapacityProvider$updateStatus`: where the create, update or delete of this
+    /// provider has got to, and `None` when nothing is in flight for it.
+    pub update_status: Option<String>,
+    /// When the create of a provider Amazon ECS had to stand up falls due, after which
+    /// the provider is [`CAPACITY_PROVIDER_ACTIVE`] and its create is
+    /// [`CAPACITY_PROVIDER_CREATE_COMPLETE`]. Cleared when it is materialised, so it
+    /// happens once.
+    pub active_due_at: Option<SystemTime>,
     /// `CapacityProvider$cluster`: the cluster a MANAGED-INSTANCES provider is scoped to
     /// ("Managed instances capacity providers are cluster-scoped"). `None` for an Auto
     /// Scaling group provider, which the account holds rather than one cluster.
@@ -2459,8 +2507,12 @@ impl CapacityProviderRecord {
     /// (`CapacityProviderField` declares exactly `TAGS`); a create reports the tags it
     /// was given, having no `include` member to narrow them with.
     ///
-    /// `updateStatus`/`updateStatusReason` stay unset: they report an update or delete in
-    /// flight, and nothing is in flight for a stored, created provider.
+    /// `updateStatus`/`updateStatusReason` report an update in flight: a create Amazon ECS
+    /// had to stand the provider's capacity up for is one, so such a provider carries
+    /// [`CAPACITY_PROVIDER_CREATE_IN_PROGRESS`] until the create lands and
+    /// [`CAPACITY_PROVIDER_CREATE_COMPLETE`] from then on, while nothing is in flight for
+    /// a provider over a group the caller already had. `updateStatusReason` stays unset:
+    /// it states why an update did not do what it was asked, and these all did.
     pub fn view(&self, include_tags: bool) -> CapacityProvider {
         CapacityProvider {
             capacity_provider_arn: Some(self.arn.clone()),
@@ -2469,7 +2521,7 @@ impl CapacityProviderRecord {
             status: Some(self.status.clone()),
             auto_scaling_group_provider: self.auto_scaling_group_provider.clone(),
             managed_instances_provider: self.managed_instances_provider.clone(),
-            update_status: None,
+            update_status: self.update_status.clone(),
             update_status_reason: None,
             tags: include_tags.then(|| self.tags.clone()),
             r#type: self.provider_type.clone(),

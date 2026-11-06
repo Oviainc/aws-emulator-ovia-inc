@@ -401,12 +401,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        let now = ::std::time::SystemTime::now();
+        // A provider over capacity Amazon ECS stands up for the account is answered while
+        // it is still standing it up — `CapacityProviderStatus` carries `PROVISIONING` for
+        // exactly that — and reaches `ACTIVE` (with its create `CREATE_COMPLETE`) one
+        // transition span later, on the clock. A provider over a group the caller ALREADY
+        // has is usable from this answer on, so nothing is owed for it.
+        let stands_up_capacity = managed_instances_provider.is_some();
         let record = crate::state::CapacityProviderRecord {
             arn: crate::state::capacity_provider_arn(&region, &name),
             name: name.clone(),
-            // AWS answers a create with the provider already usable, so nothing is owed
-            // here by the clock: `CapacityProvider$status` is ACTIVE from this answer on.
-            status: crate::state::CAPACITY_PROVIDER_ACTIVE.to_string(),
+            status: if stands_up_capacity {
+                crate::state::CAPACITY_PROVIDER_PROVISIONING.to_string()
+            } else {
+                crate::state::CAPACITY_PROVIDER_ACTIVE.to_string()
+            },
+            update_status: stands_up_capacity
+                .then(|| crate::state::CAPACITY_PROVIDER_CREATE_IN_PROGRESS.to_string()),
+            active_due_at: stands_up_capacity.then(|| now + crate::state::TRANSITION_SPAN),
             cluster: cluster_name,
             auto_scaling_group_provider: input.auto_scaling_group_provider.clone(),
             provider_type: managed_instances_provider.as_ref().map(|_| {

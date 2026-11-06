@@ -9,6 +9,10 @@
 //!   mints its ARN and stores the binding it was given (an Auto Scaling group, or capacity
 //!   Amazon ECS manages), and `DescribeCapacityProviders` reports that stored record back:
 //!   its name, status, ARN, binding, type and tags;
+//! * a provider over an Auto Scaling group the caller ALREADY has is created `ACTIVE`,
+//!   while one whose capacity Amazon ECS has to stand up is created `PROVISIONING` with
+//!   its create in flight (what it settles into is
+//!   [`crate::cluster_scoped_capacity_providers`]'s subject);
 //! * the NAME identifies the provider and an Auto Scaling group backs exactly one, so a
 //!   create that reuses either is refused and stores nothing;
 //! * the create is `@idempotent`, so REPEATING it for the provider that is already stored
@@ -44,10 +48,18 @@ struct CreateCase {
     expect_group: fn() -> Option<String>,
     /// The tags the stored provider must report.
     expect_tags: Value,
+    /// The `status` the create answers under: a provider over a group the caller already
+    /// has is usable at once, while one whose capacity Amazon ECS has to stand up is
+    /// still `PROVISIONING`.
+    expect_status: &'static str,
+    /// The `updateStatus` reported beside it — the create that is still running, and
+    /// nothing at all when there was none to run.
+    expect_update_status: Option<&'static str>,
 }
 
 /// An Auto Scaling group ARN of the account, as `autoScalingGroupProvider` takes it.
-fn group_arn(name: &str) -> String {
+/// Shared with every suite that needs a provider over a group the caller already has.
+pub(crate) fn group_arn(name: &str) -> String {
     format!(
         "arn:aws:autoscaling:{SIGNED_REGION}:{ACCOUNT}:autoScalingGroup:\
          11111111-2222-3333-4444-555555555555:autoScalingGroupName/{name}"
@@ -59,7 +71,14 @@ fn group_arn(name: &str) -> String {
 /// template's `networkConfiguration`). Shared with the daemon suite, which needs a
 /// MANAGED_INSTANCES provider to create a daemon over.
 pub(crate) fn managed_instances() -> Value {
-    json!({
+    managed_instances_monitored(None)
+}
+
+/// The same configuration with the launch template's optional `monitoring` option set to
+/// `monitoring` when a suite names one — the ONE place this payload is spelled, so every
+/// suite creates the same provider.
+pub(crate) fn managed_instances_monitored(monitoring: Option<&str>) -> Value {
+    let mut configuration = json!({
         "infrastructureRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/ecsInfrastructureRole"),
         "instanceLaunchTemplate": {
             "ec2InstanceProfileArn": format!("arn:aws:iam::{ACCOUNT}:instance-profile/ecsInstanceRole"),
@@ -68,7 +87,11 @@ pub(crate) fn managed_instances() -> Value {
                 "securityGroups": ["sg-0123456789abcdef0"],
             },
         },
-    })
+    });
+    if let Some(monitoring) = monitoring {
+        configuration["instanceLaunchTemplate"]["monitoring"] = json!(monitoring);
+    }
+    configuration
 }
 
 /// Describe one capacity provider by name and return it, with or without its tags.
@@ -130,6 +153,8 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             expect_type: None,
             expect_group: || Some(group_arn("asg-byarn")),
             expect_tags: json!([{ "key": "team", "value": "platform" }]),
+            expect_status: "ACTIVE",
+            expect_update_status: None,
         },
         CreateCase {
             name: "an Auto Scaling group named by its bare name, no managed scaling",
@@ -143,6 +168,8 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             expect_type: None,
             expect_group: || Some("asg-byname".to_string()),
             expect_tags: json!([]),
+            expect_status: "ACTIVE",
+            expect_update_status: None,
         },
         CreateCase {
             name: "capacity Amazon ECS manages, scoped to a cluster",
@@ -164,6 +191,8 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
                 { "key": "env", "value": "test" },
                 { "key": "owner", "value": "ecs" },
             ]),
+            expect_status: "PROVISIONING",
+            expect_update_status: Some("CREATE_IN_PROGRESS"),
         },
         CreateCase {
             name: "a cluster named by its ARN scopes the provider to that cluster",
@@ -178,6 +207,8 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             expect_type: Some("MANAGED_INSTANCES"),
             expect_group: || None,
             expect_tags: json!([]),
+            expect_status: "PROVISIONING",
+            expect_update_status: Some("CREATE_IN_PROGRESS"),
         },
     ];
 
@@ -208,8 +239,8 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             );
             assert_eq!(
                 string(reported, "status", case),
-                "ACTIVE",
-                "case {case:?}: a created provider is usable at once, got {reported}"
+                test.expect_status,
+                "case {case:?}: unexpected status in {reported}"
             );
             assert_eq!(
                 reported["cluster"].as_str(),
@@ -234,11 +265,17 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
                     .clone(),
                 "case {case:?}: unexpected tags in {reported}"
             );
-            // Nothing is in flight for a provider that was just created.
+            // The create itself is the only update in flight, and it did what it was
+            // asked, so no reason is stated for it.
+            assert_eq!(
+                reported["updateStatus"].as_str(),
+                test.expect_update_status,
+                "case {case:?}: unexpected updateStatus in {reported}"
+            );
             assert!(
-                reported["updateStatus"].is_null()
-                    && reported["updateStatusReason"].is_null(),
-                "case {case:?}: a created provider reports no update in flight, got {reported}"
+                reported["updateStatusReason"].is_null(),
+                "case {case:?}: a create that did what it was asked states no reason, got \
+                 {reported}"
             );
         }
 

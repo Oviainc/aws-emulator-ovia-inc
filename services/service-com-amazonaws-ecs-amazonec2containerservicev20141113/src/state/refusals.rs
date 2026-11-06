@@ -1647,6 +1647,8 @@ pub fn managed_capacity_provider(name: &str, region: &str) -> Option<CapacityPro
         name: name.to_string(),
         arn: capacity_provider_arn(region, name),
         status: CAPACITY_PROVIDER_ACTIVE.to_string(),
+        update_status: None,
+        active_due_at: None,
         cluster: None,
         auto_scaling_group_provider: None,
         managed_instances_provider: None,
@@ -2068,31 +2070,28 @@ pub fn network_configuration_violation(
     }
 }
 
-/// The refusal an exec-enabled launch earns when the task definition it runs declares no
-/// `taskRoleArn`, or `None` when it declares one (or when the launch does not enable ECS
-/// Exec at all).
+/// The refusal an exec-enabled launch earns when NO task role resolves for the task it
+/// launches, or `None` when one does (or when the launch does not enable ECS Exec at all).
 ///
 /// The rule: ECS Exec runs through the SSM agent inside the task, which signs its calls
 /// with the task's own IAM role — so a launch that turns `enableExecuteCommand` on
-/// requires the revision to carry a task role. `subject` names what the refusal is about
-/// ("The service couldn't be created", "The task couldn't be launched"), since the
+/// requires the task to have one. `task_role_arn` is the role the task ACTUALLY assumes,
+/// which for a placement that carries overrides is what those overrides resolved to
+/// ([`declared_task_role_arn`]) rather than the stored revision's own member: the role is
+/// what the rule is about, not where it was supplied. `subject` names what the refusal is
+/// about ("The service couldn't be created", "The task couldn't be launched"), since the
 /// sentence AWS words is the one the calling operation's own answer carries. Its
 /// remediation clause names WHERE the role belongs — in the task definition, which is the
-/// resource the caller has to change, rather than on this request.
+/// resource the caller has to change when the launch itself supplied none.
 pub fn execute_command_violation(
     enabled: bool,
-    definition: Option<&TaskDefinitionRecord>,
+    task_role_arn: Option<&str>,
     subject: &str,
 ) -> Option<String> {
     if !enabled {
         return None;
     }
-    let has_role = definition.is_some_and(|found| {
-        found
-            .task_role_arn
-            .as_deref()
-            .is_some_and(|arn| !arn.trim().is_empty())
-    });
+    let has_role = declared_task_role_arn(task_role_arn).is_some();
     (!has_role).then(|| {
         format!(
             "{subject} because a valid taskRoleArn is not being used. Specify a valid \

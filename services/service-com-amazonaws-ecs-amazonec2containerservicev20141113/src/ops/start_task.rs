@@ -370,10 +370,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // ECS Exec signs its session with the TASK's role, so a placement that enables it
-        // needs the revision to declare one.
+        // needs one to resolve — from this placement's own `overrides`, else from the
+        // revision ([`crate::state::resolved_task_role_arn`]).
         if let Some(message) = crate::state::execute_command_violation(
             input.enable_execute_command,
-            Some(&definition),
+            crate::state::resolved_task_role_arn(input.overrides.as_ref(), &definition),
             crate::state::EXECUTE_COMMAND_TASK_SUBJECT,
         ) {
             return Err(StartTaskErrorModeled::InvalidParameterException(

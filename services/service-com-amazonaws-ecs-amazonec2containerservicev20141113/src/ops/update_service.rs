@@ -720,7 +720,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             if let Some(message) = crate::state::execute_command_violation(
                 effective_execute_command,
-                Some(definition),
+                definition.task_role_arn.as_deref(),
                 crate::state::EXECUTE_COMMAND_SERVICE_UPDATE_SUBJECT,
             ) {
                 return Err(UpdateServiceErrorModeled::InvalidParameterException(
