@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds or updates the resource-based policy of a web function, and reports the policy
+//! stored with the `revisionId` of the generation it wrote — this is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The document is held to the `policy` member's own rule (JSON-formatted, see
+//! [`crate::state::is_policy_document`]) and the revision check is applied BEFORE
+//! anything is written, so a refused put leaves the stored policy exactly as it was. The
+//! stored policy lives in the function's own record
+//! (`crate::state::WebFunction::resource_policy`), so `GetResourcePolicy`,
+//! `DeleteResourcePolicy` and the function's own delete all see ONE copy of it.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +174,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutResourcePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialise_due_transitions(now);
+
+        // The `resourceArn` names the web function the policy hangs off; the store
+        // keys that function by name, exactly as every other reader resolves it.
+        let name = crate::state::resolve_function_name(&input.resource_arn).to_string();
+        let Some(function) = state.functions.get(&name) else {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("The web function {} doesn't exist.", input.resource_arn),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: Some("WebFunction".to_string()),
+                },
+            )
+            .into());
+        };
+        let current = function.resource_policy.clone();
+
+        // Both checks run BEFORE the write, so a put this service refuses leaves
+        // the stored policy and its revision id exactly as they were.
+        if !crate::state::is_policy_document(&input.policy) {
+            return Err(
+                PutResourcePolicyErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::POLICY_SYNTAX_ERROR_MESSAGE.to_string(),
+                })
+                .into(),
+            );
+        }
+        if let Some(supplied) = input.revision_id.as_deref() {
+            // A request that names a revision id may write over the generation
+            // that id identifies and no other — and over no generation at all
+            // while the function carries no policy.
+            let accepted = current
+                .as_ref()
+                .is_some_and(|policy| policy.accepts_revision(Some(supplied)));
+            if !accepted {
+                return Err(PutResourcePolicyErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::STALE_POLICY_REVISION_MESSAGE.to_string(),
+                        resource_id: Some(input.resource_arn.clone()),
+                        resource_type: Some(
+                            crate::state::RESOURCE_POLICY_RESOURCE_TYPE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let stored = state
+            .put_resource_policy(&name, &input.policy, now)
+            .ok_or_else(|| {
+                PutResourcePolicyErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the web function store is unavailable".to_string()),
+                })
+            })?;
+
+        // The audit record for the state change: who, what, outcome. The document
+        // itself is the caller's, so only the generation it became is recorded.
+        ::tracing::info!(
+            operation = "PutResourcePolicy",
+            akid = %akid,
+            resource_arn = %input.resource_arn,
+            revision_id = %stored.revision_id,
+            outcome = "attached",
+            "a resource-based policy was attached to a web function"
+        );
+
+        Ok(PutResourcePolicyOutput {
+            policy: stored.document,
+            revision_id: stored.revision_id,
+        })
     }
 }

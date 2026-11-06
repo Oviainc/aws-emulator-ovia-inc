@@ -10,7 +10,8 @@
 //! region, the documented resource-name rule, the record-to-modelled-shape
 //! projections, the clock-driven `Pending -> Active` transition and the opaque list
 //! cursor codec — are shared by those handlers rather than duplicated per
-//! operation. The endpoint slice lives in [`endpoints`].
+//! operation. The endpoint slice lives in [`endpoints`] and the resource-policy
+//! slice in [`resource_policies`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -30,6 +31,12 @@ pub use account::*;
 /// create paths validate it against.
 mod endpoints;
 pub use endpoints::*;
+
+/// The resource-policy slice: the resource-based policy a web function carries,
+/// the document rule the put holds it to and the revision rule both mutating
+/// operations apply.
+mod resource_policies;
+pub use resource_policies::*;
 
 /// The region an emulated request is treated as having been made in when its
 /// SigV4 credential scope does not name one (an unsigned or anonymous request).
@@ -237,6 +244,11 @@ pub struct WebFunction {
     /// identity in this API. Nested here, so a function's delete takes its
     /// endpoints with it and every endpoint reader sees ONE copy of each.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// The resource-based policy attached to this function, or `None` while it
+    /// carries none. A function has at most one, and it is nested here for the
+    /// same reason the endpoints are: a function's delete takes its policy with
+    /// it, and every resource-policy operation reads ONE copy of it.
+    pub resource_policy: Option<ResourcePolicy>,
 }
 
 impl WebFunction {
@@ -316,6 +328,10 @@ pub struct ComAmazonawsLambdawebLambdawebState {
     /// Monotonic counter behind every minted `revisionId`, so two revisions —
     /// of one function or of two — never share an id.
     pub next_revision_seq: u64,
+    /// Monotonic counter behind every minted POLICY `revisionId`, so two
+    /// generations of a resource-based policy — of one function or of two — never
+    /// share an id.
+    pub next_policy_revision_seq: u64,
 }
 
 impl ComAmazonawsLambdawebLambdawebState {

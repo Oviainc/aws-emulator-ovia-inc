@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the resource-based policy of a web function and answers 204. The revision
+//! check runs BEFORE the removal, so a delete carrying a `revisionId` that is not the
+//! policy's current one leaves the policy in place; a function that carries no policy is
+//! a `ResourceNotFoundException`. The policy lives in the function's own record
+//! (`crate::state::WebFunction::resource_policy`), so this and `GetResourcePolicy` see
+//! ONE copy of it.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +179,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // The `resourceArn` names the web function the policy hangs off; the store
+        // keys that function by name, exactly as every other reader resolves it.
+        let name = crate::state::resolve_function_name(&input.resource_arn).to_string();
+        if !state.functions.contains_key(&name) {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("The web function {} doesn't exist.", input.resource_arn),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: Some("WebFunction".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(policy) = state.resource_policy(&name) else {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::POLICY_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: Some(crate::state::RESOURCE_POLICY_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The check runs BEFORE the removal: a delete carrying an id that is not
+        // the current generation's leaves the policy exactly as it was. With no id
+        // the policy goes "regardless of its current revision".
+        if !policy.accepts_revision(input.revision_id.as_deref()) {
+            return Err(DeleteResourcePolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::STALE_POLICY_REVISION_MESSAGE.to_string(),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: Some(crate::state::RESOURCE_POLICY_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let removed = state.remove_resource_policy(&name).ok_or_else(|| {
+            DeleteResourcePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+
+        // The audit record for a destructive state change: who, what, outcome.
+        ::tracing::info!(
+            operation = "DeleteResourcePolicy",
+            akid = %akid,
+            resource_arn = %input.resource_arn,
+            revision_id = %removed.revision_id,
+            outcome = "deleted",
+            "a web function's resource-based policy was removed"
+        );
+
+        Ok(DeleteResourcePolicyOutput)
     }
 }

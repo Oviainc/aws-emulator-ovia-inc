@@ -292,6 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 revisions: ::std::collections::BTreeMap::new(),
                 latest_revision_id: None,
                 endpoints: ::std::collections::BTreeMap::new(),
+                // A fresh function carries no resource-based policy: one is
+                // attached by `PutResourcePolicy`, never by a create.
+                resource_policy: None,
             },
         );
 
