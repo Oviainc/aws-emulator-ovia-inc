@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCapacityManagerMetricDimensions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCapacityManagerMetricDimensions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the dimension COMBINATIONS the account has capacity data for inside
+//! the window the request names — the distinct projections, onto the dimensions it groups
+//! by, of the capacity resources the metrics it names measure — in a stable order, cut into
+//! `MaxResults`-sized pages followed by the token this service mints. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCapacityManagerMetricDimensions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure report: it writes nothing, so two identical calls answer identically and asking
+//! changes nothing a later caller sees. Which resources carry which dimension values, and
+//! which resources a metric measures, is [`crate::state::capacity_manager_metrics`]'s — one
+//! reading, shared with the operation that reports the metric data itself, so the two cannot
+//! disagree about what the account has data for.
+//!
+//! Capacity Manager must be ON for the account: "enables EC2 Capacity Manager for your
+//! account ... this starts data ingestion for your EC2 capacity usage"
+//! (`EnableCapacityManager`), so an account that has not enabled it has no capacity
+//! analytics to discover dimensions in and the request is refused
+//! [`crate::state::capacity_manager_disabled`] — the code EC2 answers for that condition —
+//! rather than answered with an empty set that would read as "you have no capacity".
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +163,326 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCapacityManagerMetricDimensions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCapacityManagerMetricDimensionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::time::{Instant, SystemTime};
+
+        use crate::state;
+        use crate::state::{MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MatchBudget};
+
+        // A dimension combination carries the Region of the capacity resource it describes
+        // ("the Amazon Web Services Region where the capacity resource is located" —
+        // `CapacityManagerDimension$ResourceRegion`), read off that resource rather than off
+        // the Region the request was signed for: Capacity Manager is enabled "for your
+        // account" and aggregates the account's capacity, so `ctx` — which carries request
+        // metadata only — is read for nothing here.
+        let _ = ctx;
+
+        // "The dimensions to group by when retrieving available dimension values. This
+        // determines which dimension combinations are returned. Required parameter"
+        // (`GroupBy`). A request that groups by nothing names no combination to return, so
+        // it is missing the member the answer is built from rather than asking for every
+        // dimension — the reading this crate gives every required list a request left empty.
+        // WHICH dimensions are namable is the model's own `GroupBy` catalog, already
+        // enforced before this handler runs, so it is not re-read here.
+        let group_by: &[String] = input.group_by.as_slice();
+        if group_by.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter GroupBy",
+            ));
+        }
+
+        // "The metric names to use as an additional filter when retrieving dimensions. Only
+        // dimensions that have data for these metrics will be returned. Required parameter
+        // with maximum size of 1 for v1" (`MetricNames`): the member the request says WHICH
+        // capacity the dimensions must have data for, so a request naming no metric is
+        // missing it, and one naming more than the published maximum is refused with that
+        // maximum rather than served a reading of only its first entry.
+        let metric_names: &[String] = input.metric_names.as_slice();
+        if metric_names.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter MetricNames",
+            ));
+        }
+        if metric_names.len() > MAX_METRIC_NAMES {
+            return Err(state::invalid_parameter_value(format!(
+                "MetricNames accepts at most {MAX_METRIC_NAMES} metric name, got {}",
+                metric_names.len()
+            )));
+        }
+
+        // "Only dimensions with data in this time range will be returned" (`StartTime`): a
+        // window whose end does not follow its start is no window at all, so no capacity
+        // could have data in it. The same reading, and the same sentence, as every other
+        // windowed read of this crate.
+        if state::date_time_key(input.start_time) >= state::date_time_key(input.end_time) {
+            return Err(state::invalid_parameter_value(
+                "EndTime must be later than StartTime",
+            ));
+        }
+
+        // "Conditions to filter which dimension values are returned. Each filter specifies a
+        // dimension, comparison operator, and values to match against" (`FilterBy`) — so a
+        // condition is only applicable when it carries all three, and one that leaves any of
+        // them out is refused before anything is read rather than read as a condition that
+        // holds for everything. Which dimensions and comparisons are namable is the model's
+        // own `FilterByDimension` and `Comparison` catalogs, already enforced before this
+        // handler runs.
+        let conditions: &[CapacityManagerCondition] = input.filter_by.as_deref().unwrap_or_default();
+        let mut compiled: Vec<(&str, &str, &[String])> = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            let Some(dimension_condition) = condition.dimension_condition.as_ref() else {
+                return Err(state::missing_parameter(
+                    "Each FilterBy entry must contain the parameter DimensionCondition",
+                ));
+            };
+            let Some(dimension) = dimension_condition.dimension.as_deref() else {
+                return Err(state::missing_parameter(
+                    "Each DimensionCondition must contain the parameter Dimension",
+                ));
+            };
+            let Some(comparison) = dimension_condition.comparison.as_deref() else {
+                return Err(state::missing_parameter(
+                    "Each DimensionCondition must contain the parameter Comparison",
+                ));
+            };
+            let values: &[String] = dimension_condition.values.as_deref().unwrap_or_default();
+            if values.is_empty() {
+                return Err(state::missing_parameter(
+                    "Each DimensionCondition must contain the parameter Values",
+                ));
+            }
+            // The number of comparisons a condition asks for is request-controlled, so it is
+            // capped BEFORE any work proportional to it is done and before the store is
+            // locked — the same ceiling every other filter-bearing read of this crate
+            // enforces ([`state::MAX_FILTER_VALUES`]). The model's own `@length` on
+            // `ConditionValueList` already bounds the list far below it; this is the bound
+            // the crate applies whatever the model publishes, so the product capped below
+            // cannot be reached through a list the model later widens.
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "A DimensionCondition carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            compiled.push((dimension, comparison, values));
+        }
+
+        // "The maximum number of dimension combinations to return. Valid range is 1 to 1000"
+        // (`MaxResults`). The model publishes no `@range` for this member, so the published
+        // bounds are enforced here: a page holds at least one combination, and the ceiling is
+        // the largest page this service serves ([`state::MAX_PAGE_SIZE`], the 1000 the member
+        // publishes), which is also what a request naming no `MaxResults` gets.
+        let ceiling = i32::try_from(state::MAX_PAGE_SIZE).unwrap_or(i32::MAX);
+        let limit = match input.max_results {
+            None => state::MAX_PAGE_SIZE,
+            Some(max_results) => {
+                if !(MIN_RESULTS_PER_PAGE..=ceiling).contains(&max_results) {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Invalid value '{max_results}' for MaxResults. MaxResults must be \
+                         between {MIN_RESULTS_PER_PAGE} and {ceiling}"
+                    )));
+                }
+                usize::try_from(max_results).unwrap_or(state::MAX_PAGE_SIZE)
+            }
+        };
+
+        // "The token for the next page of results" (`NextToken`) — a token this service did
+        // not mint is refused rather than read as a position, and it is refused before
+        // anything is read, so whether a bogus token is caught never depends on what the
+        // account holds. The token is SCOPED to the query it was minted for (the metrics, the
+        // grouping and the window below), because each query has its own order of
+        // combinations and a token must not resume inside another's.
+        let scope = page_scope(metric_names, group_by, &compiled, &input);
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(token, &scope)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // The permission question, answered after every parameter has been read and before
+        // the account's state is: the flag asks whether the CALLER MAY make the request.
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`).
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // Capacity Manager off means there are no capacity analytics to discover dimensions
+        // in at all (see the module docs), read through the ONE reading of the account's
+        // settings, so this and `GetCapacityManagerAttributes` cannot disagree about whether
+        // the account has it on. Asked FIRST, so a refused request reads nothing else.
+        if store.capacity_manager_at(Instant::now()).status != state::CAPACITY_MANAGER_ENABLED {
+            return Err(state::capacity_manager_disabled());
+        }
+
+        // The moves the clock already owed the account's capacity — the Spot Instance
+        // request whose fulfillment launched its instance, the reservation whose capacity
+        // was delivered — are observed here, not caused: each fell due at this instant
+        // whether or not anybody called, so this changes nothing a later caller would
+        // otherwise have seen, and the dimensions reported are those of the capacity the
+        // account has by now.
+        store.materialize_due_transitions();
+
+        // Which capacity each named metric measures, and so which resources of the account
+        // can carry a dimension value for this request: a metric of the catalog always has a
+        // subject, and naming the same subject twice is one subject.
+        let subjects: BTreeSet<state::CapacityMetricSubject> = metric_names
+            .iter()
+            .filter_map(|metric| state::capacity_metric_subject(metric))
+            .collect();
+
+        // Every combination the account has data for, folded by its key: the key IS the
+        // identity of a combination, so two resources that agree on the grouped dimensions
+        // report once, and the map's own order is the stable order the page cursor names a
+        // position in.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCapacityManagerMetricDimensions"))
+        // Every comparison below is charged to ONE budget, so the product of stored capacity
+        // rows, conditions and values per condition is bounded however the caller combines
+        // them — which is also what bounds how long this holds the store's lock.
+        let now = SystemTime::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut combinations: BTreeMap<String, CapacityManagerDimension> = BTreeMap::new();
+        for subject in subjects {
+            if budget.exhausted() {
+                break;
+            }
+            for row in
+                store.capacity_manager_dimension_rows(subject, input.start_time, input.end_time, now)
+            {
+                if budget.exhausted() {
+                    break;
+                }
+                // "If you specify multiple filters, the filters are joined with an AND": a
+                // resource is reported only when EVERY condition holds for it, judged on the
+                // whole resource rather than on the dimensions it is grouped by.
+                if !compiled.iter().all(|(dimension, comparison, values)| {
+                    state::capacity_manager_condition_holds(
+                        &row,
+                        dimension,
+                        comparison,
+                        values,
+                        &mut budget,
+                    )
+                }) {
+                    continue;
+                }
+                // A resource carrying no value for one of the grouped dimensions has no
+                // combination of them, so it contributes none.
+                let Some(projected) = state::capacity_manager_dimension_projection(&row, group_by)
+                else {
+                    continue;
+                };
+                combinations.insert(
+                    state::capacity_manager_dimension_key(&row, group_by),
+                    projected,
+                );
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently narrowed report.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+        let ordered: Vec<(String, CapacityManagerDimension)> = combinations.into_iter().collect();
+
+        // That key order is both the paging order and the cursor, so a token names the
+        // combination the next page resumes after and a walk always advances. "This value is
+        // null when there are no more results to return" (`NextToken`) — a token only when a
+        // combination follows this page.
+        let (page, next_token) = state::scoped_page_from_cursor(
+            &scope,
+            &ordered,
+            cursor.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |(key, _)| key.as_str(),
+        );
+
+        Ok(GetCapacityManagerMetricDimensionsOutput {
+            // "The available dimension combinations that have data within the specified time
+            // range and filters" (`MetricDimensionResults`).
+            metric_dimension_results: Some(
+                page.iter()
+                    .map(|(_, combination)| combination.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The largest number of metric names one request may name: "Required parameter with maximum
+/// size of 1 for v1"
+/// (`smithy_query(query="doc",shape="GetCapacityManagerMetricDimensionsRequest",member="MetricNames")`),
+/// a bound the model's own `@length` on `MetricSet` (0..40) does not express.
+const MAX_METRIC_NAMES: usize = 1;
+
+/// The smallest page this operation serves: "Valid range is 1 to 1000" (`MaxResults`). The
+/// other end of that published range is the service's own [`crate::state::MAX_PAGE_SIZE`],
+/// read where the bound is applied rather than written again here.
+const MIN_RESULTS_PER_PAGE: i32 = 1;
+
+/// What a pagination token minted by this operation is valid FOR: the query whose
+/// combinations it names a position in.
+///
+/// The order and the membership of the combinations are facts of the metrics, the grouping,
+/// the FILTER CONDITIONS and the window a request asked about — a condition decides which
+/// combinations exist at all — so all four are named here, and a token minted while paging
+/// one query is refused for any other ([`crate::state::decode_scoped_page_token`] checks it
+/// back against this text). The window is rendered in the wire's own timestamp format, so
+/// two requests asking the same question scope the same.
+///
+/// The conditions are named by a FINGERPRINT rather than by their text: their values are
+/// caller-supplied, so embedding them would both grow the token with the request and let a
+/// value carrying the scope separator break the scope apart.
+fn page_scope(
+    metric_names: &[String],
+    group_by: &[String],
+    conditions: &[(&str, &str, &[String])],
+    input: &GetCapacityManagerMetricDimensionsInput,
+) -> String {
+    let window = |at: ::aws_smithy_types::DateTime| {
+        crate::state::filter_timestamp_values(Some(at))
+            .into_iter()
+            .next()
+            .map(|value| value.into_owned())
+            .unwrap_or_default()
+    };
+    format!(
+        "{}|{}|{}|{}|{}",
+        metric_names.join(","),
+        group_by.join(","),
+        conditions_fingerprint(conditions),
+        window(input.start_time),
+        window(input.end_time)
+    )
+}
+
+/// The conditions of one query, as a fixed-size word that names them and nothing else.
+///
+/// Only ever compared against itself, inside the process that minted it — a page token is
+/// presented back to the operation that issued it — so the standard library's hasher is
+/// enough to tell one set of conditions from another, which is all [`page_scope`] asks of it.
+/// It is not a secret and nothing depends on it being unforgeable: a token that does not
+/// verify is refused, and the conditions it would name are the caller's own.
+fn conditions_fingerprint(conditions: &[(&str, &str, &[String])]) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    for (dimension, comparison, values) in conditions {
+        dimension.hash(&mut hasher);
+        comparison.hash(&mut hasher);
+        values.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }

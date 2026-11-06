@@ -99,8 +99,6 @@ mod refusal_fixed_text;
 // What `GetManagedPrefixListEntries` reports: the entry set of the one prefix list a request
 // names — a list the account created or one the Region publishes — in CIDR order, how it
 // pages, which version it reports and what it refuses. Declared beside `prefix_lists` for the
-// reason the note above gives: the sorted neighbourhood and the tail of this file are where
-// every new ec2 suite inserts its lines.
 #[path = "all/get_managed_prefix_list_entries.rs"]
 mod get_managed_prefix_list_entries;
 // What `GetManagedPrefixListAssociations` reports: the resources that reference the one prefix
@@ -1489,6 +1487,11 @@ mod capacity_reservation_reports;
 // `Attribute` names and no other, out of the state the launch wrote and the AMI, instance
 // type, volume store and interface store it is derived from — and the ids, attributes and
 // dry run it refuses. Declared at the tail of this file, which is where every new ec2 suite
-// inserts its lines.
 #[path = "all/instance_attribute_describe.rs"]
 mod instance_attribute_describe;
+// What `GetCapacityManagerMetricDimensions` reports: the dimension combinations the account
+// has capacity data for inside the window a request names, the capacity each metric family is
+// measured over, the conditions that narrow them, the pages they are reported in, and the
+// `CapacityManager.Disabled` refusal an account that has not enabled Capacity Manager gets.
+#[path = "all/capacity_manager_metric_dimensions.rs"]
+mod capacity_manager_metric_dimensions;

@@ -1572,6 +1572,15 @@
 //! count of configurations `GetCapacityManagerAttributes` reports is the size of that map,
 //! so the reader and the delete cannot disagree about what the account holds.
 //!
+//! The DIMENSIONS Capacity Manager measures capacity along are not a store of their own:
+//! they are a reading of the capacity resources the account already holds — its Capacity
+//! Reservations and its instances — over a window of time, which is why
+//! [`capacity_manager_metrics`] derives them rather than recording them. Which resources one
+//! metric measures is read off the metric's own name
+//! ([`capacity_metric_subject`]), so nothing has to be written when a
+//! reservation is created or an instance is launched for Capacity Manager to have data for
+//! it.
+//!
 //! ## Scheduled event notification tag keys are a fact of a REGION
 //!
 //! [`ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`] holds, per Region, the tag
@@ -2118,6 +2127,15 @@ pub use declarative_policies_reports::*;
 /// instance's console differently.
 pub mod instance_console;
 pub use instance_console::*;
+
+/// Which capacity resources each of Capacity Manager's metrics measures, and the DIMENSION
+/// VALUES each of those resources carries — the one reading every operation that answers
+/// along Capacity Manager's dimensions shares, so the report of the available dimensions and
+/// the report of the metric data itself cannot disagree about what the account has data for.
+/// A SUBMODULE for the same reason [`image_usage_reports`] is one, and `pub use` keeps every
+/// name reachable as `crate::state::<name>`.
+pub mod capacity_manager_metrics;
+pub use capacity_manager_metrics::*;
 
 // ---------------------------------------------------------------------------
 // Managed resource visibility (the account-wide setting)
