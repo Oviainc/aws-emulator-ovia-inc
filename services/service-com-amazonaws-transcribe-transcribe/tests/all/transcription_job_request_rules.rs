@@ -587,7 +587,10 @@ fn references() -> Vec<Reference> {
 /// The wording belongs to the FAMILY: the Call Analytics category family words the same
 /// condition its own way, which its refusal suite
 /// (`crate::call_analytics_category_refusals`) pins, so that family's sentence is read
-/// from there rather than composed here.
+/// from there rather than composed here. The custom MEDICAL vocabulary family shares
+/// the plain vocabulary family's sentence — the recorded refusal for an absent medical
+/// vocabulary reads "The requested vocabulary couldn't be found. Check the vocabulary
+/// name and try your request again.", with no "medical" in either clause.
 ///
 /// `pub(crate)` so the Call Analytics start suite
 /// (`crate::call_analytics_job_start_limits`) asserts the same wording from one home
@@ -596,6 +599,11 @@ pub(crate) fn not_found_message(kind: &str) -> String {
     if kind == "category" {
         return crate::call_analytics_category_refusals::ABSENT_CATEGORY_MESSAGE.to_string();
     }
+    let kind = if kind == "medical vocabulary" {
+        "vocabulary"
+    } else {
+        kind
+    };
     format!("The requested {kind} couldn't be found. Check the {kind} name and try your request again.")
 }
 

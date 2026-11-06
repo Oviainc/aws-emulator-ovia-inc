@@ -2,8 +2,8 @@
 
 //! @op DeleteMedicalVocabulary
 //! Deletes a stored custom MEDICAL vocabulary, refusing one whose build has not
-//! finished and refusing a name this Region holds no medical vocabulary under (see
-//! [`DeleteMedicalVocabulary::handle`]).
+//! finished and answering its empty success for a name this Region holds no medical
+//! vocabulary under (see [`DeleteMedicalVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     // [`crate::scaffolded::wire_status`].
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Remove the custom medical vocabulary this request names.
+    ///
+    /// This delete is IDEMPOTENT: it asks for a Region that holds no medical
+    /// vocabulary of that name, and a name the Region already holds none under is
+    /// already in that state, so the request is answered with this operation's empty
+    /// success (the model gives it `Unit` output) and nothing is stored or removed. A
+    /// record whose BUILD has not finished is the one thing it refuses — "Your request
+    /// didn't pass one or more validation tests. This can occur when the entity you're
+    /// trying to delete doesn't exist or if it's in a non-terminal state (such as IN
+    /// PROGRESS)" (`BadRequestException`'s own documentation) — and the clock-owed
+    /// transition is materialised first, so only a build that is genuinely still
+    /// running is refused.
     async fn handle(
         &self,
         input: Self::Input,
@@ -229,27 +241,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "custom medical vocabulary deleted"
                     );
                 }
-                // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
-                // `BadRequestException` sentence covers it — "This can occur when the
-                // entity you're trying to delete doesn't exist OR if it's in a
-                // non-terminal state" — so a name this Region holds no medical
-                // vocabulary under is refused with this service's own absent-resource
-                // text (`crate::state::not_found_message`), exactly as this family's
-                // reader answers it, and nothing is stored or removed.
+                // THIS DELETE IS IDEMPOTENT: what it asks for — that this Region hold
+                // no medical vocabulary of that name — is already true, so the request
+                // is answered with this operation's ordinary empty success (its output
+                // shape is `Unit`) rather than refused. Nothing is stored or removed,
+                // and the withdrawal below is a no-op for a name no build ever served a
+                // file for.
                 None => {
                     ::tracing::info!(
                         operation = "DeleteMedicalVocabulary",
                         vocabulary = %input.vocabulary_name,
-                        "no custom medical vocabulary of that name; the delete is refused"
+                        "no custom medical vocabulary of that name; the delete is \
+                         already satisfied"
                     );
-                    return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(crate::state::not_found_message(
-                                crate::state::KIND_MEDICAL_VOCABULARY,
-                            )),
-                        },
-                    )
-                    .into());
                 }
             }
         }

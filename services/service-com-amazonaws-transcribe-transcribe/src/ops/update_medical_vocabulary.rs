@@ -214,6 +214,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // The vocabulary this request is ABOUT is resolved first: an update names an
+        // existing record, so a name this Region holds none under is answered as
+        // not-found whatever else the request carries — the file it names is not read
+        // for a resource that is not there. The store is read again under the lock
+        // below, which is where the record is actually overwritten.
+        let held = state.lock().holds(
+            crate::state::ResourceFamily::MedicalVocabulary,
+            &region,
+            &input.vocabulary_name,
+        );
+        if !held {
+            // A medical vocabulary this Region does not hold is this service's
+            // `BadRequestException`, as it is for `GetMedicalVocabulary` and
+            // `UpdateVocabulary`: the shape whose own documentation covers an entity
+            // that "doesn't exist", and the one this service's recorded not-found
+            // responses carry — not the modelled `NotFoundException`.
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_MEDICAL_VOCABULARY,
+            )));
+        }
         // The table file the rebuild is to read, read the same way the create reads it.
         let verdict = crate::state::resolve_vocabulary_file(
             ctx,

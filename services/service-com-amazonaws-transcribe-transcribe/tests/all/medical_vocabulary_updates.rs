@@ -320,9 +320,10 @@ async fn an_update_of_an_unknown_medical_vocabulary_is_refused() {
             .await;
         refused.refused(case, 400, "BadRequestException");
         let message = refused.error_message(case);
-        assert!(
-            message.contains("medical vocabulary") && message.contains("couldn't be found"),
-            "case {case:?}: the refusal must say the medical vocabulary was not found, \
+        assert_eq!(
+            message,
+            crate::transcription_job_request_rules::not_found_message("medical vocabulary"),
+            "case {case:?}: the refusal must be the family's own not-found sentence, \
              got {message:?}"
         );
     }

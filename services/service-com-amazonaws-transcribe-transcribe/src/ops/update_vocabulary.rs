@@ -211,6 +211,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
+        // The vocabulary this request is ABOUT is resolved first: an update names an
+        // existing record, so a name this Region holds none under is answered as
+        // not-found whatever else the request carries — the terms it names are not
+        // resolved for a resource that is not there. The store is read again under the
+        // lock below, which is where the record is actually overwritten.
+        let held = state.lock().holds(
+            crate::state::ResourceFamily::Vocabulary,
+            &region,
+            &input.vocabulary_name,
+        );
+        if !held {
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_VOCABULARY,
+            )));
+        }
+
         // Same pair of alternatives as the create, and the same handling: "you can
         // either upload a text file … or you can include a list of terms directly in
         // your request using the Phrases flag". Either produces the terms the rebuild

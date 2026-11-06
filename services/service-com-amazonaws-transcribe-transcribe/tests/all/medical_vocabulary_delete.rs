@@ -4,10 +4,12 @@
 //!
 //! THE RULE: a delete in this service's custom-vocabulary families removes the one
 //! record its name and Region identify, so every later reader of that name answers
-//! "absent" and the name is free to be created again; a delete is refused when the
-//! service holds no such record (this service's absent-resource
-//! `BadRequestException`) and when the record it names is in a non-terminal state
-//! (its build still `PENDING`), and in neither case does it change what is stored.
+//! "absent" and the name is free to be created again. `DeleteMedicalVocabulary` is
+//! IDEMPOTENT about presence: a name the Region holds no medical vocabulary under is
+//! already in the state the request asks for, so it is answered with this operation's
+//! empty success (HTTP 200, `{}`) and nothing is stored; the one thing it refuses is a
+//! record in a non-terminal state (its build still `PENDING`), and a refused delete
+//! changes nothing that is stored.
 //!
 //! The rows span what the rule generalises over: the form of the vocabulary name
 //! (every character class its `@pattern` admits, up to the modelled 200-character
@@ -106,8 +108,9 @@ async fn create_and_settle(transcribe: &Transcribe, row: &Row, case: &str) {
     std::thread::sleep(PAST_THE_TRANSITION);
 }
 
-/// The whole rule on a settled record: the delete succeeds exactly once, removes what
-/// the name identified from every reader, and frees the name for a new create.
+/// The whole rule on a settled record: the delete removes what the name identified
+/// from every reader, every repeat of it is the same empty success, and the name is
+/// free for a new create.
 #[tokio::test]
 async fn a_delete_removes_the_record_and_frees_its_name() {
     let transcribe = Transcribe::new();
@@ -130,7 +133,8 @@ async fn a_delete_removes_the_record_and_frees_its_name() {
             read.body
         );
 
-        // Run the delete three times: only the FIRST finds anything to remove.
+        // Run the delete three times: the FIRST removes the record and every repeat
+        // answers the same empty success, because what it asks for is already true.
         for attempt in 1..=3 {
             let attempt_case = format!("{case} / delete #{attempt}");
             let reply = transcribe
@@ -139,12 +143,8 @@ async fn a_delete_removes_the_record_and_frees_its_name() {
                     json!({"VocabularyName": row.name}),
                 )
                 .await;
-            if attempt == 1 {
-                succeeded(&reply, &attempt_case);
-                empty_body(&reply, &attempt_case);
-            } else {
-                absent_resource_refusal(&reply, &attempt_case, KIND);
-            }
+            succeeded(&reply, &attempt_case);
+            empty_body(&reply, &attempt_case);
 
             // Every reader of the family answers "absent" afterwards.
             absent_resource_refusal(
@@ -230,18 +230,19 @@ fn absent_names() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A delete of a record this Region does not hold is REFUSED with this service's
-/// absent-resource `BadRequestException` — for every form of name — and stores
-/// nothing, so the listing is still empty afterwards.
+/// A delete of a record this Region does not hold is an EMPTY SUCCESS — for every form
+/// of name — and stores nothing, so the listing is still empty afterwards and the
+/// family's reader still answers "absent".
 #[tokio::test]
-async fn deleting_a_record_this_region_does_not_hold_is_refused() {
+async fn deleting_a_record_this_region_does_not_hold_is_an_empty_success() {
     let transcribe = Transcribe::new();
 
     for (name_case, name) in absent_names() {
         let reply = transcribe
             .call("DeleteMedicalVocabulary", json!({"VocabularyName": name}))
             .await;
-        absent_resource_refusal(&reply, name_case, KIND);
+        succeeded(&reply, name_case);
+        empty_body(&reply, name_case);
 
         // The delete must not MINT what it did not find.
         absent_resource_refusal(
@@ -433,18 +434,17 @@ async fn a_delete_reaches_only_its_own_region_and_family() {
     );
 
     // Each surviving record is deletable through its own call, and nothing else is a
-    // way to remove it: the non-medical delete does not answer for the medical family.
-    absent_resource_refusal(
-        &transcribe
-            .call_in_region(
-                "DeleteMedicalVocabulary",
-                json!({"VocabularyName": shared}),
-                home_region,
-            )
-            .await,
-        case,
-        KIND,
-    );
+    // way to remove it: the non-medical delete does not answer for the medical family,
+    // and a repeat of the medical delete that already ran is its empty success.
+    let repeated = transcribe
+        .call_in_region(
+            "DeleteMedicalVocabulary",
+            json!({"VocabularyName": shared}),
+            home_region,
+        )
+        .await;
+    succeeded(&repeated, case);
+    empty_body(&repeated, case);
     succeeded(
         &transcribe
             .call_in_region(

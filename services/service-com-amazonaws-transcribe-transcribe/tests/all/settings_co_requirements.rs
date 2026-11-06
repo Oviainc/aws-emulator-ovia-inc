@@ -380,12 +380,13 @@ async fn a_start_naming_a_custom_medical_vocabulary_this_account_lacks_is_refuse
             .await;
         refused.refused(&case, 400, "BadRequestException");
         // The service's own not-found text names the KIND of resource and never
-        // echoes the name the caller asked about.
+        // echoes the name the caller asked about — and the medical vocabulary family
+        // is named with the PLAIN vocabulary noun, as its recorded refusal words it
+        // (`crate::transcription_job_request_rules::not_found_message`).
         let message = refused.error_message(&case);
         assert_eq!(
             message,
-            "The requested medical vocabulary couldn't be found. Check the medical \
-             vocabulary name and try your request again.",
+            crate::transcription_job_request_rules::not_found_message("medical vocabulary"),
             "case {case:?}: unexpected refusal message, got {message:?}"
         );
 

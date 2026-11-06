@@ -7,11 +7,15 @@
 //! This can occur when the entity you're trying to delete doesn't exist or if it's in
 //! a non-terminal state (such as IN PROGRESS)", `BadRequestException`) — the refusal
 //! names the KIND of resource rather than echoing the request, and nothing is created
-//! or removed. No delete of this service is idempotent: exactly one delete of a
-//! resource succeeds.
+//! or removed. Exactly one delete of such a resource succeeds.
+//!
+//! `DeleteMedicalVocabulary` is the one family this does NOT hold for: its recorded
+//! answer for a name the account holds nothing under is an empty 200, so it is
+//! idempotent about presence and its rows live in `crate::medical_vocabulary_delete`
+//! rather than here.
 //!
 //! The table spans the whole delete class rather than one operation: one row per
-//! family whose delete this emulator serves (custom vocabulary, custom medical
+//! family whose delete this emulator serves and refuses an absent name (custom
 //! vocabulary, vocabulary filter, custom language model, transcription job, Call
 //! Analytics category, Call Analytics job, Medical Scribe job), crossed with the forms
 //! of name the name members' shared
@@ -78,22 +82,6 @@ fn deletables() -> Vec<Deletable> {
                     "VocabularyName": name,
                     "LanguageCode": "en-US",
                     "Phrases": ["Aardvark", "Transcribe"]
-                })
-            },
-        },
-        Deletable {
-            kind: "medical vocabulary",
-            create: "CreateMedicalVocabulary",
-            read: "GetMedicalVocabulary",
-            delete: "DeleteMedicalVocabulary",
-            name_member: "VocabularyName",
-            create_body: |name| {
-                json!({
-                    "VocabularyName": name,
-                    // "US English (en-US) is the only language supported with Amazon
-                    // Transcribe Medical" (model doc for the medical language code).
-                    "LanguageCode": "en-US",
-                    "VocabularyFileUri": "s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt"
                 })
             },
         },

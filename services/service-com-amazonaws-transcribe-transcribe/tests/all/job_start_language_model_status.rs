@@ -7,23 +7,24 @@
 //! has finished training it successfully — `COMPLETED` is that status ("When the status
 //! displays as COMPLETED the model is ready for use", `smithy_query(query="doc",
 //! shape="LanguageModel", member="ModelStatus")`) — so a start naming one whose
-//! training is still running (`IN_PROGRESS`) or whose training data the object store
-//! said it could not read (`FAILED`) is refused with the modelled
+//! training is still running (`IN_PROGRESS`) is refused with the modelled
 //! `BadRequestException` (HTTP 400) and stores no job, while the same start, once the
 //! named model has settled `COMPLETED`, is served and reads the model setting back.
 //!
 //! The rule is asserted over a table spanning what it generalises over: every start
 //! operation whose settings can name a custom language model, each of the member paths
 //! that carries such a name (the job's own `ModelSettings` / `Settings` and the
-//! per-language `LanguageIdSettings` entry), both statuses that are not `COMPLETED`, the
-//! model's language and base model, and the name forms `ModelName`'s own
-//! `@pattern`/`@length` admit.
+//! per-language `LanguageIdSettings` entry), the model's language and base model, and
+//! the name forms `ModelName`'s own `@pattern`/`@length` admit.
 //!
-//! The `FAILED` half needs an object store to GROUND the training failure in, so those
-//! rows run on the S3-mounted emulator of `crate::language_model_training_data` (the way
-//! the assembled emulator runs the two services) — the same rows there whose data IS
-//! staged are the counter-case: a model the store answered for settles `COMPLETED` and
-//! the very same start is served.
+//! The second test is the other end of the same rule: a model whose CREATE was refused
+//! — because the object store said its training data could not be read — is not held at
+//! all, so a start naming it is the family's not-found refusal rather than a state one.
+//! Those rows need an object store to ground the refusal in, so they run on the
+//! S3-mounted emulator of `crate::language_model_training_data` (the way the assembled
+//! emulator runs the two services), where the rows whose data IS staged are the
+//! counter-case: a model the store answered for settles `COMPLETED` and the very same
+//! start is served.
 //!
 //! The emulator, the call and the answer assertions are the transcription-job suite's
 //! harness (`crate::transcription_jobs`), reused rather than stood up a second time.
@@ -32,13 +33,14 @@ use serde_json::{json, Value};
 
 use crate::language_model_training_data::{
     call, create_bucket, create_request, emulator, stage, TRAINING_FILE,
+    UNREADABLE_S3_URI_MESSAGE,
 };
 use crate::language_models::{language_model_request, PAST_THE_TRANSITION};
 use crate::transcription_jobs::{not_usable_message as state_refusal, Reply, Transcribe};
 
-/// The bucket the `FAILED` rows stage their media in — and under whose prefixes their
-/// training data is deliberately NOT staged, which is what the object store's answer
-/// fails their training on.
+/// The bucket the rows of the second test stage their media in — and under whose
+/// prefixes the training data of the models whose creates must be REFUSED is
+/// deliberately NOT staged.
 const BUCKET: &str = "transcribe-clm-start-status";
 
 /// The media key every row of the S3-mounted half names: a start resolves its
@@ -249,9 +251,9 @@ async fn a_start_naming_a_model_still_training_is_refused_and_served_once_it_com
 }
 
 #[tokio::test]
-async fn a_start_naming_a_model_whose_training_failed_is_refused() {
-    // Transcribe with the object store beside it, so a model's training settles on what
-    // that store answers about the data the create named.
+async fn a_start_naming_a_model_whose_create_was_refused_finds_no_model() {
+    // Transcribe with the object store beside it, so a create's training data is
+    // resolved against what that store answers.
     let emulator = emulator();
     create_bucket(&emulator, BUCKET).await;
     stage(&emulator, BUCKET, MEDIA_KEY, TRAINING_FILE).await;
@@ -262,8 +264,8 @@ async fn a_start_naming_a_model_whose_training_failed_is_refused() {
     let names: Vec<String> = model_names().into_iter().rev().collect();
     let references = references();
 
-    // Two models per row: one whose training data is staged, one whose is not. Only
-    // what the store answers separates them — the requests have the same shape.
+    // Two creates per row, differing in nothing but whether the data they name is
+    // staged: one is served, one is refused.
     for (row, (reference, model)) in references.iter().zip(names.iter()).enumerate() {
         let staged_key = format!("staged-{row}/corpus.txt");
         stage(&emulator, BUCKET, &staged_key, TRAINING_FILE).await;
@@ -275,13 +277,20 @@ async fn a_start_naming_a_model_whose_training_failed_is_refused() {
         )
         .await
         .ok(reference.case);
-        call(
+        let refused = call(
             &emulator,
             "CreateLanguageModel",
             create_request(model, &format!("s3://{BUCKET}/not-staged-{row}/"), None),
         )
-        .await
-        .ok(reference.case);
+        .await;
+        refused.refused(reference.case, 400, "BadRequestException");
+        let message = refused.error_message(reference.case);
+        assert_eq!(
+            message, UNREADABLE_S3_URI_MESSAGE,
+            "case {:?}: the create must be refused for the location it cannot read, \
+             got {message:?}",
+            reference.case
+        );
     }
 
     std::thread::sleep(PAST_THE_TRANSITION);
@@ -290,34 +299,45 @@ async fn a_start_naming_a_model_whose_training_failed_is_refused() {
         let case = reference.case;
         let usable = format!("usable-{row}");
 
-        // What the store answered, as the family's own reader reports it.
-        for (name, expected) in [(model.as_str(), "FAILED"), (usable.as_str(), "COMPLETED")] {
-            let described = call(&emulator, "DescribeLanguageModel", json!({"ModelName": name}))
-                .await
-                .ok(case)["LanguageModel"]
-                .clone();
-            assert_eq!(
-                described["ModelStatus"],
-                json!(expected),
-                "case {case:?}: the model {name:?} must settle {expected}, got \
-                 {described:?}"
-            );
-        }
+        // What the store answered, as the family's own reader reports it: one model,
+        // and nothing at all under the refused name.
+        let described = call(
+            &emulator,
+            "DescribeLanguageModel",
+            json!({"ModelName": usable}),
+        )
+        .await
+        .ok(case)["LanguageModel"]
+            .clone();
+        assert_eq!(
+            described["ModelStatus"],
+            json!("COMPLETED"),
+            "case {case:?}: the model {usable:?} must settle COMPLETED, got \
+             {described:?}"
+        );
+        call(
+            &emulator,
+            "DescribeLanguageModel",
+            json!({"ModelName": model}),
+        )
+        .await
+        .refused(case, 400, "BadRequestException");
 
-        // The model whose training failed is not one a job may apply.
-        let failed_job = format!("failed-model-{row}");
+        // A model this account does not hold is not one a job may name, and the
+        // refusal is the family's own not-found sentence rather than a state one.
+        let unheld_job = format!("unheld-model-{row}");
         let refused = call(
             &emulator,
             reference.start,
-            (reference.request)(&failed_job, model, &media),
+            (reference.request)(&unheld_job, model, &media),
         )
         .await;
         refused.refused(case, 400, "BadRequestException");
         let message = refused.error_message(case);
         assert_eq!(
             message,
-            not_usable_message(model, "FAILED"),
-            "case {case:?}: the refusal must name the status the model is in, got \
+            crate::transcription_job_request_rules::not_found_message("language model"),
+            "case {case:?}: the refusal must be the family's not-found sentence, got \
              {message:?}"
         );
 
@@ -325,27 +345,10 @@ async fn a_start_naming_a_model_whose_training_failed_is_refused() {
         call(
             &emulator,
             reference.read,
-            json!({reference.name_member: failed_job}),
+            json!({reference.name_member: unheld_job}),
         )
         .await
         .refused(case, 400, "BadRequestException");
-
-        // The failure is terminal: a second start, after the status could only have been
-        // re-read, is refused in the same words.
-        let again = call(
-            &emulator,
-            reference.start,
-            (reference.request)(&failed_job, model, &media),
-        )
-        .await;
-        again.refused(case, 400, "BadRequestException");
-        let repeated = again.error_message(case);
-        assert_eq!(
-            repeated,
-            not_usable_message(model, "FAILED"),
-            "case {case:?}: a failed training does not become usable by being read, got \
-             {repeated:?}"
-        );
 
         // The counter-case through the very same member path: the model the store
         // answered for is COMPLETED, so the same start applying it is served.

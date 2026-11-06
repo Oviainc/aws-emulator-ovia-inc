@@ -198,6 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
+        // As `UpdateVocabulary` and `UpdateMedicalVocabulary`: the filter this request
+        // is ABOUT is resolved first, so a name this Region holds none under is
+        // answered as not-found whatever else the request carries. The store is read
+        // again under the lock below, which is where the record is overwritten.
+        let held = state.lock().holds(
+            crate::state::ResourceFamily::VocabularyFilter,
+            &region,
+            &input.vocabulary_filter_name,
+        );
+        if !held {
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_VOCABULARY_FILTER,
+            )));
+        }
+
         // Same pair of alternatives as the create, and the same handling: "You can use
         // Words or VocabularyFilterFileUri, but you can't use both." Either source
         // gives the words the rebuild holds; only the refusals for naming neither or

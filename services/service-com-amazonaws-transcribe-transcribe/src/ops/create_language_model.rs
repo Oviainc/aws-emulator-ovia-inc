@@ -184,18 +184,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_LANGUAGE_MODEL_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Record the custom language model this request describes, and resolve the data
-    /// its training run reads.
+    /// Record the custom language model this request describes, once the data its
+    /// training run reads has been RESOLVED.
     ///
     /// A model's training (and tuning) data comes from the Amazon S3 locations at
     /// `InputDataConfig$S3Uri` and `InputDataConfig$TuningDataS3Uri`, and this
     /// emulator's own Amazon S3 answers for them in process, so the create resolves
     /// them exactly where the service's training run would read them
-    /// ([`crate::state::resolve_training_data`]). The answer is stored on the record
-    /// and is what the clock-owed transition settles on: `IN_PROGRESS` here, then
-    /// `COMPLETED` — the status that makes a model usable — or, where the object store
-    /// says a named location cannot be read, `FAILED` with the `FailureReason` that
-    /// answer grounds (see [`crate::state::LanguageModelRecord`]).
+    /// ([`crate::state::resolve_training_data`]). Resolving them is part of VALIDATING
+    /// the request: a location the object store itself says cannot be read — a bucket
+    /// it does not hold, a prefix holding no file, a read it refuses — is refused
+    /// synchronously with the modelled `BadRequestException`
+    /// ([`crate::state::S3_URI_NOT_ACCESSIBLE`]) and NO model is created, so a caller's
+    /// mistyped bucket or prefix is answered rather than accepted. A location no object
+    /// store answered for at all refuses nothing: a refusal has to be grounded in what
+    /// the store said. What is stored is therefore always a model whose data the
+    /// resolution did not contradict, so its one clock-owed transition settles it
+    /// `COMPLETED` — the status that makes a model usable (see
+    /// [`crate::state::LanguageModelRecord`]).
     ///
     /// Resolving the locations takes no lock: the read is awaited BEFORE this service's
     /// store is touched, so the uniqueness check and the insert still happen under one
@@ -230,8 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model is created in — and only in — the Region the caller signed for, and its
         // training data is resolved against that Region's object store.
         let region = crate::state::request_region(ctx.parts());
-        let training_data =
-            crate::state::resolve_training_data(ctx, &region, &input.input_data_config).await;
+        // The locations the training run reads, resolved against that Region's object
+        // store before anything is stored: one the store says cannot be read refuses
+        // the create outright.
+        if crate::state::resolve_training_data(ctx, &region, &input.input_data_config).await
+            == crate::state::TrainingDataVerdict::Unreadable
+        {
+            return Err(bad_request(crate::state::S3_URI_NOT_ACCESSIBLE));
+        }
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -295,7 +307,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // One value per key, as every writer of a tag set stores it (see
             // [`crate::state::created_tag_set`]).
             crate::state::created_tag_set(input.tags),
-            training_data,
             now,
         );
 
@@ -311,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = "CreateLanguageModel",
             model = %record.name,
             status = %record.status,
-            "custom language model recorded; its training data was resolved against \
+            "custom language model recorded; its training data resolved against \
              this emulator's own Amazon S3"
         );
         let name = record.name.clone();
