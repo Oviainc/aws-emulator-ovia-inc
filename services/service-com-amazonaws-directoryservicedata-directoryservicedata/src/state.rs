@@ -101,6 +101,9 @@ pub const GROUPS_FOR_MEMBER_PAGE: &str = "groups-for-member";
 /// The page kind [`encode_cursor`] stamps on a `SearchUsers` token.
 pub const SEARCH_USERS_PAGE: &str = "search-users";
 
+/// The page kind [`encode_cursor`] stamps on a `SearchGroups` token.
+pub const SEARCH_GROUPS_PAGE: &str = "search-groups";
+
 /// The cursor format [`encode_cursor`] writes, so a token from an older encoding is
 /// refused rather than misread.
 const CURSOR_VERSION: &str = "v1";
@@ -141,6 +144,19 @@ const GIVEN_NAME_ATTRIBUTES: &[&str] = &["givenname"];
 
 /// `sn` is the attribute a surname lives in.
 const SURNAME_ATTRIBUTES: &[&str] = &["sn", "surname"];
+
+// A GROUP's own structural members, the same way. Its naming members answer to the
+// tables above — one object model, one set of naming attributes — and these two are
+// the group's alone (`smithy_query(query="shape", shape="Group")`: `GroupType`,
+// `GroupScope`).
+
+/// Active Directory holds a group's type in its `groupType` attribute, which this API
+/// models as its own member, so that member's name is the other name it answers to.
+const GROUP_TYPE_ATTRIBUTES: &[&str] = &["grouptype"];
+
+/// The same `groupType` attribute carries a group's scope, which this API likewise
+/// models as a member of its own.
+const GROUP_SCOPE_ATTRIBUTES: &[&str] = &["groupscope"];
 
 /// One user object of a directory.
 #[derive(Debug, Clone)]
@@ -190,26 +206,11 @@ impl User {
     }
 
     /// Whether this user is one a search for `search_string` over `names` reports.
-    ///
-    /// A match is an attribute the request NAMED whose value IS the search string:
-    /// nothing else about the user is looked at, no other attribute is consulted, and
-    /// the string is not treated as a prefix or a pattern. Names and values are both
-    /// compared case insensitively, which is the matching rule Active Directory
-    /// applies to an attribute name and to a string-valued attribute. A multi-valued
-    /// attribute matches when ANY of its values does.
+    /// See [`object_matches_search`], the one rule every searched object is matched
+    /// by.
     pub fn matches_search(&self, names: &[String], search_string: &str) -> bool {
-        let wanted = fold(search_string);
-        names.iter().any(|name| {
-            let folded_name = fold(name);
-            self.structural_attribute(&folded_name)
-                .into_iter()
-                .chain(
-                    self.other_attributes
-                        .iter()
-                        .filter(|(held, _)| fold(held) == folded_name)
-                        .flat_map(|(_, value)| attribute_value_strings(value)),
-                )
-                .any(|held| fold(&held) == wanted)
+        object_matches_search(names, search_string, &self.other_attributes, |folded| {
+            self.structural_attribute(folded)
         })
     }
 
@@ -220,8 +221,6 @@ impl User {
     /// projection is the directory's, not the client's, so an attribute nobody asked
     /// about is carried by no member of the answer.
     pub fn to_searched_user(&self, names: &[String]) -> crate::ops::types::User {
-        let wanted: BTreeSet<String> = names.iter().map(|name| fold(name)).collect();
-        let asked = |attributes: &[&str]| attributes.iter().any(|name| wanted.contains(*name));
         crate::ops::types::User {
             // What every search result carries, named or not: the same projection
             // `ListUsers` serves.
@@ -231,11 +230,11 @@ impl User {
             surname: self.surname.clone(),
             enabled: Some(self.enabled),
             // What widens it: the attributes this search asked about.
-            distinguished_name: asked(DISTINGUISHED_NAME_ATTRIBUTES)
+            distinguished_name: names_include(names, DISTINGUISHED_NAME_ATTRIBUTES)
                 .then(|| self.distinguished_name.clone()),
-            user_principal_name: asked(USER_PRINCIPAL_NAME_ATTRIBUTES)
+            user_principal_name: names_include(names, USER_PRINCIPAL_NAME_ATTRIBUTES)
                 .then(|| self.user_principal_name.clone()),
-            email_address: asked(EMAIL_ADDRESS_ATTRIBUTES)
+            email_address: names_include(names, EMAIL_ADDRESS_ATTRIBUTES)
                 .then(|| self.email_address.clone())
                 .flatten(),
             other_attributes: self.projected_attributes(Some(names)),
@@ -280,6 +279,55 @@ pub struct Group {
 }
 
 impl Group {
+    /// The value this group holds for the attribute `folded_name` names, when that is
+    /// one of its STRUCTURAL members.
+    fn structural_attribute(&self, folded_name: &str) -> Option<String> {
+        let held = |names: &[&str]| names.contains(&folded_name);
+        if held(SAM_ACCOUNT_NAME_ATTRIBUTES) {
+            Some(self.sam_account_name.clone())
+        } else if held(SID_ATTRIBUTES) {
+            Some(self.sid.clone())
+        } else if held(DISTINGUISHED_NAME_ATTRIBUTES) {
+            Some(self.distinguished_name.clone())
+        } else if held(GROUP_TYPE_ATTRIBUTES) {
+            Some(self.group_type.clone())
+        } else if held(GROUP_SCOPE_ATTRIBUTES) {
+            Some(self.group_scope.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Whether this group is one a search for `search_string` over `names` reports.
+    /// See [`object_matches_search`], the one rule every searched object is matched
+    /// by.
+    pub fn matches_search(&self, names: &[String], search_string: &str) -> bool {
+        object_matches_search(names, search_string, &self.other_attributes, |folded| {
+            self.structural_attribute(folded)
+        })
+    }
+
+    /// The `Group` object `SearchGroups` serves for a group the search matched.
+    ///
+    /// A search answers with the record a listing reports for that group — the
+    /// [`Self::to_summary`] members — widened by the attributes the search NAMED: the
+    /// projection is the directory's, not the client's, so an attribute nobody asked
+    /// about is carried by no member of the answer.
+    pub fn to_searched_group(&self, names: &[String]) -> crate::ops::types::Group {
+        crate::ops::types::Group {
+            // What every search result carries, named or not: the same projection
+            // `ListGroups` serves.
+            sid: Some(self.sid.clone()),
+            sam_account_name: self.sam_account_name.clone(),
+            group_type: Some(self.group_type.clone()),
+            group_scope: Some(self.group_scope.clone()),
+            // What widens it: the attributes this search asked about.
+            distinguished_name: names_include(names, DISTINGUISHED_NAME_ATTRIBUTES)
+                .then(|| self.distinguished_name.clone()),
+            other_attributes: self.projected_attributes(Some(names)),
+        }
+    }
+
     /// The `GroupSummary` projection the group listings serve.
     pub fn to_summary(&self) -> crate::ops::types::GroupSummary {
         crate::ops::types::GroupSummary {
@@ -299,6 +347,45 @@ impl Group {
     ) -> Option<HashMap<String, AttributeValue>> {
         project_attributes(&self.other_attributes, names)
     }
+}
+
+/// Whether a search for `search_string` over the attributes `names` reports an object
+/// holding `other_attributes`, whose structural members `structural` reads.
+///
+/// A match is an attribute the request NAMED whose value IS the search string:
+/// nothing else about the object is looked at, no other attribute is consulted, and
+/// the string is not treated as a prefix or a pattern. Names and values are both
+/// compared case insensitively, which is the matching rule Active Directory applies to
+/// an attribute name and to a string-valued attribute. A multi-valued attribute
+/// matches when ANY of its values does. One rule, so a user and a group are searched
+/// alike.
+fn object_matches_search(
+    names: &[String],
+    search_string: &str,
+    other_attributes: &BTreeMap<String, AttributeValue>,
+    structural: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let wanted = fold(search_string);
+    names.iter().any(|name| {
+        let folded_name = fold(name);
+        structural(&folded_name)
+            .into_iter()
+            .chain(
+                other_attributes
+                    .iter()
+                    .filter(|(held, _)| fold(held) == folded_name)
+                    .flat_map(|(_, value)| attribute_value_strings(value)),
+            )
+            .any(|held| fold(&held) == wanted)
+    })
+}
+
+/// Whether the attributes a search NAMED include one of `attributes`, the names a
+/// structural member answers to — which is what widens the record the search reports.
+fn names_include(names: &[String], attributes: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|name| attributes.contains(&fold(name).as_str()))
 }
 
 /// The attributes of a stored object that `names` asks for, matched case

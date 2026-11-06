@@ -17,6 +17,9 @@ mod group_inventory;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
 
+#[path = "all/group_search.rs"]
+mod group_search;
+
 #[path = "all/groups_for_member.rs"]
 mod groups_for_member;
 
