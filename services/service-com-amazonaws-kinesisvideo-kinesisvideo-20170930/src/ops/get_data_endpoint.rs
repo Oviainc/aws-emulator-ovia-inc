@@ -2,11 +2,13 @@
 
 //! @op GetDataEndpoint
 //! Reports the base URL of the data plane that serves the requested `APIName`, for a
-//! stored stream — see [`crate::state::data_endpoint`] for which plane serves what and
-//! why that is not this service's own endpoint. Reporting only: the single
-//! write it performs is
+//! stored stream — see [`crate::state::ensure_data_endpoint`] for which plane serves
+//! what, and why that address is not this service's own endpoint. Reporting only: the
+//! writes it performs are
 //! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
-//! which materialises status moves the clock already owed.
+//! which materialises status moves the clock already owed, and opening the plane's
+//! listener on the first call that needs it — the address every later call reports, so
+//! reading it twice reports one endpoint and nothing a later caller sees changes.
 //!
 //! ## Shape of an operation
 //!
@@ -183,24 +185,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
+        // The endpoint is reported only for a stream that is actually in the store, so
+        // both forms of identifier resolve against the same record and an identifier
+        // that names nothing is refused rather than handed an address. The guard is
+        // dropped here, before the plane's address is resolved: no lock is held across
+        // an await.
+        {
+            let mut store = state.lock();
+            store.settle_clock();
+            store
+                .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
+                .map_err(lookup_error)?;
+        }
 
-        let mut store = state.lock();
-        store.settle_clock();
-
-        // The endpoint is reported only for a stream that is actually in the store, and
-        // it is THAT stream's: the identity the endpoint is derived from is the stored
-        // record's ARN, so both forms of identifier resolve to one endpoint.
-        let stream = store
-            .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
-            .map_err(lookup_error)?;
+        // The plane's own address, which this emulator answers on — see
+        // [`crate::state::ensure_data_endpoint`]. An address that cannot be opened is
+        // reported as a failure rather than announced as an endpoint nothing serves.
+        let Some(endpoint) =
+            crate::state::ensure_data_endpoint(&*self.engine, &state, plane, ctx.callback()).await
+        else {
+            return Err(GetDataEndpointErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some(
+                        "The data endpoint for this stream is unavailable. Try again later."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
 
         Ok(GetDataEndpointOutput {
-            data_endpoint: Some(crate::state::data_endpoint(
-                plane,
-                &region,
-                &stream.stream_arn,
-            )),
+            data_endpoint: Some(endpoint),
         })
     }
 }

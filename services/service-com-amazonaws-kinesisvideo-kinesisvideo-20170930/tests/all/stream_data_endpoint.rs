@@ -1,28 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `GetDataEndpoint`: which endpoint a stream's media APIs are addressed at.
+//! `GetDataEndpoint`: which endpoint a stream's media APIs are addressed at, and
+//! whether that address is one this emulator ANSWERS on.
 //!
-//! The rule under test is that the reported `DataEndpoint` is resolved from the
-//! requested `APIName` and the stream it names — a bare `scheme://host` base URL of the
-//! data plane that serves that API — and never the control-plane endpoint the call
-//! itself arrived on. Kinesis Video Media's `InvalidEndpointException` ("Caller used
-//! wrong endpoint to write data to a stream. On receiving such an exception, the user
-//! must call `GetDataEndpoint` with `AccessMode` set to \"READ\" …") is what makes the
-//! value per-plane: one endpoint serves the writing of media and another the reading of
-//! it, so the two cannot be one address, and neither can be the control plane's.
+//! The rule under test is that an endpoint an operation hands back for the client to
+//! DIAL is an authority this emulator serves: `DataEndpoint` is "The endpoint value. To
+//! read data from the stream or to write data to it, specify this endpoint in your
+//! application", and nothing rewrites the host in between, so a value naming an address
+//! this process does not answer on makes the discovered data plane unreachable however
+//! well-formed it looks. The value is therefore a bare `scheme://host[:port]` origin —
+//! no path, because "The returned endpoint does not have the API name appended. The
+//! client needs to add the API name to the returned endpoint" — of the plane the
+//! requested `APIName` needs, distinct per plane (Kinesis Video Media's
+//! `InvalidEndpointException`, "Caller used wrong endpoint to write data to a stream …
+//! the user must call `GetDataEndpoint` with `AccessMode` set to \"READ\"", is why the
+//! two modes are reported as two addresses) and distinct from the control-plane endpoint
+//! the call itself arrived on. Which operations each address SERVES is a separate rule
+//! these cases do not assert: this emulator's one front door answers every address of it
+//! (see the module header of `crate::state::data_endpoint`).
 //!
-//! The concrete host and generated id are per-environment and nothing here asserts
-//! them. What the cases assert is the shape of the value, its independence from the
-//! address the request came in on, and the partition of the published `APIName` set it
-//! induces — over a table whose rows differ in the API asked for, the stream named, the
-//! form the stream is named by, the region of the credential scope, and the host the
-//! request arrives on (an AWS-form control-plane host and a bare loopback listener).
+//! The concrete host and port are the environment's and nothing here asserts them. What
+//! the cases assert is the shape of the value, that the address accepts a connection and
+//! is answered by this emulator's own front door, the partition of the published
+//! `APIName` set it induces, and its independence from the address the request came in
+//! on — over a table whose rows differ in the API asked for, the stream named, the form
+//! the stream is named by, the region of the credential scope, and the host the request
+//! arrives on (an AWS-form control-plane host and a bare loopback listener).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use service_com_amazonaws_kinesisvideo_kinesisvideo_20170930 as kvs;
 use smithy_server_runtime::MultiServiceRouter;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A router carrying only this service, over its own engine, with request
 /// authentication off so a case can send an unsigned-but-scoped request.
@@ -94,11 +105,7 @@ async fn call(
 }
 
 /// Create `name` on `control` and return its `StreamARN`.
-async fn create_stream(
-    router: &MultiServiceRouter,
-    control: ControlPlane,
-    name: &str,
-) -> String {
+async fn create_stream(router: &MultiServiceRouter, control: ControlPlane, name: &str) -> String {
     let (status, body) = call(
         router,
         control,
@@ -141,14 +148,14 @@ async fn data_endpoint(
         .to_string()
 }
 
-/// The host of a `scheme://host` base URL, failing the case when the value carries a
-/// path, a query or no scheme at all: "The returned endpoint does not have the API name
-/// appended. The client needs to add the API name to the returned endpoint", so
+/// The authority of a `scheme://host` base URL, failing the case when the value carries
+/// a path, a query or no scheme at all: "The returned endpoint does not have the API
+/// name appended. The client needs to add the API name to the returned endpoint", so
 /// anything after the host would be appended to rather than replaced.
-fn base_url_host(case: &str, endpoint: &str) -> String {
-    let rest = endpoint.strip_prefix("https://").unwrap_or_else(|| {
-        panic!("case {case:?}: expected an https base URL, got {endpoint:?}")
-    });
+fn base_url_authority(case: &str, endpoint: &str) -> String {
+    let rest = endpoint
+        .strip_prefix("https://")
+        .unwrap_or_else(|| panic!("case {case:?}: expected an https base URL, got {endpoint:?}"));
     assert!(
         !rest.is_empty() && !rest.contains('/') && !rest.contains('?') && !rest.contains('#'),
         "case {case:?}: expected scheme and host only with no path, got {endpoint:?}"
@@ -156,15 +163,208 @@ fn base_url_host(case: &str, endpoint: &str) -> String {
     rest.to_string()
 }
 
-/// Every `APIName` the model publishes resolves to the data endpoint of the plane that
-/// serves it: a bare base URL, never the control-plane endpoint the call arrived on,
-/// with every API of one access mode on one host and the two modes on different hosts.
-#[tokio::test]
-async fn each_api_name_resolves_to_the_endpoint_of_the_plane_that_serves_it() {
-    // The only API that WRITES media onto a stream; every other published value reads
-    // it. From the `APIName` enum (`smithy_query(query="shape", shape="APIName")`).
-    const PUT_MEDIA: &str = "PUT_MEDIA";
+/// The host and port of an announced authority, as a client dials them: an IPv6 literal
+/// keeps its own colons inside the brackets the authority writes it in.
+fn host_and_port(case: &str, authority: &str) -> (String, u16) {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let (host, tail) = rest.split_once(']').unwrap_or_else(|| {
+                panic!("case {case:?}: expected a bracketed IPv6 host, got {authority:?}")
+            });
+            (host.to_string(), tail.trim_start_matches(':'))
+        }
+        None => {
+            let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected an announced endpoint to carry the port it is \
+                     served on, got {authority:?}"
+                )
+            });
+            (host.to_string(), port)
+        }
+    };
+    let port = port
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("case {case:?}: expected a port, got {authority:?}"));
+    (host, port)
+}
 
+/// Open a TCP connection to an announced endpoint of THIS emulator.
+///
+/// The address is the one the operation handed back, so this dial is the client's own:
+/// it is what the whole value exists for, and a value naming an address nothing listens
+/// on fails here. The announced host has to be one of this machine's own loopback
+/// addresses — the interface the emulator's core binds its listeners on — and the dial
+/// below is to that address and no other.
+async fn connect(case: &str, endpoint: &str) -> tokio::net::TcpStream {
+    let authority = base_url_authority(case, endpoint);
+    let (host, port) = host_and_port(case, &authority);
+    let dialed = match host.as_str() {
+        "127.0.0.1" => tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await,
+        "::1" => tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port)).await,
+        "localhost" => tokio::net::TcpStream::connect(("localhost", port)).await,
+        other => panic!(
+            "case {case:?}: the announced endpoint must be an address of this machine, got \
+             {other:?} in {endpoint:?}"
+        ),
+    };
+    dialed.unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: the announced endpoint {endpoint:?} must accept a connection, \
+             got {error}"
+        )
+    })
+}
+
+/// Run the client side of the TLS handshake the core terminates on its listeners.
+///
+/// The verifier accepts the certificate the EMULATOR'S OWN core generated for them,
+/// which is self-signed: this client is the emulator's own test, connecting to a port
+/// the same process opened, so there is no authority to check it against.
+async fn upgrade_to_tls(
+    stream: tokio::net::TcpStream,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("the provider supports the default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptTheEmulatorsCertificate(provider)))
+        .with_no_client_auth();
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").expect("localhost is a server name");
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name, stream)
+        .await
+        .expect("the emulator's listener must complete the TLS handshake")
+}
+
+/// The answer a dialled endpoint gave: the status of the response, and its raw tail (the
+/// bytes after the header block, which a close-delimited or chunked body both carry).
+#[derive(Debug)]
+struct DialedAnswer {
+    status: u16,
+    tail: String,
+}
+
+/// Send one HTTP/1.1 request to `endpoint` as a client that was handed that endpoint
+/// does, and read the whole answer.
+///
+/// `Connection: close` is what makes the answer end at EOF, so no body framing has to be
+/// re-implemented here: the tail is searched for what the case expects to find in it.
+async fn send_to_endpoint(
+    case: &str,
+    endpoint: &str,
+    path: &str,
+    region: &str,
+    body: serde_json::Value,
+) -> DialedAnswer {
+    let authority = base_url_authority(case, endpoint);
+    let mut conn = upgrade_to_tls(connect(case, endpoint).await).await;
+    let body = serde_json::to_vec(&body).expect("the request body serializes");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\n\
+         host: {authority}\r\n\
+         content-type: application/json\r\n\
+         authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/kinesisvideo/\
+         aws4_request, SignedHeaders=host, Signature=0\r\n\
+         content-length: {}\r\n\
+         connection: close\r\n\r\n",
+        body.len()
+    );
+    conn.write_all(head.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: writing to {endpoint:?} failed: {error}"));
+    conn.write_all(&body)
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: writing to {endpoint:?} failed: {error}"));
+    conn.flush()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: writing to {endpoint:?} failed: {error}"));
+
+    let mut answer = Vec::new();
+    conn.read_to_end(&mut answer)
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: reading {endpoint:?} failed: {error}"));
+    let answer = String::from_utf8_lossy(&answer).to_string();
+    let (head, tail) = answer.split_once("\r\n\r\n").unwrap_or_else(|| {
+        panic!("case {case:?}: expected an HTTP response from {endpoint:?}, got {answer:?}")
+    });
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected an HTTP status line from {endpoint:?}, got {head:?}")
+        });
+    DialedAnswer {
+        status,
+        tail: tail.to_string(),
+    }
+}
+
+/// Accepts the self-signed certificate the emulator's core generates for its own
+/// listeners — see [`upgrade_to_tls`].
+#[derive(Debug)]
+struct AcceptTheEmulatorsCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// The only API that WRITES media onto a stream; every other published value reads it.
+/// From the `APIName` enum (`smithy_query(query="shape", shape="APIName")`).
+const PUT_MEDIA: &str = "PUT_MEDIA";
+
+/// Every `APIName` the model publishes resolves to the data endpoint of the plane that
+/// serves it: a bare base URL that this emulator accepts a connection on, never the
+/// control-plane endpoint the call arrived on, with every API of one access mode on one
+/// endpoint and the two modes on different ones.
+#[tokio::test]
+async fn each_api_name_resolves_to_a_reachable_endpoint_of_the_plane_that_serves_it() {
     assert!(
         kvs::ops::types::A_P_I_NAME_VALUES.contains(&PUT_MEDIA),
         "the model should publish {PUT_MEDIA:?}, got {:?}",
@@ -184,7 +384,6 @@ async fn each_api_name_resolves_to_the_endpoint_of_the_plane_that_serves_it() {
             ];
 
             let mut endpoints: BTreeMap<String, String> = BTreeMap::new();
-            let mut markers: BTreeMap<String, String> = BTreeMap::new();
             for api_name in kvs::ops::types::A_P_I_NAME_VALUES {
                 for (form, identifier) in &identifiers {
                     let case = format!(
@@ -193,7 +392,7 @@ async fn each_api_name_resolves_to_the_endpoint_of_the_plane_that_serves_it() {
                     );
                     let endpoint =
                         data_endpoint(&router, control, &case, identifier.clone(), api_name).await;
-                    let host = base_url_host(&case, &endpoint);
+                    let authority = base_url_authority(&case, &endpoint);
 
                     assert_ne!(
                         endpoint,
@@ -202,41 +401,21 @@ async fn each_api_name_resolves_to_the_endpoint_of_the_plane_that_serves_it() {
                          endpoint the call was made to, got {endpoint:?}"
                     );
                     assert_ne!(
-                        host, control.authority,
-                        "case {case:?}: the data host must not be the control-plane host, \
+                        authority, control.authority,
+                        "case {case:?}: the data authority must not be the control-plane one, \
                          got {endpoint:?}"
-                    );
-                    // One label of the plane's own under this service's regional host:
-                    // the plane marker and the generated id are in that label, and the
-                    // region is in the suffix.
-                    let suffix = format!(".{}", kvs::state::service_host(control.region));
-                    let label = host.strip_suffix(&suffix).unwrap_or_else(|| {
-                        panic!(
-                            "case {case:?}: expected a host under {suffix:?}, got {endpoint:?}"
-                        )
-                    });
-                    assert!(
-                        !label.is_empty() && !label.contains('.') && !label.contains(':'),
-                        "case {case:?}: expected one host label under {suffix:?}, got \
-                         {endpoint:?}"
-                    );
-                    let (marker, id) = label.split_once('-').unwrap_or_else(|| {
-                        panic!(
-                            "case {case:?}: expected a <plane>-<id> host label, got {endpoint:?}"
-                        )
-                    });
-                    assert!(
-                        !marker.is_empty() && !id.is_empty(),
-                        "case {case:?}: expected a <plane>-<id> host label, got {endpoint:?}"
                     );
                     // The API name is never appended to the value.
                     assert!(
-                        !endpoint.to_ascii_lowercase().contains(
-                            &api_name.to_ascii_lowercase().replace('_', "")
-                        ),
+                        !endpoint
+                            .to_ascii_lowercase()
+                            .contains(&api_name.to_ascii_lowercase().replace('_', "")),
                         "case {case:?}: the endpoint must not carry the API name, got \
                          {endpoint:?}"
                     );
+                    // What the value is FOR: the client dials it. An address this
+                    // emulator does not answer on fails right here.
+                    drop(connect(&case, &endpoint).await);
 
                     // Both identifier forms of one stream name one endpoint.
                     let previous = endpoints.insert((*api_name).to_string(), endpoint.clone());
@@ -247,13 +426,12 @@ async fn each_api_name_resolves_to_the_endpoint_of_the_plane_that_serves_it() {
                              resolve to one endpoint, expected {previous:?}, got {endpoint:?}"
                         );
                     }
-                    markers.insert((*api_name).to_string(), marker.to_string());
                 }
             }
 
             // The published API set is partitioned by the access mode each API needs:
             // the one that writes media to the stream, and the ones that read it. Two
-            // endpoints, and the mode marker of one is not the marker of the other.
+            // endpoints, and one plane's is not the other's.
             let write_endpoint = endpoints
                 .get(PUT_MEDIA)
                 .unwrap_or_else(|| panic!("case {stream:?}: no endpoint for {PUT_MEDIA}"));
@@ -275,28 +453,128 @@ async fn each_api_name_resolves_to_the_endpoint_of_the_plane_that_serves_it() {
                  that reads it, got {endpoints:?}",
                 control.authority
             );
-            let write_marker = markers
-                .get(PUT_MEDIA)
-                .unwrap_or_else(|| panic!("case {stream:?}: no marker for {PUT_MEDIA}"));
-            let read_markers: BTreeSet<&String> = markers
-                .iter()
-                .filter(|(api, _)| api.as_str() != PUT_MEDIA)
-                .map(|(_, marker)| marker)
-                .collect();
-            assert!(
-                !read_markers.contains(write_marker),
-                "case {stream:?} on {}: the write plane marker must differ from the read \
-                 one, got {markers:?}",
-                control.authority
-            );
         }
     }
 }
 
-/// The endpoint is the STREAM's: stable however often it is read, and different for a
-/// different stream of the same store, plane and region.
+/// What answers at an announced endpoint is this emulator's OWN front door: a request
+/// sent to the address the operation handed back is routed exactly as the same request
+/// sent to the endpoint the control call arrived on, so the service that claims the
+/// media path serves it — and in this harness, where only the control plane is
+/// registered, the answer is the router's own refusal for a path no service of it
+/// claims. Either way the answer comes from the emulator, which is what the address has
+/// to be for.
 #[tokio::test]
-async fn a_data_endpoint_is_the_streams_own_and_a_read_does_not_change_it() {
+async fn an_announced_data_endpoint_is_answered_by_this_emulators_own_front_door() {
+    let control = CONTROL_PLANES[1];
+    let router = harness();
+    create_stream(&router, control, "dialled").await;
+
+    // One case per plane, each dialled with the media path of that plane: the write
+    // plane's ingest path and a read plane's archived-media path.
+    let cases: &[(&str, &str)] = &[(PUT_MEDIA, "/putMedia"), ("LIST_FRAGMENTS", "/listFragments")];
+    for (api_name, path) in cases {
+        let case = format!("{api_name} dialled at {path}");
+        let endpoint = data_endpoint(
+            &router,
+            control,
+            &case,
+            serde_json::json!({ "StreamName": "dialled" }),
+            api_name,
+        )
+        .await;
+        let answer = send_to_endpoint(
+            &case,
+            &endpoint,
+            path,
+            control.region,
+            serde_json::json!({ "StreamName": "dialled" }),
+        )
+        .await;
+        // The router's own refusal of a path no registered service claims: a 404 whose
+        // envelope names `UnknownService`. Only this emulator's front door answers that,
+        // so reading it back off the dialled connection is what pins the announced
+        // address to the emulator rather than to some other listener.
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected this emulator's front door to answer the announced \
+             endpoint, got {answer:?}"
+        );
+        assert!(
+            answer.tail.contains("UnknownService"),
+            "case {case:?}: expected the router's own refusal for a path no service of this \
+             harness claims, got {answer:?}"
+        );
+    }
+}
+
+/// A connector that fails the way an emulator DEFECT does: by unwinding, rather than by
+/// answering. It stands in for whatever the router would have dispatched a forwarded
+/// request to.
+#[derive(Debug)]
+struct PanickingFrontDoor;
+
+impl ::aws_smithy_runtime_api::client::http::HttpConnector for PanickingFrontDoor {
+    fn call(
+        &self,
+        _request: ::aws_smithy_runtime_api::http::Request,
+    ) -> ::aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+        panic!("an operation reached through the announced data endpoint panicked")
+    }
+}
+
+/// A request that makes a handler behind an announced endpoint PANIC is answered as an
+/// internal failure, not by dropping the caller's connection: the announced address
+/// carries the same panic containment as the endpoint the control call arrived on, so one
+/// request cannot take the listener — or the process serving every other caller — down
+/// with it.
+///
+/// The rows differ in the request that reaches the panicking handler: each media path of
+/// a plane, with and without a body, so the containment is not a property of one shape of
+/// request.
+#[tokio::test]
+async fn a_panic_behind_an_announced_endpoint_is_contained_as_an_internal_failure() {
+    let transport =
+        ::aws_smithy_runtime_api::client::http::SharedHttpConnector::new(PanickingFrontDoor);
+    let cases: &[(&str, &[u8])] = &[
+        ("/putMedia", b"{\"StreamName\":\"dialled\"}"),
+        ("/getMedia", b"{}"),
+        ("/listFragments", b""),
+    ];
+    for (path, body) in cases {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(*path)
+            .header("host", "127.0.0.1:9297")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/kinesisvideo/\
+                 aws4_request, SignedHeaders=host, Signature=0",
+            )
+            .body(body.to_vec())
+            .expect("a well-formed request");
+        let answer = kvs::state::serve_on_data_plane(transport.clone(), request).await;
+        assert_eq!(
+            answer.status().as_u16(),
+            500,
+            "case {path:?}: a contained panic is answered as an internal failure, got {:?}",
+            answer.status()
+        );
+        assert!(
+            answer
+                .headers()
+                .contains_key(::emulator_server::PANIC_CONTAINED_HEADER),
+            "case {path:?}: expected the answer to be marked as a contained panic, got {:?}",
+            answer.headers()
+        );
+    }
+}
+
+/// The endpoint is the PLANE's: stable however often it is read, shared by every stream
+/// of the store that asks for that plane, and never the other plane's.
+#[tokio::test]
+async fn a_data_endpoint_is_stable_across_reads_and_is_the_planes_own() {
     let control = CONTROL_PLANES[0];
     let router = harness();
     let streams = ["alpha", "beta", "a.b_c-1"];
@@ -304,8 +582,8 @@ async fn a_data_endpoint_is_the_streams_own_and_a_read_does_not_change_it() {
         create_stream(&router, control, stream).await;
     }
 
-    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for api_name in ["PUT_MEDIA", "GET_MEDIA", "LIST_FRAGMENTS"] {
+    let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for api_name in [PUT_MEDIA, "GET_MEDIA", "LIST_FRAGMENTS"] {
         for stream in streams {
             let mut values = Vec::new();
             for round in 1..=3 {
@@ -327,16 +605,29 @@ async fn a_data_endpoint_is_the_streams_own_and_a_read_does_not_change_it() {
                 "case {stream:?} {api_name:?}: reading the endpoint must not change it, \
                  got {values:?}"
             );
-            seen.entry(api_name.to_string()).or_default().push(first);
+            seen.entry(api_name.to_string()).or_default().insert(first);
         }
     }
 
     for (api_name, values) in &seen {
-        let distinct: BTreeSet<&String> = values.iter().collect();
         assert_eq!(
-            distinct.len(),
-            streams.len(),
-            "case {api_name:?}: each stream must have its own data endpoint, got {values:?}"
+            values.len(),
+            1,
+            "case {api_name:?}: one plane is served at one address, whichever stream asks \
+             for it, got {values:?}"
+        );
+    }
+    let write = seen
+        .get(PUT_MEDIA)
+        .unwrap_or_else(|| panic!("no endpoint for {PUT_MEDIA}"));
+    for api_name in ["GET_MEDIA", "LIST_FRAGMENTS"] {
+        let read = seen
+            .get(api_name)
+            .unwrap_or_else(|| panic!("no endpoint for {api_name}"));
+        assert_ne!(
+            read, write,
+            "case {api_name:?}: the plane that reads media is not the one that writes it, \
+             got {seen:?}"
         );
     }
 }

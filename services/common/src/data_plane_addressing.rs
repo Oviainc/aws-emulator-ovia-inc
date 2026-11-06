@@ -123,6 +123,37 @@ pub fn reached_endpoint_host(
         .unwrap_or_else(|| format!("{endpoint_prefix}.{region}.amazonaws.com"))
 }
 
+/// The `host:port` a URL addresses one of the EMULATOR'S OWN listeners by — the address
+/// a service PUBLISHES for a resource it opened a core listener for
+/// (`engine.listeners()`), which is the one address a client on this machine can reach
+/// that resource at.
+///
+/// Composed through [`host_port_authority`], so an IPv6 bind is bracketed and the URL
+/// parses wherever the operator bound it.
+///
+/// Services still carrying their own copy of this reading, to be MIGRATED onto it (they
+/// predate this function):
+/// `services/service-com-amazonaws-pricing-awspricelistservice/src/state.rs` and
+/// `services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/src/state/microvm_endpoint.rs`.
+/// Nothing new inlines it again — call this module.
+#[must_use]
+pub fn listener_authority(listener: &::emulator_server::ResourceListener) -> String {
+    host_port_authority(&listener.host(), listener.port())
+}
+
+/// A `host:port` authority, with an IPv6 host bracketed as RFC 3986 requires
+/// (`[::1]:8443`) and any host already written in brackets left as it is.
+#[must_use]
+pub fn host_port_authority(host: &str, port: u16) -> String {
+    if host.starts_with('[') || host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return format!("{host}:{port}");
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return format!("[{host}]:{port}");
+    }
+    format!("{host}:{port}")
+}
+
 /// The EMULATOR's OWN endpoint a request reached, or `None` for a request addressed to a
 /// host that names some service — which is a caller that resolves AWS's own hostnames.
 ///
@@ -242,6 +273,25 @@ mod tests {
                 answered.as_deref(),
                 *expected,
                 "case ({uri:?}, {header:?}): expected {expected:?}, got {answered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listeners_address_is_written_as_a_url_parses_it() {
+        // The rows span the bind addresses a core listener reports: an IPv4 literal, an
+        // IPv6 literal (bracketed here), one already bracketed, and a name.
+        let cases: &[(&str, u16, &str)] = &[
+            ("127.0.0.1", 9297, "127.0.0.1:9297"),
+            ("::1", 9297, "[::1]:9297"),
+            ("[::1]", 8443, "[::1]:8443"),
+            ("localhost", 443, "localhost:443"),
+        ];
+        for (host, port, expected) in cases {
+            let authority = host_port_authority(host, *port);
+            assert_eq!(
+                authority, *expected,
+                "case ({host:?}, {port}): expected {expected:?}, got {authority:?}"
             );
         }
     }

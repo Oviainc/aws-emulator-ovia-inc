@@ -22,15 +22,23 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # `service-common` carries the workspace's ONE AWS wording of a constraint-violation
-# refusal, which `service.rs` states this service's error code over.
+# refusal, which `service.rs` states this service's error code over, and
+# `data_plane_addressing::listener_authority`, the one reading of the `host:port` a URL
+# addresses one of the emulator's own listeners by — which is what a published data
+# endpoint carries (`src/state/data_endpoint.rs`).
 service-common = { path = "../common" }
-# Digests the stable, opaque host id a stream's data endpoint carries per plane.
-sha2 = { workspace = true }
-# Renders that digest as the hexadecimal label the host form uses.
-hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The data-endpoint tests dial the address `GetDataEndpoint` announces, in THIS process:
+# `rustls`/`tokio-rustls` run the client side of the TLS the core's listener terminates,
+# and tokio's socket and byte-stream halves carry the HTTP exchange on top. All are the
+# versions this workspace already builds.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [lints]
 workspace = true

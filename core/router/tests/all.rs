@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `k…` span are both regions concurrently landing suites add
+// their line to.
+#[path = "all/kinesisvideo_discovered_data_plane.rs"]
+mod kinesisvideo_discovered_data_plane;
 // Declared here, in this same head region, for the reason the entry above records.
 #[path = "all/cloudformation_ec2_cdk_vpc_estate.rs"]
 mod cloudformation_ec2_cdk_vpc_estate;

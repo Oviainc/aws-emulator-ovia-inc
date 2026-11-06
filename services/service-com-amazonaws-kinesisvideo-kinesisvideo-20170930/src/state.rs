@@ -13,7 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// endpoint — see the module's own header.
 pub mod data_endpoint;
 
-pub use data_endpoint::{data_endpoint, data_plane_of, service_host, DataPlane};
+pub use data_endpoint::{
+    data_plane_of, ensure_data_endpoint, serve_on_data_plane, service_host, DataPlane,
+    DataPlaneEndpoint,
+};
 
 use crate::ops::types::{
     ChannelInfo, EdgeConfig, ImageGenerationConfiguration, MappedResourceConfigurationListItem,
@@ -459,6 +462,11 @@ pub struct ComAmazonawsKinesisvideoKinesisvideo20170930State {
     /// so two mints never ask the same question of the entropy source. It is NOT part
     /// of the token it helps mint.
     pub version_seq: u64,
+    /// The address each data plane of this store is published at, with the listener
+    /// that answers there — opened on the first `GetDataEndpoint` for that plane (see
+    /// [`ensure_data_endpoint`]) and held here for the life of the store, so a plane's
+    /// announced endpoint never moves under a client.
+    pub data_endpoints: BTreeMap<DataPlane, DataPlaneEndpoint>,
 }
 
 impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
@@ -671,9 +679,14 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsKinesisvideoKinesisvideo20170930State>> {
-    (engine as &dyn ::std::any::Any)
-        .downcast_ref::<::engine::InMemoryEngine>()
+    shared_engine(engine)
         .map(::engine::InMemoryEngine::state::<ComAmazonawsKinesisvideoKinesisvideo20170930State>)
+}
+
+/// The one shared engine behind a handler's `Eng`, which is also what vends the
+/// listener a stream's data plane is published on ([`ensure_data_endpoint`]).
+fn shared_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<&::engine::InMemoryEngine> {
+    (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()
 }
 
 /// Unix epoch milliseconds now.
@@ -787,7 +800,7 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// host form when the request carries none.
 ///
 /// It is NOT where a stream's media planes live: those are resolved per access mode by
-/// [`data_endpoint`], which is the whole point of `GetDataEndpoint`. The
+/// [`ensure_data_endpoint`], which is the whole point of `GetDataEndpoint`. The
 /// signaling-channel endpoints report this authority under the scheme each
 /// `ChannelProtocol` names.
 pub fn request_authority(parts: &::http::request::Parts, region: &str) -> String {

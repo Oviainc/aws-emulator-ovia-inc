@@ -273,11 +273,24 @@ async fn a_stream_the_control_plane_created_is_readable_on_the_media_plane() {
         let name = format!("probe-produced-{produced}");
         let arn = harness.create_stream(&name).await;
 
-        // The data plane a reader is told to use is resolved for this same stream.
+        // The data plane a reader is told to use is resolved for this same stream, and it
+        // is an address of THIS emulator — a loopback authority with the port its listener
+        // was bound on — rather than a public AWS name: a reader dials exactly the value
+        // it is handed. (The owning crate's own suite is what dials it.)
         let endpoint = harness.data_endpoint(&name).await;
+        let authority = endpoint.strip_prefix("https://").unwrap_or_else(|| {
+            panic!("case \"produced {produced}\": expected an https origin, got {endpoint:?}")
+        });
+        let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+            panic!(
+                "case \"produced {produced}\": expected the announced endpoint to carry its \
+                 port, got {endpoint:?}"
+            )
+        });
         assert!(
-            endpoint.contains("kinesisvideo"),
-            "case \"produced {produced}\": expected a Kinesis Video data endpoint, \
+            ["127.0.0.1", "::1", "[::1]", "localhost"].contains(&host)
+                && port.parse::<u16>().is_ok(),
+            "case \"produced {produced}\": expected a data endpoint of this machine, \
              got {endpoint:?}"
         );
 
