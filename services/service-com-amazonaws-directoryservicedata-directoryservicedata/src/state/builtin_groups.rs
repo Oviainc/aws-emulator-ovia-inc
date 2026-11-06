@@ -155,8 +155,10 @@ pub(super) fn seed(directory: &mut Directory) {
             group_type: DEFAULT_GROUP_TYPE.to_string(),
             group_scope: builtin.scope.to_string(),
             other_attributes: BTreeMap::new(),
-            // Which principals a built-in group holds is the domain's business; nothing
-            // in this data plane puts a member in one until `AddGroupMember` does.
+            // Which principals a built-in group holds is the domain's business; in this
+            // data plane a member reaches one through `AddGroupMember`, or through the
+            // primary-group membership a created user gets
+            // ([`super::Directory::join_primary_group`]).
             members: BTreeMap::new(),
         };
         directory.groups.insert(super::fold(builtin.name), group);

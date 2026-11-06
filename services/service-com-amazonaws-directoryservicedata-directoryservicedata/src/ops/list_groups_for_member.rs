@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupsForMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupsForMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupsForMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the groups one member belongs to, computed from the memberships
+//! [`crate::state`] holds: one page of `GroupSummary` in group-name order, no more than
+//! `MaxResults` of them, and a `NextToken` only when more groups hold the member. Each
+//! group's summary is read from the group's own record, so a membership reads the same
+//! from either side. A member no object of the directory answers to is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupsForMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupsForMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupsForMember"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupsForMemberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let member_key = crate::state::fold(&input.sam_account_name);
+
+        // A read NEVER materialises a directory: a `DirectoryId` nothing has written
+        // to holds no member to report on.
+        let store = state.lock();
+        let not_found = || {
+            ListGroupsForMemberErrorModeled::ResourceNotFoundException(
+                crate::state::member_not_found(&input.directory_id, &input.sam_account_name),
+            )
+        };
+        let Some(directory) = store.directories.get(&input.directory_id) else {
+            return Err(not_found().into());
+        };
+
+        // `MemberRealm` names the domain the MEMBER is in; this directory holds objects
+        // only in its own realm, so a member of another one is not an object it holds.
+        if !crate::state::realm_matches(input.member_realm.as_deref(), &directory.realm) {
+            return Err(not_found().into());
+        }
+        // The member is any security principal of the directory: a user object or a
+        // group object.
+        if !directory.holds_object(&member_key) {
+            return Err(not_found().into());
+        }
+
+        let member_realm =
+            crate::state::resolved_realm(input.member_realm.as_deref(), &directory.realm);
+        // `Realm` names the domain the GROUPS are in; this directory holds groups only
+        // in its own realm, so another realm reports none of them.
+        let realm = crate::state::resolved_realm(input.realm.as_deref(), &directory.realm);
+        let groups_visible = crate::state::realm_matches(input.realm.as_deref(), &directory.realm);
+
+        // The cursor is stamped with what decides which records are walked, so a token
+        // issued for another listing, or built by a client, is refused rather than
+        // read as a position in this one.
+        let scope = crate::state::list_scope(&[
+            &input.directory_id,
+            &member_key,
+            &realm.to_ascii_lowercase(),
+            &member_realm.to_ascii_lowercase(),
+        ]);
+        let after = match input.next_token.as_deref() {
+            Some(token) => {
+                match crate::state::decode_cursor(
+                    token,
+                    crate::state::GROUPS_FOR_MEMBER_PAGE,
+                    &scope,
+                ) {
+                    Some(after) => Some(after),
+                    None => {
+                        return Err(ListGroupsForMemberErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(),
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut groups = Vec::new();
+        let mut next_token = None;
+        let mut last_key = String::new();
+        if groups_visible {
+            for (group_key, group) in directory.groups_of_member(&member_key) {
+                // Resume strictly after the key the previous page ended on, so a
+                // membership given up meanwhile cannot hide the groups that follow it.
+                if after
+                    .as_deref()
+                    .is_some_and(|after| group_key.as_str() <= after)
+                {
+                    continue;
+                }
+                if groups.len() == page_size {
+                    next_token = Some(crate::state::encode_cursor(
+                        crate::state::GROUPS_FOR_MEMBER_PAGE,
+                        &scope,
+                        &last_key,
+                    ));
+                    break;
+                }
+                groups.push(group.to_summary());
+                last_key = group_key.clone();
+            }
+        }
+
+        Ok(ListGroupsForMemberOutput {
+            directory_id: Some(input.directory_id.clone()),
+            realm: Some(realm),
+            member_realm: Some(member_realm),
+            groups: Some(groups),
+            next_token,
+        })
     }
 }

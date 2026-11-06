@@ -6,7 +6,8 @@
 //! SID authority, and the answer is computed from that record.
 //!
 //! A second create of the same name conflicts; a repeated call carrying the same
-//! `ClientToken` answers with what the first one returned.
+//! `ClientToken` answers with what the first one returned. The stored user is a member
+//! of the domain's primary user group from the moment the create stores it.
 //!
 //! ## Shape of an operation
 //!
@@ -252,6 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
         };
         directory.users.insert(key, user);
+        // A domain user belongs to the domain's primary user group from the moment it
+        // is created: Active Directory creates that group with the domain and makes
+        // every user account a member of it.
+        directory.join_primary_group(&input.sam_account_name);
 
         store.record_token(input.client_token, fingerprint, Some(sid.clone()), now);
 

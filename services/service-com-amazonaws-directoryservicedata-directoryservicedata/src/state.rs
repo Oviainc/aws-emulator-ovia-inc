@@ -50,6 +50,14 @@ pub const DEFAULT_GROUP_TYPE: &str = "Security";
 /// Active Directory gives a new group by default is global.
 pub const DEFAULT_GROUP_SCOPE: &str = "Global";
 
+/// The name of the group every user account of a Managed Microsoft AD domain
+/// belongs to.
+///
+/// Active Directory makes this group — one of the groups a domain is created with
+/// ([`builtin_groups`]) — the primary group of every user account, so a user is a
+/// member of it from the moment it is created, without anything adding it.
+pub const PRIMARY_USER_GROUP: &str = "Domain Users";
+
 /// The first RID the directory hands out to an object it creates.
 ///
 /// A Windows SID ends in a relative identifier (RID) that is unique within the
@@ -86,6 +94,9 @@ pub const GROUPS_PAGE: &str = "groups";
 
 /// The page kind [`encode_cursor`] stamps on a `ListGroupMembers` token.
 pub const GROUP_MEMBERS_PAGE: &str = "group-members";
+
+/// The page kind [`encode_cursor`] stamps on a `ListGroupsForMember` token.
+pub const GROUPS_FOR_MEMBER_PAGE: &str = "groups-for-member";
 
 /// The page kind [`encode_cursor`] stamps on a `SearchUsers` token.
 pub const SEARCH_USERS_PAGE: &str = "search-users";
@@ -269,7 +280,7 @@ pub struct Group {
 }
 
 impl Group {
-    /// The `GroupSummary` projection `ListGroups` serves.
+    /// The `GroupSummary` projection the group listings serve.
     pub fn to_summary(&self) -> crate::ops::types::GroupSummary {
         crate::ops::types::GroupSummary {
             sid: self.sid.clone(),
@@ -363,6 +374,26 @@ impl Directory {
         directory
     }
 
+    /// Record `user_name` in the domain's primary user group.
+    ///
+    /// Called by the create that stores a user: a domain user is a member of that
+    /// group from the moment it exists, so the membership is part of the create and
+    /// not something a later read invents. The group itself comes with the directory
+    /// record ([`builtin_groups`]), which is why no caller has to create it.
+    pub fn join_primary_group(&mut self, user_name: &str) {
+        let joined = self.add_member(
+            &fold(PRIMARY_USER_GROUP),
+            Membership {
+                member_name: user_name.to_string(),
+                member_type: USER_MEMBER_TYPE.to_string(),
+            },
+        );
+        debug_assert!(
+            joined,
+            "the primary user group comes with the directory record"
+        );
+    }
+
     /// Mint the SID of a new object of this directory: the domain SID plus the next
     /// unused RID. Within `SID`'s `@length(min: 1, max: 256)`.
     pub fn mint_sid(&mut self) -> String {
@@ -433,6 +464,28 @@ impl Directory {
             .or_default()
             .insert(group_key.to_string());
         true
+    }
+
+    /// The groups of this directory that hold `member_key`, in folded-group-name
+    /// order — the same total order the group listings page through.
+    ///
+    /// Read through the reverse index, then confirmed against the group's own member
+    /// set, so one membership is reported identically from either side.
+    pub fn groups_of_member<'a>(
+        &'a self,
+        member_key: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a Group)> + 'a {
+        self.groups_by_member
+            .get(member_key)
+            .into_iter()
+            .flatten()
+            .filter_map(move |group_key| {
+                let group = self.groups.get(group_key)?;
+                group
+                    .members
+                    .contains_key(member_key)
+                    .then_some((group_key, group))
+            })
     }
 
     /// The `Member` view of a membership: the member's own record is where its SID
