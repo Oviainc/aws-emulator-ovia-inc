@@ -138,13 +138,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `MaxResults` is "the maximum size of each page of results", so a page of fewer
-        // than one record is not a size this operation can answer with.
-        if let Some(max_results) = input.max_results.filter(|max_results| *max_results < 1) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "MaxResults must be at least 1, was {max_results}"
-            )));
-        }
+        // The account holds at most one subscription, so the whole collection fits in any
+        // page and the only thing the size a request asks for has to be is one a read can
+        // answer with ([`crate::state::page_size`], with a ceiling of that one record).
+        crate::state::page_size(input.max_results, 1)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
         // The account holds at most one subscription, so one page always carries the
         // whole collection and this operation issues no pagination token: a request that
         // carries one carries a token this service never minted.

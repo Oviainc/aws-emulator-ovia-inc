@@ -22,6 +22,8 @@
 //! * a second create of a name that exists answers `ResourceAlreadyExistsException`;
 //! * a read reports only stored app blocks, refuses an ARN that addresses none with
 //!   `ResourceNotFoundException`, and pages every stored app block exactly once;
+//! * every read that takes a `MaxResults` decides its page size through the one shared
+//!   rule, so each refuses a page of fewer than one record with the same sentence;
 //! * the tags a create persisted are the ones the tag operations report and add to.
 
 use std::collections::BTreeSet;
@@ -669,6 +671,68 @@ async fn following_next_token_reports_every_app_block_exactly_once() {
             "ValidationException",
         )
         .await;
+    }
+}
+
+#[tokio::test]
+async fn every_read_decides_its_page_size_by_the_same_rule() {
+    // One case per read that takes a `MaxResults`: they share one page-size rule
+    // (`crate::state::page_size`), so a page of fewer than one record is refused with the
+    // same sentence whichever read is asked, and the size a request asks for is otherwise
+    // honoured up to that read's own ceiling.
+    let emulator = Emulator::in_region("us-east-1");
+    let user_pool = json!({ "AuthenticationType": "USERPOOL" });
+    // The values below one each read's own model admits: `DescribeUserStackAssociations`
+    // targets `MaxResults` (`@range` 0..500), so the boundary validator refuses a negative
+    // before the handler sees it, while the other three target a plain `Integer`
+    // (`smithy_query(query="operation", operation="DescribeUserStackAssociations")`).
+    let reads: Vec<(&str, Value, Vec<i64>)> = vec![
+        ("DescribeAppBlocks", json!({}), vec![0, -1, -2_147_483_648]),
+        (
+            "DescribeAppBlockBuilders",
+            json!({}),
+            vec![0, -1, -2_147_483_648],
+        ),
+        ("DescribeUsers", user_pool.clone(), vec![0, -1, -2_147_483_648]),
+        (
+            "DescribeUserStackAssociations",
+            json!({ "StackName": "any-stack" }),
+            vec![0],
+        ),
+        (
+            "DescribeUsageReportSubscriptions",
+            json!({}),
+            vec![0, -1, -2_147_483_648],
+        ),
+    ];
+
+    for (operation, base, too_small_values) in reads {
+        for too_small in too_small_values {
+            let case = format!("{operation} with MaxResults {too_small}");
+            let mut request = base.clone();
+            request["MaxResults"] = json!(too_small);
+            let message = refusal(
+                &emulator,
+                &case,
+                operation,
+                request,
+                400,
+                "ValidationException",
+            )
+            .await;
+            assert_eq!(
+                message,
+                format!("MaxResults must be at least 1, was {too_small}"),
+                "case {case:?}: every read must state the page-size rule the same way"
+            );
+        }
+
+        // The smallest page a read can answer with is one, and every one of these reads
+        // answers it rather than refusing it.
+        let case = format!("{operation} with MaxResults 1");
+        let mut request = base.clone();
+        request["MaxResults"] = json!(1);
+        emulator.ok(&case, operation, request).await;
     }
 }
 

@@ -1215,6 +1215,24 @@ fn decode_association_cursor(token: &str) -> Option<UserStackAssociationKey> {
     ))
 }
 
+/// How many records one page of a read carries, from the `MaxResults` the request asked
+/// for and the `ceiling` that read renders at most.
+///
+/// `MaxResults` is "the maximum size of each page of results", so a page of fewer than
+/// one record is not a size a read can answer with: such a request is refused, and the
+/// `Err` carries the sentence stating the rule. An ask above the ceiling is clamped to it,
+/// so no request sizes the page it is answered with — a caller asking for more still sees
+/// every record by following the token.
+pub fn page_size(max_results: Option<i32>, ceiling: usize) -> Result<usize, String> {
+    match max_results {
+        Some(max_results) if max_results < 1 => {
+            Err(format!("MaxResults must be at least 1, was {max_results}"))
+        }
+        Some(max_results) => Ok(usize::try_from(max_results).unwrap_or(ceiling).min(ceiling)),
+        None => Ok(ceiling),
+    }
+}
+
 /// Cut `all` (sorted, deduplicated record names) into the page that resumes at
 /// `next_token`. `None` means the token is not one this service minted.
 pub fn paginate(all: &BTreeSet<String>, next_token: Option<&str>) -> Option<DescribePage> {

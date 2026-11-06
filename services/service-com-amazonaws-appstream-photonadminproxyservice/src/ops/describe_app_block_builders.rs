@@ -138,26 +138,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `MaxResults` is "the maximum size of each page of results", so a page of fewer
-        // than one record is not a size this operation can answer with. The model puts no
-        // `@range` on the member (`smithy_query(query="operation",
+        // The records one page carries, as [`crate::state::page_size`] decides it from the
+        // `MaxResults` the request asked for and this read's own page ceiling. The model
+        // puts no `@range` on the member (`smithy_query(query="operation",
         // operation="DescribeAppBlockBuilders")` reports `MaxResults` as a plain
-        // `Integer`), so the boundary validator passes any value through and this is where
-        // the rule is enforced.
-        let page_size = match input.max_results {
-            Some(max_results) if max_results < 1 => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "MaxResults must be at least 1, was {max_results}"
-                )));
-            }
-            // Clamped to the page this operation publishes, so no request sizes the page
-            // it is answered with: a caller asking for more still sees every record by
-            // following the token.
-            Some(max_results) => usize::try_from(max_results)
-                .unwrap_or(crate::state::APP_BLOCK_BUILDER_PAGE_SIZE)
-                .min(crate::state::APP_BLOCK_BUILDER_PAGE_SIZE),
-            None => crate::state::APP_BLOCK_BUILDER_PAGE_SIZE,
-        };
+        // `Integer`), so the boundary validator passes any value through and the shared
+        // rule is what refuses a page of fewer than one record.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::APP_BLOCK_BUILDER_PAGE_SIZE,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // See `create_stack.rs` for why an engine without this service's store answers
         // "not written for that engine" rather than a fabricated success.
