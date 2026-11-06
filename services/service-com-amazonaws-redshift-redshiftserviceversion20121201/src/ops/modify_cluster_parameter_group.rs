@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyClusterPara
         // "A maximum of 20 parameters can be modified in a single request" — a
         // request carrying more is refused before the store is read at all.
         if input.parameters.len() > st::MAX_MODIFIABLE_PARAMETERS {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                 "Invalid value for Parameters: {} parameters. A maximum of {} parameters can be modified in a single request.",
                 input.parameters.len(),
                 st::MAX_MODIFIABLE_PARAMETERS
@@ -236,10 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyClusterPara
         // Cluster Management Guide ("Amazon Redshift parameter groups") says you
         // can't modify parameter values in a default parameter group — to change
         // one you create a group of the same family. The service models no error
-        // for it, so it is the generic refusal rather than a group-state fault:
-        // nothing about this group is in a transient state.
+        // for it, so it is the parameter-value refusal rather than a group-state
+        // fault: nothing about this group is in a transient state, the value the
+        // request named is simply not one this operation works on.
         if group.default_group {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                 "Invalid value for ParameterGroupName: '{}'. Default parameter group cannot be modified.",
                 input.parameter_group_name
             )));
@@ -261,43 +262,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyClusterPara
             // required, so both are checked here.
             let name = requested.parameter_name.as_deref().unwrap_or_default();
             if name.is_empty() {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for {member}.ParameterName: a parameter name must be supplied for each parameter to be modified."
                 )));
             }
             let Some(value) = requested.parameter_value.clone() else {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for {member}.ParameterValue: a parameter value must be supplied for parameter '{name}'."
                 )));
             };
 
             let Some(parameter) = group.family_parameter(name) else {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Invalid value for {member}.ParameterName: '{name}' is not a parameter of parameter group family {}.",
-                    group
-                        .group
-                        .parameter_group_family
-                        .as_deref()
-                        .unwrap_or_default()
-                )));
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::parameter_not_found_message(name),
+                ));
             };
             // "Some parameters have security or operational implications that
             // prevent them from being changed" — one the catalog publishes as not
             // modifiable is refused rather than silently kept.
             if !parameter.is_modifiable {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for {member}.ParameterName: parameter '{name}' is not modifiable."
                 )));
             }
             if let Some(max_len) = st::parameter_value_max_len(name) {
                 if value.chars().count() > max_len {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                         "Invalid value for {member}.ParameterValue: the value of '{name}' is longer than the maximum of {max_len} characters."
                     )));
                 }
             }
+            if let Err(reason) = st::json_parameter_value_refusal(name, &value) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    format!("Invalid value for {member}.ParameterValue: {reason}"),
+                ));
+            }
             if !parameter.admits(&value) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for {member}.ParameterValue: '{value}' is not a value parameter '{name}' allows. Allowed values: {}",
                     parameter.allowed_values.unwrap_or_default()
                 )));

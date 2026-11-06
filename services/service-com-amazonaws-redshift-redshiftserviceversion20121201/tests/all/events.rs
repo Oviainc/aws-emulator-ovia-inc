@@ -525,12 +525,14 @@ async fn a_read_pages_the_log_in_the_order_it_happened() {
         "case \"the whole walk\": expected the log in the order it happened, got {walked:?}"
     );
 
-    // The published `MaxRecords` window: both bounds, and one past each.
+    // The published `MaxRecords` window: both bounds, and one past each. Only
+    // the minimum is enforced, so a page past the published maximum is served.
     for (case, max_records, served) in [
         ("the window's own minimum", "20", true),
         ("the window's own maximum", "100", true),
         ("one below the minimum", "19", false),
-        ("one above the maximum", "101", false),
+        ("one above the maximum", "101", true),
+        ("far above the maximum", "1000", true),
     ] {
         let answer = read(&emulator, &[("MaxRecords", max_records)]).await;
         if served {
@@ -544,8 +546,8 @@ async fn a_read_pages_the_log_in_the_order_it_happened() {
         );
         assert_eq!(
             answer.error_code().as_deref(),
-            Some("ValidationException"),
-            "case {case:?}: expected the refusal to carry ValidationException, got body {}",
+            Some("InvalidParameterValue"),
+            "case {case:?}: expected the refusal to carry InvalidParameterValue, got body {}",
             answer.body
         );
     }

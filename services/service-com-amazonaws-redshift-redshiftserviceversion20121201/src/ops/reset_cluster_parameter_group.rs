@@ -229,15 +229,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResetClusterParam
         // all of them — the named subset is already included.
         let reset_all = input.reset_all_parameters.unwrap_or(named.is_empty());
         if !reset_all && named.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Invalid value for Parameters: at least one parameter name must be supplied when ResetAllParameters is false."
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "Invalid combination of Parameters and ResetAllParameters: at least one parameter name must be supplied when ResetAllParameters is false."
                     .to_string(),
             ));
         }
         // "Constraints: A maximum of 20 parameters can be reset in a single
         // request" — a request naming more is refused before the store is read.
         if named.len() > st::MAX_RESETTABLE_PARAMETERS {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                 "Invalid value for Parameters: {} parameters. A maximum of {} parameters can be reset in a single request.",
                 named.len(),
                 st::MAX_RESETTABLE_PARAMETERS
@@ -266,10 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResetClusterParam
         // can't change parameter values in one, and a group whose values cannot
         // be changed has none to put back either. Refused exactly as
         // `ModifyClusterParameterGroup` refuses the write, and for the same
-        // reason it is the generic refusal rather than a group-state fault:
-        // nothing about this group is in a transient state.
+        // reason it is the parameter-value refusal rather than a group-state
+        // fault: nothing about this group is in a transient state.
         if group.default_group {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                 "Invalid value for ParameterGroupName: '{}'. Default parameter group cannot be reset.",
                 input.parameter_group_name
             )));
@@ -286,19 +286,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResetClusterParam
             let member = format!("Parameters.Parameter.{}", index + 1);
             let name = requested.parameter_name.as_deref().unwrap_or_default();
             if name.is_empty() {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for {member}.ParameterName: a parameter name must be supplied for each parameter to be reset."
                 )));
             }
             let Some(parameter) = group.family_parameter(name) else {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Invalid value for {member}.ParameterName: '{name}' is not a parameter of parameter group family {}.",
-                    group
-                        .group
-                        .parameter_group_family
-                        .as_deref()
-                        .unwrap_or_default()
-                )));
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::parameter_not_found_message(name),
+                ));
             };
             named_entries.push(parameter);
         }

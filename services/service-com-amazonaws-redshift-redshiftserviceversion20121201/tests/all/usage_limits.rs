@@ -790,11 +790,14 @@ async fn usage_limits_are_selected_by_the_documented_filters() {
     }
 }
 
-/// The documented `MaxRecords` window and the `Marker` cursor, on each published
-/// bound and one past it.
+/// The `MaxRecords` window and the `Marker` cursor, on each published bound and
+/// one past it.
 ///
 /// Source: `smithy_query(query="doc", shape="DescribeUsageLimitsMessage",
 /// member="MaxRecords")` — "Default: 100 Constraints: minimum 20, maximum 100."
+/// Only the minimum is ENFORCED: a page size past the published maximum is
+/// served, so a client that legitimately asks for more is not refused a call the
+/// service serves.
 #[tokio::test]
 async fn usage_limits_are_paginated_over_the_documented_window() {
     let emulator = Emulator::new();
@@ -827,7 +830,8 @@ async fn usage_limits_are_paginated_over_the_documented_window() {
         ("at the documented minimum", "20", true),
         ("inside the window", "50", true),
         ("at the documented maximum", "100", true),
-        ("one past the documented maximum", "101", false),
+        ("one past the documented maximum", "101", true),
+        ("far past the documented maximum", "1000", true),
         ("zero", "0", false),
     ] {
         let answer = emulator
@@ -840,7 +844,7 @@ async fn usage_limits_are_paginated_over_the_documented_window() {
                 answer.status, answer.body
             );
         } else {
-            assert_refused(case, &answer, 400, "ValidationException");
+            assert_refused(case, &answer, 400, "InvalidParameterValue");
         }
     }
 
@@ -908,7 +912,7 @@ async fn usage_limits_are_paginated_over_the_documented_window() {
         let bogus = emulator
             .call("DescribeUsageLimits", &[("Marker", cursor)])
             .await;
-        assert_refused(case, &bogus, 400, "ValidationException");
+        assert_refused(case, &bogus, 400, "InvalidParameterValue");
     }
 }
 

@@ -542,9 +542,12 @@ async fn a_deleted_parameter_group_is_absent_from_every_later_read() {
     }
 }
 
-/// A parameter group the account cannot lose is refused with the modelled state
-/// fault, and the group stays readable: a default group Redshift owns, and one a
-/// cluster is configured from.
+/// A parameter group the account cannot lose is refused and the group stays
+/// readable — each with the refusal its own condition earns: a default group
+/// Redshift owns is the service's, not the account's, so the value the request
+/// named is refused (`InvalidParameterValue`), while a group a cluster is
+/// configured from is refused on the association's state
+/// (`InvalidClusterParameterGroupState`).
 #[tokio::test]
 async fn a_parameter_group_nothing_can_lose_is_refused_and_stays() {
     let emulator = Emulator::new();
@@ -569,9 +572,17 @@ async fn a_parameter_group_nothing_can_lose_is_refused_and_stays() {
         cluster.status, cluster.body
     );
 
-    for (case, group) in [
-        ("a default parameter group", default_group.as_str()),
-        ("a group a cluster is configured from", attached_group),
+    for (case, group, code) in [
+        (
+            "a default parameter group",
+            default_group.as_str(),
+            "InvalidParameterValue",
+        ),
+        (
+            "a group a cluster is configured from",
+            attached_group,
+            "InvalidClusterParameterGroupState",
+        ),
     ] {
         let refused = emulator
             .call(
@@ -579,7 +590,7 @@ async fn a_parameter_group_nothing_can_lose_is_refused_and_stays() {
                 &[("ParameterGroupName", group)],
             )
             .await;
-        assert_refused(case, &refused, 400, "InvalidClusterParameterGroupState");
+        assert_refused(case, &refused, 400, code);
         let described = emulator
             .call(
                 "DescribeClusterParameterGroups",

@@ -1433,6 +1433,11 @@ async fn a_read_pages_under_the_documented_max_records_window() {
             Some(state::MAX_RECORDS_MAX),
             total,
         ),
+        (
+            "one past the documented maximum, which the service serves",
+            Some(state::MAX_RECORDS_MAX + 1),
+            total,
+        ),
     ];
     for (case, max_records, expected) in rows {
         let value = max_records.map(|value| value.to_string());
@@ -1450,17 +1455,17 @@ async fn a_read_pages_under_the_documented_max_records_window() {
         );
     }
 
-    // One past each published bound is refused, and the cursor walks the whole
-    // collection exactly once.
+    // Below the published minimum is refused — the only bound the service
+    // enforces — and the cursor walks the whole collection exactly once.
     for (case, max_records) in [
         ("one below the published minimum", state::MAX_RECORDS_MIN - 1),
-        ("one above the published maximum", state::MAX_RECORDS_MAX + 1),
+        ("zero", 0),
     ] {
         let value = max_records.to_string();
         let answer = emulator
             .call("DescribeEndpointAccess", &[("MaxRecords", &value)])
             .await;
-        assert_refused(case, &answer, 400, "ValidationException");
+        assert_refused(case, &answer, 400, "InvalidParameterValue");
     }
 
     let page_size = state::MAX_RECORDS_MIN.to_string();
@@ -1496,5 +1501,5 @@ async fn a_read_pages_under_the_documented_max_records_window() {
     let forged = emulator
         .call("DescribeEndpointAccess", &[("Marker", "7.deadbeef")])
         .await;
-    assert_refused("a forged Marker", &forged, 400, "ValidationException");
+    assert_refused("a forged Marker", &forged, 400, "InvalidParameterValue");
 }

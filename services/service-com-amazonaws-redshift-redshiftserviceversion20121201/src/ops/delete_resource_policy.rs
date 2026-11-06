@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -173,9 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The same classification the write and the read use, so the three
-        // cannot disagree about which ARN names a policy holder.
-        if let Err(refusal) = st::check_policy_resource_arn(&input.resource_arn) {
+        // The same resolution the write and the read use, so the three cannot
+        // disagree about which ARN names a policy holder: a value that is no
+        // ARN, a resource of another service, and a Redshift resource that does
+        // not exist are each answered before any policy state is touched. A
+        // resource of another control plane is resolved over the in-process
+        // callback seam, so nothing here opens a socket.
+        if let Err(refusal) = st::resolve_policy_resource(ctx, &*self.engine, &input.resource_arn).await
+        {
             return Err(match refusal {
                 st::PolicyResourceRefusal::NotAResource(message) => {
                     DeleteResourcePolicyErrorModeled::ResourceNotFoundFault(
@@ -183,6 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message: Some(message),
                         },
                     )
+                    .into()
                 }
                 st::PolicyResourceRefusal::UnsupportedResource(message) => {
                     DeleteResourcePolicyErrorModeled::UnsupportedOperationFault(
@@ -190,9 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message: Some(message),
                         },
                     )
+                    .into()
                 }
-            }
-            .into());
+                st::PolicyResourceRefusal::NoSuchResource(message) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+            });
         }
 
         if !state.lock().remove_resource_policy(&input.resource_arn) {

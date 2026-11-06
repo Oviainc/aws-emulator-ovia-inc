@@ -355,7 +355,10 @@ struct RefusalCase {
 /// not publish, and the account's default parameter group (which the Amazon
 /// Redshift Cluster Management Guide, "Amazon Redshift parameter groups", says
 /// you cannot change parameter values in), are refusals the operation models no
-/// error for, so they are the generic `ValidationException`.
+/// error for, so they carry the query-protocol code the service itself answers:
+/// `InvalidParameterValue` for a value it cannot honour, and
+/// `InvalidParameterCombination` for a request that names neither a parameter
+/// nor a reset of all of them.
 #[tokio::test]
 async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
@@ -372,7 +375,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: Some(false),
             named: Vec::new(),
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterCombination",
         },
         RefusalCase {
             case: "a name the family does not publish",
@@ -380,7 +383,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: None,
             named: vec!["no_such_parameter"],
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "a name from another database engine",
@@ -388,7 +391,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: None,
             named: vec!["shared_buffers"],
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "a published name beside an unpublished one",
@@ -396,7 +399,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: None,
             named: vec!["require_ssl", "no_such_parameter"],
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "an empty parameter name",
@@ -404,7 +407,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: None,
             named: vec![""],
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "a name in the wrong case",
@@ -412,7 +415,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: None,
             named: vec!["REQUIRE_SSL"],
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "the account's default parameter group",
@@ -420,7 +423,7 @@ async fn a_request_the_service_cannot_honour_is_refused_and_changes_nothing() {
             reset_all: Some(true),
             named: Vec::new(),
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterValue",
         },
         RefusalCase {
             case: "a group that was never created",
@@ -499,8 +502,8 @@ async fn the_documented_per_request_parameter_count_bound_is_enforced() {
     let refused = reset(&emulator, GROUP, None, &past_bound).await;
     assert_eq!(
         (refused.status, refused.error_code()),
-        (400, Some("ValidationException".to_string())),
-        "case one past the upper bound ({} parameters): expected 400 ValidationException, got {} / {:?}",
+        (400, Some("InvalidParameterValue".to_string())),
+        "case one past the upper bound ({} parameters): expected 400 InvalidParameterValue, got {} / {:?}",
         state::MAX_RESETTABLE_PARAMETERS + 1,
         refused.status,
         refused.error_code()

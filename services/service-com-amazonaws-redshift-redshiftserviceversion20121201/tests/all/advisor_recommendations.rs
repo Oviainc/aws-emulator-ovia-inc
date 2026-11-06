@@ -492,7 +492,8 @@ async fn the_page_follows_the_published_max_records_window() {
         ("at the published minimum", "20", true),
         ("inside the window", "50", true),
         ("at the published maximum", "100", true),
-        ("one past the published maximum", "101", false),
+        ("one past the published maximum", "101", true),
+        ("far past the published maximum", "1000", true),
         ("zero", "0", false),
     ] {
         let answer = emulator
@@ -505,7 +506,7 @@ async fn the_page_follows_the_published_max_records_window() {
                 answer.status, answer.body
             );
         } else {
-            assert_refused(case, &answer, 400, "ValidationException", "MaxRecords");
+            assert_refused(case, &answer, 400, "InvalidParameterValue", "MaxRecords");
         }
     }
 
@@ -567,7 +568,7 @@ async fn the_page_follows_the_published_max_records_window() {
         "a cursor nothing produced",
         &forged,
         400,
-        "ValidationException",
+        "InvalidParameterValue",
         "Marker",
     );
 }

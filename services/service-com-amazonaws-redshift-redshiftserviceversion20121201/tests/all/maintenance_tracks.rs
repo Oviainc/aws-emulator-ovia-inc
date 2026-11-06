@@ -275,7 +275,7 @@ async fn the_track_window_and_cursor_follow_the_documented_rules() {
 
     // "Default: 100. Constraints: minimum 20, maximum 100." — the window every
     // paginated Redshift `Describe*` shares. Each published bound, and one past
-    // it on either side.
+    // it on either side; only the minimum is enforced.
     for (case, max_records, accepted) in [
         (
             "one below the minimum",
@@ -287,7 +287,7 @@ async fn the_track_window_and_cursor_follow_the_documented_rules() {
         (
             "one above the maximum",
             (state::MAX_RECORDS_MAX + 1).to_string(),
-            false,
+            true,
         ),
     ] {
         let answer = emulator
@@ -316,8 +316,8 @@ async fn the_track_window_and_cursor_follow_the_documented_rules() {
         } else {
             assert_eq!(
                 answer.error_code().as_deref(),
-                Some("ValidationException"),
-                "case MaxRecords {case} ({max_records}): expected a ValidationException, got {:?}",
+                Some("InvalidParameterValue"),
+                "case MaxRecords {case} ({max_records}): expected an InvalidParameterValue, got {:?}",
                 answer.error_code()
             );
         }
@@ -335,7 +335,7 @@ async fn the_track_window_and_cursor_follow_the_documented_rules() {
             .await;
         assert_eq!(
             (bogus.status, bogus.error_code()),
-            (400, Some("ValidationException".to_string())),
+            (400, Some("InvalidParameterValue".to_string())),
             "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
             bogus.status,
             bogus.error_code()

@@ -107,7 +107,9 @@ async fn seed_existing_group(emulator: &Emulator) {
 /// code (`ClusterNotFound`, `ClusterParameterGroupNotFound`,
 /// `ClusterParameterGroupAlreadyExists` —
 /// `smithy_query(query="operation",operation="ModifyCluster,DeleteCluster,DescribeClusterParameters,CreateClusterParameterGroup")`),
-/// a handler refusal the model cannot express `ValidationException`, a body the codec
+/// a handler refusal the model cannot express the query-protocol code the service
+/// itself answers (`InvalidParameterCombination` for members that cannot stand
+/// together), a body the codec
 /// could not read `MalformedInput`, a value outside a declared bound `ValidationError`, a
 /// scaffolded operation `NotImplemented`, and an `Action` naming no modelled operation
 /// `InvalidAction`.
@@ -161,7 +163,7 @@ fn error_cases() -> Vec<ErrorCase> {
             action: "DeleteCluster",
             params: params(&[("ClusterIdentifier", "any-cluster")]),
             status: 400,
-            code: "ValidationException",
+            code: "InvalidParameterCombination",
         },
         ErrorCase {
             case: "an absent required member, which the codec refuses",

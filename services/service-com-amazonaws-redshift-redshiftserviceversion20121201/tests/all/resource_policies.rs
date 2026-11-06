@@ -15,17 +15,54 @@
 //! policy absent from a later read and freeing nothing else; a document that is
 //! not a JSON policy document, or larger than this service holds under one
 //! resource, being refused with nothing written; and an ARN that names no
-//! resource, or a resource of another service, being refused by the write, the
-//! read and the delete alike.
+//! resource, a resource of another service, or a Redshift resource that does not
+//! exist, being refused by the write, the read and the delete alike.
 //!
 //! Tables rather than a generated corpus, for the reason the crate's
 //! `Cargo.toml` records: a property-based generator would add an entry to the
 //! workspace `Cargo.lock`, which the squash merge cannot resolve against a
 //! mainline that rewrites it.
 
+use service_com_amazonaws_redshift_redshiftserviceversion20121201::ops::types::Snapshot;
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{Answer, Emulator, REGION};
+
+/// Create one provisioned cluster, so the ARNs a row carries for it identify a
+/// resource this account holds: a resource policy is attached TO a resource,
+/// and an ARN that identifies none is refused by all three operations.
+async fn seed_cluster(emulator: &Emulator, identifier: &str) {
+    let created = emulator.create_minimal(identifier).await;
+    assert_eq!(
+        created.status, 200,
+        "case seed the cluster {identifier}: expected 200, got {} with body {}",
+        created.status, created.body
+    );
+}
+
+/// Seed one snapshot of `cluster` straight into the shared store the handlers
+/// read.
+///
+/// `CreateClusterSnapshot` takes a cluster that has finished provisioning, and
+/// what these rows need is only that the snapshot ARN they carry identifies a
+/// snapshot this account holds.
+fn seed_snapshot(emulator: &Emulator, cluster: &str, snapshot: &str) {
+    let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+    let mut store = store.lock();
+    store.snapshots.push(state::StoredSnapshot {
+        snapshot: Snapshot {
+            snapshot_identifier: Some(snapshot.to_string()),
+            cluster_identifier: Some(cluster.to_string()),
+            snapshot_arn: Some(state::snapshot_arn(cluster, snapshot, REGION)),
+            status: Some("available".to_string()),
+            snapshot_type: Some("manual".to_string()),
+            ..Default::default()
+        },
+        // Already past, so the record needs no clock-owed transition.
+        available_at: std::time::Instant::now(),
+        source: None,
+    });
+}
 
 /// `PutResourcePolicy` with one ARN and one document.
 async fn put(emulator: &Emulator, resource_arn: &str, policy: &str) -> Answer {
@@ -178,6 +215,8 @@ fn round_trip_table() -> Vec<PolicyCase> {
 #[tokio::test]
 async fn a_put_policy_is_reported_back_verbatim_by_the_put_and_by_a_later_get() {
     let emulator = Emulator::new();
+    seed_cluster(&emulator, "policy-holder").await;
+    seed_snapshot(&emulator, "policy-holder", "snap-1");
 
     for row in round_trip_table() {
         let written = put(&emulator, &row.resource_arn, &row.policy).await;
@@ -254,6 +293,7 @@ async fn a_put_policy_is_reported_back_verbatim_by_the_put_and_by_a_later_get() 
 #[tokio::test]
 async fn a_second_put_replaces_the_document_of_that_resource_alone() {
     let emulator = Emulator::new();
+    seed_cluster(&emulator, "untouched").await;
     let holder = serverless_namespace_arn("575d91fc-611c-44e9-9107-a5afb4a50b3c");
     let neighbour = state::namespace_arn("untouched", REGION);
     let neighbour_policy = policy_with_sid("Neighbour");
@@ -320,6 +360,8 @@ async fn a_second_put_replaces_the_document_of_that_resource_alone() {
 #[tokio::test]
 async fn a_delete_detaches_the_policy_of_that_resource_alone() {
     let emulator = Emulator::new();
+    seed_cluster(&emulator, "second-holder").await;
+    seed_cluster(&emulator, "third-holder").await;
     let holders = [
         serverless_namespace_arn("5533bed2-5c89-4049-91c3-77252462b84d"),
         state::namespace_arn("second-holder", REGION),
@@ -417,6 +459,14 @@ async fn a_document_that_is_no_policy_document_is_refused_and_writes_nothing() {
     for (case, policy) in &table {
         let refused = put(&emulator, &holder, policy).await;
         assert_refused(case, &refused, 400, "InvalidPolicyFault");
+        if *case != "one character past the size this service holds" {
+            assert_eq!(
+                refused.text("Message").as_deref(),
+                Some(state::RESOURCE_POLICY_NOT_A_POLICY_DOCUMENT),
+                "case {case}: expected the parse-failure sentence, got {:?}",
+                refused.text("Message")
+            );
+        }
         assert_eq!(
             stored_policy(&emulator, &holder).as_deref(),
             Some(kept.as_str()),
@@ -426,11 +476,13 @@ async fn a_document_that_is_no_policy_document_is_refused_and_writes_nothing() {
     }
 }
 
-/// An ARN that names no resource, or a resource of another service, is refused
-/// by the write, the read and the delete alike — and nothing is attached.
+/// An ARN that names no resource, a resource of another service, or a Redshift
+/// resource that does not exist is refused by the write, the read and the delete
+/// alike — and nothing is attached.
 #[tokio::test]
 async fn an_arn_naming_no_policy_holder_is_refused_by_every_resource_policy_operation() {
     let emulator = Emulator::new();
+    seed_cluster(&emulator, "policy-holder").await;
 
     // A value that is no ARN at all names no resource: `ResourceNotFoundFault`.
     let not_resources = [
@@ -518,6 +570,61 @@ async fn an_arn_naming_no_policy_holder_is_refused_by_every_resource_policy_oper
         );
     }
 
+    // A well-formed Redshift ARN whose resource does not exist identifies no
+    // policy holder either: the up-front parameter refusal,
+    // `InvalidParameterValue`, decided before any policy state is touched. The
+    // rows span the resource types an account's ARNs name — a datashare of a
+    // namespace nothing created, a cluster, a cluster's namespace, a snapshot of
+    // a cluster that exists and one of a cluster that does not.
+    let unresolvable = [
+        (
+            "a datashare of a namespace nothing created",
+            format!(
+                "arn:aws:redshift:{REGION}:000000000000:datashare:3fd3f0cf-11bd-4fd0-9c4b-1c0f2c4b1a4f/sales"
+            ),
+        ),
+        (
+            "a cluster nothing created",
+            state::cluster_arn("no-such-cluster", REGION),
+        ),
+        (
+            "the namespace of a cluster nothing created",
+            state::namespace_arn("no-such-cluster", REGION),
+        ),
+        (
+            "a snapshot nothing took of a cluster that exists",
+            state::snapshot_arn("policy-holder", "no-such-snapshot", REGION),
+        ),
+        (
+            "a snapshot of a cluster nothing created",
+            state::snapshot_arn("no-such-cluster", "snap-1", REGION),
+        ),
+        (
+            "a cluster of this account in another Region",
+            state::cluster_arn("policy-holder", "eu-west-1"),
+        ),
+    ];
+    for (case, resource_arn) in &unresolvable {
+        assert_refused(
+            case,
+            &put(&emulator, resource_arn, &policy_with_sid("Refused")).await,
+            400,
+            "InvalidParameterValue",
+        );
+        assert_refused(
+            &format!("{case}, read"),
+            &get(&emulator, resource_arn).await,
+            400,
+            "InvalidParameterValue",
+        );
+        assert_refused(
+            &format!("{case}, delete"),
+            &delete(&emulator, resource_arn).await,
+            400,
+            "InvalidParameterValue",
+        );
+    }
+
     assert_eq!(
         stored_arns(&emulator),
         Vec::<String>::new(),
@@ -530,6 +637,8 @@ async fn an_arn_naming_no_policy_holder_is_refused_by_every_resource_policy_oper
 #[tokio::test]
 async fn a_resource_that_carries_no_policy_has_none_to_report_or_detach() {
     let emulator = Emulator::new();
+    seed_cluster(&emulator, "never-written").await;
+    seed_snapshot(&emulator, "never-written", "snap-1");
     let unwritten = [
         serverless_namespace_arn("00000000-1111-2222-3333-444444444444"),
         state::namespace_arn("never-written", REGION),

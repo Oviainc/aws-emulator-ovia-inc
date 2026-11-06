@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Constraints: You can specify either the SnapshotCopyGrantName
         // parameter or the Marker parameter, but not both."
         if input.snapshot_copy_grant_name.is_some() && input.marker.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
                 "You can specify either the SnapshotCopyGrantName parameter or the Marker parameter, but not both.",
             ));
         }
@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (start, end, next_marker) =
             match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
                 Ok(page) => page,
-                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+                Err(message) => return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message)),
             };
 
         Ok(DescribeSnapshotCopyGrantsOutput {

@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reservations.len(),
         ) {
             Ok(page) => page,
-            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            Err(message) => return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message)),
         };
 
         Ok(DescribeReservedNodesOutput {

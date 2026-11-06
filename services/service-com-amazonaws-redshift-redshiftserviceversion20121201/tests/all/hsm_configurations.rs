@@ -598,7 +598,7 @@ async fn configurations_are_paginated_over_the_documented_window() {
         ("at the window's minimum", minimum.to_string(), true),
         ("inside the window", ((minimum + maximum) / 2).to_string(), true),
         ("at the window's maximum", maximum.to_string(), true),
-        ("one past the window", (maximum + 1).to_string(), false),
+        ("one past the window, which is served", (maximum + 1).to_string(), true),
         ("zero", "0".to_string(), false),
     ] {
         let answer = call_with(
@@ -614,7 +614,7 @@ async fn configurations_are_paginated_over_the_documented_window() {
                 answer.status, answer.body
             );
         } else {
-            assert_refused(case, &answer, 400, "ValidationException");
+            assert_refused(case, &answer, 400, "InvalidParameterValue");
         }
     }
 
@@ -691,7 +691,7 @@ async fn configurations_are_paginated_over_the_documented_window() {
         let bogus = emulator
             .call("DescribeHsmConfigurations", &[("Marker", cursor)])
             .await;
-        assert_refused(case, &bogus, 400, "ValidationException");
+        assert_refused(case, &bogus, 400, "InvalidParameterValue");
     }
 }
 

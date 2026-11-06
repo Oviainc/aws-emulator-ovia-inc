@@ -250,17 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
         let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
 
         // "The FinalClusterSnapshotIdentifier parameter must be specified if
-        // SkipFinalClusterSnapshot is false. Default: false"
+        // SkipFinalClusterSnapshot is false. Default: false" — the two members
+        // are a DECISION the request has to carry, so a request that carries
+        // neither, and one that carries both halves against each other, are
+        // refused on the parameters alone, before any cluster is looked up.
         let skip_final = input.skip_final_cluster_snapshot.unwrap_or(false);
         let final_identifier = match (skip_final, input.final_cluster_snapshot_identifier.as_deref())
         {
             (false, None) => {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    "FinalClusterSnapshotIdentifier must be specified unless SkipFinalClusterSnapshot is true.",
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                    st::FINAL_SNAPSHOT_DECISION_REQUIRED,
                 ))
             }
             (true, Some(_)) => {
-                return Err(crate::scaffolded::Scaffolded::validation(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
                     "FinalClusterSnapshotIdentifier cannot be specified when SkipFinalClusterSnapshot is true.",
                 ))
             }
@@ -271,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
                     "FinalClusterSnapshotIdentifier",
                     identifier,
                 ) {
-                    return Err(crate::scaffolded::Scaffolded::validation(message));
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
                 }
                 Some(identifier.to_string())
             }

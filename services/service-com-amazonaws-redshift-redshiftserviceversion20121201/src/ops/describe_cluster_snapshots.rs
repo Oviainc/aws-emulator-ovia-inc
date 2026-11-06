@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Valid Values: automated | manual".
         if let Some(kind) = input.snapshot_type.as_deref() {
             if kind != st::SNAPSHOT_TYPE_AUTOMATED && kind != st::SNAPSHOT_TYPE_MANUAL {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for SnapshotType: '{kind}'. Valid Values: {} | {}",
                     st::SNAPSHOT_TYPE_AUTOMATED,
                     st::SNAPSHOT_TYPE_MANUAL
@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If ClusterExists is set to true, ClusterIdentifier is required."
         if input.cluster_exists == Some(true) && input.cluster_identifier.is_none() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
                 "ClusterIdentifier is required when ClusterExists is true.",
             ));
         }
@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|entities| entities.len() > st::MAX_SORTING_ENTITIES)
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                 "Invalid value for SortingEntities: at most {} entities may be specified.",
                 st::MAX_SORTING_ENTITIES
             )));
@@ -420,7 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (start, end, next_marker) =
             match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
                 Ok(page) => page,
-                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+                Err(message) => return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message)),
             };
 
         Ok(DescribeClusterSnapshotsOutput {

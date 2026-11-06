@@ -226,7 +226,7 @@ async fn a_created_certificate_is_reported_with_the_key_the_service_minted() {
     let refused = describe(&emulator, &[("MaxRecords", "1")]).await;
     assert_eq!(
         (refused.status, refused.error_code().as_deref()),
-        (400, Some("ValidationException")),
+        (400, Some("InvalidParameterValue")),
         "case a MaxRecords below the window: expected a refusal, got {} / {:?}",
         refused.status,
         refused.error_code()

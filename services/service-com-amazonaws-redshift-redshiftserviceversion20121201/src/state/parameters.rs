@@ -83,6 +83,40 @@ pub fn parameter_value_max_len(name: &str) -> Option<usize> {
     (name == WLM_JSON_CONFIGURATION).then_some(8_000)
 }
 
+/// Why the value of a parameter whose value is a JSON DOCUMENT is not one, or
+/// `Ok(())` for a value that is — and for every parameter that holds a scalar,
+/// which this rule says nothing about.
+///
+/// `wlm_json_configuration` holds the workload management configuration, which
+/// is a JSON list of query queues (`smithy_query(query="doc", shape="Parameter",
+/// member="ParameterValue")` calls out that one parameter's value as the JSON
+/// configuration, which is why it alone publishes a size). A value that cannot
+/// be read as that list configures no queue at all, so it is refused rather than
+/// stored for a cluster to fail on later. The parameter publishes no
+/// `AllowedValues`, so the domain cannot be stated as a value set — which is why
+/// the check lives here beside [`EngineParameter::admits`] rather than in it.
+pub fn json_parameter_value_refusal(name: &str, value: &str) -> Result<(), String> {
+    if name != WLM_JSON_CONFIGURATION {
+        return Ok(());
+    }
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Array(_)) => Ok(()),
+        _ => Err(format!(
+            "the value of '{name}' must be a JSON list of workload management queues."
+        )),
+    }
+}
+
+/// Why a request naming a parameter the group's family does not publish is
+/// refused, naming the `ParameterName` it carried.
+///
+/// One sentence for the write and the reset, so one condition reads the same
+/// whichever operation reports it: the name is not a parameter of this family,
+/// so there is no parameter to set or to put back.
+pub fn parameter_not_found_message(parameter_name: &str) -> String {
+    format!("Could not find parameter with name: {parameter_name}")
+}
+
 /// `Parameter$ApplyType` for a parameter an associated cluster picks up without
 /// being rebooted.
 ///

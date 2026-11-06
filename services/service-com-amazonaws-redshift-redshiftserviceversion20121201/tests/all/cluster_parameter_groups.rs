@@ -643,7 +643,8 @@ async fn parameter_groups_are_paginated_over_the_documented_window() {
         ("at the documented minimum", "20", true),
         ("inside the window", "50", true),
         ("at the documented maximum", "100", true),
-        ("one past the documented maximum", "101", false),
+        ("one past the documented maximum", "101", true),
+        ("far past the documented maximum", "1000", true),
         ("zero", "0", false),
     ] {
         let answer = emulator
@@ -661,8 +662,8 @@ async fn parameter_groups_are_paginated_over_the_documented_window() {
         } else {
             assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
-                "case {case}: expected MaxRecords={max_records} to be refused with 400 ValidationException, got {} / {:?}",
+                (400, Some("InvalidParameterValue".to_string())),
+                "case {case}: expected MaxRecords={max_records} to be refused with 400 InvalidParameterValue, got {} / {:?}",
                 answer.status,
                 answer.error_code()
             );
@@ -740,8 +741,8 @@ async fn parameter_groups_are_paginated_over_the_documented_window() {
             .await;
         assert_eq!(
             (bogus.status, bogus.error_code()),
-            (400, Some("ValidationException".to_string())),
-            "case {case}: expected the cursor {cursor:?} to be refused with 400 ValidationException, got {} / {:?}",
+            (400, Some("InvalidParameterValue".to_string())),
+            "case {case}: expected the cursor {cursor:?} to be refused with 400 InvalidParameterValue, got {} / {:?}",
             bogus.status,
             bogus.error_code()
         );

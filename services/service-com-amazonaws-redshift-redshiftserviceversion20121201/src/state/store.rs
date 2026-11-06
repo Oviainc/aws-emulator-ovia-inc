@@ -1437,6 +1437,22 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         true
     }
 
+    /// Whether this store holds the resource one resource-policy `ResourceArn`
+    /// names.
+    ///
+    /// A resource policy is attached to a resource, so the ARN has to identify
+    /// one that EXISTS before any policy state is read or written. The ARN is
+    /// matched exactly, the way [`Self::resource_slot`] matches a tag target and
+    /// [`Self::cluster_with_namespace_arn`] matches a zero-ETL target: against
+    /// the ARN each stored resource itself publishes, in the Region the request
+    /// was signed for. A cluster is reachable under either ARN it publishes — the
+    /// cluster's own and its namespace's — because a policy is attached to the
+    /// data (the namespace) as well as to the cluster serving it.
+    pub fn holds_policy_resource(&self, resource_arn: &str, region: &str) -> bool {
+        self.resource_slot(resource_arn, region).is_some()
+            || self.cluster_with_namespace_arn(resource_arn).is_some()
+    }
+
     /// The policy document attached to the resource `resource_arn` names, or
     /// `None` when that resource carries no resource policy.
     pub fn resource_policy(&self, resource_arn: &str) -> Option<&str> {

@@ -76,6 +76,9 @@ pub mod serverless;
 
 /// The store's own operations, on the state struct this module declares.
 mod store;
+/// The wording of the resource-policy ARN resolution in
+/// [`resolve_policy_resource`].
+mod policy_resources;
 /// The cluster record: its derived members, its IAM roles and its shape.
 mod clusters;
 /// The published event surface and the subscriptions scoped to it.
@@ -96,6 +99,7 @@ pub use derived::*;
 pub use events::*;
 pub use naming::*;
 pub use parameters::*;
+pub use policy_resources::*;
 pub use reserved_nodes::*;
 pub use tags::*;
 
@@ -712,9 +716,15 @@ pub fn refresh_manual_retention(snapshot: &mut Snapshot, now: ::aws_smithy_types
 /// `DescribeClusterVersionsMessage$MaxRecords` — "Default: 100 … Constraints:
 /// minimum 20, maximum 100."
 pub const MAX_RECORDS_DEFAULT: i32 = 100;
-/// The documented minimum of the `MaxRecords` window. See [`MAX_RECORDS_DEFAULT`].
+/// The documented minimum of the `MaxRecords` window, and the only bound of it
+/// a request is refused for naming a value outside. See [`MAX_RECORDS_DEFAULT`]
+/// and [`page_bounds_within`].
 pub const MAX_RECORDS_MIN: i32 = 20;
-/// The documented maximum of the `MaxRecords` window. See [`MAX_RECORDS_DEFAULT`].
+/// The documented maximum of the `MaxRecords` window: the most records one page
+/// carries, which is both the page a request that names no size is served and
+/// the page a request that names MORE is served. NOT a refusal — a request
+/// naming more is served, clamped to this value (see [`page_bounds_within`]).
+/// See [`MAX_RECORDS_DEFAULT`].
 pub const MAX_RECORDS_MAX: i32 = 100;
 
 /// `ClusterIamRole$ApplyStatus` once the association is established: "the role is
@@ -1361,8 +1371,12 @@ pub fn check_resource_policy(policy: &str) -> Result<(), String> {
 
 /// Why a request carrying something that is not a JSON policy document is
 /// refused.
-pub const RESOURCE_POLICY_NOT_A_POLICY_DOCUMENT: &str =
-    "The resource policy must be a JSON policy document.";
+///
+/// The fixed sentence Amazon Redshift answers a policy it could not read with:
+/// the document, not the request's other members, is what the refusal is about,
+/// so it carries no variable part — and the text is the only thing that tells a
+/// parse failure apart from the other causes of `InvalidPolicyFault`.
+pub const RESOURCE_POLICY_NOT_A_POLICY_DOCUMENT: &str = "The resource policy can't be parsed.";
 
 /// The services whose resources carry an Amazon Redshift resource policy: the
 /// provisioned control plane and Amazon Redshift Serverless, whose namespaces
@@ -1384,17 +1398,21 @@ pub enum PolicyResourceRefusal {
     /// Redshift resource policy — the modelled `UnsupportedOperationFault`,
     /// declared by all three resource-policy operations.
     UnsupportedResource(String),
+    /// The ARN is this service's own and names a resource that does not exist,
+    /// so there is no resource to attach a policy to, report one for or detach
+    /// one from. The service models no error for it: this is the up-front
+    /// parameter refusal, `InvalidParameterValue` (see
+    /// [`resolve_policy_resource`]).
+    NoSuchResource(String),
 }
 
 /// Whether `resource_arn` names a resource an Amazon Redshift resource policy
 /// attaches to: an ARN ([`is_arn`]) of one of [`POLICY_RESOURCE_SERVICES`].
 ///
-/// The ARN is the policy holder's whole identity here. A policy is attached to
-/// "the resources that a policy is attached to"
-/// (`smithy_query(query="shape", shape="ResourcePolicy")`) — a Redshift
-/// Serverless namespace among them, which this service's own store never holds —
-/// so the ARN is what a policy is keyed by, and nothing takes it apart beyond
-/// the service whose resource it names.
+/// The ARN's SYNTAX and the service that owns the resource, which is as far as
+/// the value itself goes; whether that resource EXISTS is resolved against the
+/// control plane that owns it ([`resolve_policy_resource`]), which is what the
+/// three resource-policy operations call.
 pub fn check_policy_resource_arn(resource_arn: &str) -> Result<(), PolicyResourceRefusal> {
     if !is_arn(resource_arn) {
         return Err(PolicyResourceRefusal::NotAResource(
@@ -1417,6 +1435,98 @@ pub fn check_policy_resource_arn(resource_arn: &str) -> Result<(), PolicyResourc
 /// supported" — followed by the ARN the request carried.
 pub const UNSUPPORTED_POLICY_RESOURCE: &str =
     "The requested operation isn't supported for resource";
+
+/// Resolve the `ResourceArn` of a resource-policy request: `Ok(())` when it
+/// identifies a resource a policy attaches to, and the refusal the operation
+/// answers otherwise (worded by [`no_policy_resource_message`]).
+///
+/// `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` all take
+/// the ARN of the resource the policy is attached to, and a policy is attached
+/// TO a resource: an ARN that identifies none is refused by all three, BEFORE
+/// any policy state is read or written, so no document is ever attached to,
+/// reported for or detached from a resource that is not there. One resolver for
+/// the three, as [`check_policy_resource_arn`] is one classification of the
+/// ARN's syntax and owning service.
+///
+/// Where the answer comes from depends on which control plane owns the resource,
+/// and NEITHER path leaves this process:
+///
+/// * a provisioned resource is this store's own, so the answer is a lookup in
+///   memory ([`service_state`] →
+///   [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::holds_policy_resource`]);
+/// * a Redshift Serverless namespace belongs to another control plane with its
+///   own store, so that service is asked through [`serverless`], whose client
+///   (`serverless::serverless_client`) is built on
+///   `ctx.callback().http_client()` and `ctx.callback().aws_credentials_provider()`
+///   — the same in-process callback seam `notifications::raise` publishes
+///   through. No network client is configured on this path, so nothing here
+///   opens a socket or leaves the host, and the caller's ARN never becomes an
+///   outbound destination: it is matched against what that service reports.
+///
+/// Silence follows the rule the namespace registration already sets: a control
+/// plane that answers it holds no such namespace settles the question and the
+/// request is refused, while one that cannot be asked at all leaves it UNDECIDED
+/// and the request is admitted rather than refused on the strength of a peer
+/// that never answered.
+///
+/// The peer lookup is awaited BEFORE this store is locked, so no lock is held
+/// across an in-process call.
+pub async fn resolve_policy_resource<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
+    resource_arn: &str,
+) -> Result<(), PolicyResourceRefusal> {
+    // The ARN's syntax and the service that owns the resource first: a value
+    // that is no ARN, or one of a service whose resources carry no Amazon
+    // Redshift resource policy, is already answered.
+    check_policy_resource_arn(resource_arn)?;
+
+    if serverless::is_serverless_arn(resource_arn) {
+        return match serverless::resolve_zero_etl_target(ctx, resource_arn).await {
+            // The namespace is there. Whether compute is attached to it says
+            // nothing about attaching a policy: the resource exists either way.
+            Some(serverless::WarehouseTarget::Active | serverless::WarehouseTarget::NotActive) => {
+                Ok(())
+            }
+            Some(serverless::WarehouseTarget::Absent) => Err(
+                PolicyResourceRefusal::NoSuchResource(no_policy_resource_message(resource_arn)),
+            ),
+            Some(serverless::WarehouseTarget::Unresolvable(reason)) => {
+                policy_resource_undecided(resource_arn, &reason);
+                Ok(())
+            }
+            // An ARN of that service naming something other than a namespace:
+            // this emulator has no way to ask about it, so the question is as
+            // undecided as a peer that did not answer.
+            None => {
+                policy_resource_undecided(
+                    resource_arn,
+                    "the ARN names no namespace of the Redshift Serverless control plane",
+                );
+                Ok(())
+            }
+        };
+    }
+
+    let Some(state) = service_state(engine) else {
+        // The store could not be reached, so nothing is known about the
+        // resource: undecided, never a refusal of the caller's value.
+        policy_resource_undecided(resource_arn, STORE_UNAVAILABLE);
+        return Ok(());
+    };
+    let region = request_region(ctx);
+    let held = {
+        let store = state.lock();
+        store.holds_policy_resource(resource_arn, &region)
+    };
+    if held {
+        Ok(())
+    } else {
+        Err(PolicyResourceRefusal::NoSuchResource(
+            no_policy_resource_message(resource_arn),
+        ))
+    }
+}
 
 /// What a resource-policy operation answers when the resource it names carries
 /// no resource policy: there is no document to report, to replace or to detach.
@@ -2579,20 +2689,26 @@ fn marker_offset(cursor: &str) -> Option<usize> {
 }
 
 /// The `MaxRecords` window one paginated operation accepts: the page size it
-/// uses when the request carries none, and the inclusive bounds a request may
-/// ask for.
+/// uses when the request carries none, the smallest page a request may ask for,
+/// and the largest page the published window names.
 ///
 /// A window rather than three bare constants because the operations do NOT all
 /// share one: most Redshift `Describe*` operations publish the 20..100 window of
 /// [`MAX_RECORDS_WINDOW`], while `DescribeTags` publishes its own
 /// ([`TAG_MAX_RECORDS_WINDOW`]).
+///
+/// Only [`MaxRecordsWindow::min`] is a refusal; [`MaxRecordsWindow::max`] caps
+/// the page served. See [`page_bounds_within`].
 #[derive(Debug, Clone, Copy)]
 pub struct MaxRecordsWindow {
     /// The page size a request that names no `MaxRecords` gets.
     pub default: i32,
     /// The smallest `MaxRecords` a request may name.
     pub min: i32,
-    /// The largest `MaxRecords` a request may name.
+    /// The largest page the published window names, and the most records one
+    /// page carries: the page a request that names no size is served, and the
+    /// page a request naming MORE is clamped to (see [`page_bounds_within`]) —
+    /// a value past it is not refused.
     pub max: i32,
 }
 
@@ -2610,9 +2726,10 @@ pub const MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
 /// Source: `smithy_query(query="doc", operation="DescribeTags")` — "The
 /// MaxRecords parameter can be a range from 10 to 50 results to return in a
 /// request." The sentence states no default, so the page size a request that
-/// names no `MaxRecords` gets is this window's own MAXIMUM: the ceiling the
-/// service refuses a caller for asking past is also the most it will serve
-/// unasked, so no page can be larger than a caller is allowed to request.
+/// names no `MaxRecords` gets is this window's own MAXIMUM: the most the
+/// operation publishes is also the most it serves unasked. Only the minimum is
+/// a refusal, as on every other window, and the maximum caps the page served
+/// ([`page_bounds_within`]).
 pub const TAG_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
     default: 50,
     min: 10,
@@ -2621,6 +2738,19 @@ pub const TAG_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
 
 /// Resolve one page of `total` records from the request's `Marker` / `MaxRecords`,
 /// under the `MaxRecords` window of the operation serving it.
+///
+/// Only the window's MINIMUM is a refusal: a `MaxRecords` below it is refused,
+/// while one above the window's published maximum is SERVED — the published
+/// window is the page size a paginating client is told to stay inside, not a
+/// bound the service turns a larger request away at, so refusing a bigger page
+/// would refuse a call the service serves.
+///
+/// The page it is served is the window's maximum: that value is the most records
+/// one page carries, so a request for more is answered with a full page and a
+/// `Marker` for the rest. Clamping rather than honouring the number keeps the
+/// records one request materialises proportional to the window instead of to the
+/// whole collection, which is what each caller's page is copied and serialised
+/// from.
 ///
 /// Returns the half-open range of the page and the `Marker` to hand back, which
 /// is `Some` only when records remain after it.
@@ -2632,11 +2762,11 @@ pub fn page_bounds_within(
 ) -> Result<(usize, usize, Option<String>), String> {
     let page_size = match max_records {
         None => window.default,
-        Some(value) if (window.min..=window.max).contains(&value) => value,
+        Some(value) if value >= window.min => value.min(window.max),
         Some(value) => {
             return Err(format!(
-                "Invalid value for MaxRecords: {value}. MaxRecords must be between {} and {}.",
-                window.min, window.max
+                "Invalid value for MaxRecords: {value}. MaxRecords must be at least {}.",
+                window.min
             ))
         }
     };
@@ -2665,6 +2795,16 @@ pub fn page_bounds(
 ) -> Result<(usize, usize, Option<String>), String> {
     page_bounds_within(MAX_RECORDS_WINDOW, marker, max_records, total)
 }
+
+/// What a `DeleteCluster` that carries NEITHER half of the final-snapshot
+/// decision is refused with: `SkipFinalClusterSnapshot` defaults to false, and a
+/// delete that is not skipping the final snapshot has to name the snapshot to
+/// take.
+///
+/// Fixed text with no variable part: the sentence is about the two members, not
+/// about the cluster the request named.
+pub const FINAL_SNAPSHOT_DECISION_REQUIRED: &str =
+    "FinalClusterSnapshotIdentifier is required unless SkipFinalClusterSnapshot is specified.";
 
 /// The fewest nodes a `multi-node` cluster may have.
 ///

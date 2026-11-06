@@ -984,8 +984,8 @@ async fn describe_tags_selects_by_resource_type_and_by_tag() {
         let answer = emulator.call("DescribeTags", &filter).await;
         assert_eq!(
             (answer.status, answer.error_code()),
-            (400, Some("ValidationException".to_string())),
-            "case {case}: expected 400 ValidationException, got {} / {:?}",
+            (400, Some("InvalidParameterCombination".to_string())),
+            "case {case}: expected 400 InvalidParameterCombination, got {} / {:?}",
             answer.status,
             answer.error_code()
         );
@@ -997,8 +997,8 @@ async fn describe_tags_selects_by_resource_type_and_by_tag() {
         .await;
     assert_eq!(
         (unknown.status, unknown.error_code()),
-        (400, Some("ValidationException".to_string())),
-        "case an unpublished resource type: expected 400 ValidationException, got {} / {:?}",
+        (400, Some("InvalidParameterValue".to_string())),
+        "case an unpublished resource type: expected 400 InvalidParameterValue, got {} / {:?}",
         unknown.status,
         unknown.error_code()
     );
@@ -1023,16 +1023,17 @@ async fn describe_tags_pages_inside_its_documented_max_records_window() {
         "case seed twelve tags: expected 200"
     );
 
-    // Each row is a `MaxRecords` and whether the documented window admits it:
-    // "The MaxRecords parameter can be a range from 10 to 50 results to return
-    // in a request" (`state::TAG_MAX_RECORDS_WINDOW`), tested at each bound and
-    // one past each.
+    // Each row is a `MaxRecords` and whether the service admits it: "The
+    // MaxRecords parameter can be a range from 10 to 50 results to return in a
+    // request" (`state::TAG_MAX_RECORDS_WINDOW`), tested at each bound and one
+    // past each. Only the minimum is enforced, so a page past the published
+    // maximum is served.
     let window = state::TAG_MAX_RECORDS_WINDOW;
     let cases: Vec<(&str, i32, bool)> = vec![
         ("one below the minimum", window.min - 1, false),
         ("the minimum", window.min, true),
         ("the maximum", window.max, true),
-        ("one above the maximum", window.max + 1, false),
+        ("one above the maximum", window.max + 1, true),
         ("zero", 0, false),
         ("negative", -1, false),
     ];
@@ -1050,8 +1051,8 @@ async fn describe_tags_pages_inside_its_documented_max_records_window() {
         } else {
             assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
-                "case MaxRecords {case}: expected 400 ValidationException, got {} / {:?}",
+                (400, Some("InvalidParameterValue".to_string())),
+                "case MaxRecords {case}: expected 400 InvalidParameterValue, got {} / {:?}",
                 answer.status,
                 answer.error_code()
             );
@@ -1114,14 +1115,14 @@ async fn describe_tags_pages_inside_its_documented_max_records_window() {
         .await;
     assert_eq!(
         (bogus.status, bogus.error_code()),
-        (400, Some("ValidationException".to_string())),
-        "case a forged cursor: expected 400 ValidationException, got {} / {:?}",
+        (400, Some("InvalidParameterValue".to_string())),
+        "case a forged cursor: expected 400 InvalidParameterValue, got {} / {:?}",
         bogus.status,
         bogus.error_code()
     );
 
     // A request that names NO MaxRecords is served the window's maximum — the
-    // most a caller is allowed to ask for — and a cursor for the rest. Two
+    // most the operation serves unasked — and a cursor for the rest. Two
     // resources at the per-resource tag quota put more entries in the store than
     // one page can carry.
     let crowded = Emulator::new();

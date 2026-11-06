@@ -311,7 +311,7 @@ struct ValueCase {
 }
 
 /// A value the parameter's published `AllowedValues` set admits is taken, and
-/// one it does not is refused with 400 `ValidationException` while the group
+/// one it does not is refused with 400 `InvalidParameterValue` while the group
 /// keeps the value it had.
 ///
 /// Source: the `AllowedValues` of `state::ENGINE_DEFAULT_PARAMETERS`, which is
@@ -488,8 +488,8 @@ async fn the_published_allowed_values_set_decides_which_values_are_taken() {
         } else {
             assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
-                "case {} ({} = {:?}): expected 400 ValidationException, got {} / {:?}",
+                (400, Some("InvalidParameterValue".to_string())),
+                "case {} ({} = {:?}): expected 400 InvalidParameterValue, got {} / {:?}",
                 case.case,
                 case.parameter,
                 case.value,
@@ -556,8 +556,8 @@ async fn the_documented_wlm_configuration_value_length_bound_is_enforced() {
     .await;
     assert_eq!(
         (refused.status, refused.error_code()),
-        (400, Some("ValidationException".to_string())),
-        "case one past the upper bound (8001 characters): expected 400 ValidationException, got {} / {:?}",
+        (400, Some("InvalidParameterValue".to_string())),
+        "case one past the upper bound (8001 characters): expected 400 InvalidParameterValue, got {} / {:?}",
         refused.status,
         refused.error_code()
     );
@@ -615,8 +615,8 @@ async fn the_documented_per_request_parameter_count_bound_is_enforced() {
     let refused = modify(&emulator, GROUP, &sent).await;
     assert_eq!(
         (refused.status, refused.error_code()),
-        (400, Some("ValidationException".to_string())),
-        "case one past the upper bound ({} parameters): expected 400 ValidationException, got {} / {:?}",
+        (400, Some("InvalidParameterValue".to_string())),
+        "case one past the upper bound ({} parameters): expected 400 InvalidParameterValue, got {} / {:?}",
         state::MAX_MODIFIABLE_PARAMETERS + 1,
         refused.status,
         refused.error_code()
@@ -682,8 +682,8 @@ async fn a_request_naming_no_parameter_the_group_publishes_is_refused() {
             .await;
         assert_eq!(
             (answer.status, answer.error_code()),
-            (400, Some("ValidationException".to_string())),
-            "case {case}: expected 400 ValidationException, got {} / {:?}",
+            (400, Some("InvalidParameterValue".to_string())),
+            "case {case}: expected 400 InvalidParameterValue, got {} / {:?}",
             answer.status,
             answer.error_code()
         );
@@ -747,8 +747,8 @@ async fn the_default_parameter_group_takes_no_value_from_a_caller() {
     let answer = modify(&emulator, &group, &[("require_ssl", "true")]).await;
     assert_eq!(
         (answer.status, answer.error_code()),
-        (400, Some("ValidationException".to_string())),
-        "case the default group ({group}): expected 400 ValidationException, got {} / {:?}",
+        (400, Some("InvalidParameterValue".to_string())),
+        "case the default group ({group}): expected 400 InvalidParameterValue, got {} / {:?}",
         answer.status,
         answer.error_code()
     );

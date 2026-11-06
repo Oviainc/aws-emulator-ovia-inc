@@ -95,6 +95,8 @@ mod orderable_cluster_options;
 mod published_catalog_values;
 #[path = "all/qev2_idc_applications.rs"]
 mod qev2_idc_applications;
+#[path = "all/query_protocol_refusals.rs"]
+mod query_protocol_refusals;
 #[path = "all/reboot_cluster.rs"]
 mod reboot_cluster;
 #[path = "all/redshift_idc_applications.rs"]

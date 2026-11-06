@@ -231,6 +231,12 @@ where
 /// which admits this service beside the provisioned control plane's `redshift`.
 const SERVERLESS_ARN_SERVICE: &str = "redshift-serverless";
 
+/// Whether `value` is an ARN of the Amazon Redshift Serverless control plane —
+/// a resource of that service, not of this one.
+pub fn is_serverless_arn(value: &str) -> bool {
+    value.split(':').nth(2) == Some(SERVERLESS_ARN_SERVICE)
+}
+
 /// The two resource prefixes that same pattern admits before the namespace a
 /// `TargetArn` names.
 const NAMESPACE_RESOURCE_PREFIXES: [&str; 2] = ["namespace/", "namespace:"];

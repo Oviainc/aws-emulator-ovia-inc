@@ -981,7 +981,9 @@ async fn pagination_walks_the_whole_collection_through_the_marker() {
         ("one below the minimum", (state::MAX_RECORDS_MIN - 1).to_string(), false),
         ("at the minimum", state::MAX_RECORDS_MIN.to_string(), true),
         ("at the maximum", state::MAX_RECORDS_MAX.to_string(), true),
-        ("one above the maximum", (state::MAX_RECORDS_MAX + 1).to_string(), false),
+        ("one above the maximum", (state::MAX_RECORDS_MAX + 1).to_string(), true),
+        ("far above the maximum", (state::MAX_RECORDS_MAX * 10).to_string(), true),
+        ("zero", "0".to_string(), false),
     ] {
         let answer = emulator
             .call("DescribeClusters", &[("MaxRecords", &max_records)])
@@ -1066,7 +1068,7 @@ async fn pagination_walks_the_whole_collection_through_the_marker() {
         let bogus = emulator.call("DescribeClusters", &[("Marker", cursor)]).await;
         assert_eq!(
             (bogus.status, bogus.error_code()),
-            (400, Some("ValidationException".to_string())),
+            (400, Some("InvalidParameterValue".to_string())),
             "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
             bogus.status,
             bogus.error_code()
@@ -1083,7 +1085,7 @@ async fn pagination_walks_the_whole_collection_through_the_marker() {
         .await;
     assert_eq!(
         (both.status, both.error_code()),
-        (400, Some("ValidationException".to_string())),
+        (400, Some("InvalidParameterCombination".to_string())),
         "case identifier and marker together: expected a 400 refusal, got {} / {:?}",
         both.status,
         both.error_code()
@@ -1251,7 +1253,7 @@ async fn snapshots_are_filtered_by_cluster_type_and_existence() {
         .await;
     assert_eq!(
         (bad_type.status, bad_type.error_code()),
-        (400, Some("ValidationException".to_string())),
+        (400, Some("InvalidParameterValue".to_string())),
         "case an unmodelled snapshot type: expected a 400 refusal, got {} / {:?}",
         bad_type.status,
         bad_type.error_code()
@@ -1277,7 +1279,7 @@ async fn snapshots_are_filtered_by_cluster_type_and_existence() {
         .await;
     assert_eq!(
         (missing_identifier.status, missing_identifier.error_code()),
-        (400, Some("ValidationException".to_string())),
+        (400, Some("InvalidParameterCombination".to_string())),
         "case ClusterExists=true without ClusterIdentifier: expected a 400 refusal, got {} / {:?}",
         missing_identifier.status,
         missing_identifier.error_code()
@@ -1485,7 +1487,7 @@ async fn snapshots_are_sorted_by_the_entities_the_request_names() {
     let too_many = emulator.call("DescribeClusterSnapshots", &borrowed).await;
     assert_eq!(
         (too_many.status, too_many.error_code()),
-        (400, Some("ValidationException".to_string())),
+        (400, Some("InvalidParameterValue".to_string())),
         "case {} sorting entities: expected a 400 refusal, got {} / {:?}",
         state::MAX_SORTING_ENTITIES + 1,
         too_many.status,

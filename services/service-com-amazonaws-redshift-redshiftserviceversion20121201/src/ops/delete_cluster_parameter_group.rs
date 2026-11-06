@@ -202,18 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             // "Cannot delete a default cluster parameter group": Redshift owns
-            // it, not the account, so it is not the account's to remove.
+            // it, not the account, so it is not the account's to remove. The
+            // service models no error for that, and neither modelled fault fits:
+            // the group is not missing and nothing about it is in a transient
+            // state, so this is the parameter-value refusal — the name the
+            // request carried is not one this operation works on, and no retry
+            // will change that.
             if store.parameter_groups[position].default_group {
-                return Err(
-                    DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
-                        InvalidClusterParameterGroupStateFault {
-                            message: Some(format!(
-                                "Cluster parameter group {name} is a default parameter group and cannot be deleted."
-                            )),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    format!("The Cluster Parameter Group cannot be deleted: {name}"),
+                ));
             }
 
             // "You cannot delete a parameter group if it is associated with a

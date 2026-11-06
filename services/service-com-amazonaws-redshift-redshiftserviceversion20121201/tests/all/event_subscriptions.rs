@@ -919,12 +919,13 @@ async fn the_read_pages_filters_and_refuses_what_it_cannot_serve() {
         second.text("Marker")
     );
 
-    // The documented window, on each published bound and one past it.
+    // The documented window, on each published bound and one past it: only the
+    // minimum is enforced.
     for (case, max_records, admitted) in [
         ("the smallest page a caller may ask for", window.min, true),
-        ("the largest page a caller may ask for", window.max, true),
+        ("the largest page the window publishes", window.max, true),
         ("one below the smallest", window.min - 1, false),
-        ("one above the largest", window.max + 1, false),
+        ("one above the largest, which is served", window.max + 1, true),
     ] {
         let answer = call_with(
             &emulator,
@@ -939,7 +940,7 @@ async fn the_read_pages_filters_and_refuses_what_it_cannot_serve() {
                 answer.status, answer.body
             );
         } else {
-            assert_refused(case, &answer, 400, "ValidationException");
+            assert_refused(case, &answer, 400, "InvalidParameterValue");
         }
     }
 
@@ -951,7 +952,12 @@ async fn the_read_pages_filters_and_refuses_what_it_cannot_serve() {
         &[("Marker".to_string(), "5.deadbeef".to_string())],
     )
     .await;
-    assert_refused("a cursor nothing produced", &answer, 400, "ValidationException");
+    assert_refused(
+        "a cursor nothing produced",
+        &answer,
+        400,
+        "InvalidParameterValue",
+    );
 
     // The tag filter selects subscriptions: one matching tag reports the whole
     // record.

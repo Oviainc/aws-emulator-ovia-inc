@@ -209,13 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = st::request_region(ctx);
 
         if input.resource_name.is_some() && input.resource_type.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
                 "Invalid combination of ResourceName and ResourceType: an ARN and a resource-type value cannot be specified together in the same request.",
             ));
         }
         if input.resource_name.is_some() && (input.max_records.is_some() || input.marker.is_some())
         {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
                 "Invalid combination of ResourceName and MaxRecords or Marker: the MaxRecords and Marker parameters cannot be used together with the ARN parameter.",
             ));
         }
@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => match st::resource_type_named(requested) {
                 Some(published) => Some(published),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                         "Invalid value for ResourceType: '{requested}'. Valid resource types are: {}.",
                         st::published_resource_types().join(", ")
                     )))
@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matched.len(),
         ) {
             Ok(page) => page,
-            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            Err(message) => return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message)),
         };
 
         Ok(DescribeTagsOutput {

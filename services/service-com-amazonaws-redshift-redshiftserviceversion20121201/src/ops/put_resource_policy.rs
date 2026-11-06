@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -173,13 +173,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Which resource the policy is attached to is settled before the
         // document is read, so a request naming nothing a Redshift resource
-        // policy attaches to is refused without parsing what it carried.
-        if let Err(refusal) = st::check_policy_resource_arn(&input.resource_arn) {
+        // policy attaches to — a value that is no ARN, a resource of another
+        // service, or a Redshift resource that does not exist — is refused
+        // without parsing what it carried and without attaching anything. A
+        // resource of another control plane is resolved over the same
+        // in-process callback seam the notification publish uses, so nothing
+        // here opens a socket or leaves the host.
+        if let Err(refusal) = st::resolve_policy_resource(ctx, &*self.engine, &input.resource_arn).await
+        {
             return Err(match refusal {
                 st::PolicyResourceRefusal::NotAResource(message) => {
                     PutResourcePolicyErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
                         message: Some(message),
                     })
+                    .into()
                 }
                 st::PolicyResourceRefusal::UnsupportedResource(message) => {
                     PutResourcePolicyErrorModeled::UnsupportedOperationFault(
@@ -187,9 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message: Some(message),
                         },
                     )
+                    .into()
                 }
-            }
-            .into());
+                st::PolicyResourceRefusal::NoSuchResource(message) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+            });
         }
 
         if let Err(message) = st::check_resource_policy(&input.policy) {

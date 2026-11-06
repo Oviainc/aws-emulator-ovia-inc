@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused before the store is read at all.
         if let Some(source) = input.source.as_deref() {
             if !st::PARAMETER_SOURCES.contains(&source) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
                     "Invalid value for Source: '{source}'. Valid Values: {}",
                     st::PARAMETER_SOURCES.join(" | ")
                 )));
@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (start, end, next_marker) =
             match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
                 Ok(page) => page,
-                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+                Err(message) => return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message)),
             };
 
         Ok(DescribeClusterParametersOutput {

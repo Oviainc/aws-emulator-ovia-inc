@@ -876,13 +876,14 @@ async fn the_read_pages_under_the_services_maxrecords_window() {
         );
     }
 
-    // Each published bound of the window is served, and one past either bound is
-    // refused.
+    // Each published bound of the window is served, and below the minimum — the
+    // only bound the service enforces — is refused.
     for (case, max_records, accepted) in [
         ("one below the minimum", (minimum - 1).to_string(), false),
         ("the minimum", minimum.to_string(), true),
         ("the maximum", maximum.to_string(), true),
-        ("one past the maximum", (maximum + 1).to_string(), false),
+        ("one past the maximum", (maximum + 1).to_string(), true),
+        ("zero", "0".to_string(), false),
     ] {
         let answer = emulator
             .call(
@@ -897,7 +898,7 @@ async fn the_read_pages_under_the_services_maxrecords_window() {
                 answer.status, answer.body
             );
         } else {
-            assert_refused(case, &answer, 400, "ValidationException");
+            assert_refused(case, &answer, 400, "InvalidParameterValue");
         }
     }
 
@@ -973,7 +974,7 @@ async fn the_read_pages_under_the_services_maxrecords_window() {
         let bogus = emulator
             .call("DescribeRedshiftIdcApplications", &[("Marker", cursor)])
             .await;
-        assert_refused(case, &bogus, 400, "ValidationException");
+        assert_refused(case, &bogus, 400, "InvalidParameterValue");
     }
 }
 

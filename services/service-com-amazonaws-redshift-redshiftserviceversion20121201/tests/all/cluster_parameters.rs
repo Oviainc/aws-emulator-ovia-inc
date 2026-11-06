@@ -552,9 +552,9 @@ async fn a_source_outside_the_documented_values_is_refused() {
             .await;
         assert_eq!(
             (answer.status, answer.error_code()),
-            (400, Some("ValidationException".to_string())),
+            (400, Some("InvalidParameterValue".to_string())),
             "case {case}: expected Source={source:?} to be refused with 400 \
-             ValidationException, got {} / {:?}",
+             InvalidParameterValue, got {} / {:?}",
             answer.status,
             answer.error_code()
         );
@@ -577,7 +577,8 @@ async fn parameters_are_paged_over_the_documented_window() {
         ("the documented minimum", "20", true),
         ("inside the window", "50", true),
         ("the documented maximum", "100", true),
-        ("one above the documented maximum", "101", false),
+        ("one above the documented maximum", "101", true),
+        ("far above the documented maximum", "1000", true),
     ] {
         let answer = emulator
             .call(
@@ -616,9 +617,9 @@ async fn parameters_are_paged_over_the_documented_window() {
         } else {
             assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
+                (400, Some("InvalidParameterValue".to_string())),
                 "case {case}: expected MaxRecords={max_records} to be refused with 400 \
-                 ValidationException, got {} / {:?}",
+                 InvalidParameterValue, got {} / {:?}",
                 answer.status,
                 answer.error_code()
             );
@@ -644,9 +645,9 @@ async fn parameters_are_paged_over_the_documented_window() {
             .await;
         assert_eq!(
             (answer.status, answer.error_code()),
-            (400, Some("ValidationException".to_string())),
+            (400, Some("InvalidParameterValue".to_string())),
             "case {case}: expected the cursor {cursor:?} to be refused with 400 \
-             ValidationException, got {} / {:?}",
+             InvalidParameterValue, got {} / {:?}",
             answer.status,
             answer.error_code()
         );

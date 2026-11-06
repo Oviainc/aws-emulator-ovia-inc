@@ -333,13 +333,13 @@ async fn the_documented_max_records_window_and_marker_cursor_govern_the_page() {
     let emulator = Emulator::new();
 
     // "Default: 100 Constraints: minimum 20, maximum 100." — each published
-    // bound, and one past each.
+    // bound, and one past each; only the minimum is enforced.
     for (case, max_records, accepted) in [
         ("one below the minimum", state::MAX_RECORDS_MIN - 1, false),
         ("at the minimum", state::MAX_RECORDS_MIN, true),
         ("inside the window", state::MAX_RECORDS_MIN + 1, true),
         ("at the maximum", state::MAX_RECORDS_MAX, true),
-        ("one above the maximum", state::MAX_RECORDS_MAX + 1, false),
+        ("one above the maximum", state::MAX_RECORDS_MAX + 1, true),
         ("zero", 0, false),
     ] {
         let value = max_records.to_string();
@@ -359,7 +359,7 @@ async fn the_documented_max_records_window_and_marker_cursor_govern_the_page() {
         if !accepted {
             assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
+                (400, Some("InvalidParameterValue".to_string())),
                 "case MaxRecords {case} ({value}): expected a 400 refusal, got {} / {:?}",
                 answer.status,
                 answer.error_code()
@@ -406,7 +406,7 @@ async fn the_documented_max_records_window_and_marker_cursor_govern_the_page() {
             .await;
         assert_eq!(
             (bogus.status, bogus.error_code()),
-            (400, Some("ValidationException".to_string())),
+            (400, Some("InvalidParameterValue".to_string())),
             "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
             bogus.status,
             bogus.error_code()
