@@ -16,7 +16,7 @@
 //!   configuration. If you don't include the elements you want to keep, they are erased"
 //!   (the operation's own documentation): the `MetricsConfiguration` payload becomes the
 //!   configuration stored under THAT id in full, every other id is left alone, and the call
-//!   answers the modelled 200 with an empty body.
+//!   answers [`PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS`] with an empty body.
 //! * `GetBucketMetricsConfiguration` reports exactly that container, with every member the
 //!   request named and no member it did not; a bucket carrying none under the id answers
 //!   `NoSuchConfiguration` (HTTP 404).
@@ -25,31 +25,37 @@
 //!   that would create one past [`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`] is refused, while
 //!   replacing an id already stored creates nothing and is not.
 //! * "The ID has a 64 character limit and can only contain letters, numbers, periods,
-//!   dashes, and underscores" (`MetricsConfiguration$Id`) and "The operator must have at
-//!   least two predicates" (`MetricsFilter$And`) are part of the schema the API publishes
-//!   for the payload document, and this operation publishes no error of its own for a
-//!   document it cannot take: a payload breaking either rule is refused with `MalformedXML`
-//!   (HTTP 400) carrying that code's fixed published message.
-//! * The request's `Id` query argument and the payload's `Id` identify ONE configuration:
-//!   an argument naming another configuration than the document does is refused with
-//!   `InvalidArgument` (HTTP 400), the code S3 answers a bad argument with.
+//!   dashes, and underscores" (`MetricsConfiguration$Id`): that rule is published on a
+//!   member of the DOCUMENT, so an `Id` outside it — too long, or outside the character
+//!   class — is a document the published schema does not validate: `MalformedXML` (HTTP 400)
+//!   carrying that code's fixed published message, which is how S3 reports it for THIS
+//!   family. A call whose `id` argument states no configuration AT ALL addresses none for a
+//!   document rule to be reported against, and answers [`INVALID_CONFIGURATION_ID_CODE`]
+//!   with its own fixed sentence.
+//! * Everything else about the DOCUMENT that the published schema does not validate is the
+//!   same `MalformedXML`: a `Filter` that is not EXACTLY ONE of "a prefix, an object tag, an
+//!   access point ARN, or a conjunction (MetricsAndOperator)" (`MetricsFilter`'s own
+//!   documentation), an `And` naming fewer than the "at least two predicates"
+//!   `MetricsFilter$And` requires, a payload `Id` that is not the configuration the request
+//!   addresses, and an access point ARN member that is not an access point ARN.
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refusal leaves the stored configurations exactly as they were.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_metrics_configuration::PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE,
-    MAX_METRICS_CONFIGURATIONS_PER_BUCKET, MAX_METRICS_ID_CHARS, NO_SUCH_BUCKET_CODE,
-    NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
+    INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIGURATION_ID_MESSAGE, MALFORMED_XML_CODE,
+    MALFORMED_XML_MESSAGE, MAX_METRICS_CONFIGURATIONS_PER_BUCKET, MAX_METRICS_ID_CHARS,
+    NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 
 /// The XML namespace botocore puts on an S3 request payload.
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// An access point ARN, as `MetricsFilter$AccessPointArn` takes one.
 pub(crate) const ACCESS_POINT_ARN: &str = "arn:aws:s3:us-east-1:000000000000:accesspoint/reports";
@@ -128,7 +134,7 @@ fn tag_xml(key: &str, value: &str) -> String {
 
 /// The `MetricsConfiguration` payload for `id` and `filter`, spelled the way a client's XML
 /// writer spells it.
-fn configuration_payload(id: &str, filter: Option<&Filter>) -> String {
+pub(crate) fn configuration_payload(id: &str, filter: Option<&Filter>) -> String {
     let mut body = format!("<MetricsConfiguration xmlns=\"{XMLNS}\"><Id>{id}</Id>");
     if let Some(filter) = filter {
         body.push_str(&filter.xml());
@@ -149,7 +155,7 @@ pub(crate) async fn put_metrics(
 
 /// `PutBucketMetricsConfiguration` with the payload spelled out — for a container no
 /// [`Filter`] can express — and with any extra bound headers.
-async fn put_metrics_payload(
+pub(crate) async fn put_metrics_payload(
     router: &MultiServiceRouter,
     bucket: &str,
     id: &str,
@@ -421,6 +427,15 @@ fn round_trip_rows() -> Vec<(&'static str, String, Option<Filter>)> {
 async fn a_metrics_configuration_round_trips_under_its_own_id() {
     let router = router();
 
+    // The status a successful put answers is `204 No Content`, which the recorded service
+    // sends for this subresource write where the model's `@http` code says 200 — pinned
+    // against the LITERAL here, so the constant every other assertion of these suites reads
+    // cannot drift back to the model's code unnoticed.
+    assert_eq!(
+        PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS, 204,
+        "a successful metrics put answers 204 No Content, got {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}"
+    );
+
     for (index, (case, id, filter)) in round_trip_rows().into_iter().enumerate() {
         let name = format!("metrics-round-trip-{index}");
         bucket(&router, &name).await;
@@ -428,8 +443,9 @@ async fn a_metrics_configuration_round_trips_under_its_own_id() {
         let put = put_metrics(&router, &name, &id, filter.as_ref()).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             String::from_utf8_lossy(&put.body)
         );
@@ -463,8 +479,9 @@ async fn a_metrics_configuration_round_trips_under_its_own_id() {
         // same id leaves the bucket carrying only what IT named.
         let replacement = put_metrics(&router, &name, &id, None).await;
         assert_eq!(
-            replacement.status, 200,
-            "case {case:?}: expected the replacing put to answer 200, got {}",
+            replacement.status, PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the replacing put to answer \
+             {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}, got {}",
             replacement.status
         );
         let (_, after) = reported_configuration(&get_metrics(&router, &name, &id).await);
@@ -500,8 +517,9 @@ async fn each_id_carries_its_own_configuration() {
         let put = put_metrics(&router, name, id, Some(filter)).await;
         assert_eq!(
             put.status,
-            200,
-            "case {id:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {id:?}: expected the put to answer \
+             {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             String::from_utf8_lossy(&put.body)
         );
@@ -552,8 +570,9 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
     let stored = Filter::Prefix("kept/".to_string());
     let put = put_metrics(&router, name, stored_id, Some(&stored)).await;
     assert_eq!(
-        put.status, 200,
-        "case setup: expected the put to answer 200, got {}",
+        put.status, PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
+        "case setup: expected the put to answer \
+         {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}, got {}",
         put.status
     );
 
@@ -562,19 +581,21 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
     let too_long = "a".repeat(MAX_METRICS_ID_CHARS + 1);
     let far_too_long = "b".repeat(MAX_METRICS_ID_CHARS * 4);
 
-    // (case, id in the query, payload, expected status, expected code)
+    // (case, id in the query, payload, expected status, expected code, expected message)
     //
-    // Every row whose PAYLOAD does not satisfy the published schema is a schema refusal
-    // ([`MALFORMED_XML_CODE`], with that code's fixed published message); the one row whose
-    // payload is a valid document but whose `id` query argument names another configuration
-    // is a bad-argument refusal ([`INVALID_ARGUMENT_CODE`]).
-    let rows: Vec<(&str, String, String, u16, &str)> = vec![
+    // Every row whose DOCUMENT the published schema does not validate — the id rule
+    // included, since that rule is published on a document member — is the schema refusal
+    // ([`MALFORMED_XML_CODE`], with that code's fixed published message); a call whose `id`
+    // argument states no configuration at all addresses none, and is refused as that
+    // ([`INVALID_CONFIGURATION_ID_CODE`]).
+    let rows: Vec<(&str, String, String, u16, &str, &str)> = vec![
         (
             "an id one character past the 64-character ceiling",
             too_long.clone(),
             configuration_payload(&too_long, None),
             400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
             "an id many characters past the 64-character ceiling",
@@ -582,6 +603,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             configuration_payload(&far_too_long, None),
             400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
             "an id carrying a character the member does not allow",
@@ -589,6 +611,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             configuration_payload("not+allowed", None),
             400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
             "an id carrying a path separator, which is no id character either",
@@ -596,13 +619,23 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             configuration_payload("not/allowed", None),
             400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
-            "an empty id, which identifies no configuration",
+            "an id argument that states no configuration at all",
             String::new(),
             configuration_payload("", None),
             400,
+            INVALID_CONFIGURATION_ID_CODE,
+            INVALID_CONFIGURATION_ID_MESSAGE,
+        ),
+        (
+            "an empty payload Id beside an argument that names one",
+            "named".to_string(),
+            configuration_payload("", None),
+            400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
             "an And naming one predicate where the operator takes two",
@@ -613,6 +646,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             ),
             400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
             "an And naming no predicate at all",
@@ -623,24 +657,19 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             ),
             400,
             MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
         (
             "a payload Id that is not the configuration the request names",
             "query-id".to_string(),
             configuration_payload("payload-id", None),
             400,
-            INVALID_ARGUMENT_CODE,
-        ),
-        (
-            "an over-long id query argument beside a payload Id the schema takes",
-            too_long.clone(),
-            configuration_payload("payload-id", None),
-            400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
+            MALFORMED_XML_MESSAGE,
         ),
     ];
 
-    for (case, id, payload, status, code) in rows {
+    for (case, id, payload, status, code, message) in rows {
         let answer = put_metrics_payload(&router, name, &id, &payload, &[]).await;
         assert_eq!(
             answer.status,
@@ -655,16 +684,14 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             "case {case:?}: expected the code {code}, got {}",
             answer.error_code()
         );
-        if code == MALFORMED_XML_CODE {
-            // A schema refusal carries the code's own fixed published text, not anything
-            // about the document the request named.
-            assert_eq!(
-                answer.error_message(),
-                MALFORMED_XML_MESSAGE,
-                "case {case:?}: expected the message {MALFORMED_XML_MESSAGE:?}, got {}",
-                answer.error_message()
-            );
-        }
+        // Each of these codes carries its own FIXED published sentence, with nothing of the
+        // request in it.
+        assert_eq!(
+            answer.error_message(),
+            message,
+            "case {case:?}: expected the message {message:?}, got {}",
+            answer.error_message()
+        );
 
         // The refusal recorded nothing: the configuration that WAS stored is unchanged.
         let (reported_id, reported_filter) =
@@ -749,7 +776,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
 
 /// "You can have up to 1,000 metrics configurations per bucket": the 1,001st NEW
 /// configuration is refused with the operation's own `TooManyConfigurations`, while
-/// replacing one of the 1,000 creates none and still answers 200.
+/// replacing one of the 1,000 creates none and still succeeds.
 #[tokio::test]
 async fn one_configuration_past_the_per_bucket_limit_is_refused() {
     let router = router();
@@ -761,7 +788,7 @@ async fn one_configuration_past_the_per_bucket_limit_is_refused() {
         let answer = put_metrics(&router, name, &id, None).await;
         assert_eq!(
             answer.status,
-            200,
+            PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
             "case {id:?}: a configuration within the limit must be recorded, got {} ({})",
             answer.status,
             String::from_utf8_lossy(&answer.body)
@@ -788,8 +815,9 @@ async fn one_configuration_past_the_per_bucket_limit_is_refused() {
     let replacement = put_metrics(&router, name, "configuration-0", Some(&replaced)).await;
     assert_eq!(
         replacement.status,
-        200,
-        "case \"replacing a configuration at the limit\": expected HTTP 200, got {} ({})",
+        PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
+        "case \"replacing a configuration at the limit\": expected HTTP \
+         {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
         replacement.status,
         String::from_utf8_lossy(&replacement.body)
     );

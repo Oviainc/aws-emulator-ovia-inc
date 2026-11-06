@@ -2381,6 +2381,34 @@ pub fn is_s3_bucket_arn(value: &str) -> bool {
     is_arn_of(value, "s3", ArnField::Empty, ArnField::Empty, "")
 }
 
+/// Whether `value` is the ARN of an S3 ACCESS POINT:
+/// `arn:<partition>:s3:<region>:<account-id>:accesspoint/<name>`.
+///
+/// An access point is a REGIONAL, account-owned resource — unlike the bucket it fronts,
+/// whose ARN carries neither ([`is_s3_bucket_arn`]) — and its resource part names the kind
+/// before the name, so a bucket ARN is not one of these however well formed it is. The
+/// account is read as PRESENT rather than as this account's: an access point in another
+/// account is still an access point, and a filter may name one.
+///
+/// Shared, because more than one member takes an access point ARN: `MetricsFilter` and
+/// `MetricsAndOperator` both declare "the access point ARN used when evaluating a metrics
+/// filter", so neither may judge one its own way. Read through [`is_arn_of`], the crate's
+/// one ARN grammar.
+pub fn is_s3_access_point_arn(value: &str) -> bool {
+    is_arn_of(
+        value,
+        "s3",
+        ArnField::Present,
+        ArnField::Present,
+        ACCESS_POINT_RESOURCE_PREFIX,
+    )
+}
+
+/// What an access point ARN's resource part begins with, before the access point's own
+/// name: the resource kind, as AWS spells it in the ARN of an access point
+/// (`arn:aws:s3:<region>:<account-id>:accesspoint/<name>`).
+const ACCESS_POINT_RESOURCE_PREFIX: &str = "accesspoint/";
+
 /// Why `value` is not an ARN, as AWS states it where a refusal quotes the reason.
 ///
 /// The ARN grammar is the published one [`is_arn_of`] reads —
@@ -4533,6 +4561,9 @@ pub struct DeleteMarker {
 
 // One general purpose bucket and everything it carries.
 mod bucket;
+// The continuation token every listing of a bucket's id-addressed configurations pages
+// with, and the reading of a token a caller hands back.
+mod configuration_tokens;
 // What a bucket's stored lifecycle configuration is, and which ones S3 admits.
 mod lifecycle;
 // One stored object version.
@@ -4545,6 +4576,7 @@ mod store;
 mod uploads;
 
 pub use bucket::*;
+pub use configuration_tokens::*;
 pub use lifecycle::*;
 pub use object::*;
 pub use refusals::*;

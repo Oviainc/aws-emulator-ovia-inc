@@ -71,6 +71,8 @@ mod bucket_metadata_journal_table_update;
 mod bucket_metadata_namespace_retention;
 #[path = "all/bucket_metrics_configuration.rs"]
 mod bucket_metrics_configuration;
+#[path = "all/bucket_metrics_configuration_documents.rs"]
+mod bucket_metrics_configuration_documents;
 #[path = "all/bucket_metrics_configuration_listing.rs"]
 mod bucket_metrics_configuration_listing;
 #[path = "all/bucket_name_namespace.rs"]

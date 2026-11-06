@@ -682,15 +682,21 @@ fn union_arity_violation(request: &Request, input_schema: &Schema) -> Option<Vio
 ///
 /// `AnalyticsFilter` is one: "a filter must have exactly one prefix, one tag, or one
 /// conjunction (AnalyticsAndOperator)", and its members are the ones
-/// `smithy_query(query="shape",shape="AnalyticsFilter")` declares. The lifecycle and
-/// replication rule filters are deliberately NOT here: S3 documents an EMPTY `<Filter>` on a
-/// lifecycle rule as the way to apply the rule to every object in the bucket, so the choice
-/// there may be none and a document naming none still validates.
-const EXACTLY_ONE_MEMBER_UNIONS: &[(&str, &str, &[&str])] = &[(
-    "analyticsConfiguration",
-    "Filter",
-    &["Prefix", "Tag", "And"],
-)];
+/// `smithy_query(query="shape",shape="AnalyticsFilter")` declares. `MetricsFilter` is the
+/// other: "a filter must be a prefix, an object tag, an access point ARN, or a conjunction
+/// (MetricsAndOperator)" (`smithy_query(query="doc",shape="MetricsFilter")`), over the four
+/// members that shape declares. The lifecycle and replication rule filters are deliberately
+/// NOT here: S3 documents an EMPTY `<Filter>` on a lifecycle rule as the way to apply the
+/// rule to every object in the bucket, so the choice there may be none and a document naming
+/// none still validates.
+const EXACTLY_ONE_MEMBER_UNIONS: &[(&str, &str, &[&str])] = &[
+    ("analyticsConfiguration", "Filter", &["Prefix", "Tag", "And"]),
+    (
+        "metricsConfiguration",
+        "Filter",
+        &["Prefix", "Tag", "AccessPointArn", "And"],
+    ),
+];
 
 /// The index in `unions` of the first union element of `document` that does not carry exactly
 /// one child element, or `None` when every one of them carries one.

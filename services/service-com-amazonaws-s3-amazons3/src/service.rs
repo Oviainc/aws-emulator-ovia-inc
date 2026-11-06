@@ -758,6 +758,27 @@ fn uri_value_wording(
     refused_argument(&restored).map(|_| s3_refusal(&restored))
 }
 
+/// The refusal an ID-ADDRESSED bucket configuration call words for a value the boundary
+/// rejected outside its document — the `id` that addresses the configuration above all.
+///
+/// Worded through [`s3_refusal`], the one place this service's refusal rules live, so the
+/// code and the sentence are the ones that seam already chooses for such a value (an `id`
+/// the request states none of is [`crate::state::INVALID_CONFIGURATION_ID_CODE`], the same
+/// refusal a handler answers an id it was handed empty with). What attaching it to the
+/// operation BUYS is the renderer: a wording routes the refusal through
+/// [`EmulatedService::worded_refusal`], so the answer carries this service's own
+/// request-correlation ids rather than the framework renderer's.
+fn configuration_id_wording(
+    refused: &[(Violation, ::service_common::validation::SubmittedEcho)],
+) -> Option<Refused> {
+    let (violation, echo) = refused.first()?;
+    let restored = ::service_common::validation_message::quoting_the_whole_submitted_value(
+        violation.clone(),
+        echo,
+    );
+    Some(s3_refusal(&restored))
+}
+
 /// The `<ArgumentName>` / `<ArgumentValue>` pair S3's document carries for the request field
 /// `violation` names, or `None` for a field whose refusal carries no member of its own.
 ///
@@ -824,6 +845,14 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 /// * `CopyObject` and `UploadPartCopy` — the refusal of an `x-amz-copy-source` the modelled
 ///   pattern rejects carries the sentence its fault publishes and the argument pair naming
 ///   the header ([`uri_value_wording`]).
+/// * `PutBucketMetricsConfiguration` and `DeleteBucketMetricsConfiguration` — the two calls
+///   of the metrics plane whose refusal the BOUNDARY makes: a `MetricsConfiguration`
+///   document whose `Filter` is not exactly one member (refused by this service's own codec
+///   before a member is built, see [`wire::union_arity_violation`]) and a call that states
+///   no configuration id at all. Behind the door those answer in the envelope every other
+///   answer of this service carries, named by the pair of ids S3 mints
+///   ([`EmulatedService::worded_refusal`]); the framework's own renderer mints ids of a
+///   different shape, which a client, a log correlator and a support request all read.
 fn front_door<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> smithy_server_runtime::OperationRoutingTable {
@@ -835,6 +864,30 @@ fn front_door<Eng: Send + Sync + 'static>(
         Arc::clone(engine),
     ));
     let mut table = door.finish();
+    table.add_operation(
+        crate::ops::put_bucket_metrics_configuration::PutBucketMetricsConfiguration::<Eng>::NAME,
+        Box::new(
+            FrontDoor::worded(
+                crate::ops::put_bucket_metrics_configuration::PutBucketMetricsConfiguration::new(
+                    Arc::clone(engine),
+                ),
+                submitted_value_wording,
+            )
+            .wording_uri(configuration_id_wording),
+        ),
+    );
+    table.add_operation(
+        crate::ops::delete_bucket_metrics_configuration::DeleteBucketMetricsConfiguration::<Eng>::NAME,
+        Box::new(
+            FrontDoor::worded(
+                crate::ops::delete_bucket_metrics_configuration::DeleteBucketMetricsConfiguration::new(
+                    Arc::clone(engine),
+                ),
+                submitted_value_wording,
+            )
+            .wording_uri(configuration_id_wording),
+        ),
+    );
     table.add_operation(
         crate::ops::copy_object::CopyObject::<Eng>::NAME,
         Box::new(
@@ -1028,7 +1081,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .find_map(|(subresource, method, operation)| {
                 (*method == req.method() && query_carries(query, subresource)).then_some(*operation)
             })?;
-        self.entry.routing_table().get(operation)
+        // Served behind this service's FRONT DOOR where that operation is one of the door's
+        // ([`front_door`]), exactly as a request the generated table resolves is: a call
+        // resolved here is the same call, and the door is what words the refusal of the id
+        // it did not state in this service's own envelope.
+        self.door
+            .get(operation)
+            .or_else(|| self.entry.routing_table().get(operation))
     }
 
     /// How this service answers the AUTHENTICATION refusal of the request it is serving, or
@@ -1142,6 +1201,38 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let refusal = crate::scaffolded::UnmodeledWithDetail {
             message: refused.message.clone(),
             detail,
+        };
+        self.protocol
+            .serialize_error(
+                &refusal,
+                &crate::scaffolded::UNMODELED_SCHEMA,
+                &refused.code,
+                crate::state::INVALID_ARGUMENT_STATUS,
+            )
+            .ok()
+    }
+
+    /// `refused` rendered in the envelope every OTHER answer of this service carries: the
+    /// bare `<Error>` root with its `<Code>`, `<Message>` and request-correlation elements,
+    /// and the matching `x-amz-request-id` / `x-amz-id-2` headers — named by the pair of ids
+    /// S3 mints ([`crate::state::request_ids`]) rather than by whatever a generic renderer
+    /// generates.
+    ///
+    /// Reached for EVERY refusal of a value the model declares a rule for, on every
+    /// operation of this service and not only the ones served behind the door: what the ids
+    /// are is a property of an S3 response, not of one operation. The code and the message
+    /// are the ones the wording seam already chose, and the status is the 400 every protocol
+    /// answers a value outside its declared rules with — which is the status of every code
+    /// [`s3_refusal`] and [`published_refusal`] can choose, and the only class of refusal
+    /// routed through here (see [`ErasedServiceDefinition::refusal_response`]). A published
+    /// refusal at another status would need the status to travel with the code, which
+    /// [`Refused`] does not carry.
+    ///
+    /// `None` on the serializer failure a code and a sentence cannot actually provoke, which
+    /// leaves the entry's renderer to answer rather than panicking in the request path.
+    fn worded_refusal(&self, refused: &Refused) -> Option<RtResponse> {
+        let refusal = crate::scaffolded::UnmodeledMessage {
+            message: refused.message.clone(),
         };
         self.protocol
             .serialize_error(
@@ -1430,11 +1521,26 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
         // entry's rendering of the code and message alone.
         if let ProtocolError::Invalid(violations) = &error {
             if let Some(violation) = violations.first() {
+                // The wording this service chose for the refusal, derived ONCE: both
+                // renderers below carry the same code and message, and only the document's
+                // members differ.
+                let refused = chosen.clone().unwrap_or_else(|| s3_refusal(violation));
                 if let Some(detail) = refused_argument(violation) {
-                    let refused = chosen.clone().unwrap_or_else(|| s3_refusal(violation));
                     if let Some(response) = self.detailed_refusal(&refused, detail) {
                         return response;
                     }
+                }
+                // Every other refusal of a value the model declares a rule for is rendered
+                // through THIS service's own error channel too, for the one thing the
+                // entry's renderer cannot name: the pair of request-correlation ids an S3
+                // response carries. The entry's renderer mints ids of its own shape, where
+                // every other answer of this service — a served response and a handler's
+                // refusal alike — is named by S3's ([`crate::state::request_ids`]), and
+                // the SHAPE is what a client, a log correlator or a support request reads.
+                // The status is the 400 every protocol answers a value outside its declared
+                // rules with (see [`EmulatedService::worded_refusal`]).
+                if let Some(response) = self.worded_refusal(&refused) {
+                    return response;
                 }
             }
         }

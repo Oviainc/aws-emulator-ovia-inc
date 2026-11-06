@@ -358,6 +358,27 @@ impl SerializableStruct for UnmodeledWithDetail {
     }
 }
 
+/// A rejection the BOUNDARY answers whose error class carries NO detail member: the
+/// `<Message>` alone, beside the `<Code>` and the request-correlation elements the envelope
+/// itself writes.
+///
+/// Rendered through this service's own serializer for the reason
+/// `crate::service::EmulatedService::worded_refusal` gives — the ids an S3 response is named
+/// by are this service's, and the generic renderer behind the wording seam mints its own —
+/// so the code and the status travel with that renderer exactly as they do for
+/// [`UnmodeledWithDetail`].
+#[derive(Debug, Clone)]
+pub struct UnmodeledMessage {
+    /// Why the request was refused.
+    pub message: String,
+}
+
+impl SerializableStruct for UnmodeledMessage {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&UNMODELED_MESSAGE, self.message.as_str())
+    }
+}
+
 /// The `message` member written for a MODELED error whose own shape declares none.
 ///
 /// Same shape as the three synthetic members above — the member name Smithy uses

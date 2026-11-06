@@ -616,8 +616,31 @@ pub(crate) fn violations_in<O: Operation>(
     req: &RtRequest,
     echoes: Echoes,
 ) -> Refusing {
-    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Refusing::default();
+    let mut deserializer = match protocol.deserialize_input(req, O::INPUT_SCHEMA) {
+        Ok(deserializer) => deserializer,
+        // A refusal the PROTOCOL itself made while reading the request states the same
+        // thing the walk below states — one or more values the request carried are not
+        // ones the shape admits, carried structurally as violations — so it is the same
+        // refusal to a caller and the same one here. A service whose codec refuses a
+        // document before any member is built (a character the document's own grammar
+        // cannot hold, a union carrying other than the one member it chooses between) would
+        // otherwise find NO violation here and leave the request to the layers behind the
+        // door, where the framework's own renderer answers it in an envelope the service
+        // never chose.
+        //
+        // No value is echoed for such a violation: there is no built input to render one
+        // from, so each is reported [`SubmittedEcho::Unrendered`] — "submitted, with no
+        // text rendering this walk produces" — which leaves every clause exactly the words
+        // the violation itself carries.
+        Err(::aws_smithy_schema_server::ProtocolError::Invalid(violations)) => {
+            let echoes = vec![SubmittedEcho::Unrendered; violations.len()];
+            return Refusing {
+                violations,
+                lists: HashMap::new(),
+                echoes,
+            };
+        }
+        Err(_) => return Refusing::default(),
     };
     let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
     drop(deserializer);

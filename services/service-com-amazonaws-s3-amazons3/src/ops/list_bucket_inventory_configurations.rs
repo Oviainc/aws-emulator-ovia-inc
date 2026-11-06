@@ -173,34 +173,9 @@ impl From<ListBucketInventoryConfigurationsErrorModeled> for ListBucketInventory
 /// reported over pages rather than in one response.
 const CONFIGURATIONS_PER_PAGE: usize = 100;
 
-/// The marker a continuation token this operation issued carries, so a token it did not
-/// issue is refused rather than silently read as a cursor.
-///
-/// Distinct from the marker in [`super::list_bucket_analytics_configurations`] and the other
-/// configuration listings: a token minted for one listing is not a cursor into another.
-const CONTINUATION_TOKEN_MARKER: &str = "s3ic1 ";
-
-/// Encode the resume point of a truncated page as the response's `NextContinuationToken`.
-///
-/// "The continuation token is an opaque value that Amazon S3 understands"
-/// (`ListBucketInventoryConfigurationsOutput$NextContinuationToken`) — hex of a marker plus
-/// the first configuration id NOT returned, so the token a page hands back resumes exactly
-/// where it stopped without storing per-caller cursor state, the way the sibling
-/// configuration listings encode their own. Opaque, NOT confidential: hex is trivially
-/// reversible, and the token is only opaque in the sense that a client must not read an id
-/// out of it or mint one of its own.
-fn encode_continuation_token(first_id_not_returned: &str) -> String {
-    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_id_not_returned}").as_bytes())
-}
-
-/// The configuration id a `ContinuationToken` resumes at (inclusive), or `None` when the
-/// token is not one this operation issued.
-fn decode_continuation_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(CONTINUATION_TOKEN_MARKER)
-        .map(str::to_string)
-}
+/// Which listing a continuation token of this operation was issued for, so a token minted
+/// for a sibling configuration family's listing is not read as a cursor into this one.
+const LISTING: crate::state::ConfigurationListing = crate::state::ConfigurationListing::Inventory;
 
 /// The `ListBucketInventoryConfigurations` operation.
 ///
@@ -257,25 +232,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `Token` is `length {min 0}`, so an EMPTY continuation token is a legal value that
-        // names no cursor — the first page, exactly as if none had been sent (the reading
-        // the sibling configuration listings give it).
-        let resume_at = match input.continuation_token.as_deref() {
-            Some(token) if !token.is_empty() => {
-                Some(decode_continuation_token(token).ok_or_else(|| {
-                    // A token this listing did not issue names no page of it: the refusal
-                    // every bucket-configuration listing shares
-                    // ([`crate::state::MALFORMED_CONTINUATION_TOKEN_CODE`]).
-                    crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::MALFORMED_CONTINUATION_TOKEN_CODE,
-                        crate::state::MALFORMED_CONTINUATION_TOKEN_STATUS,
-                        crate::state::MALFORMED_CONTINUATION_TOKEN_MESSAGE,
-                    )
-                })?)
-            }
-            _ => None,
-        };
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no bucket store to read, so this
             // answers 501 rather than a truthful-looking "this bucket carries none".
@@ -285,6 +241,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // The key THIS store mints and reads its continuation tokens under (see
+        // `crate::state::configuration_tokens`): taken before the bucket is borrowed, and
+        // read-only — a listing reports, so nothing about the store moves.
+        let page_tokens = store.page_token_key();
+
+        // `Token` is `length {min 0}`, so an EMPTY continuation token is a legal value that
+        // names no cursor — the first page, exactly as if none had been sent (the reading
+        // the sibling configuration listings give it).
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => Some(
+                crate::state::decode_continuation_token(&page_tokens, LISTING, token).ok_or_else(
+                    || {
+                        // A token this listing did not issue names no page of it: the
+                        // refusal every bucket-configuration listing shares
+                        // ([`crate::state::MALFORMED_CONTINUATION_TOKEN_CODE`]).
+                        crate::scaffolded::Scaffolded::unmodeled(
+                            crate::state::MALFORMED_CONTINUATION_TOKEN_CODE,
+                            crate::state::MALFORMED_CONTINUATION_TOKEN_STATUS,
+                            crate::state::MALFORMED_CONTINUATION_TOKEN_MESSAGE,
+                        )
+                    },
+                )?,
+            ),
+            _ => None,
+        };
+
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(
                 ListBucketInventoryConfigurationsErrorModeled::NoSuchBucket(NoSuchBucket {})
@@ -306,7 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Out of slots: this configuration starts the NEXT page, and its id is what the
             // token hands back.
             if reported.len() >= CONFIGURATIONS_PER_PAGE {
-                next_continuation_token = Some(encode_continuation_token(id));
+                next_continuation_token = Some(crate::state::encode_continuation_token(
+                    &page_tokens,
+                    LISTING,
+                    id,
+                ));
                 break;
             }
             reported.push(configuration.clone());

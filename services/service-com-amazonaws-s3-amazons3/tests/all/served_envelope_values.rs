@@ -55,7 +55,7 @@ use super::object_retention::put_object_retention;
 
 /// How many characters an `x-amz-request-id` carries, and so how wide the `<RequestId>` of
 /// an error document is: the fixed-width token S3 names a request by.
-const REQUEST_ID_CHARS: usize = 16;
+pub(crate) const REQUEST_ID_CHARS: usize = 16;
 
 /// How many characters an `x-amz-id-2` carries — the wider token of the pair, which S3
 /// writes in lowercase hexadecimal.
@@ -66,7 +66,10 @@ const EXTENDED_REQUEST_ID_CHARS: usize = 64;
 ///
 /// A lowercase hyphenated UUID fails on every count — its width, its case and its
 /// separators — which is exactly what this predicate is here to catch.
-fn is_request_id(token: &str) -> bool {
+///
+/// `pub(crate)`: the metrics-document suite beside this one asserts the same shape over the
+/// refusals of ITS operations, so neither restates the rule.
+pub(crate) fn is_request_id(token: &str) -> bool {
     token.len() == REQUEST_ID_CHARS
         && token
             .chars()
@@ -84,7 +87,7 @@ fn is_extended_request_id(token: &str) -> bool {
 
 /// The pair `answer` named its request by in its HEADERS, failing the test when it carried
 /// neither — every S3 response carries both.
-fn correlation_headers(answer: &Answer, case: &str) -> (String, String) {
+pub(crate) fn correlation_headers(answer: &Answer, case: &str) -> (String, String) {
     let request_id = answer
         .header("x-amz-request-id")
         .unwrap_or_else(|| panic!("case {case:?}: the response carried no x-amz-request-id"));

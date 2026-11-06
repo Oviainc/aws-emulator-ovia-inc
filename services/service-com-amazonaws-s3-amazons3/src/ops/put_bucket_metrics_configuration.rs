@@ -3,20 +3,22 @@
 //! @op PutBucketMetricsConfiguration
 //! IMPLEMENTED: records a CloudWatch request-metrics configuration on an existing bucket
 //! under the id the request identifies it by, replacing in full whatever configuration the
-//! bucket carried under THAT id and leaving every other id untouched. The payload IS the
-//! configuration, so what the request names becomes the stored configuration and
+//! bucket carried under THAT id and leaving every other id untouched, and answers
+//! [`PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS`] with an empty body. The payload IS
+//! the configuration, so what the request names becomes the stored configuration and
 //! `GetBucketMetricsConfiguration` reports it back. Refused before anything is written when
-//! the request is not one S3 records: a payload whose `Id` is not a metrics configuration id
-//! or whose `And` filter names fewer than two predicates does not validate against the
-//! schema the API publishes for the document (`MalformedXML`), a `id` query argument that
-//! names a different configuration than the payload does (`InvalidArgument`), and a NEW
-//! configuration past [`crate::state::MAX_METRICS_CONFIGURATIONS_PER_BUCKET`]
-//! (`TooManyConfigurations`).
+//! the request is not one S3 records: a document that does not validate against the schema
+//! the API publishes for it (`MalformedXML`) — an `Id` outside the id rule every bucket
+//! configuration id shares ([`crate::state::configuration_id_fault`]), an `Id` that is not
+//! the configuration the `id` query argument addresses, a `Filter` that is not EXACTLY ONE
+//! of the union's members (refused before the codec reads the body,
+//! `crate::service::wire`), an `And` filter naming fewer than two predicates, or an access
+//! point ARN member that is not an access point ARN — and a NEW configuration past
+//! [`crate::state::MAX_METRICS_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
 //!
-//! The read side is `GetBucketMetricsConfiguration`, implemented in the same change so a
-//! put can be read back; `DeleteBucketMetricsConfiguration` and
-//! `ListBucketMetricsConfigurations` are still the scaffold's 501 and are their own stub
-//! issues.
+//! The read side is `GetBucketMetricsConfiguration`, the listing is
+//! `ListBucketMetricsConfigurations` and the delete is
+//! `DeleteBucketMetricsConfiguration`; all three are implemented.
 //!
 //! ## Shape of an operation
 //!
@@ -138,9 +140,22 @@ impl PutBucketMetricsConfigurationOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/{Bucket}?metrics",
-        Some(200u16),
+        Some(PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS),
     ));
 }
+
+/// The HTTP status a successful `PutBucketMetricsConfiguration` answers: `204 No Content`.
+///
+/// A successful write of a metrics configuration has nothing to return — the modelled output
+/// shape is `smithy.api#Unit`, which
+/// `smithy_query(query="operation",operation="PutBucketMetricsConfiguration")` reports with
+/// no members — and S3 answers it 204 with an empty body, where the model's `@http` code says
+/// 200; the same subresource's `DeleteBucketMetricsConfiguration` carries 204 in the model
+/// itself. Named once here so the operation's `SUCCESS_STATUS` (what the serializer reads)
+/// and the output schema's `@http` code cannot drift apart — the reading the sibling
+/// id-addressed configuration write gives its own no-content put
+/// ([`super::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`]).
+pub const PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS: u16 = 204;
 
 pub static PUT_BUCKET_METRICS_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PutBucketMetricsConfigurationOutput::SCHEMA;
 
@@ -209,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutBucketMetricsConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_BUCKET_METRICS_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_BUCKET_METRICS_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS;
 
     async fn handle(
         &self,
@@ -260,44 +275,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The `id` query argument is what ADDRESSES the configuration this put sets, so a
+        // call that states NONE — no argument at all, or an empty one — identifies no
+        // configuration for a document rule to be reported against, and S3 reports that
+        // against the id itself ([`crate::state::ConfigurationIdFault::Unstated`], the same
+        // refusal the boundary answers a call carrying no `id` argument with, and the one
+        // the sibling id-addressed configuration writes answer an id they were handed empty
+        // with).
+        if let Some(unstated @ crate::state::ConfigurationIdFault::Unstated) =
+            crate::state::configuration_id_fault(&input.id)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                unstated.code(),
+                unstated.status(),
+                unstated.message(),
+            ));
+        }
+
         // "The ID has a 64 character limit and can only contain letters, numbers, periods,
-        // dashes, and underscores" (`MetricsConfiguration$Id`): that rule is part of the
-        // schema the API publishes for this payload, so a document whose `Id` is outside it
-        // does not validate against that schema — which is what `MalformedXML` reports.
-        // This operation publishes ONE special error of its own
-        // ([`crate::state::TOO_MANY_CONFIGURATIONS_CODE`]) and no `InvalidArgument`, unlike
-        // the analytics and S3 Intelligent-Tiering puts, whose own documentation lists
-        // `InvalidArgument` for a member value they cannot take.
+        // dashes, and underscores" (`MetricsConfiguration$Id`): that rule is published on a
+        // member of the DOCUMENT, so a document whose `Id` is outside it does not validate
+        // against the schema the API publishes for the payload — which is what
+        // `MalformedXML` reports, and what S3 answers this family with. (The sibling
+        // id-addressed configuration families report an id outside the rule against the id
+        // itself, each with the code its own operation publishes; this operation publishes
+        // ONE special error of its own ([`crate::state::TOO_MANY_CONFIGURATIONS_CODE`]) and
+        // nothing for a document it cannot take.) The rule itself is the one every bucket
+        // configuration id shares ([`crate::state::configuration_id_fault`]), so the
+        // families cannot drift apart on WHICH values identify a configuration — only on how
+        // a value outside it is reported.
         //
-        // The payload is judged BEFORE the `id` query argument: the document is what the
-        // schema governs, and once the two agree an `Id` that satisfies the rule means the
-        // query argument does too.
-        if !crate::state::is_valid_metrics_id(&input.metrics_configuration.id) {
+        // The DOCUMENT is judged here and the `id` query argument by the comparison below:
+        // the two name one configuration, so an argument outside the rule cannot be the id
+        // a document inside it names.
+        if crate::state::configuration_id_fault(&input.metrics_configuration.id).is_some() {
             return Err(malformed_metrics_configuration());
         }
 
         // The configuration a put "specified by the metrics configuration ID" sets and the
-        // `Id` the payload is "used to identify" name ONE configuration, so two different
-        // values name no configuration the service can record. The `id` query argument is
-        // not part of the document the schema governs, so a request whose argument and
-        // document disagree is a bad argument (`InvalidArgument`), not a schema violation.
+        // `Id` the payload is "used to identify" name ONE configuration, so a document naming
+        // another one does not describe the configuration this request addresses — which is a
+        // document that "did not validate against our published schema", the fixed refusal
+        // [`crate::state::MALFORMED_XML_CODE`] carries however a document failed to validate.
+        // It also covers a document `Id` outside the id rule, since such a value can never be
+        // the id the request addresses.
         if input.metrics_configuration.id != input.id {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                format!(
-                    "MetricsConfiguration.Id {:?} does not identify the metrics configuration \
-                     the request names, {:?}",
-                    input.metrics_configuration.id, input.id
-                ),
-            ));
+            return Err(malformed_metrics_configuration());
         }
 
         // "A conjunction (logical AND) of predicates … The operator must have at least two
         // predicates" (`MetricsFilter$And`): a prefix, each tag and an access point ARN are
         // one predicate each, and that minimum is the published schema's as much as the id
-        // rule is, so an `And` carrying fewer is the same schema refusal as an `Id` outside
-        // its rule.
+        // rule is, so an `And` carrying fewer is the same schema refusal.
         if let Some(MetricsFilter::And(operator)) = &input.metrics_configuration.filter {
             let predicates = usize::from(operator.prefix.is_some())
                 + operator.tags.as_ref().map_or(0, Vec::len)
@@ -305,6 +334,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if predicates < MIN_AND_OPERATOR_PREDICATES {
                 return Err(malformed_metrics_configuration());
             }
+        }
+
+        // "The access point ARN used when evaluating a metrics filter"
+        // (`MetricsFilter$AccessPointArn`, and `MetricsAndOperator$AccessPointArn` for the
+        // same predicate inside a conjunction): a value that is not an access point ARN —
+        // the ARN of the BUCKET the access point fronts, say — names no access point the
+        // metrics could be scoped to, so the document does not validate against the published
+        // schema either. Judged through the crate's one access-point-ARN reading
+        // ([`crate::state::is_s3_access_point_arn`]), wherever the document carries one.
+        if named_access_point_arn(&input.metrics_configuration)
+            .is_some_and(|arn| !crate::state::is_s3_access_point_arn(arn))
+        {
+            return Err(malformed_metrics_configuration());
         }
 
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
@@ -320,7 +362,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match bucket.put_metrics_configuration(input.id, input.metrics_configuration) {
             crate::state::BucketConfigurationWrite::Stored
             | crate::state::BucketConfigurationWrite::Replaced => Ok(
-                // `Unit` output: success is the modelled 200 and an empty body.
+                // `Unit` output: success is
+                // [`PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS`] and an empty body.
                 PutBucketMetricsConfigurationOutput,
             ),
             // "You are attempting to create a new configuration but have already reached
@@ -352,6 +395,23 @@ fn malformed_metrics_configuration() -> PutBucketMetricsConfigurationError {
         MALFORMED_XML_STATUS,
         crate::state::MALFORMED_XML_MESSAGE,
     )
+}
+
+/// The access point ARN `configuration`'s filter names, or `None` for a filter that names
+/// none: the union's own member, or the one the conjunction carries beside its other
+/// predicates.
+///
+/// At most one, because the filter is a choice and the conjunction declares the member once.
+/// One reading for both, because they are the same predicate — "the access point ARN used
+/// when evaluating a metrics filter" and "the access point ARN used when evaluating an `AND`
+/// predicate" — so a filter cannot be judged one way at the top level and another inside a
+/// conjunction.
+fn named_access_point_arn(configuration: &MetricsConfiguration) -> Option<&str> {
+    match &configuration.filter {
+        Some(MetricsFilter::AccessPointArn(arn)) => Some(arn.as_str()),
+        Some(MetricsFilter::And(operator)) => operator.access_point_arn.as_deref(),
+        _ => None,
+    }
 }
 
 /// The fewest predicates `MetricsFilter$And` may carry: "The operator must have at least

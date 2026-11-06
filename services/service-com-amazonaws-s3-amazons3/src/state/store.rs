@@ -87,6 +87,15 @@ pub struct ComAmazonawsS3Amazons3State {
     /// out of this set; a ceiling is what bounds it
     /// ([`MAX_METADATA_NAMESPACE_TABLES`]).
     pub(super) metadata_namespace_tables: BTreeSet<String>,
+    /// The secret THIS store's page tokens are authenticated under — the continuation
+    /// token every listing of a bucket's id-addressed configurations hands back (see
+    /// `state/configuration_tokens.rs`).
+    ///
+    /// Drawn from the system's randomness when the store is created and never reported, so
+    /// a token this store did not mint is detectable and refused rather than read as a
+    /// cursor into a position the caller chose. Private: [`Self::page_token_key`] is the
+    /// one way to it, and it hands back a copy of the key rather than the key's bytes.
+    pub(super) page_tokens: ::service_common::page_tokens::PageTokenKey,
 }
 
 impl Default for ComAmazonawsS3Amazons3State {
@@ -110,6 +119,7 @@ impl Default for ComAmazonawsS3Amazons3State {
             published_versions: 0,
             vended_sessions: BTreeMap::new(),
             metadata_namespace_tables: BTreeSet::new(),
+            page_tokens: ::service_common::page_tokens::PageTokenKey::new(),
         };
         store.record_published_buckets();
         store
@@ -117,6 +127,15 @@ impl Default for ComAmazonawsS3Amazons3State {
 }
 
 impl ComAmazonawsS3Amazons3State {
+    /// The key this store's continuation tokens are minted and read under.
+    ///
+    /// `Copy`, so a paginated read takes the key off the store and goes on to borrow the
+    /// configurations it is about to report in the same call. Read-only: nothing about the
+    /// store moves, which is what keeps a listing a report.
+    pub fn page_token_key(&self) -> ::service_common::page_tokens::PageTokenKey {
+        self.page_tokens
+    }
+
     /// Forget every session whose expiry the clock has already passed, reporting the
     /// credential ids so the caller can delete them from the credential store too.
     ///

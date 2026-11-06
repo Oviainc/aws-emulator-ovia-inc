@@ -36,6 +36,7 @@
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`.
 
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_metrics_configuration::PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
     MALFORMED_CONTINUATION_TOKEN_CODE, NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
 };
@@ -60,7 +61,7 @@ type ServedRow<'a> = (&'a str, Option<&'a str>, Vec<(&'a str, &'a str)>);
 /// The most configurations one page of this listing carries: "this action supports list
 /// pagination and does not return more than 100 configurations at a time"
 /// (`ListBucketMetricsConfigurations`'s own documentation).
-const CONFIGURATIONS_PER_PAGE: usize = 100;
+pub(crate) const CONFIGURATIONS_PER_PAGE: usize = 100;
 
 /// An account id that is NOT the one this emulator serves, so a request carrying it as its
 /// `ExpectedBucketOwner` names an owner no bucket here has.
@@ -68,7 +69,7 @@ const NOT_THE_OWNER: &str = "209876543210";
 
 /// `GET /<bucket>?metrics` — `ListBucketMetricsConfigurations`, optionally continuing at
 /// `token` and with any extra bound headers.
-async fn list_metrics(
+pub(crate) async fn list_metrics(
     router: &MultiServiceRouter,
     bucket: &str,
     token: Option<&str>,
@@ -113,7 +114,7 @@ fn is_truncated(answer: &Answer) -> bool {
 }
 
 /// The ids a listing reports, in the order the body carries them.
-fn listed_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn listed_ids(answer: &Answer) -> Vec<String> {
     reported_configurations(answer)
         .into_iter()
         .map(|(id, _)| id)
@@ -121,8 +122,8 @@ fn listed_ids(answer: &Answer) -> Vec<String> {
 }
 
 /// Put every `(id, filter)` of `configurations` on `name`, failing the case loudly if any
-/// put does not answer the modelled 200.
-async fn stand_up(
+/// put does not succeed.
+pub(crate) async fn stand_up(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -133,7 +134,7 @@ async fn stand_up(
         let put = put_metrics(router, name, id, filter.as_ref()).await;
         assert_eq!(
             put.status,
-            200,
+            PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
             "case {case:?}: setup must put {id:?}, got {} ({})",
             put.status,
             body_of(&put)
@@ -631,8 +632,9 @@ async fn a_delete_is_reflected_in_the_listing_and_in_the_read() {
         .await;
         assert_eq!(
             again.status,
-            200,
-            "case {deleted:?}: expected a put under the deleted id to answer 200, got {} ({})",
+            PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {deleted:?}: expected a put under the deleted id to answer \
+             {PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             again.status,
             body_of(&again)
         );

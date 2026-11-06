@@ -961,11 +961,14 @@ pub const MALFORMED_CONTINUATION_TOKEN_STATUS: u16 = 400;
 /// families so the two cannot drift. A put naming a longer id is refused rather than
 /// recorded, so what one bucket's maps key on is bounded whatever a caller does.
 ///
-/// The LENGTH is shared; the CODE a refusal carries is each family's own, since AWS answers
-/// an over-long id per family ([`INVALID_CONFIG_ID_CODE`] for an S3 Intelligent-Tiering id,
-/// and [`MALFORMED_XML_CODE`] for a metrics id, whose rule also constrains the character set
-/// and whose operation publishes no error of its own for a document it cannot take, so the
-/// document is refused for not validating against the published schema).
+/// The LENGTH is shared, and so is the reading of WHICH values identify a configuration
+/// ([`configuration_id_fault`]); the CODE a refusal carries is each family's own, since AWS
+/// answers an id outside the rule per family — [`INVALID_CONFIG_ID_CODE`] for an analytics
+/// or S3 Intelligent-Tiering id, which those operations report against the id itself, and
+/// [`MALFORMED_XML_CODE`] for a metrics configuration's `Id`, whose rule the metrics
+/// operation reports as the document failing to validate against the published schema
+/// (`PutBucketMetricsConfiguration` publishes no error of its own for a document it cannot
+/// take).
 pub const MAX_CONFIGURATION_ID_CHARS: usize = 64;
 
 /// The code S3 answers a `GetBucketReplication` for a bucket that has no replication
@@ -1030,21 +1033,10 @@ pub const MAX_METRICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 /// contain letters, numbers, periods, dashes, and underscores" (`MetricsConfiguration$Id`).
 /// The model constrains `MetricsId` no further — `smithy_query(query="shape",
 /// shape="MetricsId")` reports a plain string with no `length` or `pattern` — so nothing
-/// refuses a longer or oddly spelled id before [`is_valid_metrics_id`] does. The length
+/// refuses a longer or oddly spelled id before [`configuration_id_fault`] does. The length
 /// half is [`MAX_CONFIGURATION_ID_CHARS`], the bound every bucket configuration id shares;
 /// the character set is this family's own.
 pub const MAX_METRICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
-
-/// Whether `value` is an id a metrics configuration may be identified by: a configuration
-/// id by length ([`MAX_METRICS_ID_CHARS`]), every character of which is a letter, a number,
-/// a period, a dash or an underscore — the rule quoted on [`MAX_METRICS_ID_CHARS`].
-///
-/// An EMPTY id identifies no configuration, so it is not one either. The reading is
-/// [`configuration_id_fault`]'s, the one place the id rule lives, so this family and the
-/// others cannot drift apart on which values a bucket's map may key on.
-pub fn is_valid_metrics_id(value: &str) -> bool {
-    configuration_id_fault(value).is_none()
-}
 
 /// Whether `value` is long enough and short enough to identify a bucket configuration:
 /// between one and [`MAX_CONFIGURATION_ID_CHARS`] characters.
