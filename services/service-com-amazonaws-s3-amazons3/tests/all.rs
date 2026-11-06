@@ -281,6 +281,8 @@ mod refusal_resource_naming;
 mod refused_argument_envelope;
 #[path = "all/rename_object_query_parameter.rs"]
 mod rename_object_query_parameter;
+#[path = "all/replication_role_trust.rs"]
+mod replication_role_trust;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
 #[path = "all/scratch_probe.rs"]

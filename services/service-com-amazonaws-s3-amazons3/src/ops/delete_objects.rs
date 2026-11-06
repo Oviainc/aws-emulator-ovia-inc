@@ -226,7 +226,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification these deletes
         // owe names the call they came of by them.
         let correlation = crate::state::request_ids::RequestCorrelation::mint();
-        let output = self.store(input, ctx, &correlation)?;
+        // The role the bucket replicates under, resolved against IAM before the store is
+        // reached: every delete marker this batch lays is replicated by S3 assuming "the
+        // Identity and Access Management (IAM) role that Amazon S3 assumes when replicating
+        // objects" (`ReplicationConfiguration$Role`), and the question is asked ONCE for the
+        // whole batch — one request is addressed to one bucket, so one role governs every
+        // key in it.
+        let replication_role =
+            crate::state::replication::role_access(&*self.engine, ctx, &input.bucket).await;
+        let output = self.store(input, ctx, &correlation, replication_role)?;
         // Recorded LAST, so the response carries the pair the notifications already named
         // this call by.
         correlation.answer();
@@ -245,6 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
         input: DeleteObjectsInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         correlation: &crate::state::request_ids::RequestCorrelation,
+        replication_role: crate::state::replication::RoleAccess,
     ) -> Result<DeleteObjectsOutput, DeleteObjectsError> {
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
@@ -546,7 +555,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                         // delete of the same keys would. Only for a bucket that carries a
                         // configuration at all (`replicates`, asked once above).
                         if replicates {
-                            let _ = store.replicate_delete_marker(&input.bucket, key);
+                            let _ = store.replicate_delete_marker(
+                                &input.bucket,
+                                key,
+                                replication_role,
+                            );
                         }
                         events.push(
                             crate::state::notifications::ObjectEvent::new(

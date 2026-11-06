@@ -14,6 +14,11 @@
 //!
 //! * only an ENABLED rule replicates — "Specifies whether the rule is enabled"
 //!   (`ReplicationRule$Status`);
+//! * every copy is made UNDER THE ROLE the configuration names — "the Identity and Access
+//!   Management (IAM) role that Amazon S3 assumes when replicating objects"
+//!   (`ReplicationConfiguration$Role`) — so a role whose trust policy does not let the
+//!   Amazon S3 service principal assume it replicates nothing at all and the source version
+//!   reports the failure ([`RoleAccess`]);
 //! * a rule covers the keys its `Prefix`, or its `Filter`, selects: "An object key name
 //!   prefix that identifies the object or objects to which the rule applies"
 //!   (`ReplicationRule$Prefix`) and "a filter that identifies the subset of objects to
@@ -55,6 +60,80 @@ pub const RULE_ENABLED: &str = "Enabled";
 /// (`smithy_query(query="shape",shape="com.amazonaws.s3#DeleteMarkerReplicationStatus")`
 /// publishes `[Enabled, Disabled]`).
 pub const DELETE_MARKER_REPLICATION_ENABLED: &str = "Enabled";
+
+/// The service principal Amazon S3's replication assumes a role AS, and so the one a
+/// replication role's trust policy has to admit for S3 to be able to assume it: the role is
+/// "the Identity and Access Management (IAM) role that Amazon S3 assumes when replicating
+/// objects" (`ReplicationConfiguration$Role`), and S3 reaches `sts:AssumeRole` as its own
+/// service principal.
+pub const REPLICATION_SERVICE_PRINCIPAL: &str = "s3.amazonaws.com";
+
+/// Whether the role a bucket's replication configuration names is one Amazon S3 can assume
+/// — the role EVERY copy that configuration calls for is made under.
+///
+/// Read once per write ([`role_access`]) and handed to the two places that act on a
+/// configuration ([`super::ComAmazonawsS3Amazons3State::replicate_write`] and
+/// [`super::ComAmazonawsS3Amazons3State::replicate_delete_marker`]), so one write cannot
+/// copy a version under a role another part of the same write found unassumable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleAccess {
+    /// Nothing IAM answered withholds the role from S3: the copies the configuration calls
+    /// for are made, which is also the answer for a bucket that replicates nothing at all.
+    Assumable,
+    /// IAM holds the role the configuration names and the trust policy it carries does not
+    /// admit [`REPLICATION_SERVICE_PRINCIPAL`]: S3 cannot assume it, so no copy can be made
+    /// under it and the replication of every covered version fails.
+    Withheld,
+}
+
+/// Whether Amazon S3 can assume the role the bucket named `bucket` replicates under,
+/// resolved against the account's IAM records.
+///
+/// A replication is carried out by S3 assuming that role, so the role is what decides
+/// whether the copies a configuration calls for can be made at all — which is why this is
+/// asked per WRITE rather than when the configuration is stored: the trust policy in force
+/// at the moment of the copy is the one that governs it.
+///
+/// IAM is reached the way any emulated service reaches another, through the in-process
+/// callback, by the reading every service resolving a caller-supplied role shares
+/// (`service_common::iam_role`). The store is locked only for the read of the stored ARN and
+/// released before that hop, so this service's own guard is never held across it — and
+/// nothing is withheld that IAM did not answer: a role IAM holds nothing under, an answer
+/// this emulator could not read and an emulator with no IAM mounted all leave the
+/// replication to proceed.
+pub async fn role_access<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    bucket: &str,
+) -> RoleAccess {
+    let Some(state) = super::service_state(engine) else {
+        return RoleAccess::Assumable;
+    };
+    let role = {
+        let store = state.lock();
+        store
+            .bucket(bucket)
+            .and_then(super::Bucket::replication)
+            .map(|configuration| configuration.role.clone())
+    };
+    // A bucket carrying no replication configuration replicates nothing, so it names no
+    // role to resolve and pays no hop for one.
+    let Some(role) = role else {
+        return RoleAccess::Assumable;
+    };
+    if ::service_common::iam_role::held_role_is_unassumable(
+        ctx,
+        &super::request_region(ctx.parts()),
+        &role,
+        REPLICATION_SERVICE_PRINCIPAL,
+    )
+    .await
+    {
+        RoleAccess::Withheld
+    } else {
+        RoleAccess::Assumable
+    }
+}
 
 /// The bucket name the `Destination$Bucket` ARN `arn` names — "the Amazon Resource Name
 /// (ARN) of the bucket where you want Amazon S3 to store the results", whose resource part

@@ -503,6 +503,12 @@ impl ComAmazonawsS3Amazons3State {
     /// ceiling. Either way the status is reported from
     /// [`REPLICATION_SETTLES_AFTER`] past the write ([`ObjectReplication::status_at`]).
     ///
+    /// Every one of those copies is made under the role the configuration names, so `access`
+    /// — what IAM answered about that role ([`replication::role_access`]) — decides whether
+    /// any of them can be made at all: a role S3 cannot assume copies NOTHING, to no
+    /// destination, and the source version reports [`REPLICATION_STATUS_FAILED`], which is
+    /// the terminal outcome of a replication whose role withholds it.
+    ///
     /// Called by the write that recorded the version, AFTER the store accepted it, so a
     /// refused write replicates nothing. A REPLICA is never replicated again, because the
     /// copy is written through [`Self::put_replica`] — which records it and replicates
@@ -518,7 +524,12 @@ impl ComAmazonawsS3Amazons3State {
     /// for a copy that cannot be stored. A write past either ceiling records
     /// [`REPLICATION_STATUS_FAILED`], which is what the source version then reports: the
     /// copies past it were not made.
-    pub fn replicate_write(&mut self, bucket: &str, key: &str) -> Option<ObjectReplication> {
+    pub fn replicate_write(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        access: replication::RoleAccess,
+    ) -> Option<ObjectReplication> {
         // The tag set alone, because that is all the SELECTION needs: a bucket with no
         // configuration — and a key no rule covers — pays no copy of the object at all.
         let tags = self.bucket(bucket)?.object(key)?.tags.clone();
@@ -533,11 +544,21 @@ impl ComAmazonawsS3Amazons3State {
         // More destinations than one write replicates to is work this emulator does not do:
         // the copies past the ceiling are not made, and the source version says so.
         let mut every_copy_made = asked <= MAX_REPLICATION_DESTINATIONS_PER_WRITE;
+        // And a role S3 cannot assume performs no copy at all: the destinations the
+        // configuration names are left untouched, whatever they could have held, because
+        // the copy into each of them would have been made under that role.
+        let targets: Vec<replication::ReplicationTarget> = match access {
+            replication::RoleAccess::Assumable => destinations
+                .into_iter()
+                .take(MAX_REPLICATION_DESTINATIONS_PER_WRITE)
+                .collect(),
+            replication::RoleAccess::Withheld => {
+                every_copy_made = false;
+                Vec::new()
+            }
+        };
         let mut copied_bytes = 0usize;
-        for target in destinations
-            .into_iter()
-            .take(MAX_REPLICATION_DESTINATIONS_PER_WRITE)
-        {
+        for target in targets {
             // A destination this emulator cannot hold a version in replicates nothing: a
             // bucket it does not hold, one whose versioning is not enabled, and the SOURCE
             // bucket itself (a bucket cannot be its own destination, which would replace
@@ -613,13 +634,25 @@ impl ComAmazonawsS3Amazons3State {
     /// in the destination is that bucket's own ([`Self::remove_object`] mints its id there),
     /// because a delete marker carries no bytes to copy.
     ///
+    /// A marker is replicated under the configuration's role like every other copy, so
+    /// `access` ([`replication::role_access`]) decides whether it is laid at all: a role S3
+    /// cannot assume marks no destination.
+    ///
     /// Called by the delete that laid the marker. The PERMANENT delete of one version never
     /// reaches here, which is the published rule: a delete naming a version id is not
     /// replicated. A batch delete asks [`Self::replicates_objects`] once and calls this only
     /// for a bucket that has a configuration at all, so a bucket with none pays nothing per
     /// key; and one call marks at most [`MAX_REPLICATION_DESTINATIONS_PER_WRITE`]
     /// destinations, the same ceiling a write's fan-out is bounded by.
-    pub fn replicate_delete_marker(&mut self, bucket: &str, key: &str) -> usize {
+    pub fn replicate_delete_marker(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        access: replication::RoleAccess,
+    ) -> usize {
+        if access == replication::RoleAccess::Withheld {
+            return 0;
+        }
         let marked: Vec<String> = replication::destinations(self, bucket, key, &[])
             .into_iter()
             .filter(|target| target.delete_markers && target.bucket != bucket)

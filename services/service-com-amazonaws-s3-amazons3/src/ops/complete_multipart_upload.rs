@@ -338,7 +338,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this
         // completion owes names the call it came of by them.
         let correlation = crate::state::request_ids::RequestCorrelation::mint();
-        let output = self.store(input, ctx, &correlation)?;
+        // The role the bucket replicates under, resolved against IAM before the store is
+        // reached: the object this completion assembles is replicated by S3 assuming "the
+        // Identity and Access Management (IAM) role that Amazon S3 assumes when replicating
+        // objects" (`ReplicationConfiguration$Role`), and the store work below is
+        // synchronous and holds the guard throughout.
+        let replication_role =
+            crate::state::replication::role_access(&*self.engine, ctx, &input.bucket).await;
+        let output = self.store(input, ctx, &correlation, replication_role)?;
         // Recorded LAST, so the response carries the pair the notifications already named
         // this call by.
         correlation.answer();
@@ -357,6 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         input: CompleteMultipartUploadInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         correlation: &crate::state::request_ids::RequestCorrelation,
+        replication_role: crate::state::replication::RoleAccess,
     ) -> Result<CompleteMultipartUploadOutput, CompleteMultipartUploadError> {
         // A completion needs nothing from the request beyond its deserialized input: the
         // upload it assembles is named by the bucket, the key and the upload id, and the
@@ -445,6 +453,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
                 "the shared S3 store is unreachable from this engine",
             ));
         };
+
+        // The role the bucket replicates under was resolved against IAM before this was
+        // called, so that in-process hop is never made while this service's own guard is
+        // held — the copies this completion owes are made by S3 assuming it.
 
         let mut store = state.lock();
         let Some(bucket_record) = store.bucket(&input.bucket) else {
@@ -695,7 +707,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // The replication the bucket's own configuration owes for the version this
         // completion stored — the same seam `PutObject` replicates its write through, so an
         // object assembled from parts is replicated exactly like one written whole.
-        let _ = store.replicate_write(&input.bucket, &input.key);
+        let _ = store.replicate_write(&input.bucket, &input.key, replication_role);
 
         // The object event this completion produced, and the notifications the bucket's
         // configuration owes for it — the same seam `PutObject` publishes its write

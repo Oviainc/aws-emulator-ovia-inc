@@ -365,7 +365,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this copy owes
         // names the call it came of by them.
         let correlation = crate::state::request_ids::RequestCorrelation::mint();
-        let output = self.store(input, ctx, &correlation)?;
+        // The role the DESTINATION bucket replicates under, resolved against IAM before the
+        // store is reached: the copy this request stores is replicated by S3 assuming "the
+        // Identity and Access Management (IAM) role that Amazon S3 assumes when replicating
+        // objects" (`ReplicationConfiguration$Role`), and the store work below is
+        // synchronous and holds the guard throughout.
+        let replication_role =
+            crate::state::replication::role_access(&*self.engine, ctx, &input.bucket).await;
+        let output = self.store(input, ctx, &correlation, replication_role)?;
         // Recorded LAST, so the response carries the pair the notifications already named
         // this call by.
         correlation.answer();
@@ -384,6 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         input: CopyObjectInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         correlation: &crate::state::request_ids::RequestCorrelation,
+        replication_role: crate::state::replication::RoleAccess,
     ) -> Result<CopyObjectOutput, CopyObjectError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store neither the source can be read nor the copy recorded, and
@@ -608,6 +616,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             }
             Err(_) => return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()),
         };
+
+        // The role the DESTINATION bucket replicates under was resolved against IAM before
+        // this was called, so that in-process hop is never made while this service's own
+        // guard is held — the copies this write owes are made by S3 assuming it.
 
         let mut store = state.lock();
 
@@ -1097,7 +1109,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
 
         // The replication the DESTINATION bucket's own configuration owes for the version
         // this copy stored — the same seam `PutObject` replicates its write through.
-        let _ = store.replicate_write(&input.bucket, &input.key);
+        let _ = store.replicate_write(&input.bucket, &input.key, replication_role);
 
         // The object event this copy produced, and the notifications the destination
         // bucket's configuration owes for it — the same seam `PutObject` publishes its

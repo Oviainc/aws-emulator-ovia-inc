@@ -353,7 +353,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this delete
         // owes names the call it came of by them.
         let correlation = crate::state::request_ids::RequestCorrelation::mint();
-        let output = self.store(input, ctx, &correlation)?;
+        // The role the bucket replicates under, resolved against IAM before the store is
+        // reached: a delete marker this delete lays is replicated by S3 assuming "the
+        // Identity and Access Management (IAM) role that Amazon S3 assumes when replicating
+        // objects" (`ReplicationConfiguration$Role`), so whether IAM lets it is asked here
+        // — the store work below is synchronous and holds the guard throughout.
+        let replication_role =
+            crate::state::replication::role_access(&*self.engine, ctx, &input.bucket).await;
+        let output = self.store(input, ctx, &correlation, replication_role)?;
         // Recorded LAST, so the response carries the pair the notifications already named
         // this call by.
         correlation.answer();
@@ -372,6 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         input: DeleteObjectInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         correlation: &crate::state::request_ids::RequestCorrelation,
+        replication_role: crate::state::replication::RoleAccess,
     ) -> Result<DeleteObjectNoContent, DeleteObjectError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::unmodeled(
@@ -600,9 +608,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         // (`DeleteMarkerReplication$Status`) — so the marker this delete laid is laid in
         // those destinations too. A delete that removed a version, or found nothing there,
         // laid no marker and so replicates nothing; the delete of ONE version (handled
-        // above, where `versionId` is named) is never replicated.
+        // above, where `versionId` is named) is never replicated. A configuration whose role
+        // S3 cannot assume marks no destination, because the marker would be laid under it.
         if matches!(outcome, crate::state::ObjectDeletion::MarkerLaid { .. }) {
-            let _ = store.replicate_delete_marker(&input.bucket, &input.key);
+            let _ = store.replicate_delete_marker(&input.bucket, &input.key, replication_role);
         }
 
         // What this delete DID is also what it notifies about: a removal is

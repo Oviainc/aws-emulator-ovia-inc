@@ -586,6 +586,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service reads the calling principal and its policies from are never reached
         // while this service's own guard is held.
         let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
+        // And so is the role the bucket replicates under, for the same reason: the copies
+        // this write owes are made by S3 assuming "the Identity and Access Management (IAM)
+        // role that Amazon S3 assumes when replicating objects"
+        // (`ReplicationConfiguration$Role`), and whether IAM lets it is asked of IAM rather
+        // than taken on trust.
+        let replication_role =
+            crate::state::replication::role_access(&*self.engine, ctx, &input.bucket).await;
         let mut store = state.lock();
         // The bucket decides the encryption of a write that named none of it: "Amazon S3
         // encrypts data with server-side encryption by using Amazon S3 managed keys
@@ -983,8 +990,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`PutBucketReplication`), so the copy is made here — after the store accepted the
         // write, and while it is still held — and the source version records what it did. A
         // bucket with no replication configuration, and a key no enabled rule covers, owes
-        // nothing.
-        let _ = store.replicate_write(&input.bucket, &input.key);
+        // nothing; a configuration whose role S3 cannot assume copies nothing and the
+        // source version reports that failure.
+        let _ = store.replicate_write(&input.bucket, &input.key, replication_role);
 
         // The object event this write produced, and the notifications the bucket's event
         // notification configuration owes for it — rendered while the store is still
