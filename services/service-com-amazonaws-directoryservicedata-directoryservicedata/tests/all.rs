@@ -22,3 +22,6 @@ mod user_lifecycle;
 
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;
+
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;

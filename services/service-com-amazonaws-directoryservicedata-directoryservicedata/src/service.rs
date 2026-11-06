@@ -75,10 +75,23 @@
 //! themselves in `x-amzn-errortype` as `<ShapeName>:<the URI of the namespace
 //! that declares them>`; a modelled error is serialized through its own schema,
 //! which names it as every other modelled error of this service is named.
+//!
+//! # Where the WORDS of a refusal live
+//!
+//! Which envelope a refused request is answered in is this file's; the prose inside
+//! it is [`validation`]'s, which states the renderings that are this service's own
+//! rather than the framework's (an enum value set's published order, the value a
+//! clause about a collection quotes, a constraint a list's elements broke stated at
+//! the list, a `@pattern` quoted as the expression a value must satisfy). Every path
+//! that words a refusal — the per-operation wrapper below, the refusal seam and the
+//! routing-error seam — goes through that one module, so the three cannot disagree.
+
+pub mod validation;
+
+use std::collections::HashMap;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::{Schema, ShapeType};
-use aws_smithy_schema_server::constraints;
 use aws_smithy_schema_server::constraints::path;
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
@@ -220,8 +233,10 @@ where
             // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
             // is not `Sync`, and this future is. The protocol itself is.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
-            let violations = refused_by::<O>(protocol, req);
-            if let Some(refusal) = validation_exception(protocol, &violations) {
+            let (violations, lists) = validation::refusing_request::<O>(protocol, req);
+            if let Some(refusal) =
+                validation_exception(protocol, &violations, &[O::INPUT_SCHEMA], &lists)
+            {
                 return refusal;
             }
             self.operation.run(svc, req, ctx).await
@@ -235,36 +250,26 @@ where
     }
 }
 
-/// Every violation that refuses `req` before `O`'s handler runs: a `@required` member
-/// absent, or a value outside a declared constraint. Empty when the request is valid,
-/// and empty for a failure that is NOT a refusal — a body the codec cannot read is a
-/// serialization failure, which this service's request layer answers before this
-/// wrapper is ever reached (see [`body_refusal`]).
-///
-/// Both classes come from the framework's own machinery (the protocol's deserializer
-/// and `constraints::validate` over the built input), so this cannot find a different
-/// set of violations from the walk that follows it.
-///
-/// Taken from the tree's shared collecting half, which is also where the value each
-/// clause quotes is restored to the bytes the caller sent — including a value the
-/// validating walk withheld as it recorded the violation, which this service's clause
-/// states.
-fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
-    ::service_common::validation::refusing_violations_restoring_withheld::<O>(protocol, req)
-}
-
 /// This service's answer to `violations`: HTTP 400 `ValidationException` with the
 /// prose in the `Message` member the model declares, serialized through that shape's
 /// own schema. `None` when there is nothing to refuse — and also when the error
 /// cannot be serialized, which leaves the framework's walk to refuse the request in
 /// its own envelope rather than answering a 400 with no reason at all.
+///
+/// The prose is [`validation::refusal_message`]'s: `input_schemas` are the input shapes
+/// a clause stated at a LIST member reads that member's element constraint set off, and
+/// `lists` holds the collection such a clause quotes, keyed by the member path it is
+/// stated at.
 fn validation_exception(
     protocol: &dyn ServerHttpProtocol,
     violations: &[Violation],
+    input_schemas: &[&'static Schema],
+    lists: &HashMap<String, String>,
 ) -> Option<RtResponse> {
-    let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+    let message =
+        validation::refusal_message(violations, input_schemas, |member| lists.get(member).cloned())?;
     let refused = crate::ops::types::shared_types::ValidationException {
-        message: Some(constraints::envelope(&stated)?),
+        message: Some(message),
         // `Reason` names a rule beyond the modelled constraints (an unknown
         // `NextToken`, an attribute this directory does not hold); a member outside
         // its declared constraint has no such reason, and the handlers that do know
@@ -279,33 +284,6 @@ fn validation_exception(
             VALIDATION_EXCEPTION_STATUS,
         )
         .ok()
-}
-
-/// A violation as this service states it: the framework's clause, with a `@pattern`
-/// named without the anchors that bracket it.
-///
-/// Directory Service Data states the pattern of a refused member as the expression
-/// alone — `d-[0-9a-f]{10}` for `DirectoryId`'s `^d-[0-9a-f]{10}$` — because the
-/// clause already says the whole member must satisfy it, so the anchors would be
-/// restating the sentence. Every other clause is the framework's unchanged.
-fn as_stated(violation: &Violation) -> Violation {
-    match &violation.kind {
-        ViolationKind::Pattern(regex) => Violation {
-            kind: ViolationKind::Pattern(unanchored(regex).to_string()),
-            ..violation.clone()
-        },
-        _ => violation.clone(),
-    }
-}
-
-/// `regex` without a leading `^` or a trailing `$`. A trailing `$` escaped by a
-/// backslash is a literal dollar in the expression, not an anchor, so it stays.
-fn unanchored(regex: &str) -> &str {
-    let inner = regex.strip_prefix('^').unwrap_or(regex);
-    match inner.strip_suffix('$') {
-        Some(stripped) if !stripped.ends_with('\\') => stripped,
-        _ => inner,
-    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -358,18 +336,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // renders — a protocol whose body this service does not re-render, and the
         // fallback in `validation_exception`. Wording it here from the same
         // violations keeps the two paths from disagreeing: a value outside a declared
-        // bound is this service's `ValidationException` either way. The clauses come
-        // from the framework's own renderer so a new constraint class cannot arrive
-        // with its own sentence; `as_stated` only names a `@pattern` the way this
-        // service names it.
+        // bound is this service's `ValidationException` either way, stated by the one
+        // renderer [`validation`] owns, so a new constraint class cannot arrive here
+        // with a sentence of its own.
         match refusal {
-            Refusal::Invalid(violations) => {
-                let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
-                Some(Refused {
-                    code: VALIDATION_EXCEPTION.to_string(),
-                    message: constraints::envelope(&stated)?,
-                })
-            }
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                // No request is at hand here, so the one half of a clause that needs it
+                // is left out: a clause about a collection states no value rather than a
+                // summary the caller never sent. Which operation was called is unknown
+                // too, so an element constraint set is read off every input shape this
+                // service serves and a member two of them declare differently keeps the
+                // framework's own per-element clause.
+                message: validation::refusal_message(violations, &modeled_inputs(), |_| None)?,
+            }),
             // Authentication is the framework's to word: this service models
             // `AccessDeniedException` for a caller it refuses, and the request never
             // reached an operation, so there is nothing of this service's own to say.
@@ -399,7 +379,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `InModelledEnvelope` answers an absent body member with.
         if let Some(route) = modeled_route(req.method(), path) {
             let absent = absent_bound_members(route, req);
-            if let Some(refusal) = validation_exception(self.entry.protocol(), &absent) {
+            // An absent member has no value and no elements, so neither half of a clause
+            // that reads the request's own values applies: the route's own input shape is
+            // the only schema a clause here could need.
+            if let Some(refusal) =
+                validation_exception(self.entry.protocol(), &absent, &[route], &HashMap::new())
+            {
                 return Some(refusal);
             }
         }

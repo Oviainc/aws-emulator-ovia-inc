@@ -12,6 +12,10 @@
 //! declares (`@pattern`, `@range`, `@length` on a string and on a list, an enum's
 //! value set, `@required`, and a constraint on a list's MEMBER) across seven
 //! operations; the recorded `DescribeUser` case is one row of it.
+//!
+//! The sibling suite `validation_message_rendering` reads the same `Message` for the
+//! three renderings that are this service's own rather than the framework's, over the
+//! sets those rules generalise across; the harness below is shared with it.
 
 use std::sync::Arc;
 
@@ -21,11 +25,11 @@ use service_com_amazonaws_directoryservicedata_directoryservicedata::EmulatedSer
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A `DirectoryId` satisfying `^d-[0-9a-f]{10}$`.
-const DIRECTORY: &str = "d-1234567890";
+pub(super) const DIRECTORY: &str = "d-1234567890";
 
 /// The error code every refusal below carries: the shape
 /// `com.amazonaws.directoryservicedata#ValidationException`, `@httpError` 400.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+pub(super) const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// `DirectoryId`'s `@pattern`, as the refusal states it: the model declares
 /// `^d-[0-9a-f]{10}$` (`smithy_query(query="shape", shape="DirectoryId")`) and the
@@ -45,14 +49,31 @@ const REALM_PATTERN: &str = r"([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?";
 /// (`smithy_query(query="shape", shape="LdapDisplayName")`).
 const LDAP_DISPLAY_NAME_PATTERN: &str = "[A-Za-z*][A-Za-z-*]*";
 
+/// `LdapDisplayName`'s `@length` bounds — the constraint on the MEMBER of
+/// `LdapDisplayNameList` (`smithy_query(query="shape", shape="LdapDisplayName")`).
+pub(super) const LDAP_DISPLAY_NAME_FLOOR: usize = 1;
+pub(super) const LDAP_DISPLAY_NAME_CEILING: usize = 63;
+
+/// `LdapDisplayName`'s WHOLE declared constraint set, as a clause stated at the list
+/// those names are elements of nests it: the `@length` maximum, its minimum, then the
+/// `@pattern` (`smithy_query(query="shape", shape="LdapDisplayNameList")` — member
+/// `LdapDisplayName`, len 1..63, pattern `^[A-Za-z*][A-Za-z-*]*$`).
+pub(super) fn search_attribute_element_set() -> String {
+    format!(
+        "Member must satisfy constraint: [Member must have length less than or equal to 63, \
+         Member must have length greater than or equal to 1, \
+         Member must satisfy regular expression pattern: {LDAP_DISPLAY_NAME_PATTERN}]"
+    )
+}
+
 /// `MaxResults`' `@range` (`smithy_query(query="shape", shape="MaxResults")`).
 const MAX_RESULTS_FLOOR: i64 = 1;
 const MAX_RESULTS_CEILING: i64 = 250;
 
 /// `LdapDisplayNameList`'s own `@length`
 /// (`smithy_query(query="shape", shape="LdapDisplayNameList")`).
-const SEARCH_ATTRIBUTES_FLOOR: usize = 1;
-const SEARCH_ATTRIBUTES_CEILING: usize = 25;
+pub(super) const SEARCH_ATTRIBUTES_FLOOR: usize = 1;
+pub(super) const SEARCH_ATTRIBUTES_CEILING: usize = 25;
 
 /// `SearchString`'s `@length` maximum, from `SearchUsers`' input
 /// (`smithy_query(query="operation", operation="SearchUsers")` — len 1..64).
@@ -65,7 +86,7 @@ const SIGNED_FOR_DS_DATA: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=abc";
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(super) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -74,27 +95,32 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// What the emulator answered: the status, the `x-amzn-errortype` header and the body.
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(super) struct Answer {
+    pub(super) status: u16,
+    pub(super) error_type: String,
+    pub(super) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(super) fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
 
     /// The `Message` member of the answer, or `None` when the body carries none.
-    fn message(&self) -> Option<&str> {
+    pub(super) fn message(&self) -> Option<&str> {
         self.body.get("Message").and_then(Value::as_str)
     }
 }
 
 /// Every operation of this service is `POST <route>` with a JSON body; `DirectoryId`
 /// rides in the query string (`@httpQuery`).
-async fn call(router: &MultiServiceRouter, route: &str, directory: &str, body: &Value) -> Answer {
+pub(super) async fn call(
+    router: &MultiServiceRouter,
+    route: &str,
+    directory: &str,
+    body: &Value,
+) -> Answer {
     let uri = format!("{route}?DirectoryId={directory}");
     let request = ::http::Request::builder()
         .method("POST")
@@ -132,7 +158,7 @@ async fn call(router: &MultiServiceRouter, route: &str, directory: &str, body: &
 }
 
 /// The envelope a single-violation refusal states, built the way the service builds it.
-fn one_violation(value: &str, member: &str, requirement: &str) -> String {
+pub(super) fn one_violation(value: &str, member: &str, requirement: &str) -> String {
     format!(
         "1 validation error detected: Value {value} at '{member}' \
          failed to satisfy constraint: {requirement}"
@@ -224,9 +250,10 @@ fn cases() -> Vec<Case> {
             message: one_violation(
                 "'NotAGroupType'",
                 "groupType",
-                // `GroupType`'s modelled values, in model order
-                // (`smithy_query(query="shape", shape="GroupType")`).
-                "Member must satisfy enum value set: [Distribution, Security]",
+                // `GroupType`'s modelled values, in the order this service publishes
+                // the set in (`crate::service::validation::GROUP_TYPE_VALUE_SET`),
+                // which is not the order the model declares them in.
+                "Member must satisfy enum value set: [Security, Distribution]",
             ),
         },
         Case {
@@ -248,21 +275,21 @@ fn cases() -> Vec<Case> {
             directory: DIRECTORY.to_string(),
             body: json!({"SearchString": "j", "SearchAttributes": ["1BadAttribute"]}),
             message: one_violation(
-                "'1BadAttribute'",
-                // The element, not the list: the path names the position that failed.
-                "searchAttributes.1.member",
-                &format!(
-                    "Member must satisfy regular expression pattern: {LDAP_DISPLAY_NAME_PATTERN}"
-                ),
+                // The list, not the element: the clause is stated at the member the
+                // request carries, quoting the whole list it held.
+                "'[1BadAttribute]'",
+                "searchAttributes",
+                &search_attribute_element_set(),
             ),
         },
         Case {
             what: "a SearchAttributes list one above its @length ceiling",
             route: "/Groups/SearchGroups",
             directory: DIRECTORY.to_string(),
-            body: json!({"SearchString": "e", "SearchAttributes": over_long_attributes}),
+            body: json!({"SearchString": "e", "SearchAttributes": over_long_attributes.clone()}),
             message: one_violation(
-                &format!("'{} items'", SEARCH_ATTRIBUTES_CEILING + 1),
+                // The value is the list the request carried, every element of it.
+                &format!("'[{}]'", over_long_attributes.join(", ")),
                 "searchAttributes",
                 &format!(
                     "Member must have length less than or equal to {SEARCH_ATTRIBUTES_CEILING}"
@@ -275,7 +302,8 @@ fn cases() -> Vec<Case> {
             directory: DIRECTORY.to_string(),
             body: json!({"SearchString": "j", "SearchAttributes": []}),
             message: one_violation(
-                &format!("'{} items'", SEARCH_ATTRIBUTES_FLOOR - 1),
+                // An empty list renders as an empty list, not as a count of none.
+                "'[]'",
                 "searchAttributes",
                 &format!(
                     "Member must have length greater than or equal to {SEARCH_ATTRIBUTES_FLOOR}"
