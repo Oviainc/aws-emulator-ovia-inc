@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/boundary_refusal_wording.rs"]
+mod boundary_refusal_wording;
 #[path = "all/route_claims.rs"]
 mod route_claims;
 #[path = "all/signaling_channel_lifecycle.rs"]
@@ -35,3 +37,5 @@ mod stream_record_state_model;
 mod stream_tags;
 #[path = "all/stream_version_mismatch_message.rs"]
 mod stream_version_mismatch_message;
+#[path = "all/version_token_read_paths.rs"]
+mod version_token_read_paths;

@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries the workspace's ONE AWS wording of a constraint-violation
+# refusal, which `service.rs` states this service's error code over.
+service-common = { path = "../common" }
 # Digests the stable, opaque host id a stream's data endpoint carries per plane.
 sha2 = { workspace = true }
 # Renders that digest as the hexadecimal label the host form uses.

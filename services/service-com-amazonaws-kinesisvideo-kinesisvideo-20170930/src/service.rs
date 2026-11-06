@@ -39,7 +39,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken here. `override_refusal` states a refused input value in
+//! this service's own error code and AWS's own wording ([`invalid_argument_refusal`]), and
+//! `override_operation` serves every routable request through
+//! [`error_message_member::ErrorMessageMemberOperation`], so the text of a failure reaches
+//! the caller in the body member this service's model declares for it — see
+//! [`error_message_member`] for that rule and why the refusal seam cannot state it.
 
+pub mod error_message_member;
+
+use aws_smithy_schema_server::Violation;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -92,6 +102,9 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper `override_operation` hands back. Stateless, and held here rather than
+    /// built per request, because the seam answers a reference borrowed from `&self`.
+    error_message_member: error_message_member::ErrorMessageMemberOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -101,6 +114,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            error_message_member: error_message_member::ErrorMessageMemberOperation,
         }
     }
 }
@@ -128,33 +142,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every routable request is served through the wrapper, which delegates to the
+        // operation the generated routing table names and then reports the text of whatever
+        // it answered in the body member this service's error shapes declare (see
+        // [`error_message_member`]). A request the table cannot serve is declined here, so
+        // the router answers it as the unroutable request it is.
+        error_message_member::routes(&self.entry, req)
+            .then_some(&self.error_message_member as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Kinesis Video Streams states a bad input value as
-        // `InvalidArgumentException` — "The value for this input parameter is
-        // invalid." — which `smithy_query(query="service_info")` lists among this
-        // service's common errors, so every operation declares it. The framework
-        // would otherwise answer the synthetic `ValidationException`, a code no
-        // kinesisvideo client branches on. The code and the message move together:
-        // the message stays the framework's envelope, which names the member and the
-        // constraint it failed, so the caller can fix the request from it.
-        match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "InvalidArgumentException".to_string(),
-                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
-                    "The value for this input parameter is invalid.".to_string()
-                }),
-            }),
-            // Every other refusal class keeps the framework's wording.
-            _ => None,
-        }
+        // See [`invalid_argument_refusal`]: this service's code for a bad input value,
+        // over the shared AWS wording of the constraint envelope. Every other refusal
+        // class keeps the framework's own wording.
+        invalid_argument_refusal(refusal)
     }
 
     fn override_routing_error(
@@ -184,4 +185,56 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The error code Kinesis Video Streams answers a refused input value with:
+/// `InvalidArgumentException` — "The value for this input parameter is invalid." —
+/// which `smithy_query(query="service_info")` lists among this service's common
+/// errors, so every operation declares it. The framework would otherwise answer the
+/// synthetic `ValidationException`, a code no kinesisvideo client branches on.
+const INVALID_ARGUMENT_EXCEPTION: &str = "InvalidArgumentException";
+
+/// What this service says when the refusal carries no violation to state at all — the
+/// modeled shape's own sentence, since there is no member to name.
+const INVALID_ARGUMENT_MESSAGE: &str = "The value for this input parameter is invalid.";
+
+/// How this service words a request the boundary validator refused before any handler
+/// ran, or `None` to keep the framework's wording for a refusal that is not about a
+/// value.
+///
+/// The code and the message travel together. The message is the shared AWS wording of
+/// the constraint envelope — the framework's own envelope, member paths and
+/// requirements, with the two renderings AWS differs from the framework in: a
+/// `@pattern` requirement is quoted without the whole-value anchors the model wraps it
+/// in, and a clause states NO rejected value. Nothing about the envelope, the paths or
+/// the requirements is spelled here, so this service cannot drift from the others that
+/// state the same sentence; what it chooses, and all it chooses, is its error code and
+/// which clauses state no value ([`states_no_value`]).
+fn invalid_argument_refusal(refusal: &Refusal) -> Option<Refused> {
+    if !matches!(refusal, Refusal::Invalid(_)) {
+        return None;
+    }
+    let message = service_common::validation_message::aws_validation_refusal_withholding_violations(
+        refusal,
+        states_no_value,
+    )
+    .map(|stated| stated.message)
+    .unwrap_or_else(|| INVALID_ARGUMENT_MESSAGE.to_string());
+    Some(Refused {
+        code: INVALID_ARGUMENT_EXCEPTION.to_string(),
+        message,
+    })
+}
+
+/// Whether the clause for `violation` states no value — true for every value a request
+/// actually carried, whatever constraint class it broke.
+///
+/// This service's refusals state the REQUIREMENT a member's value had to satisfy and
+/// never the value that missed it: the sentence is therefore the same for every request
+/// that breaks one constraint of one member, so no caller-supplied bytes reach the
+/// message. A member that was not there at all has no value to withhold, and keeps the
+/// `null` the framework states an absent member with, which is a fact about the request
+/// rather than a value out of it.
+fn states_no_value(violation: &Violation) -> bool {
+    violation.value.is_some()
 }
