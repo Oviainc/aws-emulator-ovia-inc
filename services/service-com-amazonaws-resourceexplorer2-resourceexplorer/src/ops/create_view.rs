@@ -283,28 +283,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let resource_id = guard.mint_resource_id("view", now);
-        let entry = crate::state::ViewEntry {
-            view_arn: ::engine::emulator_arn(
-                crate::state::SERVICE_NAMESPACE,
-                &region,
-                &format!("view/{}/{resource_id}", input.view_name),
-            ),
-            view_name: input.view_name,
-            region,
-            owner: ::engine::emulator_account_id().to_string(),
-            scope,
-            filter_string,
-            included_properties,
-            created_at: now,
-            last_updated_at: now,
-            tags,
-            client_token: input.client_token,
-        };
-        let output = CreateViewOutput {
+        let entry = guard.insert_view(
+            crate::state::NewView {
+                view_name: input.view_name,
+                region,
+                scope: Some(scope),
+                filter_string,
+                included_properties,
+                tags,
+                client_token: input.client_token,
+            },
+            now,
+        );
+        Ok(CreateViewOutput {
             view: Some(entry.to_wire()),
-        };
-        guard.views.insert(entry.view_arn.clone(), entry);
-        Ok(output)
+        })
     }
 }

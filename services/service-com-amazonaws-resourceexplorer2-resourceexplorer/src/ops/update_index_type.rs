@@ -181,15 +181,6 @@ impl From<UpdateIndexTypeErrorModeled> for UpdateIndexTypeError {
 /// The input member a type refusal blames, named the way the model declares it.
 const TYPE_MEMBER: &str = "Type";
 
-/// How the account's one-aggregator rule reads when a promotion runs into it, in the
-/// words `ConflictException` and `UpdateIndexType` document for exactly this case. It
-/// carries nothing from the request: which index is already the aggregator is not part
-/// of what AWS says here.
-const AGGREGATOR_EXISTS_MESSAGE: &str =
-    "You already have an AGGREGATOR index in a different Amazon Web Services Region. \
-     Before you can promote a different index to be the aggregator index for the \
-     account, you must first demote the existing aggregator index to type LOCAL.";
-
 /// The index type this request asks for, when it is one the model's `IndexType` enum
 /// admits.
 ///
@@ -323,18 +314,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The index being promoted is LOCAL (otherwise nothing changed), so any
             // aggregator this finds is a different one.
             if guard.aggregator_index().is_some() {
-                return Err(conflict(AGGREGATOR_EXISTS_MESSAGE.to_string()));
+                return Err(conflict(
+                    crate::state::AGGREGATOR_EXISTS_MESSAGE.to_string(),
+                ));
             }
             if guard
                 .aggregator_promotion_blocked_until(&input.arn, now)
                 .is_some()
             {
-                return Err(conflict(format!(
-                    "You must wait {} hours after demoting an aggregator index to a local \
-                     index before you can promote another index to be the new aggregator \
-                     index for the account.",
-                    crate::state::AGGREGATOR_PROMOTION_WAIT.as_secs() / 3_600
-                )));
+                return Err(conflict(crate::state::aggregator_wait_message()));
             }
         }
         // Demoting the aggregator is what starts the documented wait before ANOTHER index

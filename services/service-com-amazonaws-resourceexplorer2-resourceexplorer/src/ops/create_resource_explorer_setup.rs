@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceExplorerSetup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceExplorerSetup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceExplorerSetup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: turns Resource Explorer on across the requested Regions by creating
+//! each Region's index and the named view through `crate::state`, records the work as
+//! a setup task whose steps the clock settles, and answers with that task's id.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +156,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceExplorerSetup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceExplorerSetupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceExplorerSetup"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResourceExplorerSetupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        guard.settle(now);
+
+        let aggregator_regions = input.aggregator_regions.clone().unwrap_or_default();
+
+        // The Regions this call configures: every Region in `RegionList`, plus an
+        // aggregator Region named outside it — an aggregator Region holds a
+        // user-owned index of its own, which is what receives the replicated index
+        // information from the others. The Region keys the index map, so only a
+        // Region this emulator serves can get one.
+        let mut regions: Vec<String> = Vec::new();
+        for region in input.region_list.iter().chain(aggregator_regions.iter()) {
+            if !crate::state::is_servable_region(region) {
+                return Err(CreateResourceExplorerSetupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("{region} is not an Amazon Web Services Region."),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+            if !regions.iter().any(|held| held == region) {
+                regions.push(region.clone());
+            }
+        }
+        // Ordered by Region, so paging over the task's Regions is stable.
+        regions.sort();
+
+        // "You can have only one aggregator index per Amazon Web Services account", and
+        // after a demotion another index may not take its place until the documented
+        // wait has run: the same two rules `UpdateIndexType` promotes an index under.
+        if let Some(wanted) = aggregator_regions.first() {
+            match guard.aggregator_index() {
+                Some(existing) if &existing.region != wanted => {
+                    return Err(CreateResourceExplorerSetupErrorModeled::ConflictException(
+                        ConflictException {
+                            message: crate::state::AGGREGATOR_EXISTS_MESSAGE.to_string(),
+                        },
+                    )
+                    .into());
+                }
+                // The account's aggregator index is already the one this setup asks
+                // for, so there is nothing to promote and nothing to wait for.
+                Some(_) => {}
+                None => {
+                    // The index that would be promoted: the Region's own, when it has
+                    // one. A Region with none gets a new index, which is never the index
+                    // the wait was started by.
+                    let candidate = guard
+                        .indexes
+                        .get(wanted)
+                        .map(|index| index.arn.clone())
+                        .unwrap_or_default();
+                    if guard
+                        .aggregator_promotion_blocked_until(&candidate, now)
+                        .is_some()
+                    {
+                        return Err(CreateResourceExplorerSetupErrorModeled::ConflictException(
+                            ConflictException {
+                                message: crate::state::aggregator_wait_message(),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        let task_id = guard.mint_resource_id("setup-task", now);
+        let mut region_tasks: Vec<crate::state::SetupRegionTask> = Vec::new();
+        for region in regions {
+            let is_aggregator = aggregator_regions.iter().any(|named| named == &region);
+            let wanted_type = if is_aggregator {
+                crate::state::INDEX_TYPE_AGGREGATOR
+            } else {
+                crate::state::INDEX_TYPE_LOCAL
+            };
+            let held = guard
+                .indexes
+                .get(&region)
+                .map(|index| (index.state, index.index_type.clone(), index.settles_at));
+
+            // What the Region's index step is, and when the Region's index is usable:
+            // a view lives behind its Region's index, so the view step is one
+            // dependency level later than that instant.
+            let being_deleted = || {
+                format!(
+                    "The index in Region {region} is being deleted. Wait for the \
+                     deletion to finish, then try again."
+                )
+            };
+            let (index_step, index_ready_at) = match held {
+                None => {
+                    let arn = guard
+                        .insert_index(
+                            &region,
+                            wanted_type,
+                            ::std::collections::HashMap::new(),
+                            None,
+                            now,
+                        )
+                        .arn;
+                    let ready_at = now + crate::state::INDEX_SETTLE_DELAY;
+                    (
+                        crate::state::SetupStep::in_progress(Some(arn), ready_at),
+                        Some(ready_at),
+                    )
+                }
+                // An index being torn down cannot be used and cannot be replaced
+                // while it is still there, so the Region's steps fail.
+                Some((crate::state::IndexLifecycle::Deleting, _, _)) => (
+                    crate::state::SetupStep::failed(
+                        crate::state::SETUP_CONFLICT_CODE,
+                        being_deleted(),
+                    ),
+                    None,
+                ),
+                Some((state, index_type, settles_at)) => {
+                    // An index that is still coming up, or switching type, is usable
+                    // when the clock owes it `ACTIVE`; one that is active is usable now.
+                    let ready_at = match state {
+                        crate::state::IndexLifecycle::Active => now,
+                        _ => settles_at.unwrap_or(now),
+                    };
+                    if is_aggregator && index_type != crate::state::INDEX_TYPE_AGGREGATOR {
+                        // The Region already has an index, but not of the type this
+                        // setup asks for, so it is promoted the way `UpdateIndexType`
+                        // promotes one: the type changes now, and the index reports
+                        // `UPDATING` while replication from the other Regions starts.
+                        let (arn, due_at) = match guard.indexes.get_mut(&region) {
+                            Some(index) => {
+                                index.index_type =
+                                    crate::state::INDEX_TYPE_AGGREGATOR.to_string();
+                                index.last_updated_at = now;
+                                if index.state == crate::state::IndexLifecycle::Active {
+                                    index.state = crate::state::IndexLifecycle::Updating;
+                                    index.settles_at =
+                                        Some(now + crate::state::INDEX_SETTLE_DELAY);
+                                }
+                                (
+                                    Some(index.arn.clone()),
+                                    index.settles_at.unwrap_or(ready_at),
+                                )
+                            }
+                            None => (None, ready_at),
+                        };
+                        (
+                            crate::state::SetupStep::in_progress(arn, due_at),
+                            Some(due_at),
+                        )
+                    } else {
+                        // The Region already holds the index this setup would have
+                        // created, so there is nothing for the step to do.
+                        let arn = guard
+                            .indexes
+                            .get(&region)
+                            .map(|index| index.arn.clone())
+                            .unwrap_or_default();
+                        (crate::state::SetupStep::skipped(arn), Some(ready_at))
+                    }
+                }
+            };
+
+            let view_step = match index_ready_at {
+                // The view the setup asks for is already in the Region: view names
+                // are unique per Region, so that view IS the one it asks for.
+                Some(_) if guard.view_by_name(&region, &input.view_name).is_some() => {
+                    let arn = guard
+                        .view_by_name(&region, &input.view_name)
+                        .map(|view| view.view_arn.clone())
+                        .unwrap_or_default();
+                    crate::state::SetupStep::skipped(arn)
+                }
+                Some(ready_at) => crate::state::SetupStep::in_progress(
+                    None,
+                    ready_at + crate::state::INDEX_SETTLE_DELAY,
+                ),
+                // The index step failed, so the view behind that index cannot be
+                // created either.
+                None => crate::state::SetupStep::failed(
+                    crate::state::SETUP_CONFLICT_CODE,
+                    being_deleted(),
+                ),
+            };
+
+            region_tasks.push(crate::state::SetupRegionTask {
+                region,
+                index: index_step,
+                view: view_step,
+            });
+        }
+
+        guard.insert_setup_task(crate::state::SetupTask {
+            task_id: task_id.clone(),
+            view_name: input.view_name,
+            regions: region_tasks,
+            created_at: now,
+        });
+        Ok(CreateResourceExplorerSetupOutput { task_id })
     }
 }

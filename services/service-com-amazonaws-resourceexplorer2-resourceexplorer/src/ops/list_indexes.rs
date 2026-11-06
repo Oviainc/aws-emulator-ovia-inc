@@ -182,11 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|index| {
                 wanted_regions.is_none_or(|regions| regions.contains(&index.region))
             })
-            .map(|index| Index {
-                region: Some(index.region.clone()),
-                arn: Some(index.arn.clone()),
-                r#type: Some(index.index_type.clone()),
-            })
+            .map(crate::state::IndexEntry::to_wire)
             .collect();
         // The cursor is bound to the filters the listing was made with, so a token from
         // one filter set cannot resume another at that offset.

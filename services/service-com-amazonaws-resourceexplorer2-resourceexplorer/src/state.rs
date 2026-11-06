@@ -11,10 +11,19 @@
 //! from a sibling:
 //!
 //! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::settle`] — the
+//! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::settle`] — the
 //!   clock-owed index lifecycle transitions (`CREATING` -> `ACTIVE`, `UPDATING` ->
-//!   `ACTIVE`, `DELETING` -> gone, taking the Region's views with it).
-//! * [`ViewEntry::to_wire`] — the modelled `View` structure, so `CreateView` and
-//!   `GetView` cannot disagree about what a stored view looks like.
+//!   `ACTIVE`, `DELETING` -> gone, taking the Region's views with it), and the
+//!   setup-task steps that wait on them.
+//! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::insert_index`] /
+//!   [`ComAmazonawsResourceexplorer2ResourceexplorerState::insert_view`] — the ONE
+//!   place an index or a view is created, so the operations that create one cannot
+//!   disagree about its ARN or its stored shape.
+//! * [`IndexEntry::to_wire`] / [`ViewEntry::to_wire`] — the modelled `Index` and
+//!   `View` structures, so `CreateView` and `GetView` cannot disagree about what a
+//!   stored view looks like.
+//! * [`SetupTask`] (in [`setup_tasks`]) — the multi-Region setup tasks
+//!   `CreateResourceExplorerSetup` starts and `GetResourceExplorerSetup` reports on.
 //! * [`paginate`] / [`encode_page_token`] — the opaque `NextToken` cursors the
 //!   `@paginated` operations share. The offset travels INSIDE the token, so a
 //!   `@readonly` list operation never writes cursor state.
@@ -26,6 +35,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
+
+mod setup_tasks;
+pub use setup_tasks::*;
 
 /// The ARN namespace, SigV4 signing name and endpoint prefix of this service, and
 /// therefore the `Service` of every resource it owns.
@@ -121,7 +133,9 @@ pub const INDEX_TYPE_LOCAL: &str = "LOCAL";
 
 /// The `IndexType` value of the one index that collects the account's other Regions:
 /// "You can have only one aggregator index per Amazon Web Services account"
-/// (`UpdateIndexType` documentation).
+/// (`UpdateIndexType` documentation). It is the type that "receive[s] replicated
+/// index information from all other Regions where there is a user-owned index"
+/// (`CreateResourceExplorerSetupInput$AggregatorRegions`).
 pub const INDEX_TYPE_AGGREGATOR: &str = "AGGREGATOR";
 
 /// The two values the model's `IndexType` enum admits, which are therefore the only
@@ -135,6 +149,29 @@ pub const INDEX_TYPES: [&str; 2] = [INDEX_TYPE_LOCAL, INDEX_TYPE_AGGREGATOR];
 /// must wait 24 hours before you can promote another index to be the new aggregator
 /// index for the account" (`UpdateIndexType` documentation).
 pub const AGGREGATOR_PROMOTION_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How the account's one-aggregator rule reads when a promotion runs into it, in the
+/// words `ConflictException` and `UpdateIndexType` document for exactly this case. It
+/// carries nothing from the request: which index is already the aggregator is not part
+/// of what AWS says here.
+///
+/// Shared, because more than one operation can promote an index to `AGGREGATOR` and
+/// they may not disagree about how the refusal reads.
+pub const AGGREGATOR_EXISTS_MESSAGE: &str =
+    "You already have an AGGREGATOR index in a different Amazon Web Services Region. \
+     Before you can promote a different index to be the aggregator index for the \
+     account, you must first demote the existing aggregator index to type LOCAL.";
+
+/// How the wait after a demotion reads when a promotion runs into it, with the
+/// documented [`AGGREGATOR_PROMOTION_WAIT`] as its only variable part.
+pub fn aggregator_wait_message() -> String {
+    format!(
+        "You must wait {} hours after demoting an aggregator index to a local index \
+         before you can promote another index to be the new aggregator index for the \
+         account.",
+        AGGREGATOR_PROMOTION_WAIT.as_secs() / 3_600
+    )
+}
 
 /// The account's most recent demotion of its aggregator index back to `LOCAL`.
 ///
@@ -167,6 +204,20 @@ pub struct IndexEntry {
     pub tags: HashMap<String, String>,
     /// The `@idempotencyToken` the creating request carried, for replaying it.
     pub client_token: Option<String>,
+}
+
+impl IndexEntry {
+    /// The modelled `Index` structure for this stored index.
+    ///
+    /// The ONE place an `Index` is built, so the operations that report one cannot
+    /// disagree about what a stored index looks like.
+    pub fn to_wire(&self) -> crate::ops::types::Index {
+        crate::ops::types::Index {
+            region: Some(self.region.clone()),
+            arn: Some(self.arn.clone()),
+            r#type: Some(self.index_type.clone()),
+        }
+    }
 }
 
 /// One view, as `CreateView` stored it.
@@ -281,10 +332,27 @@ pub struct ComAmazonawsResourceexplorer2ResourceexplorerState {
     /// How many resources this store has minted, so the identifier it derives for the
     /// next one cannot collide with any it has already handed out.
     pub minted_resources: u64,
+    /// The multi-Region setup tasks this store has recorded, keyed by `TaskId`.
+    pub setup_tasks: HashMap<String, SetupTask>,
     /// The last time the account's aggregator index was demoted to `LOCAL`, if ever:
     /// what [`Self::aggregator_promotion_blocked_until`] measures the documented wait
     /// from.
     pub aggregator_demotion: Option<AggregatorDemotion>,
+}
+
+/// Everything one stored view's members come from, for
+/// [`ComAmazonawsResourceexplorer2ResourceexplorerState::insert_view`].
+#[derive(Debug, Clone, Default)]
+pub struct NewView {
+    pub view_name: String,
+    pub region: String,
+    /// Absent means the default `CreateView` documents: "the value defaults to the
+    /// Amazon Web Services account used to call this operation".
+    pub scope: Option<String>,
+    pub filter_string: Option<String>,
+    pub included_properties: Vec<String>,
+    pub tags: HashMap<String, String>,
+    pub client_token: Option<String>,
 }
 
 impl ComAmazonawsResourceexplorer2ResourceexplorerState {
@@ -371,6 +439,74 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
                 }
             }
         }
+        // The setup-task steps wait on the index lifecycle above, so they settle
+        // against the state it just left behind.
+        self.settle_setup_tasks(now);
+    }
+
+    /// Create `region`'s index, as the operations that turn Resource Explorer on in
+    /// a Region do.
+    ///
+    /// The ONE place an index is created: indexing is an asynchronous background
+    /// task, so the index starts out `CREATING` and the clock owes it `ACTIVE`.
+    pub fn insert_index(
+        &mut self,
+        region: &str,
+        index_type: &str,
+        tags: HashMap<String, String>,
+        client_token: Option<String>,
+        now: SystemTime,
+    ) -> IndexEntry {
+        let resource_id = self.mint_resource_id("index", now);
+        let entry = IndexEntry {
+            arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                region,
+                &format!("index/{resource_id}"),
+            ),
+            region: region.to_string(),
+            index_type: index_type.to_string(),
+            state: IndexLifecycle::Creating,
+            settles_at: Some(now + INDEX_SETTLE_DELAY),
+            created_at: now,
+            last_updated_at: now,
+            tags,
+            client_token,
+        };
+        self.indexes.insert(region.to_string(), entry.clone());
+        // What was stored, so the caller reports the stored values and nothing else.
+        entry
+    }
+
+    /// Create the view `new` describes in its Region, as the operations that create
+    /// a view do.
+    ///
+    /// The ONE place a view is created, so a view created as part of a multi-Region
+    /// setup is indistinguishable from one `CreateView` made.
+    pub fn insert_view(&mut self, new: NewView, now: SystemTime) -> ViewEntry {
+        let resource_id = self.mint_resource_id("view", now);
+        let entry = ViewEntry {
+            view_arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                &new.region,
+                &format!("view/{}/{resource_id}", new.view_name),
+            ),
+            view_name: new.view_name,
+            region: new.region,
+            owner: ::engine::emulator_account_id().to_string(),
+            scope: new
+                .scope
+                .unwrap_or_else(|| ::engine::emulator_arn("iam", "", "root")),
+            filter_string: new.filter_string,
+            included_properties: new.included_properties,
+            created_at: now,
+            last_updated_at: now,
+            tags: new.tags,
+            client_token: new.client_token,
+        };
+        self.views.insert(entry.view_arn.clone(), entry.clone());
+        // What was stored, so the caller reports the stored values and nothing else.
+        entry
     }
 
     /// The Region's index when it can back view creation and search — that is,

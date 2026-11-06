@@ -236,32 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let resource_id = guard.mint_resource_id("index", now);
-        let entry = crate::state::IndexEntry {
-            arn: ::engine::emulator_arn(
-                crate::state::SERVICE_NAMESPACE,
-                &region,
-                &format!("index/{resource_id}"),
-            ),
-            region: region.clone(),
-            // "This operation creates only a local index" — UpdateIndexType is what
-            // promotes one to AGGREGATOR.
-            index_type: crate::state::INDEX_TYPE_LOCAL.to_string(),
-            // Indexing is an asynchronous background task, so the index is reported
-            // CREATING and the clock owes it ACTIVE.
-            state: crate::state::IndexLifecycle::Creating,
-            settles_at: Some(now + crate::state::INDEX_SETTLE_DELAY),
-            created_at: now,
-            last_updated_at: now,
-            tags: input.tags.unwrap_or_default(),
-            client_token: input.client_token,
-        };
-        let output = CreateIndexOutput {
+        // "This operation creates only a local index" — UpdateIndexType is what
+        // promotes one to AGGREGATOR. Indexing is an asynchronous background task,
+        // so the stored index starts out CREATING and the clock owes it ACTIVE.
+        let entry = guard.insert_index(
+            &region,
+            crate::state::INDEX_TYPE_LOCAL,
+            input.tags.unwrap_or_default(),
+            input.client_token,
+            now,
+        );
+        Ok(CreateIndexOutput {
             arn: Some(entry.arn.clone()),
             state: Some(entry.state.as_wire().to_string()),
             created_at: Some(::aws_smithy_types::DateTime::from(entry.created_at)),
-        };
-        guard.indexes.insert(region, entry);
-        Ok(output)
+        })
     }
 }
