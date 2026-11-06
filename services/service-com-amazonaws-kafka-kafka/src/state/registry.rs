@@ -1504,8 +1504,11 @@ impl ComAmazonawsKafkaKafkaState {
     }
 
     /// The channels `cluster_arn` holds, as an endpoint for `region` sees them at
-    /// `now`, in the registry's own order (by channel ARN, which carries the
-    /// channel name) — the listing counterpart of [`Self::settled_channel_in`].
+    /// `now`, ordered by CHANNEL NAME — the identity a channel has within its
+    /// cluster ("Must be unique within the cluster",
+    /// `CreateChannelRequest$ChannelName`), so the order is total and does not
+    /// depend on the id the ARN carries. The listing counterpart of
+    /// [`Self::settled_channel_in`].
     ///
     /// Reporting only, and the writes are the ones the clock already owed: the
     /// removals this cluster's channels were due are materialised first, so a
@@ -1531,10 +1534,13 @@ impl ComAmazonawsKafkaKafkaState {
                 channel.settle(now);
             }
         }
-        arns.iter()
+        let mut channels: Vec<&Channel> = arns
+            .iter()
             .filter_map(|arn| self.channels.get(arn))
             .filter(|channel| channel.region == region)
-            .collect()
+            .collect();
+        channels.sort_by(|left, right| left.name.cmp(&right.name));
+        channels
     }
 
     /// Accept the deletion of the channel `channel_arn` names under

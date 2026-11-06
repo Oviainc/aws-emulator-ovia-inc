@@ -5,7 +5,7 @@
 //!
 //! RULE: the listing REPORTS the channels its cluster holds — the records
 //! `CreateChannel` persisted, rendered the way the channel's own reader renders
-//! them, in the registry's order — and writes nothing of its own: it is scoped to
+//! them, in CHANNEL-NAME order — and writes nothing of its own: it is scoped to
 //! the cluster in the request path, `MaxResults` / `NextToken` page it without
 //! dropping or repeating an entry, `TopicNameFilter` keeps the channels streaming
 //! that topic, and a `ClusterArn` this endpoint's region holds no cluster for is
@@ -13,8 +13,10 @@
 //!
 //! The rows differ along what the rule generalises over: how many channels the
 //! cluster holds, which destination each delivers to, which topic each streams,
-//! the page size (including sizes that divide the list and ones that do not), the
-//! filter value, which cluster, and which region.
+//! whether one channel's name is a PREFIX of another's (where ordering by name
+//! and ordering by the ARN that embeds it disagree), the page size (including
+//! sizes that divide the list and ones that do not), the filter value, which
+//! cluster, and which region.
 
 use serde_json::{json, Value};
 
@@ -90,8 +92,10 @@ impl ChannelRow {
 }
 
 /// The channels the suite's cluster holds: destination kinds and topics varied,
-/// and the names deliberately NOT in creation order, so an ordering assertion
-/// cannot pass by accident.
+/// the names deliberately NOT in creation order so an ordering assertion cannot
+/// pass by accident, and one pair (`orders`, `orders-s3`) where one name is a
+/// PREFIX of the other — name order and channel-ARN order disagree there, since
+/// the ARN continues with `/` after the name and `-` sorts before `/`.
 fn channel_rows() -> Vec<ChannelRow> {
     vec![
         ChannelRow {
@@ -118,6 +122,11 @@ fn channel_rows() -> Vec<ChannelRow> {
             name: "ledger-s3",
             topic: "ledger",
             iceberg: false,
+        },
+        ChannelRow {
+            name: "orders",
+            topic: "ledger",
+            iceberg: true,
         },
     ]
 }
@@ -280,7 +289,8 @@ async fn the_listing_reports_every_channel_its_cluster_holds() {
     .await;
 
     // The whole listing, with no page member: every channel of this cluster, in
-    // the registry's order, which is by channel name.
+    // channel-name order — including the prefix pair, where that order differs
+    // from the order of the ARNs the names are embedded in.
     let listed = list_channels(&emulator, &cluster, "").await;
     let reported = entries(&listed, "whole-listing");
     let mut expected_names: Vec<&str> = rows.iter().map(|row| row.name).collect();

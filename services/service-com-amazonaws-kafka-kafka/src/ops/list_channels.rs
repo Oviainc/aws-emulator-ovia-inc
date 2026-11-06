@@ -2,8 +2,8 @@
 
 //! @op ListChannels
 //!
-//! Pages the channels one cluster holds, in the registry's own order (by channel
-//! ARN, which carries the channel name), out of the records `CreateChannel`
+//! Pages the channels one cluster holds, in CHANNEL-NAME order (the identity a
+//! channel has within its cluster), out of the records `CreateChannel`
 //! persisted: the cluster is resolved first (a `ClusterArn` that is not an MSK
 //! cluster ARN is a bad request, and a well-formed one this endpoint's region
 //! holds no cluster for is a 404 rather than an empty page, which would claim the
@@ -138,12 +138,12 @@ impl From<ListChannelsErrorModeled> for ListChannelsError {
 /// resume another cluster's channel listing.
 const NEXT_TOKEN_PREFIX: &str = "kafka:channels:";
 
-/// Separates the cluster ARN a token was minted for from the channel ARN the page
-/// stopped at. An MSK ARN cannot contain it, so the plaintext splits back into
-/// exactly two fields.
+/// Separates the cluster ARN a token was minted for from the channel NAME the
+/// page stopped at. Neither an MSK ARN nor a channel name can contain it, so the
+/// plaintext splits back into exactly two fields.
 const NEXT_TOKEN_SEPARATOR: char = '#';
 
-/// Encode the cluster and the channel ARN a page stopped at as a token, through
+/// Encode the cluster and the channel name a page stopped at as a token, through
 /// the crate's one page-token codec ([`crate::state::encode_page_token`]).
 fn encode_next_token(cluster_arn: &str, last_channel: &str) -> String {
     crate::state::encode_page_token(
@@ -152,7 +152,7 @@ fn encode_next_token(cluster_arn: &str, last_channel: &str) -> String {
     )
 }
 
-/// The channel ARN a token resumes after, or `None` when the token is not one
+/// The channel name a token resumes after, or `None` when the token is not one
 /// this operation minted FOR THIS CLUSTER: a token carries the list it was minted
 /// from, so one cluster's page token cannot resume another cluster's listing.
 fn decode_next_token(token: &str, cluster_arn: &str) -> Option<String> {
@@ -225,12 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A token names the channel the previous page stopped at; the next page
-        // starts after it in the registry's own order, so a channel created or
+        // starts after it in the listing's own order, so a channel created or
         // removed between pages shifts nothing already returned.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => match decode_next_token(token, &input.cluster_arn) {
-                Some(arn) => Some(arn),
+                Some(name) => Some(name),
                 None => {
                     return Err(ListChannelsErrorModeled::BadRequestException(
                         BadRequestException {
@@ -250,11 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(1, MAX_RESULTS_LIMIT as usize);
 
         let mut state = state.lock();
+        // One instant for the whole request, so the cluster the listing resolves,
+        // the channels it reports and the transitions it materialises all agree
+        // about what the clock already owed.
+        let now = std::time::SystemTime::now();
 
         // Channels are listed FROM a cluster, so an endpoint that holds no cluster
         // for this ARN has no list to serve — which is a missing resource, not an
-        // empty page.
-        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+        // empty page. Resolved through the SETTLING lookup every other reader of a
+        // cluster uses, so this listing cannot disagree with them about the state
+        // the clock already owed that cluster.
+        if state
+            .settled_cluster_in(&region, &input.cluster_arn, now)
+            .is_none()
+        {
             return Err(
                 ListChannelsErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
@@ -264,9 +273,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let now = std::time::SystemTime::now();
         let mut page: Vec<ChannelInfo> = Vec::with_capacity(page_size);
-        let mut last_arn: Option<String> = None;
+        let mut last_name: Option<String> = None;
         let mut more_remain = false;
         for channel in state
             .settled_channels_in(&region, &input.cluster_arn, now)
@@ -274,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|channel| {
                 resume_after
                     .as_deref()
-                    .is_none_or(|last| channel.arn.as_str() > last)
+                    .is_none_or(|last| channel.name.as_str() > last)
             })
         {
             if input
@@ -289,14 +297,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             page.push(channel.to_channel_info());
-            last_arn = Some(channel.arn.clone());
+            last_name = Some(channel.name.clone());
         }
 
-        // The token is minted from the REGISTRY KEY the resume comparison uses,
-        // not from the rendered `ChannelInfo`, so the two can never disagree and a
-        // full page can never be mistaken for the last one.
+        // The token is minted from the KEY the resume comparison uses — the
+        // channel name the listing is ordered by — not from the rendered
+        // `ChannelInfo`, so the two can never disagree and a full page can never
+        // be mistaken for the last one.
         let next_token = match more_remain {
-            true => last_arn
+            true => last_name
                 .as_deref()
                 .map(|last| encode_next_token(&input.cluster_arn, last)),
             false => None,
