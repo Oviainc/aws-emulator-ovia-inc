@@ -156,11 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let group = store.multicast_groups.get(&input.id).ok_or_else(|| {
             GetMulticastGroupError::from(GetMulticastGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("MulticastGroup {} not found", input.id)),
-                    resource_id: Some(input.id.clone()),
-                    resource_type: Some("MulticastGroup".to_string()),
-                },
+                crate::state::multicast_group_not_found(&input.id),
             ))
         })?;
 

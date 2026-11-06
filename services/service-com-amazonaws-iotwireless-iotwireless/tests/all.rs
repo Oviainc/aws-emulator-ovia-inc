@@ -21,6 +21,8 @@ mod device_profile_lifecycle;
 mod fuota_task_device_association;
 #[path = "all/fuota_task_lifecycle.rs"]
 mod fuota_task_lifecycle;
+#[path = "all/multicast_group_device_association.rs"]
+mod multicast_group_device_association;
 #[path = "all/multicast_group_lifecycle.rs"]
 mod multicast_group_lifecycle;
 #[path = "all/service_profile_lifecycle.rs"]

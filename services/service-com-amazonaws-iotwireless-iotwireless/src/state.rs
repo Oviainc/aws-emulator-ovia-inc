@@ -358,8 +358,9 @@ pub struct WirelessDevice {
     /// that carries one reports a `FuotaDeviceStatus`.
     pub fuota_task_id: Option<String>,
     /// The multicast group this device belongs to, set by
-    /// `AssociateWirelessDeviceWithMulticastGroup` and cleared by its disassociate —
-    /// both still scaffolded. `ListWirelessDevices?multicastGroupId=` selects on it.
+    /// `AssociateWirelessDeviceWithMulticastGroup` and cleared by its disassociate (still
+    /// scaffolded). `ListWirelessDevices?multicastGroupId=` selects on it, and
+    /// `GetMulticastGroup` counts the devices that name a group.
     pub multicast_group_id: Option<String>,
     pub tags: Vec<Tag>,
     /// When the device was registered. Reported by `GetWirelessDeviceStatistics` and
@@ -510,6 +511,19 @@ pub fn fuota_task_not_found(id: &str) -> ResourceNotFoundException {
         message: Some(format!("FuotaTask {id} not found")),
         resource_id: Some(id.to_string()),
         resource_type: Some("FuotaTask".to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` body for a multicast group the account does not hold.
+///
+/// One function, so every operation that addresses a multicast group by `Id` — its
+/// reader, and the association operations that resolve one — refuses a missing one with
+/// the same body.
+pub fn multicast_group_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("MulticastGroup {id} not found")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some("MulticastGroup".to_string()),
     }
 }
 

@@ -240,8 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Whether a stored device satisfies every filter the request supplied.
 ///
 /// Each filter is answered from the device's own persisted record — including the FUOTA
-/// task `AssociateWirelessDeviceWithFuotaTask` writes, and the multicast group the
-/// (still scaffolded) `Associate*WithMulticastGroup` operations will.
+/// task `AssociateWirelessDeviceWithFuotaTask` writes and the multicast group
+/// `AssociateWirelessDeviceWithMulticastGroup` writes.
 fn matches(device: &crate::state::WirelessDevice, input: &ListWirelessDevicesInput) -> bool {
     if let Some(destination_name) = input.destination_name.as_deref() {
         if device.destination_name != destination_name {
@@ -313,8 +313,11 @@ fn statistics(device: &crate::state::WirelessDevice) -> WirelessDeviceStatistics
         }),
         // A FUOTA status exists only for a device that belongs to a task: one that has
         // just joined is at the first modelled status, because no FUOTA session has
-        // reported anything for it. The multicast members stay unset while nothing can
-        // join a device to a group.
+        // reported anything for it. The multicast members stay unset for a reason of the
+        // same kind: `MulticastDeviceStatus` reports how a multicast SETUP session went
+        // and `McGroupId` is the numeric LoRaWAN group address such a session assigns,
+        // and no multicast session runs here, so neither is reported for work nothing
+        // ran. A device's group membership is reported by the filter above.
         fuota_device_status: device
             .fuota_task_id
             .is_some()
