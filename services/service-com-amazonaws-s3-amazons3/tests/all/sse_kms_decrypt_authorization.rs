@@ -73,6 +73,11 @@ const SSE_S3: &str = "AES256";
 /// The IAM action a read that serves an SSE-KMS object's bytes is authorized under.
 const DECRYPT_ACTION: &str = "kms:Decrypt";
 
+/// The encryption-context ENTRY NAME S3 binds an object's data key to (Amazon S3 User
+/// Guide, *Using server-side encryption with KMS keys*, "Encryption context"), which is
+/// what `kms:EncryptionContextKeys` carries for such a read.
+const ARN_CONTEXT_ENTRY: &str = "aws:s3:arn";
+
 /// The code S3 answers an authorization refusal with, and the status it carries (Amazon S3
 /// "Error responses": `AccessDenied`, HTTP 403).
 const ACCESS_DENIED: &str = "AccessDenied";
@@ -367,10 +372,7 @@ impl Emulator {
             headers.push(("x-amz-server-side-encryption-aws-kms-key-id", key_id));
         }
         if bucket_key {
-            headers.push((
-                "x-amz-server-side-encryption-bucket-key-enabled",
-                "true",
-            ));
+            headers.push(("x-amz-server-side-encryption-bucket-key-enabled", "true"));
         }
         let written = self
             .s3(
@@ -485,15 +487,16 @@ fn identity_policy(actions: Value) -> String {
 }
 
 /// The ARN of the object `key` in [`BUCKET`], which is the value of the encryption-context
-/// entry S3 binds an object's data key to.
+/// entry S3 binds an object's data key to — the bucket's own ARN with the key as the rest of
+/// the resource part.
 fn object_arn(key: &str) -> String {
-    format!("arn:aws:s3:::{BUCKET}/{key}")
+    format!("{}/{key}", bucket_arn())
 }
 
 /// The ARN of [`BUCKET`] itself, which is that entry's value for an object stored under an
-/// S3 Bucket Key.
+/// S3 Bucket Key — asked of the one helper this test binary already names a bucket ARN with.
 fn bucket_arn() -> String {
-    format!("arn:aws:s3:::{BUCKET}")
+    super::bucket_analytics_configuration::bucket_arn(BUCKET)
 }
 
 /// The regional endpoint name of an AWS service, which is the value `kms:ViaService`
@@ -719,6 +722,39 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
                 json!({"StringEquals": {
                     "kms:EncryptionContext:aws:s3:arn": object_arn("context-in-scope"),
                 }}),
+            )])),
+            reader: as_reader.clone(),
+            denied: Some(Denial::NoResourcePolicy),
+        },
+        Row {
+            // `kms:EncryptionContextKeys` names the ENTRY NAMES of the request's encryption
+            // context, one value per entry (KMS's own condition keys), so a statement scoped
+            // by it governs the requests whose context carries exactly the entries it names.
+            case: "a grant scoped to the entry NAMES the read's context carries",
+            object_key: "context-keys-in-scope",
+            algorithm: SSE_KMS,
+            bucket_key: false,
+            policy: Some(policy(vec![statement(
+                "Allow",
+                &reader.role_arn,
+                json!(DECRYPT_ACTION),
+                json!({"ForAllValues:StringEquals": {
+                    "kms:EncryptionContextKeys": ARN_CONTEXT_ENTRY,
+                }}),
+            )])),
+            reader: as_reader.clone(),
+            denied: None,
+        },
+        Row {
+            case: "a grant scoped to an entry NAME the read's context does not carry",
+            object_key: "context-keys-out-of-scope",
+            algorithm: SSE_KMS,
+            bucket_key: false,
+            policy: Some(policy(vec![statement(
+                "Allow",
+                &reader.role_arn,
+                json!(DECRYPT_ACTION),
+                json!({"ForAllValues:StringEquals": {"kms:EncryptionContextKeys": "tenant"}}),
             )])),
             reader: as_reader.clone(),
             denied: Some(Denial::NoResourcePolicy),
