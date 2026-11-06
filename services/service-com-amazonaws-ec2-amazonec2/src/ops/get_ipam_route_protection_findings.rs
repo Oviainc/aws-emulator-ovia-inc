@@ -253,14 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The pools of THIS IPAM, which is what decides whose routes these findings are: a
         // pool names its IPAM by `IpamPool$IpamArn` (the modelled [`IpamPool`] carries no IPAM
-        // id at all), the same member the scope count is recounted by.
-        let ipam_arn = ipam.ipam_arn.clone().unwrap_or_default();
-        let pools: ::std::collections::BTreeMap<&str, &IpamPool> = store
-            .ipam_pools
-            .iter()
-            .filter(|(_, pool)| pool.ipam_arn.as_deref() == Some(ipam_arn.as_str()))
-            .map(|(pool_id, pool)| (pool_id.as_str(), pool))
-            .collect();
+        // id at all), the same member the scope count is recounted by. An IPAM the store holds
+        // no ARN for names NO pool — the ARN is matched as the `Option` it is rather than
+        // through an empty string, which a pool stored without one would otherwise match.
+        let ipam_arn = ipam.ipam_arn.clone();
+        let pools: ::std::collections::BTreeMap<&str, &IpamPool> = ipam_arn
+            .as_deref()
+            .map(|ipam_arn| {
+                store
+                    .ipam_pools
+                    .iter()
+                    .filter(|(_, pool)| pool.ipam_arn.as_deref() == Some(ipam_arn))
+                    .map(|(pool_id, pool)| (pool_id.as_str(), pool))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // The ROA data this sample is validated against, read once for the whole call rather
         // than once per route.
@@ -281,10 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state lock.
         let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
         let mut selected: Vec<SelectedFinding> = Vec::new();
-        for (cidr, route) in &store.byoip_cidrs {
-            if budget.exhausted() {
-                break;
-            }
+        // Set only when the walk STOPPED on the budget with work still to do, so a walk whose
+        // last charged comparison happened to spend the budget exactly still answers the
+        // complete sample rather than a refusal.
+        let mut incomplete = false;
+        'routes: for (cidr, route) in &store.byoip_cidrs {
             // "The ID of the IPAM pool associated with the CIDR" (`ByoipCidr$IpamPoolId`),
             // which `MoveByoipCidrToIpam` is what writes: a range in no pool of this IPAM is no
             // route of this IPAM.
@@ -301,21 +309,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // asks which of the covering ones authorize ITS ASN. The comparisons are charged
             // before they run, their count being known: one per published ROA.
             if !budget.spend_steps(u64::try_from(roas.len()).unwrap_or(u64::MAX)) {
+                incomplete = true;
                 break;
             }
             let covering: Vec<&PublishedRoa> = roas
                 .iter()
                 .filter(|roa| state::cidr_block_contains_block(&roa.prefix, cidr))
                 .collect();
+            // What validating ONE announcement against those covering ROAs costs: one
+            // comparison per authorization they carry, a ROA authorizing no ASN still being
+            // one. Charged per announcement, before it runs, so this loop's whole cost is
+            // accounted for rather than only the covering scan above.
+            let authorizations: u64 = covering
+                .iter()
+                .map(|roa| u64::try_from(roa.asns.len().max(1)).unwrap_or(u64::MAX))
+                .fold(0u64, u64::saturating_add);
             for asn in route_origin_asns(route) {
-                if budget.exhausted() {
-                    break;
+                if !budget.spend_steps(authorizations) {
+                    incomplete = true;
+                    break 'routes;
                 }
                 let finding =
                     route_protection_finding(cidr, route, pool, asn, &covering, sample_time);
-                if state::matches_every_filter(&selectors, &mut budget, &|name| {
+                let matches = state::matches_every_filter(&selectors, &mut budget, &|name| {
                     filter_values(&finding, name)
-                }) {
+                });
+                // A filter comparison that ran out mid-candidate answers "no match" for a
+                // reason that is not the finding's, so the answer is incomplete rather than
+                // narrower than it should be.
+                if budget.exhausted() {
+                    incomplete = true;
+                    break 'routes;
+                }
+                if matches {
                     selected.push(SelectedFinding {
                         position: finding_position(cidr, asn),
                         finding,
@@ -323,10 +349,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
-        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
-        // result: the request asked for more work than one call will do, and is told so rather
-        // than given a silently truncated page.
-        if budget.exhausted() {
+        // A walk that stopped on the budget means the answer is INCOMPLETE, which is not
+        // something to report as a result: the request asked for more work than one call will
+        // do, and is told so rather than given a silently truncated page.
+        if incomplete {
             return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
                 format!(
                     "Validating this IPAM's route announcements against the authorizations it \
@@ -504,6 +530,10 @@ fn authorized_max_length(
 /// still holds ([`crate::state::asn_association_is_held`]) is one announcement of it. A range
 /// holding none is still a route, announced by an ASN this emulator keeps no record of, so it
 /// has ONE finding whose originating ASN is absent.
+///
+/// An association the store holds no `AsnAssociationState` for is not one the range holds: an
+/// ASN is eligible to advertise a range once its association REACHES a state, so an
+/// association with no state at all announces nothing.
 fn route_origin_asns(route: &crate::state::ByoipCidrRecord) -> Vec<Option<&str>> {
     let mut asns: Vec<Option<&str>> = route
         .byoip_cidr
@@ -514,7 +544,7 @@ fn route_origin_asns(route: &crate::state::ByoipCidrRecord) -> Vec<Option<&str>>
             association
                 .state
                 .as_deref()
-                .is_none_or(crate::state::asn_association_is_held)
+                .is_some_and(crate::state::asn_association_is_held)
         })
         .filter_map(|association| association.asn.as_deref())
         .map(Some)

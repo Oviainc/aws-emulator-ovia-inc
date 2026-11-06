@@ -37,7 +37,8 @@ use ec2::ops::types::{
 use ec2::state::{
     ByoipCidrRecord, ComAmazonawsEc2Amazonec2State as Ec2State,
     IpamRoutingPolicyRegistrationRecord, ASN_ASSOCIATION_STATE_ASSOCIATED,
-    ASN_ASSOCIATION_STATE_DISASSOCIATED, BYOIP_CIDR_STATE_ADVERTISED,
+    ASN_ASSOCIATION_STATE_DISASSOCIATED, ASN_ASSOCIATION_STATE_FAILED_ASSOCIATION,
+    ASN_ASSOCIATION_STATE_PENDING_ASSOCIATION, BYOIP_CIDR_STATE_ADVERTISED,
     BYOIP_CIDR_STATE_PENDING_ADVERTISING, BYOIP_CIDR_STATE_PENDING_PROVISION,
     BYOIP_CIDR_STATE_PROVISIONED, BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
     DRY_RUN_OPERATION, INVALID_IPAM_ID_MALFORMED, INVALID_IPAM_ID_NOT_FOUND,
@@ -1136,6 +1137,119 @@ async fn reading_the_report_changes_nothing_a_later_caller_sees() {
         before, after,
         "reporting the findings writes nothing to the ranges it reports"
     );
+}
+
+/// Seed one range managed by `pool` whose single ASN association carries `state` — or no
+/// state at all, which is the case the announcement rule turns on.
+fn seed_route_with_association_state(
+    engine: &engine::InMemoryEngine,
+    cidr: &str,
+    pool: &str,
+    asn: &str,
+    state: Option<&str>,
+) {
+    let store = engine.state::<Ec2State>();
+    let mut guard = store.lock();
+    let stored = ByoipCidrRecord {
+        byoip_cidr: ByoipCidr {
+            cidr: Some(cidr.to_string()),
+            state: Some(BYOIP_CIDR_STATE_PROVISIONED.to_string()),
+            advertisement_type: None,
+            network_border_group: Some(REGION.to_string()),
+            pool_id: None,
+            ipam_pool_id: Some(pool.to_string()),
+            asn_associations: Some(vec![AsnAssociation {
+                asn: Some(asn.to_string()),
+                cidr: Some(cidr.to_string()),
+                state: state.map(str::to_string),
+                status_message: None,
+            }]),
+            description: None,
+            status_message: None,
+        },
+        released_at: None,
+        pending: None,
+    };
+    assert!(
+        guard.insert_byoip_cidr(stored),
+        "the store holds the seeded address range {cidr}"
+    );
+}
+
+#[tokio::test]
+async fn only_an_asn_association_the_range_holds_is_an_announcement() {
+    let fixture = fixture().await;
+    // Each row is one `AsnAssociationState` — or none at all — and the ASN the range's finding
+    // then reports: an association in force or on its way into force is an announcement by
+    // that ASN, while one the range no longer holds, one that never took, and one the store
+    // holds no state for are not, leaving the range announced by no ASN this emulator knows.
+    let rows: [(&str, &str, Option<&str>, bool); 5] = [
+        (
+            "an association in force",
+            "203.0.120.0/24",
+            Some(ASN_ASSOCIATION_STATE_ASSOCIATED),
+            true,
+        ),
+        (
+            "an association on its way into force",
+            "203.0.121.0/24",
+            Some(ASN_ASSOCIATION_STATE_PENDING_ASSOCIATION),
+            true,
+        ),
+        (
+            "an association whose disassociation has finished",
+            "203.0.122.0/24",
+            Some(ASN_ASSOCIATION_STATE_DISASSOCIATED),
+            false,
+        ),
+        (
+            "an association that never took",
+            "203.0.123.0/24",
+            Some(ASN_ASSOCIATION_STATE_FAILED_ASSOCIATION),
+            false,
+        ),
+        (
+            "an association the store holds no state for",
+            "203.0.124.0/24",
+            None,
+            false,
+        ),
+    ];
+    const SEEDED_ASN: &str = "64600";
+    for (_, cidr, state, _) in rows {
+        seed_route_with_association_state(
+            &fixture.engine,
+            cidr,
+            &fixture.located_pool,
+            SEEDED_ASN,
+            state,
+        );
+    }
+    let body = findings_ok(
+        "the announcement rule",
+        &fixture,
+        &fixture.ipam_id,
+        &[],
+    )
+    .await;
+    let reported = reported("the announcement rule", &body);
+    for (case, cidr, _, announced) in rows {
+        let announcements: Vec<Option<String>> = reported
+            .iter()
+            .filter(|finding| finding.cidr.as_deref() == Some(cidr))
+            .map(|finding| finding.asn.clone())
+            .collect();
+        let expected = if announced {
+            vec![Some(SEEDED_ASN.to_string())]
+        } else {
+            vec![None]
+        };
+        assert_eq!(
+            announcements, expected,
+            "case {case:?}: expected the range {cidr} to report the announcements \
+             {expected:?}, got {announcements:?}"
+        );
+    }
 }
 
 /// The state and status words the rows above pin are the model's own: each is a member of the
