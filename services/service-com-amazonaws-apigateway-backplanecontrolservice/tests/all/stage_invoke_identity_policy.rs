@@ -193,6 +193,9 @@ fn given_session(gateway: &Gateway) {
             tags: Vec::new(),
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
+            // No session policy scopes the vend: what the credential may do is the role's
+            // own policies, which is what each row puts on it.
+            policies: sts::SessionPolicies::default(),
             external_id: None,
             role_arn: Some(role_arn),
             revoked: false,
