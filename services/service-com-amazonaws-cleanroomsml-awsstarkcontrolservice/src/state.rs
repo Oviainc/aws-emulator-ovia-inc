@@ -18,14 +18,17 @@
 //! channel is created under a membership, and every member of the collaboration
 //! that membership belongs to can list the channels it holds. A trained model is
 //! scoped the same way: it is created under a membership and listed through the
-//! collaboration that membership belongs to.
+//! collaboration that membership belongs to, and so is a trained model inference
+//! job — the run of one trained model over a data source, held here beside the
+//! model it ran.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CollaborationMLInputChannelSummary, CollaborationTrainedModelSummary, ConflictException,
-    ContainerConfig, Dataset, IncrementalTrainingDataChannelOutput, InferenceContainerConfig,
+    CollaborationMLInputChannelSummary, CollaborationTrainedModelInferenceJobSummary,
+    CollaborationTrainedModelSummary, ConflictException, ContainerConfig, Dataset,
+    IncrementalTrainingDataChannelOutput, InferenceContainerConfig, InferenceOutputConfiguration,
     PayerConfiguration, ResourceNotFoundException, TrainingDatasetSummary,
 };
 
@@ -87,6 +90,12 @@ pub const ML_INPUT_CHANNEL_PAGE_LIMIT: i32 = 100;
 /// `ListCollaborationTrainedModelsRequest$maxResults` is modelled
 /// `@range(min: 1, max: 100)`.
 pub const TRAINED_MODEL_PAGE_LIMIT: i32 = 100;
+
+/// The largest page `ListCollaborationTrainedModelInferenceJobs` serves, and the
+/// page size it uses when the request names no `maxResults`:
+/// `ListCollaborationTrainedModelInferenceJobsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const TRAINED_MODEL_INFERENCE_JOB_PAGE_LIMIT: i32 = 100;
 
 /// A status change the clock owes a resource: the instant it falls due, and the
 /// status the resource carries from then on.
@@ -321,13 +330,104 @@ impl TrainedModel {
     }
 }
 
+/// One Clean Rooms ML trained model inference job, as this emulator persists it.
+///
+/// The job is one run of a trained model over a data source. It is started under
+/// a membership, and every member of the collaboration that membership belongs
+/// to sees it through the collaboration-scoped read — so the collaboration is
+/// held on the record beside the membership its ARN names, exactly as
+/// [`TrainedModel`] holds it. The model the job ran, and the version of that
+/// model, are held too: they are what the collaboration-scoped list filters on.
+#[derive(Debug, Clone)]
+pub struct TrainedModelInferenceJob {
+    /// The `TrainedModelInferenceJobArn` this record is keyed by.
+    pub arn: String,
+    /// The region the job was started in, which its ARN names. A regional
+    /// endpoint reports only its own region's resources, so this is the scope
+    /// every read of this record is checked against.
+    pub region: String,
+    /// The membership the job was started under, which its ARN names.
+    pub membership_identifier: String,
+    /// The collaboration that membership belongs to. It is the scope
+    /// `ListCollaborationTrainedModelInferenceJobs` reports in: a job is visible
+    /// to that call only through the collaboration it was run in.
+    pub collaboration_identifier: String,
+    pub name: String,
+    /// The trained model the job ran, which
+    /// `CollaborationTrainedModelInferenceJobSummary$trainedModelArn` requires.
+    pub trained_model_arn: String,
+    /// The version of that model the job ran, when the model carries versions:
+    /// the summary's `trainedModelVersionIdentifier` is optional, so a job that
+    /// ran an unversioned model reports none.
+    pub trained_model_version_identifier: Option<String>,
+    /// The configured model algorithm association the job ran through, when it
+    /// ran one.
+    pub configured_model_algorithm_association_arn: Option<String>,
+    /// Where the inference output goes, held as the start named it so the read
+    /// reports exactly what was stored.
+    pub output_configuration: InferenceOutputConfiguration,
+    pub description: Option<String>,
+    /// The account of the member that started the job.
+    pub creator_account_id: String,
+    /// The account that pays for the inference, when the start named one.
+    pub ml_model_inference_payer_account_id: Option<String>,
+    /// One of `MetricsStatus`'s values, once the job has metrics to publish.
+    pub metrics_status: Option<String>,
+    pub metrics_status_details: Option<String>,
+    /// One of `LogsStatus`'s values, once the job has logs to publish.
+    pub logs_status: Option<String>,
+    pub logs_status_details: Option<String>,
+    /// One of `TrainedModelInferenceJobStatus`'s values.
+    pub status: String,
+    /// The status change the clock owes this job, if any.
+    pub pending: Option<PendingTransition>,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+}
+
+impl TrainedModelInferenceJob {
+    /// Materialise the status change the clock owes this job, if `now` is past
+    /// its due instant.
+    pub fn settle(&mut self, now: SystemTime) {
+        settle_pending(&mut self.status, &mut self.pending, now);
+    }
+
+    /// The `CollaborationTrainedModelInferenceJobSummary` projection
+    /// `ListCollaborationTrainedModelInferenceJobs` returns.
+    pub fn to_collaboration_summary(&self) -> CollaborationTrainedModelInferenceJobSummary {
+        CollaborationTrainedModelInferenceJobSummary {
+            trained_model_inference_job_arn: self.arn.clone(),
+            configured_model_algorithm_association_arn: self
+                .configured_model_algorithm_association_arn
+                .clone(),
+            membership_identifier: self.membership_identifier.clone(),
+            trained_model_arn: self.trained_model_arn.clone(),
+            trained_model_version_identifier: self.trained_model_version_identifier.clone(),
+            collaboration_identifier: self.collaboration_identifier.clone(),
+            status: self.status.clone(),
+            output_configuration: self.output_configuration.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            metrics_status: self.metrics_status.clone(),
+            metrics_status_details: self.metrics_status_details.clone(),
+            logs_status: self.logs_status.clone(),
+            logs_status_details: self.logs_status_details.clone(),
+            ml_model_inference_payer_account_id: self.ml_model_inference_payer_account_id.clone(),
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(self.update_time),
+            creator_account_id: self.creator_account_id.clone(),
+        }
+    }
+}
+
 /// A record one of this service's collaboration-scoped lists pages over.
 ///
-/// `ListCollaborationMLInputChannels` and `ListCollaborationTrainedModels` serve
-/// the same rule over different resources — report the records of one
-/// collaboration that the endpoint's own region holds, ARN order, one page at a
-/// time — so the walk lives once in [`collaboration_page`] and each record says
-/// here what that walk needs of it.
+/// `ListCollaborationMLInputChannels`, `ListCollaborationTrainedModels` and
+/// `ListCollaborationTrainedModelInferenceJobs` serve the same rule over
+/// different resources — report the records of one collaboration that the
+/// endpoint's own region holds, ARN order, one page at a time — so the walk
+/// lives once in [`collaboration_page`] and each record says here what that
+/// walk needs of it.
 pub trait CollaborationScoped {
     /// The summary projection that list returns, one per reported record.
     type Summary;
@@ -346,6 +446,30 @@ pub trait CollaborationScoped {
 
 impl CollaborationScoped for MlInputChannel {
     type Summary = CollaborationMLInputChannelSummary;
+
+    fn page_key(&self) -> &str {
+        &self.arn
+    }
+
+    fn scope_region(&self) -> &str {
+        &self.region
+    }
+
+    fn scope_collaboration(&self) -> &str {
+        &self.collaboration_identifier
+    }
+
+    fn settle_now(&mut self, now: SystemTime) {
+        self.settle(now);
+    }
+
+    fn summary(&self) -> Self::Summary {
+        self.to_collaboration_summary()
+    }
+}
+
+impl CollaborationScoped for TrainedModelInferenceJob {
+    type Summary = CollaborationTrainedModelInferenceJobSummary;
 
     fn page_key(&self) -> &str {
         &self.arn
@@ -427,6 +551,33 @@ pub fn collaboration_page<'a, Record: CollaborationScoped + 'a>(
     resume_at: Option<&str>,
     now: SystemTime,
 ) -> (Vec<Record::Summary>, Option<String>) {
+    collaboration_page_where(
+        records,
+        collaboration_identifier,
+        region,
+        page_size,
+        resume_at,
+        now,
+        |_| true,
+    )
+}
+
+/// [`collaboration_page`], reporting only the records `reported` admits.
+///
+/// A collaboration-scoped list whose request carries filter members
+/// (`ListCollaborationTrainedModelInferenceJobs` filters on the trained model
+/// and its version) narrows the same walk: the filter is applied BEFORE the page
+/// fills, so the token a full page carries names the next record the list would
+/// report rather than one it would skip.
+pub fn collaboration_page_where<'a, Record: CollaborationScoped + 'a>(
+    records: impl Iterator<Item = &'a mut Record>,
+    collaboration_identifier: &str,
+    region: &str,
+    page_size: usize,
+    resume_at: Option<&str>,
+    now: SystemTime,
+    reported: impl Fn(&Record) -> bool,
+) -> (Vec<Record::Summary>, Option<String>) {
     let mut page = Vec::with_capacity(page_size);
     let mut next_token = None;
     for record in records {
@@ -436,6 +587,9 @@ pub fn collaboration_page<'a, Record: CollaborationScoped + 'a>(
         if record.scope_region() != region
             || record.scope_collaboration() != collaboration_identifier
         {
+            continue;
+        }
+        if !reported(record) {
             continue;
         }
         if page.len() == page_size {
@@ -498,6 +652,10 @@ pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
     /// membership-scoped lists the one stable total order their pagination
     /// tokens index into.
     pub trained_models: BTreeMap<String, TrainedModel>,
+    /// Every trained model inference job, keyed by its ARN, for the same reason:
+    /// the collaboration- and membership-scoped lists that page over the jobs
+    /// carry that ARN in their pagination token.
+    pub trained_model_inference_jobs: BTreeMap<String, TrainedModelInferenceJob>,
     /// The counter the resource segment of every minted ARN comes from.
     resource_id_seq: u64,
 }
@@ -622,6 +780,24 @@ pub fn trained_model_arn(membership_identifier: &str, id: &str, region: &str) ->
     )
 }
 
+/// The ARN of the trained model inference job with resource id `id`, started
+/// under the membership `membership_identifier` names, in `region`.
+///
+/// `TrainedModelInferenceJobArn` nests the job under its membership
+/// (`membership/{uuid}/trained-model-inference-job/{id}`), so the membership a
+/// job belongs to is readable from its ARN.
+pub fn trained_model_inference_job_arn(
+    membership_identifier: &str,
+    id: &str,
+    region: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("membership/{membership_identifier}/trained-model-inference-job/{id}"),
+    )
+}
+
 /// The resource portion of `value` when it is shaped like a Clean Rooms ML ARN
 /// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:` and a non-empty
 /// remainder), and `None` otherwise.
@@ -699,7 +875,7 @@ pub fn is_training_dataset_arn(value: &str) -> bool {
 /// True when `value` is shaped like one of this service's membership-nested ARNs
 /// — `arn:…:cleanrooms-ml:…:membership/{uuid}/{kind}/[-a-zA-Z0-9_/.]+`, where
 /// `kind` is the resource segment that follows the membership
-/// (`ml-input-channel`, `trained-model`).
+/// (`ml-input-channel`, `trained-model`, `trained-model-inference-job`).
 ///
 /// Every membership-nested shape in this service differs only in that segment,
 /// so each predicate below names its own and shares this check.
@@ -732,6 +908,14 @@ pub fn is_ml_input_channel_arn(value: &str) -> bool {
 /// models, which carries the ARN the next page resumes at.
 pub fn is_trained_model_arn(value: &str) -> bool {
     is_membership_nested_arn(value, "trained-model")
+}
+
+/// True when `value` is shaped like a `TrainedModelInferenceJobArn`
+/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:membership/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/trained-model-inference-job/[-a-zA-Z0-9_/.]+$`),
+/// for the same reason: it is the `nextToken` of a list that pages over trained
+/// model inference jobs, which carries the ARN the next page resumes at.
+pub fn is_trained_model_inference_job_arn(value: &str) -> bool {
+    is_membership_nested_arn(value, "trained-model-inference-job")
 }
 
 /// The region this request was signed for — what a minted ARN names.

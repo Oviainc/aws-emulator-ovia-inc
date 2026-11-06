@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCollaborationTrainedModelInferenceJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCollaborationTrainedModelInferenceJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the persisted trained model inference jobs of one collaboration in
+//! [`crate::state`], one `CollaborationTrainedModelInferenceJobSummary` per record,
+//! in the one stable order the store's ARN keys give, narrowed to the trained model
+//! and the model version the request filters on. A collaboration holding none —
+//! every collaboration, until a job is started in it — is reported as an empty
+//! list, not as a refusal: the operation models no not-found error for a
+//! collaboration. `nextToken` is the ARN the next page resumes at, so following it
+//! to the end enumerates every reported job of that collaboration exactly once.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCollaborationTrainedModelInferenceJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The only write is the status change the clock already owed a job it reports: an
+//! inference job runs asynchronously, so a reader materialises the transition that
+//! fell due whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +161,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCollaborationTrainedModelInferenceJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCollaborationTrainedModelInferenceJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCollaborationTrainedModelInferenceJobs"))
+        // This operation reports on the store; the region the request was signed for is
+        // the endpoint it reached, and a Clean Rooms ML endpoint is regional.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // The token is the ARN the next page starts at. `NextToken` is modelled only as
+        // a 1..10240 string, so a token this operation never issued is refused with the
+        // modelled `ValidationException` rather than silently serving page one.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_trained_model_inference_job_arn(token) {
+                return Err(
+                    ListCollaborationTrainedModelInferenceJobsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by \
+                                 ListCollaborationTrainedModelInferenceJobs"
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)`; `page_bound` is the one
+        // place this service resolves a bound the request may not carry.
+        let page_size = crate::state::page_bound(
+            input.max_results,
+            crate::state::TRAINED_MODEL_INFERENCE_JOB_PAGE_LIMIT,
+        );
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The walk — resume at the token, report one collaboration's records in the one
+        // stable order its ARN keys give, settle what the clock owes each one — is
+        // shared with the sibling collaboration-scoped lists; this one narrows it by the
+        // trained model, and the version of that model, the request filters on: a job is
+        // reported only when it ran the model, and the version, the request named.
+        let (collaboration_trained_model_inference_jobs, next_token) =
+            crate::state::collaboration_page_where(
+                store.trained_model_inference_jobs.values_mut(),
+                &input.collaboration_identifier,
+                &region,
+                page_size,
+                input.next_token.as_deref(),
+                now,
+                |job| {
+                    input
+                        .trained_model_arn
+                        .as_deref()
+                        .is_none_or(|arn| job.trained_model_arn == arn)
+                        && input
+                            .trained_model_version_identifier
+                            .as_deref()
+                            .is_none_or(|version| {
+                                job.trained_model_version_identifier.as_deref() == Some(version)
+                            })
+                },
+            );
+
+        Ok(ListCollaborationTrainedModelInferenceJobsOutput {
+            next_token,
+            collaboration_trained_model_inference_jobs,
+        })
     }
 }
