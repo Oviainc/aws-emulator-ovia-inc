@@ -206,7 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation whose resources took longer than its own status transition recorded its
         // resource events after that transition had already fallen due. A stable sort, so
         // events sharing an instant keep the reverse-append order.
-        let mut newest_first: Vec<&StoredEvent> = stack.events.iter().rev().collect();
+        //
+        // An event reporting a PRE-DEPLOYMENT VALIDATION failure is not one of them: nothing
+        // was done to the resource, so it reports no `ResourceStatus` at all, and what it
+        // does report are the validation members only `DescribeEvents` carries
+        // (`crate::state::early_validation`).
+        let mut newest_first: Vec<&StoredEvent> = stack
+            .events
+            .iter()
+            .rev()
+            .filter(|event| event.validation.is_none())
+            .collect();
         newest_first.sort_by_key(|event| ::std::cmp::Reverse(event.timestamp));
         let newest_first: Vec<StackEvent> =
             newest_first.into_iter().map(stack_event_view).collect();

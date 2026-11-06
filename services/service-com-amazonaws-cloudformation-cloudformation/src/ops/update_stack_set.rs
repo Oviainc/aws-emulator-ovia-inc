@@ -320,10 +320,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let submitted_body = match (&input.template_body, &input.template_url) {
             (Some(body), _) => Some(body.clone()),
             (None, Some(url)) => Some(
-                crate::state::template_url::fetch(
+                crate::state::template_url::fetch_as(
                     ctx,
                     &crate::state::request_region(ctx.parts()),
                     url,
+                    // The wording a STACK SET operation's refusal carries: what Amazon S3
+                    // answered, whatever it refused the read for
+                    // (`crate::state::template_url::Refused`).
+                    crate::state::template_url::Refused::AsAmazonS3Answered,
                 )
                 .await
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?,

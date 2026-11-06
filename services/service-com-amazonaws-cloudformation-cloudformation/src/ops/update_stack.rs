@@ -63,9 +63,10 @@
 //! policy, which `GetStackPolicy` reports back.
 //!
 //! Members this slice stores but has nothing to act on: `ResourceTypes`.
-//! `DisableValidation` turns off pre-deployment validation this emulator does not
-//! perform either way. `StackPolicyURL` and `StackPolicyDuringUpdateURL` name a policy in
-//! Amazon S3 and are answered 501.
+//! `DisableValidation` turns off pre-deployment validation. `StackPolicyURL` and
+//! `StackPolicyDuringUpdateURL` name those same two policies in Amazon S3: each object is
+//! read from this emulator's own Amazon S3 and acted on exactly as the inline body it stands
+//! in for ([`crate::state::stack_policy::fetch`]).
 //!
 //! A `TemplateURL` says WHERE the revised template is rather than what it means, so the
 //! object it addresses is read from this emulator's own Amazon S3 and the update is applied
@@ -468,18 +469,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
             input.template_body = Some(body);
         }
-        // The same holds for a stack policy named by URL: fetching it would need an
-        // outbound connection this emulator does not make.
-        if input.stack_policy_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "UpdateStack with StackPolicyURL (fetching a stack policy from Amazon S3)",
-            ));
+        // A stack policy reaches CloudFormation either inline, as the request's own policy
+        // body, or by reference, as a URL naming "a policy (maximum size: 16 KB) located in
+        // an Amazon S3 bucket in the same Amazon Web Services Region as the stack" — and
+        // either member of a pair may be given, "but not both".
+        crate::state::stack_policy::one_policy_source(
+            "StackPolicyBody",
+            "StackPolicyURL",
+            input.stack_policy_body.as_deref(),
+            input.stack_policy_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        crate::state::stack_policy::one_policy_source(
+            "StackPolicyDuringUpdateBody",
+            "StackPolicyDuringUpdateURL",
+            input.stack_policy_during_update_body.as_deref(),
+            input.stack_policy_during_update_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The reference says WHERE each policy document is, not what it means: the object it
+        // addresses is read from this emulator's own Amazon S3 and becomes the body this
+        // update acts on, so a policy submitted by reference and the same one submitted
+        // inline govern the update alike — the one that OVERRIDES the stack's policy for
+        // this update, and the one the update leaves ON the stack
+        // (`crate::state::stack_policy::fetch`).
+        if let Some(url) = input.stack_policy_url.take() {
+            let body = crate::state::stack_policy::fetch(
+                ctx,
+                &crate::state::request_region(ctx.parts()),
+                "StackPolicyURL",
+                "StackPolicyBody",
+                &url,
+            )
+            .await
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            input.stack_policy_body = Some(body);
         }
-        if input.stack_policy_during_update_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "UpdateStack with StackPolicyDuringUpdateURL (fetching a stack policy from \
-                 Amazon S3)",
-            ));
+        if let Some(url) = input.stack_policy_during_update_url.take() {
+            let body = crate::state::stack_policy::fetch(
+                ctx,
+                &crate::state::request_region(ctx.parts()),
+                "StackPolicyDuringUpdateURL",
+                "StackPolicyDuringUpdateBody",
+                &url,
+            )
+            .await
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            input.stack_policy_during_update_body = Some(body);
         }
         // The same rule a create's rollback triggers are held to: a trigger naming a type
         // CloudFormation cannot monitor is refused before the stack is touched, so an
@@ -771,6 +807,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && role_arn == previous.role_arn
             && rollback_configuration == previous.rollback_configuration
             && deployment_config == previous.deployment_config
+            // ...and the stack POLICY the update would leave in force is the one already in
+            // force: "structure that contains a new stack policy body" is a member of the
+            // stack's configuration this update writes, so a request that submits a
+            // different document — inline or by reference — changes the stack and is not a
+            // no-op, whatever it leaves the template and the parameters as.
+            && input
+                .stack_policy_body
+                .as_ref()
+                .is_none_or(|body| previous.stack_policy_body.as_ref() == Some(body))
         {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "No updates are to be performed.",
@@ -789,7 +834,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // temporary overriding stack policy during this update. If you don't specify a stack
         // policy, the current policy that is associated with the stack will be used." The
         // override applies to THIS update alone and is never stored, so the stack goes on
-        // carrying the document `GetStackPolicy` reads back.
+        // carrying the document `GetStackPolicy` reads back — and a `StackPolicyBody` this
+        // request submits is the document the stack is left with, not the one that decides
+        // this update ("the current policy that is associated with the stack is unchanged"
+        // is what omitting it means), so it cannot lift a Deny the update is held to.
         //
         // A template whose processed stage this update could not compute has no plan to
         // weigh: that failure is the one reported, below.

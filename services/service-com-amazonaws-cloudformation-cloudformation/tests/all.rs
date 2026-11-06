@@ -33,6 +33,8 @@ mod callback_signature;
 mod cancelled_update;
 #[path = "all/cdk_metadata_resource_type.rs"]
 mod cdk_metadata_resource_type;
+#[path = "all/change_set_early_validation.rs"]
+mod change_set_early_validation;
 #[path = "all/change_set_hooks.rs"]
 mod change_set_hooks;
 #[path = "all/change_set_lifecycle.rs"]
@@ -291,6 +293,8 @@ mod stack_own_subnets_db_subnet_group;
 mod stack_outputs;
 #[path = "all/stack_parameter_driven_updates.rs"]
 mod stack_parameter_driven_updates;
+#[path = "all/stack_policy_by_reference.rs"]
+mod stack_policy_by_reference;
 #[path = "all/stack_policy_enforcement.rs"]
 mod stack_policy_enforcement;
 #[path = "all/stack_refactors.rs"]
@@ -337,6 +341,8 @@ mod stack_teardown_events;
 mod state_roundtrip;
 #[path = "all/stop_stack_set_operation.rs"]
 mod stop_stack_set_operation;
+#[path = "all/tags_only_stack_updates.rs"]
+mod tags_only_stack_updates;
 #[path = "all/template_by_reference.rs"]
 mod template_by_reference;
 #[path = "all/template_outputs.rs"]

@@ -1,0 +1,345 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The PRE-DEPLOYMENT validation a change set is held to before it is offered for
+//! execution — CloudFormation's "early validation".
+//!
+//! ## The rule this module implements
+//!
+//! A change set is a plan a caller reviews and then executes, and CloudFormation validates
+//! that plan WHILE CREATING IT rather than leaving every problem to the deployment: a
+//! validation the plan does not pass fails the change set itself, which settles `FAILED`
+//! with `ExecutionStatus` `UNAVAILABLE` and a `StatusReason` naming the validations that
+//! failed ([`failed_reason`]) — so nothing is offered for execution that CloudFormation
+//! already knows cannot be deployed. `DisableValidation` is what turns that stage off, and a
+//! change set created with it carries the plan unvalidated, leaving the same problem to
+//! surface at execution time.
+//!
+//! The validation this module performs is the EXISTENCE check
+//! ([`RESOURCE_EXISTENCE_CHECK`]): a resource the plan would CREATE under a physical name the
+//! template SPELLS cannot be created if the service that owns it already holds a resource
+//! under that name — the create would be refused — so the plan is not a plan that can be
+//! deployed.
+//!
+//! ## What is asked, and of whom
+//!
+//! Only a plan's ADDITIONS fail the validation, and only those whose name the template
+//! states: a resource whose name CloudFormation generates is unique by construction, and one
+//! the plan MODIFIES or REMOVES already exists because the stack has it. The question is put
+//! to the service that OWNS the type, through the same in-process read drift detection asks
+//! ([`super::provisioning::Owner::actual_configuration`]), so a name is reported taken only
+//! when that service really holds a resource under it; a type with no owning provisioner
+//! here, and a service whose read is not served, report nothing and so fail nothing.
+//!
+//! The names are read off the submitted template ([`named_resources`]) and asked about with
+//! the store unlocked ([`taken_names`]); which of them the change set would really CREATE is
+//! the plan's to say ([`failing_addition`]), so the two halves are separate and neither holds
+//! this service's store while the other runs. Nothing here reads or writes that store: the
+//! handler computes the plan, asks this module for the verdict, and records the status
+//! itself.
+
+use ::std::collections::BTreeMap;
+
+use ::serde_json::Value;
+
+use super::change_action;
+use super::change_plan::StoredResourceChange;
+use super::provisioning::owner_for;
+use super::template::{self, Template};
+use super::StoredResource;
+
+/// The validation CloudFormation names for the check that a resource the plan would create
+/// does not already exist, as its own `StatusReason` spells it.
+pub const RESOURCE_EXISTENCE_CHECK: &str = "AWS::EarlyValidation::ResourceExistenceCheck";
+
+/// The NAME of the validation an event about a resource whose identifier is already taken
+/// carries (`OperationEvent$ValidationName`) — the detail `DescribeEvents` reports for a
+/// failed existence check, which is where that `StatusReason` sends a client for "detailed
+/// failure information".
+///
+/// It is the validation's own name, not a resource status: nothing was done to the resource,
+/// since the plan was never executed.
+pub const NAME_CONFLICT_VALIDATION: &str = "NAME_CONFLICT_VALIDATION";
+
+/// `OperationEvent$ValidationStatus` for a validation that FAILED, from the model's
+/// `ValidationStatus` enum (`[FAILED, SKIPPED]`).
+pub const VALIDATION_FAILED: &str = "FAILED";
+
+/// What that event reports about the resource: which identifier of which type is already
+/// there — CloudFormation's own sentence for a resource that cannot be created because it
+/// exists, whose variable parts are the declared type and the identifier the declaration
+/// asked for.
+///
+/// The same sentence is what a resource handler answers at EXECUTION time for the same
+/// collision (`super::provisioner`'s own `AlreadyExists` wording): the two want to be one
+/// helper, which the file-length rule keeps out of reach for now — collapse them here when
+/// that file is split.
+pub fn already_exists(resource_type: &str, identifier: &str) -> String {
+    format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
+}
+
+/// The `StatusReason` a change set early validation failed carries: which validations failed,
+/// and where the detail of the failure is reported.
+///
+/// The sentence is CloudFormation's own and the variable part is the list of validations, in
+/// the order they were evaluated.
+pub fn failed_reason(validations: &[&str]) -> String {
+    format!(
+        "The following hook(s)/validation failed: [{}]. To troubleshoot Early Validation \
+         errors, use the DescribeEvents API for detailed failure information.",
+        validations.join(", ")
+    )
+}
+
+/// One resource whose physical name the template SPELLS: the resource the existence check is
+/// about, with the identifier its owning service would know it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedResource {
+    pub logical_id: String,
+    pub resource_type: String,
+    /// The physical resource id the declaration gives it: the name the template states, in
+    /// the form the owning service identifies the resource by (which for some types is an
+    /// ARN built from that name).
+    pub physical_resource_id: String,
+}
+
+/// The resources `template` declares whose physical name it STATES, in the order the
+/// template reader walked the `Resources` section, each carrying the identifier its create
+/// would produce.
+///
+/// The identifiers are computed by the ONE naming pipeline a deployment uses
+/// ([`template::provision`]), so the resource this check asks about is the resource the
+/// execution would create, down to the id form its owning service uses. `stack` and
+/// `parameters` are that evaluation's scope, since a stated name may be built from a
+/// parameter or a pseudo parameter.
+///
+/// A declaration that names the resource NOWHERE is not among them — CloudFormation
+/// generates that name, and a generated name carries a unique suffix, so nothing can already
+/// hold it.
+pub fn named_resources(
+    template: &Template,
+    stack: template::StackScope<'_>,
+    parameters: &BTreeMap<String, String>,
+) -> Vec<NamedResource> {
+    let no_resources = BTreeMap::new();
+    let no_imports = BTreeMap::new();
+    let parameter_types = super::ssm_parameters::parameter_types_in_force(template);
+    let scope = template::Scope {
+        stack,
+        parameters,
+        parameter_types: &parameter_types,
+        resources: &no_resources,
+        mappings: &template.mappings,
+        conditions: &template.conditions,
+        imports: &no_imports,
+    };
+    // ONE budget for the whole template, as a deployment evaluates a whole template out of
+    // one: the work this check can be asked for is bounded.
+    let mut budget = template::Budget::new();
+    template::provision(template, &scope, &mut budget)
+        .into_iter()
+        .filter(|provisioned| states_its_name(template, provisioned))
+        .map(|provisioned| NamedResource {
+            logical_id: provisioned.logical_id,
+            resource_type: provisioned.resource_type,
+            physical_resource_id: provisioned.physical_resource_id,
+        })
+        .collect()
+}
+
+/// Whether the declaration this resource came from STATES its name, through the one reading
+/// of a declaration's name property this crate holds ([`template::name_property`]).
+fn states_its_name(template: &Template, provisioned: &StoredResource) -> bool {
+    template
+        .resources
+        .iter()
+        .find(|declared| declared.logical_id == provisioned.logical_id)
+        .is_some_and(|declared| {
+            template::name_property(&declared.resource_type, &declared.properties).is_some()
+        })
+}
+
+/// Those of `candidates` whose identifier the owning service already holds a resource under.
+///
+/// The calls are made with no store lock held (the caller is what releases it), one candidate
+/// at a time in the order they are given, so the check costs one read per NAMED resource and
+/// no more. A read the owning service does not serve, or one it refuses, establishes nothing
+/// about the name: such a candidate is not reported, because a name is reported as taken only
+/// on a resource that was read back.
+pub async fn taken_names(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    candidates: &[NamedResource],
+) -> Vec<NamedResource> {
+    let mut taken = Vec::new();
+    for candidate in candidates {
+        let Some(owner) = owner_for(&candidate.resource_type) else {
+            continue;
+        };
+        // The read is by the resource's own identifier: what the create would produce for
+        // this declaration is what the owning service would know it by.
+        let existing = StoredResource {
+            logical_id: candidate.logical_id.clone(),
+            resource_type: candidate.resource_type.clone(),
+            physical_resource_id: candidate.physical_resource_id.clone(),
+            attributes: BTreeMap::new(),
+            metadata: None,
+            properties: Value::Null,
+            materialised: true,
+            deletion_policy: None,
+        };
+        if matches!(
+            owner.actual_configuration(ctx, region, &existing).await,
+            Ok(Some(_))
+        ) {
+            taken.push(candidate.clone());
+        }
+    }
+    taken
+}
+
+/// The first resource `changes` would CREATE under one of the `taken` identifiers, or `None`
+/// when the plan creates none of them.
+///
+/// The plan is walked in its own order, so the resource reported is the one the deployment
+/// would have reached first. A name a resource the plan MODIFIES or REMOVES holds is not a
+/// collision: that resource exists BECAUSE the stack has it.
+pub fn failing_addition<'a>(
+    changes: &[StoredResourceChange],
+    taken: &'a [NamedResource],
+) -> Option<&'a NamedResource> {
+    changes
+        .iter()
+        .filter(|change| change.action == change_action::ADD)
+        .find_map(|change| {
+            taken
+                .iter()
+                .find(|candidate| candidate.logical_id == change.logical_resource_id)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: the reason names the validations that failed, in the words CloudFormation words
+    /// it in.
+    #[test]
+    fn the_reason_names_the_validations_that_failed() {
+        let rows: &[(&str, &[&str], &str)] = &[
+            (
+                "the existence check alone",
+                &[RESOURCE_EXISTENCE_CHECK],
+                "The following hook(s)/validation failed: \
+                 [AWS::EarlyValidation::ResourceExistenceCheck]. To troubleshoot Early \
+                 Validation errors, use the DescribeEvents API for detailed failure \
+                 information.",
+            ),
+            (
+                "more than one, in evaluation order",
+                &["AWS::EarlyValidation::One", "AWS::EarlyValidation::Two"],
+                "The following hook(s)/validation failed: [AWS::EarlyValidation::One, \
+                 AWS::EarlyValidation::Two]. To troubleshoot Early Validation errors, use \
+                 the DescribeEvents API for detailed failure information.",
+            ),
+        ];
+        for (case, validations, expected) in rows {
+            let reason = failed_reason(validations);
+            assert_eq!(
+                reason, *expected,
+                "case {case:?}: expected {expected:?}, got {reason:?}"
+            );
+        }
+    }
+
+    /// RULE: the resources checked are the ones the template NAMES, and the name is the one
+    /// the declaration's own name property carries; which of them fails is the plan's to
+    /// say — an addition's name collides, a modification's does not.
+    #[test]
+    fn the_checked_resources_are_the_ones_the_template_names() {
+        let body = r#"{"Resources":{
+            "Named":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"already-there"}},
+            "Generated":{"Type":"AWS::S3::Bucket","Properties":{}},
+            "Topic":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"events"}},
+            "Changed":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"kept"}}}}"#;
+        let template = super::super::declared_template(body).expect("a well-formed template");
+        let named = named_resources(
+            &template,
+            template::StackScope {
+                region: "us-east-1",
+                stack_name: "checked",
+                stack_id: "arn:aws:cloudformation:us-east-1:000000000000:stack/checked/0",
+            },
+            &BTreeMap::new(),
+        );
+        let expected = vec![
+            NamedResource {
+                logical_id: "Changed".to_string(),
+                resource_type: "AWS::S3::Bucket".to_string(),
+                physical_resource_id: "kept".to_string(),
+            },
+            NamedResource {
+                logical_id: "Named".to_string(),
+                resource_type: "AWS::S3::Bucket".to_string(),
+                physical_resource_id: "already-there".to_string(),
+            },
+            // A topic is identified by its ARN, which is what the create produces from the
+            // name the template states — so that is what the check asks Amazon SNS about.
+            NamedResource {
+                logical_id: "Topic".to_string(),
+                resource_type: "AWS::SNS::Topic".to_string(),
+                physical_resource_id: ::emulator_server::emulator_arn(
+                    "sns",
+                    "us-east-1",
+                    "events",
+                ),
+            },
+        ];
+        assert_eq!(
+            named, expected,
+            "case \"a template naming three of its four resources\": expected {expected:?}, \
+             got {named:?}"
+        );
+
+        let change = |action: &str, logical_id: &str| StoredResourceChange {
+            action: action.to_string(),
+            logical_resource_id: logical_id.to_string(),
+            resource_type: "AWS::S3::Bucket".to_string(),
+            physical_resource_id: None,
+            scope: Vec::new(),
+            replacement: None,
+            details: Vec::new(),
+            policy_action: None,
+        };
+        let rows: &[(&str, Vec<StoredResourceChange>, Option<&str>)] = &[
+            (
+                "a plan that adds a resource under a taken name",
+                vec![
+                    change(change_action::MODIFY, "Changed"),
+                    change(change_action::ADD, "Named"),
+                ],
+                Some("Named"),
+            ),
+            (
+                "a plan that only modifies and removes",
+                vec![
+                    change(change_action::MODIFY, "Changed"),
+                    change(change_action::REMOVE, "Topic"),
+                ],
+                None,
+            ),
+            (
+                "a plan that adds a resource the template does not name",
+                vec![change(change_action::ADD, "Generated")],
+                None,
+            ),
+        ];
+        for (case, changes, expected) in rows {
+            let failing = failing_addition(changes, &named);
+            assert_eq!(
+                failing.map(|resource| resource.logical_id.as_str()),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {failing:?}"
+            );
+        }
+    }
+}

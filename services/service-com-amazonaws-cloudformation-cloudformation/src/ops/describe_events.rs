@@ -95,17 +95,29 @@ const QUERY_CRITERIA_REQUIRED: &str =
 
 /// The `EventType` values this service reports (from the model's `EventType` enum).
 ///
-/// Three of the five: the stack's own status changes, the per-resource progress of an
-/// operation's walk, and a resource transition the service that owns the resource refused.
-/// `VALIDATION_ERROR` ("Failures from CloudFormation Early Validations") and
-/// `HOOK_INVOCATION_ERROR` ("Failures from CloudFormation Hook") are absent because
-/// nothing here runs an early validation or a Hook, so no event of either kind is ever
-/// recorded — rather than being reported for work nothing performed.
+/// Four of the five: the stack's own status changes, the per-resource progress of an
+/// operation's walk, a resource transition the service that owns the resource refused, and a
+/// PRE-DEPLOYMENT validation the operation's plan did not pass ("Failures from
+/// CloudFormation Early Validations", `crate::state::early_validation`).
+/// `HOOK_INVOCATION_ERROR` ("Failures from CloudFormation Hook") is absent because nothing
+/// here invokes a Hook, so no event of that kind is ever recorded — rather than being
+/// reported for work nothing performed.
 mod event_type {
     pub const STACK_EVENT: &str = "STACK_EVENT";
     pub const PROGRESS_EVENT: &str = "PROGRESS_EVENT";
     pub const PROVISIONING_ERROR: &str = "PROVISIONING_ERROR";
+    pub const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 }
+
+/// `OperationEvent$DetailedStatus` for an event reporting a validation failure, from the
+/// model's `DetailedStatus` enum: the operation's additional status is that a validation
+/// failed.
+const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+
+/// `OperationEvent$ValidationFailureMode` for one: the member targets the failure-mode enum
+/// (`[FAIL, WARN]`), and a validation whose failure FAILED the change set was handled by
+/// failing rather than warned about.
+const VALIDATION_HANDLED_BY_FAILING: &str = "FAIL";
 
 /// Whether this event is the STACK's own status change rather than one about a resource of
 /// it: the stack's own events name the stack itself, under its name and its id
@@ -118,15 +130,22 @@ fn is_stack_event(stored: &StoredEvent) -> bool {
 
 /// Whether this event reports a transition that did NOT go through — which is the set
 /// `EventFilter$FailedEvents` selects ("only returns failed events within the operation").
+///
+/// A PRE-DEPLOYMENT validation failure is one of them: it is a failure of the operation,
+/// which is exactly what a client filtering for failures is looking for.
 fn is_failed_event(stored: &StoredEvent) -> bool {
     stored
         .resource_status
         .ends_with(crate::state::FAILED_SUFFIX)
+        || stored.validation.is_some()
 }
 
 /// The `EventType` one recorded event carries.
 fn event_type_of(stored: &StoredEvent) -> &'static str {
-    if is_stack_event(stored) {
+    if stored.validation.is_some() {
+        // "Validation errors - Failures from CloudFormation Early Validations."
+        event_type::VALIDATION_ERROR
+    } else if is_stack_event(stored) {
         // The stack's own status changes: the operation opening, and how it ended.
         event_type::STACK_EVENT
     } else if is_failed_event(stored) {
@@ -142,9 +161,10 @@ fn event_type_of(stored: &StoredEvent) -> &'static str {
 /// One recorded event as the modelled `OperationEvent` shape: the event itself, plus the
 /// operation it belongs to where the stack still holds that operation's record.
 ///
-/// The Hook and the early-validation members are absent for the reason [`event_type`]
-/// gives — nothing here invokes a Hook or runs an early validation — and `DetailedStatus`
-/// with them: this service records no event in one of those detailed states.
+/// An event reporting a PRE-DEPLOYMENT VALIDATION failure fills the validation members
+/// instead of the resource-status ones: nothing was done to the resource, so it has no status
+/// to report, and what the event says is which validation failed on it and why. The Hook
+/// members are absent for the reason [`event_type`] gives — nothing here invokes a Hook.
 fn operation_event_view(stored: &StoredEvent, operation: Option<&StoredOperation>) -> OperationEvent {
     OperationEvent {
         event_id: Some(stored.event_id.clone()),
@@ -164,7 +184,10 @@ fn operation_event_view(stored: &StoredEvent, operation: Option<&StoredOperation
         end_time: operation
             .and_then(|operation| operation.ended_at)
             .map(crate::state::timestamp),
-        resource_status: Some(stored.resource_status.clone()),
+        resource_status: stored
+            .validation
+            .is_none()
+            .then(|| stored.resource_status.clone()),
         resource_status_reason: stored.resource_status_reason.clone(),
         resource_properties: stored.resource_properties.clone(),
         client_request_token: stored.client_request_token.clone(),
@@ -173,11 +196,31 @@ fn operation_event_view(stored: &StoredEvent, operation: Option<&StoredOperation
         hook_status_reason: None,
         hook_invocation_point: None,
         hook_failure_mode: None,
-        detailed_status: None,
-        validation_failure_mode: None,
-        validation_name: None,
-        validation_status: None,
-        validation_status_reason: None,
+        detailed_status: stored
+            .validation
+            .as_ref()
+            .map(|_| VALIDATION_FAILED.to_string()),
+        // "Specifies how validation failures are handled": a validation that FAILED the
+        // change set is one whose failure was handled by failing — the `FAIL` of the
+        // failure-mode enum this member targets — rather than warned about.
+        validation_failure_mode: stored
+            .validation
+            .as_ref()
+            .map(|_| VALIDATION_HANDLED_BY_FAILING.to_string()),
+        validation_name: stored
+            .validation
+            .as_ref()
+            .map(|validation| validation.name.clone()),
+        validation_status: stored
+            .validation
+            .as_ref()
+            .map(|validation| validation.status.clone()),
+        validation_status_reason: stored
+            .validation
+            .as_ref()
+            .map(|validation| validation.reason.clone()),
+        // "The path within the resource where the validation was applied": the validation
+        // this service runs is about the resource as a whole, so it names no path inside it.
         validation_path: None,
     }
 }

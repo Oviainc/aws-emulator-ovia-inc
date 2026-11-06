@@ -241,7 +241,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    change_set_status, change_set_type, execution_status, status, StoredChangeSet, StoredStack,
+    change_set_status, change_set_type, early_validation, execution_status, status,
+    StoredChangeSet, StoredStack,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -451,6 +452,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        // The PRE-DEPLOYMENT validation stage: a resource the change set would CREATE under
+        // an identifier the service that owns it ALREADY holds cannot be created, so the plan
+        // is not one that could be executed — and CloudFormation establishes that while
+        // creating the change set rather than at execution time
+        // (`crate::state::early_validation`). The names come off the submitted template and
+        // are asked about HERE, before the store lock below, because each question reaches
+        // the service that owns the type; which of those resources the plan would really
+        // create is decided from the plan itself, under the lock. `DisableValidation` turns
+        // the stage off, and a change set created with it carries the plan unvalidated.
+        //
+        // The scope a stated name is evaluated in is what the REQUEST carries: the Region,
+        // the stack's name and the parameter values this change set would deploy with. The
+        // stack's ID exists only once the stack does, so a name built from it resolves to
+        // nothing here and that resource is simply not asked about — a name no service holds
+        // is never reported as taken. A change set reusing the stack's own template submits
+        // no body and so names nothing new to check.
+        let taken_names = match (
+            input.disable_validation == Some(true),
+            submitted_processed
+                .as_ref()
+                .and_then(|processed| processed.body(input.template_body.as_deref()?))
+                .and_then(crate::state::declared_template),
+        ) {
+            (false, Some(declared)) => {
+                let mut values = declared.parameter_defaults();
+                values.extend(supplied.clone());
+                let named = early_validation::named_resources(
+                    &declared,
+                    crate::state::template::StackScope {
+                        region: &region,
+                        stack_name: &input.stack_name,
+                        stack_id: "",
+                    },
+                    &values,
+                );
+                early_validation::taken_names(ctx, &region, &named).await
+            }
+            _ => Vec::new(),
+        };
         let mut store = state.lock();
         store.settle(now);
 
@@ -815,6 +855,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Validated and within quota: from here the call allocates.
+        // What the PRE-DEPLOYMENT validation above makes of this plan: a resource it would
+        // CREATE under an identifier an owning service already holds fails the change set,
+        // which is then not offered for execution at all.
+        let conflicting = early_validation::failing_addition(&changes, &taken_names).cloned();
         let change_set_id = crate::state::new_change_set_id(&region, &input.change_set_name);
         // The id of the operation creating this change set is: every event the creation
         // records carries it, so the events of one change-set creation are reportable as
@@ -868,6 +912,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "To troubleshoot Early Validation errors, use the DescribeEvents API for detailed
+        // failure information": the detail is an event about the resource the validation
+        // failed on, carrying what is wrong with it — which identifier of which type is
+        // already taken — so a client reading the stack's events finds the resource rather
+        // than only the summary the change set reports.
+        if let Some(conflicting) = &conflicting {
+            if let Some(stack) = store.resolve_mut(&region, &stack_id) {
+                stack.record_validation_failure(
+                    now,
+                    &conflicting.logical_id,
+                    &conflicting.resource_type,
+                    crate::state::StoredValidationFailure {
+                        name: early_validation::NAME_CONFLICT_VALIDATION.to_string(),
+                        status: early_validation::VALIDATION_FAILED.to_string(),
+                        reason: early_validation::already_exists(
+                            &conflicting.resource_type,
+                            &conflicting.physical_resource_id,
+                        ),
+                    },
+                    Some(operation_id.clone()),
+                    input.client_token.clone(),
+                );
+            }
+        }
+
         // "CloudFormation starts creating the change set": it is answered CREATE_PENDING
         // and settles once the clock makes the terminal status due. A change set that would
         // change nothing settles to FAILED instead, with the reason CloudFormation gives —
@@ -881,6 +950,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(format!(
                     "The template's transforms could not be applied: {reason}"
                 )),
+            ),
+            // A plan the pre-deployment validation did not pass is not offered for
+            // execution: the change set fails with the validation's own reason, and the
+            // stack it was created for keeps the status it had — a CREATE change set's stack
+            // stays in review with nothing provisioned.
+            None if conflicting.is_some() => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                Some(early_validation::failed_reason(&[
+                    early_validation::RESOURCE_EXISTENCE_CHECK,
+                ])),
             ),
             None if changes.is_empty() => (
                 change_set_status::FAILED,

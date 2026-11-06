@@ -582,4 +582,69 @@ async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
         code, 400,
         "case \"the refused stack name\": expected no stack to exist, got {code} {body}"
     );
+
+    // A STACK SET operation words the SAME refused read differently: what Amazon S3
+    // answered, whatever it refused the read for — so an object the bucket does not hold is
+    // reported as Amazon S3's own sentence rather than as the object's absence. The rows
+    // differ along which refusal Amazon S3 gave (an absent key, an absent bucket) and which
+    // stack set operation took the reference.
+    let set_rows: Vec<(&str, String, String)> = vec![
+        (
+            "a key the staging bucket does not hold",
+            Style::VirtualHostedRegional.url("absent.template.json"),
+            s3_error("The specified key does not exist."),
+        ),
+        (
+            "a bucket nothing created",
+            format!("https://no-such-staging-bucket.s3.{REGION}.amazonaws.com/{key}"),
+            s3_error("The specified bucket does not exist"),
+        ),
+    ];
+    let (code, body) = call(
+        &router,
+        "CreateStackSet",
+        &[
+            member("StackSetName", "refused-by-reference-set"),
+            member("TemplateBody", &json_template("by-reference-set-bucket")),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "the StackSet an update revises must be created first, got {code} {body}"
+    );
+    for (case, url, expected) in &set_rows {
+        for (action, members) in [
+            (
+                "CreateStackSet",
+                vec![
+                    member("StackSetName", "never-created-set"),
+                    member("TemplateURL", url),
+                ],
+            ),
+            (
+                "UpdateStackSet",
+                vec![
+                    member("StackSetName", "refused-by-reference-set"),
+                    member("TemplateURL", url),
+                ],
+            ),
+        ] {
+            let (code, body) = call(&router, action, &members).await;
+            assert_eq!(
+                code, 400,
+                "case {case:?}: {action} must refuse the reference, got {code} {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some("ValidationError"),
+                "case {case:?}: {action} must answer a ValidationError, got {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "Message").as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: {action} must report what Amazon S3 answered, got {body}"
+            );
+        }
+    }
 }

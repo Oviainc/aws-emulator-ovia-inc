@@ -334,6 +334,11 @@ pub mod resource_scans;
 /// reports.
 pub mod change_set_hooks;
 
+/// The PRE-DEPLOYMENT validation a change set is held to before it is offered for
+/// execution: what `DisableValidation` turns off, and the `StatusReason` a change set that
+/// did not pass it carries.
+pub mod early_validation;
+
 /// The progress a resource handler reports for one handler invocation, which
 /// `RecordHandlerProgress` records against the bearer token that invocation was issued.
 pub mod handler_progress;
@@ -1397,6 +1402,26 @@ pub struct StoredRollbackConfiguration {
     pub monitoring_time_in_minutes: Option<i32>,
 }
 
+/// The PRE-DEPLOYMENT validation failure one event reports, for an event that is a
+/// VALIDATION result rather than a resource transition: "Validation errors - Failures from
+/// CloudFormation Early Validations", which is the class `DescribeEvents` reports under
+/// `EventType` `VALIDATION_ERROR` and the detail a failed change set's `StatusReason` sends a
+/// client to that call for.
+///
+/// Such an event is about a resource NOTHING did anything to — the plan was not executed —
+/// so it carries no resource status of its own ([`StoredEvent::resource_status`] is empty on
+/// one) and is not part of the resource-transition stream `DescribeStackEvents` reports.
+#[derive(Debug, Clone)]
+pub struct StoredValidationFailure {
+    /// `OperationEvent$ValidationName`: "the name of the validation that was performed".
+    pub name: String,
+    /// `OperationEvent$ValidationStatus`, from the model's `ValidationStatus` enum.
+    pub status: String,
+    /// `OperationEvent$ValidationStatusReason`: "additional information about the validation
+    /// status" — what about the resource failed the validation.
+    pub reason: String,
+}
+
 /// One stack event, appended (never overwritten) by the operation that caused it.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
@@ -1414,6 +1439,10 @@ pub struct StoredEvent {
     /// resource" — carried by a resource-level event, absent on the stack's own.
     pub resource_properties: Option<String>,
     pub client_request_token: Option<String>,
+    /// The validation failure this event reports, for an event that is one
+    /// ([`StoredValidationFailure`]); `None` for every event that reports a resource or
+    /// stack transition.
+    pub validation: Option<StoredValidationFailure>,
 }
 
 /// The bytes of one event that a CALLER sized: its `ResourceProperties` document. Every

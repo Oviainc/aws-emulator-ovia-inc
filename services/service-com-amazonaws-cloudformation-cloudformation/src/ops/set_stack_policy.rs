@@ -6,8 +6,9 @@
 //! held to: the policy in force decides which of the stack's resources an update may act
 //! on and which action it may take on each ([`crate::state::stack_policy`]), so a document
 //! set here protects those resources from the next `UpdateStack` or `ExecuteChangeSet`.
-//! A policy named by URL would have to be fetched
-//! from Amazon S3, which this emulator does not do, so that request is answered 501.
+//! A policy named by URL says WHERE the document is rather than what it means, so the object
+//! it addresses is read from this emulator's own Amazon S3 and set on the stack exactly as an
+//! inline body is ([`crate::state::stack_policy::fetch`]).
 //!
 //! ## Shape of an operation
 //!
@@ -158,21 +159,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         // "You can specify either the StackPolicyBody or the StackPolicyURL parameter, but
         // not both."
-        if input.stack_policy_body.is_some() && input.stack_policy_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "You cannot specify both StackPolicyBody and StackPolicyURL",
-            ));
-        }
-        // A `StackPolicyURL` names a policy document in an Amazon S3 bucket, which would
-        // have to be fetched over the network — this emulator makes no outbound
-        // connections, so it is answered 501 rather than with a policy nobody read, as
-        // `CreateStack` and `UpdateStack` answer the same member.
-        if input.stack_policy_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SetStackPolicy with StackPolicyURL (fetching a stack policy from Amazon S3)",
-            ));
-        }
-        let Some(body) = input.stack_policy_body.clone() else {
+        crate::state::stack_policy::one_policy_source(
+            "StackPolicyBody",
+            "StackPolicyURL",
+            input.stack_policy_body.as_deref(),
+            input.stack_policy_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // A `StackPolicyURL` says WHERE the policy document is, not what it means: the
+        // object it addresses is read from this emulator's own Amazon S3 and becomes the
+        // policy set on the stack, so a policy submitted by reference and the same one
+        // submitted inline protect the stack alike — as `CreateStack` and `UpdateStack` read
+        // the same member (`crate::state::stack_policy::fetch`).
+        let submitted = match &input.stack_policy_url {
+            Some(url) => Some(
+                crate::state::stack_policy::fetch(
+                    ctx,
+                    &region,
+                    "StackPolicyURL",
+                    "StackPolicyBody",
+                    url,
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            ),
+            None => input.stack_policy_body.clone(),
+        };
+        let Some(body) = submitted else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "Either StackPolicyBody or StackPolicyURL must be specified",
             ));

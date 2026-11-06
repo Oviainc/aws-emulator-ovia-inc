@@ -826,6 +826,43 @@ impl StoredStack {
             resource_status_reason,
             resource_properties,
             client_request_token,
+            // A transition, not a validation result ([`Self::record_validation_failure`]).
+            validation: None,
+        });
+    }
+
+    /// Append an event reporting a PRE-DEPLOYMENT VALIDATION this stack's plan did not pass,
+    /// about the resource it failed on: "Validation errors - Failures from CloudFormation
+    /// Early Validations", which is the detail a failed change set's `StatusReason` sends a
+    /// client to `DescribeEvents` for.
+    ///
+    /// Nothing was done to the resource — the plan was not executed — so the event carries no
+    /// resource status: it reports WHICH validation failed on which resource and why
+    /// ([`StoredValidationFailure`]), and is not part of the resource-transition stream.
+    pub fn record_validation_failure(
+        &mut self,
+        at: SystemTime,
+        logical_resource_id: &str,
+        resource_type: &str,
+        validation: StoredValidationFailure,
+        operation_id: Option<String>,
+        client_request_token: Option<String>,
+    ) {
+        self.push_event(StoredEvent {
+            event_id: new_identifier(&self.stack_id),
+            stack_id: self.stack_id.clone(),
+            stack_name: self.stack_name.clone(),
+            operation_id,
+            logical_resource_id: logical_resource_id.to_string(),
+            // Nothing was created, so there is no physical resource to name.
+            physical_resource_id: None,
+            resource_type: resource_type.to_string(),
+            timestamp: at,
+            resource_status: String::new(),
+            resource_status_reason: None,
+            resource_properties: None,
+            client_request_token,
+            validation: Some(validation),
         });
     }
 

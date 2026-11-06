@@ -43,6 +43,89 @@ use super::change_plan::{replacement, StoredResourceChange};
 use super::provisioning::ResourceTransition;
 use super::resource_status;
 
+/// The most bytes of policy document a stack policy named BY REFERENCE may weigh: "The URL
+/// must point to a policy (maximum size: 16 KB)" — the same ceiling the inline
+/// `StackPolicyBody` carries (`@length(max: 16384)`), since the reference says WHERE the
+/// document is and not what it may be.
+pub const POLICY_BODY_MAX_BYTES: usize = 16_384;
+
+/// `Err(message)` for a policy document past that ceiling, naming the member the document
+/// would have been submitted on and the constraint it failed — the wording this service
+/// holds every caller-sized document to ([`super::template_body_too_long`] is the same
+/// sentence for a template body).
+///
+/// The member is named as a VIOLATION PATH spells it, in lowerCamel, which is the spelling
+/// every constraint message of this surface carries.
+fn policy_body_too_long(body_member: &str) -> String {
+    let path = violation_path(body_member);
+    format!(
+        "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+         Member must have length less than or equal to {POLICY_BODY_MAX_BYTES}"
+    )
+}
+
+/// One modelled member name as a VIOLATION PATH spells it: lowerCamel, which is the spelling
+/// every constraint message of this surface carries (`StackPolicyBody` → `stackPolicyBody`,
+/// beside this crate's own `templateBody`).
+fn violation_path(member: &str) -> String {
+    let mut characters = member.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+/// The stack policy document a `…URL` member addresses, read from this emulator's own Amazon
+/// S3 — the same read a template submitted by reference goes through
+/// ([`super::template_url`]).
+///
+/// A stack policy reaches CloudFormation one of two ways, exactly as a template does: inline,
+/// as the request's own policy BODY, or by reference, as a URL naming "a policy (maximum
+/// size: 16 KB) located in an Amazon S3 bucket in the same Amazon Web Services Region as the
+/// stack". The reference says WHERE the document is, not what it means, so the object it
+/// addresses becomes the body the operation acts on and is then held to every rule a
+/// submitted body is held to.
+///
+/// `url_member` is the member the reference was given on and `body_member` the one its
+/// document would have been given on: a refusal is about the REQUEST's own member, so both
+/// the unreadable-reference sentences and the ceiling name the member that carried it.
+///
+/// `Err(message)` is the `ValidationError` message the operation answers.
+pub async fn fetch(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    url_member: &str,
+    body_member: &str,
+    url: &str,
+) -> Result<String, String> {
+    let object = super::template_url::object_of(url_member, url)?;
+    super::template_url::read(
+        ctx,
+        region,
+        &object,
+        POLICY_BODY_MAX_BYTES,
+        &policy_body_too_long(body_member),
+    )
+    .await
+}
+
+/// `Err(message)` for a request that submits a stack policy BOTH ways: "You can specify
+/// either the StackPolicyBody or the StackPolicyURL parameter, but not both" — the rule every
+/// operation that takes a policy is held to, worded once for the pair of members it is about.
+pub fn one_policy_source(
+    body_member: &str,
+    url_member: &str,
+    body: Option<&str>,
+    url: Option<&str>,
+) -> Result<(), String> {
+    if body.is_some() && url.is_some() {
+        return Err(format!(
+            "You cannot specify both {body_member} and {url_member}"
+        ));
+    }
+    Ok(())
+}
+
 /// The update actions a stack policy statement names, as the policy grammar spells them.
 pub mod update_action {
     /// "Update:Modify — Permission to update resources that will keep the same physical

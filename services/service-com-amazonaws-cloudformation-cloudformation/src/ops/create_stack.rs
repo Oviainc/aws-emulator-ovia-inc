@@ -34,9 +34,9 @@
 //! brings every resource into existence, so no action a policy governs is taken here.
 //! Stored but not acted on: `ResourceTypes` (which resource types the stack's operations
 //! may work with).
-//! `DisableValidation` turns off pre-deployment template validation, which this emulator
-//! does not perform either way. `StackPolicyURL` names a policy in Amazon S3 and is
-//! answered 501.
+//! `DisableValidation` turns off pre-deployment validation.
+//! `StackPolicyURL` names that same stack policy in Amazon S3: the object it addresses is
+//! read from this emulator's own Amazon S3 and applied exactly as an inline body is.
 //!
 //! A `TemplateURL` says WHERE the template is rather than what it means, so the object it
 //! addresses is read from this emulator's own Amazon S3 and the stack is created from it
@@ -385,16 +385,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fire (`crate::state::validate_rollback_configuration`).
         crate::state::validate_rollback_configuration(input.rollback_configuration.as_ref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        // A `StackPolicyURL` names a policy document in an Amazon S3 bucket, which would
-        // have to be fetched over the network — this emulator makes no outbound
-        // connections, so it is answered 501 rather than with a stack whose policy nobody
-        // read. ("You can specify either the StackPolicyBody or the StackPolicyURL
-        // parameter, but not both", so only the body can reach the store.)
-        if input.stack_policy_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateStack with StackPolicyURL (fetching a stack policy from Amazon S3)",
-            ));
-        }
+        // A stack policy reaches CloudFormation either inline, as the request's own
+        // `StackPolicyBody`, or by reference, as a `StackPolicyURL` naming "a policy
+        // (maximum size: 16 KB) located in an Amazon S3 bucket in the same Amazon Web
+        // Services Region as the stack" — and "you can specify either the StackPolicyBody
+        // or the StackPolicyURL parameter, but not both".
+        crate::state::stack_policy::one_policy_source(
+            "StackPolicyBody",
+            "StackPolicyURL",
+            input.stack_policy_body.as_deref(),
+            input.stack_policy_url.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The reference says WHERE the policy document is, not what it means: the object it
+        // addresses is read from this emulator's own Amazon S3 and becomes the policy this
+        // stack carries, so a policy submitted by reference and the same one submitted
+        // inline protect the stack alike (`crate::state::stack_policy::fetch`).
+        let stack_policy_body = match &input.stack_policy_url {
+            Some(url) => Some(
+                crate::state::stack_policy::fetch(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    "StackPolicyURL",
+                    "StackPolicyBody",
+                    url,
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            ),
+            None => input.stack_policy_body.clone(),
+        };
         crate::state::validate_stack_name(&input.stack_name)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The documented `TemplateBody` maximum, which the model carries no `@length` for:
@@ -596,7 +616,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stack.rollback_configuration =
             crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
         stack.client_request_token = Some(client_request_token.clone());
-        stack.stack_policy_body = input.stack_policy_body.clone();
+        stack.stack_policy_body = stack_policy_body;
         stack.resource_types = input.resource_types.clone().unwrap_or_default();
 
         // What the template's processing left: the processed body is the one the stack

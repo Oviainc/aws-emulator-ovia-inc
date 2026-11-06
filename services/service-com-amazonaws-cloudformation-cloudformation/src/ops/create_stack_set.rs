@@ -262,10 +262,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // StackSet carries, so a template submitted by reference and the same one
             // submitted inline create the same StackSet (`crate::state::template_url`).
             (None, Some(url)) => Some(
-                crate::state::template_url::fetch(
+                crate::state::template_url::fetch_as(
                     ctx,
                     &crate::state::request_region(ctx.parts()),
                     url,
+                    // A STACK SET operation reports a read Amazon S3 refused as what Amazon
+                    // S3 ANSWERED, whatever it refused it for — the refusal this operation's
+                    // own recorded answer carries, where a stack operation reports an absent
+                    // object as its absence instead.
+                    crate::state::template_url::Refused::AsAmazonS3Answered,
                 )
                 .await
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?,

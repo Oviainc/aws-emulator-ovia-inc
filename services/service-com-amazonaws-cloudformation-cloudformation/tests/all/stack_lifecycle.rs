@@ -1707,7 +1707,7 @@ async fn completed_deletions_are_retained_only_up_to_the_retention_bound() {
 }
 
 #[tokio::test]
-async fn a_stack_policy_round_trips_and_a_policy_url_is_answered_501() {
+async fn a_stack_policy_round_trips_and_a_policy_url_is_read_from_amazon_s3() {
     let router = router();
 
     // The class: any policy document a caller supplies on create or update is the one
@@ -1888,15 +1888,18 @@ async fn a_stack_policy_round_trips_and_a_policy_url_is_answered_501() {
             code: Some("ValidationError"),
         },
         PolicyRefusal {
-            // Fetching the document would need an outbound connection this emulator does
-            // not make: 501, the same answer CreateStack and UpdateStack give that member.
-            case: "a policy named by URL alone",
+            // The document is read from this emulator's own Amazon S3, so a URL addressing
+            // an object no bucket holds is the `ValidationError` CloudFormation answers for
+            // the reference it was given — the same answer CreateStack and UpdateStack give
+            // that member (`stack_policy_by_reference.rs` is the suite that drives the
+            // reference end to end).
+            case: "a policy named by a URL that addresses no readable object",
             members: vec![
                 member("StackName", "policed"),
                 member("StackPolicyURL", "https://example.s3.amazonaws.com/policy.json"),
             ],
-            status: 501,
-            code: None,
+            status: 400,
+            code: Some("ValidationError"),
         },
     ];
     for PolicyRefusal {
@@ -1954,8 +1957,10 @@ async fn a_stack_policy_round_trips_and_a_policy_url_is_answered_501() {
         );
     }
 
-    // A policy named by URL would have to be fetched from Amazon S3, which this slice does
-    // not do: 501, the honest answer — never a 200 that discards the policy.
+    // A policy named by URL is READ from this emulator's own Amazon S3, so a URL addressing
+    // an object no bucket holds is the `ValidationError` CloudFormation answers for that
+    // reference — never a 200 that discards the policy. What a READABLE object does is the
+    // whole of `stack_policy_by_reference.rs`.
     struct UrlCase {
         case: &'static str,
         action: &'static str,
@@ -2001,8 +2006,13 @@ async fn a_stack_policy_round_trips_and_a_policy_url_is_answered_501() {
     {
         let (status_code, body) = call(&router, action, &members).await;
         assert_eq!(
-            status_code, 501,
-            "case {case:?}: expected 501 NotImplemented, got {status_code} {body}"
+            status_code, 400,
+            "case {case:?}: expected the reference to be refused, got {status_code} {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "Code").as_deref(),
+            Some("ValidationError"),
+            "case {case:?}: expected a ValidationError for the unreadable object, got {body}"
         );
     }
 }
