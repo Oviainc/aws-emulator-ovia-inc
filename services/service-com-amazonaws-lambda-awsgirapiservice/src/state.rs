@@ -279,8 +279,8 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    environment_key_fault, mint_request_id, run_invocation, runs_python, EnvironmentKeyFault,
-    Invocation, Invoked, Unrunnable,
+    engine_for, environment_key_fault, mint_request_id, run_invocation, runs_handler, Engine,
+    EnvironmentKeyFault, Invocation, Invoked, Unrunnable,
 };
 
 /// The region an ARN carries when the request is unsigned and therefore names no

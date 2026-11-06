@@ -65,8 +65,8 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # `Invoke` answers with whatever the caller's handler returned, so the handler has to
 # run. These crates are an in-process execution substrate — they interpret
 # caller-supplied code — and every one of them is taken with the host-reaching surface
-# switched OFF at compile time, so the capability class is "run the caller's Python in
-# this process, with no host access at all":
+# switched OFF at compile time, so the capability class is "run the caller's Python or
+# JavaScript in this process, with no host access at all":
 #
 # * `rustpython-vm` with `default-features = false` leaves `host_env`, `stdio` and
 #   `threading` out of the build, so the VM registers no `ctypes` host loader, writes
@@ -97,6 +97,21 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # Advisories considered: RUSTSEC-2026-0394 (RustPython up to 0.5, fixed in 0.6 — the line
 # taken here) and the `atty` advisory that the 0.3/0.4 lines pull in (not reachable from
 # 0.6).
+# * `rquickjs` is the QuickJS JavaScript engine, which is what RUNS a `nodejs*`
+#   function's own handler (`crate::state::execution::node`). The `loader` feature is
+#   taken because module resolution has to be THIS emulator's: an `import` is answered
+#   from the deployment package's own entries and the core modules the crate supplies,
+#   and from nothing else. The `dyn-load` feature is deliberately NOT taken, so no
+#   native-library loader is compiled in, and plain QuickJS exposes no filesystem,
+#   process, socket or environment API of its own: the whole host surface of a run is
+#   the three functions that module installs. Each run is bounded by the engine's own
+#   memory limit (set from the function's `MemorySize`), a stack limit, an interrupt
+#   handler holding the deadline and the step ceiling, and the host-driven timer queue.
+#   It is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with
+#   `cc` at build time, which is outside this crate's forbidden `unsafe_code`; the
+#   version is pinned and resolves with a checksum in Cargo.lock. No advisory stands
+#   against this line.
+rquickjs = { version = "0.14", features = ["loader"] }
 rustpython-vm = { version = "0.6", default-features = false, features = [
     "compiler",
 ] }

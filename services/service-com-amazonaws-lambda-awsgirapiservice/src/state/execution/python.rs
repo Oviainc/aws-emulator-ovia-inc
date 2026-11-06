@@ -54,13 +54,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use rustpython_vm::function::FuncArgs;
 use rustpython_vm::builtins::PyModule;
 use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine};
 
+// What one run may spend and what it came to are the same for every engine, so they are
+// the shared ones ([`super::outcome`]) rather than this interpreter's own.
+pub use super::outcome::{Budget, Completion, Finished, Stop};
+
+use super::outcome::{captured, Capture};
 use super::package::PackageModule;
 
 /// The name of the module the three host functions live on, as the runtime source imports
@@ -165,23 +170,6 @@ const PAGE_BYTES: u64 = 4_096;
 /// emulator past it.
 const PROCESS_RESIDENT_CEILING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// What one invocation is allowed to spend.
-#[derive(Debug, Clone, Copy)]
-pub struct Budget {
-    /// How long the handler may run for.
-    pub wall_clock: Duration,
-    /// How many traced events the handler may execute.
-    pub steps: u64,
-    /// How much memory the run may add to this process.
-    pub memory_bytes: u64,
-    /// How many bytes of the handler's output are kept.
-    pub log_bytes: usize,
-    /// How large the handler's response may be.
-    pub response_bytes: usize,
-    /// How deep the handler may recurse.
-    pub recursion_limit: usize,
-}
-
 /// One invocation to run: the package, the handler, and everything the runtime reports to
 /// it.
 #[derive(Debug)]
@@ -205,63 +193,6 @@ pub struct Run<'a> {
     pub tenant_id: Option<&'a str>,
     /// What this run may spend.
     pub budget: Budget,
-}
-
-/// Which bound a stopped run ran past.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stop {
-    /// The run outlasted its wall clock.
-    Deadline,
-    /// The run executed more traced events than its budget.
-    Steps,
-    /// The run grew this process past its ceiling.
-    Memory,
-    /// The handler's response is larger than one may be.
-    Response,
-}
-
-impl Stop {
-    /// What the stop is reported as, as the reason of the run's failure.
-    #[must_use]
-    pub fn reason(self) -> &'static str {
-        match self {
-            Self::Deadline => "the invocation ran past its timeout",
-            Self::Steps => "the invocation ran past its step budget",
-            Self::Memory => "the invocation ran past its memory ceiling",
-            Self::Response => "the response is larger than the invocation may return",
-        }
-    }
-}
-
-/// What the handler came to.
-#[derive(Debug, Clone)]
-pub enum Completion {
-    /// The handler returned, and this is the JSON its value was serialized to.
-    Returned(String),
-    /// The handler (or the runtime resolving it) raised.
-    Raised {
-        /// The exception's type name, or the `Runtime.*` class of a runtime failure.
-        error_type: String,
-        /// The exception's message.
-        error_message: String,
-        /// The handler's own stack, one formatted frame per entry.
-        stack_trace: Vec<String>,
-    },
-    /// The run was stopped by one of its bounds.
-    Stopped(Stop),
-    /// The interpreter itself could not be built or driven. Not a guest failure.
-    Internal(String),
-}
-
-/// One finished run.
-#[derive(Debug, Clone)]
-pub struct Finished {
-    /// What the handler came to.
-    pub completion: Completion,
-    /// Everything the handler wrote to its output streams, capped.
-    pub log: String,
-    /// How long the run took.
-    pub elapsed: Duration,
 }
 
 /// Run `request`'s handler to completion.
@@ -805,49 +736,6 @@ fn formatted_exception(
         rendered.push_str("an exception that could not be rendered");
     }
     rendered
-}
-
-/// What the handler wrote to its output streams, capped at the run's log budget.
-#[derive(Debug)]
-struct Capture {
-    /// The text kept so far.
-    text: String,
-    /// How many bytes are kept at most.
-    limit: usize,
-}
-
-impl Capture {
-    /// A capture that keeps at most `limit` bytes.
-    fn new(limit: usize) -> Self {
-        Self {
-            text: String::new(),
-            limit,
-        }
-    }
-
-    /// Append `text`, stopping at the cap. Past it the capture keeps what it already has.
-    fn write(&mut self, text: &str) {
-        if self.text.len() >= self.limit {
-            return;
-        }
-        let room = self.limit - self.text.len();
-        if text.len() <= room {
-            self.text.push_str(text);
-            return;
-        }
-        // Cut on a character boundary, so the kept log is still text.
-        let mut end = room;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        self.text.push_str(&text[..end]);
-    }
-}
-
-/// Read the capture, which a panic in guest-driven code cannot poison out of use: what it
-/// already holds is still the only output there is.
-fn captured(capture: &Arc<Mutex<Capture>>) -> MutexGuard<'_, Capture> {
-    capture.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The run's budget, as the hook spends it. Shared with the host functions and read by the

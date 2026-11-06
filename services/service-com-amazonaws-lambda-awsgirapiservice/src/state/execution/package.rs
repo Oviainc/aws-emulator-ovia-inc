@@ -17,8 +17,9 @@
 //!   that inflates to a large one stops at the cap rather than filling memory;
 //! * [`MAX_MODULE_BYTES`] of one entry, for the same reason at the level of a single file.
 //!
-//! Only entries that are Python SOURCE — a `.py` suffix and valid UTF-8 — are kept, because
-//! a source file is the only thing this emulator's in-process interpreter can import: a
+//! Only entries that are SOURCE the engine running the package can compile — one of its
+//! suffixes ([`PYTHON_SUFFIXES`], [`JAVASCRIPT_SUFFIXES`]) and valid UTF-8 — are kept,
+//! because a source file is the only thing this emulator's in-process engines can import: a
 //! compiled artefact or a native extension shipped in the package is NOT loaded (nothing
 //! here loads a host library), so a handler that needs one fails to import exactly as it
 //! would if the file were absent, and nothing is reported as having run.
@@ -53,14 +54,36 @@ pub const MAX_UNZIPPED_BYTES: u64 = 64 * 1024 * 1024;
 /// How many INFLATED bytes of ONE entry are read.
 pub const MAX_MODULE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The suffix of an entry this interpreter can import.
-const PYTHON_SUFFIX: &str = ".py";
+/// The suffixes of an entry the Python interpreter can import.
+const PYTHON_SUFFIXES: &[&str] = &[".py"];
+
+/// The suffixes of an entry the JavaScript engine can load: the two module forms Node
+/// resolves (`.js`, and the explicit `.mjs`/`.cjs` of an ES and a CommonJS module) and the
+/// JSON a package `require`s or imports.
+const JAVASCRIPT_SUFFIXES: &[&str] = &[".js", ".mjs", ".cjs", ".json"];
 
 /// Every Python module `zip_bytes` holds, in the archive's own order.
 ///
 /// `Ok(vec![])` is a readable archive with no importable module in it, which is a package
 /// whose handler cannot be imported — not a failure of the read.
 pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, PackageFault> {
+    source_modules(zip_bytes, PYTHON_SUFFIXES)
+}
+
+/// Every JavaScript (and JSON) module `zip_bytes` holds, in the archive's own order.
+///
+/// `Ok(vec![])` is a readable archive with no loadable module in it, which is a package
+/// whose handler cannot be imported — not a failure of the read.
+pub fn javascript_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, PackageFault> {
+    source_modules(zip_bytes, JAVASCRIPT_SUFFIXES)
+}
+
+/// Every entry of `zip_bytes` whose path ends in one of `suffixes` and whose bytes are
+/// text, read under this module's three bounds.
+fn source_modules(
+    zip_bytes: Option<&[u8]>,
+    suffixes: &[&str],
+) -> Result<Vec<PackageModule>, PackageFault> {
     let Some(zip_bytes) = zip_bytes else {
         return Err(PackageFault::NotHeld);
     };
@@ -80,7 +103,7 @@ pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, Pa
             continue;
         };
         let path = normalized_path(name.as_ref());
-        if !path.ends_with(PYTHON_SUFFIX) {
+        if !suffixes.iter().any(|suffix| path.ends_with(suffix)) {
             continue;
         }
         // The read is capped by what is LEFT of the whole-archive budget and by the
@@ -93,7 +116,7 @@ pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, Pa
         ::std::io::Read::read_to_end(&mut ::std::io::Read::take(&mut entry, room), &mut bytes)
             .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
         inflated = inflated.saturating_add(bytes.len() as u64);
-        // A module that is not UTF-8 is not source this interpreter can compile; it is
+        // A module that is not UTF-8 is not source an engine here can compile; it is
         // left out rather than lossily decoded into something the caller never wrote.
         if let Ok(source) = String::from_utf8(bytes) {
             modules.push(PackageModule { path, source });
@@ -169,6 +192,34 @@ mod tests {
                 actual,
                 Some(size),
                 "case {size} bytes: expected the stored source back, got {actual:?}"
+            );
+        }
+    }
+
+    /// A JavaScript package's entries are the ones the JavaScript engine can load — one
+    /// row per suffix a Node package stores a module under, and one per entry that is not
+    /// loadable source at all.
+    #[test]
+    fn only_the_javascript_sources_of_an_archive_are_read() {
+        let cases: &[(&str, &[u8], Option<&str>)] = &[
+            ("index.js", b"exports.handler = null;\n", Some("index.js")),
+            ("index.mjs", b"export const handler = null;\n", Some("index.mjs")),
+            ("legacy.cjs", b"module.exports = {};\n", Some("legacy.cjs")),
+            ("data.json", b"{\"k\":1}", Some("data.json")),
+            ("node_modules/dep/index.js", b"", Some("node_modules/dep/index.js")),
+            ("./nested/mod.js", b"", Some("nested/mod.js")),
+            ("lambda_function.py", b"x = 1\n", None),
+            ("native.node", b"\x7fELF", None),
+            ("binary.js", b"\xff\xfe\x00", None),
+        ];
+        for (name, bytes, expected) in cases {
+            let held = archive(&[(name, bytes)]);
+            let modules = javascript_modules(Some(&held)).expect("a readable archive");
+            let actual: Vec<&str> = modules.iter().map(|module| module.path.as_str()).collect();
+            let wanted: Vec<&str> = expected.iter().copied().collect();
+            assert_eq!(
+                actual, wanted,
+                "case {name:?}: expected the modules {wanted:?}, got {actual:?}"
             );
         }
     }

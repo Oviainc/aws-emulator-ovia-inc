@@ -601,7 +601,7 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeWithResponseStreamError {
                 r#type: None,
                 message: Some(format!(
                     "The runtime {runtime} is not supported by this emulator, which runs the \
-                     Python runtimes."
+                     Python and node runtimes."
                 )),
             })
             .into()

@@ -721,9 +721,10 @@ async fn a_response_stream_invocation_streams_what_the_handler_produced() {
 #[tokio::test]
 async fn a_runtime_with_no_engine_is_refused_rather_than_answered() {
     let cases: &[(&str, &str)] = &[
-        ("a JavaScript runtime", "nodejs22.x"),
         ("a Java runtime", "java21"),
         ("a custom runtime", "provided.al2023"),
+        ("a .NET runtime", "dotnet8"),
+        ("a Ruby runtime", "ruby3.3"),
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);

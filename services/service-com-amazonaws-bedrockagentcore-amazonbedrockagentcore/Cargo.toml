@@ -29,19 +29,23 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # `rquickjs`: the QuickJS JavaScript engine, embedded in this process, which is what
 # actually RUNS the JavaScript a caller submits to `InvokeCodeInterpreter`'s
-# `executeCode` tool — nothing about a run is synthesised. Default features only: the
-# `loader` and `dyn-load` features (module resolution and native module loading) are
-# deliberately NOT enabled, so a submitted script can import nothing, and plain QuickJS
-# exposes no filesystem, process or socket API at all. Each run is bounded by a memory
-# limit, a stack limit, an interrupt deadline and an output cap, on a blocking thread —
-# see `src/ops/invoke_code_interpreter.rs`.
+# `executeCode` tool — nothing about a run is synthesized. Default features only: the
+# `dyn-load` feature (native module loading) is deliberately NOT enabled, and no
+# module loader is installed on this runtime at all, so a submitted script can import
+# nothing, and plain QuickJS exposes no filesystem, process or socket API. (The
+# `loader` feature is compiled in the workspace build because the Lambda emulator's
+# own engine resolves a deployment package's modules through it; a feature being
+# compiled installs nothing here.) Each run is bounded by a memory limit, a stack
+# limit, an interrupt deadline and an output cap, on a blocking thread — see
+# `src/ops/invoke_code_interpreter.rs`.
 #
 # It is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with
 # `cc` at build time, on the builder's machine and with the builder's authority, and
 # that C is outside this crate's `#![forbid(unsafe_code)]`. The version is pinned and
 # resolves with a checksum in Cargo.lock, so the engine every user runs is the one
-# reviewed here.
-rquickjs = "0.9"
+# reviewed here. One version is pinned for the whole workspace, so the binary carries
+# a single QuickJS.
+rquickjs = "0.14"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

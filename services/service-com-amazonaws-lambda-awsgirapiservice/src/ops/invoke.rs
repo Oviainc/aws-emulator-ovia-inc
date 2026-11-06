@@ -779,14 +779,14 @@ fn environment_key_refusal(fault: crate::state::EnvironmentKeyFault) -> InvokeEr
 fn unrunnable(why: crate::state::Unrunnable) -> InvokeError {
     match why {
         // "The runtime or runtime version specified is not supported" — this emulator
-        // embeds an interpreter for the Python runtimes and for no other, and a container
-        // image is a package it cannot run at all.
+        // embeds an interpreter for the Python runtimes and an engine for the node ones,
+        // and for no other, and a container image is a package it cannot run at all.
         crate::state::Unrunnable::NoEngine { runtime } => {
             InvokeErrorModeled::InvalidRuntimeException(InvalidRuntimeException {
                 r#type: None,
                 message: Some(format!(
                     "The runtime {runtime} is not supported by this emulator, which runs the \
-                     Python runtimes."
+                     Python and node runtimes."
                 )),
             })
             .into()

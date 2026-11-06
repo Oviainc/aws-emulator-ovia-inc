@@ -5,21 +5,22 @@
 //! An invocation's answer is the handler's: "For synchronous invocation, details about the
 //! function response, including errors, are included in the response body and headers"
 //! (`Invoke`). So this module runs the handler — the package's modules are compiled and
-//! executed in this process by the interpreter in [`python`], with the event the caller
-//! sent and the context the runtime reports — and reports back exactly what the run
-//! produced: the value the handler returned, serialized by that interpreter; the error
-//! document and `Unhandled` signal of an exception it raised; and the log the run wrote.
-//! Nothing here is synthesised: a payload, a log line, an error type or a duration is the
-//! one the run produced, and a package no engine here can run is reported as the modelled
-//! failure for it rather than as a result.
+//! executed in this process by the engine for the function's own language ([`python`],
+//! [`node`]), with the event the caller sent and the context the runtime reports — and
+//! reports back exactly what the run produced: the value the handler returned, serialized
+//! by that engine; the error document and `Unhandled` signal of an exception it raised; and
+//! the log the run wrote. Nothing here is synthesised: a payload, a log line, an error type
+//! or a duration is the one the run produced, and a package no engine here can run is
+//! reported as the modelled failure for it rather than as a result.
 //!
 //! # Which packages run
 //!
-//! A `Zip` package whose `Runtime` is one of the Python runtimes ([`runs_python`]), out of
-//! the bytes the store holds for the version the invocation resolved. Every other package
-//! — a container image, a runtime this emulator embeds no interpreter for — is
-//! [`Unrunnable::NoEngine`], which the calling operation answers as the modelled
-//! `InvalidRuntimeException`: no response payload is returned that no function produced.
+//! A `Zip` package whose `Runtime` names a language this emulator embeds an engine for
+//! ([`engine_for`]) — the Python runtimes and the node ones — out of the bytes the store
+//! holds for the version the invocation resolved. Every other package — a container image,
+//! a runtime this emulator embeds no engine for — is [`Unrunnable::NoEngine`], which the
+//! calling operation answers as the modelled `InvalidRuntimeException`: no response payload
+//! is returned that no function produced.
 //!
 //! # What bounds a run
 //!
@@ -48,9 +49,17 @@ use std::time::{Duration, SystemTime};
 /// The modules of a .zip deployment package, read out of the bytes the store holds.
 pub mod package;
 
+/// What one run may spend, and what it came to: the same for every engine.
+pub mod outcome;
+pub use outcome::{Budget, Completion, Finished, Stop};
+
 /// The Python interpreter one invocation runs in, and everything that bounds and contains
 /// it.
 pub mod python;
+
+/// The JavaScript engine one invocation runs in, and everything that bounds and contains
+/// it.
+pub mod node;
 
 /// The runtime the handler runs under, in the language the handler is written in.
 mod bootstrap;
@@ -99,6 +108,18 @@ const MIN_TIMEOUT_SECONDS: i64 = 1;
 /// is the maximum `CreateFunction` accepts), which a stored value is clamped down to.
 const MAX_TIMEOUT_SECONDS: i64 = 900;
 
+/// The smallest `MemorySize` the model allows (`smithy_query(query="shape",
+/// shape="MemorySize")`: `@range(min: 128, max: 32768)`), which a stored value is clamped
+/// up to before it bounds a run.
+const MIN_MEMORY_SIZE_MB: i64 = 128;
+
+/// The largest `MemorySize` that same range allows, which a stored value is clamped down
+/// to.
+const MAX_MEMORY_SIZE_MB: i64 = 32_768;
+
+/// The bytes of one MB of a function's `MemorySize`, which the value is stated in.
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
 /// The REQUEST ID one invocation is identified by, in the log it writes and in the error
 /// document it answers with: a fresh UUID per invocation, which is what `aws_request_id`
 /// is on the real runtime.
@@ -140,17 +161,44 @@ pub const LOG_TAIL_BYTES: usize = 4 * 1024;
 /// that raised as `Unhandled`.
 pub const FUNCTION_ERROR_UNHANDLED: &str = "Unhandled";
 
-/// The `Runtime` values this emulator embeds an interpreter for: the Python ones.
+/// The `Runtime` values this emulator runs with the Python interpreter.
 ///
 /// Matched by prefix because the identifiers are versioned (`python3.12`,
 /// `python3.13`, …) and the interpreter runs the language rather than one of its point
 /// releases (source for the value set: `smithy_query(query="shape", shape="Runtime")`).
 const PYTHON_RUNTIME_PREFIX: &str = "python";
 
+/// The `Runtime` values this emulator runs with the JavaScript engine, by the same rule:
+/// every `nodejs…` identifier of that same value set names the one language.
+const NODE_RUNTIME_PREFIX: &str = "nodejs";
+
+/// Which engine runs a function's handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// The Python interpreter ([`python`]).
+    Python,
+    /// The JavaScript engine ([`node`]).
+    Node,
+}
+
+/// The engine that runs a package for `runtime`, or `None` when this emulator embeds none
+/// for it.
+#[must_use]
+pub fn engine_for(runtime: Option<&str>) -> Option<Engine> {
+    let runtime = runtime?;
+    if runtime.starts_with(PYTHON_RUNTIME_PREFIX) {
+        return Some(Engine::Python);
+    }
+    if runtime.starts_with(NODE_RUNTIME_PREFIX) {
+        return Some(Engine::Node);
+    }
+    None
+}
+
 /// Whether `runtime` names a runtime this emulator can run a package for.
 #[must_use]
-pub fn runs_python(runtime: Option<&str>) -> bool {
-    runtime.is_some_and(|runtime| runtime.starts_with(PYTHON_RUNTIME_PREFIX))
+pub fn runs_handler(runtime: Option<&str>) -> bool {
+    engine_for(runtime).is_some()
 }
 
 /// Everything one invocation of a stored function needs to run.
@@ -249,18 +297,24 @@ impl Invoked {
 /// state guard of this service, and the caller's wait for it is bounded by
 /// [`HOST_WAIT_CEILING`] however long the function's own timeout is.
 pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnable> {
-    if !runs_python(invocation.runtime.as_deref()) {
+    let Some(engine) = engine_for(invocation.runtime.as_deref()) else {
         return Err(Unrunnable::NoEngine {
             runtime: invocation
                 .runtime
                 .clone()
                 .unwrap_or_else(|| "an image package".to_string()),
         });
-    }
+    };
     let Some(handler) = invocation.handler.clone() else {
         return Err(Unrunnable::NoHandler);
     };
-    let modules = match package::python_modules(invocation.zip_bytes.as_deref()) {
+    // Each engine imports the sources of its own language: the entries a package holds for
+    // the other one are not modules this run could load.
+    let read = match engine {
+        Engine::Python => package::python_modules(invocation.zip_bytes.as_deref()),
+        Engine::Node => package::javascript_modules(invocation.zip_bytes.as_deref()),
+    };
+    let modules = match read {
         Ok(modules) => modules,
         Err(package::PackageFault::NotHeld) => return Err(Unrunnable::PackageNotHeld),
         Err(package::PackageFault::Unreadable(why)) => {
@@ -289,6 +343,7 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
         .map_err(|error| Unrunnable::Internal(format!("the run slots are gone: {error}")))?;
 
     let budget = run_budget(invocation.timeout);
+    let heap_bytes = run_heap_bytes(invocation.memory_size);
     let started = SystemTime::now();
     let request_id = invocation.request_id.clone();
     let reported = invocation.clone();
@@ -307,17 +362,32 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
             let _mark = ThreadLifecycle {
                 lifecycle: thread_lifecycle,
             };
-            let finished = python::run(&python::Run {
-                modules: &modules,
-                handler: &handler,
-                environment: &environment,
-                event: event_text(&invocation.payload).as_deref(),
-                request_id: &invocation.request_id,
-                invoked_function_arn: &invocation.invoked_function_arn,
-                client_context: invocation.client_context.as_deref(),
-                tenant_id: invocation.tenant_id.as_deref(),
-                budget,
-            });
+            let event = event_text(&invocation.payload);
+            let finished = match engine {
+                Engine::Python => python::run(&python::Run {
+                    modules: &modules,
+                    handler: &handler,
+                    environment: &environment,
+                    event: event.as_deref(),
+                    request_id: &invocation.request_id,
+                    invoked_function_arn: &invocation.invoked_function_arn,
+                    client_context: invocation.client_context.as_deref(),
+                    tenant_id: invocation.tenant_id.as_deref(),
+                    budget,
+                }),
+                Engine::Node => node::run(&node::Run {
+                    modules: &modules,
+                    handler: &handler,
+                    environment: &environment,
+                    event: event.as_deref(),
+                    request_id: &invocation.request_id,
+                    invoked_function_arn: &invocation.invoked_function_arn,
+                    client_context: invocation.client_context.as_deref(),
+                    tenant_id: invocation.tenant_id.as_deref(),
+                    budget,
+                    heap_bytes,
+                }),
+            };
             let _ = sender.send(finished);
         });
     if let Err(error) = spawned {
@@ -358,7 +428,7 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
         }
     };
 
-    Ok(answered(finished, &request_id, &reported, budget))
+    Ok(answered(finished, &request_id, &reported, budget, engine))
 }
 
 /// Marks a run's thread as FINISHED on every exit of that thread, including an unwind out
@@ -409,22 +479,30 @@ impl Drop for RunAccounting {
 
 /// How a finished run is reported.
 fn answered(
-    finished: python::Finished,
+    finished: Finished,
     request_id: &str,
     invocation: &Invocation,
-    budget: python::Budget,
+    budget: Budget,
+    engine: Engine,
 ) -> Invoked {
+    let stack_member = stack_trace_member(engine);
     let (payload, function_error) = match &finished.completion {
-        python::Completion::Returned(payload) => (payload.clone().into_bytes(), None),
-        python::Completion::Raised {
+        Completion::Returned(payload) => (payload.clone().into_bytes(), None),
+        Completion::Raised {
             error_type,
             error_message,
             stack_trace,
         } => (
-            error_document(error_message, Some(error_type), request_id, stack_trace),
+            error_document(
+                error_message,
+                Some(error_type),
+                request_id,
+                stack_trace,
+                stack_member,
+            ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
-        python::Completion::Stopped(python::Stop::Deadline) => (
+        Completion::Stopped(Stop::Deadline) => (
             error_document(
                 &format!(
                     "{request_id} Task timed out after {:.2} seconds",
@@ -433,15 +511,40 @@ fn answered(
                 None,
                 request_id,
                 &[],
+                stack_member,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
-        python::Completion::Stopped(stop) => (
-            error_document(stop.reason(), Some("Runtime.ExitError"), request_id, &[]),
+        // A run the memory ceiling ended is one whose runtime was killed, which is what
+        // AWS reports it as: "Runtime exited with error: signal: killed".
+        Completion::Stopped(Stop::Memory) => (
+            error_document(
+                &format!("RequestId: {request_id} Error: {RUNTIME_KILLED}"),
+                Some(RUNTIME_EXIT_ERROR),
+                request_id,
+                &[],
+                stack_member,
+            ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
-        python::Completion::Internal(why) => (
-            error_document(why, Some("Runtime.InternalError"), request_id, &[]),
+        Completion::Stopped(stop) => (
+            error_document(
+                stop.reason(),
+                Some(RUNTIME_EXIT_ERROR),
+                request_id,
+                &[],
+                stack_member,
+            ),
+            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
+        Completion::Internal(why) => (
+            error_document(
+                why,
+                Some("Runtime.InternalError"),
+                request_id,
+                &[],
+                stack_member,
+            ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
     };
@@ -459,13 +562,30 @@ fn answered(
     }
 }
 
-/// The error payload an invocation that failed answers with: the members AWS's Python
-/// runtime reports for a handler that raised.
+/// The `errorType` of a run whose runtime ended instead of answering.
+const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
+
+/// What AWS reports as the message of such a run when the sandbox ended it.
+const RUNTIME_KILLED: &str = "Runtime exited with error: signal: killed";
+
+/// The member the error document carries the handler's stack under, which is the one the
+/// function's own runtime reports it under: `stackTrace` for a Python handler, `trace` for
+/// a node one.
+fn stack_trace_member(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Python => "stackTrace",
+        Engine::Node => "trace",
+    }
+}
+
+/// The error payload an invocation that failed answers with: the members the function's
+/// own runtime reports for a handler that raised.
 fn error_document(
     message: &str,
     error_type: Option<&str>,
     request_id: &str,
     stack_trace: &[String],
+    stack_member: &str,
 ) -> Vec<u8> {
     let mut document = ::serde_json::Map::new();
     document.insert(
@@ -483,7 +603,7 @@ fn error_document(
         ::serde_json::Value::String(request_id.to_string()),
     );
     document.insert(
-        "stackTrace".to_string(),
+        stack_member.to_string(),
         ::serde_json::Value::Array(
             stack_trace
                 .iter()
@@ -498,13 +618,8 @@ fn error_document(
 /// what the handler wrote, and the report line that states what the run spent.
 ///
 /// Every number in it is measured: the duration is the run's own, and the memory is what
-/// the run added to this process (see [`python`]).
-fn run_log(
-    request_id: &str,
-    version: &str,
-    memory_size: i32,
-    finished: &python::Finished,
-) -> String {
+/// the run was allowed to hold (see [`python`], [`node`]).
+fn run_log(request_id: &str, version: &str, memory_size: i32, finished: &Finished) -> String {
     let duration_ms = finished.elapsed.as_secs_f64() * 1_000.0;
     let billed_ms = duration_ms.ceil().max(1.0);
     let mut log = format!("START RequestId: {request_id} Version: {version}\n");
@@ -532,10 +647,10 @@ fn event_text(payload: &[u8]) -> Option<String> {
 /// What one run may spend: the function's own `Timeout`, clamped to the range the model
 /// allows for it and to this module's ceiling, plus the bounds that are this emulator's.
 #[must_use]
-pub fn run_budget(timeout_seconds: i32) -> python::Budget {
+pub fn run_budget(timeout_seconds: i32) -> Budget {
     let clamped = i64::from(timeout_seconds).clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
     let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1)).min(HOST_WAIT_CEILING);
-    python::Budget {
+    Budget {
         wall_clock,
         steps: MAX_RUN_STEPS,
         memory_bytes: MAX_RUN_MEMORY_BYTES,
@@ -543,6 +658,21 @@ pub fn run_budget(timeout_seconds: i32) -> python::Budget {
         response_bytes: MAX_RESPONSE_BYTES,
         recursion_limit: MAX_RUN_RECURSION,
     }
+}
+
+/// The memory one run may HOLD: the function's own `MemorySize`, clamped to the range the
+/// model allows for it and to this module's own per-run ceiling.
+///
+/// This is what an engine with an allocation ceiling of its own is given ([`node`]), so
+/// that a function's configured memory is the memory its handler really has.
+#[must_use]
+pub fn run_heap_bytes(memory_size: i32) -> usize {
+    let clamped = i64::from(memory_size).clamp(MIN_MEMORY_SIZE_MB, MAX_MEMORY_SIZE_MB);
+    let bytes = u64::try_from(clamped)
+        .unwrap_or(1)
+        .saturating_mul(BYTES_PER_MB)
+        .min(MAX_RUN_MEMORY_BYTES);
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 /// The ENVIRONMENT one run sees: the function's own variables, plus the ones the runtime
@@ -654,27 +784,90 @@ fn release_abandoned_run() {
 mod tests {
     use super::*;
 
-    /// The runtimes this emulator can run a package for, one row per class of `Runtime`
-    /// value the model declares (source: `smithy_query(query="shape", shape="Runtime")`).
+    /// The runtimes this emulator can run a package for, and which engine runs each — one
+    /// row per class of `Runtime` value the model declares (source:
+    /// `smithy_query(query="shape", shape="Runtime")`).
     #[test]
-    fn only_a_python_runtime_has_an_engine_here() {
-        let cases: &[(Option<&str>, bool)] = &[
-            (Some("python3.12"), true),
-            (Some("python3.13"), true),
-            (Some("python3.9"), true),
-            (Some("nodejs22.x"), false),
-            (Some("java21"), false),
-            (Some("dotnet8"), false),
-            (Some("ruby3.3"), false),
-            (Some("provided.al2023"), false),
-            (Some("Image"), false),
-            (None, false),
+    fn a_runtime_resolves_to_the_engine_that_runs_it() {
+        let cases: &[(Option<&str>, Option<Engine>)] = &[
+            (Some("python3.12"), Some(Engine::Python)),
+            (Some("python3.13"), Some(Engine::Python)),
+            (Some("python3.9"), Some(Engine::Python)),
+            (Some("nodejs22.x"), Some(Engine::Node)),
+            (Some("nodejs20.x"), Some(Engine::Node)),
+            (Some("nodejs18.x"), Some(Engine::Node)),
+            (Some("nodejs"), Some(Engine::Node)),
+            (Some("java21"), None),
+            (Some("dotnet8"), None),
+            (Some("ruby3.3"), None),
+            (Some("provided.al2023"), None),
+            (Some("Image"), None),
+            (None, None),
         ];
         for (runtime, expected) in cases {
-            let actual = runs_python(*runtime);
+            let actual = engine_for(*runtime);
             assert_eq!(
                 actual, *expected,
-                "case {runtime:?}: expected an engine {expected}, got {actual}"
+                "case {runtime:?}: expected the engine {expected:?}, got {actual:?}"
+            );
+            assert_eq!(
+                runs_handler(*runtime),
+                expected.is_some(),
+                "case {runtime:?}: a runtime runs exactly when an engine here runs it"
+            );
+        }
+    }
+
+    /// A stored `MemorySize` is clamped into the range the model allows before it bounds a
+    /// run, and never past this module's own per-run ceiling — one row per bound and one
+    /// past each.
+    #[test]
+    fn a_stored_memory_size_is_clamped_before_it_bounds_a_run() {
+        let cases: &[(i32, u64)] = &[
+            (0, 128),
+            (-7, 128),
+            (128, 128),
+            (256, 256),
+            (512, 512),
+            (10_240, MAX_RUN_MEMORY_BYTES / BYTES_PER_MB),
+            (32_768, MAX_RUN_MEMORY_BYTES / BYTES_PER_MB),
+            (100_000, MAX_RUN_MEMORY_BYTES / BYTES_PER_MB),
+        ];
+        for (configured, expected_mb) in cases {
+            let actual = run_heap_bytes(*configured) as u64 / BYTES_PER_MB;
+            assert_eq!(
+                actual, *expected_mb,
+                "case {configured} MB configured: expected a {expected_mb} MB ceiling, got \
+                 {actual}"
+            );
+        }
+    }
+
+    /// The error document carries the handler's stack under the member the function's own
+    /// runtime reports it under — one row per engine.
+    #[test]
+    fn the_error_document_names_the_stack_the_way_the_runtime_does() {
+        let cases: &[(Engine, &str, &str)] = &[
+            (Engine::Python, "stackTrace", "trace"),
+            (Engine::Node, "trace", "stackTrace"),
+        ];
+        for (engine, expected, absent) in cases {
+            let document = error_document(
+                "boom",
+                Some("Error"),
+                "11111111-2222-3333-4444-555555555555",
+                &["  at handler".to_string()],
+                stack_trace_member(*engine),
+            );
+            let parsed: ::serde_json::Value =
+                ::serde_json::from_slice(&document).expect("the error document is JSON");
+            assert!(
+                parsed.get(*expected).is_some_and(::serde_json::Value::is_array),
+                "case {engine:?}: expected the stack under {expected}, got {parsed}"
+            );
+            assert!(
+                parsed.get(*absent).is_none(),
+                "case {engine:?}: {absent} is another runtime's member, got {parsed}"
             );
         }
     }

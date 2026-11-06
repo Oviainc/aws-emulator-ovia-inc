@@ -195,6 +195,8 @@ mod layer_version_permissions;
 mod layer_versions;
 #[path = "all/missing_policy_refusal.rs"]
 mod missing_policy_refusal;
+#[path = "all/node_invoke_run.rs"]
+mod node_invoke_run;
 #[path = "all/permission_and_policy_refusals.rs"]
 mod permission_and_policy_refusals;
 #[path = "all/policy_versions_and_resources.rs"]
