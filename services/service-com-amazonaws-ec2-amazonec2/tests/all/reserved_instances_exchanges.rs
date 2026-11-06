@@ -34,7 +34,7 @@ use std::time::SystemTime;
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, INVALID_PARAMETER_VALUE,
-    INVALID_RESERVED_INSTANCES_ID_NOT_FOUND, INVALID_RESERVED_INSTANCES_OFFERING_ID,
+    INVALID_RESERVED_INSTANCE_ID, INVALID_RESERVED_INSTANCES_OFFERING_ID,
     MAX_ECHOED_RESOURCE_ID_CHARS, MISSING_PARAMETER, RESERVED_INSTANCE_SCOPE_REGION,
     RESERVED_INSTANCE_SCOPE_ZONE, RESERVED_INSTANCE_STATE_ACTIVE,
     RESERVED_INSTANCE_STATE_QUEUED, RESERVED_INSTANCE_STATE_RETIRED, ReservedInstancesOfferingTerms,
@@ -595,8 +595,8 @@ async fn an_exchange_refuses_what_it_cannot_act_on_and_exchanges_nothing() {
             Named::Literal("not-a-valid-reserved-instance-id"),
             &[("m5.large", None, 600.0)],
             &[],
-            INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
-            "The reserved-instances ID 'not-a-valid-reserved-instance-id' is malformed".to_string(),
+            INVALID_RESERVED_INSTANCE_ID,
+            " [not-a-valid-reserved-instance-id]".to_string(),
         ),
         (
             "an id of another EC2 resource form",
@@ -604,8 +604,8 @@ async fn an_exchange_refuses_what_it_cannot_act_on_and_exchanges_nothing() {
             Named::Literal("i-0123456789abcdef0"),
             &[("m5.large", None, 600.0)],
             &[],
-            INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
-            "The reserved-instances ID 'i-0123456789abcdef0' is malformed".to_string(),
+            INVALID_RESERVED_INSTANCE_ID,
+            " [i-0123456789abcdef0]".to_string(),
         ),
         (
             "a UUID with a field of the wrong length",
@@ -613,9 +613,8 @@ async fn an_exchange_refuses_what_it_cannot_act_on_and_exchanges_nothing() {
             Named::Literal("b847fa93-e282-4f55-b59a-1342f5bd7c0"),
             &[("m5.large", None, 600.0)],
             &[],
-            INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
-            "The reserved-instances ID 'b847fa93-e282-4f55-b59a-1342f5bd7c0' is malformed"
-                .to_string(),
+            INVALID_RESERVED_INSTANCE_ID,
+            " [b847fa93-e282-4f55-b59a-1342f5bd7c0]".to_string(),
         ),
         (
             "a value far longer than any id EC2 issues",
@@ -623,11 +622,8 @@ async fn an_exchange_refuses_what_it_cannot_act_on_and_exchanges_nothing() {
             Named::Owned(long_id.clone()),
             &[("m5.large", None, 600.0)],
             &[],
-            INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
-            format!(
-                "The reserved-instances ID '{}' is malformed",
-                "r".repeat(MAX_ECHOED_RESOURCE_ID_CHARS)
-            ),
+            INVALID_RESERVED_INSTANCE_ID,
+            format!(" [{}]", "r".repeat(MAX_ECHOED_RESOURCE_ID_CHARS)),
         ),
         (
             "a well-formed id the account holds nothing under",
@@ -635,9 +631,8 @@ async fn an_exchange_refuses_what_it_cannot_act_on_and_exchanges_nothing() {
             Named::Literal("B847FA93-E282-4F55-B59A-1342F5BD7C02"),
             &[("m5.large", None, 600.0)],
             &[],
-            INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
-            "The reserved-instances ID 'B847FA93-E282-4F55-B59A-1342F5BD7C02' does not exist"
-                .to_string(),
+            INVALID_RESERVED_INSTANCE_ID,
+            " [B847FA93-E282-4F55-B59A-1342F5BD7C02]".to_string(),
         ),
         (
             "a purchase that is only queued",

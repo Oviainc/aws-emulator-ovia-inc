@@ -13,8 +13,11 @@
 //!    enabled. This will be false after disabling Capacity Manager" — answers those
 //!    settings read back out of the store, and a later report agrees, whatever history the
 //!    account had behind it;
-//! 2. IDEMPOTENCE: disabling an account that is already off changes nothing, so any number
-//!    of disables in a row answer exactly the same settings;
+//! 2. NOTHING TO DISABLE: the disable "stops data ingestion and removes access to capacity
+//!    analytics", which an account that has Capacity Manager off has neither of, so a
+//!    disable of one is refused `CapacityManager.Disabled` — an account that never enabled it
+//!    and one a disable already turned off alike — and the account stays exactly where it
+//!    was;
 //! 3. INGESTION: the disable "stops data ingestion", so the ingestion an earlier enable
 //!    started is gone — no `IngestionStatus` is reported at all — and an enable that comes
 //!    after one starts a FRESH ingestion, in progress straight away and complete one
@@ -24,7 +27,10 @@
 //!    reported in every other;
 //! 5. a `DryRun` disable performs nothing and is answered 412 `DryRunOperation`;
 //! 6. a `ClientToken` is held to the bound every client token of this crate is held to
-//!    ([`MAX_CLIENT_TOKEN_CHARS`]), and a refused disable changes nothing.
+//!    ([`MAX_CLIENT_TOKEN_CHARS`]), a refused disable changes nothing, and repeating one
+//!    token answers the disable it made rather than the refusal a second disable would get —
+//!    "unique, case-sensitive identifier that you provide to ensure the idempotency of the
+//!    request".
 //!
 //! Each table row is a distinct input along what its rule generalises over — which
 //! sequence of enables and disables the account has behind it, whether the ingestion that
@@ -68,8 +74,29 @@ enum Step {
     Wait,
 }
 
-/// Run `history` in `region`, asserting each call was served.
+/// The code EC2 answers a disable of an account that has Capacity Manager off with.
+const DISABLED_ERROR: &str = "CapacityManager.Disabled";
+
+/// Whether the account `history` leaves EC2 Capacity Manager ON: the last enable or disable
+/// in it decides, and a history with neither leaves the account where a fresh one sits — off.
+fn leaves_the_account_on(history: &[Step]) -> bool {
+    history
+        .iter()
+        .rev()
+        .find_map(|step| match step {
+            Step::Enable(_) => Some(true),
+            Step::Disable => Some(false),
+            Step::Wait => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Run `history` in `region`, asserting each call was answered the way its own rule says.
 async fn run(router: &MultiServiceRouter, case: &str, region: &str, history: &[Step]) {
+    // What the account's status is as the history runs, so each step asserts exactly ONE
+    // outcome: RULE 2 says a disable is served while Capacity Manager is on and refused once
+    // it is off, and the steps before this one decide which of the two it is.
+    let mut account_is_on = false;
     for (index, step) in history.iter().enumerate() {
         match step {
             Step::Enable(organizations_access) => {
@@ -82,18 +109,40 @@ async fn run(router: &MultiServiceRouter, case: &str, region: &str, history: &[S
                     "case {case:?} step {index} ({step:?}): expected HTTP 200 from \
                      EnableCapacityManager, got {status} with body {body}"
                 );
+                account_is_on = true;
             }
             Step::Disable => {
                 let (status, body) = call(router, region, "DisableCapacityManager", &[]).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?} step {index} ({step:?}): expected HTTP 200 from \
-                     DisableCapacityManager, got {status} with body {body}"
-                );
+                if account_is_on {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?} step {index} ({step:?}): expected HTTP 200 from \
+                         DisableCapacityManager, got {status} with body {body}"
+                    );
+                    account_is_on = false;
+                } else {
+                    assert_eq!(
+                        status, 400,
+                        "case {case:?} step {index} ({step:?}): expected HTTP 400 disabling \
+                         an account that is already off, got {status} with body {body}"
+                    );
+                    assert_eq!(
+                        error_code(&body),
+                        DISABLED_ERROR,
+                        "case {case:?} step {index} ({step:?}): expected \
+                         {DISABLED_ERROR}, got {body}"
+                    );
+                }
             }
             Step::Wait => tokio::time::sleep(past_the_ingestion()).await,
         }
     }
+    assert_eq!(
+        account_is_on,
+        leaves_the_account_on(history),
+        "case {case:?}: the history's own reading of where it leaves the account must agree \
+         with what its calls were answered"
+    );
 }
 
 /// The settings `GetCapacityManagerAttributes` reports in `region`.
@@ -134,8 +183,10 @@ fn assert_disabled_result(case: &str, body: &str) {
     );
 }
 
-/// RULE 1 and RULE 3: whatever the account's history, one disable answers `disabled` with
-/// no Organizations access, a later report agrees, and no ingestion is reported at all.
+/// RULE 1, RULE 2 and RULE 3: whatever the account's history, a disable of an account that is
+/// ON answers `disabled` with no Organizations access and one of an account that is already
+/// off is refused `CapacityManager.Disabled`; either way a later report reads the account off,
+/// with no ingestion at all.
 #[tokio::test]
 async fn the_disable_turns_the_account_off_whatever_its_history() {
     // Each row is a history the disable runs after: histories differing in whether an
@@ -168,12 +219,25 @@ async fn the_disable_turns_the_account_off_whatever_its_history() {
         run(&router, case, region, history).await;
 
         let (status, body) = call(&router, region, "DisableCapacityManager", &[]).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200 from DisableCapacityManager, \
-             got {status} with body {body}"
-        );
-        assert_disabled_result(case, &body);
+        if leaves_the_account_on(history) {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from DisableCapacityManager, \
+                 got {status} with body {body}"
+            );
+            assert_disabled_result(case, &body);
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 disabling an account that is already off, \
+                 got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                DISABLED_ERROR,
+                "case {case:?}: expected {DISABLED_ERROR}, got {body}"
+            );
+        }
 
         // ROUND TRIP: the reader sees what the disable left behind, not what it answered.
         let reported = report(&router, case, region).await;
@@ -199,10 +263,11 @@ async fn the_disable_turns_the_account_off_whatever_its_history() {
     }
 }
 
-/// RULE 2: any number of disables in a row answer the same settings, and the account stays
-/// exactly where the first one put it.
+/// RULE 2: only the FIRST disable of an account that is on is served; every disable after it
+/// is refused `CapacityManager.Disabled`, and the account stays exactly where the first one
+/// put it.
 #[tokio::test]
-async fn repeating_the_disable_changes_nothing() {
+async fn repeating_the_disable_is_refused_and_changes_nothing() {
     // Rows differ in how many disables run and what ran before them.
     let rows: [(&str, &[Step], usize); 4] = [
         ("three disables on a fresh account", &[], 3),
@@ -223,15 +288,32 @@ async fn repeating_the_disable_changes_nothing() {
         let region = REGIONS[1];
         let router = emulator();
         run(&router, case, region, history).await;
+        // Only a disable made while the account is ON has anything to stop, so at most the
+        // first of the repeats is served.
+        let mut account_is_on = leaves_the_account_on(history);
 
         for repeat in 0..repeats {
             let (status, body) = call(&router, region, "DisableCapacityManager", &[]).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?} repeat {repeat}: expected HTTP 200, \
-                 got {status} with body {body}"
-            );
-            assert_disabled_result(&format!("{case} repeat {repeat}"), &body);
+            if account_is_on {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} repeat {repeat}: expected HTTP 200, \
+                     got {status} with body {body}"
+                );
+                assert_disabled_result(&format!("{case} repeat {repeat}"), &body);
+                account_is_on = false;
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?} repeat {repeat}: expected HTTP 400 for a disable of an \
+                     account that is already off, got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    DISABLED_ERROR,
+                    "case {case:?} repeat {repeat}: expected {DISABLED_ERROR}, got {body}"
+                );
+            }
             let reported = report(&router, case, region).await;
             assert_eq!(
                 reported.status.as_deref(),

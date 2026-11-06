@@ -181,6 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST … the error response is DryRunOperation" (`DryRun`):
+        // the probe asks about the CALLER's permissions, so it is answered before the named
+        // reservation is resolved and before the store is read at all — a probe naming a
+        // Capacity Reservation the account does not hold is still answered `DryRunOperation`,
+        // which is this operation's recorded contract. Nothing is read, so nothing can be
+        // written either.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
         let service_state = state::require_service_state(&*self.engine)?;
         let mut store = service_state.lock();
         // A move the clock already owed is materialised before the reservation is read, so
@@ -189,16 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The ID of the Capacity Reservation": an id the account holds no reservation for
-        // is an error, not an empty report.
-        let record =
-            state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
-
-        // DryRun sits AFTER the named reservation has been resolved: the flag asks whether
-        // the request WOULD have succeeded, so one that would have been refused is refused
-        // with that reason instead.
-        if input.dry_run == Some(true) {
-            return Err(Scaffolded::dry_run_operation());
-        }
+        // is an error, not an empty report — and this operation's validator answers the
+        // MALFORMED half for every id it cannot resolve
+        // ([`crate::state::require_resolvable_capacity_reservation`]).
+        let record = state::require_resolvable_capacity_reservation(
+            &store,
+            &input.capacity_reservation_id,
+        )?;
 
         let total = record.view.total_instance_count.unwrap_or_default();
         let available = record.available_instance_count();

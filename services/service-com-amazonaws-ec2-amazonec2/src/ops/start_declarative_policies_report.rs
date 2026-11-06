@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDeclarativePoliciesReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDeclarativePoliciesReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the generation of an account status report for the target the request
+//! names, stores it under a fresh `ReportId` and answers that id. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDeclarativePoliciesReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "The report is generated ASYNCHRONOUSLY, and can take several hours to complete", so the
+//! report is stored in the `running` state and the clock owes it `complete` one transition
+//! span later ([`crate::state::declarative_policies_reports`]): a caller reading straight
+//! after this call still sees the generation running, and
+//! `GetDeclarativePoliciesReportSummary` reports it complete once that span has passed.
+//!
+//! "Only one report per organization can be generated at a time. Attempting to generate a
+//! report while another is IN PROGRESS will result in an error" — so a start while a report is
+//! still running is refused rather than queued.
+//!
+//! What this file holds is this operation's own validation: the object prefix must fit an S3
+//! object key and the target must be one of the three forms the member documents. The bucket
+//! name is read by the rule every operation of this crate that takes one shares
+//! ([`crate::state::s3_bucket_name_is_well_formed`]), and the report itself — what it is
+//! stored as, its id space and the move the clock owes it — lives in
+//! [`crate::state::declarative_policies_reports`], because its readers need the same
+//! definition.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +109,54 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::{Instant, SystemTime};
+
+use crate::scaffolded::Scaffolded;
+use crate::state::{
+    DECLARATIVE_POLICIES_REPORT_TAGGABLE_RESOURCE, DeclarativePoliciesReportSpec,
+    MAX_STORED_BYTES, MAX_STORED_DECLARATIVE_POLICIES_REPORTS, REPORT_STATE_RUNNING,
+    declarative_policies_report_payload_bytes, dry_run_operation, echoed_resource_id,
+    incorrect_state, invalid_parameter_value, invalid_s3_bucket_name, missing_parameter,
+    require_service_state, s3_bucket_name_is_well_formed, tags_from_specifications,
+};
+
+/// The most characters an `S3Prefix` may carry: the published limit on the length of an
+/// Amazon S3 object key, which the prefix is the leading part of (the report is saved to
+/// "s3://AMZN-S3-DEMO-BUCKET/YOUR-OPTIONAL-S3-PREFIX/ec2_TARGETID_REPORTID_YYYYMMDDTHHMMZ.csv").
+///
+/// The model puts no `@length` on the member, so this is the only place that limit is kept —
+/// and it is also what bounds the caller-chosen bytes one stored report retains.
+const MAX_S3_PREFIX_CHARS: usize = 1024;
+
+/// Whether `target_id` is one of the three forms the member publishes: "the root ID,
+/// organizational unit ID, or account ID. Format: For root: `r-ab12`; For OU:
+/// `ou-ab12-cdef1234`; For account: `123456789012`" (`$TargetId`).
+///
+/// A root id is `r-` and four or more lowercase alphanumerics, an organizational unit id is
+/// `ou-` and a root's digits followed by `-` and its own, and an account id is twelve digits
+/// — the forms Amazon Web Services Organizations publishes for those three ids. The model
+/// declares the member a plain `String`, so this is the only place that scope is read.
+fn target_id_is_well_formed(target_id: &str) -> bool {
+    fn is_organizations_suffix(suffix: &str, minimum: usize) -> bool {
+        suffix.len() >= minimum
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    }
+
+    if let Some(suffix) = target_id.strip_prefix("ou-") {
+        return suffix
+            .split_once('-')
+            .is_some_and(|(root_digits, own_digits)| {
+                is_organizations_suffix(root_digits, 4) && is_organizations_suffix(own_digits, 8)
+            });
+    }
+    if let Some(suffix) = target_id.strip_prefix("r-") {
+        return is_organizations_suffix(suffix, 4);
+    }
+    target_id.len() == 12 && target_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +224,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDeclarativePoliciesReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDeclarativePoliciesReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDeclarativePoliciesReport"))
+        // `ctx` carries request metadata only, and this operation reads none of it: a report
+        // covers "the accounts within the specified scope", which the request names, and the
+        // bucket "must be in the same Region where the report generation request is made" —
+        // a fact about the bucket rather than about this call.
+        let _ = ctx;
+
+        // "The name of the S3 bucket where the report will be saved" (`$S3Bucket`) is
+        // `@required` but client-optional, so a request that names none reaches here with an
+        // empty string: there is nowhere to save the report, which is what EC2's
+        // `MissingParameter` says. A value outside Amazon S3's published naming rules names
+        // no bucket at all, which is the answer every operation of this crate that takes a
+        // bucket name shares ([`crate::state::s3_bucket_name_is_well_formed`] and
+        // [`crate::state::invalid_s3_bucket_name`]) — so one bad bucket name reads the same
+        // whichever of them a caller sent it to.
+        if input.s3_bucket.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter s3Bucket",
+            ));
+        }
+        if !s3_bucket_name_is_well_formed(&input.s3_bucket) {
+            return Err(invalid_s3_bucket_name());
+        }
+
+        // "The prefix for your S3 object" (`$S3Prefix`): the leading part of the key the
+        // report is written under, so it is held to the length an S3 object key has.
+        if input
+            .s3_prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.chars().count() > MAX_S3_PREFIX_CHARS)
+        {
+            return Err(invalid_parameter_value(format!(
+                "s3Prefix accepts at most {MAX_S3_PREFIX_CHARS} characters"
+            )));
+        }
+
+        // "The root ID, organizational unit ID, or account ID" (`$TargetId`), in one of the
+        // three forms that member publishes: the scope of the report is what the target
+        // names, so a value outside them names no scope to report on.
+        if input.target_id.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter targetId",
+            ));
+        }
+        if !target_id_is_well_formed(&input.target_id) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{target_id}' for targetId. A target is a root (r-ab12), an \
+                 organizational unit (ou-ab12-cdef1234) or an account (123456789012)",
+                target_id = echoed_resource_id(&input.target_id),
+            )));
+        }
+
+        // "The tags to apply" (`$TagSpecifications`) — refused by the one helper every create
+        // in this crate bounds its tag payload with, which also refuses a specification for
+        // any other resource type rather than silently dropping it.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            DECLARATIVE_POLICIES_REPORT_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        let spec = DeclarativePoliciesReportSpec {
+            s3_bucket: input.s3_bucket.clone(),
+            s3_prefix: input.s3_prefix.clone(),
+            target_id: input.target_id.clone(),
+            tags,
+        };
+        // The caller-chosen bytes this start would retain for the process's lifetime.
+        let payload_bytes = declarative_policies_report_payload_bytes(&spec);
+
+        // The permission question, answered after the request's OWN parameters have been read
+        // and BEFORE any state is: "checks whether you have the required permissions for the
+        // action, WITHOUT ACTUALLY MAKING THE REQUEST … the error response is
+        // DryRunOperation" (`$DryRun`). So a probe is answered the same whether or not the
+        // organization has a report running — the reading every operation of this surface
+        // takes — and the store is not even reached, so a probe starts nothing.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "Only one report per organization can be generated at a time. Attempting to
+        // generate a report while another is in progress will result in an error": whether
+        // one is in progress is asked as of `now`, so a report whose generation the clock has
+        // already completed does not block a fresh one.
+        let now = Instant::now();
+        if let Some(running) = store
+            .declarative_policies_reports
+            .iter()
+            .find(|(_report_id, record)| record.status_at(now) == REPORT_STATE_RUNNING)
+            .map(|(report_id, _record)| report_id.clone())
+        {
+            return Err(incorrect_state(format!(
+                "The report '{running}' is still being generated, and only one report can be \
+                 generated at a time"
+            )));
+        }
+
+        if !store.has_declarative_policies_report_capacity() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_DECLARATIVE_POLICIES_REPORTS} \
+                 declarative-policies reports, which is as many as it stores"
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+            )));
+        }
+
+        // The store mints the id, reads the start instant off the clock and records the
+        // completion the clock owes the report, so this handler decides none of them twice.
+        let report_id = store.insert_declarative_policies_report(spec, SystemTime::now());
+        store.add_stored_bytes(payload_bytes);
+
+        // Read the answer back OUT of the store, so the caller is told the id a later
+        // `GetDeclarativePoliciesReportSummary` will report rather than one held only in this
+        // stack frame.
+        store
+            .declarative_policies_reports
+            .get(&report_id)
+            .and_then(|record| record.report.report_id.clone())
+            .map(|report_id| StartDeclarativePoliciesReportOutput {
+                report_id: Some(report_id),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly started report '{report_id}' could not be read back"
+                ))
+            })
     }
 }

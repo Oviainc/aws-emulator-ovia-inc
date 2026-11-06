@@ -2070,6 +2070,19 @@ use crate::ops::types::{AttachmentEnaSrdSpecification, NetworkInterfaceAttachmen
 pub mod image_usage_reports;
 pub use image_usage_reports::*;
 
+/// Declarative-policies account status reports: what one is stored as, the id space and the
+/// two refusals that id can draw, the bytes a stored report is charged, and the completion
+/// the clock owes one. A SUBMODULE for the same reason [`image_usage_reports`] is one, and
+/// `pub use` keeps every name reachable as `crate::state::<name>`.
+pub mod declarative_policies_reports;
+pub use declarative_policies_reports::*;
+
+/// What one instance's console shows, which `GetConsoleOutput` serves as text and
+/// `GetConsoleScreenshot` draws as an image — one definition, so the two cannot report one
+/// instance's console differently.
+pub mod instance_console;
+pub use instance_console::*;
+
 // ---------------------------------------------------------------------------
 // Managed resource visibility (the account-wide setting)
 // ---------------------------------------------------------------------------

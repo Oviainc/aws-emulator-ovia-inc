@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroupsForCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroupsForCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the resource groups the stored Capacity Reservation the request names
+//! has been added to. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroupsForCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No reservation this store holds is in a group — a reservation joins one through the
+//! Resource Groups API, which this emulator does not serve, and no EC2 operation adds one — so
+//! what this operation reports is the EMPTY list, with no page after it. The `NextToken` a
+//! request may carry is still read, because a value this service never issued names no
+//! position in any list and is refused for that; `MaxResults` bounds a page of a list with
+//! nothing in it.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +143,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroupsForCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupsForCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroupsForCapacityReservation"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Reservations per account, so the Region a request was signed for
+        // does not narrow them.
+        let _ = ctx;
+
+        // "The token to use to retrieve the next page of results" (`$NextToken`) — anything
+        // else is refused rather than read as a group ARN, and it is refused before the store
+        // is looked at, so whether a bogus token is caught never depends on what is stored.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … the error response is DryRunOperation" (`$DryRun`): the probe
+        // asks about the CALLER's permissions, so it is answered before the named reservation
+        // is resolved and before the store is read at all — a probe naming a Capacity
+        // Reservation the account does not hold is still answered `DryRunOperation`, which is
+        // this operation's recorded contract.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock already owed is materialised before the reservation is read, so
+        // this report sees the state a caller would have been shown anyway — and nothing else
+        // is written: listing a reservation's groups is a READ.
+        store.materialize_due_transitions();
+
+        // "The ID of the Capacity Reservation" (`$CapacityReservationId`): an id the account
+        // holds no reservation for is an error, not an empty list — and this operation's
+        // validator answers the MALFORMED half for every id it cannot resolve
+        // ([`crate::state::require_resolvable_capacity_reservation`]).
+        state::require_resolvable_capacity_reservation(&store, &input.capacity_reservation_id)?;
+
+        // "Lists the resource groups to which a Capacity Reservation has been ADDED": a
+        // reservation joins a resource group through the Resource Groups API
+        // (`GroupResourcesRequest`), which this emulator does not serve, and no EC2 operation
+        // adds one to a group — so no reservation this store holds is in a group and the list
+        // is empty rather than invented. The `MaxResults` the request may carry bounds a page
+        // of that list and the `NextToken` above names a position in it; with nothing to page
+        // over, there is no page after this one, which is what the absent token says ("this
+        // value is null when there are no more results to return", `$NextToken`). The paging
+        // itself belongs to the day a membership can exist, so it is not written here against
+        // a list that is statically empty.
+        let _ = (&start_at, input.max_results);
+
+        Ok(GetGroupsForCapacityReservationOutput {
+            next_token: None,
+            capacity_reservation_groups: Some(Vec::new()),
+        })
     }
 }

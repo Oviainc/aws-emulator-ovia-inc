@@ -97,34 +97,14 @@ use crate::state::{
     RESERVED_INSTANCE_STATE_RETIRED, RESERVED_INSTANCES_VALUE_TOLERANCE,
     ReservedInstancesOfferingTerms, availability_zones_in_region,
     decode_reserved_instances_offering_id, deduplicate_ids, dry_run_operation,
-    echoed_resource_id, invalid_parameter_value, invalid_reserved_instances_offering_id,
-    missing_parameter, request_region, require_service_state, reserved_instances_id_does_not_exist,
-    reserved_instances_id_is_well_formed, reserved_instances_id_malformed,
-    reserved_instances_limit_exceeded, reserved_instances_not_convertible,
-    reserved_instances_not_exchangeable, reserved_instances_spec_for_offering,
-    reserved_instances_value, reserved_instances_value_text,
+    echoed_resource_id, invalid_parameter_value, invalid_reserved_instance_id,
+    invalid_reserved_instances_offering_id, missing_parameter, request_region,
+    require_service_state, reserved_instances_exchange_shares,
+    reserved_instances_id_is_well_formed, reserved_instances_limit_exceeded,
+    reserved_instances_not_convertible, reserved_instances_not_exchangeable,
+    reserved_instances_spec_for_offering, reserved_instances_value,
+    reserved_instances_value_text,
 };
-
-/// How the reservations the exchanged purchases hold are divided over the target
-/// configurations: one count per configuration, in the order the request gave them.
-///
-/// `TargetConfigurationRequest$InstanceCount` "is reserved and cannot be specified in a
-/// request", so the caller never says how many reservations a target configuration takes and
-/// the service divides them — equally, the remainder going to the earlier configurations,
-/// which is the one division that keeps the total exactly and depends on nothing but how many
-/// configurations there are. A request carrying more configurations than there are
-/// reservations is refused before this is reached, so no count it answers is zero.
-fn reservation_shares(total: i64, configurations: usize) -> Vec<i32> {
-    let configurations = i64::try_from(configurations).unwrap_or(i64::MAX).max(1);
-    let share = total / configurations;
-    let remainder = total % configurations;
-    (0..configurations)
-        .map(|position| {
-            let count = share.saturating_add(i64::from(position < remainder));
-            i32::try_from(count).unwrap_or(i32::MAX)
-        })
-        .collect()
-}
 
 /// What the target configurations of one exchange are worth together: each offering's
 /// purchase price times the reservations the configuration naming it holds
@@ -228,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything to look up, the way this service answers every unreadable resource id.
         for reserved_instance_id in &input.reserved_instance_ids {
             if !reserved_instances_id_is_well_formed(reserved_instance_id) {
-                return Err(reserved_instances_id_malformed(reserved_instance_id));
+                return Err(invalid_reserved_instance_id(reserved_instance_id));
             }
         }
         let reserved_instance_ids = deduplicate_ids(&input.reserved_instance_ids);
@@ -236,14 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An exchange is INTO something: "the configuration of the target Convertible
         // Reserved Instance to exchange for your current Convertible Reserved Instances"
         // ($TargetConfigurations). The member is client-optional in the model, so a request
-        // that names no target reaches here and is refused as missing the parameter the
-        // operation needs rather than exchanging the purchases for nothing.
+        // that names no target reaches here with an empty list; that it is EMPTY is answered
+        // once the purchases have been resolved (below), the order the recorded contract of
+        // this operation and of `GetReservedInstancesExchangeQuote` share — both answer the
+        // `reservedInstanceId` refusal for a request that names a purchase the account does
+        // not hold, whether or not it also names a target.
         let targets = input.target_configurations.unwrap_or_default();
-        if targets.is_empty() {
-            return Err(missing_parameter(
-                "The request must contain the parameter targetConfiguration",
-            ));
-        }
         if targets.len() > MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS {
             return Err(invalid_parameter_value(format!(
                 "TargetConfigurations carries {} configurations, above the maximum of \
@@ -252,20 +230,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Every target configuration is read before anything is looked up or written: the
-        // offering it names must be one this service publishes, that offering must be
-        // Convertible — "if `convertible` it can be exchanged for Reserved Instances of the
-        // same or higher monetary value" — and it must lie in a zone the Region has, since
-        // the zones of a Region are facts of that Region.
+        // "The number of instances the Convertible Reserved Instance offering can be
+        // applied to. This parameter is reserved and cannot be specified in a request"
+        // (`TargetConfigurationRequest$InstanceCount`): a request that carries it is not one
+        // the operation accepts, whatever the offering it names, so the member is read here,
+        // with the other checks that read nothing but the request itself.
+        if let Some(instance_count) = targets
+            .iter()
+            .find_map(|target: &TargetConfigurationRequest| target.instance_count)
+        {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{instance_count}' for instanceCount. This parameter is \
+                 reserved and cannot be specified in a request"
+            )));
+        }
+
+        // The permission question, answered before any resource the request names is
+        // resolved and before the store is read at all: "checks whether you have the
+        // required permissions for the action, WITHOUT ACTUALLY MAKING THE REQUEST … if you
+        // have the required permissions, the error response is DryRunOperation" ($DryRun).
+        // So a probe whose target configuration names an offering this service does not
+        // publish, or whose `reservedInstanceId` the account holds nothing under, is still
+        // answered `DryRunOperation` — this operation's recorded contract — while the
+        // parameter checks above, which read nothing but the request itself, still have
+        // their say.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Every move the clock already owed is applied before anything is read or written, so
+        // a Reserved Instance a fulfilled modification retired is seen as retired here rather
+        // than exchanged after it was replaced.
+        store.materialize_due_transitions();
+
+        // Each id must name a Convertible Reserved Instance this account holds and that is in
+        // effect: only a Convertible purchase can be exchanged, and only one in effect has a
+        // term left to carry onto another offering. The whole batch is resolved before
+        // anything is written, so a request naming one id it cannot act on exchanges nothing
+        // at all — and BEFORE the target offerings are read, because a purchase this account
+        // does not hold cannot be exchanged into any offering, which is the order this
+        // operation's recorded refusal shows.
+        let mut held_count: i64 = 0;
+        let mut held_value: f64 = 0.0;
+        for reserved_instance_id in &reserved_instance_ids {
+            let Some(held) = store.reserved_instances.get(reserved_instance_id) else {
+                return Err(invalid_reserved_instance_id(reserved_instance_id));
+            };
+            let held_state = held.state.as_deref().unwrap_or_default();
+            if held_state != RESERVED_INSTANCE_STATE_ACTIVE {
+                return Err(reserved_instances_not_exchangeable(
+                    reserved_instance_id,
+                    held_state,
+                ));
+            }
+            if held.offering_class.as_deref() != Some(RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE)
+            {
+                return Err(reserved_instances_not_convertible(reserved_instance_id));
+            }
+            let instance_count = held.instance_count.unwrap_or_default();
+            held_count = held_count.saturating_add(i64::from(instance_count));
+            held_value += reserved_instances_value(held.fixed_price.unwrap_or_default(), instance_count);
+        }
+
+        // A request that names no target at all asks for the purchases to be exchanged for
+        // nothing, which is the parameter the operation needs missing.
+        if targets.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter targetConfiguration",
+            ));
+        }
+
+        // Every target configuration is read once the purchases have been resolved and before
+        // anything is written: the offering it names must be one this service publishes, that
+        // offering must be Convertible — "if `convertible` it can be exchanged for Reserved
+        // Instances of the same or higher monetary value" — and it must lie in a zone the
+        // Region has, since the zones of a Region are facts of that Region.
         let zones = availability_zones_in_region(&region);
         let mut offerings: Vec<ReservedInstancesOfferingTerms> = Vec::with_capacity(targets.len());
         for target in &targets {
-            if let Some(instance_count) = target.instance_count {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value '{instance_count}' for instanceCount. This parameter is \
-                     reserved and cannot be specified in a request"
-                )));
-            }
             let Some(offering) = decode_reserved_instances_offering_id(&target.offering_id) else {
                 return Err(invalid_reserved_instances_offering_id(&target.offering_id));
             };
@@ -287,48 +332,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             offerings.push(offering);
         }
 
-        // The permission question, answered before the resource one and before any write:
-        // "if you have the required permissions, the error response is DryRunOperation"
-        // ($DryRun).
-        if input.dry_run == Some(true) {
-            return Err(dry_run_operation());
-        }
-
-        let state = require_service_state(&*self.engine)?;
-        let mut store = state.lock();
-
-        // Every move the clock already owed is applied before anything is read or written, so
-        // a Reserved Instance a fulfilled modification retired is seen as retired here rather
-        // than exchanged after it was replaced.
-        store.materialize_due_transitions();
-
-        // Each id must name a Convertible Reserved Instance this account holds and that is in
-        // effect: only a Convertible purchase can be exchanged, and only one in effect has a
-        // term left to carry onto another offering. The whole batch is resolved before
-        // anything is written, so a request naming one id it cannot act on exchanges nothing
-        // at all.
-        let mut held_count: i64 = 0;
-        let mut held_value: f64 = 0.0;
-        for reserved_instance_id in &reserved_instance_ids {
-            let Some(held) = store.reserved_instances.get(reserved_instance_id) else {
-                return Err(reserved_instances_id_does_not_exist(reserved_instance_id));
-            };
-            let held_state = held.state.as_deref().unwrap_or_default();
-            if held_state != RESERVED_INSTANCE_STATE_ACTIVE {
-                return Err(reserved_instances_not_exchangeable(
-                    reserved_instance_id,
-                    held_state,
-                ));
-            }
-            if held.offering_class.as_deref() != Some(RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE)
-            {
-                return Err(reserved_instances_not_convertible(reserved_instance_id));
-            }
-            let instance_count = held.instance_count.unwrap_or_default();
-            held_count = held_count.saturating_add(i64::from(instance_count));
-            held_value += reserved_instances_value(held.fixed_price.unwrap_or_default(), instance_count);
-        }
-
         // The reservations being exchanged are divided over the target configurations, so a
         // request carrying more configurations than reservations asks for a purchase holding
         // none — which is not a Reserved Instance at all.
@@ -340,7 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  target configurations they would be divided over"
             )));
         }
-        let shares = reservation_shares(held_count, offerings.len());
+        // The ONE division a quote and the exchange it describes both make
+        // ([`reserved_instances_exchange_shares`]).
+        let shares = reserved_instances_exchange_shares(held_count, offerings.len());
 
         // "The IDs of the Convertible Reserved Instances to exchange for another Convertible
         // Reserved Instance of the same or higher value" ($ReservedInstanceIds): an exchange

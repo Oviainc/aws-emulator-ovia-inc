@@ -875,8 +875,8 @@ fn reserved_instances_spec_for_target(
 /// (`AcceptReservedInstancesExchangeQuoteRequest$ReservedInstanceIds`).
 pub const RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE: &str = "convertible";
 
-/// `InvalidReservedInstancesID.NotFound` (HTTP 400): EC2's code for a `reservedInstanceId`
-/// the exchange API cannot resolve to a Reserved Instance of this account.
+/// `InvalidReservedInstancesID.NotFound` (HTTP 400): EC2's code for a `reservedInstancesId`
+/// the REPORT of this account's purchases cannot resolve.
 ///
 /// ONE code for both halves of that — a value that is not a Reserved Instances id at all, and
 /// a well-formed id the account holds nothing under — because that is the code the recorded
@@ -884,32 +884,56 @@ pub const RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE: &str = "convertible";
 /// two are told apart by the message. It is deliberately not the
 /// [`invalid_reserved_instances_id`] of this module's other operations: that one is what
 /// `DeleteQueuedReservedInstances` was recorded answering for its own `reservedInstancesId`
-/// member, and the exchange API words its own member's refusal the way this one does.
+/// member, and `DescribeReservedInstances` words its own member's refusal the way this one
+/// does. The EXCHANGE API words its own differently again
+/// ([`INVALID_RESERVED_INSTANCE_ID`]).
 pub const INVALID_RESERVED_INSTANCES_ID_NOT_FOUND: &str = "InvalidReservedInstancesID.NotFound";
+
+/// `InvalidReservedInstanceId` (HTTP 400): EC2's code for a `reservedInstanceId` the EXCHANGE
+/// API cannot resolve to a Reserved Instance of this account.
+///
+/// The exchange API's own spelling of that refusal, which is neither
+/// [`INVALID_RESERVED_INSTANCES_ID_NOT_FOUND`] nor the `InvalidParameterValue` of
+/// `DeleteQueuedReservedInstances`: EC2's per-operation validators do not word the Reserved
+/// Instances id refusal the same way, and the recorded contract of
+/// `GetReservedInstancesExchangeQuote` and `AcceptReservedInstancesExchangeQuote` carries
+/// this one — which is why both of them answer it through
+/// [`invalid_reserved_instance_id`] rather than each keeping a spelling of its own.
+pub const INVALID_RESERVED_INSTANCE_ID: &str = "InvalidReservedInstanceId";
+
+/// Refuse a `reservedInstanceId` the exchange API cannot resolve to a Reserved Instance of
+/// this account: HTTP 400 [`INVALID_RESERVED_INSTANCE_ID`], in the SENTENCE the recorded
+/// refusals of the two exchange operations carry — a space, then the id the request named in
+/// square brackets, and nothing else.
+///
+/// That sentence has almost no fixed text, which is unusual for an EC2 message and is why it
+/// is worded in one place: it is what the recorded refusals show. Two independent recorded
+/// units carry it — the quote of a stale exchange
+/// (`ec2.accept-reserved-instances-exchange-quote-stale-quote-rejected`, whose recorded
+/// message is ` [<the reservedInstanceId the request sent>]`) and the quote operation's own
+/// contract unit (`ec2.op-contract-get-reserved-instances-exchange-quote`, the same sentence
+/// around its own id) — and the second of those also pins that the ACCEPT answers the very
+/// same code and message for the same id
+/// (`ec2.op-contract-acceptReservedInstancesExchangeQuote-b`). The only part built from the
+/// request is the id, so nothing of one recording's values is written here.
+///
+/// ONE wording for both halves of that refusal — a value that is not a Reserved Instances id
+/// at all, and one inside the UUID form ([`reserved_instances_id_is_well_formed`]) the
+/// account holds nothing under — because the code does not tell them apart either. Only the
+/// first [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are named
+/// ([`echoed_resource_id`]).
+pub fn invalid_reserved_instance_id<E>(reserved_instance_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_RESERVED_INSTANCE_ID,
+        400,
+        format!(" [{id}]", id = echoed_resource_id(reserved_instance_id)),
+    )
+}
 
 /// `InvalidReservedInstancesOfferingId` (HTTP 400): the `offeringId` a target configuration
 /// named is not an offering this service publishes — "the specified Reserved Instances
 /// offering does not exist", as EC2's error reference puts it.
 pub const INVALID_RESERVED_INSTANCES_OFFERING_ID: &str = "InvalidReservedInstancesOfferingId";
-
-/// Refuse a `reservedInstanceId` that is not a Reserved Instances id at all: HTTP 400
-/// [`INVALID_RESERVED_INSTANCES_ID_NOT_FOUND`], quoting the value the request carried.
-///
-/// A Reserved Instances id is the hyphenated form of a UUID
-/// ([`reserved_instances_id_is_well_formed`]), so anything else names nothing and is refused
-/// before there is anything to look up. Only the first
-/// [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are quoted
-/// ([`echoed_resource_id`]).
-pub fn reserved_instances_id_malformed<E>(reserved_instance_id: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(
-        INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
-        400,
-        format!(
-            "The reserved-instances ID '{id}' is malformed",
-            id = echoed_resource_id(reserved_instance_id)
-        ),
-    )
-}
 
 /// Refuse a well-formed `reservedInstanceId` the account holds no Reserved Instance under:
 /// HTTP 400 [`INVALID_RESERVED_INSTANCES_ID_NOT_FOUND`], the other half of that code.
@@ -1114,6 +1138,33 @@ pub fn reserved_instances_spec_for_offering(
         fixed_price: terms.fixed_price,
         usage_price: terms.usage_price,
     }
+}
+
+/// How the reservations the exchanged purchases hold are divided over the target
+/// configurations of ONE exchange: one count per configuration, in the order the request gave
+/// them.
+///
+/// `TargetConfigurationRequest$InstanceCount` "is reserved and cannot be specified in a
+/// request", so the caller never says how many reservations a target configuration takes and
+/// the service divides them — equally, the remainder going to the earlier configurations,
+/// which is the one division that keeps the total exactly and depends on nothing but how many
+/// configurations there are.
+///
+/// The ONE definition of that division, because `GetReservedInstancesExchangeQuote` quotes the
+/// configurations `AcceptReservedInstancesExchangeQuote` would then mint: a quote and the
+/// exchange it describes cannot divide one purchase's reservations two ways. A request
+/// carrying more configurations than there are reservations is refused by each of those
+/// operations before this is reached, so no count it answers is zero.
+pub fn reserved_instances_exchange_shares(total: i64, configurations: usize) -> Vec<i32> {
+    let configurations = i64::try_from(configurations).unwrap_or(i64::MAX).max(1);
+    let share = total / configurations;
+    let remainder = total % configurations;
+    (0..configurations)
+        .map(|position| {
+            let count = share.saturating_add(i64::from(position < remainder));
+            i32::try_from(count).unwrap_or(i32::MAX)
+        })
+        .collect()
 }
 
 /// What one Reserved Instance, or one side of a whole exchange, is WORTH: the purchase price

@@ -2876,6 +2876,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "Unique, case-sensitive identifier you provide to ensure the idempotency of the
     /// request" (`CreateManagedPrefixListRequest$ClientToken`).
     pub managed_prefix_list_client_tokens: HashMap<String, String>,
+    /// Every declarative-policies account status report the account has started, by
+    /// `ReportId`, as [`DeclarativePoliciesReportRecord`]s — the facts
+    /// `StartDeclarativePoliciesReport` recorded beside the instant the clock owes the
+    /// report its completion. Ordered by id, the one stable order a report of them pages
+    /// over.
+    ///
+    /// Starts EMPTY: a report exists only because `StartDeclarativePoliciesReport` asked for
+    /// one.
+    pub declarative_policies_reports: BTreeMap<String, DeclarativePoliciesReportRecord>,
+    /// Every `ClientToken` a SERVED `DisableCapacityManager` carried, so a repeat of one
+    /// answers that disable again instead of being refused as a second disable of an account
+    /// that is already off: "unique, case-sensitive identifier that you provide to ensure the
+    /// idempotency of the request" (`DisableCapacityManagerRequest$ClientToken`). A token a
+    /// REFUSED disable carried is not here, so a replay of one is refused the same way the
+    /// first call was.
+    pub capacity_manager_disable_client_tokens: BTreeSet<String>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -3213,6 +3229,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // the Region (see `service_prefix_lists_in_region`).
             managed_prefix_lists: BTreeMap::new(),
             managed_prefix_list_client_tokens: HashMap::new(),
+            // A fresh account has asked for no declarative-policies account status report
+            // until `StartDeclarativePoliciesReport` starts one.
+            declarative_policies_reports: BTreeMap::new(),
+            // No disable has been served for a fresh account, so no token names one.
+            capacity_manager_disable_client_tokens: BTreeSet::new(),
         };
         // The ambient default network of [`DEFAULT_REGION`], so a request signed for the
         // emulator's own Region finds it without this store ever writing on a read. Every

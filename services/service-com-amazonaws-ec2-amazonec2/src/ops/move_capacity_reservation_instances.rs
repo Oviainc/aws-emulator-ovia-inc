@@ -152,12 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The SHAPE of both ids, before either is looked up: a value that is not a Capacity
         // Reservation id at all names no reservation in ANY account, so it is refused as
-        // malformed rather than reported not found — the ONE reading of that form this
-        // crate has ([`crate::state::capacity_reservation_id_is_well_formed`]). Both ids
-        // are asked HERE so the SOURCE's shape is refused first, the order the request
-        // names the two in; the lookups further down ask the same question again through
-        // [`crate::state::require_known_capacity_reservation`], where it is a no-op for an
-        // id that got past this point.
+        // malformed — the ONE reading of that form this crate has
+        // ([`crate::state::capacity_reservation_id_is_well_formed`]). Both ids are asked HERE
+        // so the SOURCE's shape is refused first, the order the request names the two in; the
+        // lookups further down answer the SAME code for an id of that shape the account holds
+        // no reservation under
+        // ([`crate::state::require_resolvable_capacity_reservation`]).
         state::require_well_formed_capacity_reservation_id(&source_id)?;
         state::require_well_formed_capacity_reservation_id(&destination_id)?;
 
@@ -250,13 +250,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return move_response(&store, &first, now);
         }
 
-        // Both reservations have to exist for capacity to move between them. Each view is
-        // taken as of `now`, so an expiry the clock already owed is seen here rather than
-        // after the write.
+        // Both reservations have to exist for capacity to move between them, and this
+        // operation's validator refuses every id it cannot resolve as MALFORMED
+        // ([`crate::state::require_resolvable_capacity_reservation`]). Each view is taken as
+        // of `now`, so an expiry the clock already owed is seen here rather than after the
+        // write.
         let source =
-            state::require_known_capacity_reservation(&store, &source_id)?.view_at(now);
+            state::require_resolvable_capacity_reservation(&store, &source_id)?.view_at(now);
         let destination =
-            state::require_known_capacity_reservation(&store, &destination_id)?.view_at(now);
+            state::require_resolvable_capacity_reservation(&store, &destination_id)?.view_at(now);
 
         // "The source Capacity Reservation and the destination Capacity Reservation must be
         // `active`": capacity that is not available for use cannot be moved, and capacity

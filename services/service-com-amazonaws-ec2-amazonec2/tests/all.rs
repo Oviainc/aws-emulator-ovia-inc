@@ -1423,3 +1423,31 @@ mod monitor_instances;
 // in. Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/deleted_resources_stop_resolving.rs"]
 mod deleted_resources_stop_resolving;
+// What `GetConsoleOutput` serves for one instance: that instance's console as text,
+// base64-encoded, beside the instant it was last written — and what it refuses. Declared at
+// the tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/get_console_output.rs"]
+mod get_console_output;
+// The declarative-policies account status report surface: what
+// `StartDeclarativePoliciesReport` records, what `GetDeclarativePoliciesReportSummary` reads
+// back, what `CancelDeclarativePoliciesReport` stops, and what each refuses.
+#[path = "all/declarative_policies_reports.rs"]
+mod declarative_policies_reports;
+// What `GetReservedInstancesExchangeQuote` quotes for an exchange of Convertible Reserved
+// Instances: what each side is worth, what the exchange would cost, and why one that cannot
+// be performed cannot.
+#[path = "all/reserved_instances_exchange_quotes.rs"]
+mod reserved_instances_exchange_quotes;
+// What `GetHostReservationPurchasePreview` prices for a Dedicated Host reservation: the
+// published offering applied to the hosts the request names, and the host ids and offerings it
+// refuses. Declared at the tail of this file, which is where every new ec2 suite inserts its
+#[path = "all/host_reservation_purchase_preview.rs"]
+mod host_reservation_purchase_preview;
+// The two reports of ONE Capacity Reservation — `GetGroupsForCapacityReservation` and
+// `GetCapacityReservationUsage`: the permission probe they answer before resolving the
+// reservation, the one half of `InvalidCapacityReservationId` they refuse every id they cannot
+// resolve with, and the empty group set a reservation no Resource Groups call has added to a
+// group is in. Declared at the tail of this file, which is where every new ec2 suite inserts
+// its lines.
+#[path = "all/capacity_reservation_reports.rs"]
+mod capacity_reservation_reports;

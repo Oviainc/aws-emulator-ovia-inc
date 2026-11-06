@@ -568,6 +568,19 @@ fn host_offering_id(index: usize) -> String {
     format!("{HOST_OFFERING_ID_PREFIX}-{index:017x}")
 }
 
+/// The published offering `offering_id` names, and `None` for an id no entry of the
+/// catalog carries.
+///
+/// The ONE lookup of an offering by id, so `GetHostReservationPurchasePreview` prices
+/// exactly the offering this describe publishes under that id and the two cannot quote one
+/// offering differently. An offering is a catalog entry rather than a stored resource, so
+/// this reads the catalog instead of a store and writes nothing.
+pub fn host_offering_by_id(offering_id: &str) -> Option<&'static HostOfferingRecord> {
+    host_offering_catalog()
+        .iter()
+        .find(|offering| offering.offering_id == offering_id)
+}
+
 /// The whole published catalog: every offering of every family, on every payment option,
 /// for every term — built ONCE.
 ///

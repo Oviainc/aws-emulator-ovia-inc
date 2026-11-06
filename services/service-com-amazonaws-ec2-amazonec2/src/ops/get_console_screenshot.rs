@@ -127,7 +127,7 @@
 use super::types::*;
 use ::base64::Engine as _;
 
-use crate::state::{InstanceRecord, iso8601_utc};
+use crate::state::{instance_console_lines, require_console_instance};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -227,11 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // screenshot can cause, and it is the clock's, not this operation's.
             store.materialize_due_transitions();
 
-            // Every id this operation cannot resolve is malformed; see the resolver's doc.
-            let instance = require_screenshotted_instance(&store, &input.instance_id)?;
+            // Every id this operation cannot resolve is malformed; see the resolver's doc
+            // ([`crate::state::require_console_instance`], shared with `GetConsoleOutput`).
+            let instance = require_console_instance(&store, &input.instance_id)?;
             // The id read back off the stored record rather than echoed from the request,
             // so the response names the instance the service resolved.
-            (instance.instance_id.clone(), console_lines(instance))
+            (
+                instance.instance_id.clone(),
+                instance_console_lines(instance),
+            )
         };
         let screen = render_console_screen(&lines).map_err(Scaffolded::internal_error)?;
 
@@ -243,52 +247,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance_id: Some(instance_id),
         })
     }
-}
-
-/// Resolve the instance `GetConsoleScreenshot` is asked for the console screen of, or
-/// refuse the id: HTTP 400 `InvalidInstanceID.Malformed`, in one of the two wordings that
-/// code carries.
-///
-/// EC2's per-operation validators do NOT agree about an instance id they cannot resolve,
-/// and this operation's is the strict one: a WELL-FORMED id that names no instance of the
-/// account is answered `InvalidInstanceID.Malformed` — the instance ID is malformed — rather
-/// than reported as not found.
-///
-/// The evidence is this operation's OWN recorded unit: the second task of
-/// `ec2-get-console-screenshot-dry-run-and-malformed-instance-error` probes an instance id
-/// the account does not hold, inside the long form
-/// [`crate::state::instance_id_is_well_formed`] accepts, and the recorded response is
-/// `InvalidInstanceID.Malformed`, "The instance ID '<id>' is malformed" — so the shared
-/// helper's not-found half diverged on it until this resolver replaced it.
-/// `crate::ops::create_replace_root_volume_task` and `crate::ops::create_snapshots` are
-/// recorded making the same answer, while `CreateInstanceExportTask` answers such an id
-/// "does not exist": the choice belongs to the OPERATION rather than to the id, which is why
-/// this lives here and not in [`crate::state::require_known_instance`] — the shared helper
-/// that the operations which DO draw the distinction keep using.
-///
-/// A value that is not an instance id AT ALL is refused one step earlier, by the id space
-/// itself, with the echoed-value message
-/// [`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`] carries — the same order
-/// and the same two wordings `CreateSnapshots` uses, so one code is worded one way per half
-/// across the crate rather than per operation.
-///
-/// The resolved record is handed back, so the handler reads the instance ONCE rather than
-/// looking it up again behind an unreachable branch.
-fn require_screenshotted_instance<'store, E>(
-    store: &'store crate::state::ComAmazonawsEc2Amazonec2State,
-    instance_id: &str,
-) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    // A value that is not an instance id at all never reaches the store: it is refused by
-    // the id space itself, with the echoed-value message every EC2 id space answers for one.
-    if !crate::state::instance_id_is_well_formed(instance_id) {
-        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
-            instance_id,
-        ));
-    }
-    store
-        .instances
-        .get(instance_id)
-        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
 }
 
 /// How many characters of text the console screen is wide.
@@ -321,34 +279,12 @@ const FOREGROUND: [u8; 3] = [0xd0, 0xd0, 0xd0];
 /// high enough that 8x8 text survives the encoder's chroma subsampling.
 const JPEG_QUALITY: u8 = 90;
 
-/// How wide the label column of a screen line is, in characters.
-const LABEL_WIDTH: usize = 20;
-
-/// The lines of text one instance's console screen shows: the facts this service holds
-/// about that instance, one per line, labelled.
-///
-/// A fact the record does not carry gets no line at all, rather than a line with a
-/// placeholder in it: an instance with no public address has nothing to report there.
-fn console_lines(instance: &InstanceRecord) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut line = |label: &str, value: &str| {
-        lines.push(format!("{label:<width$}{value}", width = LABEL_WIDTH));
-    };
-    line("instance-id", &instance.instance_id);
-    line("instance-state", instance.state.as_str());
-    line("instance-type", &instance.instance_type);
-    if let Some(image_id) = &instance.image_id {
-        line("image-id", image_id);
-    }
-    line("availability-zone", &instance.placement_az);
-    line("private-ip-address", &instance.private_ip);
-    line("private-dns-name", &instance.private_dns_name);
-    if let Some(public_ip) = &instance.public_ip {
-        line("public-ip-address", public_ip);
-    }
-    line("launch-time", &iso8601_utc(instance.launch_time));
-    lines
-}
+// The lines of text one instance's console screen shows are the lines that instance's console
+// shows, whichever way it is read: `crate::state::instance_console_lines`, the ONE definition
+// `GetConsoleOutput` serves as text, so the two readers of one console cannot report it
+// differently — as is the instance id reading they share
+// (`crate::state::require_console_instance`). Their label column is
+// `crate::state::CONSOLE_LABEL_WIDTH` wide.
 
 /// Draw `lines` into the console screen and encode it as a baseline JPEG, or say why the
 /// screen could not be encoded.

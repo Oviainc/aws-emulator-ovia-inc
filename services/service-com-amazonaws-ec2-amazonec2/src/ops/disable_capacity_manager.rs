@@ -7,7 +7,12 @@
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::disable_capacity_manager`] and answers
 //! "the current status of Capacity Manager after the disable operation"
 //! (`DisableCapacityManagerResult$CapacityManagerStatus`) read back out of the store.
-//! Idempotent: disabling an account it is already off for changes nothing at all.
+//!
+//! NOT idempotent: the disable "stops data ingestion and removes access to capacity
+//! analytics", and an account that never enabled Capacity Manager has neither, so a request
+//! for one is refused `CapacityManager.Disabled`
+//! ([`crate::state::capacity_manager_disabled`]) rather than answered with a disable it did
+//! not make — which is also what a second disable in a row gets.
 //!
 //! The disable also "stops data ingestion", so the ingestion an earlier enable started is
 //! dropped with the setting: `GetCapacityManagerAttributes` then reports no
@@ -155,9 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
         // the request" (`DisableCapacityManagerRequest$ClientToken`), held to the published
         // constraint every client token of this crate is held to
-        // ([`state::MAX_CLIENT_TOKEN_CHARS`]). Nothing is stored for it, and nothing needs
-        // to be: this disable mints no resource and is already idempotent in the settings it
-        // asks for, so no caller-chosen bytes are added to the store.
+        // ([`state::MAX_CLIENT_TOKEN_CHARS`]).
         if input
             .client_token
             .as_ref()
@@ -179,9 +182,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state::require_service_state(&*self.engine)?;
         let mut store = store.lock();
+        // "Disables EC2 Capacity Manager for your account. This STOPS data ingestion and
+        // removes access to capacity analytics" (`DisableCapacityManager`): an account that
+        // has not enabled Capacity Manager has no ingestion to stop and no access to remove,
+        // so there is nothing to disable, and EC2 refuses the request with its own code for
+        // that condition rather than reporting a disable it did not make. The settings are
+        // read as of `now`, so the answer is decided against what a later
+        // `GetCapacityManagerAttributes` reports.
+        let now = Instant::now();
+        // Idempotency: one token names the ONE disable it made, so a repeat of it answers
+        // that disable rather than being refused as a second disable of an account that is
+        // already off. A token the store has never served a disable for — the one a REFUSED
+        // request carried included — names nothing, so such a request is judged on the
+        // account's settings like any other.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| store.capacity_manager_disable_client_tokens.contains(token));
+        if !replayed && store.capacity_manager_at(now).status != state::CAPACITY_MANAGER_ENABLED {
+            return Err(state::capacity_manager_disabled());
+        }
+
+        // The token map keeps one entry per served disable for the process's lifetime, so the
+        // bytes it would retain are charged against the store's budget BEFORE the write, the
+        // way every other caller-supplied string here is: a token's length is bounded above,
+        // but the number of tokens a caller can bring is not.
+        let payload_bytes = match (replayed, input.client_token.as_deref()) {
+            (false, Some(token)) => token.len(),
+            _ => 0,
+        };
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
         // Answer the settings read back OUT of the store, so the caller sees what a later
         // `GetCapacityManagerAttributes` will see rather than what this handler assumed.
-        let settings = store.disable_capacity_manager(Instant::now());
+        let settings = store.disable_capacity_manager(now);
+        if payload_bytes > 0 {
+            if let Some(token) = input.client_token.clone() {
+                store.add_stored_bytes(payload_bytes);
+                store.capacity_manager_disable_client_tokens.insert(token);
+            }
+        }
         Ok(DisableCapacityManagerOutput {
             capacity_manager_status: Some(settings.status.to_string()),
             organizations_access: Some(settings.organizations_access),

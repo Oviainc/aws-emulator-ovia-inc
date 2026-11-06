@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReservedInstancesExchangeQuote
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReservedInstancesExchangeQuote`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: quotes the exchange of the Convertible Reserved Instances the request names
+//! into the target offerings it names — what each side is worth, what the exchange would cost,
+//! when the new term would end, and, when the exchange cannot be performed, WHY. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReservedInstancesExchangeQuote::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A quote is a REPORT: "use AcceptReservedInstancesExchangeQuote to perform the exchange",
+//! so this operation writes nothing at all — no purchase is retired, none is minted, and two
+//! quotes of the same request at the same instant answer the same thing.
+//!
+//! "If the exchange cannot be performed, the reason is returned in the response": a condition
+//! that makes the exchange impossible — a purchase that is not in effect or not Convertible, a
+//! target offering that is not Convertible or lies outside the Region, more target
+//! configurations than there are reservations, or targets worth less than what is being given
+//! up — is reported as `IsValidExchange` `false` with the reason, where
+//! `AcceptReservedInstancesExchangeQuote` refuses the request outright. Only a value that
+//! names NOTHING is an error here: a `reservedInstanceId` this account holds no purchase
+//! under, and an `offeringId` this service publishes no offering under, leave nothing to
+//! quote.
+//!
+//! The values are computed from the purchases and the offerings themselves — "the balance of
+//! the total value (the sum of remainingUpfrontValue + hourlyPrice * number of hours
+//! remaining)" (`ReservationValue$RemainingTotalValue`) — and the reservations are divided
+//! over the target configurations by the ONE division the exchange itself makes
+//! ([`crate::state::reserved_instances_exchange_shares`]), so a quote describes exactly the
+//! exchange an accept would carry out.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +104,99 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::{Duration, SystemTime};
+
+use crate::state::{
+    MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS, MAX_RESOURCE_IDS,
+    RESERVED_INSTANCE_CURRENCY_CODE, RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE,
+    RESERVED_INSTANCE_STATE_ACTIVE, RESERVED_INSTANCES_VALUE_TOLERANCE,
+    ReservedInstancesOfferingTerms, availability_zones_in_region, date_time_to_system_time,
+    decode_reserved_instances_offering_id, deduplicate_ids, dry_run_operation,
+    echoed_resource_id, invalid_parameter_value, invalid_reserved_instance_id,
+    invalid_reserved_instances_offering_id, missing_parameter, request_region,
+    require_service_state, reserved_instances_exchange_shares,
+    reserved_instances_id_is_well_formed, reserved_instances_value, system_time_to_date_time,
+};
+
+/// One amount as this operation quotes it: to the cent, which is the smallest amount
+/// [`RESERVED_INSTANCE_CURRENCY_CODE`] is quoted in.
+///
+/// The modelled members are STRINGS (`ReservationValue$HourlyPrice`,
+/// `GetReservedInstancesExchangeQuoteResult$PaymentDue`), so the service decides how an amount
+/// is written; writing every one of them here is what keeps the rollups and the per-item
+/// values in one form.
+fn amount_text(amount: f64) -> String {
+    format!("{amount:.2}")
+}
+
+/// What one side of an exchange is worth over the term it has LEFT: "the cost associated with
+/// the Reserved Instance" ([`ReservationValue`]).
+///
+/// * `HourlyPrice` is "the hourly rate of the reservation": the offering's usage price for
+///   every reservation the purchase holds.
+/// * `RemainingUpfrontValue` is "the remaining upfront cost of the reservation": the part of
+///   the purchase price that the part of the term still to run has not used up, so a purchase
+///   half way through its term carries half of it, and a purchase that has not started yet
+///   carries all of it.
+/// * `RemainingTotalValue` is "the balance of the total value (the sum of
+///   remainingUpfrontValue + hourlyPrice * number of hours remaining)" — the member's own
+///   formula, which is why all three are computed in one place.
+fn reservation_value(
+    fixed_price: f32,
+    usage_price: f32,
+    instance_count: i32,
+    term: Duration,
+    remaining: Duration,
+) -> ReservationValue {
+    let hourly_price = f64::from(usage_price) * f64::from(instance_count);
+    let term_seconds = term.as_secs_f64();
+    // A term the store holds no duration for has no part of it left to pro-rate, so none of
+    // the upfront price is reported as remaining rather than dividing by zero.
+    let remaining_fraction = if term_seconds > 0.0 {
+        (remaining.as_secs_f64() / term_seconds).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let remaining_upfront_value =
+        reserved_instances_value(fixed_price, instance_count) * remaining_fraction;
+    let remaining_hours = remaining.as_secs_f64() / 3_600.0;
+    ReservationValue {
+        hourly_price: Some(amount_text(hourly_price)),
+        remaining_upfront_value: Some(amount_text(remaining_upfront_value)),
+        remaining_total_value: Some(amount_text(
+            remaining_upfront_value + hourly_price * remaining_hours,
+        )),
+    }
+}
+
+/// The amount an amount member of a quote carries, read back out of the quote so a rollup and
+/// the items it rolls up cannot be computed from two different numbers.
+fn amount_of(value: Option<&String>) -> f64 {
+    value
+        .and_then(|amount| amount.parse::<f64>().ok())
+        .unwrap_or_default()
+}
+
+/// The sum of the [`ReservationValue`]s of one side of an exchange: "the cost associated with
+/// the Reserved Instance" rolled up over every item of that side
+/// (`GetReservedInstancesExchangeQuoteResult$ReservedInstanceValueRollup`), each member added
+/// across the items it is a member of.
+fn rollup<'values>(values: impl IntoIterator<Item = &'values ReservationValue>) -> ReservationValue {
+    let mut hourly_price = 0.0;
+    let mut remaining_upfront_value = 0.0;
+    let mut remaining_total_value = 0.0;
+    for value in values {
+        hourly_price += amount_of(value.hourly_price.as_ref());
+        remaining_upfront_value += amount_of(value.remaining_upfront_value.as_ref());
+        remaining_total_value += amount_of(value.remaining_total_value.as_ref());
+    }
+    ReservationValue {
+        hourly_price: Some(amount_text(hourly_price)),
+        remaining_upfront_value: Some(amount_text(remaining_upfront_value)),
+        remaining_total_value: Some(amount_text(remaining_total_value)),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +264,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReservedInstancesExchangeQuote` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReservedInstancesExchangeQuoteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReservedInstancesExchangeQuote"))
+        // A Reserved Instance is reported in an Availability Zone of the Region the request
+        // was signed for, so a target offering's zone is read against that Region.
+        let region = request_region(ctx.parts());
+
+        // `ReservedInstanceIds` is `@required` but client-optional, so a request that names
+        // none reaches here with an empty list: there is nothing to quote an exchange of,
+        // which is what EC2's `MissingParameter` says. The model bounds neither list, so both
+        // are bounded here, before any work proportional to them is done. One Reserved
+        // Instance is quoted ONCE however many times the request names it.
+        if input.reserved_instance_ids.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter reservedInstanceId",
+            ));
+        }
+        if input.reserved_instance_ids.len() > MAX_RESOURCE_IDS {
+            return Err(invalid_parameter_value(format!(
+                "ReservedInstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.reserved_instance_ids.len()
+            )));
+        }
+        // A value that is not a Reserved Instances id at all names no purchase in ANY
+        // account, so it is refused before there is anything to look up.
+        for reserved_instance_id in &input.reserved_instance_ids {
+            if !reserved_instances_id_is_well_formed(reserved_instance_id) {
+                return Err(invalid_reserved_instance_id(reserved_instance_id));
+            }
+        }
+        let reserved_instance_ids = deduplicate_ids(&input.reserved_instance_ids);
+
+        // The permission question, answered after the request's own parameters have been read
+        // and before any resource it names is resolved: "checks whether you have the required
+        // permissions for the action, WITHOUT ACTUALLY MAKING THE REQUEST … if you have the
+        // required permissions, the error response is DryRunOperation" ($DryRun) — the same
+        // place this operation's sibling `AcceptReservedInstancesExchangeQuote` answers it.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read, so a purchase
+        // a fulfilled modification retired is quoted as retired here rather than as one that
+        // could still be exchanged. This is the only write a quote can cause, and it is the
+        // clock's: the moves were due at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // ONE reading of the wall clock for this quote, so every remaining term it measures
+        // is measured as of the same instant.
+        let now = SystemTime::now();
+
+        // Each id must name a Reserved Instance this account holds: an id it holds none under
+        // leaves nothing to quote, which is the one refusal this operation answers for the
+        // member. Whether those purchases CAN be exchanged is reported below rather than
+        // refused — "if the exchange cannot be performed, the reason is returned in the
+        // response".
+        let mut held_values: Vec<ReservedInstanceReservationValue> =
+            Vec::with_capacity(reserved_instance_ids.len());
+        let mut held_count: i64 = 0;
+        let mut held_value: f64 = 0.0;
+        let mut invalid_because: Option<String> = None;
+        for reserved_instance_id in &reserved_instance_ids {
+            let Some(held) = store.reserved_instances.get(reserved_instance_id) else {
+                return Err(invalid_reserved_instance_id(reserved_instance_id));
+            };
+            let held_state = held.state.as_deref().unwrap_or_default();
+            let instance_count = held.instance_count.unwrap_or_default();
+            let term = Duration::from_secs(u64::try_from(held.duration.unwrap_or_default()).unwrap_or_default());
+            // "The time when the Reserved Instance expires" (`ReservedInstances$End`): what is
+            // left of the term is what the exchange carries over, so a purchase whose term is
+            // already over has none of it left.
+            let remaining = held
+                .end
+                .map(date_time_to_system_time)
+                .and_then(|end| end.duration_since(now).ok())
+                .unwrap_or_default();
+            held_values.push(ReservedInstanceReservationValue {
+                reserved_instance_id: held.reserved_instances_id.clone(),
+                reservation_value: Some(reservation_value(
+                    held.fixed_price.unwrap_or_default(),
+                    held.usage_price.unwrap_or_default(),
+                    instance_count,
+                    term,
+                    remaining,
+                )),
+            });
+            held_count = held_count.saturating_add(i64::from(instance_count));
+            held_value += reserved_instances_value(held.fixed_price.unwrap_or_default(), instance_count);
+
+            // Only a purchase that is in effect has a term left to carry onto another
+            // offering, and only a Convertible one "can be exchanged for Reserved Instances of
+            // the same or higher monetary value" — each reported as the reason the exchange
+            // cannot be performed, the first one found.
+            if invalid_because.is_none() && held_state != RESERVED_INSTANCE_STATE_ACTIVE {
+                invalid_because = Some(format!(
+                    "The Reserved Instance '{reserved_instance_id}' is in the '{held_state}' \
+                     state, so it cannot be exchanged"
+                ));
+            }
+            if invalid_because.is_none()
+                && held.offering_class.as_deref()
+                    != Some(RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE)
+            {
+                invalid_because = Some(format!(
+                    "The Reserved Instance '{reserved_instance_id}' is not Convertible, and \
+                     only Convertible Reserved Instances can be exchanged"
+                ));
+            }
+        }
+        // The purchases have been read; nothing below this point touches the store, so the
+        // guard is given back rather than held while the quote is computed.
+        drop(store);
+
+        // An exchange is INTO something: "the configuration of the target Convertible Reserved
+        // Instance to exchange for your current Convertible Reserved Instances"
+        // ($TargetConfigurations). The member is client-optional in the model, so a request
+        // that names no target reaches here and is told the parameter the operation needs is
+        // missing rather than being quoted an exchange for nothing.
+        let targets = input.target_configurations.unwrap_or_default();
+        if targets.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter targetConfiguration",
+            ));
+        }
+        if targets.len() > MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS {
+            return Err(invalid_parameter_value(format!(
+                "TargetConfigurations carries {} configurations, above the maximum of \
+                 {MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS}",
+                targets.len()
+            )));
+        }
+        // "The number of instances the Convertible Reserved Instance offering can be applied
+        // to. This parameter is reserved and cannot be specified in a request"
+        // (`TargetConfigurationRequest$InstanceCount`).
+        if let Some(instance_count) = targets
+            .iter()
+            .find_map(|target: &TargetConfigurationRequest| target.instance_count)
+        {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{instance_count}' for instanceCount. This parameter is \
+                 reserved and cannot be specified in a request"
+            )));
+        }
+
+        // Every target configuration must name an offering this service publishes — an id it
+        // does not is the second refusal this operation answers, since there is no offering
+        // for it to quote. Whether that offering can be exchanged INTO is reported, not
+        // refused.
+        let zones = availability_zones_in_region(&region);
+        let mut offerings: Vec<ReservedInstancesOfferingTerms> = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let Some(offering) = decode_reserved_instances_offering_id(&target.offering_id) else {
+                return Err(invalid_reserved_instances_offering_id(&target.offering_id));
+            };
+            if invalid_because.is_none()
+                && offering.offering_class != RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE
+            {
+                invalid_because = Some(format!(
+                    "The offering '{id}' is not Convertible, and only a Convertible Reserved \
+                     Instances offering can be exchanged into",
+                    id = echoed_resource_id(&target.offering_id)
+                ));
+            }
+            if invalid_because.is_none() {
+                if let Some(zone_name) = offering.availability_zone.as_deref() {
+                    if !zones.iter().any(|zone| zone.zone_name == zone_name) {
+                        invalid_because = Some(format!(
+                            "The offering '{id}' is in the Availability Zone \
+                             '{zone_name}', which the Region '{region}' does not have",
+                            id = echoed_resource_id(&target.offering_id)
+                        ));
+                    }
+                }
+            }
+            offerings.push(offering);
+        }
+
+        // The reservations being exchanged are divided over the target configurations, so a
+        // request carrying more configurations than reservations asks for a purchase holding
+        // none — which is not a Reserved Instance at all.
+        let configurations = i64::try_from(offerings.len()).unwrap_or(i64::MAX);
+        if invalid_because.is_none() && configurations > held_count {
+            invalid_because = Some(format!(
+                "The Reserved Instances being exchanged hold {held_count} reservations, fewer \
+                 than the {configurations} target configurations they would be divided over"
+            ));
+        }
+        // The ONE division a quote and the exchange it describes both make, so the counts this
+        // quote reports are the counts an accept would mint.
+        let shares = reserved_instances_exchange_shares(held_count, offerings.len());
+
+        // Each target configuration as this quote reports it: the offering it names, the
+        // reservations it would hold, and what it is worth over its own full term — a purchase
+        // the exchange has not made yet has all of its term left to run.
+        let mut target_values: Vec<TargetReservationValue> = Vec::with_capacity(offerings.len());
+        let mut target_value_total: f64 = 0.0;
+        let mut longest_term = Duration::ZERO;
+        for ((offering, instance_count), target) in offerings.iter().zip(&shares).zip(&targets) {
+            let term =
+                Duration::from_secs(u64::try_from(offering.duration_seconds).unwrap_or_default());
+            longest_term = longest_term.max(term);
+            target_values.push(TargetReservationValue {
+                target_configuration: Some(TargetConfiguration {
+                    offering_id: Some(target.offering_id.clone()),
+                    instance_count: Some(*instance_count),
+                }),
+                reservation_value: Some(reservation_value(
+                    offering.fixed_price,
+                    offering.usage_price,
+                    *instance_count,
+                    term,
+                    term,
+                )),
+            });
+            target_value_total += reserved_instances_value(offering.fixed_price, *instance_count);
+        }
+
+        // "The IDs of the Convertible Reserved Instances to exchange for another Convertible
+        // Reserved Instance of the same or higher value": an exchange into offerings worth
+        // less than what is being given up cannot be performed, and both sides are measured
+        // the one way ([`reserved_instances_value`]).
+        if invalid_because.is_none()
+            && target_value_total + RESERVED_INSTANCES_VALUE_TOLERANCE < held_value
+        {
+            invalid_because = Some(
+                "The target Convertible Reserved Instances are worth less than the Reserved \
+                 Instances being exchanged, and an exchange is for another Convertible \
+                 Reserved Instance of the same or higher value"
+                    .to_string(),
+            );
+        }
+
+        let held_rollup = rollup(
+            held_values
+                .iter()
+                .filter_map(|held| held.reservation_value.as_ref()),
+        );
+        let target_rollup = rollup(
+            target_values
+                .iter()
+                .filter_map(|target| target.reservation_value.as_ref()),
+        );
+        // "The total true upfront charge for the exchange" ($PaymentDue): what the target
+        // configurations cost upfront, less what the purchases being given up have not used
+        // up. An exchange into offerings worth no more than what is left is paid for by the
+        // purchases themselves, so nothing is due — never a negative charge, since EC2 does
+        // not refund an exchange.
+        let payment_due =
+            (target_value_total - amount_of(held_rollup.remaining_upfront_value.as_ref())).max(0.0);
+
+        Ok(GetReservedInstancesExchangeQuoteOutput {
+            // "The currency of the transaction" ($CurrencyCode): the one currency this
+            // service's Reserved Instances are priced in.
+            currency_code: Some(RESERVED_INSTANCE_CURRENCY_CODE.to_string()),
+            // "If true, the exchange is valid. If false, the exchange cannot be completed"
+            // ($IsValidExchange), and "describes the reason why the exchange cannot be
+            // completed" ($ValidationFailureReason) — reported only for an exchange that
+            // cannot be.
+            is_valid_exchange: Some(invalid_because.is_none()),
+            validation_failure_reason: invalid_because,
+            // "The new end date of the reservation term"
+            // ($OutputReservedInstancesWillExpireAt): the purchases an accept would mint start
+            // when it is accepted, so the term ends that far out — the LONGEST of the target
+            // terms, which is when the last of them expires.
+            output_reserved_instances_will_expire_at: now
+                .checked_add(longest_term)
+                .map(system_time_to_date_time),
+            payment_due: Some(amount_text(payment_due)),
+            reserved_instance_value_rollup: Some(held_rollup),
+            reserved_instance_value_set: Some(held_values),
+            target_configuration_value_rollup: Some(target_rollup),
+            target_configuration_value_set: Some(target_values),
+        })
     }
 }

@@ -552,6 +552,31 @@ pub fn require_capacity_reservation_by_id_shape<'store, E>(
         .ok_or_else(|| invalid_capacity_reservation_id_not_found(capacity_reservation_id))
 }
 
+/// The record of the Capacity Reservation `capacity_reservation_id` names, for an operation
+/// whose validator answers [`INVALID_CAPACITY_RESERVATION_ID_MALFORMED`] for EVERY id it
+/// cannot resolve.
+///
+/// EC2's per-operation validators do NOT agree about a Capacity Reservation id they cannot
+/// resolve, and this is the strict reading: a well-formed id the account holds no reservation
+/// under is refused as malformed — to this validator an id it never issued THIS account is
+/// not an id — rather than reported not found. The recorded contract of
+/// `GetCapacityReservationUsage`, `GetGroupsForCapacityReservation` and
+/// `MoveCapacityReservationInstances` carries that answer, where
+/// `DescribeCapacityReservations` reports such an id
+/// [`INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND`] and the interruptible allocation pair reads
+/// ids through [`require_capacity_reservation_by_id_shape`]. So the reading belongs to the
+/// OPERATION, and the three that take this one share it here rather than each keeping a copy.
+pub fn require_resolvable_capacity_reservation<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    capacity_reservation_id: &str,
+) -> Result<&'store CapacityReservationRecord, crate::scaffolded::Scaffolded<E>> {
+    require_well_formed_capacity_reservation_id(capacity_reservation_id)?;
+    store
+        .capacity_reservations
+        .get(capacity_reservation_id)
+        .ok_or_else(|| invalid_capacity_reservation_id_malformed(capacity_reservation_id))
+}
+
 /// The record of the Capacity Reservation `capacity_reservation_id` names, or the refusal
 /// for an id this service cannot resolve: a malformed one before an unknown one, the way
 /// the service orders the two.

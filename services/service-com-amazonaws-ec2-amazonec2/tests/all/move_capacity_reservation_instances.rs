@@ -13,10 +13,10 @@
 //!    `AvailableInstanceCount` change by that count, the capacity the two hold between them
 //!    is conserved, and `DescribeCapacityReservations` reads both sides back as the move
 //!    left them.
-//! 2. A Capacity Reservation id this service cannot resolve is refused BEFORE the move: a
-//!    value outside the long id form EC2 issues with
-//!    `InvalidCapacityReservationId.Malformed`, and a well-formed id the account holds no
-//!    reservation for with `InvalidCapacityReservationId.NotFound` — on either side of the
+//! 2. A Capacity Reservation id this service cannot resolve is refused BEFORE the move, with
+//!    `InvalidCapacityReservationId.Malformed` — this operation's validator answers that half
+//!    both for a value outside the long id form EC2 issues and for a well-formed id the
+//!    account holds no reservation under — on either side of the
 //!    move.
 //! 3. "The source Capacity Reservation and the destination Capacity Reservation must be
 //!    `active`, owned by your Amazon Web Services account, and share the following:
@@ -367,11 +367,13 @@ async fn an_id_the_service_cannot_resolve_is_refused_on_either_side() {
     // The rows differ in the FORM of the id: the long form EC2 issues (which is looked up
     // and not found), the null id, the short form, a leading digit above zero, another
     // resource's prefix, a known id with a suffix, and something that is not an id at all.
+    // Every one of them is the malformed half for this operation: an id it cannot resolve to
+    // a reservation of the account is not one EC2 issued this account.
     let rows: [IdRow; 7] = [
         (
             "a well-formed id nothing was reserved under",
             UNKNOWN_CAPACITY_RESERVATION_ID.to_string(),
-            "NotFound",
+            "Malformed",
         ),
         ("the null id", "cr-00000000000000000".to_string(), "Malformed"),
         ("the short id form", "cr-12345678".to_string(), "Malformed"),

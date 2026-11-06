@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHostReservationPurchasePreview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHostReservationPurchasePreview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: prices the Dedicated Host reservation the request describes — the published
+//! offering it names, applied to the Dedicated Hosts it names — without purchasing anything.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHostReservationPurchasePreview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "This is a preview of the PurchaseHostReservation action and DOES NOT RESULT IN THE
+//! OFFERING BEING PURCHASED", so this operation writes nothing at all: no reservation is
+//! stored, no id is minted, and two previews of the same request answer the same prices. The
+//! offering is the one `DescribeHostReservationOfferings` publishes under that id
+//! ([`crate::ops::describe_host_reservation_offerings::host_offering_by_id`]), so a preview
+//! and the catalog cannot quote one offering differently.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +75,40 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::ops::describe_host_reservation_offerings::{
+    HOST_OFFERING_CURRENCY_CODE, format_price_milli, host_offering_by_id,
+};
+use crate::scaffolded::Scaffolded;
+use crate::state::{
+    MAX_RESOURCE_IDS, deduplicate_ids, echoed_resource_id, host_id_is_well_formed,
+    host_instance_family, host_is_released, invalid_parameter_value, missing_parameter,
+    require_service_state, unresolvable_host_ids_message,
+};
+
+/// `InvalidHostId.Malformed` (HTTP 400): the request named a Dedicated Host id this operation
+/// cannot resolve, so there is nothing to price a reservation for.
+///
+/// ONE code and ONE wording for both halves of an unresolvable id — a value that is not a
+/// host id at all, and one inside the host id form the account holds no host under — because
+/// the recorded contract for the purchase PREVIEW answers the malformed half for an id it
+/// cannot resolve: to this validator an id it never issued this account is not an id,
+/// whatever its shape. The same reading `crate::ops::move_capacity_reservation_instances` is
+/// recorded making of a Capacity Reservation id.
+///
+/// The preview prices a reservation for the whole `HostIdSet`, so the sentence names that SET
+/// — the wording the recorded refusal carries, through the crate's one sentence for it
+/// ([`unresolvable_host_ids_message`]), which `crate::ops::purchase_host_reservation` answers
+/// for the same member. The CODE is this operation's own spelling:
+/// `crate::ops::purchase_host_reservation` is recorded answering `InvalidHostID.Malformed`
+/// for a value outside the id form, so each operation answers the one it was recorded with.
+fn host_ids_not_valid(host_id_set: &[String]) -> GetHostReservationPurchasePreviewError {
+    Scaffolded::service_error(
+        "InvalidHostId.Malformed",
+        400,
+        unresolvable_host_ids_message(host_id_set.iter().map(String::as_str)),
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +177,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHostReservationPurchasePreview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHostReservationPurchasePreviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHostReservationPurchasePreview"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // hosts it prices a reservation for are the account's, and the offering is published
+        // for every Region alike.
+        let _ = ctx;
+
+        // "The IDs of the Dedicated Hosts with which the reservation is associated"
+        // (`$HostIdSet`) is `@required` but client-optional, so a request that names none
+        // reaches here with an empty list: there is no host to price a reservation for,
+        // which is what EC2's `MissingParameter` says. The model bounds the list nowhere, so
+        // it is bounded here, before any work proportional to it is done; one host is priced
+        // ONCE however many times the request names it.
+        if input.host_id_set.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter hostIdSet",
+            ));
+        }
+        if input.host_id_set.len() > MAX_RESOURCE_IDS {
+            return Err(invalid_parameter_value(format!(
+                "HostIdSet carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.host_id_set.len()
+            )));
+        }
+        // A value that is not a Dedicated Host id at all names no host in ANY account, so it
+        // is refused for its FORM before anything is looked up — with the same code and the
+        // same sentence an id the account holds no host under gets, since this operation's
+        // validator does not tell the two apart.
+        if input
+            .host_id_set
+            .iter()
+            .any(|host_id| !host_id_is_well_formed(host_id))
+        {
+            return Err(host_ids_not_valid(&input.host_id_set));
+        }
+        let host_ids = deduplicate_ids(&input.host_id_set);
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "You must have ACTIVE Dedicated Hosts in your account before you purchase a
+        // reservation": a host the account does not hold, and one it has given back — whose
+        // id "can no longer be specified in another request" (`ReleaseHosts`) — is not one a
+        // reservation can be priced for, and each is answered the same code and sentence a
+        // value outside the host id form gets ([`host_ids_not_valid`]). Asked BEFORE the
+        // offering is read, because a preview for a host that is not there cannot be priced
+        // whatever offering it names — which is the order this operation's recorded refusal
+        // shows.
+        if host_ids.iter().any(|host_id| {
+            store
+                .dedicated_hosts
+                .get(host_id.as_str())
+                .is_none_or(host_is_released)
+        }) {
+            return Err(host_ids_not_valid(&input.host_id_set));
+        }
+
+        // "The offering ID of the reservation" (`$OfferingId`): an id no entry of the
+        // published catalog carries names no offering, so there is nothing to price — refused
+        // the way `crate::ops::purchase_host_reservation` refuses the same member.
+        let Some(offering) = host_offering_by_id(&input.offering_id) else {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{offering_id}' for offeringId. An offering id is one of \
+                 those DescribeHostReservationOfferings reports",
+                offering_id = echoed_resource_id(&input.offering_id),
+            )));
+        };
+
+        // "Preview a reservation purchase with configurations that MATCH THOSE OF YOUR
+        // DEDICATED HOST": a reservation covers "the instance family on the Dedicated Host
+        // that the reservation can be associated with" (`Purchase$InstanceFamily`), so an
+        // offering of another family cannot be applied to these hosts and the mismatch is
+        // named with both families — which is what the caller has to change.
+        for host_id in &host_ids {
+            let family = store
+                .dedicated_hosts
+                .get(host_id)
+                .and_then(host_instance_family)
+                .unwrap_or_default();
+            if family != offering.instance_family {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{offering_id}' for offeringId. It is an offering for \
+                     instance family '{offered}', and Dedicated Host '{host_id}' is of \
+                     instance family '{family}'",
+                    offering_id = echoed_resource_id(&input.offering_id),
+                    offered = offering.instance_family,
+                )));
+            }
+        }
+
+        // The purchase this offering would make for those hosts: ONE reservation covering the
+        // whole set, since every host in it is of the offering's own instance family. Each
+        // price is the offering's price for one host times the hosts the reservation would
+        // cover, held in thousandths of the currency the way the catalog holds them, so the
+        // totals below cannot drift from the entry they sum.
+        let hosts = i64::try_from(host_ids.len()).unwrap_or(i64::MAX);
+        let hourly_price_milli = offering.hourly_price_milli.saturating_mul(hosts);
+        let upfront_price_milli = offering.upfront_price_milli.saturating_mul(hosts);
+        let purchase = Purchase {
+            currency_code: Some(HOST_OFFERING_CURRENCY_CODE.to_string()),
+            duration: Some(offering.duration_seconds),
+            host_id_set: Some(host_ids),
+            // "The ID of the reservation" (`Purchase$HostReservationId`): a preview "does
+            // not result in the offering being purchased", so there is no reservation for an
+            // id to name and none is minted.
+            host_reservation_id: None,
+            hourly_price: Some(format_price_milli(offering.hourly_price_milli)),
+            instance_family: Some(offering.instance_family.clone()),
+            payment_option: Some(offering.payment_option.to_string()),
+            upfront_price: Some(format_price_milli(offering.upfront_price_milli)),
+        };
+
+        Ok(GetHostReservationPurchasePreviewOutput {
+            // "The currency in which the totalUpfrontPrice and totalHourlyPrice amounts are
+            // specified. At this time, the only supported currency is USD" (`$CurrencyCode`).
+            currency_code: Some(HOST_OFFERING_CURRENCY_CODE.to_string()),
+            // "The potential total hourly price of the reservation per hour"
+            // (`$TotalHourlyPrice`) and "the potential total upfront price. This is billed
+            // immediately" (`$TotalUpfrontPrice`): the purchase's prices over every host the
+            // reservation would cover.
+            total_hourly_price: Some(format_price_milli(hourly_price_milli)),
+            total_upfront_price: Some(format_price_milli(upfront_price_milli)),
+            purchase: Some(vec![purchase]),
+        })
     }
 }

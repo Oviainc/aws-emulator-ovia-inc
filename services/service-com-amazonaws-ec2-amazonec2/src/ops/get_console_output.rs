@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConsoleOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConsoleOutput`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: serves the console output of the instance the request names — the lines that
+//! instance's console shows, base64-encoded, with the instant they were last written. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConsoleOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A console is a device of the INSTANCE, so what it shows is derived from the stored
+//! instance on every call ([`crate::state::instance_console_text`], the one definition
+//! `GetConsoleScreenshot` draws as an image): two reads of an instance nothing has moved
+//! answer exactly the same bytes, and reading a console writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +73,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use ::base64::Engine as _;
+
+use crate::state::{
+    instance_console_text, require_console_instance, require_service_state,
+    system_time_to_date_time,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +147,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConsoleOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConsoleOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConsoleOutput"))
+        use crate::scaffolded::Scaffolded;
+
+        // Nothing about this answer depends on the request's Region or headers: what an
+        // instance's console shows is a fact of that instance.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the operation, WITHOUT
+        // ACTUALLY MAKING THE REQUEST … the error response is DryRunOperation" (`$DryRun`).
+        // The probe is a question about the CALLER's permissions, so it is answered here —
+        // before the instance store is read, which is what the recorded contract for this
+        // operation observes: a `DryRun` call naming an id the account cannot resolve is
+        // answered `DryRunOperation`, not a refusal about the id. The store is not even
+        // reached, so a probe cannot write anything.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Which state the console reports is a question about the CURRENT state, so a
+        // transition the clock already owed is materialised before it is read: an instance
+        // whose launch settled a moment ago is `running`, and that move was due at that
+        // instant whether or not anybody called. This is the only write reading a console can
+        // cause, and it is the clock's, not this operation's.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance" (`$InstanceId`), resolved through the reading the console
+        // readers share ([`crate::state::require_console_instance`]): every id this operation
+        // cannot resolve is answered `InvalidInstanceID.Malformed`, a value that is no
+        // instance id at all by the id space's own wording and a well-formed id the account
+        // holds no instance under by this validator's.
+        let instance = require_console_instance(&store, &input.instance_id)?;
+
+        // "When enabled, retrieves the latest console output for the instance. Default:
+        // disabled (false)" (`$Latest`): the console this service holds is derived from the
+        // instance as it stands at this instant, so it IS the latest output either way — there
+        // is no older captured block for a request that leaves the member out to get instead.
+        let _ = input.latest;
+
+        // "The time at which the output was last updated" (`$Timestamp`): the instance wrote
+        // its console when it booted, and again each time it was rebooted or interrupted —
+        // "the interrupt crashes and reboots the instance's operating system"
+        // (`SendDiagnosticInterrupt`) — so the latest of those three instants is when the
+        // output last changed. Read off the stored instance, so two reads report the same
+        // instant.
+        let updated_at = [
+            Some(instance.launch_time),
+            instance.last_reboot_queued_at,
+            instance.last_diagnostic_interrupt_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(instance.launch_time);
+
+        Ok(GetConsoleOutputOutput {
+            // The id read back off the stored record rather than echoed from the request, so
+            // the response names the instance the service resolved.
+            instance_id: Some(instance.instance_id.clone()),
+            // "The console output, base64-encoded. If you are using a command line tool, the
+            // tool decodes the output for you" (`$Output`).
+            output: Some(
+                ::base64::engine::general_purpose::STANDARD.encode(instance_console_text(instance)),
+            ),
+            timestamp: Some(system_time_to_date_time(updated_at)),
+        })
     }
 }

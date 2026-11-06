@@ -928,8 +928,9 @@ async fn tag_specifications_tag_the_interruptible_reservation_only() {
 // ---------------------------------------------------------------------------
 
 /// `GetCapacityReservationUsage` reports the stored reservation and nothing else: an id the
-/// account holds no reservation for is refused, a bogus `NextToken` is refused, and the one
-/// page it serves carries the owner's usage.
+/// account holds no reservation for is refused — that operation's validator answers the
+/// malformed half for every id it cannot resolve — a bogus `NextToken` is refused, and the
+/// one page it serves carries the owner's usage.
 #[tokio::test]
 async fn reading_a_reservation_back_reports_the_store() {
     let (router, engine) = super::ec2_query::emulator();
@@ -943,8 +944,8 @@ async fn reading_a_reservation_back_reports_the_store() {
     );
     assert_eq!(
         error_code(&body),
-        "InvalidCapacityReservationId.NotFound",
-        "an unknown reservation: expected InvalidCapacityReservationId.NotFound, got {body}"
+        "InvalidCapacityReservationId.Malformed",
+        "an unknown reservation: expected InvalidCapacityReservationId.Malformed, got {body}"
     );
 
     let (status, body) = super::ec2_query::call(

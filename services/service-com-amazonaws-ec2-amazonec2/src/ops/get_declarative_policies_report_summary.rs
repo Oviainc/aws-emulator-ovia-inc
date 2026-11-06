@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeclarativePoliciesReportSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeclarativePoliciesReportSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: summarises the stored account status report the request names — where it is
+//! saved, the target it covers, when its generation started and ended, and how many accounts
+//! it covered. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeclarativePoliciesReportSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A summary is a REPORT of the report: it writes nothing, and the status it reports from is
+//! the one the clock has reached ([`crate::state::declarative_policies_reports`]), so a
+//! generation that fell complete a moment ago is summarised as complete without this call
+//! moving it.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +82,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::Instant;
+
+use crate::state::{
+    REPORT_STATE_COMPLETE, dry_run_operation,
+    invalid_declarative_policies_report_id_not_found, require_service_state,
+};
+
+/// How many accounts a report of this emulator's organization covers: the ONE account this
+/// emulator serves ([`::engine::emulator_account_id`]).
+///
+/// "The total number of accounts associated with the specified targetId"
+/// (`$NumberOfAccounts`): whichever scope the target names — a root, an organizational unit
+/// or an account — the accounts inside it that this emulator holds are that one, so a report
+/// of any of them covers exactly it.
+const ACCOUNTS_IN_SCOPE: i32 = 1;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -150,18 +165,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeclarativePoliciesReportSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeclarativePoliciesReportSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeclarativePoliciesReportSummary"))
+        // `ctx` carries request metadata only, and this operation reads none of it: a report
+        // is a resource of the organization, so the Region a request was signed for does not
+        // narrow which one an id names.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … the error response is DryRunOperation" (`$DryRun`): the probe
+        // asks about the CALLER's permissions, so it is answered FIRST — before the id the
+        // request carries is read at all, which is this operation's recorded contract: a
+        // probe naming a report id the service cannot resolve is still answered
+        // `DryRunOperation` rather than a refusal about the id.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "The ID of the report" (`$ReportId`): every id this operation cannot resolve to a
+        // report of the organization is reported NOT FOUND — a value outside the form every
+        // report id carries included. EC2's per-operation validators do not answer the same
+        // half for an id they cannot resolve, and this one's recorded contract carries the
+        // not-found half where `CancelDeclarativePoliciesReport`'s refuses a value that is no
+        // report id as malformed ([`crate::state::require_declarative_policies_report`]); the
+        // choice belongs to the OPERATION, so it is made here.
+        let Some(record) = store.declarative_policies_reports.get(&input.report_id) else {
+            return Err(invalid_declarative_policies_report_id_not_found(
+                &input.report_id,
+            ));
+        };
+        // The report as the clock has left it, so the `EndTime` this summary reports is the
+        // one a `DescribeDeclarativePoliciesReports` would report — derived rather than
+        // written, which is what lets this read change nothing.
+        let report = record.view_at(Instant::now());
+        let complete = report.status.as_deref() == Some(REPORT_STATE_COMPLETE);
+
+        Ok(GetDeclarativePoliciesReportSummaryOutput {
+            report_id: report.report_id,
+            s3_bucket: report.s3_bucket,
+            s3_prefix: report.s3_prefix,
+            target_id: report.target_id,
+            start_time: report.start_time,
+            // "The time when the report generation ended" (`$EndTime`): absent while it is
+            // still being generated.
+            end_time: report.end_time,
+            // "The total number of accounts associated with the specified targetId"
+            // (`$NumberOfAccounts`) and "the number of accounts where attributes could not be
+            // retrieved in ANY Region" (`$NumberOfFailedAccounts`): a report that has not
+            // finished has covered no accounts yet, and one that has covered the accounts in
+            // its scope ([`ACCOUNTS_IN_SCOPE`]) — none of which failed, since the attributes
+            // of this emulator's own account are the ones it holds.
+            number_of_accounts: Some(if complete { ACCOUNTS_IN_SCOPE } else { 0 }),
+            number_of_failed_accounts: Some(0),
+            // "The attributes described in the report" (`$AttributeSummaries`): an attribute
+            // is summarised because a DECLARATIVE POLICY sets it, and those policies live in
+            // Amazon Web Services Organizations, which this emulator does not serve — so no
+            // attribute of this organization is under one, and the set is empty rather than
+            // invented.
+            attribute_summaries: Some(Vec::new()),
+        })
     }
 }

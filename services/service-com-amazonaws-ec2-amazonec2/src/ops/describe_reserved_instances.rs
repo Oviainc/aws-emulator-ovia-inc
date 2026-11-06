@@ -347,13 +347,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
 /// listed here. Every entry must be answered by [`filter_values`].
-const RESERVED_INSTANCES_FILTERS: [&str; 13] = [
+///
+/// `offering-class` and `offering-type` are the two names the recorded contract of this
+/// operation accepts that the member's own documentation does not list: a recorded call
+/// narrowing this report by the offering class of a purchase is SERVED, so the service takes
+/// those two filters as well — they select on the purchase's own `OfferingClass` and
+/// `OfferingType`, which `DescribeReservedInstances` reports for every purchase.
+const RESERVED_INSTANCES_FILTERS: [&str; 15] = [
     "availability-zone",
     "availability-zone-id",
     "duration",
     "end",
     "fixed-price",
     "instance-type",
+    "offering-class",
+    "offering-type",
     "product-description",
     "reserved-instances-id",
     "scope",
@@ -437,6 +445,10 @@ fn filter_values<'a>(purchase: &'a ReservedInstances, name: &str) -> Vec<Cow<'a,
         "end" => crate::state::filter_timestamp_values(purchase.end),
         "fixed-price" => price_filter_values(purchase.fixed_price),
         "instance-type" => text(purchase.instance_type.as_deref()),
+        // The two filters the recorded contract accepts beside the documented list, each
+        // selecting on the member of the same name this report already carries.
+        "offering-class" => text(purchase.offering_class.as_deref()),
+        "offering-type" => text(purchase.offering_type.as_deref()),
         "product-description" => text(purchase.product_description.as_deref()),
         "reserved-instances-id" => text(purchase.reserved_instances_id.as_deref()),
         "scope" => text(purchase.scope.as_deref()),

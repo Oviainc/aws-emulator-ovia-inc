@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelDeclarativePoliciesReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelDeclarativePoliciesReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: cancels the generation of the account status report the request names, so
+//! every later reader of that report sees it `cancelled` and the completion the clock owed it
+//! never happens. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelDeclarativePoliciesReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can only cancel a report while it has the RUNNING status. Reports with other statuses
+//! (complete, cancelled, or error) can't be canceled" — so a report the clock has already
+//! completed, and one a cancel has already stopped, are refused rather than cancelled twice.
+//! The report itself lives in [`crate::state::declarative_policies_reports`], which is where
+//! the cancel's one transition is written.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +68,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::{Instant, SystemTime};
+
+use crate::state::{
+    REPORT_STATE_RUNNING, dry_run_operation, incorrect_state, require_declarative_policies_report,
+    require_service_state,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,18 +143,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelDeclarativePoliciesReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelDeclarativePoliciesReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelDeclarativePoliciesReport"))
+        // `ctx` carries request metadata only, and this operation reads none of it: a report
+        // is a resource of the organization, so the Region a request was signed for does not
+        // narrow which one an id names.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … the error response is DryRunOperation" (`$DryRun`): the probe
+        // asks about the CALLER's permissions, so it is answered FIRST — before the id the
+        // request carries is read at all, which is what the recorded contract of this surface
+        // observes: a probe naming a report id the service cannot resolve is still answered
+        // `DryRunOperation` rather than a refusal about the id. The store is not even
+        // reached, so a probe cancels nothing.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // ONE reading of each clock for this call, so the status the cancel is judged against
+        // and the instant it records cannot differ.
+        let now = Instant::now();
+        let cancelled_at = SystemTime::now();
+
+        // "The ID of the report" (`$ReportId`), resolved through the one reading this surface
+        // has ([`crate::state::require_declarative_policies_report`]): a value that is not a
+        // report id at all is refused as malformed before any lookup, and one inside the form
+        // this organization started no report under is reported not found — there is nothing
+        // to cancel either way.
+        let record = require_declarative_policies_report(&store, &input.report_id)?;
+
+        // "You can only cancel a report while it has the running status. Reports with other
+        // statuses (complete, cancelled, or error) can't be canceled" — and the status is the
+        // one the clock has reached, so a report whose generation completed a moment ago is
+        // refused here rather than cancelled after it was finished.
+        let status = record.status_at(now).to_string();
+        if status != REPORT_STATE_RUNNING {
+            return Err(incorrect_state(format!(
+                "The report '{report_id}' has the '{status}' status, and only a report with \
+                 the '{REPORT_STATE_RUNNING}' status can be canceled",
+                report_id = input.report_id,
+            )));
+        }
+
+        // The cancel itself, through the ONE writer of that transition
+        // (`crate::state::declarative_policies_reports`), so every later reader of the report
+        // sees it cancelled at this instant.
+        if !store.cancel_declarative_policies_report(&input.report_id, now, cancelled_at) {
+            return Err(crate::scaffolded::Scaffolded::internal_error(format!(
+                "the report '{report_id}' could not be read back to cancel it",
+                report_id = input.report_id,
+            )));
+        }
+
+        // "Is true if the request succeeds, and an error otherwise" (`$Return`).
+        Ok(CancelDeclarativePoliciesReportOutput {
+            r#return: Some(true),
+        })
     }
 }

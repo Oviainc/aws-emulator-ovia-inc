@@ -366,6 +366,33 @@ async fn the_report_is_the_store_narrowed_by_what_the_request_names() {
             filters(&[("product-description", &["Windows"])]),
             vec![1],
         ),
+        // `offering-class` and `offering-type` are the two filter names this operation's
+        // recorded contract serves that the member's own documentation does not list — a
+        // recorded call narrowing this report by the offering class of a purchase is SERVED —
+        // so each selects on the member of the same name the report already carries.
+        (
+            "the offering-class filter",
+            filters(&[("offering-class", &["convertible"])]),
+            vec![1],
+        ),
+        (
+            "the offering-class filter, for the standard purchases",
+            filters(&[("offering-class", &["standard"])]),
+            vec![0, 2],
+        ),
+        (
+            "the offering-type filter",
+            filters(&[("offering-type", &["Partial Upfront"])]),
+            vec![2],
+        ),
+        (
+            "the offering-class filter beside the offering-type filter",
+            filters(&[
+                ("offering-class", &["standard"]),
+                ("offering-type", &["All Upfront"]),
+            ]),
+            vec![0],
+        ),
         (
             "the duration filter, for a three-year term",
             filters(&[("duration", &["94608000"])]),

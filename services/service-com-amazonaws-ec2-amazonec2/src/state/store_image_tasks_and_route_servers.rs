@@ -612,6 +612,28 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+/// `CapacityManager.Disabled` (HTTP 400): the account's Capacity Manager is OFF, so there is
+/// nothing for a request that acts on it to act on.
+///
+/// EC2's own code for that condition, in the `<Feature>.<Condition>` form it words a
+/// feature-level refusal in: the recorded contract for `DisableCapacityManager` answers it
+/// for an account that has not enabled Capacity Manager, where the account-level setting that
+/// WORD describes is [`CAPACITY_MANAGER_DISABLED`].
+pub const CAPACITY_MANAGER_DISABLED_ERROR: &str = "CapacityManager.Disabled";
+
+/// Refuse a request that acts on Capacity Manager while the account has it off: HTTP 400
+/// [`CAPACITY_MANAGER_DISABLED_ERROR`], in the wording its recorded refusal carries.
+///
+/// One place the sentence is worded, so every operation that has to report that condition
+/// reports it the same way.
+pub fn capacity_manager_disabled<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        CAPACITY_MANAGER_DISABLED_ERROR,
+        400,
+        "Capacity Manager isn't enabled for this account.",
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Capacity Manager DATA EXPORT configurations (a resource with an id)
 // ---------------------------------------------------------------------------
