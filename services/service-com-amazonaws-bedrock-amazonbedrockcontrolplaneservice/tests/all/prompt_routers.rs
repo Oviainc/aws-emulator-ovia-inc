@@ -672,7 +672,8 @@ async fn the_listing_reports_the_routers_of_the_region_and_type_asked_for() {
     // The routers Amazon Bedrock publishes itself in this region, which the `default`
     // listing reports: the ids come from the published catalog ("Intelligent prompt
     // routing"), spelled as the `PromptRouterArn` of the region the request addresses.
-    let published: Vec<String> = ["anthropic.claude:1", "meta.llama:1"]
+    let published_ids = ["amazon.nova:1", "anthropic.claude:1", "meta.llama:1"];
+    let published: Vec<String> = published_ids
         .iter()
         .map(|id| format!("{}{id}", arn_prefix(REGION)))
         .collect();
@@ -697,7 +698,7 @@ async fn the_listing_reports_the_routers_of_the_region_and_type_asked_for() {
             "another region, type=default",
             other_region,
             "type=default",
-            ["anthropic.claude:1", "meta.llama:1"]
+            published_ids
                 .iter()
                 .map(|id| format!("{}{id}", arn_prefix(other_region)))
                 .collect(),

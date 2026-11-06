@@ -2,14 +2,18 @@
 
 //! @op GetPromptRouter
 //!
-//! Reports the prompt router a `PromptRouterArn` names, entirely out of what
-//! `ops/create_prompt_router.rs` persisted in [`crate::state`]: its name, description,
-//! target models, fallback model, routing criteria, status, type and the two instants.
+//! Reports the prompt router a `PromptRouterArn` names: a `custom` router out of what
+//! `ops/create_prompt_router.rs` persisted in [`crate::state`], and a `default` one out of
+//! the catalogue Amazon Bedrock publishes itself
+//! ([`crate::state::default_prompt_routers`], the same rows `ops/list_prompt_routers.rs`
+//! reports) — its name, description, target models, fallback model, routing criteria,
+//! status, type and the two instants either way.
 //! A read, and only a read — nothing in the store changes here.
 //!
-//! An ARN no router in the store carries is `ResourceNotFoundException`, which is also
-//! what an ARN of another region gets: a router is keyed by the ARN it was minted with,
-//! and that ARN carries the region the create addressed.
+//! An ARN neither the store nor the published catalogue carries is
+//! `ResourceNotFoundException`, which is also what an ARN of another region gets: a stored
+//! router is keyed by the ARN it was minted with, a published one carries the ARN of the
+//! region it is offered in, and either ARN carries the region it belongs to.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!

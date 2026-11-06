@@ -148,6 +148,31 @@ fn model_id_of(model_arn: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The `inferenceProfileArn`s `ListInferenceProfiles` reports in `region` for the profiles
+/// Amazon Bedrock publishes there — what a router's target must be one of.
+async fn published_profile_arns(emu: &Emulator, region: &str) -> Vec<String> {
+    let listed = list_profiles(emu, region, &format!("type={SYSTEM_DEFINED}")).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {region:?}: ListInferenceProfiles must answer 200, got {} {:?}",
+        listed.status, listed.body
+    );
+    rows(&listed, "inferenceProfileSummaries")
+        .iter()
+        .map(|row| text(row, "inferenceProfileArn"))
+        .collect()
+}
+
+/// The base `modelId` a published `inference-profile` ARN routes to: the profile id behind
+/// its geography prefix.
+fn profile_model_id(profile_arn: &str) -> String {
+    profile_arn
+        .rsplit_once("inference-profile/")
+        .and_then(|(_, id)| id.split_once('.'))
+        .map(|(_, model_id)| model_id.to_string())
+        .unwrap_or_default()
+}
+
 /// The summaries a listing reported.
 fn rows(reply: &Reply, member: &str) -> Vec<Value> {
     reply
@@ -224,8 +249,10 @@ async fn the_default_listing_reports_the_published_routers_of_the_region() {
                 "case {case:?}: routingCriteria is @required, got {summary:?}"
             );
 
-            // The models a caller may route to, and the fallback: each one is a model this
-            // control plane itself publishes, which is what makes them routable here.
+            // The models a caller may route to, and the fallback: each one is reported as
+            // the ARN of the CROSS-REGION INFERENCE PROFILE this control plane itself
+            // publishes for that model in this region, which is what makes the target
+            // routable here.
             let models = summary
                 .get("models")
                 .and_then(Value::as_array)
@@ -242,6 +269,7 @@ async fn the_default_listing_reports_the_published_routers_of_the_region() {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let profiles = published_profile_arns(&emu, region).await;
             for model_arn in models
                 .iter()
                 .map(|model| {
@@ -253,13 +281,19 @@ async fn the_default_listing_reports_the_published_routers_of_the_region() {
                 })
                 .chain(std::iter::once(fallback))
             {
-                let model_id = model_id_of(&model_arn);
-                assert_eq!(
-                    model_arn,
-                    format!("arn:aws:bedrock:{region}::foundation-model/{model_id}"),
-                    "case {case:?}: a target model is reported as the FoundationModelArn of \
-                     this region"
+                assert!(
+                    model_arn.starts_with(&format!(
+                        "arn:aws:bedrock:{region}:{ACCOUNT}:inference-profile/"
+                    )),
+                    "case {case:?}: a target model is reported as the inference-profile ARN \
+                     of this region, got {model_arn:?}"
                 );
+                assert!(
+                    profiles.contains(&model_arn),
+                    "case {case:?}: the target {model_arn:?} must be a profile \
+                     ListInferenceProfiles reports, which carries {profiles:?}"
+                );
+                let model_id = profile_model_id(&model_arn);
                 assert!(
                     catalog.contains(&model_id),
                     "case {case:?}: the target model {model_id:?} must be one \
@@ -279,6 +313,9 @@ async fn the_default_listing_reports_the_published_routers_of_the_region() {
                 "promptRouterName",
                 "promptRouterArn",
                 "routingCriteria",
+                "description",
+                "createdAt",
+                "updatedAt",
                 "models",
                 "fallbackModel",
                 "status",
@@ -291,6 +328,13 @@ async fn the_default_listing_reports_the_published_routers_of_the_region() {
                      {:?} and {:?}",
                     summary.get(member),
                     read.get(member)
+                );
+            }
+            for member in ["description", "createdAt", "updatedAt"] {
+                assert_ne!(
+                    summary.get(member).cloned().unwrap_or(Value::Null),
+                    Value::Null,
+                    "case {case:?}: a published router carries {member}, got {summary:?}"
                 );
             }
             seen_arns.push(arn);
@@ -423,6 +467,9 @@ async fn a_published_profile_resolves_under_both_identifier_spellings() {
                 for member in [
                     "inferenceProfileName",
                     "inferenceProfileId",
+                    "description",
+                    "createdAt",
+                    "updatedAt",
                     "models",
                     "status",
                     "type",
@@ -434,6 +481,14 @@ async fn a_published_profile_resolves_under_both_identifier_spellings() {
                          {:?} and {:?}",
                         summary.get(member),
                         read.get(member)
+                    );
+                }
+                for member in ["description", "createdAt", "updatedAt"] {
+                    assert_ne!(
+                        read.get(member),
+                        Value::Null,
+                        "case {case:?}: a published profile carries {member}, got {:?}",
+                        read.body
                     );
                 }
             }

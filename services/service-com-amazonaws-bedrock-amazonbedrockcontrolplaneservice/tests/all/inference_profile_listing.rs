@@ -81,12 +81,19 @@ const GEOGRAPHIES: &[(&str, &str, &[&str])] = &[
     ("us", "US", &["us-east-1", "us-east-2", "us-west-2"]),
 ];
 
-/// The base models that catalog publishes a cross-region profile for, each with the label
-/// its published name carries: `(modelId, label)`, in `modelId` order.
+/// The base models that catalog publishes a cross-region profile for, each with the brand
+/// its published name carries — the provider's name and the model's name as
+/// `ListFoundationModels` reports them, the model's name alone for a model AWS publishes
+/// itself: `(modelId, brand)`, in `modelId` order. The listing reports them in
+/// `inferenceProfileName` order, which [`published_in`] sorts them into.
 const CROSS_REGION_MODELS: &[(&str, &str)] = &[
     ("amazon.nova-lite-v1:0", "Nova Lite"),
     ("amazon.nova-micro-v1:0", "Nova Micro"),
     ("amazon.nova-pro-v1:0", "Nova Pro"),
+    (
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "Anthropic Claude 3.5 Sonnet",
+    ),
     (
         "anthropic.claude-3-haiku-20240307-v1:0",
         "Anthropic Claude 3 Haiku",
@@ -95,6 +102,8 @@ const CROSS_REGION_MODELS: &[(&str, &str)] = &[
         "anthropic.claude-3-sonnet-20240229-v1:0",
         "Anthropic Claude 3 Sonnet",
     ),
+    ("meta.llama3-1-70b-instruct-v1:0", "Meta Llama 3.1 70B"),
+    ("meta.llama3-1-8b-instruct-v1:0", "Meta Llama 3.1 8B"),
 ];
 
 /// The geography a region belongs to, or `None` when the catalog publishes none there.
@@ -106,12 +115,15 @@ fn geography_of(region: &str) -> Option<(&'static str, &'static str, &'static [&
 }
 
 /// The `SYSTEM_DEFINED` summaries the catalog publishes in `region`, in
-/// `inferenceProfileId` order — what the listing must report, member for member.
+/// `inferenceProfileName` order — what the listing must report, member for member, beside
+/// the `description`, `createdAt` and `updatedAt` a published profile carries, which the
+/// row below asserts on their own because they come off the MODEL's own published launch
+/// rather than out of this table.
 fn published_in(region: &str) -> Vec<Value> {
     let Some((prefix, label, regions)) = geography_of(region) else {
         return Vec::new();
     };
-    CROSS_REGION_MODELS
+    let mut profiles: Vec<Value> = CROSS_REGION_MODELS
         .iter()
         .map(|(model_id, model_label)| {
             let id = format!("{prefix}.{model_id}");
@@ -128,7 +140,33 @@ fn published_in(region: &str) -> Vec<Value> {
                 "type": TYPE_SYSTEM_DEFINED,
             })
         })
-        .collect()
+        .collect();
+    profiles.sort_by_key(|profile| {
+        profile
+            .get("inferenceProfileName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
+    profiles
+}
+
+/// The `description` a published profile carries, as the catalogue states it: the model it
+/// routes to, and the geography it routes within.
+fn published_description(label: &str, model_label: &str) -> String {
+    format!("Routes requests to {model_label} in {label} regions")
+}
+
+/// One listed summary without the three members a published profile computes rather than
+/// carries in the table above, so the comparison is against what the table does state.
+fn without_published_metadata(summary: &Value) -> Value {
+    let mut trimmed = summary.clone();
+    if let Some(object) = trimmed.as_object_mut() {
+        for member in ["description", "createdAt", "updatedAt"] {
+            object.remove(member);
+        }
+    }
+    trimmed
 }
 
 /// A `foundation-model` source ARN, as `InferenceProfileModelSource`'s pattern spells one.
@@ -442,23 +480,53 @@ async fn the_published_cross_region_profiles_of_the_region_are_listed() {
             listing.status, listing.body
         );
         let expected = published_in(region);
+        let listed: Vec<Value> = summaries(case, &listing)
+            .iter()
+            .map(without_published_metadata)
+            .collect();
         assert_eq!(
-            summaries(case, &listing),
-            expected,
+            listed, expected,
             "case {case:?}: the published profiles of {region} must be reported member for \
-             member, in inferenceProfileId order, got {:?}",
+             member, in inferenceProfileName order, got {:?}",
             listing.body
         );
-        // Nothing published carries an instant: no `createdAt` and no `updatedAt`, because
-        // no call created it.
+        // A published profile carries the three members the table above leaves to this row:
+        // the description stating what it routes and where, and the instant it came into
+        // being — the same for `createdAt` and `updatedAt`, because no call has updated a
+        // resource no call created.
+        let label = geography_of(region).map(|(_, label, _)| label);
         for summary in summaries(case, &listing) {
-            for member in ["createdAt", "updatedAt"] {
-                assert_eq!(
-                    summary.get(member).cloned().unwrap_or(Value::Null),
-                    Value::Null,
-                    "case {case:?}: a published profile carries no {member}, got {summary:?}"
-                );
-            }
+            let name = summary
+                .get("inferenceProfileName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model_label = label
+                .and_then(|label| name.strip_prefix(&format!("{label} ")))
+                .unwrap_or_default();
+            assert_eq!(
+                summary.get("description").and_then(Value::as_str),
+                Some(published_description(label.unwrap_or_default(), model_label).as_str()),
+                "case {case:?}: the published description must name the model and the \
+                 geography, got {summary:?}"
+            );
+            let created = summary
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: a published profile carries createdAt, got {summary:?}"))
+                .to_string();
+            let updated = summary
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: a published profile carries updatedAt, got {summary:?}"))
+                .to_string();
+            assert_eq!(
+                created, updated,
+                "case {case:?}: nothing has updated a published profile, so the two instants \
+                 agree, got {summary:?}"
+            );
+            // And it is an instant on the wire, not an epoch number: `@timestampFormat`.
+            date_time_seconds(case, &created);
         }
     }
 
@@ -514,7 +582,14 @@ async fn a_published_profile_is_a_model_source_a_create_accepts() {
         );
         // The model behind the geography prefix, as the published profile's own id carries
         // it, tracked as a `FoundationModelArn` of this region.
-        let model_id = CROSS_REGION_MODELS[index].0;
+        let profile_id = summary
+            .get("inferenceProfileId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let model_id = profile_id
+            .split_once('.')
+            .map(|(_, model_id)| model_id)
+            .unwrap_or_default();
         assert_eq!(
             read.get("models"),
             json!([{ "modelArn": foundation_model_arn(REGION, model_id) }]),

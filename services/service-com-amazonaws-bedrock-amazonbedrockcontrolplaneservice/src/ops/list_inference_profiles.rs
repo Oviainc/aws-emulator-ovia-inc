@@ -9,7 +9,8 @@
 //! exactly what `ops/get_inference_profile.rs` reports for that same record. The listing is
 //! ordered by creation instant and paginated with the cursor every creation-time listing of
 //! this service pages with ([`crate::state::listing_cursor`]); a published profile was
-//! created by no call, so it is ordered ahead of them, by ARN.
+//! created by no call, so it is ordered ahead of them, by the name Amazon Bedrock publishes
+//! it under.
 //!
 //! `typeEquals` "filters for inference profiles that match the type you specify", so a
 //! request that names none asks for every profile of the region, of either type. A profile
@@ -172,8 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The system-defined profiles Amazon Bedrock publishes in this region come first —
         // they were not created by any call, so their cursor's instant half is zero and
-        // they are ordered among themselves by ARN — and the account's own profiles follow
-        // in the order they were created.
+        // they are ordered among themselves by the NAME Amazon Bedrock publishes them
+        // under, which is the order it reports them in — and the account's own profiles
+        // follow in the order they were created.
         let wanted_type = input.type_equals.as_deref();
         let system_defined = crate::state::INFERENCE_PROFILE_TYPE_SYSTEM_DEFINED;
         let mut rows: Vec<(String, InferenceProfileSummary)> = Vec::new();
@@ -181,11 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rows.extend(
                 crate::state::system_defined_inference_profiles(&region)
                     .into_iter()
-                    .map(|published| {
+                    .enumerate()
+                    .map(|(position, published)| {
                         (
                             crate::state::listing_cursor(
                                 ::std::time::SystemTime::UNIX_EPOCH,
-                                &published.inference_profile_arn,
+                                &crate::state::published_row_cursor_key(position),
                             ),
                             published,
                         )

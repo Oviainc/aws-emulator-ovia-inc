@@ -5,6 +5,8 @@
 //! profile surfaces report them through.
 
 use super::*;
+mod published_routing;
+pub use published_routing::*;
 
 /// One foundation model Amazon Bedrock offers, as this control plane reports it.
 ///
@@ -2214,9 +2216,28 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
 /// `None` only for a value that is not an instant at all, which no row of
 /// [`FOUNDATION_MODELS`] carries: a row's instants are pinned by this crate's own suites, so
 /// a misspelled one fails there rather than being reported as an absent date.
+///
+/// Reached by the catalogues built OVER the models too (`state/foundation_models/
+/// published_routing.rs`), whose own instants are the launch instants of the models they
+/// are published over.
 pub(super) fn published_instant(published: &str) -> Option<::aws_smithy_types::DateTime> {
     ::aws_smithy_types::DateTime::from_str(published, ::aws_smithy_types::date_time::Format::DateTime)
         .ok()
+}
+
+/// The published row `model_id` names, read off [`FOUNDATION_MODELS`] itself.
+///
+/// The catalog is published data, so a row is the same for every account and reachable
+/// without a store: this is what the catalogues built OVER the models — the cross-region
+/// inference profiles and the default prompt routers — read a target model's published
+/// attributes from, rather than carrying a second copy of them. `None` for an id the
+/// catalog offers no model under, which is what makes a target model nothing can be
+/// published for visible instead of invented.
+#[must_use]
+pub fn catalogued_model(model_id: &str) -> Option<&'static FoundationModel> {
+    FOUNDATION_MODELS
+        .iter()
+        .find(|model| model.model_id == model_id)
 }
 
 /// The same catalog row as the `FoundationModelDetails` a `GetFoundationModel` response
@@ -2474,272 +2495,3 @@ pub const FOUNDATION_MODEL_END_OF_LIFE_MESSAGE: &str =
 // operation that creates one, so these rows are published data the same way
 // [`FOUNDATION_MODELS`] is: the same for every account, written by no handler. A caller
 // discovers the routable model sets from them before building a router of its own.
-
-/// `PromptRouterType` — the type of a router Amazon Bedrock itself publishes.
-///
-/// The other of the two values the enum carries, beside [`PROMPT_ROUTER_TYPE_CUSTOM`].
-pub const PROMPT_ROUTER_TYPE_DEFAULT: &str = "default";
-
-/// The `responseQualityDifference` a published router reports.
-///
-/// `RoutingCriteria$responseQualityDifference` is modelled `@range(min: 0, max: 100)` and
-/// is `@required`, so a published router reports one; AWS publishes no tolerance for its
-/// own routers, so this is the minimum that range admits — the strictest criteria, under
-/// which a prompt is routed to the smaller model only when its answer is no worse.
-pub const PUBLISHED_ROUTING_QUALITY_DIFFERENCE: f64 = 0.0;
-
-/// One prompt router Amazon Bedrock publishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DefaultPromptRouter {
-    /// The resource half of the router's `PromptRouterArn`, whose pattern admits
-    /// `[a-zA-Z0-9-:.]+` there ([`prompt_router_arn`]).
-    pub id: &'static str,
-    /// `promptRouterName` — inside `PromptRouterName`'s `^([0-9a-zA-Z][ _-]?)+$`.
-    pub name: &'static str,
-    /// The `modelId`s the router routes between, in the order the summary reports them.
-    /// Every id is a row of [`FOUNDATION_MODELS`], so a router never offers a model this
-    /// control plane does not serve.
-    pub models: &'static [&'static str],
-    /// The `modelId` of the model the router falls back to when the criteria are not met;
-    /// one of [`DefaultPromptRouter::models`].
-    pub fallback_model: &'static str,
-}
-
-/// The prompt routers this emulator's Amazon Bedrock publishes, in `id` order — the order
-/// their ARNs sort in, which is the order a listing pages through.
-///
-/// The ids, names and model sets are the ones AWS publishes in "Intelligent prompt
-/// routing": one router per model family, routing between two models of that family and
-/// falling back to the larger one. The model ids are the rows [`FOUNDATION_MODELS`]
-/// carries for those families, so the two catalogs agree about which models exist.
-///
-/// Offered in every region this emulator serves: AWS publishes these routers in the
-/// regions where intelligent prompt routing is available, and nothing in the model marks a
-/// region as one of them, so a region is not treated as having none.
-pub const DEFAULT_PROMPT_ROUTERS: &[DefaultPromptRouter] = &[
-    DefaultPromptRouter {
-        id: "anthropic.claude:1",
-        name: "Anthropic Prompt Router",
-        models: &[
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        ],
-        fallback_model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
-    },
-    DefaultPromptRouter {
-        id: "meta.llama:1",
-        name: "Meta Prompt Router",
-        models: &[
-            "meta.llama3-1-8b-instruct-v1:0",
-            "meta.llama3-70b-instruct-v1:0",
-        ],
-        fallback_model: "meta.llama3-70b-instruct-v1:0",
-    },
-];
-
-/// Every prompt router Amazon Bedrock publishes in `region`, as the `PromptRouterSummary`
-/// a listing carries, in `promptRouterArn` order.
-///
-/// Each one reports the foundation models it routes between as `PromptRouterTargetModel`s
-/// carrying the `FoundationModelArn` of this region ([`foundation_model_arn`]) — the form
-/// `PromptRouterTargetModelArn` admits — and no `createdAt` or `updatedAt`: those two
-/// members are optional, and nothing publishes an instant for a router no caller created.
-#[must_use]
-pub fn default_prompt_routers(region: &str) -> Vec<PromptRouterSummary> {
-    let target = |model_id: &str| PromptRouterTargetModel {
-        model_arn: foundation_model_arn(region, model_id),
-    };
-    DEFAULT_PROMPT_ROUTERS
-        .iter()
-        .map(|router| PromptRouterSummary {
-            prompt_router_name: router.name.to_string(),
-            routing_criteria: RoutingCriteria {
-                response_quality_difference: PUBLISHED_ROUTING_QUALITY_DIFFERENCE,
-            },
-            description: None,
-            created_at: None,
-            updated_at: None,
-            prompt_router_arn: prompt_router_arn(region, router.id),
-            models: router.models.iter().map(|model| target(model)).collect(),
-            fallback_model: target(router.fallback_model),
-            status: PROMPT_ROUTER_AVAILABLE.to_string(),
-            r#type: PROMPT_ROUTER_TYPE_DEFAULT.to_string(),
-        })
-        .collect()
-}
-
-/// The prompt router Amazon Bedrock publishes in `region` under `arn`, if it publishes one.
-///
-/// `GetPromptRouter` addresses a router by its `PromptRouterArn` alone, and a published
-/// router carries the ARN of the region it is offered in, so one of another region names
-/// another account-region's router.
-#[must_use]
-pub fn default_prompt_router(arn: &str, region: &str) -> Option<PromptRouterSummary> {
-    default_prompt_routers(region)
-        .into_iter()
-        .find(|published| published.prompt_router_arn == arn)
-}
-
-// =============================================================================
-// The published cross-region inference profile catalog
-// =============================================================================
-//
-// Amazon Bedrock publishes the SYSTEM_DEFINED inference profiles itself — "the inference
-// profile is defined by Amazon Bedrock. You can route inference requests across regions
-// with these inference profiles"
-// (`smithy_query(query="shape",shape="InferenceProfileSummary")`) — and there is no
-// operation that creates one, so these rows are published data the same way
-// [`FOUNDATION_MODELS`] is: the same for every account, written by no handler.
-
-/// `InferenceProfileType` — the type of a profile Amazon Bedrock itself defines.
-///
-/// The other of the two values `InferenceProfileType` carries, beside
-/// [`INFERENCE_PROFILE_TYPE_APPLICATION`].
-pub const INFERENCE_PROFILE_TYPE_SYSTEM_DEFINED: &str = "SYSTEM_DEFINED";
-
-/// One geography a cross-region inference profile routes invocations within.
-///
-/// A geography is the unit the published profiles are cut along: a profile exists once per
-/// geography per model, is offered in that geography's regions, and routes requests to
-/// those same regions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InferenceProfileGeography {
-    /// The leading dot-separated segment of the published `inferenceProfileId`
-    /// (`us.<modelId>`), which is also what `ops/create_inference_profile.rs` reads back
-    /// off such an id to find the model behind it.
-    pub prefix: &'static str,
-    /// How the published `inferenceProfileName` spells the geography. Spelled without a
-    /// `.` so a published name stays inside `InferenceProfileName`'s pattern
-    /// (`^([0-9a-zA-Z][ _-]?)+$`).
-    pub label: &'static str,
-    /// The regions of the geography: where the profile is offered, and where it routes
-    /// invocations to. At most five, because `InferenceProfileModels` is
-    /// `@length(min: 1, max: 5)` and a published profile reports one model per region.
-    pub regions: &'static [&'static str],
-}
-
-/// The geographies this emulator's Amazon Bedrock publishes cross-region profiles for, in
-/// `prefix` order — the order their profile ids sort in.
-///
-/// The prefixes and the regions are the ones AWS publishes in "Supported Regions and
-/// models for inference profiles": a geography's profile routes to the commercial regions
-/// of that geography. A SUBSET of what AWS offers, spanning geographies of three different
-/// sizes, because the listing rule — not the catalog's size — is what this emulator has to
-/// get right.
-pub const INFERENCE_PROFILE_GEOGRAPHIES: &[InferenceProfileGeography] = &[
-    InferenceProfileGeography {
-        prefix: "apac",
-        label: "APAC",
-        regions: &[
-            "ap-northeast-1",
-            "ap-northeast-2",
-            "ap-south-1",
-            "ap-southeast-1",
-            "ap-southeast-2",
-        ],
-    },
-    InferenceProfileGeography {
-        prefix: "eu",
-        label: "EU",
-        regions: &["eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3"],
-    },
-    InferenceProfileGeography {
-        prefix: "us",
-        label: "US",
-        regions: &["us-east-1", "us-east-2", "us-west-2"],
-    },
-];
-
-/// One base model Amazon Bedrock publishes a cross-region inference profile for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CrossRegionModel {
-    /// `BedrockModelId` — the base model the profile routes invocations of, and the rest
-    /// of the published `inferenceProfileId` behind its geography prefix. Every id here is
-    /// a row of [`FOUNDATION_MODELS`], so the two catalogs agree about which models exist.
-    pub model_id: &'static str,
-    /// How the published `inferenceProfileName` spells the model, after the geography's
-    /// own label.
-    pub label: &'static str,
-}
-
-/// The base models this emulator's Amazon Bedrock publishes a cross-region profile for, in
-/// `model_id` order.
-///
-/// The models AWS lists as supported for cross-region inference on "Supported Regions and
-/// models for inference profiles", restricted to the ids [`FOUNDATION_MODELS`] carries so
-/// no published profile routes to a model this control plane does not offer. A SUBSET of
-/// what AWS offers, spanning two providers.
-pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
-    CrossRegionModel {
-        model_id: "amazon.nova-lite-v1:0",
-        label: "Nova Lite",
-    },
-    CrossRegionModel {
-        model_id: "amazon.nova-micro-v1:0",
-        label: "Nova Micro",
-    },
-    CrossRegionModel {
-        model_id: "amazon.nova-pro-v1:0",
-        label: "Nova Pro",
-    },
-    CrossRegionModel {
-        model_id: "anthropic.claude-3-haiku-20240307-v1:0",
-        label: "Anthropic Claude 3 Haiku",
-    },
-    CrossRegionModel {
-        model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
-        label: "Anthropic Claude 3 Sonnet",
-    },
-];
-
-/// The ARN of a system-defined inference profile in `region`:
-/// `arn:aws:bedrock:<region>:<account>:inference-profile/<id>`.
-///
-/// `inference-profile` is the resource type `InferenceProfileArn`'s pattern admits beside
-/// `application-inference-profile` (see [`application_inference_profile_arn`]), and it is
-/// the one the profiles Amazon Bedrock publishes carry.
-#[must_use]
-pub fn system_defined_inference_profile_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("inference-profile/{id}"))
-}
-
-/// Every system-defined inference profile Amazon Bedrock publishes in `region`, as the
-/// `InferenceProfileSummary` a listing carries, in `inferenceProfileId` order.
-///
-/// A profile is published in the regions of its own geography, so a region belonging to no
-/// geography this catalog carries has none. Each one reports one model per region of that
-/// geography — the base model it routes invocations to there — and no `createdAt` or
-/// `updatedAt`: those two members are optional, and nothing publishes an instant for a
-/// profile no caller created.
-#[must_use]
-pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSummary> {
-    let Some(geography) = INFERENCE_PROFILE_GEOGRAPHIES
-        .iter()
-        .find(|geography| geography.regions.contains(&region))
-    else {
-        return Vec::new();
-    };
-    CROSS_REGION_MODELS
-        .iter()
-        .map(|model| {
-            let id = format!("{}.{}", geography.prefix, model.model_id);
-            InferenceProfileSummary {
-                inference_profile_name: format!("{} {}", geography.label, model.label),
-                description: None,
-                created_at: None,
-                updated_at: None,
-                inference_profile_arn: system_defined_inference_profile_arn(region, &id),
-                models: geography
-                    .regions
-                    .iter()
-                    .map(|routed| InferenceProfileModel {
-                        model_arn: Some(foundation_model_arn(routed, model.model_id)),
-                    })
-                    .collect(),
-                inference_profile_id: id,
-                status: INFERENCE_PROFILE_ACTIVE.to_string(),
-                r#type: INFERENCE_PROFILE_TYPE_SYSTEM_DEFINED.to_string(),
-            }
-        })
-        .collect()
-}

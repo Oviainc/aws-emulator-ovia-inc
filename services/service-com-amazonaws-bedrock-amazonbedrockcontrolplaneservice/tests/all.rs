@@ -57,6 +57,8 @@ mod custom_model_deployments;
 mod custom_model_source_bucket;
 #[path = "all/custom_models.rs"]
 mod custom_models;
+#[path = "all/default_prompt_routers.rs"]
+mod default_prompt_routers;
 #[path = "all/enforced_guardrail_configuration.rs"]
 mod enforced_guardrail_configuration;
 #[path = "all/enforced_guardrail_inference.rs"]
