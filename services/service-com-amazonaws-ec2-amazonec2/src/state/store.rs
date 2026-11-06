@@ -421,6 +421,21 @@ pub const RESETTABLE_INSTANCE_ATTRIBUTES: &[&str] = &[
 /// attribute enables checking again.
 pub const DEFAULT_SOURCE_DEST_CHECK: bool = true;
 
+/// The `instanceInitiatedShutdownBehavior` of an instance whose launch named none:
+/// "Default: `stop`" (`RunInstancesRequest$InstanceInitiatedShutdownBehavior`).
+///
+/// A member of the `ShutdownBehavior` catalog
+/// (`crate::ops::types::SHUTDOWN_BEHAVIOR_VALUES`), so the word stored on an instance is
+/// always one of that catalog's rather than a request's own text; the launch's own choice
+/// is held on [`InstanceDetail`] with the other settings a launch makes.
+pub const DEFAULT_SHUTDOWN_BEHAVIOR: &str = "stop";
+
+/// The `disableApiStop` of an instance whose launch asked for no stop protection:
+/// "Indicates whether an instance is enabled for stop protection"
+/// (`RunInstancesRequest$DisableApiStop`) is a protection a launch or a modify turns ON,
+/// so an instance nothing asked it for is not protected.
+pub const DEFAULT_DISABLE_API_STOP: bool = false;
+
 /// One stored EC2 instance.
 #[derive(Debug, Clone)]
 pub struct InstanceRecord {
@@ -465,8 +480,8 @@ pub struct InstanceRecord {
     pub launch_time: SystemTime,
     pub ami_launch_index: i32,
     /// Stored because the launch supplied it; `DescribeInstances` never reports user
-    /// data (the real service returns it from `DescribeInstanceAttribute`, which is
-    /// still a stub).
+    /// data (the real service returns it from `DescribeInstanceAttribute`, which is what
+    /// reports it here too).
     pub user_data: Option<String>,
     pub placement_az: String,
     pub monitoring_state: String,

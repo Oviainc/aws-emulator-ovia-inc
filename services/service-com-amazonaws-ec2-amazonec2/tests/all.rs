@@ -1485,3 +1485,10 @@ mod host_reservation_purchase_preview;
 // its lines.
 #[path = "all/capacity_reservation_reports.rs"]
 mod capacity_reservation_reports;
+// What `DescribeInstanceAttribute` reports for ONE attribute of one instance: the member
+// `Attribute` names and no other, out of the state the launch wrote and the AMI, instance
+// type, volume store and interface store it is derived from — and the ids, attributes and
+// dry run it refuses. Declared at the tail of this file, which is where every new ec2 suite
+// inserts its lines.
+#[path = "all/instance_attribute_describe.rs"]
+mod instance_attribute_describe;

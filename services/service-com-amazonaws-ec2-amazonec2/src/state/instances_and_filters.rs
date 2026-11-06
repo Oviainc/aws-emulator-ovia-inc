@@ -1734,6 +1734,30 @@ impl ComAmazonawsEc2Amazonec2State {
             .unwrap_or_default()
     }
 
+    /// Whether enhanced networking with the Intel 82599 Virtual Function interface is
+    /// enabled for one instance, as the word AWS reports it by: "a value of `simple`
+    /// indicates that enhanced networking with the Intel 82599 VF interface is enabled"
+    /// (`Instance$SriovNetSupport`).
+    ///
+    /// Enhanced networking reaches an instance through the AMI it was launched from —
+    /// "enable `SriovNetSupport` on an instance and create an AMI from the instance"
+    /// (`ModifyImageAttribute`) is how an image comes to carry it — so the value is read
+    /// off that image's own `Image$SriovNetSupport` rather than copied onto the instance
+    /// record, where the two could disagree. An instance launched from an image this store
+    /// no longer holds reports the value every image this crate publishes carries
+    /// ([`IMAGE_SRIOV_NET_SUPPORT_SIMPLE`]), the same fallback the instance's other
+    /// AMI-derived facts take (`super::instance_detail`).
+    pub fn instance_sriov_net_support(&self, instance: &InstanceRecord) -> Option<String> {
+        let image = instance
+            .image_id
+            .as_deref()
+            .and_then(|image_id| self.images.get(image_id));
+        match image {
+            Some(image) => image.sriov_net_support.clone(),
+            None => Some(IMAGE_SRIOV_NET_SUPPORT_SIMPLE.to_string()),
+        }
+    }
+
     /// Whether the account `account_id` OWNS the product code `product_code`.
     ///
     /// No EC2 operation mints a product code: a code belongs to the seller whose PAID

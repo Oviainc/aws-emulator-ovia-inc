@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE attribute of one stored EC2 instance.
+//!
+//! "Describes the specified attribute of the specified instance. You can specify only one
+//! attribute at a time": the request names an instance and one `InstanceAttributeName`
+//! member, and the response carries that instance's id and the value the STORE holds for
+//! that one attribute — no other member of the result is filled in. Every value is the one
+//! `DescribeInstances` reports for the same instance (`crate::state::instance_view` and the
+//! record it projects), so one instance cannot be described two ways.
+//!
+//! This is a pure READ: nothing is written beyond the moves the clock already owed, so two
+//! describes of an instance report the same attribute.
+//!
+//! The refusals, in the order this handler makes them — the order every instance read of
+//! this crate keeps:
+//!
+//! * `InvalidParameterValue` (HTTP 400) for an attribute outside the modelled catalog,
+//!   which no member of the result corresponds to.
+//! * `InvalidParameterValue` (HTTP 400) for a value that is no instance id EC2 issues,
+//!   naming the parameter and the form it expected ([`instance_id_is_not_an_issued_id`]),
+//!   and `InvalidInstanceID.NotFound` (HTTP 400) for a readable id this account holds no
+//!   instance for — the split [`crate::state::require_instance_record_worded`] makes, which
+//!   is the one reading of those two cases this crate has.
+//! * `DryRunOperation` (HTTP 412) for a dry run of a request that would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +116,36 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    ComAmazonawsEc2Amazonec2State, INSTANCE_ID_PREFIX, INSTANCE_IDS_PARAMETER, InstanceRecord,
+    dry_run_operation, echoed_resource_id, internal_error, invalid_id_parameter_value,
+    invalid_parameter_value, require_instance_record_worded, require_service_state,
+};
+
+/// Refuse a value that is no instance id of the form EC2 issues: HTTP 400
+/// `InvalidParameterValue`, naming the parameter and the form it expected
+/// ([`invalid_id_parameter_value`]).
+///
+/// EC2 answers an id it cannot read two ways and WHICH one is a fact of the operation rather
+/// than of the id: an operation that resolves the one resource it acts on answers that
+/// resource's own `InvalidInstanceID.Malformed`, while an operation that validates the id as
+/// a request PARAMETER answers this one. This read of an instance's attribute is recorded
+/// answering the parameter layer, so that is the wording it reaches for — the WHICH-values
+/// rule is unchanged ([`require_instance_record_worded`]), only the class of the refusal.
+///
+/// It lives in this file rather than in `crate::state` because this is the only operation
+/// recorded answering it for an instance id — the same reason
+/// `crate::ops::describe_image_attribute` keeps its own refusal beside its handler.
+fn instance_id_is_not_an_issued_id<E>(instance_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    // The value comes from the request, so the echo is bounded the way every other echoed
+    // resource id of this crate is bounded.
+    invalid_id_parameter_value(
+        INSTANCE_IDS_PARAMETER,
+        &echoed_resource_id(instance_id),
+        INSTANCE_ID_PREFIX,
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +213,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceAttribute"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // instance is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "You can specify only one attribute at a time" — `Attribute` is one
+        // `InstanceAttributeName`, and the response carries only the member it names. The
+        // modelled enum constraint is already refused by the request walk before this
+        // handler runs, so this is the same belt-and-braces check `DescribeImageAttribute`
+        // and `DescribeNetworkInterfaceAttribute` keep: without it an attribute no result
+        // member corresponds to would be answered with a response carrying no attribute at
+        // all.
+        let attribute = input.attribute.as_str();
+        if !INSTANCE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({}) for parameter attribute is invalid. Unknown attribute.",
+                echoed_resource_id(attribute)
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A move the clock already owed — a state change, an attachment, a detachment — fell
+        // due at its own instant whether or not anybody called, so it is applied before the
+        // attribute is read: what this reports is what `DescribeInstances` reports at the
+        // same instant.
+        store.materialize_due_transitions();
+
+        // "Describes the specified attribute of the specified instance": the instance
+        // first, since every member of the response is a fact of it — a value that is no
+        // issued instance id before an id that names no instance, in the class of refusal
+        // this operation's own recorded answer carries.
+        let instance = require_instance_record_worded(
+            &store,
+            &input.instance_id,
+            instance_id_is_not_an_issued_id,
+        )?;
+
+        // The request is one that would have succeeded, so a dry run stops HERE, having
+        // read the instance and reported nothing: "If you have the required permissions,
+        // the error response is DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        reported_attribute(attribute, &store, instance).ok_or_else(|| {
+            // Unreachable: the catalog check above admits only the attributes
+            // `reported_attribute` answers.
+            internal_error(format!(
+                "'{attribute}' is an instance attribute this emulator holds no value for"
+            ))
+        })
     }
+}
+
+/// `instance` as the result of asking for its `attribute`: the ONE member that attribute
+/// names, read off the store, beside the instance's own id. `None` for an attribute no
+/// member of the result corresponds to, which the handler's catalog check has already
+/// refused.
+///
+/// Each arm names the `InstanceAttributeName` value the model publishes
+/// ([`INSTANCE_ATTRIBUTE_NAME_VALUES`]) and reports the `InstanceAttribute` member AWS
+/// documents that attribute as, so the mapping from attribute to value lives in one place:
+///
+/// ```text
+/// smithy_query(query="shape",shape="InstanceAttributeName,InstanceAttribute",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// The member asked about is always REPORTED, carrying no `Value` when the instance holds
+/// none — an instance launched without user data is one whose `userData` attribute has no
+/// value, which is a different answer from "this instance has no such attribute" — and a
+/// list attribute is reported as the list the instance carries, empty or not, the way
+/// `DescribeNetworkInterfaceAttribute` reports an interface's groups.
+///
+/// The values that are facts of the AMI, the instance type, the volume store or the
+/// interface store are taken from the ONE projection of a stored instance
+/// ([`ComAmazonawsEc2Amazonec2State::instance_view`]), so this operation and
+/// `DescribeInstances` cannot disagree about one instance; the rest are read off the
+/// instance's own record and the settings its launch chose
+/// ([`crate::state::InstanceDetail`]), which is where a launch, a modify and a reset leave
+/// them.
+fn reported_attribute(
+    attribute: &str,
+    store: &ComAmazonawsEc2Amazonec2State,
+    instance: &InstanceRecord,
+) -> Option<DescribeInstanceAttributeOutput> {
+    let text = |value: Option<String>| Some(AttributeValue { value });
+    let flag = |value: bool| {
+        Some(AttributeBooleanValue {
+            value: Some(value),
+        })
+    };
+    let mut reported = DescribeInstanceAttributeOutput {
+        instance_id: Some(instance.instance_id.clone()),
+        ..DescribeInstanceAttributeOutput::default()
+    };
+    match attribute {
+        "instanceType" => reported.instance_type = text(Some(instance.instance_type.clone())),
+        "kernel" => reported.kernel_id = text(instance.kernel_id.clone()),
+        "ramdisk" => reported.ramdisk_id = text(instance.ramdisk_id.clone()),
+        // "The user data" (`InstanceAttribute$UserData`): the base64 text the launch
+        // supplied, reported as it was stored.
+        "userData" => reported.user_data = text(instance.user_data.clone()),
+        "disableApiTermination" => {
+            reported.disable_api_termination = flag(instance.disable_api_termination);
+        }
+        "disableApiStop" => reported.disable_api_stop = flag(instance.detail.disable_api_stop),
+        "instanceInitiatedShutdownBehavior" => {
+            reported.instance_initiated_shutdown_behavior = text(Some(
+                instance
+                    .detail
+                    .instance_initiated_shutdown_behavior
+                    .to_string(),
+            ));
+        }
+        "sourceDestCheck" => reported.source_dest_check = flag(instance.source_dest_check),
+        "ebsOptimized" => reported.ebs_optimized = flag(instance.ebs_optimized),
+        // "The device name of the root device volume" (`InstanceAttribute$RootDeviceName`):
+        // a fact of the AMI the instance was launched from, reported through the instance's
+        // own projection.
+        "rootDeviceName" => {
+            reported.root_device_name = text(store.instance_view(instance).root_device_name);
+        }
+        // "The block device mapping of the instance"
+        // (`InstanceAttribute$BlockDeviceMappings`): the volumes the volume store records as
+        // attached to it, which is the list the instance report carries.
+        "blockDeviceMapping" => {
+            reported.block_device_mappings = Some(
+                store
+                    .instance_view(instance)
+                    .block_device_mappings
+                    .unwrap_or_default(),
+            );
+        }
+        // "The security groups associated with the instance" (`InstanceAttribute$Groups`):
+        // the groups of its primary network interface, through the one reading of an
+        // instance's groups this crate has.
+        "groupSet" => reported.groups = Some(store.instance_security_groups(instance)),
+        // "The product codes" (`InstanceAttribute$ProductCodes`): the codes of the AMI it
+        // was launched from, reported as the EMPTY list for an instance launched from an AMI
+        // nobody sells — the attribute every instance has, with nothing in it.
+        "productCodes" => reported.product_codes = Some(store.instance_product_codes(instance)),
+        // "Indicates whether the instance is enabled for Amazon Web Services Nitro
+        // Enclaves" (`InstanceAttribute$EnclaveOptions`): the option set the launch chose.
+        "enclaveOptions" => {
+            reported.enclave_options = Some(EnclaveOptions {
+                enabled: Some(instance.detail.enclave_enabled),
+            });
+        }
+        // "Indicates whether enhanced networking with the Intel 82599 Virtual Function
+        // interface is enabled" (`InstanceAttribute$SriovNetSupport`), which an instance
+        // inherits from its AMI
+        // ([`ComAmazonawsEc2Amazonec2State::instance_sriov_net_support`]).
+        "sriovNetSupport" => {
+            reported.sriov_net_support = text(store.instance_sriov_net_support(instance));
+        }
+        // "Note that the `enaSupport` attribute is not supported"
+        // (`DescribeInstanceAttributeRequest$Attribute`): the one member of the catalog this
+        // operation reports no value for, so the result carries the instance's id alone.
+        // The instance's ENA support is still reported by `DescribeInstances`
+        // (`Instance$EnaSupport`), which is the read AWS leaves it to.
+        "enaSupport" => {}
+        _ => return None,
+    }
+    Some(reported)
 }

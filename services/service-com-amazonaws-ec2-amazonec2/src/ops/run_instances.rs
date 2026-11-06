@@ -342,7 +342,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             IamInstanceProfileAssociationSpec, InstanceDetail, InstanceDetailSpec, InstanceRecord,
             InstanceStateName,
             MONITORING_STATE_DISABLED, MONITORING_STATE_ENABLED,
-            PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE,
+            PendingTransition, ReservationRecord,
+            DEFAULT_INSTANCE_TYPE,
             DEFAULT_SOURCE_DEST_CHECK, MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS,
             MAX_INSTANCES_PER_RUN,
             MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
@@ -636,14 +637,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         // The option sets this launch chose for every instance it mints — its metadata
-        // options, enclave, Capacity Reservation preference, maintenance and network
-        // performance options, instance hostname options and tenancy — resolved ONCE for the
+        // options, enclave, stop protection, shutdown behaviour, Capacity Reservation
+        // preference, maintenance and network performance options, instance hostname options
+        // and tenancy — resolved ONCE for the
         // batch against the account's own IMDS defaults and the AMI's `ImdsSupport`, so
         // every instance of one launch reports the same detail. A word outside its modelled
         // catalog refuses the launch HERE, before the first write.
         let detail: InstanceDetail = InstanceDetail::launched(InstanceDetailSpec {
             metadata_options: input.metadata_options.as_ref(),
             enclave_options: input.enclave_options.as_ref(),
+            disable_api_stop: input.disable_api_stop,
+            instance_initiated_shutdown_behavior: input
+                .instance_initiated_shutdown_behavior
+                .as_deref(),
             capacity_reservation_preference: input
                 .capacity_reservation_specification
                 .as_ref()

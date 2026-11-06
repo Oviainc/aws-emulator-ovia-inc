@@ -35,12 +35,14 @@ use crate::ops::types::{
     InstanceBlockDeviceMapping, InstanceMaintenanceOptions, InstanceMaintenanceOptionsRequest,
     InstanceMetadataOptionsRequest, InstanceMetadataOptionsResponse,
     InstanceNetworkPerformanceOptions, InstanceNetworkPerformanceOptionsRequest, Placement,
-    PrivateDnsNameOptionsRequest, PrivateDnsNameOptionsResponse, TENANCY_VALUES,
+    PrivateDnsNameOptionsRequest, PrivateDnsNameOptionsResponse, SHUTDOWN_BEHAVIOR_VALUES,
+    TENANCY_VALUES,
 };
 use crate::scaffolded::Scaffolded;
 
 use super::{
-    AccountInstanceMetadataDefaults, ComAmazonawsEc2Amazonec2State, HOSTNAME_TYPE_IP_NAME,
+    AccountInstanceMetadataDefaults, ComAmazonawsEc2Amazonec2State, DEFAULT_DISABLE_API_STOP,
+    DEFAULT_SHUTDOWN_BEHAVIOR, HOSTNAME_TYPE_IP_NAME,
     IMAGE_HYPERVISOR_XEN, IMAGE_ROOT_DEVICE_TYPE_EBS, IMAGE_VIRTUALIZATION_TYPE_HVM,
     IMDS_SUPPORT_V2, ImageSpec, InstanceRecord, MAX_METADATA_HOP_LIMIT, MIN_METADATA_HOP_LIMIT,
     TRANSITION_DELAY, catalog_member, due_instant, echoed_resource_id, image_creation_time,
@@ -160,6 +162,16 @@ pub struct InstanceDetail {
     pub metadata_applied_at: Instant,
     /// `EnclaveOptions$Enabled`.
     pub enclave_enabled: bool,
+    /// "Indicates whether stop protection is enabled for the instance"
+    /// (`InstanceAttribute$DisableApiStop`), which a launch asks for through
+    /// `RunInstancesRequest$DisableApiStop` — off for a launch that asks for nothing
+    /// ([`DEFAULT_DISABLE_API_STOP`]).
+    pub disable_api_stop: bool,
+    /// "Indicates whether an instance stops or terminates when you initiate shutdown from
+    /// the instance" (`InstanceAttribute$InstanceInitiatedShutdownBehavior`): the
+    /// `ShutdownBehavior` member the launch chose, or [`DEFAULT_SHUTDOWN_BEHAVIOR`] when it
+    /// chose none.
+    pub instance_initiated_shutdown_behavior: &'static str,
     /// `CapacityReservationSpecificationResponse$CapacityReservationPreference`.
     pub capacity_reservation_preference: &'static str,
     /// `InstanceMaintenanceOptions$AutoRecovery`.
@@ -198,6 +210,8 @@ impl Default for InstanceDetail {
             instance_metadata_tags: METADATA_TAGS_DISABLED,
             metadata_applied_at: due_instant(TRANSITION_DELAY),
             enclave_enabled: false,
+            disable_api_stop: DEFAULT_DISABLE_API_STOP,
+            instance_initiated_shutdown_behavior: DEFAULT_SHUTDOWN_BEHAVIOR,
             capacity_reservation_preference: CAPACITY_RESERVATION_PREFERENCE_OPEN,
             auto_recovery: AUTO_RECOVERY_DEFAULT,
             bandwidth_weighting: BANDWIDTH_WEIGHTING_DEFAULT,
@@ -301,6 +315,20 @@ impl InstanceDetail {
                 .enclave_options
                 .and_then(|options| options.enabled)
                 .unwrap_or(false),
+            // "Indicates whether an instance is enabled for stop protection"
+            // (`RunInstancesRequest$DisableApiStop`): a protection a launch turns ON, so a
+            // launch that asks for nothing leaves the instance unprotected.
+            disable_api_stop: spec.disable_api_stop.unwrap_or(DEFAULT_DISABLE_API_STOP),
+            // "Indicates whether an instance stops or terminates when you initiate shutdown
+            // from the instance … Default: `stop`"
+            // (`RunInstancesRequest$InstanceInitiatedShutdownBehavior`), resolved to a member
+            // of its own modelled catalog like every other word of this record.
+            instance_initiated_shutdown_behavior: requested_word(
+                "InstanceInitiatedShutdownBehavior",
+                spec.instance_initiated_shutdown_behavior,
+                SHUTDOWN_BEHAVIOR_VALUES,
+            )?
+            .unwrap_or(DEFAULT_SHUTDOWN_BEHAVIOR),
             capacity_reservation_preference: requested_word(
                 "CapacityReservationPreference",
                 spec.capacity_reservation_preference,
@@ -361,6 +389,10 @@ pub struct InstanceDetailSpec<'request> {
     pub metadata_options: Option<&'request InstanceMetadataOptionsRequest>,
     /// `RunInstancesRequest$EnclaveOptions`.
     pub enclave_options: Option<&'request EnclaveOptionsRequest>,
+    /// `RunInstancesRequest$DisableApiStop`.
+    pub disable_api_stop: Option<bool>,
+    /// `RunInstancesRequest$InstanceInitiatedShutdownBehavior`, as the launch named it.
+    pub instance_initiated_shutdown_behavior: Option<&'request str>,
     /// `CapacityReservationSpecification$CapacityReservationPreference`, as the launch
     /// named it.
     pub capacity_reservation_preference: Option<&'request str>,
