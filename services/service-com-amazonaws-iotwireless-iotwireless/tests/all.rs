@@ -19,6 +19,8 @@ mod destination_update_and_not_found;
 mod device_profile_lifecycle;
 #[path = "all/fuota_task_device_association.rs"]
 mod fuota_task_device_association;
+#[path = "all/fuota_task_device_disassociation.rs"]
+mod fuota_task_device_disassociation;
 #[path = "all/fuota_task_lifecycle.rs"]
 mod fuota_task_lifecycle;
 #[path = "all/multicast_group_device_association.rs"]

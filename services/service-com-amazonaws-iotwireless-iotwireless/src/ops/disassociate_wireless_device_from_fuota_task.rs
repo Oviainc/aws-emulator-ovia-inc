@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateWirelessDeviceFromFuotaTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateWirelessDeviceFromFuotaTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateWirelessDeviceFromFuotaTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: drops the stored membership that joins one wireless device to the FUOTA
+//! task this call names, so every reader that selects on that membership stops reporting
+//! it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +138,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateWirelessDeviceFromFuotaTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateWirelessDeviceFromFuotaTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateWirelessDeviceFromFuotaTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateWirelessDeviceFromFuotaTaskError::from(
+                DisassociateWirelessDeviceFromFuotaTaskErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let mut store = state.lock();
+        // Both ends are resolved against real state before anything is written, exactly
+        // as the matching associate resolves them, so a call that names a resource the
+        // account does not hold is refused rather than reporting a removal of nothing.
+        if !store.fuota_tasks.contains_key(&input.id) {
+            return Err(
+                DisassociateWirelessDeviceFromFuotaTaskErrorModeled::ResourceNotFoundException(
+                    crate::state::fuota_task_not_found(&input.id),
+                )
+                .into(),
+            );
+        }
+        let device = store
+            .wireless_devices
+            .get_mut(&input.wireless_device_id)
+            .ok_or_else(|| {
+                DisassociateWirelessDeviceFromFuotaTaskError::from(
+                    DisassociateWirelessDeviceFromFuotaTaskErrorModeled::ResourceNotFoundException(
+                        crate::state::wireless_device_not_found(&input.wireless_device_id),
+                    ),
+                )
+            })?;
+
+        // Removing a membership is idempotent: once the device does not belong to the
+        // task this call names there is nothing left to remove, so the same empty
+        // success is reported again. A membership this call does NOT name is left
+        // exactly as it stands, so a device held by another task keeps that task.
+        if device.fuota_task_id.as_deref() == Some(input.id.as_str()) {
+            device.fuota_task_id = None;
+        }
+        Ok(DisassociateWirelessDeviceFromFuotaTaskOutput {})
     }
 }

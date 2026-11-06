@@ -353,9 +353,9 @@ pub struct WirelessDevice {
     pub thing_name: Option<String>,
     pub thing_arn: Option<String>,
     /// The FUOTA task this device belongs to, set by `AssociateWirelessDeviceWithFuotaTask`
-    /// and cleared by its disassociate (still scaffolded), so a device created today
-    /// belongs to none. `ListWirelessDevices?fuotaTaskId=` selects on it, and a device
-    /// that carries one reports a `FuotaDeviceStatus`.
+    /// and cleared by `DisassociateWirelessDeviceFromFuotaTask`, so a device created
+    /// today belongs to none. `ListWirelessDevices?fuotaTaskId=` selects on it, and a
+    /// device that carries one reports a `FuotaDeviceStatus`.
     pub fuota_task_id: Option<String>,
     /// The multicast group this device belongs to, set by
     /// `AssociateWirelessDeviceWithMulticastGroup` and cleared by its disassociate (still
