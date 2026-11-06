@@ -734,7 +734,7 @@ fn reuse_cases(template: &str) -> Vec<ReuseCase> {
                 member("Parameters.member.2.ParameterValue", "first-label"),
                 member("Description", "the plan"),
             ],
-            mismatch: Some("TemplateBody"),
+            mismatch: Some("Template"),
         },
         ReuseCase {
             case: "a capability the stored change set does not carry",

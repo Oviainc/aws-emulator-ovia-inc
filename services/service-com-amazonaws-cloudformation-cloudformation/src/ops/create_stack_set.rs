@@ -247,6 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service shares with the operations that name a stack.
         crate::state::validate_stack_set_name(&input.stack_set_name)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The same rule a stack's tags are held to: a key in AWS's own reserved namespace is
+        // refused before the StackSet exists (`crate::state::stack_tags`).
+        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         // Which template the StackSet deploys. Conditional: "You must specify either the
         // TemplateBody or the TemplateURL parameter, but not both."

@@ -427,6 +427,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             regions.len(),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The same rule a stack's tags are held to: a key in AWS's own reserved namespace is
+        // refused before the StackSet is touched (`crate::state::stack_tags`).
+        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no StackSet store to update, so

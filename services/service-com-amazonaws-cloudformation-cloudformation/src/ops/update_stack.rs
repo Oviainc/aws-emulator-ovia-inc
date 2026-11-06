@@ -523,6 +523,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::validate_rollback_configuration`).
         crate::state::validate_rollback_configuration(input.rollback_configuration.as_ref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The same rule a create's tags are held to: a key in AWS's own reserved namespace
+        // is refused before the stack is touched, so an update cannot put a key the service
+        // itself owns onto the stack (`crate::state::stack_tags`).
+        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack to update, and nothing

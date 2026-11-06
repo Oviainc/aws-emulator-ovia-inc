@@ -383,6 +383,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::validate_rollback_configuration`).
         crate::state::validate_rollback_configuration(input.rollback_configuration.as_ref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The tags this change set would put on the stack are held to the same rule a
+        // create's and an update's are: a key in AWS's own reserved namespace is refused
+        // before the change set exists (`crate::state::stack_tags`).
+        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         if let Some(body) = &input.template_body {
             // The documented `TemplateBody` maximum, which the model carries no `@length`
             // for.

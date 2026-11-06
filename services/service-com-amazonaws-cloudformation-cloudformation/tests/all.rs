@@ -109,6 +109,8 @@ mod extension_registrations;
 mod extension_registry;
 #[path = "all/failed_create_rollback.rs"]
 mod failed_create_rollback;
+#[path = "all/forced_deletion_is_gated_by_status.rs"]
+mod forced_deletion_is_gated_by_status;
 #[path = "all/forced_stack_deletion.rs"]
 mod forced_stack_deletion;
 #[path = "all/foreach_expanded_output_values.rs"]
@@ -191,6 +193,8 @@ mod nested_resource_outputs;
 mod no_echo_parameters;
 #[path = "all/operation_events.rs"]
 mod operation_events;
+#[path = "all/parameter_and_change_set_conflicts.rs"]
+mod parameter_and_change_set_conflicts;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
 #[path = "all/public_extension_arn_versions.rs"]
@@ -227,6 +231,8 @@ mod refused_stack_deletion;
 mod regional_stack_namespace;
 #[path = "all/requested_rollback.rs"]
 mod requested_rollback;
+#[path = "all/reserved_stack_tag_keys.rs"]
+mod reserved_stack_tag_keys;
 #[path = "all/resource_deletion_policies.rs"]
 mod resource_deletion_policies;
 #[path = "all/resource_scan_discovery.rs"]

@@ -160,6 +160,28 @@ impl From<DeleteStackErrorModeled> for DeleteStackError {
     }
 }
 
+/// The message `DeleteStack` answers a request whose `DeletionMode` is `FORCE_DELETE_STACK`
+/// against a stack whose status is not the one that mode exists for.
+///
+/// Worded in this OPERATION's own template for a deletion its target does not admit, which
+/// is the sentence it answers a stack whose termination protection blocks the delete with:
+/// `Stack [<name>] cannot be deleted while <the condition that refused>` — the bracketed
+/// stack as the REQUEST spelled it, and then what stands in the way. Here that condition is
+/// the status the stack is in, read from the store, since `DeletionMode`
+/// `FORCE_DELETE_STACK` is "delete the stack if it's stuck in a DELETE_FAILED state due to
+/// resource deletion failure" and so acts on that one status: a stack no resource deletion
+/// has failed on is deleted by the standard behaviour, which abandons none of its resources.
+///
+/// The two variable parts come from the request and from this store; no part of the sentence
+/// comes from any one run.
+fn force_delete_needs_a_failed_deletion(stack_name: &str, status: &str) -> String {
+    format!(
+        "Stack [{stack_name}] cannot be deleted with DeletionMode {} while it is in {status} \
+         state",
+        crate::state::deletion_mode::FORCE_DELETE_STACK
+    )
+}
+
 /// The `DeleteStack` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -299,6 +321,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // happening, so it does not start a second one.
             if previous.status == status::DELETE_IN_PROGRESS {
                 return Ok(DeleteStackOutput);
+            }
+            // The deletion this call would START has to be one the request's `DeletionMode`
+            // can start: the forced mode is for a deletion that has already FAILED
+            // ([`force_delete_needs_a_failed_deletion`]), so it is refused from every other
+            // status — weighed here, AFTER the shortcut above, so a repeat of a deletion
+            // already in flight is still the no-op success it is under the standard mode
+            // rather than a refusal about the status that deletion itself put the stack in.
+            if input.deletion_mode.as_deref()
+                == Some(crate::state::deletion_mode::FORCE_DELETE_STACK)
+                && previous.status != status::DELETE_FAILED
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    force_delete_needs_a_failed_deletion(&input.stack_name, &previous.status),
+                ));
             }
 
             let operation_id = crate::state::new_operation_id();

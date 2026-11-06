@@ -380,6 +380,10 @@ pub mod stack_sets;
 /// `UpdateStackSet` and `UpdateStackInstances` share.
 pub mod stack_set_rollout;
 
+/// The rule a CALLER's `Tags` are held to: the tag keys AWS reserves for itself, which no
+/// operation that takes a `Tags` list admits from a request.
+pub mod stack_tags;
+
 /// The TIMELINE of one stack operation's walk over a stack's resources: when each resource
 /// was scheduled and when it finished, which is what the per-resource `StackEvent`s of that
 /// operation are stamped with.
@@ -1815,18 +1819,23 @@ impl StoredChangeSet {
     }
 
     /// The first attribute this stored change set states differently from a request that
-    /// re-creates its name, spelled as the REQUEST member that carries it, or `None` when
-    /// the request submits the very same change set.
+    /// re-creates its name, spelled as the change set's OWN attribute, or `None` when the
+    /// request submits the very same change set.
     ///
     /// What `CreateChangeSet` answers for a name the stack already carries depends on this
     /// comparison, not on the name alone: re-submitting the same plan under the same name is
     /// the same change set (which is what makes a retried create idempotent), while one
     /// whose attributes differ cannot be created, and the refusal names the attribute that
-    /// differs — "cannot be created due to a mismatch with existing attribute `<member>`".
+    /// differs — "cannot be created due to a mismatch with existing attribute `<attribute>`".
     ///
-    /// The attributes are the request's own, in the order this function compares them; the
-    /// change set's id, its stack, its creation time and its status are not request
-    /// attributes and are not compared.
+    /// The attributes are the change set's own, in the order this function compares them;
+    /// its id, its stack, its creation time and its status are not submitted attributes and
+    /// are not compared. An attribute is named as the SERVICE names it, which is the request
+    /// member's name wherever one member carries one attribute — and `Template` for the
+    /// template the change set would put on the stack, which three request members
+    /// (`TemplateBody`, `TemplateURL`, `UsePreviousTemplate`) are three ways of stating, so
+    /// naming any one of them would name a member the conflicting request need not have
+    /// carried at all.
     pub fn mismatching_attribute(
         &self,
         submitted: &SubmittedChangeSet<'_>,
@@ -1837,7 +1846,7 @@ impl StoredChangeSet {
                 "Parameters",
                 same_parameters(&self.parameters, submitted.parameters),
             ),
-            ("TemplateBody", self.template_body == submitted.template_body),
+            ("Template", self.template_body == submitted.template_body),
             ("Capabilities", self.capabilities == submitted.capabilities),
             ("ResourceTypes", self.resource_types == submitted.resource_types),
             ("RoleARN", self.role_arn.as_deref() == submitted.role_arn),
@@ -3340,11 +3349,12 @@ pub fn merged_parameters(
                     "Parameters: every parameter must have a ParameterKey".to_string()
                 })?;
             if parameter.use_previous_value == Some(true) {
-                if parameter.parameter_value.is_some() {
-                    return Err(format!(
-                        "Parameters: [{key}] cannot specify both a ParameterValue and \
-                         UsePreviousValue"
-                    ));
+                if parameter
+                    .parameter_value
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    return Err(use_previous_value_with_a_value(&key));
                 }
                 let value = previous
                     .iter()
@@ -3380,6 +3390,23 @@ pub fn merged_parameters(
             })
         })
         .collect()
+}
+
+/// The message CloudFormation answers a parameter entry that asks for the stack's previous
+/// value AND supplies one of its own: `Parameter$UsePreviousValue` is "during a stack
+/// update, use the existing parameter value that the stack is using for a given parameter
+/// key. If you specify true, do not specify a parameter value", so the two together state
+/// two different values for one key and the request is refused.
+///
+/// The sentence states the rule it enforces — a value is only in conflict with
+/// `UsePreviousValue` when it is NON-EMPTY, which is what [`merged_parameters`] holds a
+/// parameter to — and its one variable part is the `ParameterKey` the entry carried,
+/// spelled as the request spelled it.
+pub fn use_previous_value_with_a_value(parameter_key: &str) -> String {
+    format!(
+        "Invalid input for parameter key {parameter_key}. Cannot specify usePreviousValue as \
+         true and non empty value for a parameter"
+    )
 }
 
 /// `CreateStackInput$StackName`'s documented rule: "A stack name can contain only

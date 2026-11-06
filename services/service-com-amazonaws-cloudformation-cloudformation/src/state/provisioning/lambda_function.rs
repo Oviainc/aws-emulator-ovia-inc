@@ -170,10 +170,6 @@ const RUNTIME_MANAGEMENT_PROPERTY: &str = "RuntimeManagementConfig";
 const KMS_KEY_PROPERTY: &str = "KmsKeyArn";
 const KMS_KEY_MEMBER: &str = "KMSKeyArn";
 
-/// The tag-key namespace Lambda reserves, compared in lower case: a tag write carrying one
-/// is refused outright, whoever makes it ([`storable_tags`]).
-const RESERVED_TAG_PREFIX: &str = "aws:";
-
 /// Create the function an `AWS::Lambda::Function` declares, in AWS Lambda itself — so a
 /// client that deployed the stack and then calls `lambda get-function` with the id the
 /// stack published reads the function back, rather than a `ResourceNotFoundException` for a
@@ -751,10 +747,14 @@ fn base64_encoded(bytes: &[u8]) -> String {
 /// resource's logical id) are left in CloudFormation's own records rather than sent to a
 /// call that would refuse the function outright. Every other tag travels, which is what a
 /// stack's tags being "propagated to the resources that CloudFormation creates" means here.
+///
+/// The namespace is the one this crate defines once
+/// ([`crate::state::stack_tags::is_reserved_tag_key`]), since Lambda reserves the same
+/// prefix every other tag-writing API does.
 fn storable_tags(properties: &Value, propagated: &[(String, String)]) -> Vec<(String, String)> {
     tags_of(properties, propagated)
         .into_iter()
-        .filter(|(key, _)| !key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX))
+        .filter(|(key, _)| !crate::state::stack_tags::is_reserved_tag_key(key))
         .collect()
 }
 

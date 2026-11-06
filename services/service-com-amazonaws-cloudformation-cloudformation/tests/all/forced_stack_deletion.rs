@@ -17,11 +17,12 @@
 //!
 //! The rows differ along what the rule generalises over: WHICH service refuses the deletion
 //! and with which error (Amazon S3 refusing a bucket that still holds an object, Amazon RDS
-//! refusing a protected DB instance), where in the teardown order the refused resource sits
-//! (resources declared both before and after it must still be deleted — a refusal no longer
-//! stops the walk), and a stack NOTHING refuses, where the forced deletion is the standard
-//! one. `stack_delete_failure_reason.rs` and `refused_stack_deletion.rs` are the suites for
-//! the standard mode's own outcome; this one is what the mode changes.
+//! refusing a protected DB instance) and where in the teardown order the refused resource
+//! sits (resources declared both before and after it must still be deleted — a refusal no
+//! longer stops the walk). Every row reaches the forced deletion from `DELETE_FAILED`, which
+//! is the one status that mode is accepted from (`forced_deletion_is_gated_by_status.rs` is
+//! the suite for that gate). `stack_delete_failure_reason.rs` and `refused_stack_deletion.rs`
+//! are the suites for the standard mode's own outcome; this one is what the mode changes.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -44,8 +45,6 @@ enum Abandoned {
     Bucket(&'static str),
     /// The DB instance, which must still be there with its deletion protection on.
     DbInstance(&'static str),
-    /// Nothing: no owning service refused this deletion.
-    Nothing,
 }
 
 /// One stack deleted under `FORCE_DELETE_STACK`.
@@ -112,21 +111,6 @@ const FORCED_CASES: &[ForcedCase] = &[
         deleted_topics: &["forced-delete-db-topic"],
         abandoned: Abandoned::DbInstance("cfn-forced-delete-protected"),
     },
-    ForcedCase {
-        case: "nothing refuses the deletion, so the forced one is the standard one",
-        stack: "forced-delete-clean",
-        template: concat!(
-            "Resources:\n",
-            "  Topic:\n",
-            "    Type: AWS::SNS::Topic\n",
-            "    Properties:\n",
-            "      TopicName: forced-delete-clean-topic\n",
-        ),
-        fill_bucket: None,
-        refused: None,
-        deleted_topics: &["forced-delete-clean-topic"],
-        abandoned: Abandoned::Nothing,
-    },
 ];
 
 /// Create the row's stack, wait for it to settle, and answer its stack id.
@@ -187,7 +171,6 @@ async fn reported_status(router: &MultiServiceRouter, case: &str, stack_id: &str
 /// What the owning service holds for the resource the forced deletion abandoned.
 async fn assert_still_there(router: &MultiServiceRouter, case: &str, abandoned: Abandoned) {
     match abandoned {
-        Abandoned::Nothing => {}
         Abandoned::Bucket(bucket) => {
             // Still serving the object that blocked the deletion...
             let (status_code, _, body) =

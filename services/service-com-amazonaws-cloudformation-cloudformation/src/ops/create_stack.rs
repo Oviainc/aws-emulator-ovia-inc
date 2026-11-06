@@ -417,6 +417,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         crate::state::validate_stack_name(&input.stack_name)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // A tag key in AWS's own reserved namespace is not a tag a caller may set
+        // (`crate::state::stack_tags`): refused HERE, so nothing is created carrying a key
+        // the service itself owns.
+        crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The documented `TemplateBody` maximum, which the model carries no `@length` for:
         // a stored body is caller-sized otherwise.
         crate::state::validate_template_body(&template_body)
