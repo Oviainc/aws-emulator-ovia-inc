@@ -169,31 +169,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone before this call looks for it.
         state.materialise_due_transitions(now);
 
-        // A data source belongs to a knowledge base, so the knowledge base the
-        // URI names has to hold it: a knowledge base nothing holds, or one that
-        // is itself on its way out of the store, leaves no data source here to
-        // delete.
-        if state.live_knowledge_base(&input.knowledge_base_id).is_none() {
+        // The resource this operation acts on is the DATA SOURCE the pair of
+        // path labels addresses, so that pair is what is resolved and that data
+        // source is the resource reported missing: a knowledge base nothing
+        // holds, one itself on its way out of the store, and an id belonging to
+        // another knowledge base's data source all leave the same addressed data
+        // source unresolvable, and the refusal names both identifiers of the
+        // pair rather than the enclosing knowledge base alone.
+        let unresolved = state.live_knowledge_base(&input.knowledge_base_id).is_none();
+        let record = if unresolved {
+            None
+        } else {
+            state.data_source_of(&input.knowledge_base_id, &input.data_source_id)
+        };
+        let Some(record) = record else {
             return Err(DeleteDataSourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::knowledge_base_not_found_message(
-                        &input.knowledge_base_id,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // A data source is identified by the knowledge base it belongs to as
-        // well as its own id, so an id of another knowledge base's data source
-        // is as absent here as one nothing holds.
-        let Some(record) = state.data_source_of(&input.knowledge_base_id, &input.data_source_id)
-        else {
-            return Err(DeleteDataSourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::data_source_not_found_message(
-                        &input.data_source_id,
-                    )),
+                    message: Some(
+                        crate::state::data_source_of_knowledge_base_not_found_message(
+                            &input.data_source_id,
+                            &input.knowledge_base_id,
+                        ),
+                    ),
                 },
             )
             .into());

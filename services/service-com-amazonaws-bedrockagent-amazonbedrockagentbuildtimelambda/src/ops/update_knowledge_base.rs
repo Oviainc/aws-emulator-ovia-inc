@@ -226,6 +226,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // base"), so an update that would leave a different one there is a bad
         // request and nothing is written. `name`, `description` and `roleArn` are
         // the ones it does change.
+        //
+        // The configuration's `type` is checked first and on its own: it is the
+        // discriminator of the whole configuration rather than one more value
+        // inside it, and a request that would change it is refused in those
+        // terms rather than as a member whose value differs.
+        if record.knowledge_base_configuration.r#type != input.knowledge_base_configuration.r#type {
+            return Err(UpdateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::knowledge_base_type_immutable_message()),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
         let immutable = [
             crate::state::immutable_member_verdict(
                 "knowledgeBaseConfiguration",

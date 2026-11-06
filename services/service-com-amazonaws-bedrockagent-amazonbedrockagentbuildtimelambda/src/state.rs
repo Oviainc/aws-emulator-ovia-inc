@@ -808,8 +808,8 @@ impl KnowledgeBaseConfigurationProblem {
                  knowledgeBaseConfiguration.type of {knowledge_base_type}"
             ),
             Self::MissingStorageConfiguration => format!(
-                "storageConfiguration is required for a knowledgeBaseConfiguration.type of \
-                 {VECTOR_KNOWLEDGE_BASE_TYPE}"
+                "You must provide a storage configuration if you create a \
+                 {VECTOR_KNOWLEDGE_BASE_TYPE} knowledge base."
             ),
         }
     }
@@ -1522,6 +1522,22 @@ pub fn data_source_not_found_message(data_source_id: &str) -> String {
     format!("DataSource with id {data_source_id} is not found.")
 }
 
+/// The `ResourceNotFoundException` message `DeleteDataSource` answers when the
+/// data source the request addresses cannot be resolved — whether it is the data
+/// source or the knowledge base enclosing it that the store does not hold. The
+/// missing resource is the DATA SOURCE the request names, and this refusal words
+/// it with both identifiers of the pair that addresses it; each is a value taken
+/// from the request path, and the rest is fixed text.
+pub fn data_source_of_knowledge_base_not_found_message(
+    data_source_id: &str,
+    knowledge_base_id: &str,
+) -> String {
+    format!(
+        "DataSource with id {data_source_id} in knowledgeBase with id {knowledge_base_id} \
+         is not found."
+    )
+}
+
 /// The most ingestion jobs one data source holds; past it `StartIngestionJob`
 /// answers the modelled `ServiceQuotaExceededException` instead of growing.
 ///
@@ -1762,23 +1778,18 @@ pub fn document_content_member(data_source_type: &str) -> Option<&'static str> {
 /// as "The dataSourceType specified in the content for each document must match
 /// the type of the data source that you specify in the header".
 ///
-/// The two kinds are comparable only where the data source's own kind is one a
-/// document's content can name — [`DOCUMENT_CONTENT_MEMBERS`] lists them — so a
-/// data source of any other kind takes a document of whichever kind its content
-/// names.
+/// The requirement holds for every kind of data source: a document's content
+/// names one of the modelled `ContentDataSourceType` values, so a data source
+/// whose own type is any other kind — one no content can name — takes no
+/// directly ingested document at all.
 ///
-/// `path` is the member path the request carries the offending value at
-/// (`...content.dataSourceType`), so one template serves every document of
-/// every request.
-pub fn document_data_source_type_message(
-    path: &str,
-    document_type: &str,
-    data_source_id: &str,
-    data_source_type: &str,
-) -> String {
+/// The kind the DOCUMENT names is the one variable part of the sentence; the
+/// rest is fixed text for this error class.
+pub fn document_data_source_type_message(document_type: &str) -> String {
     format!(
-        "{path} of {document_type} does not match the type {data_source_type} of data \
-         source {data_source_id}"
+        "The dataSourceType that you specified in {document_type} doesn't match the type \
+         of the data source specified in the request header. Check that both types match \
+         and retry your request."
     )
 }
 
@@ -2765,6 +2776,18 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
 /// `smithy_query(query="doc",shape="UpdateKnowledgeBase")`).
 pub fn immutable_member_message(member: &str) -> String {
     format!("{member} cannot be updated once created.")
+}
+
+/// The `ValidationException` message `UpdateKnowledgeBase` answers when the
+/// update would leave a different `knowledgeBaseConfiguration.type` than the
+/// knowledge base was created with.
+///
+/// The `type` member is the discriminator of the whole configuration rather than
+/// one more value inside it — it decides which sibling member carries the
+/// details and whether a vector store is needed at all — so the refusal for
+/// changing it is its own sentence, and that sentence is entirely fixed text.
+pub fn knowledge_base_type_immutable_message() -> String {
+    "You can't modify the type of the knowledge base after creation.".to_string()
 }
 
 /// What an update does to a member that cannot change once the resource exists.

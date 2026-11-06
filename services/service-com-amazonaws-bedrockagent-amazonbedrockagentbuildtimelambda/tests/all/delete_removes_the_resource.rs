@@ -439,10 +439,23 @@ fn knowledge_base_not_found(knowledge_base_id: &str) -> String {
     format!("KnowledgeBase with id {knowledge_base_id} is not found.")
 }
 
-/// The same for a data source: the enclosing knowledge base is not part of the
-/// sentence.
+/// The same for a data source a read names and the service does not hold: the
+/// enclosing knowledge base is not part of the sentence.
 fn data_source_not_found(data_source_id: &str) -> String {
     format!("DataSource with id {data_source_id} is not found.")
+}
+
+/// The sentence `DeleteDataSource` words for the data source it cannot resolve:
+/// the delete addresses the data source by the pair of ids, so its refusal names
+/// both of them.
+fn data_source_of_knowledge_base_not_found(
+    data_source_id: &str,
+    knowledge_base_id: &str,
+) -> String {
+    format!(
+        "DataSource with id {data_source_id} in knowledgeBase with id {knowledge_base_id} \
+         is not found."
+    )
 }
 
 /// The same for a flow: the whole sentence is fixed text for the error class
@@ -1035,7 +1048,7 @@ async fn deleting_what_nothing_holds_is_the_modelled_not_found() {
     assert_not_found(
         "DeleteDataSource on an id nothing holds",
         "DeleteDataSource",
-        &data_source_not_found(unknown),
+        &data_source_of_knowledge_base_not_found(unknown, &knowledge_base_id),
         &unknown_data_source,
     );
 

@@ -236,18 +236,6 @@ fn vector_knowledge_base(name: &str) -> Value {
     })
 }
 
-/// A service-managed knowledge base, whose data sources are managed connectors.
-fn managed_knowledge_base(name: &str) -> Value {
-    json!({
-        "name": name,
-        "roleArn": KB_ROLE,
-        "knowledgeBaseConfiguration": {
-            "type": "MANAGED",
-            "managedKnowledgeBaseConfiguration": { "embeddingModelType": "MANAGED" },
-        },
-    })
-}
-
 /// A CUSTOM data source: documents are pushed into it rather than crawled.
 fn custom_data_source(name: &str) -> Value {
     json!({
@@ -263,18 +251,6 @@ fn s3_data_source(name: &str) -> Value {
         "dataSourceConfiguration": {
             "type": "S3",
             "s3Configuration": { "bucketArn": "arn:aws:s3:::documents-demo-docs" },
-        },
-    })
-}
-
-/// A managed-connector data source: a kind no document content can name, so a
-/// document ingested into it stands on whichever kind its own content names.
-fn managed_connector_data_source(name: &str) -> Value {
-    json!({
-        "name": name,
-        "dataSourceConfiguration": {
-            "type": "MANAGED_KNOWLEDGE_BASE_CONNECTOR",
-            "managedKnowledgeBaseConnectorConfiguration": {},
         },
     })
 }
@@ -478,15 +454,6 @@ async fn ingested_documents_round_trip_through_get_knowledge_base_documents() {
                 s3_identifier("s3://documents-demo-docs/a.txt"),
                 s3_identifier("s3://documents-demo-docs/b.txt"),
             ],
-        ),
-        (
-            // A data source of a kind no document content can name: the
-            // content's own kind is what the document is stored as.
-            "a custom-content document of a managed-connector data source",
-            managed_knowledge_base("documents-kb-managed"),
-            managed_connector_data_source("managed-connector"),
-            vec![custom_text_document("the-managed-document", "managed text")],
-            vec![custom_identifier("the-managed-document")],
         ),
     ];
 
@@ -826,10 +793,10 @@ async fn document_operations_are_scoped_to_the_knowledge_base_and_data_source_na
     }
 }
 
-/// A document whose content names a kind of data source that the data source
-/// itself is — when the data source is of a kind content can name at all — is
-/// the only content that data source takes: anything else is refused with
-/// `ValidationException` (400) and nothing of the request is written.
+/// A document whose content names the kind of data source the addressed data
+/// source itself is, is the only content that data source takes: anything else
+/// is refused with `ValidationException` (400) and nothing of the request is
+/// written.
 #[tokio::test]
 async fn a_document_naming_another_kind_of_data_source_is_refused() {
     let emulator = Emulator::new();

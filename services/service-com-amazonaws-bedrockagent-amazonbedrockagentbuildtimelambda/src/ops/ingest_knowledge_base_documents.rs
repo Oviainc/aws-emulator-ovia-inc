@@ -246,30 +246,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // Each document's content names the kind of data source it comes from.
-        // That kind is comparable with the data source's own kind only where
-        // the content can name it at all: `ContentDataSourceType` declares two
-        // kinds, so a data source of one of THOSE takes documents of that kind
-        // alone, while a data source of a kind no content can name leaves the
-        // content's kind nothing to disagree with. The kind also names which
-        // member carries the document's own details, so content that carries
-        // none of them identifies no document. Both are bad requests, and
-        // nothing is written for any document of a request carrying one.
-        let data_source_names_a_content_kind =
-            crate::state::document_content_member(&data_source_type).is_some();
+        // Each document's content names the kind of data source it comes from,
+        // and `IngestKnowledgeBaseDocuments` requires that kind to be the kind
+        // of the data source the URI addresses. The comparison holds for every
+        // kind of data source: a content kind is one of the two
+        // `ContentDataSourceType` values, so a data source of any other kind
+        // matches no document's content and takes none. The kind also names
+        // which member carries the document's own details, so content that
+        // carries none of them identifies no document. Both are bad requests,
+        // and nothing is written for any document of a request carrying one.
         let mut keys: Vec<crate::state::DocumentKey> = Vec::with_capacity(input.documents.len());
         for (index, document) in input.documents.iter().enumerate() {
             let path = format!("documents[{index}].content");
             let content_type = document.content.data_source_type.as_str();
-            if data_source_names_a_content_kind && content_type != data_source_type {
+            if content_type != data_source_type {
                 return Err(
                     IngestKnowledgeBaseDocumentsErrorModeled::ValidationException(
                         ValidationException {
                             message: Some(crate::state::document_data_source_type_message(
-                                &format!("{path}.dataSourceType"),
                                 content_type,
-                                &input.data_source_id,
-                                &data_source_type,
                             )),
                             field_list: None,
                         },

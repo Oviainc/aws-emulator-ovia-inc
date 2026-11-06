@@ -271,19 +271,6 @@ fn s3_data_source(name: &str) -> Value {
     })
 }
 
-/// A managed-connector data source: a kind no document content can name, so it
-/// takes documents of either modelled `ContentDataSourceType` and one data
-/// source can hold documents of both kinds.
-fn managed_connector_data_source(name: &str) -> Value {
-    json!({
-        "name": name,
-        "dataSourceConfiguration": {
-            "type": "MANAGED_KNOWLEDGE_BASE_CONNECTOR",
-            "managedKnowledgeBaseConnectorConfiguration": {},
-        },
-    })
-}
-
 /// A custom document whose content is defined inline as text.
 fn custom_document(id: &str) -> Value {
     json!({
@@ -383,9 +370,9 @@ fn assert_detail(case: &str, detail: &Value, knowledge_base_id: &str, data_sourc
 
 /// Every document a data source holds is reported, over a table of data sources
 /// that differ in the kind of data source, the kind of document identity (each
-/// value of the modelled `ContentDataSourceType`, and both in one data source)
-/// and the number of documents held — none, one, more than one request may
-/// carry, and ids whose ingestion order is not their document order.
+/// value of the modelled `ContentDataSourceType`, each in a data source of its
+/// own kind) and the number of documents held — none, one, more than one request
+/// may carry, and ids whose ingestion order is not their document order.
 #[tokio::test]
 async fn list_knowledge_base_documents_reports_every_document_the_data_source_holds() {
     // Rows: (case, the data source to create, the documents to ingest in that
@@ -437,16 +424,16 @@ async fn list_knowledge_base_documents_reports_every_document_the_data_source_ho
             ],
         ),
         (
-            "both kinds of identity in one data source",
-            managed_connector_data_source("listing-mixed"),
+            "S3 documents whose URIs sort against their ingestion order",
+            s3_data_source("listing-mixed"),
             vec![
                 s3_document("s3://listing-docs/mixed/b.txt"),
-                custom_document("mixed-custom"),
+                s3_document("s3://listing-docs/mixed/m.txt"),
                 s3_document("s3://listing-docs/mixed/a.txt"),
             ],
             vec![
                 s3_identifier("s3://listing-docs/mixed/b.txt"),
-                custom_identifier("mixed-custom"),
+                s3_identifier("s3://listing-docs/mixed/m.txt"),
                 s3_identifier("s3://listing-docs/mixed/a.txt"),
             ],
         ),
@@ -513,15 +500,13 @@ async fn list_knowledge_base_documents_reports_every_document_the_data_source_ho
 /// range (1..1000) and the member omitted.
 #[tokio::test]
 async fn list_knowledge_base_documents_pages_by_max_results_and_resumes_after_each_page() {
-    // A data source holding documents of both modelled identity kinds, so a
-    // page boundary can fall inside either kind.
-    let documents: Vec<Value> = (0..7)
-        .map(|index| custom_document(&format!("paged-{index}")))
-        .chain((0..6).map(|index| s3_document(&format!("s3://listing-docs/paged/{index}.txt"))))
+    // A data source holding thirteen documents of its own kind, so a page
+    // boundary can fall anywhere inside the listing.
+    let documents: Vec<Value> = (0..13)
+        .map(|index| s3_document(&format!("s3://listing-docs/paged/{index}.txt")))
         .collect();
-    let identifiers: Vec<Value> = (0..7)
-        .map(|index| custom_identifier(&format!("paged-{index}")))
-        .chain((0..6).map(|index| s3_identifier(&format!("s3://listing-docs/paged/{index}.txt"))))
+    let identifiers: Vec<Value> = (0..13)
+        .map(|index| s3_identifier(&format!("s3://listing-docs/paged/{index}.txt")))
         .collect();
     let all = in_document_order(&identifiers);
 
@@ -539,10 +524,7 @@ async fn list_knowledge_base_documents_pages_by_max_results_and_resumes_after_ea
             .knowledge_base(vector_knowledge_base("kb-for-paging"))
             .await;
         let data_source_id = emulator
-            .data_source(
-                &knowledge_base_id,
-                managed_connector_data_source("listing-paged"),
-            )
+            .data_source(&knowledge_base_id, s3_data_source("listing-paged"))
             .await;
         emulator
             .ingest_all(&knowledge_base_id, &data_source_id, &documents)

@@ -213,6 +213,13 @@ fn immutable_member_message(member: &str) -> String {
     format!("{member} cannot be updated once created.")
 }
 
+/// The sentence AWS words when an update would change the knowledge base's
+/// TYPE: the configuration's discriminator has its own refusal, which is
+/// entirely fixed text.
+fn knowledge_base_type_message() -> String {
+    "You can't modify the type of the knowledge base after creation.".to_string()
+}
+
 /// A self-managed vector knowledge base over an S3 vector store, as the pair of
 /// configurations `CreateKnowledgeBase` takes.
 fn vector_configurations(embedding_model: &str, index_name: &str) -> (Value, Value) {
@@ -301,10 +308,15 @@ fn update_request(name: &str, ingestion: Option<Value>) -> Value {
 /// Assert `answer` is the modelled refusal for `member`: HTTP 400, the
 /// `ValidationException` shape, and the message AWS answers for that class.
 fn assert_immutable_member_refusal(case: &str, member: &str, answer: &Answer) {
+    assert_validation_refusal(case, &immutable_member_message(member), answer);
+}
+
+/// Assert `answer` is the modelled `ValidationException` (HTTP 400) worded
+/// `expected_message`.
+fn assert_validation_refusal(case: &str, expected_message: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 400,
-        "case {case}: expected the update of an unchangeable {member} to be refused with \
-         HTTP 400, got {answer:?}"
+        "case {case}: expected the refused update to answer HTTP 400, got {answer:?}"
     );
     assert_eq!(
         answer.error_type.as_deref(),
@@ -314,8 +326,8 @@ fn assert_immutable_member_refusal(case: &str, member: &str, answer: &Answer) {
     );
     assert_eq!(
         answer.string(&["message"]),
-        immutable_member_message(member),
-        "case {case}: expected the refusal message for an unchangeable member, got {:?}",
+        expected_message,
+        "case {case}: expected the refusal to be worded {expected_message:?}, got {:?}",
         answer.member(&["message"])
     );
 }
@@ -643,20 +655,21 @@ async fn changing_a_stored_knowledge_base_configuration_is_refused() {
 
     // The rows differ along which immutable member changes and how: a value
     // inside it, the kind its `type` discriminator names, and the vector store
-    // it points at.
+    // it points at. A changed `type` is the configuration's discriminator rather
+    // than one more value inside it, so it carries its own sentence.
     let (other_model_configuration, _) =
         vector_configurations(OTHER_EMBEDDING_MODEL, "stored-kb-index");
     let (_, other_index_storage) = vector_configurations(EMBEDDING_MODEL, "another-kb-index");
-    let rows: Vec<(&str, &str, Value, Value)> = vec![
+    let rows: Vec<(&str, String, Value, Value)> = vec![
         (
             "a different embedding model in the knowledge base configuration",
-            "knowledgeBaseConfiguration",
+            immutable_member_message("knowledgeBaseConfiguration"),
             other_model_configuration,
             stored_storage.clone(),
         ),
         (
             "a knowledge base configuration of another type",
-            "knowledgeBaseConfiguration",
+            knowledge_base_type_message(),
             json!({
                 "type": "MANAGED",
                 "managedKnowledgeBaseConfiguration": { "embeddingModelType": "MANAGED" },
@@ -665,13 +678,13 @@ async fn changing_a_stored_knowledge_base_configuration_is_refused() {
         ),
         (
             "a different vector index in the storage configuration",
-            "storageConfiguration",
+            immutable_member_message("storageConfiguration"),
             stored_configuration.clone(),
             other_index_storage,
         ),
         (
             "a storage configuration of another type",
-            "storageConfiguration",
+            immutable_member_message("storageConfiguration"),
             stored_configuration.clone(),
             json!({
                 "type": "OPENSEARCH_SERVERLESS",
@@ -688,7 +701,7 @@ async fn changing_a_stored_knowledge_base_configuration_is_refused() {
         ),
     ];
 
-    for (case, member, configuration, storage) in rows {
+    for (case, expected_message, configuration, storage) in rows {
         let refused = emulator
             .update_knowledge_base(
                 &knowledge_base_id,
@@ -700,7 +713,7 @@ async fn changing_a_stored_knowledge_base_configuration_is_refused() {
                 }),
             )
             .await;
-        assert_immutable_member_refusal(case, member, &refused);
+        assert_validation_refusal(case, &expected_message, &refused);
 
         let fetched = emulator.get_knowledge_base(&knowledge_base_id).await;
         assert_eq!(
