@@ -15,6 +15,8 @@
 mod catalogue_published_urls;
 #[path = "all/catalogue_resolution_single_source.rs"]
 mod catalogue_resolution_single_source;
+#[path = "all/create_deployment_finding_report.rs"]
+mod create_deployment_finding_report;
 #[path = "all/create_deployment_status_sequence.rs"]
 mod create_deployment_status_sequence;
 #[path = "all/create_deployment_store_ceiling_preflight.rs"]

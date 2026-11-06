@@ -172,6 +172,49 @@ impl Harness {
     }
 }
 
+/// A deployment NAME the service accepts, built from the descriptive label a suite
+/// names its case by.
+///
+/// `CreateDeployment` judges a name by a rule stricter than the modelled `@pattern`
+/// (`state::DEPLOYMENT_NAME_SERVER_PATTERN`: a leading letter, then one or more
+/// alphanumerics), so a label like `"page-one"` is not a name a deployment can be
+/// created under. The suites still name their cases descriptively and run them through
+/// here: each separator run starts a new word (`"page-one"` -> `"pageOne"`), a word
+/// starting with a digit keeps a marker so two labels cannot collapse onto one name
+/// (`"ver-1-0"` -> `"verN1N0"`, `"ver-10"` -> `"verN10"`), and a name already inside the
+/// rule comes back unchanged — so this is idempotent and a builder may apply it to a
+/// name a caller already built. `tests/all/create_deployment_finding_report.rs` is the
+/// suite that drives the rule itself.
+pub fn deployment_name(label: &str) -> String {
+    let mut name = String::with_capacity(label.len() + 1);
+    let mut starts_word = false;
+    for character in label.chars() {
+        if !character.is_ascii_alphanumeric() {
+            starts_word = !name.is_empty();
+            continue;
+        }
+        if starts_word {
+            if character.is_ascii_digit() {
+                name.push('N');
+            }
+            name.extend(character.to_uppercase());
+        } else {
+            name.push(character);
+        }
+        starts_word = false;
+    }
+    // The rule's own two halves: a leading LETTER, and at least one character after it.
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name.insert(0, 'n');
+    }
+    if name.len() < 2 {
+        name.push('x');
+    }
+    // `DeploymentName` is @length(min: 1, max: 50).
+    name.truncate(50);
+    name
+}
+
 /// The short name of a wire error code (`com.example#Boom` -> `Boom`).
 pub fn short_code(raw: &str) -> String {
     raw.split('#').next_back().unwrap_or(raw).to_string()

@@ -31,7 +31,7 @@ use service_com_amazonaws_launchwizard_launchwizard::ops::types::DEPLOYMENT_FILT
 use service_com_amazonaws_launchwizard_launchwizard::state::MAX_FILTER_PAIR_CLAUSES;
 
 use crate::deployment_lifecycle::create;
-use crate::harness::Harness;
+use crate::harness::{deployment_name, Harness};
 
 /// The wire error code and HTTP status a refused filter carries (`ValidationException`,
 /// `errorKind: client`, `httpError: 400`).
@@ -50,7 +50,7 @@ async fn seeded(harness: &Harness) -> Vec<String> {
     let mut names = Vec::new();
     for (workload, pattern, name) in rows {
         create(harness, name, workload, pattern, name).await;
-        names.push(name.to_string());
+        names.push(deployment_name(name));
     }
     names
 }

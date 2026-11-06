@@ -18,7 +18,7 @@ use service_com_amazonaws_launchwizard_launchwizard::ops::types::WORKLOAD_DEPLOY
 // The HTTP harness, the catalogue reader and the pagination walker are shared with the
 // other suites in this crate rather than copied — see `tests/all/harness.rs`.
 use crate::deployment_lifecycle::get;
-use crate::harness::{catalogue, walk_pages, Harness};
+use crate::harness::{catalogue, deployment_name, walk_pages, Harness};
 
 /// The two values `DeploymentSpecificationsField$required` carries: the model types
 /// the member as a plain `String` and documents it as "Indicates if the deployment
@@ -514,7 +514,7 @@ async fn the_reported_specification_schema_drives_a_create_deployment() {
                 "case {case:?}: the schema must ask for at least one specification"
             );
 
-            let name = format!("lw-{workload}-{pattern}");
+            let name = deployment_name(&format!("lw-{workload}-{pattern}"));
             let created = harness
                 .ok(
                     &case,
@@ -565,7 +565,7 @@ async fn the_reported_specification_schema_drives_a_create_deployment() {
                     json!({
                         "workloadName": workload,
                         "deploymentPatternName": pattern,
-                        "name": format!("{name}-bad"),
+                        "name": format!("{name}Bad"),
                         "specifications": json!({}),
                     }),
                     400,

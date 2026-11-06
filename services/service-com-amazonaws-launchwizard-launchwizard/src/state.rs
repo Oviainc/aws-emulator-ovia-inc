@@ -2167,17 +2167,20 @@ pub const SPECIFICATION_KEY_MAX_LEN: i64 = 256;
 /// See [`SPECIFICATION_KEY_MIN_LEN`].
 pub const SPECIFICATION_KEY_PATTERN: &str = "^[a-zA-Z0-9-:]+$";
 
-/// A map KEY leaf schema: one string member carrying the key shape's `@length` and
-/// `@pattern`.
+/// A leaf string schema for a rule this crate RESTATES: one string member carrying the
+/// `@length` and/or `@pattern` the restatement is made of.
 ///
-/// A map's KEY constraints are the one part of a shape the generated schemas do not
-/// carry (codegen captures a collection's element/value constraints only), so a map key
-/// is the one thing the constraint walk over an input cannot judge — it judges a key
-/// against the member's schema, which composes the VALUE shape's constraints. These
-/// schemas give the key rules back, so the rules a key is judged by are the model's and
-/// the refusal is worded by the same renderer as every other constraint. `member` is
-/// the INPUT member the map arrived on, so the refusal names what the caller sent.
-fn map_key_schema(
+/// Two kinds of rule need one. A map's KEY constraints are the one part of a shape the
+/// generated schemas do not carry (codegen captures a collection's element/value
+/// constraints only), so a map key is the one thing the constraint walk over an input
+/// cannot judge — it judges a key against the member's schema, which composes the VALUE
+/// shape's constraints. And a rule the SERVICE applies to a member beyond the modelled
+/// shape ([`DEPLOYMENT_NAME_SERVER_PATTERN`]) is not in the model at all. Either way the
+/// value is judged by the framework's own constraint walk — one regex engine, one length
+/// comparison — rather than by a hand-rolled character walk beside it. `member` is the
+/// INPUT member the value arrived on, so a refusal worded from a violation names what
+/// the caller sent.
+fn restated_member_schema(
     shape_id: &'static str,
     member: &'static str,
     traits: &'static ::std::sync::LazyLock<::aws_smithy_schema::TraitMap>,
@@ -2193,16 +2196,24 @@ fn map_key_schema(
 
 /// A key shape's `@length` and `@pattern` as the trait map the framework's constraint
 /// walk reads. Each key shape holds its own in a static, because
-/// [`map_key_schema`] composes a `&'static` one.
+/// [`restated_member_schema`] composes a `&'static` one.
 fn map_key_traits(
     min_len: i64,
     max_len: i64,
     pattern: &'static str,
 ) -> ::aws_smithy_schema::TraitMap {
-    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    let mut traits = pattern_traits(pattern);
     traits.insert(Box::new(
         ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(min_len), Some(max_len)),
     ));
+    traits
+}
+
+/// A single `@pattern` as the trait map the framework's constraint walk reads — what a
+/// rule stated as an expression alone is made of, and the pattern half of
+/// [`map_key_traits`].
+fn pattern_traits(pattern: &'static str) -> ::aws_smithy_schema::TraitMap {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
     traits.insert(Box::new(
         ::aws_smithy_schema_server::constraints::PatternTrait::new(pattern),
     ));
@@ -2227,10 +2238,10 @@ static SPECIFICATION_KEY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::Trai
     });
 
 /// The key leaf of a `Tags` map, as it arrives on the `tags` member. See
-/// [`map_key_schema`].
+/// [`restated_member_schema`].
 static TAG_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
     ::std::sync::LazyLock::new(|| {
-        map_key_schema(
+        restated_member_schema(
             "com.amazonaws.launchwizard#Tags$key",
             "tags",
             &TAG_KEY_TRAITS,
@@ -2238,15 +2249,58 @@ static TAG_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
     });
 
 /// The key leaf of a `DeploymentSpecifications` map, as it arrives on the
-/// `specifications` member. See [`map_key_schema`].
+/// `specifications` member. See [`restated_member_schema`].
 static SPECIFICATION_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
     ::std::sync::LazyLock::new(|| {
-        map_key_schema(
+        restated_member_schema(
             "com.amazonaws.launchwizard#DeploymentSpecifications$key",
             "specifications",
             &SPECIFICATION_KEY_TRAITS,
         )
     });
+
+/// The rule a deployment NAME is judged by on the SERVER: a leading letter followed by
+/// one or more alphanumerics.
+///
+/// It is STRICTER than the `@pattern` the model declares for `DeploymentName`
+/// (`^[A-Za-z0-9_\.-]+$`, `@length(min: 1, max: 50)`), which admits a hyphen, an
+/// underscore, a dot and a single character — so the generated constraint walk lets a
+/// name through that the service itself refuses. The modelled shape constrains what the
+/// WIRE may carry; this is the rule the service applies to the member, and the one a
+/// refusal quotes. Without it a create is accepted under a name that cannot be created,
+/// which is the one failure a caller cannot see coming.
+pub const DEPLOYMENT_NAME_SERVER_PATTERN: &str = "^[a-zA-Z][a-zA-Z0-9]+$";
+
+/// How the service names the deployment-name member in a finding about it: the wire
+/// name of the thing being named, not the input member's short name (`name`), so the
+/// finding reads the same whichever request carried it.
+const DEPLOYMENT_NAME_MEMBER: &str = "deploymentName";
+
+/// [`DEPLOYMENT_NAME_SERVER_PATTERN`] as the walk reads it.
+static DEPLOYMENT_NAME_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| pattern_traits(DEPLOYMENT_NAME_SERVER_PATTERN));
+
+/// The `name` member of a create, carrying the server-side rule rather than the
+/// modelled one. See [`restated_member_schema`].
+static DEPLOYMENT_NAME_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    ::std::sync::LazyLock::new(|| {
+        restated_member_schema(
+            "com.amazonaws.launchwizard#DeploymentName",
+            "name",
+            &DEPLOYMENT_NAME_TRAITS,
+        )
+    });
+
+/// Whether `value` satisfies every constraint `schema` carries, judged by the
+/// framework's own constraint walk.
+fn satisfies(schema: &::aws_smithy_schema::Schema, value: &str) -> bool {
+    use ::aws_smithy_schema::serde::ShapeSerializer as _;
+
+    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(schema, value);
+    validator.into_violations().is_empty()
+}
 
 /// The refusal message for the map keys that break the shape `schema` carries, or
 /// `None` when every one of them is within it.
@@ -2429,40 +2483,70 @@ pub fn filter_name_refusal<'a>(
         })
 }
 
-/// The validation warnings a submitted `specifications` map raises against the
+/// The validation findings a submitted `specifications` map raises against the
 /// specification schema of the deployment pattern it is submitted for — the SAME
-/// schema `GetWorkloadDeploymentPattern` reports for that pattern.
+/// schema `GetWorkloadDeploymentPattern` reports.
 ///
 /// Launch Wizard judges a deployment's settings against the schema of the pattern it
 /// deploys, and `UpdateDeployment$force` exists to apply an update "even if validation
 /// warnings are present" — so these are the warnings that member overrides. A CREATE
-/// models no such member, so for `CreateDeployment` the same clauses are a refusal
-/// ([`specification_create_refusal`]): the schema published with `required` and
+/// models no such member, so for `CreateDeployment` the same findings are a refusal
+/// ([`create_deployment_findings`]): the schema published with `required` and
 /// `allowedValues` is what a deployment of that pattern has to fill in. Each one
 /// is a statement the STORED schema makes about the submitted map: a setting the
 /// pattern does not define, a value outside a field's `allowedValues`, and a field the
 /// pattern marks required that the map does not carry.
 ///
 /// A field's `conditionals` are PUBLISHED metadata only: they tell a caller which other
-/// setting decides whether this one is read, and no clause here is raised from them — a
+/// setting decides whether this one is read, and no finding here is raised from them — a
 /// conditional field is accepted whatever the field it depends on carries, which is why
 /// no pattern marks a conditional field required.
 ///
-/// `DeploymentSpecifications` is `@sensitive`, so a warning names the KEY it is about
+/// `DeploymentSpecifications` is `@sensitive`, so a finding names the KEY it is about
 /// (a caller cannot fix the request otherwise) and never the submitted VALUE; an
-/// `allowedValues` warning lists the values the SCHEMA allows, which is the pattern's
+/// `allowedValues` finding lists the values the SCHEMA allows, which is the pattern's
 /// own published vocabulary rather than anything the caller sent.
 ///
-/// The order is the schema's own then the submitted map's (both ordered), so one
-/// request always produces the same report.
+/// The order is the one the service reports findings in — a setting the pattern does not
+/// define first, then what its published schema says about the settings it does define —
+/// and within each half the order of the map or the schema it walks (both ordered), so
+/// one request always produces the same report.
 pub fn specification_warnings(
     pattern: &DeploymentPattern,
     specifications: &BTreeMap<String, String>,
 ) -> Vec<String> {
-    let mut warnings = Vec::new();
+    let mut warnings = disallowed_specification_findings(pattern, specifications);
+    warnings.extend(published_schema_findings(pattern, specifications));
+    warnings
+}
+
+/// The findings for the submitted keys the pattern's schema does not define at all.
+///
+/// Reported BEFORE anything the published schema says about the settings it does define:
+/// a key the pattern does not define is not a setting of this deployment, so the caller
+/// is told to drop it before being told what the schema asks for.
+fn disallowed_specification_findings(
+    pattern: &DeploymentPattern,
+    specifications: &BTreeMap<String, String>,
+) -> Vec<String> {
+    specifications
+        .keys()
+        .filter(|name| !pattern.specifications.iter().any(|f| &&f.name == name))
+        .map(|name| format!("Specification {name} is not allowed"))
+        .collect()
+}
+
+/// The findings the pattern's PUBLISHED schema raises over the settings it does define:
+/// a field it marks `required` that the map omits, and a value outside a field's
+/// `allowedValues`.
+fn published_schema_findings(
+    pattern: &DeploymentPattern,
+    specifications: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut findings = Vec::new();
     for field in &pattern.specifications {
         match specifications.get(&field.name) {
-            None if field.required => warnings.push(format!(
+            None if field.required => findings.push(format!(
                 "'{}' is required by deployment pattern '{}'",
                 field.name, pattern.pattern_name
             )),
@@ -2470,7 +2554,7 @@ pub fn specification_warnings(
             Some(value) => {
                 let allowed = &field.allowed_values;
                 if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == value) {
-                    warnings.push(format!(
+                    findings.push(format!(
                         "the value of '{}' is not one of the values deployment pattern '{}' \
                          allows for it [{}]",
                         field.name,
@@ -2481,24 +2565,61 @@ pub fn specification_warnings(
             }
         }
     }
-    for name in specifications.keys() {
-        if !pattern.specifications.iter().any(|f| &f.name == name) {
-            warnings.push(format!(
-                "'{name}' is not a specification of deployment pattern '{}'",
-                pattern.pattern_name
-            ));
-        }
-    }
-    warnings
+    findings
 }
 
-/// How many clauses, then the clauses — the ONE shape every refusal this service words
-/// states a report in, because a caller reads them all the same way.
+/// The finding a deployment `name` raises against the rule the service applies to it,
+/// or `None` when the name satisfies that rule.
 ///
-/// Every renderer goes through here, [`validation_report`] included, so the count, the
-/// singular/plural noun, the `" validation "`/`" detected: "` wording and the `"; "`
-/// separator exist once and cannot differ between two refusals. `noun` is pluralised by
-/// appending an `s`, which is what every caller's noun takes.
+/// The expression the finding quotes is the expression the name was judged by
+/// ([`DEPLOYMENT_NAME_SERVER_PATTERN`]), so a caller can fix the request from the
+/// response alone. The name itself is NOT echoed: a finding states the member and the
+/// rule, which is what [`validation_report`] does for a modelled constraint too.
+pub fn deployment_name_finding(name: &str) -> Option<String> {
+    (!satisfies(&DEPLOYMENT_NAME_SCHEMA, name)).then(|| {
+        pattern_mismatch_finding(DEPLOYMENT_NAME_MEMBER, DEPLOYMENT_NAME_SERVER_PATTERN)
+    })
+}
+
+/// How the service states that a member's value does not match a regular expression it
+/// judges that member by: fixed text around the member's wire name and the expression.
+fn pattern_mismatch_finding(member: &str, pattern: &str) -> String {
+    format!("The value of '{member}' doesn't match the regular expression pattern <'{pattern}'>")
+}
+
+/// EVERY finding a `CreateDeployment` request raises, in the order the service reports
+/// them: the settings the pattern does not define, then the rule the deployment name is
+/// judged by, then what the pattern's published schema says about the settings it does
+/// define.
+///
+/// A create models no `force`, so each of these is a refusal rather than a warning: the
+/// whole list is accumulated into the one `ValidationException` message
+/// ([`validation_findings_report`]) rather than the request being refused on the first
+/// one, so a caller fixes everything that is wrong with it in one round trip.
+pub fn create_deployment_findings(
+    pattern: &DeploymentPattern,
+    name: &str,
+    specifications: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut findings = disallowed_specification_findings(pattern, specifications);
+    findings.extend(deployment_name_finding(name));
+    findings.extend(published_schema_findings(pattern, specifications));
+    findings
+}
+
+/// How many clauses, then the clauses — the ONE shape a COUNTED refusal this service
+/// words states its report in, because a caller reads them all the same way.
+///
+/// Both renderers that count go through here — [`validation_report`] for a modelled
+/// constraint the request broke, and [`specification_warning_refusal`] for the settings
+/// an update may apply anyway — so the count, the singular/plural noun, the
+/// `" validation "`/`" detected: "` wording and the `"; "` separator exist once and
+/// cannot differ between two refusals. `noun` is pluralised by appending an `s`, which
+/// is what every caller's noun takes.
+///
+/// A refusal that states the findings the service itself raised about a request counts
+/// nothing: it accumulates them as AWS's finding list instead
+/// ([`validation_findings_report`]).
 fn counted_clauses(noun: &str, clauses: &[String]) -> String {
     let plural = if clauses.len() == 1 {
         noun.to_string()
@@ -2543,21 +2664,21 @@ pub fn deployment_update_refusal(deployment: &Deployment) -> Option<&'static str
     }
 }
 
-/// The `ValidationException` message a CREATE refused for its specification warnings
-/// carries.
+/// The `ValidationException` message a request refused for the findings it raised
+/// carries: one SENTENCE per finding, each terminated by a period, joined with `", "`.
 ///
-/// `CreateDeployment` models no `force`, so what an update merely warns about is the
-/// end of a create: the clauses are stated as the errors they are, and the caller is
-/// pointed at the operation that publishes the schema they were judged against — the
-/// one `CreateDeployment`'s own docs name "to retrieve the specifications required to
-/// create a deployment". Same caveat as above: only the status and the code are the
-/// contract.
-pub fn specification_create_refusal(warnings: &[String]) -> String {
-    format!(
-        "{}; the specifications a deployment pattern accepts are reported by \
-         GetWorkloadDeploymentPattern.",
-        counted_clauses(VALIDATION_ERROR_NOUN, warnings)
-    )
+/// The message is the only place a `ValidationException` says WHICH input was wrong —
+/// the modelled shape carries a `message` and nothing else — so every finding the
+/// request raised is accumulated into it, in the order the service reports them, with no
+/// count preamble and no sentence that is not a finding. A client reading the message to
+/// tell its operator which input to fix reads one finding per sentence, whichever check
+/// raised it.
+pub fn validation_findings_report(findings: &[String]) -> String {
+    findings
+        .iter()
+        .map(|finding| format!("{}.", finding.trim_end_matches('.')))
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// A `SystemTime` as the modelled `Timestamp` the wire carries.
@@ -2718,8 +2839,8 @@ const VALIDATION_WARNING_NOUN: &str = "warning";
 /// and reports a `@pattern` as the expression itself, without the `^`/`$` the model
 /// spells "whole value" with.
 ///
-/// The sentence the clauses are stated in is [`counted_clauses`]', the same one the
-/// specification refusals are worded by; a modelled constraint is an `error`.
+/// The sentence the clauses are stated in is [`counted_clauses`]', the same one an
+/// update's warning report is worded by; a modelled constraint is an `error`.
 pub fn validation_report(violations: &[Violation]) -> String {
     let mut clauses: Vec<String> = Vec::new();
     // The clauses already stated, kept as a SET so recognising a repeat does not cost a

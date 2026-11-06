@@ -38,7 +38,7 @@ use crate::deployment_update::{
     conforming_specifications, constrained_field, error_message, every_pattern,
     one_pattern_per_workload, pattern_data, required_field, update_body, with_member,
 };
-use crate::harness::{walk_pages, Harness};
+use crate::harness::{deployment_name, walk_pages, Harness};
 
 /// Long enough for every clock-owed step a CREATE schedules to come due (the three
 /// `state::TRANSITION_SPAN`s a create walks, plus slack). A deployment whose create is
@@ -58,7 +58,9 @@ struct CreateRow {
 }
 
 /// A `CreateDeployment` request body over an explicit settings map, with `tags` only
-/// when `tags` is `Some` — a dry run must answer the same way either way.
+/// when `tags` is `Some` — a dry run must answer the same way either way. `name` is the
+/// case's descriptive label, carried into a name the service's own name rule accepts by
+/// [`deployment_name`].
 fn create_request(
     workload: &str,
     pattern: &str,
@@ -70,7 +72,7 @@ fn create_request(
     let mut body = json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
-        "name": name,
+        "name": deployment_name(name),
         "specifications": Value::Object(specifications.clone()),
         "dryRun": dry_run,
     });
@@ -106,7 +108,7 @@ async fn create_rows(harness: &Harness) -> Vec<CreateRow> {
         let data = pattern_data(harness, &case, &workload, &pattern).await;
         let specifications = conforming_specifications(&case, &data, index % 2 == 0);
         let tags = (index % 2 == 1).then(|| json!({"Owner": "emulator-tests"}));
-        let name = format!("dry-run-{index}");
+        let name = deployment_name(&format!("dry-run-{index}"));
         let body = create_request(
             &workload,
             &pattern,

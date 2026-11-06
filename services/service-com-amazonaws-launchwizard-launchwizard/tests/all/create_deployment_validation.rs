@@ -37,7 +37,7 @@ use crate::deployment_update::{
     conforming_specifications, constrained_field, error_message, every_pattern, first_allowed_value,
     one_pattern_per_workload, pattern_data, schema_fields,
 };
-use crate::harness::{walk_pages, Harness};
+use crate::harness::{deployment_name, walk_pages, Harness};
 use crate::resource_tagging::{deployment_arn, encode_component, model, shape_traits};
 use service_com_amazonaws_launchwizard_launchwizard::state::{
     DRY_RUN_OPERATION_CODE, DRY_RUN_OPERATION_STATUS,
@@ -70,7 +70,9 @@ const MAX_TAG_KEY_LEN: usize = 128;
 /// the key-shape rule; the schema rule states its own clauses instead.
 const SHAPE_MARKER: &str = "failed to satisfy constraint";
 
-/// A `CreateDeployment` request body over an explicit settings map.
+/// A `CreateDeployment` request body over an explicit settings map. `name` is the
+/// case's descriptive label, carried into a name the service's own name rule accepts by
+/// [`deployment_name`].
 fn create_request(
     workload: &str,
     pattern: &str,
@@ -81,7 +83,7 @@ fn create_request(
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
-        "name": name,
+        "name": deployment_name(name),
         "specifications": Value::Object(specifications.clone()),
         "dryRun": dry_run,
     })

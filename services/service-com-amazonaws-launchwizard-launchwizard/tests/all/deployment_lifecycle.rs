@@ -24,7 +24,7 @@ use service_com_amazonaws_launchwizard_launchwizard::state::{
 // The HTTP harness, the signing region and the pagination walker are shared with the
 // other suites in this crate rather than copied — see `tests/all/harness.rs`.
 use crate::deployment_update::conforming_specifications;
-use crate::harness::{catalogue, walk_pages, Harness, REGION};
+use crate::harness::{catalogue, deployment_name, walk_pages, Harness, REGION};
 
 /// The canonical emulator account id every ARN carries.
 pub(crate) const ACCOUNT: &str = "000000000000";
@@ -69,6 +69,9 @@ pub(crate) async fn required_specifications(
 /// against that schema, so a body that is meant to succeed fills it in; see
 /// `tests/all/create_deployment_validation.rs` for the suite that drives the judgement
 /// itself.
+///
+/// `name` is the case's descriptive label, carried into a name the service's own name
+/// rule accepts by [`deployment_name`].
 pub(crate) async fn create_body(
     harness: &Harness,
     workload: &str,
@@ -79,7 +82,7 @@ pub(crate) async fn create_body(
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
-        "name": name,
+        "name": deployment_name(name),
         "specifications": Value::Object(required_specifications(harness, workload, pattern).await),
         "tags": {"Owner": "emulator-tests", "Workload": workload},
         "dryRun": dry_run,
@@ -308,7 +311,7 @@ async fn a_created_deployment_is_read_back_from_state_and_advances_on_the_clock(
         assert!(
             event["description"]
                 .as_str()
-                .is_some_and(|d| d.contains("demo-deployment")),
+                .is_some_and(|d| d.contains(&deployment_name("demo-deployment"))),
             "case {case:?}: an event describes this deployment, got {}",
             event["description"]
         );
@@ -653,7 +656,7 @@ async fn list_deployments_pages_and_filters_the_stored_deployments() {
             .iter()
             .map(|d| d["name"].as_str().unwrap_or_default().to_string())
             .collect();
-        let expected: BTreeSet<String> = expected.into_iter().map(ToString::to_string).collect();
+        let expected: BTreeSet<String> = expected.into_iter().map(deployment_name).collect();
         assert_eq!(
             got, expected,
             "case {case:?}: expected deployments {expected:?}, got {got:?}"

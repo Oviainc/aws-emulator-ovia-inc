@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::deployment_lifecycle::required_specifications;
 use crate::deployment_update::every_pattern;
-use crate::harness::{catalogue, Harness};
+use crate::harness::{catalogue, deployment_name, Harness};
 use crate::resource_tagging::{
     as_map, deployment_arn, deployment_tags, listed_tags, model, tags_path, untag_path,
 };
@@ -163,7 +163,7 @@ async fn create_carrying(
     let mut body = json!({
         "workloadName": WORKLOAD,
         "deploymentPatternName": pattern,
-        "name": name,
+        "name": deployment_name(name),
         "specifications": Value::Object(required_specifications(harness, WORKLOAD, pattern).await),
         "dryRun": false,
     });

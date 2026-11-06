@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! That this service states EVERY refusal report in ONE sentence, driven over HTTP
+//! That this service states a COUNTED refusal report in ONE sentence, driven over HTTP
 //! through the same router the production emulator serves with.
 //!
-//! RULE: a refusal that lists what failed is stated as `"<count> validation
+//! RULE: a refusal that counts what failed is stated as `"<count> validation
 //! <noun>[s] detected: "` followed by the clauses joined with `"; "` — the count is HOW
 //! MANY clauses follow, the noun is singular for one clause and takes an `s` for any
 //! other number, and the separator is the same whichever check raised the clauses. The
-//! two refusal families this crate words — a modelled constraint the request broke, and
-//! a deployment's settings judged against the specification schema its pattern
-//! publishes — are read the same way by a caller, so they state the same sentence.
+//! two refusal families this crate counts — a modelled constraint the request broke, and
+//! the settings an UPDATE is warned about and may apply anyway — are read the same way by
+//! a caller, so they state the same sentence. (A `CreateDeployment` refused for its own
+//! input is NOT one of them: it accumulates every finding it raised into AWS's
+//! finding list instead, which `tests/all/create_deployment_finding_report.rs` drives.)
 //!
 //! The suite exists because that sentence used to be rendered in two places in
 //! `src/state.rs`, one per family, each with its own count-and-pluralise branch: the
@@ -28,14 +30,12 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_launchwizard_launchwizard::state::{
-    specification_create_refusal, specification_warning_refusal,
-};
+use service_com_amazonaws_launchwizard_launchwizard::state::specification_warning_refusal;
 
 use crate::deployment_lifecycle::create_body;
 use crate::deployment_update::{
-    conforming_specifications, error_message, one_pattern_per_workload, pattern_data,
-    required_field, update_body, with_member,
+    conforming_specifications, error_message, one_pattern_per_workload, pattern_data, update_body,
+    with_member,
 };
 use crate::harness::Harness;
 
@@ -143,7 +143,6 @@ async fn every_refusal_states_its_clauses_in_the_one_report_sentence() {
     let pattern_case = format!("{workload}/{pattern}");
     let data = pattern_data(&harness, &pattern_case, &workload, &pattern).await;
     let conforming = conforming_specifications(&pattern_case, &data, true);
-    let required = required_field(&pattern_case, &data);
 
     // The deployment the `UpdateDeployment` rows name, created first so its clock-owed
     // steps come due while the rows above it run.
@@ -225,49 +224,9 @@ async fn every_refusal_states_its_clauses_in_the_one_report_sentence() {
         });
     }
 
-    // Family 2: the clauses the pattern's PUBLISHED specification schema raises, which a
-    // create states as errors. One row per clause count, so the pluralisation is driven
-    // on this family too.
-    let create_trailer = trailer(specification_create_refusal, "error");
-    for extra in 1..=3 {
-        rows.push(Row {
-            case: format!("{extra} settings the pattern does not publish"),
-            path: "/createDeployment",
-            body: with_member(
-                &create_body(
-                    &harness,
-                    &workload,
-                    &pattern,
-                    &format!("report-unpublished-{extra}"),
-                    false,
-                )
-                .await,
-                "specifications",
-                Value::Object(unpublished(extra)),
-            ),
-            noun: "error",
-            clauses: extra,
-            trailer: create_trailer.clone(),
-        });
-    }
-    {
-        // A different kind of clause from the same schema: a field the pattern marks
-        // required that the map does not carry.
-        let mut specifications = conforming.clone();
-        specifications.remove(&required);
-        rows.push(Row {
-            case: "a required field the map does not carry".to_string(),
-            path: "/createDeployment",
-            body: with_member(
-                &create_body(&harness, &workload, &pattern, "report-required", false).await,
-                "specifications",
-                Value::Object(specifications),
-            ),
-            noun: "error",
-            clauses: 1,
-            trailer: create_trailer.clone(),
-        });
-    }
+    // Family 2: the clauses the pattern's PUBLISHED specification schema raises, which an
+    // update states as the warnings `force` overrides. Driven below, after the rows above
+    // have given the subject's clock-owed steps time to come due.
 
     for row in &rows {
         let body = harness
@@ -276,12 +235,11 @@ async fn every_refusal_states_its_clauses_in_the_one_report_sentence() {
         assert_report(row, &error_message(&body));
     }
 
-    // Family 2 again, with the OTHER noun: an update states the same schema's clauses as
-    // the warnings `force` overrides, so the singular/plural rule is exercised on a noun
-    // the error rows never state.
+    // One row per clause count, so the singular/plural rule is driven on this family and
+    // on a noun the error rows never state.
     std::thread::sleep(CREATE_SETTLE);
     let warning_trailer = trailer(specification_warning_refusal, "warning");
-    for extra in 1..=2 {
+    for extra in 1..=3 {
         let row = Row {
             case: format!("an update warned about {extra} unpublished settings"),
             path: "/updateDeployment",

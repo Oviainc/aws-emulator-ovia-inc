@@ -36,8 +36,12 @@ const EXPECTED_PREFIX: &str = "LaunchWizard-";
 const PRE_PROVISIONING: [&str; 2] = ["CREATING", "VALIDATING"];
 
 /// `DeploymentName` is len 1..50 over `^[A-Za-z0-9_\.-]+$` (smithy_query:
-/// `shape="DeploymentName"`), so these are its published bounds.
-const NAME_MIN_LEN: usize = 1;
+/// `shape="DeploymentName"`), so 50 is its published ceiling. Its floor is not a length
+/// this suite can use: `CreateDeployment` judges a name by a stricter rule of its own
+/// (`state::DEPLOYMENT_NAME_SERVER_PATTERN`, driven by
+/// `tests/all/create_deployment_finding_report.rs`), under which the shortest name a
+/// deployment can carry is two characters.
+const NAME_MIN_LEN: usize = 2;
 /// See [`NAME_MIN_LEN`].
 const NAME_MAX_LEN: usize = 50;
 
@@ -107,20 +111,20 @@ fn assert_well_formed(case: &str, group: &str) {
     );
 }
 
-/// The deployment names this suite spans: every character class `DeploymentName`
-/// allows and both of its published length bounds, each one a different length so the
-/// reported group name cannot be a fixed string.
+/// The deployment names this suite spans: every character class a name a deployment can
+/// be created under may hold, and both bounds of the length it may have, each one a
+/// different length so the reported group name cannot be a fixed string.
 fn deployment_names() -> Vec<(&'static str, String)> {
     vec![
-        // The shortest name the model allows.
+        // The shortest name a deployment can carry.
         ("shortest name", "a".repeat(NAME_MIN_LEN)),
-        // Every character class the pattern allows, mixed.
-        ("all character classes", "Rg_1.name-2".to_string()),
-        // Digits only — a name that is not identifier-shaped.
-        ("digits only", "0123456789".to_string()),
-        // Separators only, so the prefix boundary is visible.
-        ("separators", "a.b_c-d".to_string()),
-        // The longest name the model allows.
+        // Every character class the rule allows, mixed.
+        ("all character classes", "Rg1name2".to_string()),
+        // Digits after the leading letter, so the name is not word-shaped.
+        ("digits after the leading letter", "n0123456789".to_string()),
+        // A leading capital, one character past the shortest name.
+        ("a leading capital", "Rg1".to_string()),
+        // The longest name a deployment can carry.
         ("longest name", "L".repeat(NAME_MAX_LEN)),
     ]
 }

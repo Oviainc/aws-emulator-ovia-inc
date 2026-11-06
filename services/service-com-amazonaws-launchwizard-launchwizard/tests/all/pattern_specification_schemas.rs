@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 
 use crate::deployment_lifecycle::get;
 use crate::deployment_update::{conforming_specifications, error_message, pattern_data, schema_fields};
-use crate::harness::{catalogue, Harness};
+use crate::harness::{catalogue, deployment_name, Harness};
 use crate::resource_tagging::model;
 
 /// The wire error code and HTTP status a settings map the pattern's schema rejects
@@ -83,7 +83,9 @@ fn required_names(case: &str, data: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// A `CreateDeployment` request body over an explicit settings map.
+/// A `CreateDeployment` request body over an explicit settings map. `name` is the
+/// case's descriptive label, carried into a name the service's own name rule accepts by
+/// [`deployment_name`].
 fn create_request(
     workload: &str,
     pattern: &str,
@@ -93,7 +95,7 @@ fn create_request(
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
-        "name": name,
+        "name": deployment_name(name),
         "specifications": Value::Object(specifications.clone()),
     })
 }

@@ -260,21 +260,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let pattern_version_name = pattern_version.version_name.clone();
 
-        // The settings are judged against the specification schema THIS pattern
-        // publishes — the same `state::specification_warnings` an update is judged by,
-        // over the same records `GetWorkloadDeploymentPattern` reports: a field the
-        // pattern marks `required` that the map omits, a value outside a field's
-        // `allowedValues`, and a key the pattern does not publish. An update can apply
-        // settings the schema warns about (`force`); `CreateDeployment` models no such
-        // member, so here the warnings are the refusal, and a deployment the schema
-        // says is unusable is never stored. Judged BEFORE the `dryRun` short-circuit
-        // below, so a pre-flight of an unusable request is refused rather than
-        // answered success.
-        let warnings = crate::state::specification_warnings(pattern, &specifications);
-        if !warnings.is_empty() {
+        // The request's own input is judged next, against the rules the generated
+        // constraint walk does not carry: the settings against the specification schema
+        // THIS pattern publishes — the same `state::specification_warnings` an update is
+        // judged by, over the same records `GetWorkloadDeploymentPattern` reports — and
+        // the deployment NAME against the rule the service applies to it beyond the
+        // modelled `@pattern` (`state::DEPLOYMENT_NAME_SERVER_PATTERN`), which is the
+        // same reason the specification KEYS are judged above: a rule the schema walk
+        // cannot know about. An update can apply settings the schema warns about
+        // (`force`); `CreateDeployment` models no such member, so here every finding is
+        // a refusal, and a deployment the schema says is unusable — or under a name the
+        // service would not create — is never stored.
+        //
+        // EVERY finding is accumulated into the one message
+        // (`state::create_deployment_findings`, rendered by
+        // `state::validation_findings_report`) rather than the request being refused on
+        // the first one, so one round trip tells the caller everything that is wrong
+        // with the request. Judged BEFORE the `dryRun` short-circuit below, so a
+        // pre-flight of an unusable request is refused rather than answered success.
+        let findings =
+            crate::state::create_deployment_findings(pattern, &input.name, &specifications);
+        if !findings.is_empty() {
             return Err(CreateDeploymentErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::specification_create_refusal(&warnings)),
+                    message: Some(crate::state::validation_findings_report(&findings)),
                 },
             )
             .into());
