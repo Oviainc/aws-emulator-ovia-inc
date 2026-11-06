@@ -253,6 +253,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `input`'s own documentation: "Length constraints apply to the payload size,
+        // and are expressed as bytes in UTF-8 encoding" — the half of that bound the
+        // centralized walk cannot enforce, since `@length` counts a string's
+        // CHARACTERS. This operation's model declares no `ValidationException`, so the
+        // refusal goes out through the crate's one non-modelled channel, carrying the
+        // same message the walk states for a payload past its bound.
+        if let Some(value) = input.input.as_deref() {
+            if let Some(message) = crate::state::payload_size::payload_refusal("input", value) {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+        }
+
         // `input`'s own documentation: "If you don't include any JSON input data, you
         // still must include the two braces" — an execution with no input data is the
         // empty JSON object, which is what the interpreter receives.
@@ -569,6 +581,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if keep {
             store.insert_execution(executed);
         }
+        // Every guard on this service's store is released before the observations this
+        // run queued are published: the metric series an Express run is counted and
+        // billed in, and the history events its logging configuration delivers.
+        drop(store);
+        crate::state::observability::publish(&*self.engine);
 
         Ok(response)
     }

@@ -44,6 +44,7 @@
 use std::sync::LazyLock;
 
 use smithy_server_runtime::{Refusal, Refused, Violation};
+use ::aws_smithy_schema_server::ViolationKind;
 
 use crate::state::FRACTIONAL_MEMBERS;
 
@@ -140,8 +141,25 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
         return None;
     };
     let in_modelled_types: Vec<Violation> = violations.iter().map(in_modelled_type).collect();
+    let mut stated = shared_wording(&in_modelled_types)?;
+    // A member whose bound is a payload SIZE states the requirement about that size
+    // rather than the character-length sentence the framework states for every other
+    // member, so a refusal carrying one is restated clause by clause: each clause by
+    // the rule its own member's bound follows, inside the one envelope.
+    if in_modelled_types.iter().any(|violation| payload_limit(violation).is_some()) {
+        let clauses: Vec<String> = in_modelled_types.iter().map(stated_clause).collect();
+        stated.message = ::service_common::validation_message::envelope_over(&clauses)?;
+    }
+    Some(stated)
+}
+
+/// The shared wording's statement of `violations`: the framework's envelope over the
+/// framework's clauses, with this service's two differences — the `@pattern`
+/// expression as the model writes it, and the value half dropped from a `@sensitive`
+/// member's clause.
+fn shared_wording(violations: &[Violation]) -> Option<Refused> {
     ::service_common::validation_message::aws_validation_refusal_withholding_with(
-        &Refusal::Invalid(in_modelled_types),
+        &Refusal::Invalid(violations.to_vec()),
         // The expression a `@pattern` clause advertises is the model's own, as
         // the framework already quotes it: this service is recorded stating the
         // alias-name pattern with the anchors the model writes, so only the
@@ -149,6 +167,59 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
         |pattern| pattern.to_string(),
         |path| WITHHELD_MEMBERS.withholds_value(path),
     )
+}
+
+/// The maximum this violation's member is bounded by in UTF-8 BYTES, or `None` when
+/// its bound is not a payload size — including a violation of another class, since a
+/// payload member is only measured in bytes against its `@length` MAXIMUM.
+fn payload_limit(violation: &Violation) -> Option<usize> {
+    match violation.kind {
+        ViolationKind::MaxLength(_) => {
+            crate::state::payload_size::PAYLOAD_MEMBERS.limit_at(&violation.path)
+        }
+        _ => None,
+    }
+}
+
+/// The clause `violation` is stated by: the shared wording's own, with the REQUIREMENT
+/// restated for a member whose bound is a payload size in UTF-8 bytes.
+///
+/// Everything else about the clause — the member path, the value half and the fact
+/// that a `@sensitive` member states none — is the shared wording's, which is why the
+/// member half is taken from the clause it already stated rather than rebuilt here:
+/// only the requirement sentence differs, and it is swapped for the one the model's
+/// own documentation states ("Length constraints apply to the payload size, and are
+/// expressed as bytes in UTF-8 encoding").
+fn stated_clause(violation: &Violation) -> String {
+    let shared = shared_clause(violation);
+    let Some(max_bytes) = payload_limit(violation) else {
+        return shared;
+    };
+    let framework = ::service_common::validation_message::requirement(violation.kind.clone());
+    let requirement = crate::state::payload_size::byte_size_requirement(max_bytes);
+    match shared.strip_suffix(&framework) {
+        Some(member_half) => format!("{member_half}{requirement}"),
+        None => shared,
+    }
+}
+
+/// The shared wording's clause for ONE violation: its whole statement with the
+/// envelope that wording puts around a single clause removed, so a clause this module
+/// restates and a clause it does not can sit inside one envelope.
+///
+/// The envelope's own opening is read back out of the shared wording
+/// ([`::service_common::validation_message::envelope_over`] over one empty clause)
+/// rather than spelled here, so nothing about the envelope is stated twice.
+fn shared_clause(violation: &Violation) -> String {
+    let stated = shared_wording(::std::slice::from_ref(violation))
+        .map(|refused| refused.message)
+        .unwrap_or_default();
+    let opening = ::service_common::validation_message::envelope_over(&[String::new()])
+        .unwrap_or_default();
+    stated
+        .strip_prefix(&opening)
+        .unwrap_or(stated.as_str())
+        .to_string()
 }
 
 /// The standard validation envelope for ONE violation a HANDLER found, as the

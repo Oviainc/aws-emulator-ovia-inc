@@ -327,10 +327,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(GetExecutionHistoryOutput {
+        let reported = GetExecutionHistoryOutput {
             events,
             next_token: next.map(|cursor| crate::state::history_page_token(cursor, total)),
-        })
+        };
+        // The guard is released before what the settle above materialised is
+        // published: an outcome the clock made due is also what the execution
+        // publishes about having ended.
+        drop(store);
+        crate::state::observability::publish(&*self.engine);
+
+        Ok(reported)
     }
 }
 

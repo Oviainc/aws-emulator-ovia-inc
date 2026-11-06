@@ -355,6 +355,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+            // Naming that role HANDS this service a role to run the state as, which is
+            // the caller's own `iam:PassRole`: a caller whose identity-based policies
+            // do not let it pass the role is refused before the state is run. See
+            // `crate::service::authorization`.
+            if let Some(why) =
+                crate::service::authorization::pass_role_denial(&*self.engine, ctx, role_arn)
+            {
+                return Err(crate::scaffolded::Scaffolded::access_denied(why));
+            }
         }
 
         // "A string that contains the JSON input data for the state" — a state tested

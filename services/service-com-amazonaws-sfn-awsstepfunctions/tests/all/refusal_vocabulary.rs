@@ -106,6 +106,13 @@ fn at_least(characters: usize) -> String {
     format!("Member must have length greater than or equal to {characters}")
 }
 
+/// The requirement a member whose own documentation states its bound as a payload
+/// SIZE carries (`StartExecution$input`: "Length constraints apply to the payload
+/// size, and are expressed as bytes in UTF-8 encoding").
+fn at_most_bytes(bytes: usize) -> String {
+    format!("Member must have size less than or equal to {bytes} bytes in UTF-8 encoding")
+}
+
 // ---------------------------------------------------------------------------
 // Rules 1 and 2: the modelled-constraint envelope, and the sensitive member
 // ---------------------------------------------------------------------------
@@ -153,10 +160,12 @@ async fn a_sensitive_members_rejected_value_is_not_echoed() {
             envelope_without_value("definition", &at_least(1)),
         ),
         (
+            // `input`'s bound is a payload SIZE, which its own documentation states
+            // in UTF-8 bytes, so the requirement is the one about that size.
             "StartExecution with an input past its maximum",
             "StartExecution",
             json!({ "stateMachineArn": &machine, "input": &oversized_data }),
-            envelope_without_value("input", &at_most(MAX_SENSITIVE_DATA_CHARS)),
+            envelope_without_value("input", &at_most_bytes(MAX_SENSITIVE_DATA_CHARS)),
         ),
         (
             "TestState with variables past their maximum",

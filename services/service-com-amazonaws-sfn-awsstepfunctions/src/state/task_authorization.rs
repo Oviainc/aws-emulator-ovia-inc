@@ -217,6 +217,29 @@ fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
+/// Why the role `role_arn` may not perform `action` on `resource`, as the service
+/// named `service` words that refusal, or `None` when nothing of the kind can be shown
+/// (see the module docs for the cases that show nothing).
+///
+/// The ONE evaluation of a role's identity-based documents in this crate, so a `Task`
+/// state's integration call and every other decision taken about what a state
+/// machine's execution role may do read the same documents in the same order. Call it
+/// with no store of this service locked: it takes the IAM store's own.
+pub fn role_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+    service: &str,
+) -> Option<String> {
+    if role_arn.is_empty() {
+        return None;
+    }
+    let iam = iam_state(engine)?;
+    let denial = refusal(&iam.lock(), role_arn, action, resource, service);
+    denial
+}
+
 /// The sentence the invoked service refuses the call with when the role `role_arn`
 /// may not perform `action` on `resource`, or `None` when nothing of the kind can be
 /// shown (see the module docs for the cases that show nothing).

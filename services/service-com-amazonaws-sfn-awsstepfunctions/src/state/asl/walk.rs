@@ -1309,8 +1309,12 @@ impl Interpreter<'_> {
                 next: default.to_string(),
                 output: None,
             }),
-            None => Err(named(
-                NO_CHOICE_ERROR,
+            // A `Choice` that no rule matched and that declares no `Default` has
+            // nowhere to go, so the execution ends at it — under the name the
+            // interpreter raises every failure of its own under
+            // ([`RUNTIME_ERROR`]), which is the name RECORDED for this outcome,
+            // with the cause saying what could not be decided.
+            None => Err(runtime(
                 "no choice rule matched the state's input and the state declares no 'Default'"
                     .to_string(),
             )),

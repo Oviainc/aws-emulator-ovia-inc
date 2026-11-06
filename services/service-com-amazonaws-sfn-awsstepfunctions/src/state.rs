@@ -2418,6 +2418,12 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// It only ever increases, so a sequence a deleted alias held is never handed out
     /// again and the aliases that remain keep their relative order.
     alias_sequence: u64,
+    /// What this store's executions have published about themselves and nothing has
+    /// written out yet: the metric datapoints and the log deliveries
+    /// [`observability::publish`] hands to CloudWatch and CloudWatch Logs once this
+    /// store's guard is released. Bounded by
+    /// [`observability::MAX_PENDING_OBSERVATIONS`].
+    pending_observations: observability::Pending,
 }
 
 // ---------------------------------------------------------------------------
@@ -4282,6 +4288,8 @@ pub mod item_batcher;
 pub mod item_reader;
 mod json_diagnostic;
 pub mod jsonata;
+pub mod observability;
+pub mod payload_size;
 mod plan;
 pub use plan::*;
 pub mod run_a_job;

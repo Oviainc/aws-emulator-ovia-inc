@@ -71,6 +71,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether IAM lets the caller hand this service the ROLE a control-plane request
+/// names — the `iam:PassRole` step `CreateStateMachine`, `UpdateStateMachine` and
+/// `TestState` take before anything the request names is resolved.
+pub(crate) mod authorization;
+
 /// How this service words the input-constraint refusals the framework hands
 /// back — the one formatter every operation's boundary validation reaches.
 /// How this service words a boundary refusal, and which members it states no value

@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (crate::state::REDRIVE_STATUS_REDRIVABLE.to_string(), None),
             };
 
-        Ok(DescribeExecutionOutput {
+        let reported = DescribeExecutionOutput {
             execution_arn: execution.arn.clone(),
             state_machine_arn: execution.state_machine_arn.clone(),
             name: Some(execution.name.clone()),
@@ -368,6 +368,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             redrive_date: execution.redrive_date.map(crate::state::to_date_time),
             redrive_status: Some(redrive_status),
             redrive_status_reason,
-        })
+        };
+        // The guard is released before what the settle above materialised is
+        // published: an outcome the clock made due is also what the execution
+        // publishes about having ended, and the two stores are never locked at once.
+        drop(store);
+        crate::state::observability::publish(&*self.engine);
+
+        Ok(reported)
     }
 }

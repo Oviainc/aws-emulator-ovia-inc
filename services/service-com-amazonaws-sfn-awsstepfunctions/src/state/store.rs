@@ -80,6 +80,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 continue;
             }
             execution.apply_pending();
+            // The outcome the clock just made due is also what the execution publishes
+            // about having ended, so the observations are queued at the instant the
+            // transition is materialised rather than when somebody next looks.
+            self.observe_execution_settled(&arn);
         }
         self.pending_executions = still_pending;
 
@@ -1872,7 +1876,13 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .entry(execution.state_machine_arn.clone())
             .or_default()
             .push(execution.arn.clone());
+        let arn = execution.arn.clone();
         self.executions.insert(execution.arn.clone(), execution);
+        // What the new execution publishes about itself: it has STARTED, and — for a
+        // record that arrives terminal, which a synchronous Express run does — what it
+        // publishes about having ended. Queued here, in the one place a started
+        // execution enters the store, and written out by the call that queued it.
+        self.observe_execution_started(&arn);
     }
 
     // -----------------------------------------------------------------------
@@ -2416,6 +2426,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_add(after)
             .saturating_sub(before);
         self.pending_executions.retain(|pending| pending != arn);
+        // The stop is this execution's terminal status, so it is also what the
+        // execution publishes about having ended.
+        self.observe_execution_settled(arn);
         // A Map Run of this execution had not finished either, so it stopped here too.
         self.abort_map_runs_of(arn, now);
         // The job this execution was parked at is nobody's work any more: the record

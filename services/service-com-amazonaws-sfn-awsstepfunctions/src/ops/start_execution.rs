@@ -298,6 +298,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `input`'s own documentation: "Length constraints apply to the payload size,
+        // and are expressed as bytes in UTF-8 encoding" — the half of that bound the
+        // centralized walk cannot enforce, since `@length` counts a string's
+        // CHARACTERS. Refused with the same envelope and the same requirement the walk
+        // states for a payload past its bound (`crate::state::payload_size`).
+        if let Some(value) = input.input.as_deref() {
+            if let Some(message) = crate::state::payload_size::payload_refusal("input", value) {
+                return Err(StartExecutionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         // `input`'s own documentation: "The string that contains the JSON input data
         // for the execution" — an execution with no input data is still the empty JSON
         // object, which is what the interpreter receives.
@@ -406,6 +423,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let role_arn = configuration.role_arn.clone();
 
         let region = crate::state::arn_region(&machine_arn);
+
+        // An execution of a state machine on a CUSTOMER MANAGED key has its data
+        // sealed under that key, which Step Functions does as the state machine's
+        // EXECUTION ROLE — so a key no cryptographic operation can use, and a role
+        // whose policies do not allow minting a data key with it, each refuse the
+        // start with the modelled `Kms*` error and start nothing. The decision is
+        // taken with no store of this service locked, before the walk.
+        if let Some(refusal) = crate::state::encryption::execution_start_denied(
+            &*self.engine,
+            &region,
+            &machine_arn,
+            &role_arn,
+        ) {
+            return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
+        }
 
         // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here. The walk is
         // bounded by its own step budget, but it is the expensive part of this call,
@@ -617,9 +649,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its own service's reporting call until it ends
         // (`crate::state::run_a_job`). This call answers now, with the execution
         // RUNNING, exactly as the service answers while such a task is parked.
-        if let Some(parked) = parked {
-            store.park_job(&arn, parked, &region);
-            drop(store);
+        let watching = match parked {
+            Some(parked) => {
+                store.park_job(&arn, parked, &region);
+                true
+            }
+            None => false,
+        };
+        // Every guard on this service's store is released here, which is what lets
+        // the two writes below reach another service's store.
+        drop(store);
+        if watching {
             crate::state::run_a_job::watch(
                 std::sync::Arc::clone(&self.engine),
                 ctx.callback().clone(),
@@ -627,6 +667,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn.clone(),
             );
         }
+        // What this start — and every outcome the settle above materialised —
+        // published about itself: the `AWS/States` series the executions are counted
+        // in, and the history events a logging configuration delivers.
+        crate::state::observability::publish(&*self.engine);
 
         Ok(StartExecutionOutput {
             execution_arn: arn,

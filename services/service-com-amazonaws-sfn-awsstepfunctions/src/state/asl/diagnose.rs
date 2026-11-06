@@ -164,6 +164,13 @@ pub struct Diagnostic {
     pub location: Option<String>,
 }
 
+/// The place an `InvalidDefinition` subject states for a diagnostic that sits at no
+/// position in the definition ([`Diagnostic::stated`]).
+///
+/// RECORDED text: the refusal states the place of every subject, and for a diagnostic
+/// about the definition as a whole that place is the bare word `null`.
+const NO_LOCATION_STATED: &str = "null";
+
 impl Diagnostic {
     /// Whether this diagnostic prevents a create or an update: "A value of `ERROR`
     /// means that you cannot create or update a state machine with this
@@ -178,11 +185,17 @@ impl Diagnostic {
     /// The place is joined to the detail by the bare word ` at ` and nothing else, so
     /// the subject reads as one sentence and a client that parses the location out of
     /// a refusal finds it unwrapped.
+    ///
+    /// EVERY subject states a place, including a diagnostic about the definition AS A
+    /// WHOLE — a workflow that declares no terminal state is the recorded one — which
+    /// sits at no position in the document: that place is stated as
+    /// [`NO_LOCATION_STATED`], the way the refusal RECORDS it, so a client parsing the
+    /// location out of a subject finds the same field in every one of them. The
+    /// `location` MEMBER of a `ValidateStateMachineDefinition` diagnostic is a
+    /// different report of the same fact and stays absent there.
     pub(super) fn stated(&self) -> String {
-        match &self.location {
-            Some(location) => format!("{}: {} at {location}", self.code, self.message),
-            None => format!("{}: {}", self.code, self.message),
-        }
+        let location = self.location.as_deref().unwrap_or(NO_LOCATION_STATED);
+        format!("{}: {} at {location}", self.code, self.message)
     }
 }
 

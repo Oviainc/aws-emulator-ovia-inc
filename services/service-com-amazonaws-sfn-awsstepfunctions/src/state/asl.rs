@@ -189,10 +189,6 @@ pub const RESULT_PATH_ERROR: &str = "States.ResultPathMatchFailure";
 /// whose path could not be resolved ("States.ParameterPathFailure").
 pub const PARAMETER_PATH_ERROR: &str = "States.ParameterPathFailure";
 
-/// The ASL predefined error name for a `Choice` state no rule matched and that
-/// declares no `Default` ("States.NoChoiceMatched").
-pub const NO_CHOICE_ERROR: &str = "States.NoChoiceMatched";
-
 /// The ASL predefined error name for a Distributed Map whose failed items went past
 /// its tolerated-failure threshold ("States.ExceedToleratedFailureThreshold").
 pub const TOLERATED_FAILURE_ERROR: &str = "States.ExceedToleratedFailureThreshold";

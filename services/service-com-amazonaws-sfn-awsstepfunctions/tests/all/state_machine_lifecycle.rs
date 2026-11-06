@@ -2147,7 +2147,7 @@ async fn express_executions_are_refused_by_the_operations_that_exclude_them() {
             "StopExecution",
             json!({ "executionArn": execution }),
             400,
-            "ValidationException",
+            "InvalidArn",
         ),
     ];
     for (case, operation, body, expected_status, expected) in cases {

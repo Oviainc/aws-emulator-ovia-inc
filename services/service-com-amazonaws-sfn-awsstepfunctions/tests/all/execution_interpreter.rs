@@ -737,15 +737,15 @@ async fn every_choice_comparator_the_language_defines_is_evaluated() {
     }
 }
 
-/// A `Choice` state no rule matched, and that declares no `Default`, reports ASL's
-/// own `States.NoChoiceMatched`.
+/// A `Choice` state no rule matched, and that declares no `Default`, ends the
+/// execution under the interpreter's own `States.Runtime`.
 #[tokio::test]
 async fn a_choice_with_no_match_and_no_default_reports_no_choice_matched() {
     let cases = [RunCase {
         case: "no rule matches and there is no Default",
         definition: r#"{"StartAt":"C","States":{"C":{"Type":"Choice","Choices":[{"Variable":"$.s","StringEquals":"go","Next":"Then"}]},"Then":{"Type":"Succeed"}}}"#,
         input: r#"{"s":"stop"}"#,
-        expected: Expected::Failure("States.NoChoiceMatched"),
+        expected: Expected::Failure("States.Runtime"),
     }];
 
     let emulator = Emulator::new();

@@ -214,18 +214,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(&input.execution_arn)
                 .and_then(|execution| store.state_machines.get(&execution.state_machine_arn))
                 .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
-            // "This API action is not supported by EXPRESS state machines."
+            // "This API action is not supported by EXPRESS state machines": the ARN
+            // names an execution this action is not for, which is a defect in the
+            // REQUEST rather than an execution that is absent or a combination of
+            // members that cannot hold together — so it is the ARN error every
+            // execution reader of this service refuses an ARN it does not serve with
+            // (`crate::state::read_execution_arn` answers the same `InvalidArn` for
+            // the `express` resource type a synchronous Express execution ARN
+            // carries), worded through the one ARN envelope.
             if express {
-                return Err(StopExecutionErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "StopExecution does not support execution {}, which belongs to an \
-                             EXPRESS state machine",
-                            input.execution_arn
-                        )),
-                        reason: None,
-                    },
-                )
+                return Err(StopExecutionErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(crate::state::invalid_arn_message(format!(
+                        "StopExecution is not supported by {} state machines: {}",
+                        crate::state::STATE_MACHINE_TYPE_EXPRESS, input.execution_arn
+                    ))),
+                })
                 .into());
             }
 
@@ -275,6 +278,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .await;
         }
+
+        // What the stop published about this execution: the series an aborted
+        // execution is counted in, and the history events its logging configuration
+        // delivers. The store guard was released with the block above.
+        crate::state::observability::publish(&*self.engine);
 
         Ok(StopExecutionOutput {
             stop_date: crate::state::to_date_time(stopped.stop_date),

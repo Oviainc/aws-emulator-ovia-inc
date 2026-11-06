@@ -39,10 +39,14 @@ mod client_error_wrappers;
 mod client_refusal_status;
 #[path = "all/completed_map_run_refusal.rs"]
 mod completed_map_run_refusal;
+#[path = "all/control_plane_pass_role.rs"]
+mod control_plane_pass_role;
 #[path = "all/control_plane_refusal_classes.rs"]
 mod control_plane_refusal_classes;
 #[path = "all/definition_field_schema.rs"]
 mod definition_field_schema;
+#[path = "all/definition_finding_subjects.rs"]
+mod definition_finding_subjects;
 #[path = "all/definition_graph_diagnostics.rs"]
 mod definition_graph_diagnostics;
 #[path = "all/definition_path_diagnostics.rs"]
@@ -75,6 +79,8 @@ mod execution_history_state_lifecycle;
 mod execution_interpreter;
 #[path = "all/execution_key_state.rs"]
 mod execution_key_state;
+#[path = "all/execution_observability.rs"]
+mod execution_observability;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
 #[path = "all/execution_role_assumption.rs"]
@@ -105,6 +111,8 @@ mod map_runs;
 mod nested_type_discriminator;
 #[path = "all/parallel_run_a_job.rs"]
 mod parallel_run_a_job;
+#[path = "all/payload_byte_limits.rs"]
+mod payload_byte_limits;
 #[path = "all/refusal_message_fidelity.rs"]
 mod refusal_message_fidelity;
 #[path = "all/refusal_message_wording.rs"]

@@ -233,7 +233,9 @@ impl Chain {
     }
 
     /// One awsQuery call to IAM, signed with the account's own credential.
-    async fn iam(&self, action: &str, params: &[(&str, String)]) -> String {
+    ///
+    /// `pub(crate)` for the same reason [`Self::iam_user`] is.
+    pub(crate) async fn iam(&self, action: &str, params: &[(&str, String)]) -> String {
         let mut body = format!("Action={action}&Version=2010-05-08");
         for (name, value) in params {
             body.push('&');
@@ -267,7 +269,11 @@ impl Chain {
 
     /// An IAM user carrying `policy` as its inline policy, with a long-term access key
     /// of its own: the access key id a request speaks for it with, and the user's ARN.
-    async fn iam_user(&self, user_name: &str, policy: &Value) -> (String, String) {
+    ///
+    /// `pub(crate)` for the reason [`form_encode`] is: `tests/all.rs` is this binary's
+    /// crate root, so a sibling suite that has to call as a BOUNDED principal makes one
+    /// here rather than carrying a second copy of this setup.
+    pub(crate) async fn iam_user(&self, user_name: &str, policy: &Value) -> (String, String) {
         let created = self
             .iam("CreateUser", &[("UserName", user_name.to_string())])
             .await;

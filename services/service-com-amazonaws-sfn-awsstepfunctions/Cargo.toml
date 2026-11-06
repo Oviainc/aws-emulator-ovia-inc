@@ -64,6 +64,16 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # what a `Task` state's integration call is made as: read out of IAM's own store, so
 # this service judges that call against the documents IAM's handlers wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The principal a request's access key id speaks for, read out of STS's own store —
+# the same place `sts:GetCallerIdentity` answers from — so the `iam:PassRole` a
+# control-plane request makes is decided for the identity that signed it.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# Where this service's own observability goes: the `AWS/States` metric series an
+# execution publishes, and the execution-history events a logging configuration
+# delivers — written into the stores CloudWatch's and CloudWatch Logs' own readers
+# answer from, so a published metric and its reader cannot disagree.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

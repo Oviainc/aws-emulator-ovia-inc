@@ -226,7 +226,7 @@ async fn test_state_answers_what_the_single_state_produced() {
             status: "FAILED",
             output: None,
             next_state: None,
-            error: Some("States.NoChoiceMatched"),
+            error: Some("States.Runtime"),
         },
         StateCase {
             case: "a Succeed state ends with the input it was given",

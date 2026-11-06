@@ -191,6 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // `output`'s own documentation: "Length constraints apply to the payload size,
+        // and are expressed as bytes in UTF-8 encoding" — the half of that bound the
+        // centralized walk cannot enforce, since `@length` counts a string's
+        // CHARACTERS. This operation's model declares no `ValidationException`, so the
+        // refusal goes out through the crate's one non-modelled channel, carrying the
+        // same message the walk states for a payload past its bound.
+        if let Some(message) = crate::state::payload_size::payload_refusal("output", &input.output) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         // "The JSON output of the task": a document that is not JSON is refused with
         // the modelled `InvalidOutput` BEFORE anything is read or written, so a
         // refused reply changes nothing — the task stays outstanding and the token

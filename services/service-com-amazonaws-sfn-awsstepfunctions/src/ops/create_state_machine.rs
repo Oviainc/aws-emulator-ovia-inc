@@ -263,6 +263,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Naming that role HANDS this service a role, which is the caller's own
+        // `iam:PassRole`: a caller whose identity-based policies do not let it pass
+        // the role is refused before anything the request names is resolved and
+        // before anything is written. See `crate::service::authorization`.
+        if let Some(why) =
+            crate::service::authorization::pass_role_denial(&*self.engine, ctx, &input.role_arn)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(why));
+        }
+
         // `type`'s own documentation: "Determines whether a Standard or Express state
         // machine is created. The default is STANDARD."
         let sm_type = input

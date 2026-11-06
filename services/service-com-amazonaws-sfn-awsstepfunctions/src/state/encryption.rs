@@ -286,6 +286,76 @@ pub fn state_machine_read_denied<Eng: Send + Sync + 'static>(
     key_denied(engine, ctx, region, &key, READ_OF_SEALED_DATA)
 }
 
+/// Why an execution of the state machine `state_machine_arn` identifies cannot be
+/// STARTED under its customer managed key, or `None` when it can be.
+///
+/// Starting an execution seals the execution's data under the state machine's key, and
+/// Step Functions does that AS THE STATE MACHINE'S EXECUTION ROLE: "the IAM role to
+/// use for this state machine" is the identity the service acts under for the run, and
+/// `kmsDataKeyReusePeriodSeconds` names the call that sealing makes ("when the period
+/// expires, Step Functions will call `GenerateDataKey`"). So the decision here is
+/// about the ROLE rather than about the caller: a role whose identity-based policies do
+/// not allow that call on the key cannot have the execution's data sealed, and the
+/// start is refused with the modelled `KmsAccessDeniedException` — "either your KMS key
+/// policy or API caller does not have the required permissions" — having started
+/// nothing.
+///
+/// The KEY STATE is deliberately not decided here: it is a condition of the key rather
+/// than of an identity, and it is decided by the calls that read or write the sealed
+/// data ([`key_denied`]), which is where this crate decides it for every operation
+/// that touches that data. One question, one place.
+///
+/// `None` wherever nothing of the kind can be shown: a state machine on an Amazon Web
+/// Services owned key (nothing of any identity's is asked of such a key), an engine
+/// carrying no KMS or no IAM store, an identifier naming no key KMS holds, and a role
+/// IAM holds no record for — each is evidence of nothing, so the start proceeds. Call
+/// it with no store of this service locked.
+pub fn execution_start_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    state_machine_arn: &str,
+    role_arn: &str,
+) -> Option<KeyRefusal> {
+    let state = super::service_state(engine)?;
+    // The guard is released before KMS and IAM are consulted: no store of another
+    // service is reached while this one's is held.
+    let key = {
+        let store = state.lock();
+        state_machine_key(&store, state_machine_arn)?
+    };
+    let kms = kms_store::service_state(engine)?;
+    // What the key itself answers, read under the KMS guard and nothing else: the
+    // guard is released before the role's documents are read.
+    let (customer_managed, key_arn) = {
+        let store = kms.lock();
+        let kms_store::KeyRef::Found(found) = store.resolve(region, &key) else {
+            return None;
+        };
+        (
+            found.key_manager == kms_store::KEY_MANAGER_CUSTOMER,
+            found.arn.clone(),
+        )
+    };
+    // An Amazon Web Services managed key's policy is managed by AWS for the service
+    // that owns it, so no identity needs a grant of its own on it.
+    if !customer_managed {
+        return None;
+    }
+    super::task_authorization::role_denial(
+        engine,
+        role_arn,
+        GENERATE_DATA_KEY_ACTION,
+        &key_arn,
+        KMS_SERVICE_NAME,
+    )
+    .map(|why| KeyRefusal::AccessDenied(relayed(&why)))
+}
+
+/// The IAM action minting the data key a payload is sealed with: the KMS operation
+/// `kmsDataKeyReusePeriodSeconds` names, under the `kms` action namespace a policy
+/// grants it in.
+const GENERATE_DATA_KEY_ACTION: &str = "kms:GenerateDataKey";
+
 /// The customer managed key the state machine `arn` names is encrypted under.
 ///
 /// A version is its own stored record carrying its own encryption configuration, and

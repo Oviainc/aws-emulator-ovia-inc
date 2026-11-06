@@ -332,6 +332,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                 );
             }
+            // Replacing the role HANDS this service a role, which is the caller's own
+            // `iam:PassRole`: a caller whose identity-based policies do not let it
+            // pass the role is refused before the state machine is touched, so a
+            // denied privilege escalation does not happen. See
+            // `crate::service::authorization`.
+            if let Some(why) =
+                crate::service::authorization::pass_role_denial(&*self.engine, ctx, role_arn)
+            {
+                return Err(crate::scaffolded::Scaffolded::access_denied(why));
+            }
         }
         if let Some(configuration) = input.encryption_configuration.as_ref() {
             if let Some(why) = crate::state::invalid_encryption_reason(configuration) {

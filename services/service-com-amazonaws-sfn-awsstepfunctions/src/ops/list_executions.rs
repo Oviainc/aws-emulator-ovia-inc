@@ -411,6 +411,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token =
             crate::state::next_page_token(offset, executions.len(), matching.len());
+        // The guard is released before what the settle above materialised is
+        // published: an outcome the clock made due is also what the execution
+        // publishes about having ended.
+        drop(store);
+        crate::state::observability::publish(&*self.engine);
         Ok(ListExecutionsOutput {
             executions,
             next_token,

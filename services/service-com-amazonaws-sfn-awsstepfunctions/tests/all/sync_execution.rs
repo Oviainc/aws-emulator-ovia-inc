@@ -227,7 +227,7 @@ async fn a_sync_start_answers_the_outcome_the_definition_computed() {
             input: Some(r#"{"n":2}"#),
             status: "FAILED",
             output: None,
-            error: Some("States.NoChoiceMatched"),
+            error: Some("States.Runtime"),
             least_millis: 0,
         },
     ];
