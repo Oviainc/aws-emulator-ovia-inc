@@ -99,6 +99,8 @@ mod ephemeris_in_use_writes;
 mod ephemeris_supersession;
 #[path = "all/ephemeris_updates.rs"]
 mod ephemeris_updates;
+#[path = "all/ephemeris_window_selection.rs"]
+mod ephemeris_window_selection;
 #[path = "all/ground_station_inventory.rs"]
 mod ground_station_inventory;
 #[path = "all/ground_station_reservations.rs"]

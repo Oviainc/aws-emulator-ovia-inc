@@ -7,7 +7,9 @@
 //! A REPORT of the ephemerides this account holds, filtered by the request: the window the
 //! caller named is tested against each ephemeris's EXPIRATION time (`startTime`/`endTime`
 //! are documented as "returns ephemerides with expiration times within your specified time
-//! range"), beside the optional `satelliteId`, `ephemerisType` and `statusList` filters.
+//! range"), so an ephemeris that carries no expiration time has none inside the range and
+//! is selected by no window, beside the optional `satelliteId`, `ephemerisType` and
+//! `statusList` filters.
 //! It writes only what the clock already owed: the status moves
 //! `state::settle_due_ephemerides` materialises.
 //!
@@ -279,11 +281,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             // The window is tested against the EXPIRATION time, as both members
             // document ("returns ephemerides with expiration times within your specified
-            // time range"). An ephemeris with no expiration time never expires, so no
-            // window excludes it.
+            // time range"): an ephemeris is selected when the expiration it carries falls
+            // inside the window, both edges included — the one closed-interval reading
+            // every window filter of this service takes
+            // (`crate::state::windows_overlap`). An ephemeris carrying NO expiration has
+            // no expiration time inside the range the request named, so no window selects
+            // it; that is the same reading of an absent expiration the clock-owed move
+            // takes, where it is what keeps such an ephemeris from ever reaching EXPIRED
+            // (`state::settle_due_ephemerides`).
             .filter(|ephemeris| {
-                ephemeris.expiration_time.is_none_or(|expiration| {
-                    (window_start..=window_end).contains(&expiration.as_secs_f64())
+                ephemeris.expiration_time.is_some_and(|expiration| {
+                    let at = expiration.as_secs_f64();
+                    crate::state::windows_overlap((at, at), (window_start, window_end))
                 })
             })
             .map(|ephemeris| EphemerisItem {

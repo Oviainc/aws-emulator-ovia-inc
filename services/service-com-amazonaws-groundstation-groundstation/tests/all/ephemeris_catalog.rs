@@ -127,7 +127,7 @@ pub(crate) async fn create_ok(router: &MultiServiceRouter, case: &str, body: Val
 
 /// A `ListEphemerides` request body: the window every listing must name, plus the members
 /// of `extra`.
-fn filters(window: (i64, i64), extra: Value) -> Value {
+pub(crate) fn filters(window: (i64, i64), extra: Value) -> Value {
     let mut body = json!({"startTime": window.0, "endTime": window.1});
     for (member, value) in extra.as_object().into_iter().flatten() {
         body[member] = value.clone();
@@ -138,7 +138,7 @@ fn filters(window: (i64, i64), extra: Value) -> Value {
 /// Every item `ListEphemerides` returns for `request`, across as many pages as it takes,
 /// in the order the listing gave them. `page_size` is the caller's `maxResults`, or `None`
 /// to name none.
-async fn list_all(
+pub(crate) async fn list_all(
     router: &MultiServiceRouter,
     request: &Value,
     page_size: Option<i64>,
@@ -209,7 +209,7 @@ async fn list_all(
 }
 
 /// The ids `ListEphemerides` reports for `request`, in the order it gave them.
-async fn list_ids(router: &MultiServiceRouter, request: &Value) -> Vec<String> {
+pub(crate) async fn list_ids(router: &MultiServiceRouter, request: &Value) -> Vec<String> {
     list_all(router, request, None)
         .await
         .iter()
@@ -610,8 +610,8 @@ async fn an_ephemeris_whose_request_names_no_expiration_takes_its_data_s_own() {
 
     // The window the listing names selects on the EXPIRATION time, so an ephemeris created
     // without one is listed under the end of its own data's validity, and one whose data
-    // declares no validity at all is listed whatever window is asked for: it does not
-    // expire.
+    // declares no validity at all carries no expiration time for the window to select on,
+    // so no window lists it.
     for form in data_forms() {
         let id = create_ok(
             &router,
@@ -643,11 +643,10 @@ async fn an_ephemeris_whose_request_names_no_expiration_takes_its_data_s_own() {
             None => {
                 for window in [(1_i64, 2_i64), (PAST, PAST + 60), WHOLE_WINDOW] {
                     let listed = list_ids(&router, &filters(window, json!({}))).await;
-                    assert_eq!(
-                        listed,
-                        vec![id.clone()],
-                        "case {} window {window:?}: an ephemeris with no expiration is excluded \
-                         by no window, got {listed:?}",
+                    assert!(
+                        listed.is_empty(),
+                        "case {} window {window:?}: an ephemeris carrying no expiration time \
+                         has none inside the window, so no window selects it, got {listed:?}",
                         form.case
                     );
                 }
