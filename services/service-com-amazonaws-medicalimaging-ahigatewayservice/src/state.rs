@@ -466,16 +466,45 @@ pub fn constraint_clause(violation: &Violation) -> String {
         // than guessing at its parts.
         return rendered;
     };
-    let requirement = match &violation.kind {
-        ViolationKind::Pattern(pattern) => {
-            requirement.replace(pattern.as_str(), unanchored(pattern))
-        }
-        _ => requirement.to_string(),
-    };
+    let requirement = service_requirement(&violation.kind, requirement);
     if withholds_value(&violation.path) {
         return format!("{}{CONSTRAINT_SEPARATOR}{requirement}", violation.path);
     }
     format!("{subject}{CONSTRAINT_SEPARATOR}{requirement}")
+}
+
+/// The requirement half of a clause as THIS service words it: the framework's own words,
+/// with a `@pattern` quoted without the `^` / `$` the model spells it with — the one
+/// rewording [`constraint_clause`] applies to a requirement, kept here so a refusal
+/// stating a requirement on its own is worded by the same rule.
+fn service_requirement(kind: &ViolationKind, rendered: &str) -> String {
+    match kind {
+        ViolationKind::Pattern(pattern) => rendered.replace(pattern.as_str(), unanchored(pattern)),
+        _ => rendered.to_string(),
+    }
+}
+
+/// The REQUIREMENT one violation kind states, with no subject in front of it — the words
+/// a clause carries after `failed to satisfy constraint: `.
+///
+/// For a constraint a HANDLER applies to a value it found INSIDE a member the boundary
+/// validator does not walk, such as an attribute of a JSON document carried in a blob:
+/// the clause names the blob member it was carried in ([`handler_requirement_error`]) and
+/// the requirement says which constraint of which attribute the value failed. Worded
+/// through the framework's own rendering, so a bound, a length or a pattern reads exactly
+/// as the boundary states the same constraint on a member it does walk.
+pub fn constraint_requirement(kind: ViolationKind) -> String {
+    let violation = Violation {
+        path: String::new(),
+        kind,
+        value: None,
+        sensitive: true,
+    };
+    let rendered = violation.message();
+    match rendered.rsplit_once(CONSTRAINT_SEPARATOR) {
+        Some((_, requirement)) => service_requirement(&violation.kind, requirement),
+        None => rendered,
+    }
 }
 
 /// The members whose value a refusal WITHHOLDS, spelled out so the rule's scope is

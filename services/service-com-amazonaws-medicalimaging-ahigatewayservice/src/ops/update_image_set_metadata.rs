@@ -28,7 +28,12 @@
 //!     version is not a previous one and is refused with `ValidationException` (400).
 //! * an attribute the model NAMES (`DICOMTags`, sixteen members) is written to that
 //!   member, so what `SearchImageSets` filters on and what the metadata document reports
-//!   never disagree. Every OTHER attribute — DICOM defines thousands — is persisted at the
+//!   never disagree. Only a value that member can legally carry is written: the document
+//!   arrives in a blob the boundary validator does not walk, so every constraint the model
+//!   declares on the member it is destined for — its kind, its `@length`, its `@pattern`,
+//!   its `@range` ([`ModelledAttribute::unmet_requirement`]) — is applied here instead, and
+//!   a value that fails one is refused with `ValidationException` (400) rather than
+//!   persisted. Every OTHER attribute — DICOM defines thousands — is persisted at the
 //!   path it was written at ([`crate::state::ImageSetAttributes::extra_attributes`]) and
 //!   reported from there, rather than accepted and dropped. The model names the attributes
 //!   of ONE series per image set, the series its `dicomSeriesInstanceUID` identifies
@@ -145,6 +150,7 @@
 use super::types::*;
 
 use ::serde_json::{Map, Value};
+use ::smithy_server_runtime::ViolationKind;
 
 use crate::state::{
     ImageSet, ImageSetAttributes, ImageSetState, ImageSetWorkflowStatus,
@@ -228,6 +234,53 @@ impl AttributeKind {
     }
 }
 
+/// The `@range` MAXIMUM the model declares on both study counts —
+/// `DICOMNumberOfStudyRelatedSeries` and `DICOMNumberOfStudyRelatedInstances`
+/// (`smithy_query(query="shape",shape="DICOMTags")`), each `@range(min: 0, max: 1000000)`.
+const MAX_STUDY_RELATED_COUNT: i64 = 1_000_000;
+
+/// The `@range` `DICOMSeriesNumber` declares
+/// (`smithy_query(query="shape",shape="DICOMTags")`:
+/// `@range(min: -2147483648, max: 2147483647)`) — the whole of the 32-bit integer the
+/// model types every numeric member of the shape at, so it bounds any of them that
+/// declares no narrower range of its own.
+const INTEGER_MEMBER_RANGE: (i64, i64) = (i32::MIN as i64, i32::MAX as i64);
+
+/// The `@pattern` a modelled attribute's member declares. The model declares ONE
+/// expression across the members that have one, so it is named rather than compiled: a
+/// variant per expression, with the text to quote in a refusal and the test to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributePattern {
+    /// What a DICOM Unique Identifier is: the pattern both the Study and the Series
+    /// Instance UID members declare.
+    DicomUid,
+}
+
+impl AttributePattern {
+    /// The expression itself, copied verbatim from the model
+    /// (`smithy_query(query="shape",shape="DICOMTags")`) — the text a refusal quotes.
+    fn declared(self) -> &'static str {
+        match self {
+            Self::DicomUid => "^[0-9.]+$",
+        }
+    }
+
+    /// Whether `text` satisfies it.
+    ///
+    /// A character class is a MEMBERSHIP test rather than a pattern language, so the class
+    /// and the `+` quantifier between the `^` and the `$` are applied character by
+    /// character — the way this service applies the pattern on a tag key
+    /// (`crate::state::tag_key_matches_pattern`): the check then costs one pass over the
+    /// value with no regex engine on a path that reads request text.
+    fn matches(self, text: &str) -> bool {
+        match self {
+            Self::DicomUid => {
+                !text.is_empty() && text.chars().all(|digit| digit.is_ascii_digit() || digit == '.')
+            }
+        }
+    }
+}
+
 /// One attribute the MODEL names: the `DICOMTags` member the document's keyword at that
 /// level maps to.
 ///
@@ -268,15 +321,123 @@ impl ModelledAttribute {
         }
     }
 
-    /// Whether `value` is of the kind this attribute holds — an integer the modelled
-    /// member can carry, or text.
+    /// Whether `value` is one this attribute's modelled member can legally carry: of the
+    /// kind the member holds AND within every constraint the model declares on it
+    /// ([`ModelledAttribute::unmet_requirement`]).
     fn admits(self, value: &Value) -> bool {
-        match self.kind() {
-            AttributeKind::Integer => value
-                .as_i64()
-                .is_some_and(|number| i32::try_from(number).is_ok()),
-            AttributeKind::Text => value.is_string(),
+        self.unmet_requirement(value).is_none()
+    }
+
+    /// The `@length` MAXIMUM the model declares on this attribute's member, or `None` for
+    /// one holding a number (`smithy_query(query="shape",shape="DICOMTags")`).
+    ///
+    /// Each text member's `@length` minimum is 0, which every string satisfies, so the
+    /// maximum is the whole of the bound there is to apply.
+    fn max_length(self) -> Option<usize> {
+        match self {
+            Self::PatientId
+            | Self::PatientName
+            | Self::StudyInstanceUid
+            | Self::StudyId
+            | Self::StudyDescription
+            | Self::AccessionNumber
+            | Self::SeriesInstanceUid => Some(512),
+            Self::PatientBirthDate | Self::StudyDate => Some(36),
+            Self::StudyTime => Some(56),
+            Self::PatientSex => Some(16),
+            Self::SeriesModality => Some(32),
+            Self::SeriesBodyPart => Some(128),
+            Self::StudyRelatedSeries | Self::StudyRelatedInstances | Self::SeriesNumber => None,
         }
+    }
+
+    /// The `@pattern` the model declares on this attribute's member, or `None` when it
+    /// declares none (`smithy_query(query="shape",shape="DICOMTags")`): the two UID members
+    /// are the ones that carry one.
+    fn pattern(self) -> Option<AttributePattern> {
+        match self {
+            Self::StudyInstanceUid | Self::SeriesInstanceUid => Some(AttributePattern::DicomUid),
+            _ => None,
+        }
+    }
+
+    /// The `@range` this attribute's member carries, as the inclusive pair of bounds
+    /// (`smithy_query(query="shape",shape="DICOMTags")`): the two study counts are bounded
+    /// at a million, and every other numeric member carries
+    /// [`INTEGER_MEMBER_RANGE`] — the `@range` the series number declares, which is also
+    /// the integer width the model types the shape's numeric members at, so a numeric
+    /// member declaring no `@range` of its own is still bounded by what it can hold.
+    ///
+    /// Read only for a member [`ModelledAttribute::kind`] says holds a number.
+    fn range(self) -> (i64, i64) {
+        match self {
+            Self::StudyRelatedSeries | Self::StudyRelatedInstances => (0, MAX_STUDY_RELATED_COUNT),
+            _ => INTEGER_MEMBER_RANGE,
+        }
+    }
+
+    /// The requirement `value` FAILS as this attribute's modelled member, or `None` when
+    /// it satisfies every one of them.
+    ///
+    /// The member is a constrained shape, so a document may only write a value the member
+    /// can carry: of the kind it holds, then every constraint the model declares on it.
+    fn unmet_requirement(self, value: &Value) -> Option<String> {
+        match self.kind() {
+            AttributeKind::Integer => self.unmet_number_requirement(value),
+            AttributeKind::Text => self.unmet_text_requirement(value),
+        }
+    }
+
+    /// [`ModelledAttribute::unmet_requirement`] for a member holding a NUMBER: a JSON
+    /// integer, inside the member's `@range`.
+    ///
+    /// The requirement is worded by the framework
+    /// ([`crate::state::constraint_requirement`]), so a refusal stated here reads like the
+    /// one the boundary states for the same constraint on a member it does walk.
+    fn unmet_number_requirement(self, value: &Value) -> Option<String> {
+        let Some(number) = value.as_i64() else {
+            return Some(self.kind_requirement());
+        };
+        let (min, max) = self.range();
+        let violated = if number < min {
+            Some(ViolationKind::MinValue(min.to_string()))
+        } else if number > max {
+            Some(ViolationKind::MaxValue(max.to_string()))
+        } else {
+            None
+        };
+        violated.map(crate::state::constraint_requirement)
+    }
+
+    /// [`ModelledAttribute::unmet_requirement`] for a member holding TEXT: a JSON string,
+    /// inside the member's `@length` and matching its `@pattern`.
+    ///
+    /// The two constraints are checked in the order the boundary validator's own leaf walk
+    /// runs the traits — the length bound, then the pattern — so a value breaking both is
+    /// refused the way the boundary would have refused it.
+    fn unmet_text_requirement(self, value: &Value) -> Option<String> {
+        let Some(text) = value.as_str() else {
+            return Some(self.kind_requirement());
+        };
+        // `@length` on a string counts CHARACTERS, which is how the boundary validator
+        // counts the same member's length.
+        let length = text.chars().count();
+        let over_long = self.max_length().filter(|max| length > *max);
+        let violated = match (over_long, self.pattern()) {
+            (Some(max), _) => Some(ViolationKind::MaxLength(max as i64)),
+            (None, Some(pattern)) if !pattern.matches(text) => {
+                Some(ViolationKind::Pattern(pattern.declared().to_string()))
+            }
+            _ => None,
+        };
+        violated.map(crate::state::constraint_requirement)
+    }
+
+    /// The requirement a value of the WRONG KIND for this attribute fails — the one
+    /// requirement no modelled constraint states, since the document carries a value's kind
+    /// where a member's schema states it.
+    fn kind_requirement(self) -> String {
+        format!("Member must hold {}", self.kind().described())
     }
 
     /// What this attribute's modelled member HOLDS, spelled as the aggregated metadata
@@ -491,9 +652,10 @@ fn settle_modelled_series(attributes: &mut ImageSetAttributes, described: Option
             let Some(value) = value_at(&attributes.extra_attributes, &at).cloned() else {
                 continue;
             };
-            // A value of another kind than the model types the member as stays where it
-            // was written: the member carries what the model says it carries, and nothing
-            // is dropped for it.
+            // A value the modelled member cannot legally carry — of another kind than the
+            // model types the member as, or outside the constraints it declares — stays
+            // where it was written: the member carries what the model says it carries, and
+            // nothing is dropped for it.
             if !modelled.admits(&value) {
                 continue;
             }
@@ -688,15 +850,9 @@ fn apply_document(
                 remove_at(&mut attributes.extra_attributes, &at);
             }
             Some(modelled) => {
-                if !modelled.admits(&value) {
+                if let Some(requirement) = modelled.unmet_requirement(&value) {
                     let keyword = at.last().cloned().unwrap_or_default();
-                    return Err(refuse(
-                        path,
-                        &format!(
-                            "Member must hold {} for {keyword}",
-                            modelled.kind().described()
-                        ),
-                    ));
+                    return Err(refuse(path, &format!("{requirement} for {keyword}")));
                 }
                 modelled.write(&mut attributes.dicom_tags, Some(&value));
                 remove_at(&mut attributes.extra_attributes, &at);
