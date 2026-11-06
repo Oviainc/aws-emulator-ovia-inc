@@ -94,6 +94,9 @@ mod vpc_endpoints;
 /// subnets is in, resolved against the service that owns subnets.
 pub mod vpc_network;
 
+/// Which analyzer an index's field mappings may name, and the refusal of one nothing
+/// configures.
+mod analyzers;
 /// An index of a domain, the schema it carries and the settings around it.
 mod indexes;
 /// A package of this account and its association with a domain.
@@ -113,6 +116,7 @@ mod projections;
 /// The payloads this service refuses a request with, one per condition.
 mod refusals;
 
+pub use analyzers::*;
 pub use domains::*;
 pub use indexes::*;
 pub use instance_types::*;

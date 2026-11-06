@@ -264,6 +264,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A mapped field names its analyzer BY NAME, and that name has to resolve for
+        // the mapping to be parsed at all: either the engine ships the analyzer or the
+        // index's analysis settings define one under that name — the settings the index
+        // already carries as well as the ones this request adds, since an earlier write
+        // may have defined the analyzer this one refers to. A name nothing resolves is
+        // refused before anything is written, so neither the analyzer name nor the field
+        // that named it reaches the stored schema. Decided after the files the analysis
+        // settings name are resolved, because the cluster builds the index's analysis
+        // from its settings before it parses the mappings against it.
+        if let Some(analyzer) = crate::state::unconfigured_analyzer(
+            &input.index_schema,
+            &[&index.schema, &input.index_schema],
+        ) {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::analyzer_not_configured(&analyzer),
+            )
+            .into());
+        }
+
         // A field's type is settled by the write that first maps it: a later update
         // may add to that field's mapping but not re-type it. Checked against the
         // STORED schema and before anything is written, so a refused update leaves

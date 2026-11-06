@@ -119,6 +119,8 @@ mod fixed_sentence_refusals;
 mod inbound_connection_acceptance;
 #[path = "all/inbound_connections.rs"]
 mod inbound_connections;
+#[path = "all/index_analyzer_resolution.rs"]
+mod index_analyzer_resolution;
 #[path = "all/index_authorization.rs"]
 mod index_authorization;
 #[path = "all/index_deletion.rs"]

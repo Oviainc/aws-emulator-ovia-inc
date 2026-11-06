@@ -288,6 +288,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A mapped field names its analyzer BY NAME, and that name has to resolve for
+        // the mapping to be parsed at all: either the engine ships the analyzer or this
+        // schema's own analysis settings define one under that name. A name nothing
+        // resolves is refused before anything is stored, so no index is created — the
+        // same rule `UpdateIndex` applies to the mappings it merges, decided after the
+        // files the analysis settings name are resolved because the cluster builds the
+        // index's analysis from its settings before it parses the mappings against it.
+        if let Some(analyzer) =
+            crate::state::unconfigured_analyzer(&input.index_schema, &[&input.index_schema])
+        {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                crate::state::analyzer_not_configured(&analyzer),
+            )
+            .into());
+        }
+
         domain.indexes.insert(
             input.index_name.clone(),
             Index {
