@@ -34,7 +34,11 @@
 //! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
 //! `ops/get_evaluation_job.rs` reads back, together with the instant each job's
 //! non-terminal status is owed its move to a terminal one and the instant each job
-//! `ops/batch_delete_evaluation_job.rs` accepted for deletion is owed its removal.
+//! `ops/batch_delete_evaluation_job.rs` accepted for deletion is owed its removal. Each of
+//! those records also holds what the job's WORK established — whether its run is still owed,
+//! the terminal status that run decided and the sentences a job that could not be run
+//! reports ([`evaluation_run`]) — because a job reported as having run and the result
+//! objects under its output prefix are two sides of one run.
 //!
 //! And it holds the advanced prompt optimization jobs
 //! `ops/create_advanced_prompt_optimization_job.rs` mints,
@@ -200,6 +204,9 @@ use crate::ops::types::{
     ModelInvocationJobInputDataConfig, ModelInvocationJobOutputDataConfig,
     ModelInvocationJobSummary,
     EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,
+    EvaluationInferenceConfigSummary, EvaluationModelConfigSummary, EvaluationModelConfig,
+    EvaluationPrecomputedRagSourceConfig, EvaluationRagConfigSummary, EvaluationSummary,
+    EvaluatorModelConfig, KnowledgeBaseConfig, RAGConfig,
     FoundationModelLifecycle, FoundationModelSummary, GuardrailAutomatedReasoningPolicy,
     GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
@@ -230,6 +237,19 @@ use crate::ops::types::{
 /// another emulated service (object storage, and the inference surface), while the record
 /// and its lifecycle live here.
 pub mod model_invocation_run;
+
+/// The WORK an automated evaluation job performs: the prompts it reads out of its
+/// configured datasets, the inference it performs over each one, the metrics it scores that
+/// inference with and the result records it writes under its output prefix. Beside this
+/// module for the reason [`model_invocation_run`] is: it reaches another emulated service
+/// (object storage, and the inference surface), while the record and its lifecycle live
+/// here.
+pub mod evaluation_run;
+
+/// The prompt datasets an evaluation job runs over: the built-in ones a job names by name,
+/// and the reading of a caller's own one out of object storage. Beside
+/// [`evaluation_run`], which is its only caller, for the same reason.
+pub mod evaluation_datasets;
 
 /// Whether the Amazon S3 location a model source names satisfies the Amazon-managed-bucket
 /// pre-condition the member carrying it states. Beside this module for the reason

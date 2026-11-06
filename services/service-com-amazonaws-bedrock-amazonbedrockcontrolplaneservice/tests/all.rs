@@ -69,6 +69,10 @@ mod enum_value_set_listing;
 mod enum_value_set_order;
 #[path = "all/evaluation_job_completion.rs"]
 mod evaluation_job_completion;
+#[path = "all/evaluation_job_execution.rs"]
+mod evaluation_job_execution;
+#[path = "all/evaluation_job_listing.rs"]
+mod evaluation_job_listing;
 #[path = "all/evaluation_jobs.rs"]
 mod evaluation_jobs;
 #[path = "all/foundation_model_agreement_offers.rs"]

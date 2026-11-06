@@ -94,6 +94,7 @@ fn enforcement(words: Vec<BlockedWord>, included: &[&str], excluded: &[&str]) ->
         blocked_outputs_messaging: BLOCKED_OUTPUT.to_string(),
         words,
         managed_word_lists: Vec::new(),
+        content_filters: Vec::new(),
         included_models: included.iter().map(|id| (*id).to_string()).collect(),
         excluded_models: excluded.iter().map(|id| (*id).to_string()).collect(),
         system_guarded_selectively: false,

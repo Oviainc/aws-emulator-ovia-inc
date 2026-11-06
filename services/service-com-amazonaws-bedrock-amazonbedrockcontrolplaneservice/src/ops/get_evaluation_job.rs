@@ -5,11 +5,16 @@
 //! ## What this handler does
 //!
 //! Reports one stored evaluation job, read out of the record `CreateEvaluationJob` wrote.
-//! A reporting operation: the only write it makes is to materialise the status transition
-//! the clock had already made due — a running job's move to `Completed` after
-//! [`crate::state::EVALUATION_JOB_COMPLETE_AFTER`], or a stopping job's move to `Stopped` —
-//! which was owed at that instant even if nobody had called, so two reads inside one span
-//! answer alike.
+//! A reporting operation: the only writes it makes are the ones the CLOCK had already made
+//! due — the status transition a running job's move to its terminal status is, or a stopping
+//! job's move to `Stopped`, owed at its due instant even if nobody had called, so two reads
+//! inside one span answer alike — and the job's own RUN, which the create made due and this
+//! read performs once ([`crate::state::evaluation_run::run_evaluation`]): the records of
+//! every dataset the job names, evaluated on the model its `inferenceConfig` names under the
+//! guardrail this account enforces, and saved under `outputDataConfig.s3Uri`. So a client
+//! that reads this job and then lists that prefix finds the results there, and a job whose
+//! configuration could not be run reports the modelled `Failed` with its `failureMessages`
+//! rather than `Completed` with nothing saved.
 //!
 //! ## Shape of an operation
 //!
@@ -179,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetEvaluationJobErrorModeled::InternalServerException(
@@ -194,17 +199,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries the region the job was created in — so the identifier addresses the
         // store on its own, and an ARN of another region names no job here.
         let now = ::std::time::SystemTime::now();
+        let not_found = || {
+            GetEvaluationJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::evaluation_job_not_found(
+                    &input.job_identifier,
+                )),
+            })
+        };
+
+        // The work the create made due, taken here and performed before this read answers: an
+        // accepted evaluation job evaluates its configured datasets on the model it names and
+        // saves the results under its output prefix, so a client that lists that prefix
+        // straight after reading the job finds them
+        // (`crate::state::evaluation_run::run_evaluation`). It is collected while the store is
+        // locked and performed after the guard is dropped, so no lock is held across the
+        // in-process calls into the object store and the inference surface, and it is taken
+        // ONCE per job, so this read reports what the run established without changing it for
+        // the next caller.
+        let due = {
+            let mut store = state.lock();
+            let Some(job) = store.evaluation_job(&input.job_identifier, now) else {
+                return Err(not_found().into());
+            };
+            job.due_run()
+        };
+        if let Some(due) = due {
+            let outcome =
+                crate::state::evaluation_run::run_evaluation(&*self.engine, ctx, &due).await;
+            if let Some(job) = state.lock().evaluation_jobs.get_mut(&due.arn) {
+                job.record_run(outcome);
+            }
+        }
+
         let mut store = state.lock();
         let Some(job) = store.evaluation_job(&input.job_identifier, now) else {
-            return Err(GetEvaluationJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no evaluation job answers to {} in this account",
-                        input.job_identifier
-                    )),
-                },
-            )
-            .into());
+            return Err(not_found().into());
         };
 
         Ok(GetEvaluationJobOutput {
@@ -221,10 +250,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_data_config: job.output_data_config.clone(),
             creation_time: crate::state::date_time(job.created_at),
             last_modified_time: Some(crate::state::date_time(job.last_modified_at)),
-            // "A list of strings that specify why the evaluation job failed to create": a
-            // job that is running or that ran to completion has none, and nothing here
-            // fails an accepted job, so no stored job carries any.
-            failure_messages: None,
+            // "A list of strings that specify why the evaluation job failed to create": the
+            // sentences the job's own run failed on, reported for a job that FAILED and for
+            // no other — a job that is still running, or that ran, has no failure to report.
+            failure_messages: (job.status == crate::state::EVALUATION_JOB_STATUS_FAILED
+                && !job.failure_messages.is_empty())
+                .then(|| job.failure_messages.clone()),
         })
     }
 }

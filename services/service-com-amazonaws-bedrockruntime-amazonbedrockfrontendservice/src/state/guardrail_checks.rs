@@ -375,9 +375,14 @@ const PERSON: &str = r"(?:you|your|yourself|him|his|her|hers|them|their|themselv
 /// toxicity analysis, and the calibration is stated here in the type the member is
 /// modelled as: this member is a `Double`, so the midpoints are computed in `f64`
 /// rather than widened from the `Float` that member carries.
-const MILD_SEVERITY: f64 = 1.0 / 6.0;
-const MODERATE_SEVERITY: f64 = 0.5;
-const SEVERE_SEVERITY: f64 = 5.0 / 6.0;
+///
+/// They are `pub` because the ENFORCED guardrail reads them
+/// ([`super::enforced_guardrail`]): a configured filter blocks a category from a
+/// level upwards, so the level a severity stands for has to be the same number on
+/// both sides of that comparison.
+pub const MILD_SEVERITY: f64 = 1.0 / 6.0;
+pub const MODERATE_SEVERITY: f64 = 0.5;
+pub const SEVERE_SEVERITY: f64 = 5.0 / 6.0;
 
 /// The modelled content-filter categories the profanity/abuse engine classifies,
 /// each with the engine category that classifies it.

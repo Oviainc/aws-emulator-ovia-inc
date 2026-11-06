@@ -168,9 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job) = store.evaluation_job(&input.job_identifier, now) else {
             return Err(StopEvaluationJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no evaluation job answers to {} in this account",
-                        input.job_identifier
+                    message: Some(crate::state::evaluation_job_not_found(
+                        &input.job_identifier,
                     )),
                 },
             )

@@ -548,6 +548,141 @@ pub fn evaluation_job_type_of(config: &EvaluationConfig) -> &'static str {
     }
 }
 
+/// The `EvaluationSummary` `ListEvaluationJobs` reports for a stored job.
+///
+/// Every member comes off the stored record, so a listing and a read of the same job agree:
+/// the identity and status the job holds now, the task types its `datasetMetricConfigs`
+/// name, and the models or RAG sources its `inferenceConfig` names — reported both in the
+/// `inferenceConfigSummary` and, for the models, in the deprecated `modelIdentifiers` member
+/// AWS still populates ("Inference identifiers should be retrieved from the
+/// inferenceConfigSummary", `smithy_query(query="shape",shape="EvaluationSummary")`), since
+/// a client reading either must see the same configuration.
+#[must_use]
+pub fn evaluation_summary(record: &EvaluationJobRecord) -> EvaluationSummary {
+    let (bedrock_models, precomputed_sources) = match &record.inference_config {
+        EvaluationInferenceConfig::Models(models) => models.iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut bedrock, mut precomputed), model| {
+                match model {
+                    EvaluationModelConfig::bedrockModel(model) => {
+                        bedrock.push(model.model_identifier.clone());
+                    }
+                    EvaluationModelConfig::precomputedInferenceSource(source) => {
+                        precomputed.push(source.inference_source_identifier.clone());
+                    }
+                }
+                (bedrock, precomputed)
+            },
+        ),
+        EvaluationInferenceConfig::ragConfigs(_) => (Vec::new(), Vec::new()),
+    };
+    let (knowledge_bases, precomputed_rag) = match &record.inference_config {
+        EvaluationInferenceConfig::ragConfigs(configs) => configs.iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut bases, mut precomputed), config| {
+                match config {
+                    RAGConfig::knowledgeBaseConfig(KnowledgeBaseConfig::retrieveConfig(
+                        retrieve,
+                    )) => bases.push(retrieve.knowledge_base_id.clone()),
+                    RAGConfig::knowledgeBaseConfig(
+                        KnowledgeBaseConfig::retrieveAndGenerateConfig(generate),
+                    ) => bases.extend(
+                        generate
+                            .knowledge_base_configuration
+                            .as_ref()
+                            .map(|configuration| configuration.knowledge_base_id.clone()),
+                    ),
+                    RAGConfig::precomputedRagSourceConfig(
+                        EvaluationPrecomputedRagSourceConfig::retrieveSourceConfig(source),
+                    ) => precomputed.push(source.rag_source_identifier.clone()),
+                    RAGConfig::precomputedRagSourceConfig(
+                        EvaluationPrecomputedRagSourceConfig::retrieveAndGenerateSourceConfig(
+                            source,
+                        ),
+                    ) => precomputed.push(source.rag_source_identifier.clone()),
+                }
+                (bases, precomputed)
+            },
+        ),
+        EvaluationInferenceConfig::Models(_) => (Vec::new(), Vec::new()),
+    };
+    let automated = match &record.evaluation_config {
+        EvaluationConfig::Automated(automated) => Some(automated),
+        EvaluationConfig::Human(_) => None,
+    };
+    // `EvaluatorModelIdentifiers` is `@length(0..1)`, as the one `bedrockEvaluatorModels`
+    // entry a configuration may name is.
+    let evaluator_models = |models: Option<&EvaluatorModelConfig>| {
+        models
+            .map(|config| {
+                let EvaluatorModelConfig::bedrockEvaluatorModels(models) = config;
+                models
+                    .iter()
+                    .map(|model| model.model_identifier.clone())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    };
+    EvaluationSummary {
+        job_arn: record.arn.clone(),
+        job_name: record.name.clone(),
+        status: record.status.to_string(),
+        creation_time: date_time(record.created_at),
+        job_type: record.job_type.to_string(),
+        evaluation_task_types: evaluation_task_types(&record.evaluation_config),
+        model_identifiers: Some(bedrock_models.clone()),
+        rag_identifiers: Some(knowledge_bases.clone()),
+        evaluator_model_identifiers: Some(evaluator_models(
+            automated.and_then(|automated| automated.evaluator_model_config.as_ref()),
+        )),
+        custom_metrics_evaluator_model_identifiers: Some(
+            automated
+                .and_then(|automated| automated.custom_metric_config.as_ref())
+                .map(|config| {
+                    config
+                        .evaluator_model_config
+                        .bedrock_evaluator_models
+                        .iter()
+                        .map(|model| model.model_identifier.clone())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default(),
+        ),
+        inference_config_summary: Some(EvaluationInferenceConfigSummary {
+            model_config_summary: Some(EvaluationModelConfigSummary {
+                bedrock_model_identifiers: Some(bedrock_models),
+                precomputed_inference_source_identifiers: Some(precomputed_sources),
+            }),
+            rag_config_summary: Some(EvaluationRagConfigSummary {
+                bedrock_knowledge_base_identifiers: Some(knowledge_bases),
+                precomputed_rag_source_identifiers: Some(precomputed_rag),
+            }),
+        }),
+        application_type: record.application_type.clone(),
+    }
+}
+
+/// The `evaluationTaskTypes` of a job: the `taskType` of each `datasetMetricConfigs` entry
+/// its configuration carries, each reported ONCE and in the order the entries name them.
+///
+/// `EvaluationTaskTypes` is `@length(1..5)`, as `EvaluationDatasetMetricConfigs` is, and
+/// both configuration variants carry that list — so the task types of a job are the task
+/// types its entries configure, whether workers or this service compute its metrics.
+#[must_use]
+pub fn evaluation_task_types(config: &EvaluationConfig) -> Vec<String> {
+    let entries = match config {
+        EvaluationConfig::Automated(automated) => &automated.dataset_metric_configs,
+        EvaluationConfig::Human(human) => &human.dataset_metric_configs,
+    };
+    let mut task_types: Vec<String> = Vec::new();
+    for entry in entries {
+        if !task_types.contains(&entry.task_type) {
+            task_types.push(entry.task_type.clone());
+        }
+    }
+    task_types
+}
+
 /// The ARN of a Provisioned Throughput in `region`:
 /// `arn:aws:bedrock:<region>:<account>:provisioned-model/<id>`, as `ProvisionedModelArn`
 /// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:provisioned-model/[a-z0-9]{12}$`)

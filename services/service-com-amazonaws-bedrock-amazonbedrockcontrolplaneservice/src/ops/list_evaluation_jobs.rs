@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEvaluationJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEvaluationJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEvaluationJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Reports the stored evaluation jobs of the account-region the request addressed, one
+//! `EvaluationSummary` apiece, filtered by the members the request carried and paged with
+//! the cursor every paginated listing of this service pages with. A reporting operation: the
+//! only writes it makes are the ones the CLOCK had already made due — each job's status
+//! transition, and the RUN the create made due
+//! ([`crate::state::evaluation_run::run_evaluation`]) — so the status this listing reports
+//! for a job is the status a read of that one job reports at the same instant, and a job it
+//! reports in a terminal status has its results under its output prefix.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +150,60 @@ impl<Eng> ListEvaluationJobs<Eng> {
     }
 }
 
+/// The most summaries one page of this listing carries.
+///
+/// The MODELLED ceiling of the response's own list: `jobSummaries` targets
+/// `EvaluationSummaries`, which is `@length(min: 1, max: 5)`
+/// (`smithy_query(query="operation",operation="ListEvaluationJobs")`) — so a page carries at
+/// most five jobs however large a `maxResults` the request asks for (that member is modelled
+/// `range 1..1000`), and the jobs past it are reported on the next page.
+const MAX_PAGE_SIZE: usize = 5;
+
+/// `SortOrder` — oldest first, which is the order an absent `sortOrder` takes.
+const SORT_ASCENDING: &str = "Ascending";
+
+/// Whether every filter `input` carries holds for `record`.
+///
+/// The time bounds are STRICT, as the members word them: jobs created "after a specified
+/// time" and "before a specified time".
+fn matches(input: &ListEvaluationJobsInput, record: &crate::state::EvaluationJobRecord) -> bool {
+    let created = crate::state::epoch_seconds(record.created_at);
+    if let Some(after) = input.creation_time_after.as_ref() {
+        if created <= after.as_secs_f64() {
+            return false;
+        }
+    }
+    if let Some(before) = input.creation_time_before.as_ref() {
+        if created >= before.as_secs_f64() {
+            return false;
+        }
+    }
+    if input
+        .status_equals
+        .as_deref()
+        .is_some_and(|status| status != record.status)
+    {
+        return false;
+    }
+    if input
+        .application_type_equals
+        .as_deref()
+        .is_some_and(|application_type| {
+            record.application_type.as_deref() != Some(application_type)
+        })
+    {
+        return false;
+    }
+    if input
+        .name_contains
+        .as_deref()
+        .is_some_and(|fragment| !record.name.contains(fragment))
+    {
+        return false;
+    }
+    true
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListEvaluationJobs<Eng>
 {
@@ -165,18 +221,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEvaluationJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEvaluationJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEvaluationJobs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEvaluationJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "evaluation job state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The status each job holds NOW is what this listing reports and what `statusEquals`
+        // filters on, so the transitions the clock has already made due are materialised
+        // before either happens — and with them the work the create made due: a job carried
+        // into a terminal status has evaluated the records of its datasets and saved the
+        // results under its output prefix
+        // (`crate::state::evaluation_run::run_evaluation`). The runs are collected while the
+        // store is locked and performed after the guard is dropped, so no lock is held across
+        // the in-process calls they make, and each is taken ONCE per job, so a listing reports
+        // what the run established without changing it.
+        let dues = {
+            let mut store = state.lock();
+            store.settle_evaluation_jobs(now);
+            store.due_evaluation_runs(&region)
+        };
+        for due in dues {
+            let outcome =
+                crate::state::evaluation_run::run_evaluation(&*self.engine, ctx, &due).await;
+            if let Some(job) = state.lock().evaluation_jobs.get_mut(&due.arn) {
+                job.record_run(outcome);
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle_evaluation_jobs(now);
+
+        let descending = input
+            .sort_order
+            .as_deref()
+            .is_some_and(|order| order != SORT_ASCENDING);
+        let mut rows: Vec<(String, EvaluationSummary)> = store
+            .evaluation_jobs
+            .values()
+            // The ARN carries the region, so a job created in another region is another
+            // account-region's resource and is not listed here.
+            .filter(|record| record.region == region)
+            .filter(|record| matches(&input, record))
+            .map(|record| {
+                (
+                    crate::state::listing_cursor(record.created_at, &record.arn),
+                    crate::state::evaluation_summary(record),
+                )
+            })
+            .collect();
+        // `sortBy` admits only `CreationTime`, which the cursor's leading half IS — the
+        // instant the job was created; its trailing half breaks a tie by ARN, so the order is
+        // total either way round.
+        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+        if descending {
+            rows.reverse();
+        }
+
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::cursor_belongs(token) {
+                return Err(ListEvaluationJobsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "nextToken is not a pagination token this service issued".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            rows.retain(|(cursor, _)| {
+                if descending {
+                    cursor.as_str() <= token
+                } else {
+                    cursor.as_str() >= token
+                }
+            });
+        }
+
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // The row the next page starts on IS the next page's cursor, so the pages partition
+        // the listing with neither a gap nor a repeat.
+        let next_token = rows.get(page_size).map(|(cursor, _)| cursor.clone());
+        rows.truncate(page_size);
+
+        let summaries: Vec<EvaluationSummary> =
+            rows.into_iter().map(|(_, summary)| summary).collect();
+        Ok(ListEvaluationJobsOutput {
+            // The member is reported whether or not the account holds a job to report: the
+            // recorded behaviour of this listing carries `jobSummaries` for an account with
+            // none, so a client that reads the list out of the response finds an EMPTY list
+            // rather than a response without the member. (`EvaluationSummaries`'
+            // `@length(min: 1, max: 5)` bounds a page that carries summaries, which is why
+            // `MAX_PAGE_SIZE` is five.)
+            job_summaries: Some(summaries),
+            next_token,
+        })
     }
 }

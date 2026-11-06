@@ -459,10 +459,19 @@ pub const EVALUATION_JOB_STATUS_COMPLETED: &str = "Completed";
 /// that touches the record rather than waited on, so no handler sleeps.
 pub const EVALUATION_JOB_COMPLETE_AFTER: Duration = Duration::from_secs(3);
 
-/// `EvaluationJobStatus` — the job ended without producing its results. Nothing here makes
-/// an accepted evaluation fail, so no call mints it; it is named because a job that carries
-/// it is one a batch delete accepts.
+/// `EvaluationJobStatus` — the job ended without producing its results: the terminal status
+/// a job whose configured run could not be performed reaches
+/// ([`crate::state::evaluation_run`]), reported with the sentences it failed on in
+/// `failureMessages`. It is also one of the statuses a batch delete accepts.
 pub const EVALUATION_JOB_STATUS_FAILED: &str = "Failed";
+
+/// The most `failureMessages` an evaluation job reports.
+///
+/// The MODELLED ceiling: `GetEvaluationJobResponse$failureMessages` targets `ErrorMessages`,
+/// which is `@length(max: 20)`
+/// (`smithy_query(query="operation",operation="GetEvaluationJob")`), so a run that failed on
+/// more than that reports the first of them rather than a list the response cannot carry.
+pub const MAX_EVALUATION_FAILURE_MESSAGES: usize = 20;
 
 /// `EvaluationJobStatus` — the job a batch delete accepted is being deleted.
 ///
@@ -493,6 +502,19 @@ pub const EVALUATION_JOB_DELETABLE_STATUSES: [&str; 3] = [
 /// instant on the next call that touches the record rather than waited on, so no handler
 /// sleeps.
 pub const EVALUATION_JOB_DELETED_AFTER: Duration = Duration::from_millis(500);
+
+/// What Amazon Bedrock answers when an `EvaluationJobIdentifier` names no evaluation job
+/// this account holds: the modelled `ResourceNotFoundException` (`@httpError(404)`).
+///
+/// RECORDED behaviour, with the identifier the request carried as its one variable part:
+/// Amazon Bedrock reports that the job does not exist and tells the caller what to do about
+/// it. The operations that resolve such an identifier answer with ONE sentence — the read
+/// and the stop address the same resource by the same identifier, so a job neither of them
+/// finds is reported the same way.
+#[must_use]
+pub fn evaluation_job_not_found(identifier: &str) -> String {
+    format!("Evaluation job {identifier} does not exist. Please verify the job arn and retry.")
+}
 
 /// `EvaluationJobType` — the job computes metrics itself.
 ///

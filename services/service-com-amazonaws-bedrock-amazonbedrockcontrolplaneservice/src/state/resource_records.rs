@@ -194,6 +194,24 @@ pub struct EvaluationJobRecord {
     pub job_type: &'static str,
     /// `EvaluationJobStatus`.
     pub status: &'static str,
+    /// The terminal `EvaluationJobStatus` this job's [`Self::completed_due_at`] moves it to:
+    /// [`EVALUATION_JOB_STATUS_COMPLETED`] for a job whose run was performed, and
+    /// [`EVALUATION_JOB_STATUS_FAILED`] for one whose configuration could not be run.
+    ///
+    /// Decided by the WORK, not by the clock: the run over the job's datasets
+    /// ([`evaluation_run::run_evaluation`]) is what sets it, so the status a job ends in
+    /// reports what happened to its records.
+    pub terminal_status: &'static str,
+    /// `failureMessages` — why the job failed, and empty for a job that did not.
+    pub failure_messages: Vec<String>,
+    /// Whether this job's run — reading the records of its datasets, invoking the models it
+    /// evaluates over each of them and saving the results under its output prefix — is still
+    /// owed.
+    ///
+    /// The run is owed from the create that accepted the job and is taken ONCE
+    /// ([`Self::due_run`]): a run the object store did not take is given back, so a later
+    /// call takes it again, and no later call runs a job whose results are already saved.
+    pub run_owed: bool,
     /// When [`Self::status`] is owed its move to [`EVALUATION_JOB_STATUS_COMPLETED`], or
     /// `None` once the run has ended or a caller has stopped or deleted the job.
     ///
@@ -240,6 +258,9 @@ impl EvaluationJobRecord {
         self.completed_due_at = None;
         self.stopped_due_at = Some(now + EVALUATION_JOB_STOPPED_AFTER);
         self.last_modified_at = now;
+        // The run it was accepted for is being wound down, so the records it would have
+        // evaluated are not evaluated and nothing is saved for them.
+        self.run_owed = false;
     }
 
     /// Whether this job is one a batch delete may accept: its status is terminal.
@@ -273,9 +294,82 @@ impl EvaluationJobRecord {
         self.deleted_due_at.is_some_and(|due| now >= due)
     }
 
+    /// The run this job still owes, taken ONCE — or `None` when it owes none.
+    ///
+    /// The work was made due by the create that accepted the job: an accepted job RUNS,
+    /// whether or not anybody calls, so the first operation that reads the job takes the run
+    /// ([`evaluation_run::run_evaluation`]) and no later call takes it again — which is what
+    /// leaves what a client fetched out of the output location as it fetched it.
+    ///
+    /// A job whose configuration names nothing this service runs owes nothing: there is no
+    /// dataset to evaluate, or no model to invoke ([`evaluation_run::due_datasets`],
+    /// [`evaluation_run::due_model_ids`]).
+    pub fn due_run(&mut self) -> Option<evaluation_run::DueRun> {
+        if !self.run_owed || !self.has_begun() {
+            return None;
+        }
+        let datasets = evaluation_run::due_datasets(&self.evaluation_config);
+        let model_ids = evaluation_run::due_model_ids(&self.inference_config);
+        self.run_owed = false;
+        if datasets.is_empty() || model_ids.is_empty() {
+            return None;
+        }
+        Some(evaluation_run::DueRun {
+            arn: self.arn.clone(),
+            job_name: self.name.clone(),
+            region: self.region.clone(),
+            model_ids,
+            datasets,
+            output_uri: evaluation_run::output_s3_uri(&self.output_data_config).to_string(),
+        })
+    }
+
+    /// Whether the job is RUNNING or has run: the statuses a job whose run was started
+    /// carries, which are the ones its results belong to.
+    #[must_use]
+    pub fn has_begun(&self) -> bool {
+        matches!(
+            self.status,
+            EVALUATION_JOB_STATUS_IN_PROGRESS | EVALUATION_JOB_STATUS_COMPLETED
+        )
+    }
+
+    /// Write back what the run established, and give the run back when it established
+    /// nothing.
+    ///
+    /// The terminal status this job ends in is decided here: a job that ran ends
+    /// [`EVALUATION_JOB_STATUS_COMPLETED`], and one whose configuration could not be run
+    /// ends [`EVALUATION_JOB_STATUS_FAILED`] with the sentences it failed on. A job the
+    /// clock has ALREADY carried into its terminal status is moved to the one the run
+    /// decided, so no job reports `Completed` for a run that could not be performed. A run
+    /// that established nothing at all leaves the job still owing it, so a later call takes
+    /// it again rather than reporting a job that did nothing as having run.
+    pub fn record_run(&mut self, outcome: evaluation_run::RunOutcome) {
+        match outcome {
+            evaluation_run::RunOutcome::Ran { .. } => {
+                self.terminal_status = EVALUATION_JOB_STATUS_COMPLETED;
+                self.failure_messages.clear();
+            }
+            evaluation_run::RunOutcome::Failed(messages) => {
+                self.terminal_status = EVALUATION_JOB_STATUS_FAILED;
+                // `ErrorMessages` is modelled `@length(max: 20)`, so a job reports at most
+                // that many of the sentences its run failed on.
+                self.failure_messages = messages;
+                self.failure_messages.truncate(MAX_EVALUATION_FAILURE_MESSAGES);
+            }
+            evaluation_run::RunOutcome::Deferred => {
+                self.run_owed = true;
+                return;
+            }
+        }
+        if self.has_begun() && self.completed_due_at.is_none() {
+            self.status = self.terminal_status;
+        }
+    }
+
     /// Materialise the status move the clock has already made due at `now`: a running job's
-    /// move to [`EVALUATION_JOB_STATUS_COMPLETED`], or a stopping job's to
-    /// [`EVALUATION_JOB_STATUS_STOPPED`].
+    /// move to the terminal status its run ended in ([`Self::terminal_status`]), or a
+    /// stopping job's to [`EVALUATION_JOB_STATUS_STOPPED`].
     ///
     /// The only write a reporting operation on this resource makes: it was owed at the due
     /// instant even if nobody had called, which is why that instant — not `now` — is the
@@ -283,7 +377,7 @@ impl EvaluationJobRecord {
     /// since a stop drops the completion the clock owed the run it wound down.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
-            self.status = EVALUATION_JOB_STATUS_COMPLETED;
+            self.status = self.terminal_status;
             self.completed_due_at = None;
             self.last_modified_at = due;
         }

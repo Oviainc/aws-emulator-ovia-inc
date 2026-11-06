@@ -19,8 +19,9 @@
 //!
 //! WHAT IT HOLDS. The guardrail revision being enforced, as the policies this
 //! plane evaluates: the configured words and managed word lists of its word
-//! policy, the two blocked-messaging strings, the models the configuration's
-//! model enforcement covers, and its selective-guarding modes. A guardrail
+//! policy, the filters of its content policy, the two blocked-messaging strings,
+//! the models the configuration's model enforcement covers, and its
+//! selective-guarding modes. A guardrail
 //! version a configuration enforces is a NUMBERED version
 //! (`GuardrailNumericalVersion`, never the DRAFT), and a numbered version is an
 //! immutable snapshot of the guardrail's policies, so what is installed here is
@@ -28,13 +29,16 @@
 //! stands.
 //!
 //! HOW IT IS APPLIED. Before generation, the request's own input text is
-//! evaluated against the word policy; a word the policy blocks on the input side
-//! means the guardrail INTERVENED, and the turn that is served carries the
-//! guardrail's `blockedInputMessaging` rather than a completion ("BLOCK – Block
-//! the content and replace it with blocked messaging", `GuardrailWord$inputAction`).
-//! An input the policy passes is generated for, and the generated text is then
-//! evaluated against the words the policy blocks on the OUTPUT side, which
-//! answers `blockedOutputsMessaging` the same way. Either way the invocation
+//! evaluated against EVERY policy the enforced revision configures — a guardrail
+//! blocks on any one of them, not only on the one it was most recently read for.
+//! A word the word policy blocks on the input side, or a category the content
+//! policy filters on the input side at or above the strength that filter is
+//! configured at, means the guardrail INTERVENED, and the turn that is served
+//! carries the guardrail's `blockedInputMessaging` rather than a completion
+//! ("BLOCK – Block the content and replace it with blocked messaging",
+//! `GuardrailWord$inputAction`). An input every policy passes is generated for,
+//! and the generated text is then evaluated against the same policies on the
+//! OUTPUT side, which answers `blockedOutputsMessaging` the same way. Either way the invocation
 //! reports the action it took: the invoke surfaces carry it in the
 //! service-injected [`GUARDRAIL_ACTION_FIELD`] member of the response body, and
 //! the Converse surfaces in the modelled `StopReason`
@@ -59,7 +63,11 @@
 //! untrusted text with. So the scan is linear in that bounded text rather than
 //! linear in it once per configured word — there is no product of the two — which
 //! is what keeps this stage on the request path, beside the tokenizing and the
-//! prompt digesting the same handlers already do there.
+//! prompt digesting the same handlers already do there. The content policy is
+//! evaluated by the very check the inline guardrail checks serve the content
+//! filter from ([`super::guardrail_checks::evaluate`]), over that same bounded
+//! text and once for every category the policy configures together, so one
+//! evaluation reads the text once whatever the policy holds.
 
 use rustrict::{Censor, Type};
 
@@ -95,6 +103,24 @@ pub const ALL_MODELS: &str = "ALL";
 /// `GuardrailWordAction$BLOCK` — block the content and replace it with the
 /// guardrail's blocked messaging.
 pub const WORD_ACTION_BLOCK: &str = "BLOCK";
+
+/// `GuardrailContentFilterAction$BLOCK` — the content policy's own spelling of
+/// the same blocking action [`WORD_ACTION_BLOCK`] is the word policy's, read by
+/// the one reading of a policy entry's action ([`blocks`]).
+pub const FILTER_ACTION_BLOCK: &str = WORD_ACTION_BLOCK;
+
+/// `GuardrailContentFilterType$PROMPT_ATTACK` — the one modelled content-filter
+/// category that is about an INSTRUCTION to the model rather than about the
+/// language a message uses, so it is placed by the prompt-attack recognizer
+/// beside the content filter ([`super::guardrail_checks`]).
+pub const FILTER_PROMPT_ATTACK: &str = "PROMPT_ATTACK";
+
+/// `GuardrailFilterStrength` — the strengths a content filter can be configured
+/// at, strongest first. `NONE` is named by its absence from
+/// [`blocking_severity`]: a filter at that strength blocks nothing.
+pub const FILTER_STRENGTH_HIGH: &str = "HIGH";
+pub const FILTER_STRENGTH_MEDIUM: &str = "MEDIUM";
+pub const FILTER_STRENGTH_LOW: &str = "LOW";
 
 /// `GuardrailManagedWordsType$PROFANITY` — the one managed word list a guardrail
 /// can configure.
@@ -203,6 +229,78 @@ fn blocks(action: Option<&str>, enabled: Option<bool>) -> bool {
     enabled.unwrap_or(true) && action.is_none_or(|action| action == WORD_ACTION_BLOCK)
 }
 
+/// One filter a guardrail's content policy is configured with, as this plane
+/// applies it: which modelled category it filters, and the strength it filters
+/// that category at on each side.
+///
+/// A side the filter does not BLOCK on carries no strength at all
+/// ([`ContentFilter::new`] reads `inputAction` / `outputAction` and `inputEnabled`
+/// / `outputEnabled` exactly as [`BlockedWord::new`] does), so the evaluation
+/// below asks only about the categories the policy would block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentFilter {
+    /// `GuardrailContentFilter$type` — a value of the modelled
+    /// `GuardrailContentFilterType` enum.
+    pub category: String,
+    /// `inputStrength` — the strength this category is filtered at on the input
+    /// side, or `None` where this filter does not block that side.
+    pub input_strength: Option<String>,
+    /// `outputStrength` — the same for generated text.
+    pub output_strength: Option<String>,
+}
+
+impl ContentFilter {
+    /// A configured filter as its policy entry means it.
+    #[must_use]
+    pub fn new(
+        category: String,
+        input_strength: String,
+        input_action: Option<&str>,
+        input_enabled: Option<bool>,
+        output_strength: String,
+        output_action: Option<&str>,
+        output_enabled: Option<bool>,
+    ) -> Self {
+        Self {
+            category,
+            input_strength: blocks(input_action, input_enabled).then_some(input_strength),
+            output_strength: blocks(output_action, output_enabled).then_some(output_strength),
+        }
+    }
+
+    /// The strength this filter blocks `category` at on one side.
+    fn strength(&self, input: bool) -> Option<&str> {
+        if input {
+            self.input_strength.as_deref()
+        } else {
+            self.output_strength.as_deref()
+        }
+    }
+}
+
+/// The lowest severity a filter configured at `strength` blocks a category from,
+/// or `None` for a strength that blocks nothing.
+///
+/// A filter's strength decides how much of what its detector places is blocked:
+/// the strongest setting blocks content placed at any confidence, the middle one
+/// blocks medium and high confidence, and the weakest only high confidence, while
+/// `GuardrailFilterStrength$NONE` applies no filter at all ("Content filters" in
+/// the Amazon Bedrock guardrails documentation, which publishes exactly that
+/// table of filter strengths against detection confidence). The engine places a
+/// category at one of the three levels the content-filter check reports
+/// ([`super::guardrail_checks`]), so each strength is the lowest of those levels
+/// it blocks.
+fn blocking_severity(strength: &str) -> Option<f64> {
+    use super::guardrail_checks::{MILD_SEVERITY, MODERATE_SEVERITY, SEVERE_SEVERITY};
+
+    match strength {
+        FILTER_STRENGTH_HIGH => Some(MILD_SEVERITY),
+        FILTER_STRENGTH_MEDIUM => Some(MODERATE_SEVERITY),
+        FILTER_STRENGTH_LOW => Some(SEVERE_SEVERITY),
+        _ => None,
+    }
+}
+
 /// The guardrail the account enforces on inference, as the inference path applies
 /// it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -221,6 +319,8 @@ pub struct EnforcedGuardrail {
     pub words: Vec<BlockedWord>,
     /// The word policy's managed word lists.
     pub managed_word_lists: Vec<ManagedWordList>,
+    /// The content policy's filters, at most one per modelled category.
+    pub content_filters: Vec<ContentFilter>,
     /// `modelEnforcement.includedModels` — the models the configuration is
     /// enforced on. EMPTY when the configuration carries no model enforcement at
     /// all, which is enforcement on every model ("If not present, the
@@ -263,22 +363,133 @@ impl EnforcedGuardrail {
     }
 
     /// The guardrail's `blockedInputMessaging` when `texts` — the request's input,
-    /// piece by piece — carries something the word policy blocks on the input
-    /// side, and `None` when it passes.
+    /// piece by piece — carries something a policy of this guardrail blocks on the
+    /// input side, and `None` when it passes every one of them.
     #[must_use]
     pub fn input_intervention(&self, texts: &[String]) -> Option<&str> {
-        self.blocked(texts.iter().map(String::as_str), true)
+        self.intervention(texts.iter().map(String::as_str), true)
             .then_some(self.blocked_input_messaging.as_str())
     }
 
     /// The same for generated text, answering `blockedOutputsMessaging`.
     #[must_use]
     pub fn output_intervention(&self, text: &str) -> Option<&str> {
-        self.blocked(::std::iter::once(text), false)
+        self.intervention(::std::iter::once(text), false)
             .then_some(self.blocked_outputs_messaging.as_str())
     }
 
-    /// Whether any word the policy blocks on this side occurs in `texts`.
+    /// Whether ANY policy of this guardrail blocks `texts` on this side: a word
+    /// its word policy blocks, or a category its content policy filters at or
+    /// above the strength that filter is configured at.
+    ///
+    /// The text is read against the ceiling this stage reads at ONCE
+    /// ([`Self::budgeted`]), so the two policies evaluate the same bounded text
+    /// and a request cannot grow the work by the number of policies configured.
+    fn intervention<'a>(&self, texts: impl IntoIterator<Item = &'a str>, input: bool) -> bool {
+        let pieces = Self::budgeted(texts);
+        self.blocked(&pieces, input) || self.filtered(&pieces, input)
+    }
+
+    /// The pieces of text one evaluation reads, cut to the ceiling this stage
+    /// reads at.
+    ///
+    /// The characters are charged over every piece of the request together and at
+    /// least one per piece, so neither the length of the text nor the number of
+    /// pieces it arrives in can grow the work one invocation does.
+    fn budgeted<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut budget = super::guardrail_checks::MAX_SUBMITTED_CHARACTERS;
+        let mut pieces: Vec<String> = Vec::new();
+        for piece in texts {
+            if budget == 0 {
+                break;
+            }
+            let guarded: String = piece.chars().take(budget).collect();
+            budget = budget.saturating_sub(guarded.chars().count().max(1));
+            pieces.push(guarded);
+        }
+        pieces
+    }
+
+    /// Whether a category the content policy filters on this side is placed in
+    /// `pieces` at or above the strength its filter is configured at.
+    ///
+    /// The categories are asked about TOGETHER, in one evaluation by the check the
+    /// inline guardrail checks serve the content filter from
+    /// ([`super::guardrail_checks::evaluate`]), so the two surfaces cannot
+    /// disagree about what a message carries. `PROMPT_ATTACK` is the one modelled
+    /// filter category that check places with its prompt-attack recognizer rather
+    /// than with the content filter, so it is read off that result instead — at
+    /// the strongest severity any of its families was placed at, since the filter
+    /// is configured for the category as a whole.
+    fn filtered(&self, pieces: &[String], input: bool) -> bool {
+        use super::guardrail_checks::{
+            evaluate, CheckedText, RequestedChecks, CONTENT_FILTER_RESULT_ORDER,
+            PROMPT_ATTACK_RESULT_ORDER,
+        };
+
+        let configured: Vec<(&str, f64)> = self
+            .content_filters
+            .iter()
+            .filter_map(|filter| {
+                let least = blocking_severity(filter.strength(input)?)?;
+                Some((filter.category.as_str(), least))
+            })
+            .collect();
+        if configured.is_empty() || pieces.is_empty() {
+            return false;
+        }
+        let named = |category: &str| configured.iter().any(|(named, _)| *named == category);
+        let categories: ::std::collections::BTreeSet<String> = CONTENT_FILTER_RESULT_ORDER
+            .into_iter()
+            .filter(|category| named(category))
+            .map(str::to_string)
+            .collect();
+        let attacks: ::std::collections::BTreeSet<String> = match named(FILTER_PROMPT_ATTACK) {
+            true => PROMPT_ATTACK_RESULT_ORDER
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            false => ::std::collections::BTreeSet::new(),
+        };
+        let requested = RequestedChecks {
+            content_filter: (!categories.is_empty()).then_some(categories),
+            prompt_attack: (!attacks.is_empty()).then_some(attacks),
+            sensitive_information: None,
+        };
+        let texts: Vec<CheckedText> = pieces
+            .iter()
+            .enumerate()
+            .map(|(index, text)| CheckedText {
+                message_index: index,
+                content_index: 0,
+                text: text.clone(),
+            })
+            .collect();
+        let placed = evaluate(&requested, &texts);
+        let attack_severity = placed
+            .prompt_attack
+            .unwrap_or_default()
+            .into_iter()
+            .map(|finding| finding.severity_score)
+            .max_by(f64::total_cmp);
+        configured.into_iter().any(|(category, least)| {
+            let severity = match category == FILTER_PROMPT_ATTACK {
+                true => attack_severity,
+                false => placed
+                    .content_filter
+                    .as_ref()
+                    .and_then(|findings| {
+                        findings
+                            .iter()
+                            .find(|finding| finding.category == category)
+                            .map(|finding| finding.severity_score)
+                    }),
+            };
+            severity.is_some_and(|severity| severity > 0.0 && severity >= least)
+        })
+    }
+
+    /// Whether any word the policy blocks on this side occurs in `pieces`.
     ///
     /// A configured word matches as a WORD: a match whose neighbours are
     /// alphanumeric is part of a longer word and is not the word that was
@@ -289,10 +500,8 @@ impl EnforcedGuardrail {
     ///
     /// Every word the policy blocks on this side goes into ONE pattern, matched by
     /// the linear-time engine this crate already matches untrusted text with, so
-    /// the text is scanned once however many words are configured, and the text
-    /// read is bounded both in length and in the number of pieces it arrives in
-    /// (see this module's header).
-    fn blocked<'a>(&self, texts: impl IntoIterator<Item = &'a str>, input: bool) -> bool {
+    /// the text is scanned once however many words are configured.
+    fn blocked(&self, pieces: &[String], input: bool) -> bool {
         let side = |blocks_input: bool, blocks_output: bool| {
             if input {
                 blocks_input
@@ -343,17 +552,9 @@ impl EnforcedGuardrail {
             return false;
         }
 
-        // The characters this evaluation still reads, over every piece of the
-        // request together and charged at least one per piece, so neither the
-        // length of the text nor the number of pieces it arrives in can grow the
-        // work one invocation does.
-        let mut budget = super::guardrail_checks::MAX_SUBMITTED_CHARACTERS;
-        for piece in texts {
-            if budget == 0 {
-                break;
-            }
-            let guarded: String = piece.chars().take(budget).collect();
-            budget = budget.saturating_sub(guarded.chars().count().max(1));
+        // The pieces this evaluation reads are already cut to the ceiling this
+        // stage reads at ([`Self::budgeted`]).
+        for guarded in pieces {
             let lowercase = guarded.to_lowercase();
             if matcher.as_ref().is_some_and(|matcher| {
                 matcher
@@ -362,7 +563,7 @@ impl EnforcedGuardrail {
             }) {
                 return true;
             }
-            if profanity && Censor::from_str(&guarded).analyze().is(Type::PROFANE) {
+            if profanity && Censor::from_str(guarded).analyze().is(Type::PROFANE) {
                 return true;
             }
         }

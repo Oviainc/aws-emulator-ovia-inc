@@ -13,9 +13,13 @@
 //! Where that decision admits the pass, this mints one evaluation job in the store and
 //! answers its `jobArn`. The job is accepted and
 //! runs asynchronously, so it is stored `InProgress`, which is the only status this
-//! operation mints: the clock owes that non-terminal status its move to `Completed` after
+//! operation mints: the clock owes that non-terminal status its move to a terminal one after
 //! [`crate::state::EVALUATION_JOB_COMPLETE_AFTER`], materialised by the next call that
-//! reads the record. `GetEvaluationJob` reads the job back.
+//! reads the record. The accepted job also OWES ITS RUN from here — the records of every
+//! dataset its `evaluationConfig` names, evaluated on the model its `inferenceConfig` names
+//! and saved under `outputDataConfig.s3Uri` ([`crate::state::evaluation_run`]) — which the
+//! first call that reads the job performs, so the terminal status it reaches is the one its
+//! run ended in. `GetEvaluationJob` reads the job back.
 //!
 //! ## Shape of an operation
 //!
@@ -335,6 +339,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // from here onwards, and the clock owes it its move to the terminal status the
             // run ends in.
             status: crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS,
+            // The RUN itself is owed from here too: an accepted job evaluates its configured
+            // datasets on the model its `inferenceConfig` names and saves the results under
+            // `outputDataConfig.s3Uri`, which the first call that reads the job performs
+            // (`crate::state::evaluation_run`). Until it has been performed the job ends in
+            // the status a run that was performed leads to; a run that cannot be performed
+            // replaces that with the modelled failure.
+            run_owed: true,
+            terminal_status: crate::state::EVALUATION_JOB_STATUS_COMPLETED,
+            failure_messages: Vec::new(),
             completed_due_at: Some(now + crate::state::EVALUATION_JOB_COMPLETE_AFTER),
             // Nothing has asked for a stop yet, so the clock owes this job no transition.
             stopped_due_at: None,

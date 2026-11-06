@@ -181,6 +181,29 @@ pub(super) fn enforced_guardrail_enforcement(
                 )
             })
             .collect(),
+        // The content policy's filters, each with the strength it filters its
+        // category at on each side: a guardrail blocks on ANY policy it
+        // configures, so an enforcement installed from a revision that configures
+        // content filters is evaluated against them as much as against its words.
+        content_filters: revision
+            .content_policy
+            .as_ref()
+            .and_then(|policy| policy.filters.as_ref())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|filter| {
+                runtime_guardrail::ContentFilter::new(
+                    filter.r#type.clone(),
+                    filter.input_strength.clone(),
+                    filter.input_action.as_deref(),
+                    filter.input_enabled,
+                    filter.output_strength.clone(),
+                    filter.output_action.as_deref(),
+                    filter.output_enabled,
+                )
+            })
+            .collect(),
         // A configuration carrying no `modelEnforcement` is enforced on every model, which
         // the inference plane reads from an EMPTY included list; one that carries it names
         // the models to enforce on and the ones to exclude.
