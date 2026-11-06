@@ -45,6 +45,8 @@ mod data_sources;
 mod delete_api_cache;
 #[path = "all/disassociation_reference_refusals.rs"]
 mod disassociation_reference_refusals;
+#[path = "all/domain_name_list.rs"]
+mod domain_name_list;
 #[path = "all/environment_variables.rs"]
 mod environment_variables;
 #[path = "all/error_contract.rs"]
