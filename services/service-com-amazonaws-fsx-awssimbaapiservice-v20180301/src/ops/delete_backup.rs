@@ -7,7 +7,9 @@
 //! backup won't show up in later DescribeBackups calls." A backup that is still being
 //! created cannot be deleted — that is the modelled `BackupInProgress` — and a repeat of the
 //! same call under one `ClientRequestToken` answers as the first did, for the "idempotent
-//! deletion" that token is documented to ensure.
+//! deletion" that token is documented to ensure. A backup the store does not hold is the
+//! modelled `BackupNotFound`, whose `Message` is this operation's recorded template: the
+//! requested `BackupId` alone.
 //!
 //! The ONLY file to touch for this operation.
 //!
@@ -89,7 +91,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{backup_not_found_message, BACKUP_LIFECYCLE_CREATING, BACKUP_LIFECYCLE_DELETED};
+use crate::state::{
+    deleted_backup_not_found_message, BACKUP_LIFECYCLE_CREATING, BACKUP_LIFECYCLE_DELETED,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -203,8 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.backups.get(&input.backup_id) else {
             return Err(DeleteBackupErrorModeled::BackupNotFound(BackupNotFound {
                 // Built from the id the caller asked about, so the response says WHICH
-                // backup could not be found.
-                message: Some(backup_not_found_message(&input.backup_id)),
+                // backup could not be found. This operation's recorded `Message` is that id
+                // alone, with no sentence around it.
+                message: Some(deleted_backup_not_found_message(&input.backup_id)),
             })
             .into());
         };

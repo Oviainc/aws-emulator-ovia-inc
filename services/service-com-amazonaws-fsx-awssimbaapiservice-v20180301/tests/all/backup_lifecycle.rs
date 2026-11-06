@@ -28,7 +28,7 @@ use crate::file_system_lifecycle::{
 /// Absent `FileSystemId`s spanning the modelled `FileSystemId` shape: pattern
 /// `^(fs-[0-9a-f]{8,})$` with `length 11..21`, so the shortest legal id, a mid-length one
 /// and the longest legal id.
-const ABSENT_FILE_SYSTEM_IDS: &[&str] = &[
+pub(crate) const ABSENT_FILE_SYSTEM_IDS: &[&str] = &[
     "fs-deadbeef",
     "fs-00000000deadbeef",
     "fs-ffffffffffffffffff",
@@ -36,7 +36,7 @@ const ABSENT_FILE_SYSTEM_IDS: &[&str] = &[
 
 /// `VolumeId`s spanning the modelled `VolumeId` shape: pattern
 /// `^(fsvol-[0-9a-f]{17,})$` with `length 23..23`, so `fsvol-` plus exactly 17 hex digits.
-const VOLUME_IDS: &[&str] = &[
+pub(crate) const VOLUME_IDS: &[&str] = &[
     "fsvol-00000000000000000",
     "fsvol-0123456789abcdef0",
     "fsvol-fffffffffffffffff",
@@ -70,7 +70,7 @@ fn is_base64_shaped(token: &str) -> bool {
 
 /// Create one file system and return its id, with the clock-owed `CREATING` ->  `AVAILABLE`
 /// transition already settled: a backup is taken of a file system that is in service.
-async fn available_file_system(router: &MultiServiceRouter, request: &Value) -> String {
+pub(crate) async fn available_file_system(router: &MultiServiceRouter, request: &Value) -> String {
     let created = ok(
         router,
         "CreateFileSystem",
@@ -90,7 +90,7 @@ async fn available_file_system(router: &MultiServiceRouter, request: &Value) -> 
 }
 
 /// A `CreateFileSystem` request for one row of a type table.
-fn create_file_system_request(
+pub(crate) fn create_file_system_request(
     file_system_type: &str,
     subnets: &[&str],
     configuration: Option<(&str, Value)>,
@@ -109,7 +109,7 @@ fn create_file_system_request(
 
 /// The `WindowsConfiguration` of a create, with `ThroughputCapacity` (required by the
 /// modelled shape) and the documented `CopyTagsToBackups` when the case names one.
-fn windows_configuration(copy_tags_to_backups: Option<bool>) -> (&'static str, Value) {
+pub(crate) fn windows_configuration(copy_tags_to_backups: Option<bool>) -> (&'static str, Value) {
     let mut configuration = json!({ "ThroughputCapacity": 32 });
     if let Some(copies) = copy_tags_to_backups {
         configuration["CopyTagsToBackups"] = json!(copies);
@@ -119,7 +119,7 @@ fn windows_configuration(copy_tags_to_backups: Option<bool>) -> (&'static str, V
 
 /// The `LustreConfiguration` of a create: `deployment_type` is what decides whether the
 /// file system can be backed up at all.
-fn lustre_configuration(
+pub(crate) fn lustre_configuration(
     deployment_type: Option<&str>,
     copy_tags_to_backups: Option<bool>,
 ) -> (&'static str, Value) {
@@ -146,7 +146,7 @@ fn open_zfs_configuration(copy_tags_to_backups: Option<bool>) -> (&'static str, 
 }
 
 /// Create one backup of `file_system_id`, requiring a 200, and return the `Backup`.
-async fn backup_of(router: &MultiServiceRouter, file_system_id: &str) -> Value {
+pub(crate) async fn backup_of(router: &MultiServiceRouter, file_system_id: &str) -> Value {
     ok(
         router,
         "CreateBackup",
@@ -172,7 +172,7 @@ async fn describe_one(router: &MultiServiceRouter, backup_id: &str) -> Value {
 }
 
 /// The `BackupId`s of a `DescribeBackups` page, sorted.
-fn listed_backup_ids(body: &Value) -> Vec<String> {
+pub(crate) fn listed_backup_ids(body: &Value) -> Vec<String> {
     let mut ids: Vec<String> = body["Backups"]
         .as_array()
         .expect("Backups must be a list")
@@ -184,7 +184,7 @@ fn listed_backup_ids(body: &Value) -> Vec<String> {
 }
 
 /// Dispatch one operation, require a failure, and return `(status, error code, Message)`.
-async fn error_of(
+pub(crate) async fn error_of(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
@@ -800,8 +800,9 @@ async fn a_backup_outlives_the_file_system_it_was_taken_of() {
 }
 
 /// RULE: `DescribeBackups` reports the backups the store holds; `BackupIds` selects them and
-/// overrides the filters, a supported `Filter` selects by a value the record carries, and
-/// the page is cut to what the caller asked for with an opaque `NextToken` scoped to the
+/// overrides the filters, a supported `Filter` selects by a value the record carries — a
+/// value naming nothing the store holds selects no record rather than refusing — and the
+/// page is cut to what the caller asked for with an opaque `NextToken` scoped to the
 /// selection it was minted for.
 #[tokio::test]
 async fn describe_backups_selects_by_id_filter_and_page() {
@@ -878,6 +879,19 @@ async fn describe_backups_selects_by_id_filter_and_page() {
             ] }),
             Vec::new(),
         ),
+        (
+            "a filter naming an absent file system",
+            json!({ "Filters": [{
+                "Name": "file-system-id",
+                "Values": [ABSENT_FILE_SYSTEM_IDS[1]],
+            }] }),
+            Vec::new(),
+        ),
+        (
+            "a filter naming a volume",
+            json!({ "Filters": [{ "Name": "volume-id", "Values": [VOLUME_IDS[1]] }] }),
+            Vec::new(),
+        ),
         ("everything", json!({}), every_backup.clone()),
     ];
 
@@ -933,23 +947,6 @@ async fn describe_backups_selects_by_id_filter_and_page() {
             400,
             "BackupNotFound",
             "Backup 'backup-0123456789abcdef0' does not exist.".to_string(),
-        ),
-        (
-            "a filter naming an absent file system",
-            json!({ "Filters": [{
-                "Name": "file-system-id",
-                "Values": [ABSENT_FILE_SYSTEM_IDS[1]],
-            }] }),
-            400,
-            "FileSystemNotFound",
-            format!("File system '{}' does not exist.", ABSENT_FILE_SYSTEM_IDS[1]),
-        ),
-        (
-            "a filter naming a volume",
-            json!({ "Filters": [{ "Name": "volume-id", "Values": [VOLUME_IDS[1]] }] }),
-            400,
-            "VolumeNotFound",
-            format!("Volume '{}' does not exist.", VOLUME_IDS[1]),
         ),
         (
             "a filter this listing does not support",
@@ -1115,7 +1112,7 @@ async fn delete_backup_removes_a_taken_backup_and_protects_one_under_way() {
 }
 
 /// RULE: deleting a backup the store does not hold is refused with `BackupNotFound`, whose
-/// `Message` names the identifier the request supplied.
+/// `Message` is the identifier the request supplied, alone.
 #[tokio::test]
 async fn deleting_an_absent_backup_names_it() {
     let router = emulator().await;
@@ -1141,8 +1138,9 @@ async fn deleting_an_absent_backup_names_it() {
         );
         assert_eq!(
             message,
-            format!("Backup '{backup_id}' does not exist."),
-            "case {backup_id:?}: expected the Message to name the requested id, got {message:?}"
+            backup_id.to_string(),
+            "case {backup_id:?}: expected the Message to be the requested id alone, got \
+             {message:?}"
         );
     }
 }

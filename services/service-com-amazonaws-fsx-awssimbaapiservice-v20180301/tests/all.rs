@@ -19,6 +19,8 @@ mod constraint_refusals;
 mod create_file_system_resolves_ec2_subnets;
 #[path = "all/create_file_system_validation.rs"]
 mod create_file_system_validation;
+#[path = "all/describe_backups_filter_selection.rs"]
+mod describe_backups_filter_selection;
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
 #[path = "all/not_found_messages.rs"]

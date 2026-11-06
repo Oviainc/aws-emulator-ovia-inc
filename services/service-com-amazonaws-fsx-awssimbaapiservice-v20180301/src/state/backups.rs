@@ -417,6 +417,18 @@ pub fn backup_not_found_message(backup_id: &str) -> String {
     within_error_message_length(format!("Backup '{backup_id}' does not exist."))
 }
 
+/// The `BackupNotFound$Message` `DeleteBackup` answers with: the requested `BackupId`
+/// alone.
+///
+/// Same rule as [`backup_not_found_message`] — the `Message` is built from the identifier
+/// the caller sent — but this operation's recorded template is the bare id, with no sentence
+/// around it, exactly as [`super::deleted_file_system_not_found_message`] already is for the
+/// sibling delete path, so it has its own constructor rather than silently reusing the other
+/// one. Clamped to the modelled `ErrorMessage` `length 1..256`.
+pub fn deleted_backup_not_found_message(backup_id: &str) -> String {
+    within_error_message_length(backup_id.to_string())
+}
+
 /// The `VolumeNotFound$Message` an operation addressed by a `VolumeId` answers with. Same
 /// rule as [`backup_not_found_message`].
 pub fn volume_not_found_message(volume_id: &str) -> String {
