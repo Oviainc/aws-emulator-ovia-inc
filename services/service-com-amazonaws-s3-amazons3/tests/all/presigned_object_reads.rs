@@ -381,12 +381,11 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
     // path is the key alone. A host whose first label is a bucket this emulator does not
     // hold is therefore a read OF THAT BUCKET — `NoSuchBucket` — and not a path-style read
     // of the bucket its first path segment happens to name.
-    let absent_host_bucket = send_to_host(
+    let absent_host_bucket = send_signed(
         &router,
         "GET",
         "absent-host-bucket.s3.us-east-1.amazonaws.com",
         "/host-style-bucket/written.bin",
-        true,
     )
     .await;
     assert_eq!(
@@ -404,5 +403,24 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
         "case \"a host label naming no bucket\": the refusal must name the host's bucket, got \
          {:?}",
         text(&absent_host_bucket)
+    );
+    // The other half of that boundary: a host that is NOT one of this service's
+    // virtual-hosted addresses — a local endpoint reached under its own name — carries no
+    // bucket at all, so its first path segment is still the bucket, which is what leaves an
+    // endpoint whose own name nothing here knows resolving as it always did.
+    let local_endpoint = send_signed(
+        &router,
+        "GET",
+        "absent-host-bucket.localhost",
+        "/host-style-bucket/written.bin",
+    )
+    .await;
+    assert_eq!(
+        local_endpoint.body.as_ref(),
+        written.as_slice(),
+        "case \"an endpoint whose own name is not a bucket\": the read must resolve from the \
+         path, got {} bytes with status {}",
+        local_endpoint.body.len(),
+        local_endpoint.status
     );
 }

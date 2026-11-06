@@ -21,6 +21,11 @@ use crate::ops::types::{
     BuildConfig, FunctionRevisionSummary, FunctionSummary, RevisionError, ServiceConfig,
 };
 
+/// The account-settings slice: the quotas this emulator applies to web
+/// functions, and the usage `GetWebAccountSettings` derives from the store.
+mod account;
+pub use account::*;
+
 /// The endpoint slice: what an endpoint of a web function is, and the rules the
 /// create paths validate it against.
 mod endpoints;
