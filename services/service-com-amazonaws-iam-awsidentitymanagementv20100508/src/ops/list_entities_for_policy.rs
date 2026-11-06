@@ -190,17 +190,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `arnType` asks only for a 20..2048 character string, so the ARN still has
         // to BE a managed policy's: `arn:<partition>:iam::<account>:policy/<path><name>`.
         // Anything else is an "invalid … value … supplied for an input parameter".
-        let Some(policy) = crate::state::parse_policy_arn(&input.policy_arn) else {
+        // The two layers IAM takes an ARN member's form in, exactly as this crate's
+        // `AttachRolePolicy` takes it (`crate::state::is_arn`): a value that is not an ARN
+        // at all is refused with the code IAM answers a wrong FORM with, and an ARN naming
+        // another service or resource type is the "invalid … value … supplied for an input
+        // parameter" this operation MODELS — one sentence for both
+        // (`crate::state::arn_not_valid`).
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            if !crate::state::is_arn(&input.policy_arn) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::arn_not_valid(&input.policy_arn),
+                ));
+            }
             return Err(ListEntitiesForPolicyErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "ARN {} is not valid: PolicyArn must be an IAM managed policy ARN",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::arn_not_valid(&input.policy_arn)),
                 },
             )
             .into());
-        };
+        }
 
         // `EntityFilter` and `PolicyUsageFilter` each name one value of a modelled
         // enum, and the boundary validator has already refused any value outside the
@@ -279,18 +287,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("policy {}", input.policy_arn),
         )?;
 
-        // A managed policy relates an entity only if the policy EXISTS. An
-        // AWS-managed policy (account segment `aws`) belongs to AWS rather than to
-        // this account, so it is not account state and is taken as present, exactly as
-        // `AttachRolePolicy` takes it; a customer-managed policy exists precisely when
-        // this account holds it, which the policy store `CreatePolicy` writes records.
+        // A managed policy relates an entity only if the policy EXISTS, resolved
+        // through the one resolution every `PolicyArn` is resolved by
+        // (`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::managed_policy_exists`),
+        // exactly as `AttachRolePolicy` resolves the policy it attaches: the account's
+        // own store for a policy it created, AWS's catalog for one in AWS's namespace,
+        // whose published PATH is part of the identifier.
         //
         // What this reports is which entities the policy is ATTACHED to, so the absence is
         // worded the way IAM words it for the attachment family: the ARN names no policy
         // this account can relate an entity to, which is not the same claim as "no such
         // policy resource" (`crate::state::policy_not_attachable`).
-        let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
-        if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
+        if !store.managed_policy_exists(&input.policy_arn) {
             return Err(ListEntitiesForPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(crate::state::policy_not_attachable(&input.policy_arn)),

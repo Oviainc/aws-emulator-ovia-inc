@@ -306,8 +306,14 @@ async fn attaching_to_or_listing_an_unheld_role_is_refused() {
 
 /// RULE: `PolicyArn` must BE a managed policy's ARN —
 /// `arn:<partition>:iam::<account>:policy/<path><name>`, with an empty region
-/// segment because IAM is global — and anything else is an invalid value for an
-/// input parameter (400 `InvalidInput`), persisting nothing.
+/// segment because IAM is global — and a value that is not one is refused 400,
+/// persisting nothing. IAM takes that form in TWO layers, and the row's value says
+/// which one refuses it: a value that is not an ARN at all (no `arn:` frame and its
+/// six colon-separated fields) is a value whose FORM is wrong for the member and
+/// carries the code IAM answers that with (`ValidationError`), while an ARN that IS
+/// one and names another service, another resource type or a body IAM's grammar does
+/// not admit is the operation's own modelled refusal (`InvalidInput`). Both answer
+/// IAM's one sentence for an unusable ARN.
 #[tokio::test]
 async fn attaching_an_arn_that_is_not_a_managed_policy_arn_is_refused() {
     let router = router();
@@ -321,20 +327,20 @@ async fn attaching_an_arn_that_is_not_a_managed_policy_arn_is_refused() {
 
     // Each row is at least 20 characters, `arnType`'s minimum length, so the
     // handler — not the modelled length constraint — is what refuses it. The rows
-    // break one part of the grammar each.
+    // break one part of the grammar each, and span both layers.
     let malformed = [
-        "this-is-not-an-arn-at-all",
-        "arn:aws:s3:::a-bucket-named-like-this",
-        "arn:aws:iam::aws:role/NotAPolicyAtAll",
-        "arn:aws:iam::aws:user/SomeUserNamedHere",
-        "arn:aws:iam:us-east-1:aws:policy/RegionIsSet",
-        "arn::iam::aws:policy/PartitionIsEmpty",
-        "arn:aws:iam:::policy/AccountIsEmptyHere",
-        "arn:aws:iam::aws:policy/service-role/",
-        "arn:aws:iam::aws:policy//EmptySegment",
-        "aws:iam::aws:policy/MissingArnPrefixHere",
+        ("this-is-not-an-arn-at-all", "ValidationError"),
+        ("arn:aws:s3:::a-bucket-named-like-this", "InvalidInput"),
+        ("arn:aws:iam::aws:role/NotAPolicyAtAll", "InvalidInput"),
+        ("arn:aws:iam::aws:user/SomeUserNamedHere", "InvalidInput"),
+        ("arn:aws:iam:us-east-1:aws:policy/RegionIsSet", "InvalidInput"),
+        ("arn::iam::aws:policy/PartitionIsEmpty", "InvalidInput"),
+        ("arn:aws:iam:::policy/AccountIsEmptyHere", "InvalidInput"),
+        ("arn:aws:iam::aws:policy/service-role/", "InvalidInput"),
+        ("arn:aws:iam::aws:policy//EmptySegment", "InvalidInput"),
+        ("aws:iam::aws:policy/MissingArnPrefixHere", "ValidationError"),
     ];
-    for policy_arn in malformed {
+    for (policy_arn, expected_code) in malformed {
         assert!(
             policy_arn.len() >= 20,
             "case {policy_arn:?}: a row must satisfy arnType's 20-character minimum"
@@ -346,9 +352,15 @@ async fn attaching_an_arn_that_is_not_a_managed_policy_arn_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {policy_arn:?}: expected InvalidInput, got {:?}",
+            expected_code,
+            "case {policy_arn:?}: expected {expected_code}, got {:?}",
             error_code(&body)
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            format!("ARN {policy_arn} is not valid."),
+            "case {policy_arn:?}: expected IAM's unusable-ARN sentence, got {:?}",
+            element(&body, "Message")
         );
     }
 

@@ -313,29 +313,41 @@ async fn the_policy_is_addressed_by_its_own_arn() {
         "the fixture's ARN must be the account's managed-policy ARN, got {held_arn:?}"
     );
 
-    // A value that is not a managed-policy ARN at all: `arnType` constrains only the
-    // length, so each row is 20 characters or longer and still names no policy.
-    for (case, arn) in [
+    // A value that cannot be used as a managed-policy ARN: `arnType` constrains only the
+    // length, so each row is 20 characters or longer and still names no policy. The code
+    // is the layer that took the form — `ValidationError` for a value that is not an ARN
+    // at all, the modelled `InvalidInput` for an ARN naming another service or resource
+    // type — and both carry IAM's one sentence for an unusable ARN.
+    for (case, arn, expected_code) in [
         (
             "a bare string of the right length",
             "not-an-arn-at-all-xx".to_string(),
+            "ValidationError",
         ),
         (
             "a role ARN",
             format!("arn:aws:iam::{}:role/some-role", account_id()),
+            "InvalidInput",
         ),
         (
             "a user ARN",
             format!("arn:aws:iam::{}:user/some-user", account_id()),
+            "InvalidInput",
         ),
-        ("another service's ARN", "arn:aws:s3:::some-bucket-name".to_string()),
+        (
+            "another service's ARN",
+            "arn:aws:s3:::some-bucket-name".to_string(),
+            "InvalidInput",
+        ),
         (
             "an IAM policy ARN carrying a region",
             format!("arn:aws:iam:us-west-2:{}:policy/held", account_id()),
+            "InvalidInput",
         ),
         (
             "a policy ARN with no partition",
             format!("arn::iam::{}:policy/held", account_id()),
+            "InvalidInput",
         ),
     ] {
         let (status, body) = untag_policy(&router, &arn, &keys(&["team"])).await;
@@ -345,8 +357,8 @@ async fn the_policy_is_addressed_by_its_own_arn() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {case:?}: expected the modelled awsQuery code, got {body}"
+            expected_code,
+            "case {case:?}: expected the code {expected_code}, got {body}"
         );
         assert_eq!(
             element(&body, "Message"),

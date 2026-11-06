@@ -1556,6 +1556,33 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         parse_policy_arn(arn).is_none_or(|parsed| !is_service_linked_role_path(&parsed.path))
     }
 
+    /// Whether the managed policy `arn` names EXISTS — the question every operation
+    /// addressed by a `PolicyArn` asks before it does anything with that policy.
+    ///
+    /// Which store answers is decided by the ARN's account segment, the one thing that
+    /// says who owns the policy. A customer-managed policy exists exactly when THIS
+    /// account holds it under that ARN ([`policy_by_arn`](Self::policy_by_arn)); a
+    /// policy in AWS's own namespace is not account state, so AWS's catalog answers for
+    /// it ([`is_published_aws_managed_policy_arn`]), where a name the catalog carries is
+    /// published under exactly one path and the same name under any other path names
+    /// nothing. A value that is not a managed-policy ARN at all names no policy either —
+    /// an operation taking a `PolicyArn` refuses such a value as an invalid input before
+    /// it asks.
+    ///
+    /// ONE resolution, shared by the attach calls, the permissions-boundary puts and the
+    /// readers that resolve a policy through its attachability, so none of them can
+    /// accept an ARN another calls missing — and nothing an identity carries can be an
+    /// ARN that names no policy.
+    pub fn managed_policy_exists(&self, arn: &str) -> bool {
+        let Some(parsed) = parse_policy_arn(arn) else {
+            return false;
+        };
+        if parsed.account == AWS_MANAGED_POLICY_ACCOUNT {
+            return is_published_aws_managed_policy_arn(arn);
+        }
+        self.policy_by_arn(arn).is_some()
+    }
+
     /// The delegation request `arn` names, if the account holds it.
     ///
     /// Every read of a delegation request addressed by ARN resolves it here, and the

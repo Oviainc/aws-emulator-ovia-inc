@@ -187,15 +187,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `arnType` asks only for a 20..2048 character string, so the ARN still has
         // to BE a managed policy's: `arn:<partition>:iam::<account>:policy/<path><name>`,
-        // exactly as this crate's `AttachRolePolicy` reads one. Anything else is an
-        // "invalid … value … supplied for an input parameter".
+        // exactly as this crate's `AttachRolePolicy` reads one — in the two layers IAM
+        // takes that form in (`crate::state::is_arn`): a value that is not an ARN at all
+        // is refused with the code IAM answers a wrong FORM with, while an ARN naming
+        // another service or resource type is the "invalid … value … supplied for an input
+        // parameter" this operation models. One sentence for both
+        // (`crate::state::arn_not_valid`).
         if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            if !crate::state::is_arn(&input.policy_arn) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::arn_not_valid(&input.policy_arn),
+                ));
+            }
             return Err(DetachRolePolicyErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "ARN {} is not valid: PolicyArn must be an IAM managed policy ARN",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::arn_not_valid(&input.policy_arn)),
                 },
             )
             .into());

@@ -290,8 +290,11 @@ async fn bounding_a_role_that_does_not_exist_is_refused() {
 
 /// RULE: `PermissionsBoundary` must BE a managed policy's ARN —
 /// `arn:<partition>:iam::<account>:policy/<path><name>`, with an empty region
-/// segment because IAM is global — and anything else is an invalid value for an
-/// input parameter (400 `InvalidInput`), persisting nothing.
+/// segment because IAM is global — and a value that is not one is refused 400,
+/// persisting nothing. Which code it carries is the layer that took the form: a value
+/// that is not an ARN at all is refused with the code IAM answers a wrong FORM with
+/// (`ValidationError`), while an ARN naming another service or resource type is this
+/// operation's own modelled refusal (`InvalidInput`).
 #[tokio::test]
 async fn a_boundary_that_is_not_a_managed_policy_arn_is_refused() {
     let router = router();
@@ -305,20 +308,20 @@ async fn a_boundary_that_is_not_a_managed_policy_arn_is_refused() {
 
     // Each row is at least 20 characters, `arnType`'s minimum length, so the handler
     // — not the modelled length constraint — is what refuses it. The rows break one
-    // part of the grammar each.
+    // part of the grammar each, and span both layers.
     let malformed = [
-        "this-is-not-an-arn-at-all",
-        "arn:aws:s3:::a-bucket-named-like-this",
-        "arn:aws:iam::aws:role/NotAPolicyAtAll",
-        "arn:aws:iam::aws:user/SomeUserNamedHere",
-        "arn:aws:iam:us-east-1:aws:policy/RegionIsSet",
-        "arn::iam::aws:policy/PartitionIsEmpty",
-        "arn:aws:iam:::policy/AccountIsEmptyHere",
-        "arn:aws:iam::aws:policy/job-function/",
-        "arn:aws:iam::aws:policy//EmptySegment",
-        "aws:iam::aws:policy/MissingArnPrefixHere",
+        ("this-is-not-an-arn-at-all", "ValidationError"),
+        ("arn:aws:s3:::a-bucket-named-like-this", "InvalidInput"),
+        ("arn:aws:iam::aws:role/NotAPolicyAtAll", "InvalidInput"),
+        ("arn:aws:iam::aws:user/SomeUserNamedHere", "InvalidInput"),
+        ("arn:aws:iam:us-east-1:aws:policy/RegionIsSet", "InvalidInput"),
+        ("arn::iam::aws:policy/PartitionIsEmpty", "InvalidInput"),
+        ("arn:aws:iam:::policy/AccountIsEmptyHere", "InvalidInput"),
+        ("arn:aws:iam::aws:policy/job-function/", "InvalidInput"),
+        ("arn:aws:iam::aws:policy//EmptySegment", "InvalidInput"),
+        ("aws:iam::aws:policy/MissingArnPrefixHere", "ValidationError"),
     ];
-    for boundary in malformed {
+    for (boundary, expected_code) in malformed {
         assert!(
             boundary.len() >= 20,
             "case {boundary:?}: a row must satisfy arnType's 20-character minimum"
@@ -330,8 +333,8 @@ async fn a_boundary_that_is_not_a_managed_policy_arn_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {boundary:?}: expected InvalidInput, got {:?}",
+            expected_code,
+            "case {boundary:?}: expected {expected_code}, got {:?}",
             error_code(&body)
         );
     }

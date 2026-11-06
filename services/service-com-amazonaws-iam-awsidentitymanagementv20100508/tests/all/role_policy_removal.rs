@@ -380,9 +380,11 @@ async fn removing_a_dependent_the_role_does_not_carry_is_not_found() {
     );
 }
 
-/// RULE: a `PolicyArn` that is not an IAM managed policy's ARN is refused as an
-/// `InvalidInput` (HTTP 400) — the modelled `arnType` asks only for a 20..2048
-/// character string, so the ARN's SHAPE is what the operation checks.
+/// RULE: a `PolicyArn` that is not an IAM managed policy's ARN is refused HTTP 400 — the
+/// modelled `arnType` asks only for a 20..2048 character string, so the ARN's SHAPE is
+/// what the operation checks — under the code of the layer that took the form:
+/// `ValidationError` for a value that is not an ARN at all, the modelled `InvalidInput`
+/// for an ARN naming another service or resource type.
 ///
 /// The rows are strings long enough to pass `arnType`'s length constraint that name
 /// something other than a managed policy: another IAM entity type, another service's
@@ -400,14 +402,20 @@ async fn a_policy_arn_that_names_no_managed_policy_is_invalid_input() {
     .await;
 
     let malformed = [
-        "arn:aws:iam::123456789012:role/rds-proxy-role",
-        "arn:aws:iam::123456789012:user/engineer-one",
-        "arn:aws:s3:::rds-proxy-bucket-0001",
-        "arn:aws:iam:us-east-1:123456789012:policy/Regional",
-        "arn:aws:iam::123456789012:policy//EmptySegment",
-        "AmazonS3ReadOnlyAccess-but-not-an-arn",
+        ("arn:aws:iam::123456789012:role/rds-proxy-role", "InvalidInput"),
+        ("arn:aws:iam::123456789012:user/engineer-one", "InvalidInput"),
+        ("arn:aws:s3:::rds-proxy-bucket-0001", "InvalidInput"),
+        (
+            "arn:aws:iam:us-east-1:123456789012:policy/Regional",
+            "InvalidInput",
+        ),
+        (
+            "arn:aws:iam::123456789012:policy//EmptySegment",
+            "InvalidInput",
+        ),
+        ("AmazonS3ReadOnlyAccess-but-not-an-arn", "ValidationError"),
     ];
-    for policy_arn in malformed {
+    for (policy_arn, expected_code) in malformed {
         let (status, body) = call(
             &router,
             "DetachRolePolicy",
@@ -421,8 +429,8 @@ async fn a_policy_arn_that_names_no_managed_policy_is_invalid_input() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {policy_arn:?}: expected the modelled awsQuery code, got {body}"
+            expected_code,
+            "case {policy_arn:?}: expected the code {expected_code}, got {body}"
         );
     }
 

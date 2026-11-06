@@ -341,6 +341,20 @@ fn stated_refusal(violations: &[Violation]) -> Option<Refused> {
     if self_taken.is_empty() {
         return without_refused_value_echo(violations);
     }
+    // A self-taken sentence states that member's WHOLE form, so no clause about the SAME
+    // member's value is stated beside it: IAM takes the form itself, before the
+    // model-level walk, so a value that is both outside the published form AND outside the
+    // member's length is answered with the form sentence alone. A clause about ANOTHER
+    // member is left where it is — it states a requirement the sentence says nothing
+    // about.
+    let modeled: Vec<Violation> = modeled
+        .into_iter()
+        .filter(|violation| {
+            !self_taken
+                .iter()
+                .any(|stated| stated.path == violation.path)
+        })
+        .collect();
     if modeled.is_empty() {
         // One sentence, so a request that broke two self-taken members is answered with
         // the first of them in the order the walk reported them.

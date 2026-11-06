@@ -171,10 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter" — a different refusal from an ARN naming a policy that is not
         // held. The form is checked through the one definition of the ARN grammar
         // this crate holds, the same one every read addressed by `PolicyArn` uses.
+        if !crate::state::is_arn(&input.policy_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::arn_not_valid(&input.policy_arn),
+            ));
+        }
         if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
             return Err(ListPolicyVersionsErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                    message: Some(crate::state::arn_not_valid(&input.policy_arn)),
                 },
             )
             .into());

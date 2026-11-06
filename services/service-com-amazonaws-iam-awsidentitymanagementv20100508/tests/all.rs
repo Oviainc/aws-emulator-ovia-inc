@@ -37,6 +37,8 @@ mod account_properties;
 mod account_singleton_authorization;
 #[path = "all/authentication_refusal_wording.rs"]
 mod authentication_refusal_wording;
+#[path = "all/aws_managed_policy_arn_resolution.rs"]
+mod aws_managed_policy_arn_resolution;
 #[path = "all/aws_managed_policy_attachability.rs"]
 mod aws_managed_policy_attachability;
 #[path = "all/aws_managed_policy_catalog.rs"]

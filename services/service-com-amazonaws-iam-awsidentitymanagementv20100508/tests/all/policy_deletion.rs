@@ -246,9 +246,11 @@ async fn deleting_an_arn_the_account_holds_no_policy_under_is_not_found() {
     );
 }
 
-/// RULE: a value that is not a managed-policy ARN at all is an "invalid … value …
-/// supplied for an input parameter" — `InvalidInput` (HTTP 400) — which is a different
-/// refusal from an ARN the account does not hold.
+/// RULE: a value that cannot be used as a managed-policy ARN is refused HTTP 400 — a
+/// different refusal from an ARN the account does not hold — under the code of the layer
+/// that took the form: `ValidationError` for a value that is not an ARN at all, the
+/// modelled `InvalidInput` ("invalid … value … supplied for an input parameter") for an
+/// ARN naming another service or resource type.
 ///
 /// The rows are values that satisfy `arnType`'s own 20..2048 length constraint (so the
 /// handler, not the modelled constraint, is what refuses them) and span the ways a
@@ -261,14 +263,26 @@ async fn deleting_a_value_that_is_not_a_managed_policy_arn_is_invalid_input() {
     let held = create_policy(&router, "held", "/").await;
 
     let rejected = [
-        "this-is-not-an-arn-at-all".to_string(),
-        format!("arn:aws:iam::{}:role/some-role", account_id()),
-        format!("arn:aws:iam::{}:user/some-user", account_id()),
-        format!("arn:aws:iam::{}:instance-profile/some-profile", account_id()),
-        format!("arn:aws:iam:us-east-1:{}:policy/held", account_id()),
-        format!("arn:aws:iam::{}:policy/", account_id()),
+        ("this-is-not-an-arn-at-all".to_string(), "ValidationError"),
+        (
+            format!("arn:aws:iam::{}:role/some-role", account_id()),
+            "InvalidInput",
+        ),
+        (
+            format!("arn:aws:iam::{}:user/some-user", account_id()),
+            "InvalidInput",
+        ),
+        (
+            format!("arn:aws:iam::{}:instance-profile/some-profile", account_id()),
+            "InvalidInput",
+        ),
+        (
+            format!("arn:aws:iam:us-east-1:{}:policy/held", account_id()),
+            "InvalidInput",
+        ),
+        (format!("arn:aws:iam::{}:policy/", account_id()), "InvalidInput"),
     ];
-    for candidate in rejected {
+    for (candidate, expected_code) in rejected {
         let (status, body) =
             call(&router, "DeletePolicy", &[("PolicyArn", candidate.as_str())]).await;
         assert_eq!(
@@ -278,8 +292,8 @@ async fn deleting_a_value_that_is_not_a_managed_policy_arn_is_invalid_input() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {candidate:?}: expected the modelled awsQuery code, got {body}"
+            expected_code,
+            "case {candidate:?}: expected the code {expected_code}, got {body}"
         );
     }
 

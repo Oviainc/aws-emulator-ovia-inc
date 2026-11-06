@@ -178,15 +178,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `arnType` constrains only the length, so a value that is not a
-        // managed-policy ARN at all is an "invalid … value … supplied for an input
-        // parameter" — a different refusal from an ARN naming a policy that is not
-        // held. The form is checked through the one definition of the ARN grammar
-        // this crate holds.
+        // `arnType` constrains only the length, so the form is checked here, in the two
+        // layers IAM takes an ARN member's form in (`crate::state::is_arn`): a value that
+        // is not an ARN at all is a wrong FORM for the member, refused with the code IAM
+        // answers that with, while an ARN naming another service or resource type is an
+        // "invalid … value … supplied for an input parameter" — a different refusal from
+        // an ARN naming a policy that is not held. The grammar is the one definition this
+        // crate holds.
+        if !crate::state::is_arn(&input.policy_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::arn_not_valid(&input.policy_arn),
+            ));
+        }
         if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
             return Err(GetPolicyVersionErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                    message: Some(crate::state::arn_not_valid(&input.policy_arn)),
                 },
             )
             .into());

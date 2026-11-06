@@ -600,9 +600,11 @@ async fn refuses_a_marker_it_did_not_issue_for_that_policy() {
     }
 }
 
-/// RULE: `PolicyArn` must name a managed policy that exists — a string that is not
-/// a managed-policy ARN is refused with 400 `InvalidInput`, and a well-formed ARN
-/// the account holds no policy under with 404 `NoSuchEntity`.
+/// RULE: `PolicyArn` must name a managed policy that exists — a string that cannot be
+/// used as a managed-policy ARN is refused 400, under the code of the layer that took
+/// the form (`ValidationError` for a value that is not an ARN at all, this operation's
+/// modelled `InvalidInput` for an ARN naming another service or resource type), and a
+/// well-formed ARN the account holds no policy under with 404 `NoSuchEntity`.
 #[tokio::test]
 async fn refuses_an_arn_that_names_no_managed_policy() {
     let fixture = fixture().await;
@@ -613,13 +615,19 @@ async fn refuses_an_arn_that_names_no_managed_policy() {
     // segment, a missing name, and a string that is no ARN at all. Each is padded
     // to `arnType`'s 20-character floor, which the framework refuses before the
     // handler.
-    for arn in [
-        "arn:aws:s3:::policy/ReadItems".to_string(),
-        format!("arn:aws:iam:us-east-1:{account}:policy/ReadItems"),
-        format!("arn:aws:iam::{account}:role/ReadItems"),
-        format!("arn:aws:iam::{account}:policy//ReadItems"),
-        format!("arn:aws:iam::{account}:policy/"),
-        "not-an-arn-at-all-but-long".to_string(),
+    for (arn, expected_code) in [
+        ("arn:aws:s3:::policy/ReadItems".to_string(), "InvalidInput"),
+        (
+            format!("arn:aws:iam:us-east-1:{account}:policy/ReadItems"),
+            "InvalidInput",
+        ),
+        (format!("arn:aws:iam::{account}:role/ReadItems"), "InvalidInput"),
+        (
+            format!("arn:aws:iam::{account}:policy//ReadItems"),
+            "InvalidInput",
+        ),
+        (format!("arn:aws:iam::{account}:policy/"), "InvalidInput"),
+        ("not-an-arn-at-all-but-long".to_string(), "ValidationError"),
     ] {
         let (status, body) = list(&fixture.router, &arn, &[]).await;
         assert_eq!(
@@ -628,8 +636,8 @@ async fn refuses_an_arn_that_names_no_managed_policy() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {arn:?}: expected InvalidInput, got {:?}: {body}",
+            expected_code,
+            "case {arn:?}: expected {expected_code}, got {:?}: {body}",
             error_code(&body)
         );
     }

@@ -187,18 +187,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `arnType` asks only for a 20..2048 character string, so the ARN still has
         // to BE a managed policy's: `arn:<partition>:iam::<account>:policy/<path><name>`.
-        // Anything else is an "invalid … value … supplied for an input parameter".
-        let Some(policy) = crate::state::parse_policy_arn(&input.policy_arn) else {
+        // That form is taken in TWO layers, the way IAM takes it
+        // (`crate::state::is_arn`): a value that is not an ARN at all is a value whose
+        // FORM is wrong for the member it was supplied for, refused with the code IAM
+        // answers such a value with, while an ARN that names another service or another
+        // resource type is the "invalid … value … supplied for an input parameter" this
+        // operation MODELS — one sentence for both (`crate::state::arn_not_valid`), since
+        // what separates the layers is the error code a client branches on.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            if !crate::state::is_arn(&input.policy_arn) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::arn_not_valid(&input.policy_arn),
+                ));
+            }
             return Err(AttachRolePolicyErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "ARN {} is not valid: PolicyArn must be an IAM managed policy ARN",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::arn_not_valid(&input.policy_arn)),
                 },
             )
             .into());
-        };
+        }
 
         let mut store = state.lock();
 
@@ -266,16 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A managed policy is attachable only if it exists. An AWS-managed policy
-        // (account segment `aws`) belongs to AWS rather than to this account, so it
-        // is not account state and is taken as present: AWS's catalog runs to well
-        // over a thousand policies and `crate::state::AWS_MANAGED_POLICIES` carries
-        // a subset of it, so refusing the ARNs outside that subset would refuse
-        // attachments AWS accepts. A
-        // customer-managed policy, by contrast, exists exactly when this account
-        // holds it — which is what the policy store `CreatePolicy` writes records.
-        let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
-        if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
+        // A managed policy is attachable only if it EXISTS, resolved through the one
+        // resolution every `PolicyArn` is resolved by
+        // (`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::managed_policy_exists`):
+        // the account's own store for a policy it created, AWS's catalog for one in
+        // AWS's namespace, whose published PATH is part of the identifier — so the same
+        // policy name spelled under another path names nothing and attaches nothing.
+        // An ARN nothing resolves "referenced a resource entity that does not exist",
+        // and the role keeps exactly the attachments it had.
+        if !store.managed_policy_exists(&input.policy_arn) {
             return Err(AttachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(crate::state::policy_not_attachable(&input.policy_arn)),

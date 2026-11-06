@@ -191,18 +191,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `arn:<partition>:iam::<account>:policy/<path><name>`. Anything else is an
         // "invalid … value … supplied for an input parameter", read through the one
         // definition of that grammar in `crate::state`, as `AttachRolePolicy` does.
-        let Some(policy) = crate::state::parse_policy_arn(&input.permissions_boundary) else {
+        // The two layers IAM takes an ARN member's form in, exactly as this crate's
+        // `AttachRolePolicy` takes it (`crate::state::is_arn`): a value that is not an ARN
+        // at all is refused with the code IAM answers a wrong FORM with, and an ARN naming
+        // another service or resource type is the "invalid … value … supplied for an input
+        // parameter" this operation MODELS — one sentence for both
+        // (`crate::state::arn_not_valid`).
+        if crate::state::parse_policy_arn(&input.permissions_boundary).is_none() {
+            if !crate::state::is_arn(&input.permissions_boundary) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::arn_not_valid(&input.permissions_boundary),
+                ));
+            }
             return Err(PutRolePermissionsBoundaryErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "ARN {} is not valid: PermissionsBoundary must be an IAM managed \
-                         policy ARN",
-                        input.permissions_boundary
-                    )),
+                    message: Some(crate::state::arn_not_valid(&input.permissions_boundary)),
                 },
             )
             .into());
-        };
+        }
 
         let mut store = state.lock();
 
@@ -267,18 +274,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A policy can set a boundary only if it exists. An AWS-managed policy
-        // (account segment `aws`) belongs to AWS rather than to this account, so it is
-        // not account state and is taken as present — this emulator carries no catalog
-        // of AWS's managed policies, and an entry invented for one would not be
-        // knowledge it has. A customer-managed policy exists exactly when this account
-        // holds it, which is what `CreatePolicy` records. The same rule
-        // `AttachRolePolicy` applies to the policy it attaches. The sentence is the
-        // boundary family's own (`crate::state::boundary_scope_not_attachable`): what a
-        // boundary call names is a SCOPE rather than an attachment, which IAM words
+        // A policy can set a boundary only if it EXISTS, resolved through the one
+        // resolution every `PolicyArn` is resolved by
+        // (`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::managed_policy_exists`),
+        // the same rule `AttachRolePolicy` applies to the policy it attaches: the
+        // account's own store for a policy it created, AWS's catalog for one in AWS's
+        // namespace, whose published PATH is part of the identifier — so the same policy
+        // name spelled under another path bounds nothing. The sentence is the boundary
+        // family's own (`crate::state::boundary_scope_not_attachable`): what a boundary
+        // call names is a SCOPE rather than an attachment, which IAM words
         // `Scope ARN: <arn> …` where the attachment family words it `Policy <arn> …`.
-        let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
-        if !aws_managed && store.policy_by_arn(&input.permissions_boundary).is_none() {
+        if !store.managed_policy_exists(&input.permissions_boundary) {
             return Err(PutRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(crate::state::boundary_scope_not_attachable(

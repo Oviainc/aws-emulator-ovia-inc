@@ -554,9 +554,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A list of managed policy ARNs" the template attaches. A managed policy is
-        // attachable only if it exists, read exactly as `AttachRolePolicy` reads it: an
-        // AWS-managed policy belongs to AWS rather than to this account and is taken as
-        // present, while a customer-managed one exists exactly when this account holds it.
+        // attachable only if it EXISTS, resolved through the one resolution every
+        // `PolicyArn` is resolved by
+        // (`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::managed_policy_exists`),
+        // exactly as `AttachRolePolicy` resolves it: the account's own store for a
+        // policy it created, AWS's catalog for one in AWS's namespace, whose published
+        // PATH is part of the identifier.
         let managed_policy_arns: Vec<String> = version
             .managed_policy_arns
             .clone()
@@ -564,18 +567,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .collect();
         for policy_arn in &managed_policy_arns {
-            let Some(policy) = crate::state::parse_policy_arn(policy_arn) else {
+            if crate::state::parse_policy_arn(policy_arn).is_none() {
+                if !crate::state::is_arn(policy_arn) {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::arn_not_valid(policy_arn),
+                    ));
+                }
                 return Err(AcquireRoleErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "ARN {policy_arn} is not valid: a managed policy ARN is required"
-                        )),
+                        message: Some(crate::state::arn_not_valid(policy_arn)),
                     },
                 )
                 .into());
-            };
-            let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
-            if !aws_managed && store.policy_by_arn(policy_arn).is_none() {
+            }
+            if !store.managed_policy_exists(policy_arn) {
                 return Err(AcquireRoleErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
                         message: Some(crate::state::policy_not_attachable(policy_arn)),

@@ -542,11 +542,12 @@ async fn a_reserved_tag_key_is_refused() {
     }
 }
 
-/// `GetPolicy` distinguishes a value that is not a managed-policy ARN at all (the
-/// modelled `InvalidInputException`, HTTP 400) from a well-formed ARN the account
-/// does not hold (the modelled `NoSuchEntityException`, HTTP 404). Every row is at
-/// least 20 characters, so `arnType`'s own length constraint is satisfied and the
-/// handler is what answers.
+/// `GetPolicy` distinguishes a value it cannot use as a managed-policy ARN (HTTP 400,
+/// under the code of the layer that took the form: `ValidationError` for a value that is
+/// not an ARN at all, the modelled `InvalidInputException` for an ARN naming another
+/// service or resource type) from a well-formed ARN the account does not hold (the
+/// modelled `NoSuchEntityException`, HTTP 404). Every row is at least 20 characters, so
+/// `arnType`'s own length constraint is satisfied and the handler is what answers.
 #[tokio::test]
 async fn get_policy_separates_an_invalid_arn_from_an_unheld_one() {
     let router = router();
@@ -558,24 +559,36 @@ async fn get_policy_separates_an_invalid_arn_from_an_unheld_one() {
     .await;
     assert_eq!(status, 200, "the fixture create must succeed, got {created}");
 
-    for (case, arn) in [
-        ("a bare string of the right length", "not-an-arn-at-all-xx"),
+    for (case, arn, expected_code) in [
+        (
+            "a bare string of the right length",
+            "not-an-arn-at-all-xx",
+            "ValidationError",
+        ),
         (
             "a role ARN",
             &format!("arn:aws:iam::{}:role/some-role", account_id()),
+            "InvalidInput",
         ),
         (
             "a user ARN",
             &format!("arn:aws:iam::{}:user/some-user", account_id()),
+            "InvalidInput",
         ),
-        ("another service's ARN", "arn:aws:s3:::some-bucket-name"),
+        (
+            "another service's ARN",
+            "arn:aws:s3:::some-bucket-name",
+            "InvalidInput",
+        ),
         (
             "an IAM policy ARN carrying a region",
             &format!("arn:aws:iam:us-west-2:{}:policy/held", account_id()),
+            "InvalidInput",
         ),
         (
             "a policy ARN with no partition",
             &format!("arn::iam::{}:policy/held", account_id()),
+            "InvalidInput",
         ),
     ] {
         let (status, body) = call(&router, "GetPolicy", &[("PolicyArn", arn)]).await;
@@ -585,8 +598,8 @@ async fn get_policy_separates_an_invalid_arn_from_an_unheld_one() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidInput",
-            "case {case:?}: expected the modelled awsQuery code, got {body}"
+            expected_code,
+            "case {case:?}: expected the code {expected_code}, got {body}"
         );
     }
 
