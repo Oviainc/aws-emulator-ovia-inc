@@ -27,6 +27,8 @@ mod asset_versions;
 mod assets;
 #[path = "all/backlog_task_refusal_arms.rs"]
 mod backlog_task_refusal_arms;
+#[path = "all/in_space_resource_refusals.rs"]
+mod in_space_resource_refusals;
 #[path = "all/operator_app.rs"]
 mod operator_app;
 #[path = "all/probe_mime.rs"]
