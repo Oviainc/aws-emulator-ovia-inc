@@ -448,27 +448,33 @@ async fn a_delete_that_names_neither_snapshot_member_asks_for_one_of_them() {
 /// answered with, or `None` for a password the service accepts.
 type PasswordRow = (&'static str, String, Option<String>);
 
-/// The passwords the rule spans: each published bound of
-/// `MasterUserPassword` ("Must contain from 8 to 41 characters"), the values just outside
-/// them, and each character the member forbids ("can contain any printable ASCII character
-/// except \"/\", \"\"\", or \"@\"").
-fn password_rows() -> Vec<PasswordRow> {
+/// The passwords the rule spans, for an engine whose `MasterUserPassword` may be up to
+/// `longest` characters: each published bound of the member, the values just outside them,
+/// and each character it forbids ("Can include any printable ASCII character except \"/\",
+/// \"'\", \"\"\", or the \"@\" symbol").
+///
+/// The LENGTH bound is per engine — `MasterUserPassword` publishes one line per engine
+/// ("MySQL: Must contain from 8 to 41 characters", "PostgreSQL: Must contain from 8 to 128
+/// characters", Amazon DocumentDB's "Must contain from 8 to 100 characters") — and every
+/// one of them has the same lower bound of 8, so the table takes the upper bound of the
+/// engine under test.
+fn password_rows(longest: usize) -> Vec<PasswordRow> {
     let too_short = "The parameter MasterUserPassword is not a valid password because it is \
                      shorter than 8 characters."
         .to_string();
-    let too_long = "The parameter MasterUserPassword is not a valid password because it is \
-                    longer than 41 characters."
-        .to_string();
-    let forbidden = "The parameter MasterUserPassword is not a valid password because it \
-                     contains a character that is not allowed. Only printable ASCII \
-                     characters besides '/', '\"' and '@' may be used."
+    let too_long = format!(
+        "The parameter MasterUserPassword is not a valid password because it is longer \
+         than {longest} characters."
+    );
+    let forbidden = "The parameter MasterUserPassword is not a valid password. Only \
+                     printable ASCII characters besides '/', '@', '\"', ' ' may be used."
         .to_string();
     vec![
         ("one character under the lower bound", "p".repeat(7), Some(too_short.clone())),
         ("the lower bound itself", "p".repeat(8), None),
         ("a password well inside both bounds", "pw1-Secret".to_string(), None),
-        ("the upper bound itself", "p".repeat(41), None),
-        ("one character over the upper bound", "p".repeat(42), Some(too_long)),
+        ("the upper bound itself", "p".repeat(longest), None),
+        ("one character over the upper bound", "p".repeat(longest + 1), Some(too_long)),
         ("a single character", "p".to_string(), Some(too_short)),
         (
             "the forbidden at sign",
@@ -487,6 +493,10 @@ fn password_rows() -> Vec<PasswordRow> {
         ),
     ]
 }
+
+/// How long a `MasterUserPassword` may be on an Amazon DocumentDB cluster, which is the
+/// engine the table below drives: "Must contain from 8 to 100 characters".
+const DOCDB_PASSWORD_MAX: usize = 100;
 
 #[tokio::test]
 async fn a_master_user_password_outside_its_constraints_names_the_constraint_it_broke() {
@@ -507,7 +517,9 @@ async fn a_master_user_password_outside_its_constraints_names_the_constraint_it_
     );
     wait_for_settle();
 
-    for (index, (case, password, refusal)) in password_rows().into_iter().enumerate() {
+    for (index, (case, password, refusal)) in
+        password_rows(DOCDB_PASSWORD_MAX).into_iter().enumerate()
+    {
         // The same value on the MODIFY and on a fresh CREATE: one rule, both paths.
         let created = format!("emu-sibling-password-{index}");
         let calls: [(&str, Params); 2] = [

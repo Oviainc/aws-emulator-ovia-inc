@@ -82,6 +82,15 @@ pub struct ParameterSetting {
     /// `Parameter$ApplyMethod`, as the caller asked for it (see
     /// [`APPLY_METHOD_PENDING_REBOOT`] for what an absent one becomes).
     pub apply_method: String,
+    /// When the setting was written.
+    ///
+    /// A change that waits for a reboot ("changes to static parameters require a reboot …
+    /// before the change can take effect") is in force on an engine that has come up SINCE
+    /// it was made and not on one that has not, so the engine data plane compares this
+    /// against when the instance's engine last started
+    /// ([`data_plane::pg_server::running_parameters`]). Without it a pending change would
+    /// be indistinguishable from an applied one.
+    pub set_at: ::aws_smithy_types::DateTime,
 }
 
 /// A persisted cluster parameter group.

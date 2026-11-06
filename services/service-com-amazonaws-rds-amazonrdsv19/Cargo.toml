@@ -31,11 +31,15 @@ tracing = { workspace = true }
 #
 # The `backup` feature is SQLite's own online-backup API, which is what COPYING one
 # instance's database is: taking a DB snapshot of an instance and restoring that snapshot
-# into a new instance's storage are both a page-for-page copy made by the engine.
+# into a new instance's storage are both a page-for-page copy made by the engine. The
+# `functions` feature registers this endpoint's own server functions
+# (`pg_postmaster_start_time`, `pg_is_in_recovery`, `pg_sleep`, `current_setting`) on each
+# database's connection, so a statement that calls one is planned and run by the engine.
 rusqlite = { version = "0.37", features = [
     "backup",
     "bundled",
     "column_decltype",
+    "functions",
     "hooks",
     "limits",
 ] }

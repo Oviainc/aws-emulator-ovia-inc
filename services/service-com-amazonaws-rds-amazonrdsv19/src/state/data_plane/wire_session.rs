@@ -21,7 +21,7 @@ use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use tokio::sync::watch;
 
 use super::sql_engine::{Cell, ColumnInfo, EngineError, EngineErrorKind, InstanceDatabase, ResultSet};
-use super::{server_statements, EngineWire};
+use super::{dialect, server_statements, EngineWire};
 use crate::state::ComAmazonawsRdsAmazonrdsv19State;
 
 /// How many bytes of SQL one statement may carry, matching the engine's own statement
@@ -135,6 +135,9 @@ pub struct SessionContext {
     pub resource_id: String,
     /// The instance's database.
     pub database: Arc<InstanceDatabase>,
+    /// The sessions open on this endpoint, which is what `pg_stat_activity` reports and
+    /// what `max_connections` is counted against.
+    pub sessions: super::pg_sessions::SessionRegistry,
     /// The core's TLS server, for the in-band upgrade each wire negotiates.
     pub upgrader: ::emulator_server::TlsUpgrader,
     /// The engine's run: a session ends when this changes (a reboot, a stop).
@@ -218,7 +221,97 @@ impl SessionContext {
             default_database,
             requires_secure_transport: store.requires_secure_transport(record),
             endpoint_host,
+            runtime: engine_runtime_of(&store, record),
         })
+    }
+
+    /// The instance's engine RUNTIME as it is now, re-read for each statement a session
+    /// runs: the parameters in force, when the engine last came up, and whether it is
+    /// replaying from a primary.
+    ///
+    /// Read fresh rather than taken at login, because a parameter group a caller modifies
+    /// mid-session changes what the engine reports from then on — "changes to dynamic
+    /// parameters are applied immediately" — and a session that is already open must see
+    /// that, not the values its login happened to find.
+    pub fn engine_runtime(&self) -> Option<EngineRuntime> {
+        let store = self.state.lock();
+        let record = store.instance_by_resource_id(&self.region, &self.resource_id)?;
+        Some(engine_runtime_of(&store, record))
+    }
+}
+
+/// The engine runtime of `record`, read under the state lock the caller holds.
+fn engine_runtime_of(
+    store: &ComAmazonawsRdsAmazonrdsv19State,
+    record: &crate::state::DbInstanceRecord,
+) -> EngineRuntime {
+    let group = record.db_parameter_group_name.as_ref().and_then(|name| {
+        store
+            .db_parameter_groups
+            .get(&(record.region.clone(), name.to_ascii_lowercase()))
+    });
+    // The engine defaults come from the parameter group's FAMILY. For a group this store
+    // holds that is the family it was created with; for one of the default groups AWS
+    // provides — which no request creates, so this store has no record of them — it is the
+    // family the group is NAMED after (`default.postgres16`), which is where
+    // `CreateDBInstance` got the name from.
+    let family = match group {
+        Some(group) => group.family.clone(),
+        None => record
+            .db_parameter_group_name
+            .as_deref()
+            .and_then(|name| name.strip_prefix(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX))
+            .unwrap_or_default()
+            .to_string(),
+    };
+    EngineRuntime {
+        parameters: super::pg_server::running_parameters(
+            &family,
+            crate::state::published_db_parameters(&family),
+            group.map(|group| &group.parameters),
+            record.engine_started_at.as_secs_f64(),
+        ),
+        postmaster_start_time: record.engine_started_at.as_secs_f64(),
+        // `pg_is_in_recovery()` is true on a standby replaying from a primary. An instance
+        // is a standby only where it was created as a read replica, and
+        // `CreateDBInstanceReadReplica` is still a scaffold in this crate (its own stub
+        // issue), so no instance this store holds has a replication source to replay
+        // from: every one of them is a writer, which is what this reports.
+        in_recovery: false,
+        master_username: record.master_username.clone(),
+    }
+}
+
+/// What the engine of one DB instance is running with, as of now.
+#[derive(Debug, Clone, Default)]
+pub struct EngineRuntime {
+    /// The configuration parameters in force, resolved from the instance's DB parameter
+    /// group and the engine defaults its family publishes.
+    pub parameters: Vec<super::pg_server::RunningParameter>,
+    /// When the engine last came up, as epoch seconds.
+    pub postmaster_start_time: f64,
+    /// Whether the engine is replaying from a primary.
+    pub in_recovery: bool,
+    /// The instance's master user, which owns its databases.
+    pub master_username: Option<String>,
+}
+
+impl EngineRuntime {
+    /// The value the engine is running with for the parameter `lowered`, or `None` for a
+    /// parameter it has none of.
+    #[must_use]
+    pub fn parameter(&self, lowered: &str) -> Option<&str> {
+        self.parameters
+            .iter()
+            .find(|parameter| parameter.name == lowered)
+            .map(|parameter| parameter.running.as_str())
+    }
+
+    /// The parameter `lowered` as a whole number, for the parameters that bound something
+    /// (`max_connections`, `statement_timeout`).
+    #[must_use]
+    pub fn numeric_parameter(&self, lowered: &str) -> Option<u64> {
+        self.parameter(lowered)?.trim().parse().ok()
     }
 }
 
@@ -241,6 +334,9 @@ pub struct InstanceFacts {
     pub requires_secure_transport: bool,
     /// The host the instance's listener is bound to, which is the host a refusal names.
     pub endpoint_host: String,
+    /// What the instance's engine is running with: its parameters, its start time, its
+    /// role.
+    pub runtime: EngineRuntime,
 }
 
 /// Why a login was refused. Each wire words it in its own protocol's terms.
@@ -415,8 +511,15 @@ pub struct SessionFacts {
     pub settings: BTreeMap<String, String>,
     /// The databases this instance has, which is what a `USE` is resolved against.
     pub databases: Vec<String>,
-    /// The host the instance's listener is bound to, which is the host a refusal names.
+    /// The host the instance's listener is bound to, which is the host a refusal names —
+    /// and the host a MySQL `USER()` reports the session as connecting from.
     pub endpoint_host: String,
+    /// What the instance's engine is running with. Re-read before each statement, so a
+    /// parameter group a caller changes mid-session is visible to this session from then
+    /// on.
+    pub runtime: EngineRuntime,
+    /// The sessions open on this endpoint, this one included.
+    pub sessions: super::pg_sessions::SessionRegistry,
 }
 
 impl SessionFacts {
@@ -434,9 +537,83 @@ impl SessionFacts {
         if let Some(value) = self.settings.get(&lowered) {
             return Some(value.clone());
         }
+        // The instance's own configuration parameters come before the settings the server
+        // answers for itself, so a parameter group that sets one is what the session reads.
+        if let Some(value) = self.runtime.parameter(&lowered) {
+            return Some(value.to_string());
+        }
         server_setting(self, &lowered)
     }
+
+    /// Every setting this session can read, by lowercased name: the engine's parameters,
+    /// the settings the server answers for itself, and the session's own `SET`s. What
+    /// `current_setting` resolves against and what `pg_settings` reports.
+    #[must_use]
+    pub fn all_settings(&self) -> BTreeMap<String, String> {
+        let mut settings = BTreeMap::new();
+        for parameter in &self.runtime.parameters {
+            settings.insert(parameter.name.clone(), parameter.running.clone());
+        }
+        for name in SERVER_SETTING_NAMES {
+            if let Some(value) = server_setting(self, name) {
+                settings.insert(name.to_string(), value);
+            }
+        }
+        for (name, value) in &self.settings {
+            settings.insert(name.clone(), value.clone());
+        }
+        settings
+    }
+
+    /// The MySQL ACCOUNT this session holds the privileges of: `user@host-pattern`.
+    ///
+    /// A MySQL privilege is granted to an account, not to a bare user name, and the master
+    /// user Amazon RDS creates is granted to `'<master>'@'%'` — the account whose grants
+    /// `SHOW GRANTS` lists and which `CURRENT_USER()` reports.
+    #[must_use]
+    pub fn mysql_account(&self) -> String {
+        format!("{}@{}", self.user, MYSQL_MASTER_HOST_PATTERN)
+    }
+
+    /// The sessions open on this endpoint right now, which is what `pg_stat_activity`
+    /// reports.
+    #[must_use]
+    pub fn live_sessions(&self) -> Vec<super::pg_sessions::LiveSession> {
+        self.sessions.open_sessions()
+    }
 }
+
+/// The host pattern of the account Amazon RDS grants the master user: `%`, "any host",
+/// because an RDS DB instance is reached from whatever host the client is on.
+pub const MYSQL_MASTER_HOST_PATTERN: &str = "%";
+
+/// The settings the SERVER itself answers for, by name — the ones that are not
+/// parameter-group parameters at all. See [`server_setting`], which answers each of them.
+pub const SERVER_SETTING_NAMES: [&str; 23] = [
+    "ssl",
+    "server_version",
+    "version",
+    "server_encoding",
+    "client_encoding",
+    "character_set_server",
+    "character_set_client",
+    "character_set_results",
+    "character_set_connection",
+    "collation_server",
+    "collation_connection",
+    "datestyle",
+    "timezone",
+    "time_zone",
+    "integer_datetimes",
+    "standard_conforming_strings",
+    "is_superuser",
+    "session_authorization",
+    "transaction_isolation",
+    "autocommit",
+    "rds.force_ssl",
+    "require_secure_transport",
+    "ssl_version",
+];
 
 /// The settings the server itself answers for, by lowercased name.
 ///
@@ -573,6 +750,13 @@ impl StatementAnswer {
         self.notices.push(notice);
         self
     }
+
+    /// The same answer, with a setting it changed for the session.
+    #[must_use]
+    pub fn with_setting(mut self, name: &str, value: String) -> Self {
+        self.setting_changed = Some((name.to_string(), value));
+        self
+    }
 }
 
 /// Run one statement for a session: a server command answered from this emulator's own
@@ -609,18 +793,148 @@ pub fn run_statement(
     }
     let words = leading_words(&tokens, 3);
     if let Some(answer) = server_command(database, facts, &words, &tokens)? {
-        return Ok(answer);
+        // The isolation level a transaction runs at belongs to THAT transaction: a `BEGIN`
+        // that names one sets it for the transaction it opens, a `BEGIN` that names none
+        // runs at the session's default, and ending the transaction puts the default back.
+        // That is what the session reads back as its `transaction_isolation`.
+        return Ok(match transaction_isolation(facts, &words, &tokens) {
+            Some(level) => answer.with_setting("transaction_isolation", level),
+            None => answer,
+        });
+    }
+    // The role statements, which this server keeps in its own role catalog rather than
+    // handing to the engine, and which it answers in PostgreSQL's words.
+    if facts.wire == EngineWire::Postgres {
+        if let Some(answer) = super::pg_server::role_statement(database, facts, &words, &tokens)? {
+            return Ok(answer);
+        }
     }
     let verb = statement_verb(&words);
+    // The system catalogs the statement READS are rebuilt from this service's state first,
+    // so the rows the engine then plans over are the instance as it is at this instant.
+    let named = catalogs_named(&tokens);
+    if !named.is_empty() {
+        super::pg_server::refresh_catalogs(database, facts, &named)?;
+    }
     // Where the statement's own names put it, and the statement as the engine reads it.
     let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
-    let prepared = render_for_engine(facts, &stream);
+    let prepared = dialect::render_for_engine(facts, &stream);
     let result = database
-        .execute(&target, &prepared, params)
+        .execute_as(&target, &server_view(facts), &prepared, params)
         .map_err(|error| {
             server_statements::as_the_engine_words_it(facts.wire, &prepared, error)
         })?;
     Ok(StatementAnswer::new(verb, result))
+}
+
+/// The isolation level the session reports after a transaction-control statement, or `None`
+/// for a statement that is not one.
+///
+/// Both engines take the transaction's characteristics on the statement that opens it —
+/// PostgreSQL's `BEGIN [ISOLATION LEVEL …] [READ ONLY|READ WRITE]`, MySQL's `START
+/// TRANSACTION [WITH CONSISTENT SNAPSHOT] [READ ONLY|READ WRITE]` — and the level belongs
+/// to THAT transaction: `transaction_isolation` "shows the isolation level of the current
+/// transaction", so a transaction opened without naming a level runs at the session's
+/// default (`default_transaction_isolation` on PostgreSQL, the `transaction_isolation`
+/// parameter on MySQL) and ending the transaction puts that default back. The transaction
+/// itself is the engine's ([`server_statements::transaction_control`] opens and ends it).
+fn transaction_isolation(
+    facts: &SessionFacts,
+    words: &[String],
+    tokens: &[Token],
+) -> Option<String> {
+    let first = words.first().map(String::as_str).unwrap_or_default();
+    let second = words.get(1).map(String::as_str).unwrap_or_default();
+    let opens = matches!((first, second), ("BEGIN", _) | ("START", "TRANSACTION"));
+    let ends = matches!(first, "COMMIT" | "ROLLBACK" | "END" | "ABORT");
+    if !opens && !ends {
+        return None;
+    }
+    // The level the session is back to once no transaction names one of its own.
+    let default = || {
+        let named = match facts.wire {
+            EngineWire::Postgres => "default_transaction_isolation",
+            EngineWire::MySql => "transaction_isolation",
+        };
+        facts
+            .runtime
+            .parameter(named)
+            .map(str::to_string)
+            .unwrap_or_else(|| match facts.wire {
+                // Each engine's own default, for an instance whose parameter group and
+                // family catalogue carry no value for it.
+                EngineWire::Postgres => "read committed".to_string(),
+                EngineWire::MySql => "REPEATABLE-READ".to_string(),
+            })
+    };
+    if ends {
+        return Some(default());
+    }
+    let modes: Vec<String> = tokens
+        .iter()
+        .map(|token| match token {
+            Token::Word(word) => word.value.to_ascii_uppercase(),
+            other => other.to_string(),
+        })
+        .collect();
+    // "ISOLATION LEVEL { SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ
+    // UNCOMMITTED }": the level is the words after `ISOLATION LEVEL`, up to the next mode.
+    let Some(at) = modes.iter().position(|word| word == "ISOLATION") else {
+        return Some(default());
+    };
+    let level = modes
+        .iter()
+        .skip(at + 2)
+        .take_while(|word| {
+            matches!(
+                word.as_str(),
+                "SERIALIZABLE" | "REPEATABLE" | "READ" | "COMMITTED" | "UNCOMMITTED"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if level.is_empty() {
+        return Some(default());
+    }
+    Some(match facts.wire {
+        // The two engines report the level in their own spelling: PostgreSQL in lower case
+        // with a space, MySQL in upper case with a hyphen.
+        EngineWire::Postgres => level.to_ascii_lowercase(),
+        EngineWire::MySql => level.replace(' ', "-"),
+    })
+}
+
+/// The system catalogs a statement names, in the order [`super::pg_server::CATALOGS`] lists
+/// them. A statement that names none is run without rebuilding anything.
+fn catalogs_named(tokens: &[Token]) -> Vec<&'static str> {
+    super::pg_server::CATALOGS
+        .into_iter()
+        .filter(|catalog| {
+            tokens.iter().any(|token| match token {
+                Token::Word(word) => word.value.eq_ignore_ascii_case(catalog),
+                _ => false,
+            })
+        })
+        .collect()
+}
+
+/// What the server functions in this session's statement answer from.
+fn server_view(facts: &SessionFacts) -> super::sql_engine::ServerView {
+    super::sql_engine::ServerView {
+        settings: facts.all_settings(),
+        postmaster_start_time: facts.runtime.postmaster_start_time,
+        in_recovery: facts.runtime.in_recovery,
+        backend_pid: facts.connection_id,
+        // `statement_timeout`: "the time in milliseconds after which a statement is
+        // aborted; 0 disables the timeout" — the session's own value where it set one, else
+        // the instance's.
+        statement_timeout_ms: facts
+            .setting("statement_timeout")
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0),
+        deadline: None,
+    }
 }
 
 /// Which DATABASE a statement runs against, and the statement with the qualifiers that
@@ -660,10 +974,10 @@ fn resolve_qualifiers(
                 .iter()
                 .find(|known| known.eq_ignore_ascii_case(&word.value));
             if let Some(qualifier) = qualifier {
-                let period = next_significant(stream, index + 1)
+                let period = dialect::next_significant(stream, index + 1)
                     .filter(|at| matches!(stream.get(*at), Some(Token::Period)));
                 let qualified = period
-                    .and_then(|at| next_significant(stream, at + 1))
+                    .and_then(|at| dialect::next_significant(stream, at + 1))
                     .is_some_and(|at| matches!(stream.get(at), Some(Token::Word(_))));
                 if let (Some(period), true) = (period, qualified) {
                     if target
@@ -723,7 +1037,7 @@ pub fn describe_statement(
         return Vec::new();
     };
     database
-        .describe(&target, &render_for_engine(facts, &stream))
+        .describe(&target, &dialect::render_for_engine(facts, &stream))
         .unwrap_or_default()
 }
 
@@ -945,6 +1259,11 @@ fn mysql_show(
                     .collect(),
             ),
         )),
+        // `SHOW GRANTS [FOR <account>]` — "lists the privileges … granted to an account".
+        // The account is the session's own where the statement names none, and the
+        // privileges are the ones the account HAS, which this server knows for exactly one
+        // account: the master user Amazon RDS created with the instance.
+        "GRANTS" => Ok(StatementAnswer::new("SHOW", mysql_grants(facts, tokens)?)),
         // `SHOW TABLES`, `SHOW COLUMNS`, `SHOW CREATE TABLE` and the rest read the
         // schema, which is the ENGINE's to report; the engine has no `SHOW`, so the
         // honest answer is that this server does not serve the command rather than a
@@ -957,6 +1276,63 @@ fn mysql_show(
             ),
         )),
     }
+}
+
+/// The privileges the master user of an Amazon RDS for MySQL DB instance holds, in the
+/// order a `GRANT` statement lists them.
+///
+/// Source: the Amazon RDS User Guide's "Master user account privileges" — RDS grants the
+/// master user "most of the privileges" of a MySQL `root` account but NOT the
+/// server-administration ones it keeps for itself, which is why `SUPER` is absent here and
+/// why `SET GLOBAL` is refused on this endpoint. The list is what `SHOW GRANTS` reports for
+/// the account, so the two cannot disagree about what the master user may do.
+const MYSQL_MASTER_PRIVILEGES: &str = "SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, \
+     PROCESS, REFERENCES, INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES, LOCK TABLES, \
+     EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, \
+     ALTER ROUTINE, CREATE USER, EVENT, TRIGGER";
+
+/// `SHOW GRANTS [FOR <account>]`: one row per `GRANT` statement, in the single column MySQL
+/// names after the account.
+///
+/// An account this server has no grants for — any account but the instance's master user —
+/// gets the refusal MySQL answers for one, which is what a client branches on; the master
+/// user's own grants are [`MYSQL_MASTER_PRIVILEGES`] on every schema, held with the grant
+/// option, as RDS grants them.
+fn mysql_grants(facts: &SessionFacts, tokens: &[Token]) -> Result<ResultSet, EngineError> {
+    let named: Vec<String> = tokens
+        .iter()
+        .skip_while(|token| !matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("FOR")))
+        .filter_map(|token| match token {
+            Token::SingleQuotedString(value) | Token::DoubleQuotedString(value) => {
+                Some(value.clone())
+            }
+            Token::Word(word) if word.quote_style == Some('`') => Some(word.value.clone()),
+            _ => None,
+        })
+        .collect();
+    let (user, host) = match named.as_slice() {
+        [] => (facts.user.clone(), MYSQL_MASTER_HOST_PATTERN.to_string()),
+        [user] => (user.clone(), MYSQL_MASTER_HOST_PATTERN.to_string()),
+        [user, host, ..] => (user.clone(), host.clone()),
+    };
+    // Only the instance's master user is an account this server holds grants for: an
+    // account nothing granted anything to is MySQL's own "no such grant" refusal, which is
+    // what a client branches on, rather than a privilege list nothing stands behind.
+    if user != facts.user || host != MYSQL_MASTER_HOST_PATTERN {
+        return Err(EngineError::new(
+            EngineErrorKind::UndefinedObject,
+            format!("There is no such grant defined for user '{user}' on host '{host}'"),
+        ));
+    }
+    Ok(ResultSet::of_rows(
+        vec![ColumnInfo {
+            name: format!("Grants for {user}@{host}"),
+            declared_type: Some("text".to_string()),
+        }],
+        vec![vec![Cell::Text(format!(
+            "GRANT {MYSQL_MASTER_PRIVILEGES} ON *.* TO `{user}`@`{host}` WITH GRANT OPTION"
+        ))]],
+    ))
 }
 
 /// The session variables `SHOW VARIABLES` reports: the settings this server answers for.
@@ -1143,108 +1519,6 @@ fn statement_verb(words: &[String]) -> String {
     }
 }
 
-/// The statement as the SQL ENGINE is asked to run it: the same tokens, with the values
-/// this SESSION carries substituted for the session functions and system variables that
-/// name them.
-///
-/// Substituting a session value is what a server does with `current_user`: the value comes
-/// from the connection, not from the statement. Only WORD tokens are replaced, so a
-/// string literal that happens to spell one is left exactly as the client wrote it.
-fn render_for_engine(facts: &SessionFacts, tokens: &[Token]) -> String {
-    let mut rendered = String::new();
-    let mut index = 0usize;
-    while index < tokens.len() {
-        let token = &tokens[index];
-        let text = token.to_string();
-        // A MySQL system variable: `@@name`, or `@@` followed by the name.
-        if let Some(name) = text.strip_prefix("@@") {
-            let (name, consumed) = if name.is_empty() {
-                (
-                    tokens
-                        .get(index + 1)
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                    2,
-                )
-            } else {
-                (name.to_string(), 1)
-            };
-            let name = name
-                .trim_start_matches("global.")
-                .trim_start_matches("session.")
-                .to_string();
-            rendered.push_str(&quote_value(facts.setting(&name)));
-            index += consumed;
-            continue;
-        }
-        match token {
-            Token::Word(word) if word.quote_style.is_none() => {
-                let lowered = word.value.to_ascii_lowercase();
-                let next = next_significant(tokens, index + 1);
-                let called = matches!(next.and_then(|at| tokens.get(at)), Some(Token::LParen));
-                match session_function(facts, &lowered, called) {
-                    // A function written with an empty argument list is substituted
-                    // together with it.
-                    Some(value) => {
-                        rendered.push_str(&value);
-                        index += 1;
-                        if called {
-                            let close = next.and_then(|at| next_significant(tokens, at + 1));
-                            if matches!(close.and_then(|at| tokens.get(at)), Some(Token::RParen)) {
-                                index = close.map_or(index, |at| at + 1);
-                            }
-                        }
-                        continue;
-                    }
-                    None => rendered.push_str(&text),
-                }
-            }
-            _ => rendered.push_str(&text),
-        }
-        index += 1;
-    }
-    rendered
-}
-
-/// The index of the next token that is not whitespace, at or after `from`.
-fn next_significant(tokens: &[Token], from: usize) -> Option<usize> {
-    tokens
-        .iter()
-        .enumerate()
-        .skip(from)
-        .find(|(_, token)| !matches!(token, Token::Whitespace(_)))
-        .map(|(index, _)| index)
-}
-
-/// The value a session function returns, as a SQL literal, or `None` for a word that is
-/// not one.
-///
-/// `called` says whether the word is followed by an argument list, which is what separates
-/// the two kinds: the forms the SQL standard spells as KEYWORDS (`current_user`,
-/// `session_user`) carry no parentheses, while the rest are functions and are substituted
-/// only where they are CALLED — so a column or alias that happens to be named `version`
-/// stays the column it is.
-fn session_function(facts: &SessionFacts, lowered: &str, called: bool) -> Option<String> {
-    let text = |value: &str| Some(format!("'{}'", value.replace('\'', "''")));
-    match lowered {
-        "current_user" | "session_user" | "user" | "current_role" => text(&facts.user),
-        "current_catalog" => text(&facts.database),
-        "current_schema" if !called => text(match facts.wire {
-            EngineWire::Postgres => "public",
-            EngineWire::MySql => &facts.database,
-        }),
-        _ if !called => None,
-        "current_database" | "database" | "schema" => text(&facts.database),
-        "current_schema" => text(match facts.wire {
-            EngineWire::Postgres => "public",
-            EngineWire::MySql => &facts.database,
-        }),
-        "pg_backend_pid" | "connection_id" => Some(facts.connection_id.to_string()),
-        "version" => text(&server_version_banner(facts)),
-        _ => None,
-    }
-}
-
 /// The version string the engine reports for itself, as `version()` returns it.
 ///
 /// PostgreSQL's `version()` is a banner naming the server and its version; MySQL's is the
@@ -1254,14 +1528,6 @@ pub fn server_version_banner(facts: &SessionFacts) -> String {
     match facts.wire {
         EngineWire::Postgres => format!("PostgreSQL {}", facts.server_version),
         EngineWire::MySql => facts.server_version.clone(),
-    }
-}
-
-/// `value` as a SQL literal, or `NULL` where the session has no such value.
-fn quote_value(value: Option<String>) -> String {
-    match value {
-        Some(value) => format!("'{}'", value.replace('\'', "''")),
-        None => "NULL".to_string(),
     }
 }
 
@@ -1295,6 +1561,15 @@ pub fn split_statements(wire: EngineWire, sql: &str) -> Result<Vec<String>, Engi
         ));
     }
     Ok(statements)
+}
+
+/// The statement's SIGNIFICANT tokens — whitespace and comments dropped — which is what
+/// decides what the statement IS.
+pub fn significant_tokens(wire: EngineWire, sql: &str) -> Result<Vec<Token>, EngineError> {
+    Ok(statement_tokens(wire, sql)?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect())
 }
 
 /// The statement's tokens, keeping the whitespace that separates them (so a re-rendered

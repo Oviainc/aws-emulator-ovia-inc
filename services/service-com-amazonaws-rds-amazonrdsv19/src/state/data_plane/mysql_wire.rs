@@ -117,13 +117,16 @@ impl ::emulator_server::NativeHandler for MySqlWire {
 }
 
 /// Rolls back whatever a session had not committed when it ends — on every path,
-/// including a severed connection.
+/// including a severed connection — and takes the session out of the endpoint's registry.
 struct Session {
     database: Arc<InstanceDatabase>,
+    sessions: super::pg_sessions::SessionRegistry,
+    connection_id: u32,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.sessions.ended(self.connection_id);
         self.database.rollback_open_transaction();
     }
 }
@@ -217,11 +220,45 @@ async fn serve_session(
         settings: std::collections::BTreeMap::new(),
         databases: facts.databases.clone(),
         endpoint_host: facts.endpoint_host.clone(),
+        runtime: facts.runtime.clone(),
+        sessions: context.sessions.clone(),
     };
+    // `max_connections` bounds the sessions a MySQL server holds at once too, and the
+    // server refuses the connection that would exceed it.
+    if let Some(limit) = session_facts.runtime.numeric_parameter("max_connections") {
+        if context.sessions.open_count() as u64 >= limit {
+            return write_error(
+                &mut conn,
+                sequence.wrapping_add(1),
+                1040,
+                "08004",
+                "Too many connections",
+            )
+            .await;
+        }
+    }
     let database_handle = Arc::clone(&context.database);
     let _session = Session {
         database: Arc::clone(&database_handle),
+        sessions: context.sessions.clone(),
+        connection_id,
     };
+    context.sessions.admitted(super::pg_sessions::LiveSession {
+        pid: connection_id,
+        user: session_facts.user.clone(),
+        database: session_facts.database.clone(),
+        application_name: String::new(),
+        client_address: facts.endpoint_host.clone(),
+        backend_start: super::pg_server::timestamptz_text(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        ),
+        state: super::pg_sessions::STATE_IDLE.to_string(),
+        query: String::new(),
+        query_start: None,
+    });
     let deprecate_eof = client_capabilities & CLIENT_DEPRECATE_EOF != 0;
     write_ok(
         &mut conn,
@@ -296,6 +333,7 @@ async fn serve_session(
                 serve_query(
                     &mut conn,
                     sequence.wrapping_add(1),
+                    &context,
                     &database_handle,
                     &mut session_facts,
                     &sql,
@@ -421,6 +459,7 @@ fn session_nonce() -> std::io::Result<Vec<u8>> {
 async fn serve_query(
     conn: &mut ::emulator_server::ListenerConn,
     sequence: u8,
+    context: &SessionContext,
     database: &Arc<InstanceDatabase>,
     facts: &mut SessionFacts,
     sql: &str,
@@ -446,6 +485,11 @@ async fn serve_query(
         return write_error(conn, sequence, 1065, "42000", "Query was empty").await;
     };
     let answer = {
+        // The instance's engine runtime as it is NOW, so a parameter group a caller
+        // modifies under a live session is what this statement runs against.
+        if let Some(runtime) = context.engine_runtime() {
+            facts.runtime = runtime;
+        }
         let database = Arc::clone(database);
         let session = facts.clone();
         let statement = statement.clone();

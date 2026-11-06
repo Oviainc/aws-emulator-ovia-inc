@@ -408,6 +408,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         crate::state::check_db_instance_class(&input.db_instance_class)
             .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        // `MasterUserPassword` carries the engine's master-password policy wherever it is
+        // taken: the same constraints `CreateDBCluster`, `ModifyDBCluster` and
+        // `ModifyDBInstance` check ([`crate::state::check_master_user_password`]), so one
+        // policy holds across every operation that sets one and a value outside it never
+        // becomes a live credential. The refusal names the member and the constraint; the
+        // value is `@sensitive` and is never echoed.
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_master_user_password(&input.engine, password)
+                .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        }
         // Resolved here, before the store is touched, so a request naming a version
         // this service cannot provision is refused for the version and leaves no
         // instance behind.
@@ -690,6 +700,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .engine_lifecycle_support
                 .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
             instance_create_time: crate::state::now_as_wire_timestamp(),
+            // The engine's first run starts with the instance; a later restart moves it.
+            engine_started_at: crate::state::now_as_wire_timestamp(),
             tags: input.tags.unwrap_or_default(),
             // The instance's log starts empty; the line below is its first entry, and the
             // transitions the clock then makes due add the rest (`DbInstanceRecord`).

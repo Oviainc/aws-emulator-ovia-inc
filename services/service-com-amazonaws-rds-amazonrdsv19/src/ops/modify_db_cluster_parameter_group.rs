@@ -263,6 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::ParameterSetting {
                     value: value.to_string(),
                     apply_method,
+                    set_at: crate::state::now_as_wire_timestamp(),
                 },
             ));
         }

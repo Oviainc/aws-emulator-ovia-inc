@@ -593,6 +593,16 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
          ALTER TABLE SET STATISTICS.",
     ),
     parameter(
+        "default_transaction_isolation",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "read committed,read uncommitted,repeatable read,serializable",
+        "read committed",
+        true,
+        "",
+        "Sets the transaction isolation level of each new transaction.",
+    ),
+    parameter(
         "from_collapse_limit",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -715,6 +725,16 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         "The time in milliseconds after which a statement is aborted; 0 disables the \
          timeout.",
+    ),
+    parameter(
+        "superuser_reserved_connections",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "0-8388607",
+        "3",
+        true,
+        "",
+        "Sets the number of connection slots reserved for superusers.",
     ),
     parameter(
         "temp_buffers",

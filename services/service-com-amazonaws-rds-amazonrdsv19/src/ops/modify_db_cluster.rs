@@ -406,10 +406,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(password)
-                .map_err(ModifyDBClusterError::invalid_parameter_value)?;
-        }
         if let Some(support) = &input.engine_lifecycle_support {
             crate::state::check_engine_lifecycle_support(support)
                 .map_err(ModifyDBClusterError::invalid_parameter_value)?;
@@ -526,6 +522,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let engine = current.engine.clone();
         let current_engine_version = current.engine_version.clone();
         let status = current.status.clone();
+
+        // `MasterUserPassword` carries the engine's master-password policy, and the bound
+        // is per engine ([`crate::state::master_user_password_len`]), so the value is
+        // checked once the cluster's own engine is in hand — the same check every other
+        // operation that sets one makes.
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_master_user_password(&engine, password)
+                .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+        }
 
         // A cluster takes one modification at a time: one that is still coming up, on its
         // way out, or already applying a modification is not in a state this operation can

@@ -775,6 +775,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The restored instance was created NOW; the source's own creation time
                 // stays on the snapshot, which is what `InstanceCreateTime` reports there.
                 instance_create_time: crate::state::now_as_wire_timestamp(),
+                // Its engine's first run starts with it, the same as a create's; a later
+                // reboot or start moves it.
+                engine_started_at: crate::state::now_as_wire_timestamp(),
                 tags,
                 engine_log: crate::state::InstanceLog::default(),
             };

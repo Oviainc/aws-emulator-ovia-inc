@@ -491,6 +491,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `MasterUserPassword` carries the engine's master-password policy wherever it is
+        // taken, and a rotation is exactly where a weak value must not be installed: the
+        // value is checked against the same constraints `CreateDBInstance`,
+        // `CreateDBCluster` and `ModifyDBCluster` check it against
+        // ([`crate::state::check_master_user_password`]), so one password policy holds
+        // across every operation that sets one. The refusal names the member and the
+        // constraint; the value itself is `@sensitive` and is never echoed.
+        if let Some(password) = &input.master_user_password {
+            // The bound is per engine ([`crate::state::master_user_password_len`]), so it
+            // is read from the engine the modification LEAVES the instance on.
+            let engine = input
+                .engine
+                .clone()
+                .unwrap_or_else(|| store.db_instances[&key].engine.clone());
+            crate::state::check_master_user_password(&engine, password)
+                .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
+        }
+
         // The version the instance RUNS once the modification is applied: the same
         // resolution `CreateDBInstance` does, against the engine the modification
         // leaves the instance on. Resolved BEFORE the record is taken out of the

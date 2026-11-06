@@ -48,6 +48,12 @@ const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 /// what this endpoint serves, so a length prefix cannot make it allocate without bound.
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
+/// `superuser_reserved_connections`'s own default: "the number of connection slots
+/// reserved for connections by roles with SUPERUSER", which PostgreSQL ships as 3. Those
+/// slots come out of `max_connections`, so an ordinary role is refused once only they are
+/// left.
+const DEFAULT_SUPERUSER_RESERVED_CONNECTIONS: u64 = 3;
+
 /// The PostgreSQL wire handler for one DB instance's listener.
 pub struct PostgresWire {
     context: SessionContext,
@@ -85,6 +91,7 @@ impl ::emulator_server::NativeHandler for PostgresWire {
 /// teardown can be guaranteed to happen at all.
 struct Session {
     database: Arc<InstanceDatabase>,
+    sessions: super::pg_sessions::SessionRegistry,
     /// The database this session is connected to, which is the one its row and its
     /// uncommitted work are in.
     name: String,
@@ -93,6 +100,7 @@ struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.sessions.ended(self.pid);
         let _ = self.database.execute(
             &self.name,
             "DELETE FROM pg_stat_ssl WHERE pid = ?",
@@ -238,13 +246,63 @@ async fn serve_session(
         settings: std::collections::BTreeMap::new(),
         databases: facts.databases.clone(),
         endpoint_host: facts.endpoint_host.clone(),
+        runtime: facts.runtime.clone(),
+        sessions: context.sessions.clone(),
     };
+    // `max_connections` — "the maximum number of concurrent connections to the database
+    // server" — is what a PostgreSQL server bounds its session table by, and it refuses the
+    // connection that would exceed it before the session is opened. The value is the
+    // instance's own effective parameter, so a parameter group that lowers it lowers what
+    // this endpoint admits. The last `superuser_reserved_connections` slots are not
+    // available to an ordinary role at all, and the master user of an RDS instance is one
+    // ([`wire_session::EngineRuntime`] reports it as no superuser), so it is refused for
+    // the reserved slots before the table is full.
+    if let Some(limit) = session_facts.runtime.numeric_parameter("max_connections") {
+        let open = context.sessions.open_count() as u64;
+        let reserved = session_facts
+            .runtime
+            .numeric_parameter("superuser_reserved_connections")
+            .unwrap_or(DEFAULT_SUPERUSER_RESERVED_CONNECTIONS);
+        if open >= limit {
+            return fatal(&mut conn, "53300", "sorry, too many clients already").await;
+        }
+        if open + reserved >= limit {
+            return fatal(
+                &mut conn,
+                "53300",
+                "remaining connection slots are reserved for non-replication superuser \
+                 connections",
+            )
+            .await;
+        }
+    }
     let database_handle = Arc::clone(&context.database);
     let _session = Session {
         database: Arc::clone(&database_handle),
+        sessions: context.sessions.clone(),
         name: session_facts.database.clone(),
         pid: session_facts.connection_id,
     };
+    context.sessions.admitted(super::pg_sessions::LiveSession {
+        pid: session_facts.connection_id,
+        user: user.clone(),
+        database: database.clone(),
+        application_name: startup
+            .iter()
+            .find(|(key, _)| key == "application_name")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default(),
+        client_address: facts.endpoint_host.clone(),
+        backend_start: super::pg_server::timestamptz_text(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        ),
+        state: super::pg_sessions::STATE_IDLE.to_string(),
+        query: String::new(),
+        query_start: None,
+    });
     register_session(&database_handle, &session_facts).await;
 
     send(&mut conn, b'R', &0i32.to_be_bytes()).await?;
@@ -311,6 +369,7 @@ async fn serve_session(
                 let (sql, _) = cstring(&body, 0);
                 failed_in_transaction = run_simple_query(
                     &mut conn,
+                    &context,
                     &database_handle,
                     &mut session_facts,
                     &sql,
@@ -425,10 +484,28 @@ async fn serve_session(
                 match portals.get(&name) {
                     Some(portal) => {
                         let described = portal.described;
+                        let statement = portal.sql.clone();
+                        // A `COPY … FROM STDIN` a client parsed and executed through the
+                        // extended protocol enters copy-in mode here, exactly as it does
+                        // in a simple query.
+                        if let Some(target) = copy_target(&session_facts, &statement) {
+                            if !serve_copy_in(
+                                &mut conn,
+                                &database_handle,
+                                &session_facts,
+                                &target,
+                            )
+                            .await?
+                            {
+                                failed_in_transaction = true;
+                            }
+                            continue;
+                        }
                         let outcome = run_statement(
+                            &context,
                             &database_handle,
                             &mut session_facts,
-                            portal.sql.clone(),
+                            statement,
                             portal.params.clone(),
                         )
                         .await;
@@ -606,6 +683,7 @@ fn read_i32(body: &[u8], at: usize) -> Result<i32, EngineError> {
 /// the session is inside a transaction.
 async fn run_simple_query(
     conn: &mut ::emulator_server::ListenerConn,
+    context: &wire_session::SessionContext,
     database: &Arc<InstanceDatabase>,
     facts: &mut SessionFacts,
     sql: &str,
@@ -622,7 +700,15 @@ async fn run_simple_query(
         return Ok(false);
     }
     for statement in statements {
-        match run_statement(database, facts, statement, Vec::new()).await {
+        // `COPY … FROM STDIN` is not a statement the engine runs on its own: it puts this
+        // session into the protocol's copy-in mode, where the client streams the rows.
+        if let Some(target) = copy_target(facts, &statement) {
+            if !serve_copy_in(conn, database, facts, &target).await? {
+                return Ok(true);
+            }
+            continue;
+        }
+        match run_statement(context, database, facts, statement, Vec::new()).await {
             Ok(answer) => write_answer(conn, &answer, true).await?,
             Err(error) => {
                 engine_error_response(conn, &error).await?;
@@ -633,21 +719,138 @@ async fn run_simple_query(
     Ok(false)
 }
 
+/// The copy-in target `sql` names, for the statements that are one.
+fn copy_target(facts: &SessionFacts, sql: &str) -> Option<super::pg_copy::CopyTarget> {
+    let tokens = wire_session::significant_tokens(facts.wire, sql).ok()?;
+    super::pg_copy::copy_in_target(facts, &tokens)
+}
+
+/// Serve one `COPY <table> FROM STDIN`: ask the client for the data, read what it streams,
+/// load it, and answer with what was loaded — or with the error the load stopped on.
+///
+/// Returns whether the copy succeeded. A copy that failed leaves the session the way any
+/// failed statement does: the error is reported and the caller answers `ReadyForQuery`.
+async fn serve_copy_in(
+    conn: &mut ::emulator_server::ListenerConn,
+    database: &Arc<InstanceDatabase>,
+    facts: &SessionFacts,
+    target: &super::pg_copy::CopyTarget,
+) -> std::io::Result<bool> {
+    // CopyInResponse: the text format (0), and no per-column format codes, which is what
+    // the text format carries.
+    let mut response = vec![0u8];
+    response.extend_from_slice(&0i16.to_be_bytes());
+    send(conn, b'G', &response).await?;
+    conn.flush().await?;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut failed: Option<EngineError> = None;
+    loop {
+        let Some((kind, body)) = read_message(conn).await? else {
+            // The client went away mid-copy: nothing is loaded.
+            return Ok(false);
+        };
+        match kind {
+            // CopyData.
+            b'd' => {
+                if data.len() + body.len() > super::pg_copy::MAX_COPY_BYTES {
+                    failed = Some(EngineError::new(
+                        EngineErrorKind::LimitExceeded,
+                        format!(
+                            "the copy data is larger than this endpoint serves ({} bytes)",
+                            super::pg_copy::MAX_COPY_BYTES
+                        ),
+                    ));
+                    data.clear();
+                    continue;
+                }
+                data.extend_from_slice(&body);
+            }
+            // CopyDone.
+            b'c' => break,
+            // CopyFail: the client gave up on its own load, and says why.
+            b'f' => {
+                let (reason, _) = cstring(&body, 0);
+                engine_error_response(
+                    conn,
+                    &EngineError::new(
+                        EngineErrorKind::Cancelled,
+                        format!("COPY from stdin failed: {reason}"),
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            }
+            // The protocol allows nothing else between CopyInResponse and CopyDone.
+            _ => {
+                let _ = fatal(conn, "08P01", "unexpected message during COPY from stdin").await;
+                return Ok(false);
+            }
+        }
+    }
+    if let Some(error) = failed {
+        engine_error_response(conn, &error).await?;
+        return Ok(false);
+    }
+    let loaded = {
+        let database = Arc::clone(database);
+        let facts = facts.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || super::pg_copy::load(&database, &facts, &target, &data))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    };
+    match loaded {
+        Ok(rows) => {
+            let mut tag = Vec::new();
+            put_cstring(&mut tag, &format!("COPY {rows}"));
+            send(conn, b'C', &tag).await?;
+            Ok(true)
+        }
+        Err(error) => {
+            engine_error_response(conn, &error).await?;
+            Ok(false)
+        }
+    }
+}
+
 /// Run one statement on a blocking task — the engine's work is CPU-bound and must not run
 /// on the async worker — and keep any setting it changed on the session.
+///
+/// The instance's engine runtime is re-read first, so the statement sees the parameters the
+/// instance has NOW: a parameter group modified under a live session is visible to it from
+/// the next statement on, which is what "applied immediately" means. The session's own row
+/// in `pg_stat_activity` is marked with the statement for as long as it runs.
 async fn run_statement(
+    context: &wire_session::SessionContext,
     database: &Arc<InstanceDatabase>,
     facts: &mut SessionFacts,
     sql: String,
     params: Vec<Option<String>>,
 ) -> Result<wire_session::StatementAnswer, EngineError> {
+    if let Some(runtime) = context.engine_runtime() {
+        facts.runtime = runtime;
+    }
+    context.sessions.running(
+        facts.connection_id,
+        &sql,
+        super::pg_server::timestamptz_text(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        ),
+    );
     let engine = Arc::clone(database);
     let session = facts.clone();
+    let statement = sql.clone();
     let answer = tokio::task::spawn_blocking(move || {
-        wire_session::run_statement(&engine, &session, &sql, &params)
+        wire_session::run_statement(&engine, &session, &statement, &params)
     })
     .await
-    .map_err(|error| EngineError::new(EngineErrorKind::Internal, error.to_string()))??;
+    .map_err(|error| EngineError::new(EngineErrorKind::Internal, error.to_string()));
+    context.sessions.idle(facts.connection_id);
+    let answer = answer??;
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
     }
@@ -865,6 +1068,7 @@ async fn register_session(database: &Arc<InstanceDatabase>, facts: &SessionFacts
     let _ = tokio::task::spawn_blocking(move || {
         let _ = super::server_statements::open_extension_catalog(&database, &session);
         let _ = database.execute(&name, PG_STAT_SSL_SCHEMA, &[]);
+        let _ = super::pg_server::ensure_catalogs(&database, &name);
         let _ = database.execute(
             &name,
             "INSERT OR REPLACE INTO pg_stat_ssl (pid, ssl, version, cipher) \

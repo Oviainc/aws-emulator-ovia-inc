@@ -32,9 +32,10 @@
 //!   can draw out of one statement is capped in rows and in bytes.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
@@ -52,6 +53,17 @@ pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// handler, which runs on the thread executing the statement — a timeout on the task
 /// could not interrupt a CPU-bound statement, and this can.
 pub const STATEMENT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// What PostgreSQL tells a client whose statement its `statement_timeout` cancelled. The
+/// engine's own sentence for the cancellation, which is what the wire reports with
+/// SQLSTATE `57014`.
+pub const STATEMENT_TIMEOUT_CANCELLATION: &str =
+    "canceling statement due to statement timeout";
+
+/// What this endpoint tells a client whose statement ran past [`STATEMENT_DEADLINE`] with
+/// no `statement_timeout` of its own in force.
+pub const ENDPOINT_DEADLINE_CANCELLATION: &str =
+    "canceling statement: it ran longer than this endpoint serves";
 
 /// How often the engine asks the progress handler whether to carry on.
 const PROGRESS_HANDLER_OPS: std::os::raw::c_int = 1_000;
@@ -265,9 +277,38 @@ impl ResultSet {
     }
 }
 
+/// What the server functions registered on the engine's connections answer from: the
+/// instance's own runtime and the session running the statement.
+///
+/// Set under the engine's lock for the duration of ONE statement
+/// ([`InstanceDatabase::execute_as`]), which is the only time a function can run, so a
+/// function always reads the session that called it.
+#[derive(Debug, Clone, Default)]
+pub struct ServerView {
+    /// The configuration parameters in force for this session, by lowercased name: what
+    /// `current_setting` resolves against.
+    pub settings: BTreeMap<String, String>,
+    /// When the instance's engine last came up, as epoch seconds:
+    /// `pg_postmaster_start_time()`.
+    pub postmaster_start_time: f64,
+    /// Whether the instance is replaying from a primary: `pg_is_in_recovery()`.
+    pub in_recovery: bool,
+    /// The session's own backend pid: `pg_backend_pid()`.
+    pub backend_pid: u32,
+    /// `statement_timeout` for this statement, in milliseconds; 0 disables it, as the
+    /// parameter documents.
+    pub statement_timeout_ms: u64,
+    /// When the statement running now must be cancelled, which is what `pg_sleep` waits
+    /// against.
+    pub deadline: Option<Instant>,
+}
+
 /// One DB instance's engine: its databases, each with its own connection.
 pub struct InstanceDatabase {
     databases: Mutex<Databases>,
+    /// Shared with the server functions registered on every one of those connections; see
+    /// [`ServerView`].
+    view: Arc<Mutex<ServerView>>,
 }
 
 /// The databases one instance holds.
@@ -300,9 +341,11 @@ impl InstanceDatabase {
     /// the caller answers the create with a failure rather than publishing an endpoint
     /// nothing serves — and each database is opened empty when it is first named.
     pub fn open() -> Result<Self, EngineError> {
-        probe_the_engine_starts()?;
+        let view = Arc::new(Mutex::new(ServerView::default()));
+        probe_the_engine_starts(&view)?;
         Ok(Self {
             databases: Mutex::new(Databases::default()),
+            view,
         })
     }
 
@@ -355,7 +398,7 @@ impl InstanceDatabase {
             if admit_another_database(&databases).is_err() {
                 return;
             }
-            match open_confined_database() {
+            match open_confined_database(&self.view) {
                 Ok(conn) => {
                     databases.open.insert(name.clone(), conn);
                 }
@@ -370,19 +413,64 @@ impl InstanceDatabase {
     /// Blocking, CPU-bound work: a wire handler calls it on a blocking task so a long
     /// statement cannot starve the async runtime, and the statement itself is bounded by
     /// [`STATEMENT_DEADLINE`] and by the result caps.
+    ///
+    /// This is the form the server's OWN statements use (the catalog rebuilds, the
+    /// statements a server command runs for a session): it runs with no session view, so a
+    /// server function in it would see none. A client's own statement goes through
+    /// [`Self::execute_as`].
     pub fn execute(
         &self,
         database: &str,
         sql: &str,
         params: &[Option<String>],
     ) -> Result<ResultSet, EngineError> {
+        self.execute_as(database, &ServerView::default(), sql, params)
+    }
+
+    /// Run `sql` against `database` as the session `view` describes: the server functions
+    /// it calls answer from that session, and the statement is cancelled at the earlier of
+    /// this endpoint's own deadline and the session's `statement_timeout`.
+    ///
+    /// The cancellation is reported the way the engine that cancelled it words it — a
+    /// `statement_timeout` cancellation is PostgreSQL's own sentence — because that is the
+    /// text a client branches on.
+    pub fn execute_as(
+        &self,
+        database: &str,
+        view: &ServerView,
+        sql: &str,
+        params: &[Option<String>],
+    ) -> Result<ResultSet, EngineError> {
         let mut databases = self.lock();
-        let conn = connection(&mut databases, database)?;
-        let deadline = Instant::now() + STATEMENT_DEADLINE;
+        let endpoint_deadline = Instant::now() + STATEMENT_DEADLINE;
+        let statement_deadline = (view.statement_timeout_ms > 0)
+            .then(|| Instant::now() + Duration::from_millis(view.statement_timeout_ms));
+        let deadline = statement_deadline.map_or(endpoint_deadline, |timeout| {
+            timeout.min(endpoint_deadline)
+        });
+        {
+            let mut current = self.view.lock().unwrap_or_else(PoisonError::into_inner);
+            *current = view.clone();
+            current.deadline = Some(deadline);
+        }
+        let conn = connection(&mut databases, &self.view, database)?;
         conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline));
         let answer = run_statement(conn, sql, params);
         conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
-        answer
+        match answer {
+            // The statement did not finish inside its budget: whatever the engine said
+            // about the interruption, what happened is the cancellation, worded by
+            // whichever deadline came first.
+            Err(_) if Instant::now() >= deadline => Err(EngineError::new(
+                EngineErrorKind::Cancelled,
+                if statement_deadline.is_some_and(|timeout| timeout <= endpoint_deadline) {
+                    STATEMENT_TIMEOUT_CANCELLATION
+                } else {
+                    ENDPOINT_DEADLINE_CANCELLATION
+                },
+            )),
+            other => other,
+        }
     }
 
     /// Whether the database `database` is inside a transaction a session opened, which is
@@ -399,15 +487,12 @@ impl InstanceDatabase {
     /// extended query protocol's `Describe` answers.
     pub fn describe(&self, database: &str, sql: &str) -> Result<Vec<ColumnInfo>, EngineError> {
         let mut databases = self.lock();
-        let conn = connection(&mut databases, database)?;
+        let conn = connection(&mut databases, &self.view, database)?;
         let statement = conn.prepare(sql).map_err(from_engine)?;
         Ok(statement
             .columns()
             .iter()
-            .map(|column| ColumnInfo {
-                name: column.name().to_string(),
-                declared_type: column.decl_type().map(str::to_string),
-            })
+            .map(|column| named_column(column.name(), column.decl_type()))
             .collect())
     }
 
@@ -468,7 +553,7 @@ impl InstanceDatabase {
         // instance that has already been handed a database must not seed another over it.
         destination.seeded = source.seeded;
         for (name, held) in &source.open {
-            let mut copy = open_confined_database()?;
+            let mut copy = open_confined_database(&self.view)?;
             copy_database(held, &mut copy, deadline)?;
             destination.open.insert(name.clone(), copy);
         }
@@ -508,7 +593,7 @@ impl InstanceDatabase {
         admit_another_database(&databases)?;
         databases
             .open
-            .insert(name.to_string(), open_confined_database()?);
+            .insert(name.to_string(), open_confined_database(&self.view)?);
         Ok(true)
     }
 
@@ -570,12 +655,15 @@ fn admit_another_database(databases: &Databases) -> Result<(), EngineError> {
 /// database each without the engine having to be told their names when it starts.
 fn connection<'a>(
     databases: &'a mut Databases,
+    view: &Arc<Mutex<ServerView>>,
     name: &str,
 ) -> Result<&'a mut Connection, EngineError> {
     let key = resolve(&databases.open, name).unwrap_or_else(|| name.to_string());
     if !databases.open.contains_key(&key) {
         admit_another_database(databases)?;
-        databases.open.insert(key.clone(), open_confined_database()?);
+        databases
+            .open
+            .insert(key.clone(), open_confined_database(view)?);
     }
     databases
         .open
@@ -586,14 +674,15 @@ fn connection<'a>(
 /// Whether the engine can be started on this host at all: one database is opened under
 /// the bounds above and closed again, so a DB instance whose engine cannot run is refused
 /// at create time rather than publishing an endpoint nothing serves.
-fn probe_the_engine_starts() -> Result<(), EngineError> {
-    drop(open_confined_database()?);
+fn probe_the_engine_starts(view: &Arc<Mutex<ServerView>>) -> Result<(), EngineError> {
+    drop(open_confined_database(view)?);
     Ok(())
 }
 
-/// One empty in-memory database, with every bound above in force before any client
-/// statement can reach it.
-fn open_confined_database() -> Result<Connection, EngineError> {
+/// One empty in-memory database, with every bound above in force — and with the server
+/// functions this endpoint defines registered on it ([`register_server_functions`]) —
+/// before any client statement can reach it.
+fn open_confined_database(view: &Arc<Mutex<ServerView>>) -> Result<Connection, EngineError> {
     let conn = Connection::open_in_memory().map_err(unavailable)?;
     // Temp database in memory FIRST, so naming `temp` below opens it in memory and
     // not as a host file; then the page ceiling on both schemas.
@@ -626,6 +715,7 @@ fn open_confined_database() -> Result<Connection, EngineError> {
     // Installed LAST, so the settings above — themselves pragmas — are not refused
     // by it.
     conn.authorizer(Some(confine_to_the_instance));
+    register_server_functions(&conn, view)?;
     Ok(conn)
 }
 
@@ -678,6 +768,98 @@ fn unavailable(error: rusqlite::Error) -> EngineError {
     EngineError::new(EngineErrorKind::Internal, error.to_string())
 }
 
+/// How long `pg_sleep` waits between checks of its statement's deadline, so a sleep that is
+/// cut short by a `statement_timeout` is cut short promptly rather than at its end.
+const SLEEP_SLICE: Duration = Duration::from_millis(20);
+
+/// Register the PostgreSQL server functions on this connection, so a statement that calls
+/// one is planned and run by the engine like any other.
+///
+/// Each answers from the session view the statement is running under
+/// ([`InstanceDatabase::execute_as`]) — the instance's own runtime and the calling session
+/// — and nothing else; the catalogue of which functions exist and what each returns is
+/// [`super::pg_server::SERVER_FUNCTIONS`].
+fn register_server_functions(
+    conn: &Connection,
+    view: &Arc<Mutex<ServerView>>,
+) -> Result<(), EngineError> {
+    let read = |view: &Arc<Mutex<ServerView>>| -> ServerView {
+        view.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    };
+
+    let start_time = Arc::clone(view);
+    conn.create_scalar_function(
+        "pg_postmaster_start_time",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        move |_| Ok(super::pg_server::timestamptz_text(read(&start_time).postmaster_start_time)),
+    )
+    .map_err(unavailable)?;
+
+    let recovery = Arc::clone(view);
+    conn.create_scalar_function(
+        "pg_is_in_recovery",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        move |_| Ok(i64::from(read(&recovery).in_recovery)),
+    )
+    .map_err(unavailable)?;
+
+    let backend = Arc::clone(view);
+    conn.create_scalar_function("pg_backend_pid", 0, FunctionFlags::SQLITE_UTF8, move |_| {
+        Ok(i64::from(read(&backend).backend_pid))
+    })
+    .map_err(unavailable)?;
+
+    // `pg_sleep(seconds)` — "Makes the current session's process sleep until the given
+    // number of seconds have elapsed". It really waits, and it stops waiting when the
+    // statement's deadline passes, which is what makes a `statement_timeout` observable
+    // through it. The wait is bounded twice over: by the deadline the statement runs
+    // under, which is at most `STATEMENT_DEADLINE`, and by an hour for the argument
+    // itself, so the connection this holds cannot be held by a caller's own number.
+    let sleeping = Arc::clone(view);
+    conn.create_scalar_function("pg_sleep", 1, FunctionFlags::SQLITE_UTF8, move |context| {
+        let seconds = context.get::<f64>(0).unwrap_or(0.0).max(0.0);
+        let view = read(&sleeping);
+        let until = Instant::now() + Duration::from_secs_f64(seconds.min(3_600.0));
+        loop {
+            let now = Instant::now();
+            if now >= until {
+                return Ok(Option::<String>::None);
+            }
+            if view.deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(rusqlite::Error::UserFunctionError(
+                    STATEMENT_TIMEOUT_CANCELLATION.into(),
+                ));
+            }
+            std::thread::sleep(SLEEP_SLICE.min(until - now));
+        }
+    })
+    .map_err(unavailable)?;
+
+    // `current_setting(name [, missing_ok])` — "Returns the current value of the setting",
+    // erroring on an unrecognised name unless the second argument asks for NULL instead.
+    let settings = Arc::clone(view);
+    conn.create_scalar_function(
+        "current_setting",
+        -1,
+        FunctionFlags::SQLITE_UTF8,
+        move |context| {
+            let name = context.get::<String>(0).unwrap_or_default();
+            let missing_ok = context.len() > 1 && context.get::<i64>(1).unwrap_or(0) != 0;
+            match read(&settings).settings.get(&name.to_ascii_lowercase()) {
+                Some(value) => Ok(Some(value.clone())),
+                None if missing_ok => Ok(None),
+                None => Err(rusqlite::Error::UserFunctionError(
+                    format!("unrecognized configuration parameter \"{name}\"").into(),
+                )),
+            }
+        },
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
 /// Prepare, bind and run one statement, reading its rows out under the result caps.
 fn run_statement(
     conn: &Connection,
@@ -703,10 +885,7 @@ fn run_statement(
     let columns: Vec<ColumnInfo> = statement
         .columns()
         .iter()
-        .map(|column| ColumnInfo {
-            name: column.name().to_string(),
-            declared_type: column.decl_type().map(str::to_string),
-        })
+        .map(|column| named_column(column.name(), column.decl_type()))
         .collect();
     if columns.is_empty() {
         let affected = statement.raw_execute().map_err(from_engine)?;
@@ -761,6 +940,31 @@ fn run_statement(
     })
 }
 
+/// One column as the wire reports it.
+///
+/// A column the engine produced from a TABLE carries the type its declaration names. A
+/// column that is a call of one of this server's own functions carries no declaration, so
+/// it takes the two facts PostgreSQL reports for it: the column is named after the function
+/// and carries that function's return type
+/// ([`super::pg_server::function_result_type`]) — which is what lets a client decode
+/// `pg_is_in_recovery()` as a boolean and `pg_postmaster_start_time()` as a timestamp.
+fn named_column(name: &str, declared: Option<&str>) -> ColumnInfo {
+    if declared.is_none() {
+        if let Some(function) = name.strip_suffix(')').and_then(|call| call.split('(').next()) {
+            if let Some(result) = super::pg_server::function_result_type(function) {
+                return ColumnInfo {
+                    name: function.to_string(),
+                    declared_type: Some(result.to_string()),
+                };
+            }
+        }
+    }
+    ColumnInfo {
+        name: name.to_string(),
+        declared_type: declared.map(str::to_string),
+    }
+}
+
 /// Classify what the engine refused, keeping ITS message.
 fn from_engine(error: rusqlite::Error) -> EngineError {
     // A statement the engine could not READ at all arrives as its own variant, carrying
@@ -786,14 +990,19 @@ fn from_engine(error: rusqlite::Error) -> EngineError {
         _ => EngineErrorKind::Internal,
     };
     // SQLite words a missing table or column as "no such <thing>", which is the one
-    // failure class every client branches on separately.
+    // failure class every client branches on separately. A configuration parameter the
+    // server does not have is the same class: PostgreSQL answers it as an undefined
+    // object, and the sentence comes from `current_setting` above.
     let kind = if message.contains("no such table")
         || message.contains("no such column")
         || message.contains("no such function")
         || message.contains("no such index")
         || message.contains("no such view")
+        || message.starts_with("unrecognized configuration parameter")
     {
         EngineErrorKind::UndefinedObject
+    } else if message == STATEMENT_TIMEOUT_CANCELLATION {
+        EngineErrorKind::Cancelled
     } else {
         kind
     };
@@ -891,7 +1100,9 @@ fn confine_to_the_instance(context: AuthContext<'_>) -> Authorization {
         // this emulator has not reviewed — including one a future engine build defines —
         // falls through to the deny arm below.
         AuthAction::Function { function_name } => {
-            if ::service_common::sqlite_confinement::sql_function_is_permitted(function_name) {
+            if ::service_common::sqlite_confinement::sql_function_is_permitted(function_name)
+                || super::pg_server::is_server_function(function_name)
+            {
                 Authorization::Allow
             } else {
                 Authorization::Deny

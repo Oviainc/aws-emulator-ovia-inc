@@ -225,6 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // now and the clock owes it `available` once the outage is over.
         record.status = "rebooting".to_string();
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+        // "Rebooting a DB instance restarts the database engine service": the engine's run
+        // starts again here, which is what `pg_postmaster_start_time()` reports and what
+        // puts a parameter change that was waiting for a reboot into force.
+        record.engine_started_at = crate::state::now_as_wire_timestamp();
         let instance_arn = record.arn();
         let db_instance = record.to_wire();
         // "Rebooting a DB instance restarts the database engine service": the sessions

@@ -192,10 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
         crate::state::check_master_username(&input.master_username)
             .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
-        if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(password)
-                .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
-        }
         for (member, value) in [
             ("CharacterSetName", input.character_set_name.as_deref()),
             (
@@ -274,6 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let dbi_resource_id = instance.dbi_resource_id.clone();
         let deletion_protection = instance.deletion_protection;
+        let instance_engine = instance.engine.clone();
+
+        // `MasterUserPassword` carries the engine's master-password policy, whose length
+        // bound is per engine ([`crate::state::master_user_password_len`]) — the engine
+        // here being the one the instance this tenant database belongs to runs.
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_master_user_password(&instance_engine, password)
+                .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+        }
 
         let key = (
             region.clone(),

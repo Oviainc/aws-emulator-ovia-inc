@@ -114,7 +114,7 @@ pub(crate) fn endpoint_of(envelope: &str) -> (String, u16) {
 }
 
 /// A DB parameter group of `family` carrying one setting, as a client creates it.
-async fn parameter_group(
+pub(crate) async fn parameter_group(
     router: &smithy_server_runtime::MultiServiceRouter,
     name: &str,
     family: &str,
@@ -380,10 +380,34 @@ impl PostgresSession {
         self.read_answer().await
     }
 
+    /// Run one `COPY … FROM STDIN` and stream `data` for it, as a bulk-loading client
+    /// does: the statement, then the `CopyInResponse` the server answers with, then the
+    /// data in `CopyData` messages and a `CopyDone`.
+    pub(crate) async fn copy_in(&mut self, sql: &str, data: &str) -> Result<Rows, Refusal> {
+        let mut message = Vec::new();
+        put_cstring(&mut message, sql);
+        postgres_send(&mut self.conn, b'Q', &message).await;
+        let (kind, body) = postgres_read(&mut self.conn).await;
+        if kind == b'E' {
+            let refusal = postgres_refusal(&body);
+            // The server reported the statement, not the data: drain the cycle.
+            let _ = self.read_answer().await;
+            return Err(refusal);
+        }
+        assert_eq!(
+            kind, b'G',
+            "a COPY FROM STDIN must be answered with CopyInResponse, got {:?}",
+            kind as char
+        );
+        postgres_send(&mut self.conn, b'd', data.as_bytes()).await;
+        postgres_send(&mut self.conn, b'c', &[]).await;
+        self.read_answer().await
+    }
+
     /// Run one statement through the EXTENDED query protocol, with its parameter values
     /// bound — the exchange a driver uses for a parameterised statement: `Parse`, `Bind`,
     /// `Describe`, `Execute`, `Sync`.
-    async fn query_with_params(&mut self, sql: &str, params: &[&str]) -> Result<Rows, Refusal> {
+    pub(crate) async fn query_with_params(&mut self, sql: &str, params: &[&str]) -> Result<Rows, Refusal> {
         let mut parse = Vec::new();
         put_cstring(&mut parse, "");
         put_cstring(&mut parse, sql);
@@ -1087,10 +1111,12 @@ async fn a_mysql_endpoint_serves_its_version_its_sql_and_its_privilege_refusals(
     assert_eq!(
         identity.rows,
         vec![vec![
-            Some(MASTER_USER.to_string()),
+            // A MySQL session's identity is the ACCOUNT whose privileges it holds, which
+            // for the RDS master user is `'<master>'@'%'`.
+            Some(format!("{MASTER_USER}@%")),
             Some(DATABASE.to_string())
         ]],
-        "the session must report the master user and the created database, got {identity:?}"
+        "the session must report the master user's account and the created database, got {identity:?}"
     );
 
     // A round trip through the instance's own database.

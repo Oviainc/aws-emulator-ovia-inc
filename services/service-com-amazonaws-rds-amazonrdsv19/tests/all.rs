@@ -105,6 +105,8 @@ mod docdb_query_surface;
 mod engine_default_cluster_parameters;
 #[path = "all/engine_default_parameters.rs"]
 mod engine_default_parameters;
+#[path = "all/engine_server_surface.rs"]
+mod engine_server_surface;
 #[path = "all/engine_statement_classes.rs"]
 mod engine_statement_classes;
 #[path = "all/engine_version_families.rs"]
@@ -129,6 +131,8 @@ mod export_tasks;
 mod global_clusters;
 #[path = "all/guard_order_and_refusal_classes.rs"]
 mod guard_order_and_refusal_classes;
+#[path = "all/instance_configuration_guards.rs"]
+mod instance_configuration_guards;
 #[path = "all/lifecycle_poll_loops.rs"]
 mod lifecycle_poll_loops;
 #[path = "all/maintenance_action_resource_guard.rs"]

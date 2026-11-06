@@ -37,6 +37,20 @@ pub const DB_INSTANCE_STATUS_DELETING: &str = "deleting";
 /// `StartDBInstance` and an accepted `RebootDBInstance` settle it on.
 pub const DB_INSTANCE_STATUS_AVAILABLE: &str = "available";
 
+/// The status a DB instance reports while `CreateDBInstance` is still provisioning it.
+/// Transient: the clock owes [`DB_INSTANCE_STATUS_AVAILABLE`]
+/// [`STATUS_TRANSITION_DELAY`] later.
+pub const DB_INSTANCE_STATUS_CREATING: &str = "creating";
+
+/// How far behind the clock a DB instance's `LatestRestorableTime` trails.
+///
+/// Amazon RDS documents the continuous-backup recovery point as being within five minutes
+/// of the current time ("you can restore to any point in time during your backup retention
+/// period … typically up to the last five minutes"), so the latest instant an instance can
+/// be restored to is five minutes behind now rather than now itself. See
+/// [`DbInstanceRecord::latest_restorable_time`].
+pub const LATEST_RESTORABLE_LAG: Duration = Duration::from_secs(5 * 60);
+
 /// The status an accepted `StopDBInstance` reports while the database engine shuts down.
 /// Transient: the clock owes [`DB_INSTANCE_STATUS_STOPPED`] [`STATUS_TRANSITION_DELAY`]
 /// later.
@@ -886,9 +900,10 @@ pub const MAX_MASTER_USERNAME_LEN: usize = 16;
 /// than only upstream.
 pub const MAX_IAM_ROLE_ARN_LEN: usize = 2048;
 
-/// Refuse a `MasterUserPassword` outside the constraints its member documents: "Must
-/// contain from 8 to 41 characters. Can contain any printable ASCII character except \"/\",
-/// \"\"\", or \"@\"."
+/// Refuse a `MasterUserPassword` outside the constraints its member documents: "Can
+/// include any printable ASCII character except \"/\", \"'\", \"\"\", or the \"@\" symbol",
+/// and the LENGTH the engine the password belongs to publishes
+/// ([`master_user_password_len`]).
 ///
 /// The refusal is worded the way this Query API words a password it will not take: it names
 /// the member and the constraint the value broke ("The parameter MasterUserPassword is not
@@ -898,20 +913,21 @@ pub const MAX_IAM_ROLE_ARN_LEN: usize = 2048;
 /// The password itself is never stored or reported — the member is `@sensitive` and RDS
 /// reports no member carrying it — so this is the only place it is looked at at all, and
 /// the refusal quotes the constraint rather than the value.
-pub fn check_master_user_password(value: &str) -> Result<(), String> {
+pub fn check_master_user_password(engine: &str, value: &str) -> Result<(), String> {
     let length = value.chars().count();
-    if length < *MASTER_USER_PASSWORD_LEN.start() {
+    let allowed = master_user_password_len(engine);
+    if length < *allowed.start() {
         return Err(format!(
             "The parameter MasterUserPassword is not a valid password because it is \
              shorter than {} characters.",
-            MASTER_USER_PASSWORD_LEN.start()
+            allowed.start()
         ));
     }
-    if length > *MASTER_USER_PASSWORD_LEN.end() {
+    if length > *allowed.end() {
         return Err(format!(
             "The parameter MasterUserPassword is not a valid password because it is \
              longer than {} characters.",
-            MASTER_USER_PASSWORD_LEN.end()
+            allowed.end()
         ));
     }
     if !value
@@ -919,17 +935,35 @@ pub fn check_master_user_password(value: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '"' | '@'))
     {
         return Err(
-            "The parameter MasterUserPassword is not a valid password because it \
-             contains a character that is not allowed. Only printable ASCII characters \
-             besides '/', '\"' and '@' may be used."
+            "The parameter MasterUserPassword is not a valid password. Only printable \
+             ASCII characters besides '/', '@', '\"', ' ' may be used."
                 .to_string(),
         );
     }
     Ok(())
 }
 
-/// How long a `MasterUserPassword` may be ("Must contain from 8 to 41 characters").
-pub const MASTER_USER_PASSWORD_LEN: std::ops::RangeInclusive<usize> = 8..=41;
+/// How long a `MasterUserPassword` may be on `engine`.
+///
+/// `MasterUserPassword` publishes the bound PER ENGINE
+/// ("MariaDB: Must contain from 8 to 41 characters", "Microsoft SQL Server: Must contain
+/// from 8 to 128 characters", "MySQL: Must contain from 8 to 41 characters", "Oracle: Must
+/// contain from 8 to 30 characters", "PostgreSQL: Must contain from 8 to 128 characters"),
+/// so the bound is read from the engine the password is being set on rather than from one
+/// engine's line. Every engine publishes the SAME lower bound of 8, which is why an engine
+/// string this does not recognise still carries it, with the widest published upper bound.
+pub fn master_user_password_len(engine: &str) -> std::ops::RangeInclusive<usize> {
+    let lowered = engine.to_ascii_lowercase();
+    let longest = match lowered.as_str() {
+        _ if lowered.contains("mysql") || lowered.starts_with("mariadb") => 41,
+        _ if lowered.starts_with("oracle") || lowered.starts_with("custom-oracle") => 30,
+        // Amazon DocumentDB, whose SDK clients this front door serves too: "Must contain
+        // from 8 to 100 characters".
+        _ if lowered.starts_with("docdb") => 100,
+        _ => 128,
+    };
+    8..=longest
+}
 
 /// What a delete that names NEITHER of its two final-snapshot members is refused with.
 ///

@@ -43,7 +43,11 @@ use tokio::sync::watch;
 
 use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 
+pub mod dialect;
 pub mod mysql_wire;
+pub mod pg_copy;
+pub mod pg_server;
+pub mod pg_sessions;
 pub mod pg_wire;
 pub mod server_statements;
 pub mod sql_engine;
@@ -121,6 +125,9 @@ pub struct DbEngineEndpoint {
     pub wire: EngineWire,
     /// The instance's databases, shared with every session on the listener.
     database: Arc<sql_engine::InstanceDatabase>,
+    /// The sessions open on this listener, shared with every session on it: what
+    /// `pg_stat_activity` reports and what `max_connections` is counted against.
+    sessions: pg_sessions::SessionRegistry,
     /// The engine's run: a session serves only while the value it started under is
     /// current, so bumping it severs every live session (a reboot, a stop).
     generation: watch::Sender<u64>,
@@ -146,6 +153,12 @@ impl DbEngineEndpoint {
     #[must_use]
     pub fn database(&self) -> Arc<sql_engine::InstanceDatabase> {
         Arc::clone(&self.database)
+    }
+
+    /// The sessions open on this endpoint.
+    #[must_use]
+    pub fn sessions(&self) -> pg_sessions::SessionRegistry {
+        self.sessions.clone()
     }
 
     /// End every session open on this endpoint, leaving the port bound.
@@ -319,11 +332,13 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             .map_err(|error| format!("the SQL engine could not be started: {}", error.message))?,
     );
     let (generation, generation_rx) = watch::channel(0u64);
+    let sessions = pg_sessions::SessionRegistry::default();
     let context = wire_session::SessionContext {
         state: state.clone(),
         region: region.to_string(),
         resource_id: resource_id.to_string(),
         database: Arc::clone(&database),
+        sessions: sessions.clone(),
         upgrader,
         generation: generation_rx,
         next_connection_id: Arc::new(AtomicU32::new(1)),
@@ -340,6 +355,7 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
         },
         wire,
         database,
+        sessions,
         generation,
         _listener: listener,
     })

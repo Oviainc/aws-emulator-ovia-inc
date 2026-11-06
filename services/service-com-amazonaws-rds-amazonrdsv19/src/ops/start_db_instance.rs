@@ -310,6 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
             DB_INSTANCE_STATUS_AVAILABLE,
         ));
+        // A stopped instance's engine was not running; starting it starts the engine's run
+        // again, which is what `pg_postmaster_start_time()` reports on the data plane.
+        record.engine_started_at = crate::state::now_as_wire_timestamp();
         let instance_arn = record.arn();
         let db_instance = record.to_wire();
         // The start happened, so the region's event log records it.

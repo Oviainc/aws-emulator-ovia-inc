@@ -463,7 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(CreateDBClusterError::invalid_parameter_value)?;
         }
         if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(password)
+            crate::state::check_master_user_password(&input.engine, password)
                 .map_err(CreateDBClusterError::invalid_parameter_value)?;
         }
         if let Some(port) = input.port {

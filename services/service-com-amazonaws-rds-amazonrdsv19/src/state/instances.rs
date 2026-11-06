@@ -83,6 +83,15 @@ pub struct DbInstanceRecord {
     /// The storage throughput provisioned for the instance, in MiBps.
     pub storage_throughput: i32,
     pub instance_create_time: ::aws_smithy_types::DateTime,
+    /// When this instance's database engine last came UP: the create that provisioned it,
+    /// or the most recent restart of the engine (`RebootDBInstance`, `StartDBInstance`).
+    ///
+    /// Separate from [`Self::instance_create_time`], which is when the INSTANCE was
+    /// created and never moves. This is the engine's run, which is what the data plane's
+    /// `pg_postmaster_start_time()` reports and what decides whether a parameter change
+    /// that waits for a reboot is in force yet
+    /// ([`data_plane::pg_server::running_parameters`]).
+    pub engine_started_at: ::aws_smithy_types::DateTime,
     pub tags: Vec<Tag>,
     /// The instance's log: the lifecycle lines THIS SERVICE has recorded for it, which is
     /// what `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion` serves. See
@@ -207,6 +216,48 @@ impl DbInstanceRecord {
         }
     }
 
+    /// `LatestRestorableTime`: "the latest time to which a database in this DB instance
+    /// can be restored with point-in-time restore."
+    ///
+    /// An instance has one exactly while it keeps continuous backups, which is what
+    /// `BackupRetentionPeriod` decides: "To disable automated backups, set this value to
+    /// 0", and a non-zero period is what makes point-in-time restore available at all. So
+    /// `None` for an instance with automated backups off, and `None` while the instance is
+    /// still being created, which has taken no backup yet — in both cases there is no
+    /// instant the instance can be restored to, which is what reporting no member says.
+    ///
+    /// The value ADVANCES with the clock, trailing it by [`LATEST_RESTORABLE_LAG`], and
+    /// never predates the instance: a point before it existed is not a point it can be
+    /// restored to. Computed from the clock and the stored retention period rather than
+    /// stored, so it cannot go stale between two describes.
+    pub fn latest_restorable_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        if self.backup_retention_period < 1 || self.status == DB_INSTANCE_STATUS_CREATING {
+            return None;
+        }
+        let trailing = now_as_wire_timestamp().as_secs_f64() - LATEST_RESTORABLE_LAG.as_secs_f64();
+        Some(::aws_smithy_types::DateTime::from_secs_f64(
+            trailing.max(self.instance_create_time.as_secs_f64()),
+        ))
+    }
+
+    /// The window a point-in-time restore of this instance may target: "any point in time
+    /// during your backup retention period", up to [`Self::latest_restorable_time`].
+    ///
+    /// `None` for an instance that keeps no continuous backup, which is the case
+    /// `RestoreDBInstanceToPointInTime` answers `PointInTimeRestoreNotEnabled` for.
+    pub fn restorable_window(
+        &self,
+    ) -> Option<(::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime)> {
+        let latest = self.latest_restorable_time()?;
+        let retention = f64::from(self.backup_retention_period) * 24.0 * 60.0 * 60.0;
+        let earliest =
+            (latest.as_secs_f64() - retention).max(self.instance_create_time.as_secs_f64());
+        Some((
+            ::aws_smithy_types::DateTime::from_secs_f64(earliest),
+            latest,
+        ))
+    }
+
     /// Project the stored record onto the modelled `DBInstance` output shape.
     ///
     /// Every member RDS reports for a DB instance it holds is projected here, from the
@@ -236,6 +287,7 @@ impl DbInstanceRecord {
             instance_create_time: Some(self.instance_create_time),
             preferred_backup_window: self.preferred_backup_window.clone(),
             backup_retention_period: Some(self.backup_retention_period),
+            latest_restorable_time: self.latest_restorable_time(),
             // The legacy EC2-Classic memberships: empty for every instance created
             // through the VPC platform, which is every instance this service holds
             // unless a request named one.
