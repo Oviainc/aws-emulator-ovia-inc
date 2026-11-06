@@ -79,6 +79,9 @@ pub const USERS_PAGE: &str = "users";
 /// The page kind [`encode_cursor`] stamps on a `ListGroupMembers` token.
 pub const GROUP_MEMBERS_PAGE: &str = "group-members";
 
+/// The page kind [`encode_cursor`] stamps on a `SearchUsers` token.
+pub const SEARCH_USERS_PAGE: &str = "search-users";
+
 /// The cursor format [`encode_cursor`] writes, so a token from an older encoding is
 /// refused rather than misread.
 const CURSOR_VERSION: &str = "v1";
@@ -92,6 +95,33 @@ const CURSOR_SEPARATOR: char = '\u{1f}';
 pub fn fold(name: &str) -> String {
     name.to_lowercase()
 }
+
+// The attribute names each of a user's STRUCTURAL members answers to, [`fold`]ed
+// because an AD attribute name is case insensitive: the attribute Active Directory
+// holds the value in, and beside it the name the model gives the member where the two
+// differ (`smithy_query(query="shape", shape="User")`: `SID`, `SAMAccountName`,
+// `DistinguishedName`, `UserPrincipalName`, `EmailAddress`, `GivenName`, `Surname`,
+// `Enabled`). One table, used both to match a search and to project its answer.
+
+/// `sAMAccountName`, and `cn`: the directory creates the object as
+/// `CN=<SAMAccountName>` (see [`Directory::distinguished_name`]), so its common name
+/// is that same name.
+const SAM_ACCOUNT_NAME_ATTRIBUTES: &[&str] = &["samaccountname", "cn"];
+
+/// `objectSid` is the attribute an object's SID lives in.
+const SID_ATTRIBUTES: &[&str] = &["objectsid", "sid"];
+
+const DISTINGUISHED_NAME_ATTRIBUTES: &[&str] = &["distinguishedname"];
+
+const USER_PRINCIPAL_NAME_ATTRIBUTES: &[&str] = &["userprincipalname"];
+
+/// `mail` is the attribute an email address lives in.
+const EMAIL_ADDRESS_ATTRIBUTES: &[&str] = &["mail", "emailaddress"];
+
+const GIVEN_NAME_ATTRIBUTES: &[&str] = &["givenname"];
+
+/// `sn` is the attribute a surname lives in.
+const SURNAME_ATTRIBUTES: &[&str] = &["sn", "surname"];
 
 /// One user object of a directory.
 #[derive(Debug, Clone)]
@@ -114,6 +144,85 @@ pub struct User {
 }
 
 impl User {
+    /// The value this user holds for the attribute `folded_name` names, when that is
+    /// one of its STRUCTURAL members.
+    ///
+    /// `Enabled` is not readable this way: Active Directory holds it as a bit of
+    /// `userAccountControl`, not as a value a string can equal.
+    fn structural_attribute(&self, folded_name: &str) -> Option<String> {
+        let held = |names: &[&str]| names.contains(&folded_name);
+        if held(SAM_ACCOUNT_NAME_ATTRIBUTES) {
+            Some(self.sam_account_name.clone())
+        } else if held(SID_ATTRIBUTES) {
+            Some(self.sid.clone())
+        } else if held(DISTINGUISHED_NAME_ATTRIBUTES) {
+            Some(self.distinguished_name.clone())
+        } else if held(USER_PRINCIPAL_NAME_ATTRIBUTES) {
+            Some(self.user_principal_name.clone())
+        } else if held(EMAIL_ADDRESS_ATTRIBUTES) {
+            self.email_address.clone()
+        } else if held(GIVEN_NAME_ATTRIBUTES) {
+            self.given_name.clone()
+        } else if held(SURNAME_ATTRIBUTES) {
+            self.surname.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Whether this user is one a search for `search_string` over `names` reports.
+    ///
+    /// A match is an attribute the request NAMED whose value IS the search string:
+    /// nothing else about the user is looked at, no other attribute is consulted, and
+    /// the string is not treated as a prefix or a pattern. Names and values are both
+    /// compared case insensitively, which is the matching rule Active Directory
+    /// applies to an attribute name and to a string-valued attribute. A multi-valued
+    /// attribute matches when ANY of its values does.
+    pub fn matches_search(&self, names: &[String], search_string: &str) -> bool {
+        let wanted = fold(search_string);
+        names.iter().any(|name| {
+            let folded_name = fold(name);
+            self.structural_attribute(&folded_name)
+                .into_iter()
+                .chain(
+                    self.other_attributes
+                        .iter()
+                        .filter(|(held, _)| fold(held) == folded_name)
+                        .flat_map(|(_, value)| attribute_value_strings(value)),
+                )
+                .any(|held| fold(&held) == wanted)
+        })
+    }
+
+    /// The `User` object `SearchUsers` serves for a user the search matched.
+    ///
+    /// A search answers with the record a listing reports for that user — the
+    /// [`Self::to_summary`] members — widened by the attributes the search NAMED: the
+    /// projection is the directory's, not the client's, so an attribute nobody asked
+    /// about is carried by no member of the answer.
+    pub fn to_searched_user(&self, names: &[String]) -> crate::ops::types::User {
+        let wanted: BTreeSet<String> = names.iter().map(|name| fold(name)).collect();
+        let asked = |attributes: &[&str]| attributes.iter().any(|name| wanted.contains(*name));
+        crate::ops::types::User {
+            // What every search result carries, named or not: the same projection
+            // `ListUsers` serves.
+            sid: Some(self.sid.clone()),
+            sam_account_name: self.sam_account_name.clone(),
+            given_name: self.given_name.clone(),
+            surname: self.surname.clone(),
+            enabled: Some(self.enabled),
+            // What widens it: the attributes this search asked about.
+            distinguished_name: asked(DISTINGUISHED_NAME_ATTRIBUTES)
+                .then(|| self.distinguished_name.clone()),
+            user_principal_name: asked(USER_PRINCIPAL_NAME_ATTRIBUTES)
+                .then(|| self.user_principal_name.clone()),
+            email_address: asked(EMAIL_ADDRESS_ATTRIBUTES)
+                .then(|| self.email_address.clone())
+                .flatten(),
+            other_attributes: self.projected_attributes(Some(names)),
+        }
+    }
+
     /// The `UserSummary` projection `ListUsers` serves.
     pub fn to_summary(&self) -> crate::ops::types::UserSummary {
         crate::ops::types::UserSummary {
@@ -445,6 +554,19 @@ pub fn attributes_fingerprint(attributes: Option<&HashMap<String, AttributeValue
         .map(|(name, value)| (fold(name), format!("{value:?}")))
         .collect();
     format!("{normalized:?}")
+}
+
+/// The values an attribute holds, as a search compares them.
+///
+/// One string per value, because a multi-valued attribute (`SS`) matches when any of
+/// its values does; a number or a boolean is compared as the directory renders it.
+pub fn attribute_value_strings(value: &AttributeValue) -> Vec<String> {
+    match value {
+        AttributeValue::S(text) => vec![text.clone()],
+        AttributeValue::N(number) => vec![number.to_string()],
+        AttributeValue::Bool(flag) => vec![flag.to_string()],
+        AttributeValue::Ss(values) => values.clone(),
+    }
 }
 
 /// The attributes of a request, stored in the order a directory reports them.

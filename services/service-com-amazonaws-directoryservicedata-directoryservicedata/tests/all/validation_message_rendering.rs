@@ -291,10 +291,9 @@ async fn an_element_constraint_is_stated_once_at_the_list_with_the_whole_element
 /// clauses above are the constraints' doing and not the renderer's.
 ///
 /// Each published bound of `LdapDisplayNameList` is covered, with an element at each
-/// published bound of `LdapDisplayName`. `SearchUsers` itself is still a scaffold, so what
-/// a request past the constraint layer reaches is that scaffold's `501 NotImplemented`
-/// (its own stub issue): the assertion is that no `ValidationException` is stated, which
-/// is what this rule decides.
+/// published bound of `LdapDisplayName`: the assertion is that no `ValidationException` is
+/// stated and the request is not refused, which is what this rule decides — whatever the
+/// handler past the constraint layer then answers.
 #[tokio::test]
 async fn a_list_inside_every_bound_is_not_refused_as_invalid() {
     let router = emulator();
