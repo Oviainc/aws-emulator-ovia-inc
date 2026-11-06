@@ -15,7 +15,12 @@
 //! * the operation models no error, so a stack with no association — including a name
 //!   the account does not hold — reports an empty list rather than a refusal;
 //! * following `NextToken` walks every associated fleet exactly once, in a stable order,
-//!   and a token this service never issued is refused.
+//!   and a token this service never issued is refused;
+//! * the names come from the stack half of each stored edge, so a fleet associated with
+//!   several stacks is reported by each of them, a repeated association writes no second
+//!   edge, and a disassociation clears only the pair it names;
+//! * the operation reports, it does not mutate: the same read repeated answers the same
+//!   names.
 
 use std::collections::BTreeSet;
 
@@ -163,6 +168,137 @@ async fn list_associated_fleets_reports_the_edges_associate_wrote() {
                 still_expected.iter().cloned().collect::<Vec<String>>(),
                 "case {case:?}: disassociating {cleared:?} must drop it from the list"
             );
+        }
+    }
+}
+
+/// The stacks every edge-script case creates, and the fleets it associates with them.
+///
+/// `StackName` and `FleetName` carry no enumerated values — they are plain names, only
+/// length-constrained on the wire
+/// (`smithy_query(query="operation", operation="ListAssociatedFleets")`) — so what the
+/// rows below vary is the SHAPE of the edge set, not the spelling of a name.
+const SCRIPT_STACKS: [&str; 3] = ["alpha-stack", "beta-stack", "gamma-stack"];
+const SCRIPT_FLEETS: [&str; 2] = ["shared-fleet", "solo-fleet"];
+
+/// One write in an edge script: the pair it associates, or the pair it clears.
+#[derive(Clone, Copy, Debug)]
+enum Edge {
+    Associate(&'static str, &'static str),
+    Disassociate(&'static str, &'static str),
+}
+
+/// Write scripts spanning the class: a fleet shared by several stacks, a repeated
+/// association, a cleared pair, a pair re-associated after being cleared, and several
+/// fleets on one stack.
+fn edge_scripts() -> Vec<(&'static str, Vec<Edge>)> {
+    let (shared, solo) = (SCRIPT_FLEETS[0], SCRIPT_FLEETS[1]);
+    let (alpha, beta, gamma) = (SCRIPT_STACKS[0], SCRIPT_STACKS[1], SCRIPT_STACKS[2]);
+    vec![
+        (
+            "one fleet, two stacks",
+            vec![Edge::Associate(shared, alpha), Edge::Associate(shared, beta)],
+        ),
+        (
+            "the same pair associated twice",
+            vec![Edge::Associate(solo, alpha), Edge::Associate(solo, alpha)],
+        ),
+        (
+            "one of a shared fleet's two stacks cleared",
+            vec![
+                Edge::Associate(shared, alpha),
+                Edge::Associate(shared, beta),
+                Edge::Disassociate(shared, alpha),
+            ],
+        ),
+        (
+            "a pair re-associated after being cleared",
+            vec![
+                Edge::Associate(solo, gamma),
+                Edge::Disassociate(solo, gamma),
+                Edge::Associate(solo, gamma),
+            ],
+        ),
+        (
+            "several fleets on one stack, one of them shared",
+            vec![
+                Edge::Associate(shared, alpha),
+                Edge::Associate(solo, alpha),
+                Edge::Associate(shared, beta),
+                Edge::Disassociate(solo, alpha),
+            ],
+        ),
+    ]
+}
+
+/// The names each stack must report are exactly the fleets the stored edge set names for
+/// it, after EVERY write of the script — never a fleet a sibling stack's edge names.
+#[tokio::test]
+async fn the_listed_names_track_every_edge_write() {
+    for (script_case, script) in edge_scripts() {
+        let emulator = Emulator::new();
+        for stack in SCRIPT_STACKS {
+            emulator
+                .ok(script_case, "CreateStack", json!({ "Name": stack }))
+                .await;
+        }
+        for fleet in SCRIPT_FLEETS {
+            emulator
+                .ok(
+                    script_case,
+                    "CreateFleet",
+                    json!({ "Name": fleet, "InstanceType": "stream.standard.small" }),
+                )
+                .await;
+        }
+
+        // The edge set the script has written so far, kept independently of the service.
+        let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+        for (step, edge) in script.iter().enumerate() {
+            match *edge {
+                Edge::Associate(fleet, stack) => {
+                    emulator
+                        .ok(
+                            script_case,
+                            "AssociateFleet",
+                            json!({ "FleetName": fleet, "StackName": stack }),
+                        )
+                        .await;
+                    edges.insert((fleet.to_string(), stack.to_string()));
+                }
+                Edge::Disassociate(fleet, stack) => {
+                    emulator
+                        .ok(
+                            script_case,
+                            "DisassociateFleet",
+                            json!({ "FleetName": fleet, "StackName": stack }),
+                        )
+                        .await;
+                    edges.remove(&(fleet.to_string(), stack.to_string()));
+                }
+            }
+
+            for stack in SCRIPT_STACKS {
+                let case = format!("{script_case}: after step {step} ({edge:?}), {stack}");
+                let expected: Vec<String> = edges
+                    .iter()
+                    .filter(|(_, associated)| associated == stack)
+                    .map(|(fleet, _)| fleet.clone())
+                    .collect();
+                let reported = list_every_page(&emulator, &case, stack).await;
+                assert_eq!(
+                    reported, expected,
+                    "case {case:?}: expected the fleets the stored edges name for this \
+                     stack, {expected:?}, got {reported:?}"
+                );
+                // A report, not a mutation: reading the list leaves the edge set alone,
+                // so the same read repeated answers the same names.
+                let again = list_every_page(&emulator, &case, stack).await;
+                assert_eq!(
+                    again, expected,
+                    "case {case:?}: a repeated read must answer {expected:?}, got {again:?}"
+                );
+            }
         }
     }
 }
