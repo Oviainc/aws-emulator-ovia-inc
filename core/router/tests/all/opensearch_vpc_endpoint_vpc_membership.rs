@@ -18,7 +18,9 @@
 //! names, which of them is the foreign one and in which position, whether the change also
 //! names security groups, and whether it names subnets at all — and every refusal is
 //! followed by an accepted change, so a refused call is shown to leave the operation
-//! working.
+//! working. Three CREATE rows cover the other half of the same rule: subnets spanning the
+//! two VPCs name no placement an endpoint can have, so the create is refused and mints
+//! nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,14 +210,14 @@ async fn vpc_domain(router: &MultiServiceRouter, name: &str, subnet: &str) -> St
         .to_owned()
 }
 
-/// `CreateVpcEndpoint` for `domain_arn` in `subnets`, answering with the endpoint.
-async fn create_endpoint(
+/// `CreateVpcEndpoint` for `domain_arn` in `subnets`, as it answered.
+async fn attempt_create_endpoint(
     router: &MultiServiceRouter,
     domain_arn: &str,
     subnets: &[String],
     security_groups: &[&str],
-) -> Value {
-    let created = opensearch(
+) -> Reply {
+    opensearch(
         router,
         "POST",
         &format!("{PREFIX}/opensearch/vpcEndpoints"),
@@ -227,13 +229,42 @@ async fn create_endpoint(
             },
         })),
     )
-    .await;
+    .await
+}
+
+/// The same create, asserted to have been served, answering with the endpoint.
+async fn create_endpoint(
+    router: &MultiServiceRouter,
+    domain_arn: &str,
+    subnets: &[String],
+    security_groups: &[&str],
+) -> Value {
+    let created = attempt_create_endpoint(router, domain_arn, subnets, security_groups).await;
     assert_eq!(
         created.status, 200,
         "setup: CreateVpcEndpoint must succeed, got {} with {}",
         created.status, created.body
     );
     created.body["VpcEndpoint"].clone()
+}
+
+/// How many endpoints `ListVpcEndpoints` reports for this account.
+async fn listed_endpoint_count(router: &MultiServiceRouter) -> usize {
+    let listed = opensearch(
+        router,
+        "GET",
+        &format!("{PREFIX}/opensearch/vpcEndpoints"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        listed.status, 200,
+        "a listing of this account's endpoints must be served, got {} with {}",
+        listed.status, listed.body
+    );
+    listed.body["VpcEndpointSummaryList"]
+        .as_array()
+        .map_or(0, Vec::len)
 }
 
 /// `UpdateVpcEndpoint` with the `VpcOptions` a row names.
@@ -404,6 +435,51 @@ async fn a_vpc_endpoint_cannot_be_moved_into_another_vpc() {
 
     // The create's own span falls due before the first change is made.
     tokio::time::sleep(settle_wait()).await;
+
+    // A create whose subnets span the TWO VPCs names no placement an endpoint can have —
+    // an endpoint lives in one VPC, and its `VPCId` is derived from those subnets — so it
+    // is refused and mints nothing, over the rows that differ in which VPC the foreign
+    // subnet belongs to and where in the list it sits.
+    let held_before = listed_endpoint_count(&router).await;
+    let spanning: [(&str, Vec<String>); 3] = [
+        (
+            "a create naming one subnet of each VPC",
+            vec![own_subnets[0].clone(), other_subnets[0].clone()],
+        ),
+        (
+            "a create naming the foreign subnet first",
+            vec![other_subnets[1].clone(), own_subnets[1].clone()],
+        ),
+        (
+            "a create naming two own subnets and then a foreign one",
+            vec![
+                own_subnets[0].clone(),
+                own_subnets[2].clone(),
+                other_subnets[0].clone(),
+            ],
+        ),
+    ];
+    for (case, subnets) in spanning {
+        let refused =
+            attempt_create_endpoint(&router, &domain_arn, &subnets, &["sg-0aaa0000000000009"]).await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (400, "ValidationException"),
+            "case {case:?}: expected a 400 ValidationException, got {} with {}",
+            refused.status,
+            refused.body
+        );
+        assert!(
+            refused.message().contains(&own_vpc) && refused.message().contains(&other_vpc),
+            "case {case:?}: expected the refusal to name both VPCs the subnets are in, got {}",
+            refused.body
+        );
+        assert_eq!(
+            listed_endpoint_count(&router).await,
+            held_before,
+            "case {case:?}: a refused create must mint no endpoint"
+        );
+    }
 
     for row in ROWS {
         let case = row.case;

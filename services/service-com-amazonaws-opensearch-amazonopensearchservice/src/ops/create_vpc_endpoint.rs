@@ -18,7 +18,9 @@
 //! subnets") — are read off the account's own network rather than invented here
 //! ([`crate::state::vpc_network`]), and that stored `VPCId` is what fixes the VPC the
 //! endpoint lives in for the rest of its life: see [`crate::ops::update_vpc_endpoint`].
-//! A subnet the account's network reports nothing for leaves both members unreported.
+//! A subnet the account's network reports nothing for leaves both members unreported, and
+//! subnets it places in DIFFERENT VPCs name no placement at all — an endpoint lives in
+//! one VPC — so such a create is refused and mints nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -92,10 +94,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::vpc_network::{placed_vpc_options, resolve_subnets};
+use crate::state::vpc_network::{placed_vpc_options, resolve_subnets, subnets_span_two_vpcs};
 use crate::state::{
-    request_region, vpc_endpoint_domain_unavailable, vpc_endpoint_host, OwedStatus,
-    VpcEndpointRecord, PROVISIONING, VPC_ENDPOINT_QUOTA, VPC_ENDPOINT_STATUS_ACTIVE,
+    request_region, subnets_in_two_vpcs, vpc_endpoint_domain_unavailable, vpc_endpoint_host,
+    OwedStatus, VpcEndpointRecord, PROVISIONING, VPC_ENDPOINT_QUOTA, VPC_ENDPOINT_STATUS_ACTIVE,
     VPC_ENDPOINT_STATUS_CREATING,
 };
 
@@ -187,6 +189,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resolve_subnets(ctx, &request_region(ctx.parts()), subnet_ids).await
             }
         };
+
+        // An endpoint lives in exactly ONE VPC — the one its subnets name — so a request
+        // whose subnets the account's network puts in different VPCs names no placement
+        // an endpoint can have, and is refused with the operation's modelled
+        // `ValidationException` before anything is minted rather than stored as a record
+        // whose own VPC nothing could state afterwards. Decided from what EC2 ANSWERED, so
+        // subnets it resolved nothing for refuse nothing.
+        if let Some((one, other)) = subnets_span_two_vpcs(&placements) {
+            return Err(CreateVpcEndpointErrorModeled::ValidationException(
+                subnets_in_two_vpcs(
+                    &one.subnet_id,
+                    one.vpc_id.as_deref().unwrap_or_default(),
+                    &other.subnet_id,
+                    other.vpc_id.as_deref().unwrap_or_default(),
+                ),
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

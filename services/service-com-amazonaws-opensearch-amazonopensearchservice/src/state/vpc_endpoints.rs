@@ -378,6 +378,29 @@ pub fn vpc_endpoint_domain_unavailable() -> ValidationException {
     }
 }
 
+/// The `ValidationException` payload for a create whose subnets do not all belong to ONE
+/// VPC.
+///
+/// An endpoint lives in exactly one VPC and reports it in `VPCDerivedInfo$VPCId`, derived
+/// from the subnets the create named — so subnets of two VPCs name no placement an
+/// endpoint can have. The sentence names the two subnets and the VPCs the account's own
+/// network puts them in, so the caller can tell which of the subnets it listed is the odd
+/// one out.
+pub fn subnets_in_two_vpcs(
+    subnet_id: &str,
+    vpc_id: &str,
+    other_subnet_id: &str,
+    other_vpc_id: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "The subnet {subnet_id} belongs to VPC {vpc_id} and the subnet \
+             {other_subnet_id} to VPC {other_vpc_id}. The subnets of a VPC endpoint must \
+             all belong to one VPC."
+        )),
+    }
+}
+
 /// The `ValidationException` payload for a change that would move a service-managed VPC
 /// endpoint into another VPC: a subnet the request names belongs to a VPC other than the
 /// one the endpoint was created in.

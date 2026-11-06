@@ -33,14 +33,23 @@ use super::*;
 /// named is still resolved against what EC2 does hold.
 const SUBNET_ID_FILTER: &str = "subnet-id";
 
-/// The most subnet identifiers one call resolves, in ONE hop.
+/// The most subnet identifiers asked about in ONE hop to EC2.
+///
+/// A hop is evaluated against every subnet the account stores, so this caps the
+/// identifiers one question carries; the identifiers a request names beyond it are asked
+/// about in further hops ([`MAX_RESOLVED_SUBNET_HOPS`] of them).
+const SUBNET_IDS_PER_HOP: usize = 64;
+
+/// The most hops one call makes, and so — with [`SUBNET_IDS_PER_HOP`] — the most
+/// identifiers it resolves.
 ///
 /// CHOSEN as a process-safety ceiling, not a published quota: the model declares no
 /// `@length` on `VPCOptions$SubnetIds`, so without one the work a single request causes
 /// would be sized by that request. A VPC endpoint is placed with one subnet per
-/// Availability Zone, so this is far above what a real placement names; identifiers past
-/// it are left unresolved, which — like an EC2 that cannot be asked — grounds nothing.
-const SUBNET_IDS_PER_CALL: usize = 64;
+/// Availability Zone, so the product is far above what any real placement names;
+/// identifiers past it are left unresolved, which — like an EC2 that cannot be asked —
+/// grounds nothing.
+const MAX_RESOLVED_SUBNET_HOPS: usize = 8;
 
 /// One subnet of the account, reduced to what this service reads off it: which VPC it
 /// belongs to and which Availability Zone it sits in, as EC2 reports them.
@@ -100,21 +109,25 @@ fn ec2(
 /// every identifier when there is no EC2 to ask: this resolves what the account's network
 /// says, and says nothing of its own about what it could not resolve.
 ///
-/// Bounded by [`SUBNET_IDS_PER_CALL`] identifiers, asked about in one hop, deduplicated —
-/// so the work does not grow with how many times one subnet is named.
+/// EVERY identifier the request named is asked about, deduplicated and in hops of
+/// [`SUBNET_IDS_PER_HOP`] — so a placement is resolved whole rather than only as far as
+/// one hop reaches, and a caller cannot push a subnet past the question by listing more of
+/// them. The work is bounded by [`MAX_RESOLVED_SUBNET_HOPS`] hops whatever the request
+/// carries.
 pub async fn resolve_subnets(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
 ) -> Vec<SubnetPlacement> {
-    let mut asked: Vec<&String> = Vec::new();
+    let ceiling = SUBNET_IDS_PER_HOP * MAX_RESOLVED_SUBNET_HOPS;
+    let mut asked: Vec<String> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for subnet_id in subnet_ids {
-        if asked.len() == SUBNET_IDS_PER_CALL {
+        if asked.len() == ceiling {
             break;
         }
         if seen.insert(subnet_id.as_str()) {
-            asked.push(subnet_id);
+            asked.push(subnet_id.clone());
         }
     }
     if asked.is_empty() {
@@ -123,24 +136,27 @@ pub async fn resolve_subnets(
     let Some(client) = ec2(ctx, region) else {
         return Vec::new();
     };
-    let by_id = ::aws_sdk_ec2::types::Filter::builder()
-        .name(SUBNET_ID_FILTER)
-        .set_values(Some(asked.iter().map(|id| (*id).clone()).collect()))
-        .build();
-    let reported = match client.describe_subnets().filters(by_id).send().await {
-        Ok(output) => output.subnets().to_vec(),
-        Err(error) => {
-            // At `warn`: a deployment where this hop fails is one where the network
-            // behind an endpoint is never resolved, which is worth seeing — and it IS
-            // why an identifier did not resolve.
-            ::tracing::warn!(
-                %region,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the subnets a request named could not be resolved against EC2"
-            );
-            return Vec::new();
+    let mut reported: Vec<::aws_sdk_ec2::types::Subnet> = Vec::new();
+    for hop in asked.chunks(SUBNET_IDS_PER_HOP) {
+        let by_id = ::aws_sdk_ec2::types::Filter::builder()
+            .name(SUBNET_ID_FILTER)
+            .set_values(Some(hop.to_vec()))
+            .build();
+        match client.describe_subnets().filters(by_id).send().await {
+            Ok(output) => reported.extend(output.subnets().iter().cloned()),
+            Err(error) => {
+                // At `warn`: a deployment where this hop fails is one where the network
+                // behind an endpoint is never resolved, which is worth seeing — and it IS
+                // why an identifier did not resolve. The hops already answered are kept:
+                // every placement they resolved is still what the account's network says.
+                ::tracing::warn!(
+                    %region,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the subnets a request named could not be resolved against EC2"
+                );
+            }
         }
-    };
+    }
     // In the order the REQUEST named them, so what a caller is told about is the subnet
     // it listed rather than whichever row EC2 happened to answer first.
     subnet_ids
@@ -163,11 +179,30 @@ pub async fn resolve_subnets(
 ///
 /// `VPCDerivedInfo$VPCId` is a single VPC, so a set of subnets that does not agree on one
 /// names no VPC to report — which is the same answer as a placement nothing could be
-/// resolved for.
+/// resolved for. A CALLER naming subnets of two VPCs is told so instead of being given
+/// such a record ([`subnets_span_two_vpcs`]).
 pub fn placed_vpc(placements: &[SubnetPlacement]) -> Option<String> {
     let mut vpcs = placements.iter().filter_map(|placement| placement.vpc_id.as_deref());
     let first = vpcs.next()?;
     vpcs.all(|vpc| vpc == first).then(|| first.to_owned())
+}
+
+/// The two subnets of a placement that EC2 puts in DIFFERENT VPCs — the first such pair in
+/// the order the request named them — or `None` where every resolved subnet is in one VPC
+/// (which includes a placement nothing resolved for).
+///
+/// An endpoint lives in exactly one VPC, and the subnets it is created in are what name it,
+/// so a placement whose subnets disagree names no VPC at all: the create that asked for it
+/// is refused rather than stored with no `VPCId` — a record whose own VPC nothing could
+/// state afterwards.
+pub fn subnets_span_two_vpcs(placements: &[SubnetPlacement]) -> Option<(&SubnetPlacement, &SubnetPlacement)> {
+    let mut placed = placements
+        .iter()
+        .filter(|placement| placement.vpc_id.is_some());
+    let first = placed.next()?;
+    placed
+        .find(|placement| placement.vpc_id != first.vpc_id)
+        .map(|other| (first, other))
 }
 
 /// The Availability Zones the resolved subnets sit in, in the order the request named the
