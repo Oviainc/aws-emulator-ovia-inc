@@ -437,7 +437,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         // A function whose environment variables are encrypted with a customer managed key
         // is only invoked while that key can decrypt them, exactly as on `Invoke`.
         if let Some(fault) = crate::state::environment_key_fault(
-            ctx,
+            ctx.callback(),
             &region,
             kms_key_arn.as_deref(),
             &invocation.variables,

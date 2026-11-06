@@ -43,8 +43,12 @@ mod alias_write_not_found_sentence;
 mod async_delivery;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
+
+#[path = "all/async_invocation_delivery.rs"]
+mod async_invocation_delivery;
 #[path = "all/asynchronous_invoke_run.rs"]
 mod asynchronous_invoke_run;
+
 #[path = "all/capacity_provider_bounds.rs"]
 mod capacity_provider_bounds;
 #[path = "all/capacity_provider_duplicate_name.rs"]
@@ -103,6 +107,8 @@ mod event_source_mapping_least_privilege_role;
 mod event_source_mapping_metrics_scope;
 #[path = "all/event_source_mapping_paused_state_and_response_types.rs"]
 mod event_source_mapping_paused_state_and_response_types;
+#[path = "all/event_source_mapping_processed_batch.rs"]
+mod event_source_mapping_processed_batch;
 #[path = "all/event_source_mapping_processing_visibility.rs"]
 mod event_source_mapping_processing_visibility;
 #[path = "all/event_source_mapping_queue_visibility.rs"]

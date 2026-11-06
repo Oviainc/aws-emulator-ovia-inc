@@ -12,7 +12,9 @@
 //! the service's own state, which is where the queued event lands.
 //!
 //! The clock-driven half (a queued event whose delivery attempt has come due) is
-//! exercised by moving the stored due instant into the past, so nothing here sleeps.
+//! exercised by moving the stored due instant into the past, so nothing here sleeps. What
+//! becomes of a delivered event is
+//! [`super::async_invocation_delivery`]'s subject, not this suite's.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -212,6 +214,7 @@ fn hold_undelivered_event(engine: &Arc<engine::InMemoryEngine>, name: &str, payl
         payload: payload.to_vec(),
         received: "2026-01-01T00:00:00.000Z".to_string(),
         attempt_due: SystemTime::now() - Duration::from_secs(1),
+        attempts: 0,
         outcome: AsyncInvocationOutcome::Queued,
     });
 }

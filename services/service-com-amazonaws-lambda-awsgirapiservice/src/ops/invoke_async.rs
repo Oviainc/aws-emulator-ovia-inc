@@ -7,7 +7,8 @@
 //! invocation" (the model's own `InvokeAsyncResponse` documentation) and says nothing
 //! about the run. The queued event is persisted on the function record and then DELIVERED
 //! to the function off the response path: the handler runs with it, through the same
-//! in-process engine a synchronous invocation runs through, and the queue entry keeps what
+//! in-process engine a synchronous invocation runs through, a delivery whose handler errored
+//! is attempted again up to the attempts Lambda documents, and the queue entry keeps what
 //! the run came to (`crate::state::async_invocation`). No result, log tail or duration is
 //! ever reported to the caller, which was answered before the run happened.
 //!

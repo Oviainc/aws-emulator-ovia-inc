@@ -55,11 +55,11 @@
 //!   [`super::metrics`]), including a 0-valued poll count for a minute in which the mapping
 //!   polled nothing.
 //!
-//! What this emulator cannot do is RUN a function's deployment package: there is no
-//! in-process runtime for one, which is what `Invoke` answers 501 for. So an invocation of
-//! such a function is refused, the batch is not deleted, and the counts the pass publishes
-//! say exactly that — the events were polled, none was invoked and none was deleted. Nothing
-//! here reports a success, or counts an event as processed, that no invocation earned.
+//! A function whose deployment package this emulator can run no engine for is one no
+//! invocation of can succeed: such an invocation is refused, the batch is not deleted, and
+//! the counts the pass publishes say exactly that — the events were polled, none was
+//! invoked and none was deleted. Nothing here reports a success, or counts an event as
+//! processed, that no invocation earned.
 //!
 //! # How a poll is driven
 //!

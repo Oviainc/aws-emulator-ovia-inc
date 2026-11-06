@@ -287,6 +287,7 @@ impl FunctionRecord {
             payload,
             received: iso8601(now),
             attempt_due: now + ASYNC_DELIVERY_DELAY,
+            attempts: 0,
             outcome: AsyncInvocationOutcome::Queued,
         });
     }
@@ -312,6 +313,7 @@ impl FunctionRecord {
             payload,
             received: iso8601(now),
             attempt_due: now,
+            attempts: 0,
             outcome: AsyncInvocationOutcome::Failed(ASYNC_RECURSION_STOPPED_REASON.to_string()),
         });
     }

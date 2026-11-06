@@ -14,9 +14,12 @@
 //! event's delivery attempt comes due [`ASYNC_DELIVERY_DELAY`] after it was accepted, and the
 //! attempt runs the function's own deployment package through the in-process engine every
 //! synchronous invocation runs it through ([`super::execution::run_invocation`]) — the same
-//! handler, the same package, the same bounds. Nothing about the run reaches the accepting
-//! call's response, because the response was given before the run happened; the entry keeps
-//! what the attempt came to ([`AsyncInvocationOutcome`]).
+//! handler, the same package, the same bounds. An attempt whose handler ERRORED is followed
+//! by another, as many as the event has ([`super::async_delivery`]), because "if you invoke
+//! a function asynchronously and it returns an error, Lambda executes the function up to two
+//! more times". Nothing about the run reaches the accepting call's response, because the
+//! response was given before the run happened; the entry keeps what the last attempt came to
+//! ([`AsyncInvocationOutcome`]).
 //!
 //! Nothing sleeps inside a request: the attempt is driven on a task of its own, exactly as
 //! the account's other in-process pumps are, and with no async runtime to spawn onto there
@@ -68,6 +71,9 @@ pub struct AsyncInvocationRecord {
     pub received: String,
     /// When the first delivery attempt becomes due; see [`ASYNC_DELIVERY_DELAY`].
     pub attempt_due: SystemTime,
+    /// How many delivery attempts have been MADE for this event, which is what
+    /// [`super::async_delivery::MAX_ASYNC_DELIVERY_ATTEMPTS`] bounds.
+    pub attempts: u32,
     /// What has become of the event.
     pub outcome: AsyncInvocationOutcome,
 }
@@ -156,10 +162,12 @@ impl Drop for DeliveryPermit {
 /// handler, and the entry `invocation.request_id` names keeps what the attempt came to.
 ///
 /// What bounds the task: at most [`MAX_IN_FLIGHT_DELIVERIES`] of them run at once, each is
-/// one wait for the event's delivery delay and then ONE run of the handler through
+/// one wait for the event's delivery delay and then at most
+/// [`super::async_delivery::MAX_ASYNC_DELIVERY_ATTEMPTS`] runs of the handler through
 /// [`super::execution::run_invocation`] — which holds a run slot of its own, waits at most
 /// [`super::execution::PERMIT_WAIT`] for one and is cut off by the function's `Timeout`
-/// inside [`super::execution::HOST_WAIT_CEILING`] — and there is no retry loop behind it.
+/// inside [`super::execution::HOST_WAIT_CEILING`] — with only an errored handler taking
+/// another ([`super::async_delivery::next_attempt_in`]).
 ///
 /// With no async runtime to spawn onto nothing is delivered, and nothing a caller was told
 /// depends on it: the entry settles on the clock instead, carrying
@@ -195,50 +203,77 @@ pub fn deliver(
         // inside the request that queued the event, so a caller that looks straight after
         // that call still sees the event queued. No store guard is held across it.
         ::tokio::time::sleep(ASYNC_DELIVERY_DELAY).await;
-        // The attempt is the entry's from here on, so the clock settles it no further.
-        if !claim(&state, &function_name, &request_id) {
-            return;
+        // Each turn is ONE delivery attempt: the attempt is the entry's from here on, so the
+        // clock settles it no further, and what follows an attempt is the retry policy's
+        // (`super::async_delivery`) — an errored handler is invoked again, a handler that
+        // returned and a run that never started are not.
+        loop {
+            let Some(attempts) = claim(&state, &function_name, &request_id) else {
+                return;
+            };
+            let (outcome, ran, function_error) =
+                match super::execution::run_invocation(invocation.clone()).await {
+                    Ok(invoked) => {
+                        let function_error = invoked.function_error.clone();
+                        (
+                            AsyncInvocationOutcome::Delivered {
+                                function_error: invoked.function_error,
+                            },
+                            true,
+                            function_error,
+                        )
+                    }
+                    Err(why) => (
+                        AsyncInvocationOutcome::Failed(unrunnable_reason(&why)),
+                        false,
+                        None,
+                    ),
+                };
+            if let AsyncInvocationOutcome::Failed(ref why) = outcome {
+                // A function an accepted event could not be run for is worth seeing: the
+                // caller was answered before the attempt, so this is the only place it is
+                // reported.
+                ::tracing::warn!(
+                    function = %function_name,
+                    request_id = %request_id,
+                    detail = %why,
+                    "an accepted asynchronous invocation could not be delivered to its \
+                     function"
+                );
+            }
+            let Some(again) =
+                super::async_delivery::next_attempt_in(ran, function_error.as_deref(), attempts)
+            else {
+                settle(&state, &function_name, &request_id, outcome);
+                return;
+            };
+            // The event has another attempt, so the entry is left as the one it is being
+            // delivered under rather than carrying an outcome a later attempt may replace.
+            ::tokio::time::sleep(again).await;
         }
-        let outcome = match super::execution::run_invocation(invocation).await {
-            Ok(invoked) => AsyncInvocationOutcome::Delivered {
-                function_error: invoked.function_error,
-            },
-            Err(why) => AsyncInvocationOutcome::Failed(unrunnable_reason(&why)),
-        };
-        if let AsyncInvocationOutcome::Failed(ref why) = outcome {
-            // A function an accepted event could not be run for is worth seeing: the caller
-            // was answered before the attempt, so this is the only place it is reported.
-            ::tracing::warn!(
-                function = %function_name,
-                request_id = %request_id,
-                detail = %why,
-                "an accepted asynchronous invocation could not be delivered to its function"
-            );
-        }
-        settle(&state, &function_name, &request_id, outcome);
     });
 }
 
-/// Mark the entry `request_id` names on `function` as being delivered, so the clock does not
-/// settle an event an attempt is already making.
+/// Mark the entry `request_id` names on `function` as being delivered, counting the attempt
+/// that is about to be made, so the clock does not settle an event an attempt is already
+/// making — and answer how many attempts the event has now had.
 ///
 /// The claim is unconditional: an entry the clock settled in the instant between its attempt
 /// falling due and this attempt taking it is one that IS being delivered, so the attempt's
 /// own outcome is the one that stands.
 ///
-/// `false` when the store holds no such entry any more — the queue is bounded, so a newer
+/// `None` when the store holds no such entry any more — the queue is bounded, so a newer
 /// event may already have made room with it — in which case there is nothing to deliver to.
 fn claim(
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     function: &str,
     request_id: &str,
-) -> bool {
+) -> Option<u32> {
     let mut store = state.lock();
-    let Some(entry) = entry_of(&mut store, function, request_id) else {
-        return false;
-    };
+    let entry = entry_of(&mut store, function, request_id)?;
     entry.outcome = AsyncInvocationOutcome::Delivering;
-    true
+    entry.attempts = entry.attempts.saturating_add(1);
+    Some(entry.attempts)
 }
 
 /// Record what the delivery attempt for `request_id` came to on the entry that holds it, if

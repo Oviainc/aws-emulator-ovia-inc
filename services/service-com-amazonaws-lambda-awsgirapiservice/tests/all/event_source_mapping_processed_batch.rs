@@ -1,0 +1,430 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for what an event source mapping on an Amazon SQS queue CONSUMES once
+//! its function has actually run the batch it was handed.
+//!
+//! `CreateEventSourceMapping` "creates a mapping between an event source and an Lambda Event
+//! Function. Lambda reads items from the event source and invokes the function", and the
+//! rule under test, in one sentence: a message leaves the queue when the invocation it was
+//! handed to processed it, and stays on the queue when it did not — so a batch an invocation
+//! accepted whole is deleted whole, a batch whose function errored is deleted not at all,
+//! and for a mapping whose `FunctionResponseTypes` asks for its function's report of which
+//! records failed (`ReportBatchItemFailures`) exactly the records that report names stay
+//! behind and come back when their visibility timeout lapses.
+//!
+//! Every row drives real HTTP requests through the production `MultiServiceRouter` with
+//! Lambda and Amazon SQS on ONE engine, as `core/router` assembles them: the queue is
+//! created and written through Amazon SQS's own surface, the function carries a REAL
+//! deployment package whose handler decides each record's fate from the record itself, and
+//! what the row asserts is the queue's own message counts — so a batch nothing processed, or
+//! one deleted without a function having run it, fails here.
+//!
+//! The rows differ along what the rule generalises over: whether the mapping asks for the
+//! failure report, how many records of the batch the function reports as failed (none, one,
+//! all), how it ends (a return, a raise), and how many messages are waiting. Each row runs a
+//! real interpreter, so the table spans the class with as few of them as the class takes.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use base64::Engine as _;
+use serde_json::json;
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::event_source_mappings::{
+    call, call_sqs, create_mapping, create_queue, get_mapping, messages_held,
+    queue_message_counts, router_on,
+};
+use crate::synchronous_invoke_run::package;
+
+/// Where `CreateFunction` is bound.
+const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+
+/// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
+const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+
+/// The `State` a mapping reports once it is polling its event source.
+const STATE_ENABLED: &str = "Enabled";
+
+/// The one value of the model's `FunctionResponseType` enum
+/// (`smithy_query(query="shape", shape="FunctionResponseType")`).
+const REPORT_BATCH_ITEM_FAILURES: &str = "ReportBatchItemFailures";
+
+/// How long a row waits for the chain to reach what the rule owes before failing: the
+/// mapping settles, the poller takes a batch, the function runs and the messages the
+/// invocation processed are deleted, each driven by the clock.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often a row re-reads the queue while it waits.
+const POLL: Duration = Duration::from_millis(100);
+
+/// Several of the poll intervals this mapping's queue is polled at: long enough that a
+/// poller which was going to consume anything more has had the chance to.
+const POLL_WINDOWS: Duration = Duration::from_secs(3);
+
+/// Several of the one-second visibility windows the last suite's queue hands a message over
+/// for, for the same reason.
+const VISIBILITY_WINDOWS: Duration = Duration::from_secs(3);
+
+/// Create a function whose handler is `source`, with a `Timeout` of one second so the hold a
+/// batch's delivery takes stays short.
+async fn create_runnable_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    source: &str,
+) {
+    let answer = call(
+        router,
+        "POST",
+        FUNCTIONS_URI,
+        &json!({
+            "FunctionName": name,
+            "Role": ROLE,
+            "Runtime": "python3.12",
+            "Handler": "lambda_function.lambda_handler",
+            "Timeout": 1,
+            "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(source)) },
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        201,
+        "case {case:?}: expected CreateFunction {name:?} to answer 201, got {} {}",
+        answer.status,
+        answer.text()
+    );
+}
+
+/// `SendMessage` of `body` to the queue `url` addresses.
+async fn send_message(router: &MultiServiceRouter, case: &str, url: &str, body: &str) {
+    let (status, sent) = call_sqs(
+        router,
+        "SendMessage",
+        &json!({ "QueueUrl": url, "MessageBody": body }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected SendMessage to answer 200, got {status} {sent}"
+    );
+}
+
+/// The bodies of every message the queue `arn` names still HOLDS, read out of the queue's own
+/// store — visible or in flight — so what is read does not depend on racing the poller for a
+/// delivery.
+fn held_bodies(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> BTreeSet<String> {
+    let state = engine
+        .state::<service_com_amazonaws_sqs_amazonsqs::state::ComAmazonawsSqsAmazonsqsState>();
+    let store = state.lock();
+    store
+        .queue_by_arn(arn)
+        .map(|queue| {
+            queue
+                .messages
+                .iter()
+                .map(|message| message.body.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Wait until the queue `url` addresses holds `expected` messages, answering what it held.
+async fn wait_for_held(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    expected: u32,
+) -> (u32, u32, u32) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let counts = queue_message_counts(router, case, url).await;
+        if messages_held(counts) == expected {
+            return counts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the queue to hold {expected} message(s) once the batch \
+             was processed, it still holds {} (visible, in flight, delayed) = {counts:?}",
+            messages_held(counts)
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Wait for the mapping `uuid` names to report `Enabled`, which is the state in which it
+/// polls.
+async fn wait_for_enabled(router: &MultiServiceRouter, case: &str, uuid: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let read = get_mapping(router, uuid).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected GetEventSourceMapping to answer 200, got {} {}",
+            read.status,
+            read.text()
+        );
+        if read.string("State").as_deref() == Some(STATE_ENABLED) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the mapping never reached {STATE_ENABLED}: {}",
+            read.text()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// One row: the handler the function runs, what the mapping asks of its response, the bodies
+/// sent to the queue, and which of them must be left on it.
+struct Row {
+    case: &'static str,
+    /// The Python handler source. Each row's handler decides a record's fate from the
+    /// RECORD, never from a count or an order, so the same source serves any batch.
+    handler: &'static str,
+    /// Whether the mapping carries `ReportBatchItemFailures`.
+    reports_failures: bool,
+    /// The message bodies sent to the queue, in order.
+    sent: &'static [&'static str],
+    /// The bodies the queue must still hold once the batch has been processed.
+    left: &'static [&'static str],
+}
+
+/// A handler that reports every record whose body says `fail` as failed, and nothing else.
+/// It names those records by the `messageId` of the record it was handed, which is the
+/// identifier a batch item failure report names a record by.
+const REPORTING_HANDLER: &str = r#"
+import json
+
+
+def lambda_handler(event, context):
+    failures = []
+    for record in event["Records"]:
+        if json.loads(record["body"]).get("fail"):
+            failures.append({"itemIdentifier": record["messageId"]})
+    return {"batchItemFailures": failures}
+"#;
+
+/// A handler that returns nothing at all, which is the response of a function that processed
+/// its whole batch and reports no failure.
+const SILENT_HANDLER: &str = r#"
+def lambda_handler(event, context):
+    return None
+"#;
+
+/// A handler that raises, so the invocation the batch was handed to errored.
+const RAISING_HANDLER: &str = r#"
+def lambda_handler(event, context):
+    raise RuntimeError("this batch cannot be processed")
+"#;
+
+fn rows() -> Vec<Row> {
+    vec![
+        Row {
+            case: "a mapping with no failure report, whose function returned",
+            handler: SILENT_HANDLER,
+            reports_failures: false,
+            sent: &[r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3}"#],
+            left: &[],
+        },
+        Row {
+            case: "a mapping with no failure report, whose function raised",
+            handler: RAISING_HANDLER,
+            reports_failures: false,
+            sent: &[r#"{"id":1}"#, r#"{"id":2}"#],
+            left: &[r#"{"id":1}"#, r#"{"id":2}"#],
+        },
+        Row {
+            case: "a report naming no record of the batch",
+            handler: REPORTING_HANDLER,
+            reports_failures: true,
+            sent: &[r#"{"id":1}"#, r#"{"id":2}"#],
+            left: &[],
+        },
+        Row {
+            case: "a report naming one record of the batch",
+            handler: REPORTING_HANDLER,
+            reports_failures: true,
+            sent: &[r#"{"id":1}"#, r#"{"id":2,"fail":true}"#, r#"{"id":3}"#],
+            left: &[r#"{"id":2,"fail":true}"#],
+        },
+        Row {
+            case: "a report naming every record of the batch",
+            handler: REPORTING_HANDLER,
+            reports_failures: true,
+            sent: &[r#"{"id":1,"fail":true}"#, r#"{"id":2,"fail":true}"#],
+            left: &[r#"{"id":1,"fail":true}"#, r#"{"id":2,"fail":true}"#],
+        },
+    ]
+}
+
+/// The whole rule, per row: the mapping polls the queue, the function runs the batch, and
+/// exactly the messages its invocation did not process are left on the queue.
+#[tokio::test]
+async fn a_mapping_consumes_the_records_its_function_processed_and_leaves_the_rest() {
+    for (index, row) in rows().iter().enumerate() {
+        let case = row.case;
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = router_on(&engine);
+        router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+
+        let function = format!("processed-batch-{index}");
+        create_runnable_function(&router, case, &function, row.handler).await;
+        // The queue's default visibility timeout, so a message the invocation did not
+        // process stays in flight for the whole of this row rather than coming back to be
+        // handed over again: what the row asserts is that it was not DELETED, which the
+        // queue's own counts report whether it is visible or in flight.
+        let (url, arn) = create_queue(
+            &router,
+            case,
+            &format!("processed-batch-{index}"),
+            &json!({ "VisibilityTimeout": "30" }),
+        )
+        .await;
+
+        let mut request = json!({
+            "FunctionName": function,
+            "EventSourceArn": arn,
+            "BatchSize": 10,
+        });
+        if row.reports_failures {
+            request["FunctionResponseTypes"] = json!([REPORT_BATCH_ITEM_FAILURES]);
+        }
+        let created = create_mapping(&router, &request).await;
+        assert_eq!(
+            created.status,
+            202,
+            "case {case:?}: expected CreateEventSourceMapping to answer 202, got {} {}",
+            created.status,
+            created.text()
+        );
+        let uuid = created
+            .string("UUID")
+            .unwrap_or_else(|| panic!("case {case:?}: no UUID in {}", created.text()));
+        wait_for_enabled(&router, case, &uuid).await;
+
+        for body in row.sent {
+            send_message(&router, case, &url, body).await;
+        }
+
+        let expected_left = u32::try_from(row.left.len()).expect("a small count");
+        wait_for_held(&router, case, &url, expected_left).await;
+        // And nothing more leaves once the mapping has had several further poll intervals:
+        // a message the invocation processed is gone for good, and one it did not is still
+        // held.
+        tokio::time::sleep(POLL_WINDOWS).await;
+        let counts = queue_message_counts(&router, case, &url).await;
+        assert_eq!(
+            messages_held(counts),
+            expected_left,
+            "case {case:?}: expected the queue to settle holding {expected_left} message(s), \
+             got (visible, in flight, delayed) = {counts:?}"
+        );
+        let held = held_bodies(&engine, &arn);
+        let expected: BTreeSet<String> = row.left.iter().map(|body| (*body).to_string()).collect();
+        assert_eq!(
+            held, expected,
+            "case {case:?}: expected exactly the unprocessed messages to be left on the \
+             queue, got {held:?}"
+        );
+    }
+}
+
+/// What a mapping consumes is decided by the response of the invocation it handed the batch
+/// to, so a function whose package cannot be run processes nothing: the batch stays whole on
+/// the queue. The counterpart of the rows above, which the same mapping and the same queue
+/// would have consumed had the function run.
+#[tokio::test]
+async fn a_mapping_whose_function_cannot_run_consumes_nothing() {
+    let case = "a package that is not a readable archive";
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = router_on(&engine);
+    router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+
+    let answer = call(
+        &router,
+        "POST",
+        FUNCTIONS_URI,
+        &json!({
+            "FunctionName": "unrunnable-batch",
+            "Role": ROLE,
+            "Runtime": "python3.12",
+            "Handler": "lambda_function.lambda_handler",
+            "Timeout": 1,
+            "Code": {
+                "ZipFile": base64::engine::general_purpose::STANDARD
+                    .encode(b"these bytes are not a zip archive"),
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        201,
+        "case {case:?}: expected CreateFunction to answer 201, got {} {}",
+        answer.status,
+        answer.text()
+    );
+    let (url, arn) = create_queue(
+        &router,
+        case,
+        "unrunnable-batch",
+        &json!({ "VisibilityTimeout": "1" }),
+    )
+    .await;
+    let created = create_mapping(
+        &router,
+        &json!({
+            "FunctionName": "unrunnable-batch",
+            "EventSourceArn": arn,
+            "BatchSize": 10,
+            "FunctionResponseTypes": [REPORT_BATCH_ITEM_FAILURES],
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        202,
+        "case {case:?}: expected CreateEventSourceMapping to answer 202, got {} {}",
+        created.status,
+        created.text()
+    );
+    let uuid = created
+        .string("UUID")
+        .unwrap_or_else(|| panic!("case {case:?}: no UUID in {}", created.text()));
+    wait_for_enabled(&router, case, &uuid).await;
+
+    send_message(&router, case, &url, r#"{"id":1}"#).await;
+    tokio::time::sleep(VISIBILITY_WINDOWS).await;
+    let counts = queue_message_counts(&router, case, &url).await;
+    assert_eq!(
+        messages_held(counts),
+        1,
+        "case {case:?}: expected the message to stay on the queue, got (visible, in flight, \
+         delayed) = {counts:?}"
+    );
+    let held = held_bodies(&engine, &arn);
+    assert_eq!(
+        held,
+        BTreeSet::from([r#"{"id":1}"#.to_string()]),
+        "case {case:?}: expected the message to keep its body, got {held:?}"
+    );
+    let read = get_mapping(&router, &uuid).await;
+    // "The result of the last Lambda invocation of your function"
+    // (`EventSourceMappingConfiguration$LastProcessingResult`): the attempt failed, so that
+    // is what the mapping reports rather than a success nothing earned.
+    assert_eq!(
+        read.string("LastProcessingResult").as_deref(),
+        Some("PROBLEM: Function call failed"),
+        "case {case:?}: expected the mapping to report the failed attempt, got {}",
+        read.text()
+    );
+}

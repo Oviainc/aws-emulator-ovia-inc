@@ -13,7 +13,8 @@
 //! event is then DELIVERED to the function off the response path: the handler runs with
 //! it, through the same in-process engine a synchronous invocation runs through, so
 //! whatever the handler itself performs becomes observable shortly after the accepting
-//! call (`crate::state::async_invocation`).
+//! call, and a delivery whose handler errored is attempted again up to the attempts
+//! Lambda documents (`crate::state::async_invocation`).
 //!
 //! An accepted `Event` invocation of a DURABLE function — one whose resolved
 //! configuration carries a `DurableConfig` — or one that names a `DurableExecutionName`
@@ -745,7 +746,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at 502 (`crate::state::execution::environment_key`). Nothing has run at this
         // point, and nothing will if the key cannot be used.
         if let Some(fault) = crate::state::environment_key_fault(
-            ctx,
+            ctx.callback(),
             &invocation.region,
             kms_key_arn.as_deref(),
             &invocation.variables,

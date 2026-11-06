@@ -43,9 +43,10 @@
 //! to. What FOLLOWS the accepting call is the delivery: the event is handed to the
 //! function and its handler runs, through the same in-process engine a synchronous
 //! invocation runs on, so whatever the handler performs becomes observable shortly after
-//! the call that queued it (see [`async_invocation::deliver`]). The entry keeps what the
-//! attempt came to; nothing invents a result, a log tail or a duration for a function
-//! that did not run.
+//! the call that queued it (see [`async_invocation::deliver`]). A delivery whose handler
+//! ERRORED is attempted again, up to the attempts Lambda documents for one, and the entry
+//! keeps what the last attempt came to; nothing invents a result, a log tail or a duration
+//! for a function that did not run.
 //!
 //! The durable-execution slice hangs off the same record too, in
 //! [`FunctionRecord::durable_executions`]: one [`DurableExecutionRecord`] per execution
@@ -2842,6 +2843,12 @@ pub mod event_source_mapping;
 /// re-exported here, so a handler names them as `crate::state::…`.
 pub mod async_invocation;
 pub use async_invocation::*;
+/// How many times a delivery attempt of such an event is MADE — "if you invoke a function
+/// asynchronously and it returns an error, Lambda executes the function up to two more
+/// times" — lives beside it in [`async_delivery`], the policy that decides what follows one
+/// attempt, and is re-exported here for the same reason.
+pub mod async_delivery;
+pub use async_delivery::*;
 pub use event_source_mapping::{
     created_event_source_mapping_state, default_batch_size, default_batching_window_seconds,
     event_source_is_mappable_by_this_account, event_source_mapping_arn, event_source_vendor,

@@ -17,7 +17,7 @@
 //! the invocation is refused with. Only a DEFINITE answer refuses: a key the key service
 //! reports as usable, and an answer that establishes nothing at all (the key service is
 //! not mounted beside this one, it answered about itself, or it was not reached), both
-//! leave the invocation to run, because nothing was learnt that says it must not.
+//! leave the invocation to run.
 //!
 //! A function with no `KMSKeyArn`, or with no environment variables to decrypt, has nothing
 //! to ask about.
@@ -87,8 +87,13 @@ const STATE_ENABLED: &str = "Enabled";
 ///
 /// `variables` is the function's own environment: a function with none has nothing
 /// encrypted with the key, so there is nothing to decrypt and nothing to ask about.
+///
+/// `callback` is the in-process seam the key service is asked over, which a request reaches
+/// through [`smithy_server_runtime::OperationContext::callback`] and the asynchronous
+/// delivery loop ([`super::super::async_delivery`]) holds its own clone of: an invocation
+/// begins with this decrypt however it arrived.
 pub async fn environment_key_fault(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     kms_key_arn: Option<&str>,
     variables: &BTreeMap<String, String>,
@@ -97,7 +102,7 @@ pub async fn environment_key_fault(
     if variables.is_empty() {
         return None;
     }
-    let described = kms_client(ctx, region)
+    let described = kms_client(callback, region)
         .describe_key()
         .key_id(key_arn)
         .send()
@@ -164,15 +169,15 @@ fn is_access_denied(error: &::aws_sdk_kms::operation::describe_key::DescribeKeyE
 /// routes in process, so no network client is configured here. `region` is the Region the
 /// invocation was addressed to, which is where the function's key lives.
 fn kms_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_kms::Client {
     let config = ::aws_sdk_kms::Config::builder()
         .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
         .region(::aws_sdk_kms::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         // The transport is in-process: there is nothing to retry, time out or watch for a
         // stalled stream, and each of those would need a sleep implementation this client
         // is not given. The same goes for caching the identity: the credentials are handed

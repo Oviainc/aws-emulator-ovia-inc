@@ -36,10 +36,9 @@
 //!   functions are idle is claiming exactly its allocations), while
 //!   [`CONCURRENT_EXECUTIONS_METRIC`] is published for a function that IS processing
 //!   executions and for no other: a function nobody invoked has no datapoint in the window
-//!   rather than a zero. Nothing in this emulator runs a deployment package — `Invoke`
-//!   refuses the run ([`crate::ops::invoke`]) — so the executions these samples charge are
-//!   the ones the store holds ([`super::FunctionRecord`]'s `concurrent_executions`), never a
-//!   burst nothing performed.
+//!   rather than a zero. The executions these samples charge are the ones the store holds
+//!   ([`super::FunctionRecord`]'s `concurrent_executions`), never a burst nothing
+//!   performed.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
