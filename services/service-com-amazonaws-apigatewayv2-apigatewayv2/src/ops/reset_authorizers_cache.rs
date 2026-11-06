@@ -217,7 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each label of the path is resolved in turn, and a level that names nothing is the
         // modelled 404, reported the way every other reader and writer of that level
-        // reports one.
+        // reports one. A stage is addressed by the api that owns it AND its own name, so a
+        // name naming a stage of ANOTHER api resolves to nothing here either.
         let Some(api) = store.apis.get(&input.api_id) else {
             return Err(not_found(crate::state::invalid_api_identifier_message(
                 &input.api_id,

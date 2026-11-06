@@ -141,9 +141,9 @@ use smithy_server_runtime::http;
 use super::data_plane::{
     addresses_connections, api_id_of_host, authority_of, first_segment, forbidden, header_of,
     identity_source_value, json_response, path_of, path_segments, presents_identity_source,
-    query_of, query_parameters, service_named_by_host, split_first_segment, EXECUTE_API_LABEL,
-    LOCAL_ENDPOINT_PREFIX, NOT_FOUND_MESSAGE, NOT_FOUND_STATUS, UNAUTHORIZED_MESSAGE,
-    UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
+    query_of, query_parameters, resolve_stage_variables, service_named_by_host,
+    split_first_segment, EXECUTE_API_LABEL, LOCAL_ENDPOINT_PREFIX, NOT_FOUND_MESSAGE,
+    NOT_FOUND_STATUS, UNAUTHORIZED_MESSAGE, UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
 };
 use super::jwt;
 use crate::state::{
@@ -1096,7 +1096,9 @@ fn authorization_refusal(
 ///
 /// * an `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator opens no
 ///   outbound connection of its own, so the caller is sent there: `307 Temporary Redirect`
-///   with the stored `IntegrationUri` in `Location`. A `307` is the redirect that preserves
+///   with the stored `IntegrationUri` — with this STAGE's variables interpolated into it,
+///   which is what lets one api reach a different backend per stage — in `Location`. A `307`
+///   is the redirect that preserves
 ///   the request's method and body (RFC 7231 §6.4.7), so the client repeats exactly the
 ///   request the gateway would have forwarded. Nothing about the upstream is invented —
 ///   the caller is told where the backend is instead of being handed a body no upstream
@@ -1141,6 +1143,25 @@ fn serve_integration(
             .map(str::trim)
             .filter(|upstream| !upstream.is_empty())
         {
+            // The upstream a stage reaches is the integration's URI WITH this stage's own
+            // variables interpolated: "you can use API Gateway stage variables … as part of
+            // an HTTP integration URL", which is how one api serves a different backend per
+            // stage. A reference this stage carries no variable for, and a result past the
+            // length the URI's own member may hold, name no backend at all, so both are
+            // answered as an integration that produced no response rather than by sending
+            // the caller to a URI carrying an unresolved reference.
+            let Some(upstream) = resolve_stage_variables(upstream, &stage.stage_variables) else {
+                tracing::warn!(
+                    api_id = %api.api_id,
+                    stage = %stage.stage_name,
+                    route_key = %route.route_key,
+                    integration_uri = %upstream,
+                    "this route's HTTP_PROXY upstream names a stage variable this stage does \
+                     not carry, or resolves past the length its member may hold, so it \
+                     resolves to no backend"
+                );
+                return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
+            };
             tracing::info!(
                 api_id = %api.api_id,
                 stage = %stage.stage_name,
@@ -1148,7 +1169,7 @@ fn serve_integration(
                 "redirecting the caller to this route's HTTP_PROXY upstream rather than \
                  connecting to it"
             );
-            return redirect(upstream);
+            return redirect(&upstream);
         }
     }
     tracing::warn!(

@@ -77,11 +77,7 @@ fn cache_uri(api_id: &str, stage_name: &str) -> String {
 }
 
 /// One `ResetAuthorizersCache` call.
-async fn reset(
-    emulator: &MultiServiceRouter,
-    api_id: &str,
-    stage_name: &str,
-) -> (u16, Value) {
+async fn reset(emulator: &MultiServiceRouter, api_id: &str, stage_name: &str) -> (u16, Value) {
     call(emulator, "DELETE", &cache_uri(api_id, stage_name), None).await
 }
 

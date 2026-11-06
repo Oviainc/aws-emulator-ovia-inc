@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcLink
+//! The subnets a link's elastic network interfaces go in are Amazon EC2's resources, not
+//! this service's, so `SubnetIds` is resolved against EC2 — over the in-process callback,
+//! in [`crate::state::resolve_vpc_link_subnets`] — before a link is minted: a request
+//! naming an id EC2 holds no subnet for, or subnets sitting in more than one VPC, is
+//! refused with the modelled `BadRequestException` and stores nothing.
 //!
 //! ## Shape of an operation
 //!

@@ -228,6 +228,15 @@ pub const API_DESCRIPTION_LEN: (usize, usize) = (0, 1024);
 /// "A string with a length between [1-64]".
 pub const API_VERSION_LEN: (usize, usize) = (1, 64);
 
+/// The length window an `IntegrationUri` falls in: `UriWithLengthBetween1And2048`, "a
+/// string representation of a URI with a length between [1-2048]"
+/// (`smithy_query(query="shape", shape="UriWithLengthBetween1And2048")`). The shape carries
+/// no `@length` trait, so the window is a handler's to enforce — and it is also the bound
+/// the data plane resolves a stage variable into that URI under
+/// (`crate::service::data_plane`), so the stored template and the upstream it resolves to
+/// are held to one length.
+pub const INTEGRATION_URI_LEN: (usize, usize) = (1, 2048);
+
 /// Refuse a string member whose length falls outside the window the shape it targets
 /// documents.
 ///
@@ -2118,7 +2127,13 @@ pub fn validate_integration(
 /// `Ok(())`, or why this `IntegrationUri` does not name what an integration of this
 /// `IntegrationType` invokes — the message for the operation's `BadRequestException`.
 ///
-/// One rule: a type that integrates "with an AWS service action"
+/// Two rules. The LENGTH window the member's own shape documents
+/// ([`INTEGRATION_URI_LEN`]) holds for every integration type, because the value is a URI
+/// of that member whatever the backend is — and because the data plane resolves a stage
+/// variable INTO this value under the same bound, so a template admitted here cannot grow
+/// an upstream past what the member may hold.
+///
+/// Then: a type that integrates "with an AWS service action"
 /// ([`AWS_RESOURCE_INTEGRATION_TYPES`]) names the resource that action runs on, so its
 /// URI has to be a well-formed ARN — read through [`::service_common::arn::parse`], the
 /// tree's one caller-supplied-ARN parse — and an ARN of AWS Lambda has to name the
@@ -2126,11 +2141,12 @@ pub fn validate_integration(
 /// the same reading a quick-create `Target` is admitted under). A URI that is neither is
 /// not an address this integration could ever invoke, so it is refused rather than
 /// persisted on an api that then looks deployable. The other types name an endpoint of
-/// their own protocol, which this leaves as it came.
+/// their own protocol, whose shape this leaves as it came.
 pub fn validate_integration_uri(
     integration_type: &str,
     integration_uri: &str,
 ) -> Result<(), String> {
+    validate_member_length("IntegrationUri", integration_uri, INTEGRATION_URI_LEN)?;
     if !AWS_RESOURCE_INTEGRATION_TYPES.contains(&integration_type) {
         return Ok(());
     }

@@ -47,6 +47,8 @@ mod authorizers_cache_reset;
 mod auto_deploy_republishes;
 #[path = "all/child_resource_delete_is_applied.rs"]
 mod child_resource_delete_is_applied;
+#[path = "all/child_collection_pagination_token.rs"]
+mod child_collection_pagination_token;
 #[path = "all/cors_configuration.rs"]
 mod cors_configuration;
 #[path = "all/cors_protocol_refusal.rs"]
@@ -103,6 +105,8 @@ mod integration_pagination;
 mod integration_response_lifecycle;
 #[path = "all/integration_update.rs"]
 mod integration_update;
+#[path = "all/integration_uri_length.rs"]
+mod integration_uri_length;
 #[path = "all/integration_validation.rs"]
 mod integration_validation;
 #[path = "all/iso8601_timestamp_members.rs"]
@@ -209,6 +213,8 @@ mod stage_lifecycle;
 mod stage_pagination;
 #[path = "all/stage_update.rs"]
 mod stage_update;
+#[path = "all/stage_variable_backend_selection.rs"]
+mod stage_variable_backend_selection;
 #[path = "all/stage_variable_invoke_url_value.rs"]
 mod stage_variable_invoke_url_value;
 #[path = "all/stage_variable_values.rs"]

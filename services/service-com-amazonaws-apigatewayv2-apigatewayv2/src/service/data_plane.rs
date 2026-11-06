@@ -112,6 +112,78 @@ pub fn forbidden() -> RtResponse {
     json_response(FORBIDDEN_STATUS, FORBIDDEN_MESSAGE, None)
 }
 
+/// The reference form a stage variable is interpolated into an integration's configuration
+/// under: `${stageVariables.<name>}`.
+///
+/// "You can use API Gateway stage variables … as part of an HTTP integration URL", written
+/// as `http://${stageVariables.<variable_name>}/resource` — so the backend a stage reaches
+/// is chosen by the stage's own variables rather than by the integration record, which is
+/// the documented way one api serves a different backend per stage. That is the ONE spelling
+/// the reference is documented under, so it is the one matched: a reference spelled any other
+/// way is not this one and is left as written.
+pub const STAGE_VARIABLE_REFERENCE_PREFIX: &str = "stageVariables.";
+
+/// `template` with every `${stageVariables.<name>}` reference replaced by the value the
+/// stage carries for that variable, or `None` when the stage carries no value for one of
+/// the variables it names, or when the result would not fit the member it is a value of.
+///
+/// `None` is "this configuration could not be resolved for this stage", which is a fault of
+/// the api's configuration rather than of the caller: the backend the reference names does
+/// not exist for this stage, or does not fit in the URI the integration holds, so nothing
+/// can be reached at it.
+///
+/// BOUNDED: the resolved value is still a value of the member it came from, so it is held to
+/// that member's own documented length ([`crate::state::INTEGRATION_URI_LEN`]) — checked
+/// BEFORE each substitution appends, so the string this builds cannot grow past that bound
+/// however many references the template carries and however long the stage's values are.
+/// Both factors of the expansion are therefore capped by a constant rather than by the
+/// request, and nothing a client sends chooses the work or the answer's size.
+///
+/// Every OTHER `${…}` reference is left EXACTLY as written: this reads only the part of the
+/// configuration a stage decides, so a mapping expression of another kind — and a reference
+/// spelled otherwise than the documented [`STAGE_VARIABLE_REFERENCE_PREFIX`] — is carried
+/// through for whatever reads it rather than being resolved, or refused, here. The variable
+/// NAME is read as written too, since that is the key the stage stores it under.
+pub fn resolve_stage_variables(
+    template: &str,
+    stage_variables: &BTreeMap<String, String>,
+) -> Option<String> {
+    const OPEN: &str = "${";
+    // The bound every piece below is appended under: the upper end of the window the
+    // member's own shape documents.
+    let limit = crate::state::INTEGRATION_URI_LEN.1;
+    let mut resolved = String::with_capacity(template.len().min(limit));
+    // Append `piece`, or answer `None` when it would take the result past the bound.
+    let push = |resolved: &mut String, piece: &str| -> Option<()> {
+        (resolved.chars().count() + piece.chars().count() <= limit).then(|| resolved.push_str(piece))
+    };
+    let mut rest = template;
+    while let Some(at) = rest.find(OPEN) {
+        push(&mut resolved, &rest[..at])?;
+        let after = &rest[at + OPEN.len()..];
+        // An unterminated `${` closes no reference at all, so it is text like any other.
+        let Some((reference, tail)) = after.split_once('}') else {
+            push(&mut resolved, OPEN)?;
+            rest = after;
+            continue;
+        };
+        match reference
+            .strip_prefix(STAGE_VARIABLE_REFERENCE_PREFIX)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => push(&mut resolved, stage_variables.get(name)?)?,
+            None => {
+                push(&mut resolved, OPEN)?;
+                push(&mut resolved, reference)?;
+                push(&mut resolved, "}")?;
+            }
+        }
+        rest = tail;
+    }
+    push(&mut resolved, rest)?;
+    Some(resolved)
+}
+
 /// One data-plane response: a status, a JSON `{"message": …}` body, and, for a refusal a
 /// client branches on, the error code in [`ERROR_TYPE_HEADER`].
 pub fn json_response(status: u16, message: &str, error_code: Option<&str>) -> RtResponse {
@@ -617,6 +689,128 @@ mod tests {
                 actual.as_deref(),
                 *expected,
                 "case {case:?}: expected {identity_source:?} to read {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A stage variable reference in an integration's configuration resolves against the
+    /// STAGE the request addresses: the documented `${stageVariables.<name>}` form, in every
+    /// position a URL carries one, with every other kind of reference carried through as
+    /// written and a reference the stage holds no value for resolving to nothing at all.
+    #[test]
+    fn a_stage_variable_reference_resolves_against_the_stage_that_serves_the_request() {
+        let stage_variables: BTreeMap<String, String> = [
+            ("backendUrl", "abc1230000.execute-api.eu-west-1.amazonaws.com/prod"),
+            ("host", "backend.example"),
+            ("path", "items"),
+            ("empty", ""),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+
+        // (case, the stored configuration, what it resolves to for this stage)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "no reference at all",
+                "https://backend.example/items",
+                Some("https://backend.example/items"),
+            ),
+            (
+                "the whole host and path, the documented HTTP-proxy use case",
+                "https://${stageVariables.backendUrl}",
+                Some("https://abc1230000.execute-api.eu-west-1.amazonaws.com/prod"),
+            ),
+            (
+                "a reference followed by more path",
+                "https://${stageVariables.host}/items/{id}",
+                Some("https://backend.example/items/{id}"),
+            ),
+            (
+                "two references in one URL",
+                "https://${stageVariables.host}/${stageVariables.path}",
+                Some("https://backend.example/items"),
+            ),
+            (
+                "the lower-case spelling of the prefix, which is not the documented one",
+                "https://${stagevariables.host}/items",
+                Some("https://${stagevariables.host}/items"),
+            ),
+            (
+                "a variable whose value is empty",
+                "https://${stageVariables.empty}/items",
+                Some("https:///items"),
+            ),
+            (
+                "a reference the stage holds no variable for",
+                "https://${stageVariables.absent}/items",
+                None,
+            ),
+            (
+                "a reference of another kind, carried through as written",
+                "https://backend.example/${request.path.id}",
+                Some("https://backend.example/${request.path.id}"),
+            ),
+            (
+                "an unterminated reference, which is text",
+                "https://backend.example/${stageVariables.host",
+                Some("https://backend.example/${stageVariables.host"),
+            ),
+            (
+                "the prefix naming no variable",
+                "https://${stageVariables.}/items",
+                Some("https://${stageVariables.}/items"),
+            ),
+            ("the empty configuration", "", Some("")),
+        ];
+
+        for (case, template, expected) in rows {
+            let resolved = resolve_stage_variables(template, &stage_variables);
+            assert_eq!(
+                resolved.as_deref(),
+                *expected,
+                "case {case:?}: expected {template:?} to resolve to {expected:?}, got \
+                 {resolved:?}"
+            );
+        }
+
+        // The BOUND, over the two ways a result can grow: a long value, and many
+        // references to it. Both are capped by the member's own documented length, so a
+        // template that would resolve past it resolves to nothing at all — whatever the
+        // stage's values are and however many references it carries.
+        let limit = crate::state::INTEGRATION_URI_LEN.1;
+        let long: BTreeMap<String, String> = [("big".to_string(), "x".repeat(limit))]
+            .into_iter()
+            .collect();
+        let rows: Vec<(&str, String, bool)> = vec![
+            (
+                "one reference whose value fills the bound exactly",
+                "${stageVariables.big}".to_string(),
+                true,
+            ),
+            (
+                "the same value with one character of text beside it",
+                "/${stageVariables.big}".to_string(),
+                false,
+            ),
+            (
+                "two references to a value that fits once",
+                "${stageVariables.big}${stageVariables.big}".to_string(),
+                false,
+            ),
+            (
+                "a hundred references to it",
+                "${stageVariables.big}".repeat(100),
+                false,
+            ),
+        ];
+        for (case, template, resolves) in rows {
+            let resolved = resolve_stage_variables(&template, &long);
+            assert_eq!(
+                resolved.is_some(),
+                resolves,
+                "case {case:?}: expected resolves={resolves}, got a result of {:?} characters",
+                resolved.map(|value| value.chars().count())
             );
         }
     }
