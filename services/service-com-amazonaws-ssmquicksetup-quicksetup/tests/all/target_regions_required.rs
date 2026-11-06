@@ -20,7 +20,6 @@
 //! shape="ConfigurationDefinitionInput", member="Parameters")`).
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -68,15 +67,11 @@ fn parameters_after(type_: &str, entries: &Value) -> Value {
     Value::Object(map)
 }
 
-/// One emulator with an empty store, mounted exactly as the router mounts it.
+/// One emulator with an empty store, mounted exactly as the router mounts it, with the
+/// administration role every local deployment below names already in the account
+/// (`tests/all/local_deployment_roles.rs`, which owns that rule).
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ssmquicksetup_quicksetup::EmulatedService::new(engine),
-    );
-    router
+    super::local_deployment_roles::emulator()
 }
 
 /// A request signed for `ssm-quicksetup` in [`REGION`], the signal the router routes on
@@ -167,6 +162,10 @@ fn label(value: &str) -> String {
 }
 
 /// `CreateConfigurationManager` with ONE definition of `type_` carrying `parameters`.
+///
+/// Every definition names the administration role a LOCAL deployment must name, since a
+/// case here may target accounts and none of them is about that rule
+/// (`tests/all/local_deployment_roles.rs`).
 async fn create(
     router: &MultiServiceRouter,
     type_: &str,
@@ -174,7 +173,12 @@ async fn create(
 ) -> (u16, Value) {
     let body = json!({
         "Name": "regions",
-        "ConfigurationDefinitions": [{ "Type": type_, "Parameters": parameters }],
+        "ConfigurationDefinitions": [{
+            "Type": type_,
+            "Parameters": parameters,
+            "LocalDeploymentAdministrationRoleArn":
+                super::local_deployment_roles::administration_role_arn(),
+        }],
     });
     call(router, "POST", "/configurationManager", Some(&body)).await
 }

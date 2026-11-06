@@ -12,6 +12,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+/// Whether the role a LOCAL configuration deployment is administered with can be assumed
+/// by the service that deploys it: its own concern, so its own module.
+pub mod local_administration_role;
+
 use crate::ops::types::{
     ConfigurationDefinition, ConfigurationDefinitionSummary, ConfigurationManagerSummary,
     ConfigurationSummary, Filter, ServiceSettings, StatusSummary,
@@ -779,6 +783,71 @@ pub const NO_DEPLOYMENT_REGION_MESSAGE: &str = "TargetRegions must be defined in
 /// renders no value of the request.
 pub fn missing_parameter_message(key: &str) -> String {
     format!("{key} must be defined in parameters.")
+}
+
+/// The `ConfigurationDefinitionInput` member naming the role a LOCAL configuration
+/// deployment is administered with: "The ARN of the IAM role used to administrate local
+/// configuration deployments" (`smithy_query(query="shape",
+/// shape="ConfigurationDefinitionInput")`). `UpdateConfigurationDefinition` binds the
+/// same member.
+pub const LOCAL_DEPLOYMENT_ADMINISTRATION_ROLE_ARN: &str = "LocalDeploymentAdministrationRoleArn";
+
+/// Why a request leaving out a MEMBER this service requires of it is refused.
+///
+/// A different sentence from [`missing_parameter_message`] because it is about a
+/// different thing: that one names an entry of a definition's `Parameters` map, this one
+/// names a member of the request's own shape. Both are requirements the model cannot
+/// state, because both hold only under a condition about another value of the same
+/// request — which is why the member is modelled optional and refused here instead.
+/// Carries nothing of the request but the member's own modelled name.
+pub fn missing_required_member_message(member: &str) -> String {
+    format!("The required parameter {member} is missing.")
+}
+
+/// Whether a configuration definition holding `parameters` deploys LOCALLY: whether its
+/// parameters name [`PARAMETER_TARGET_ACCOUNTS`], documented as the ID of the account
+/// initiating the configuration deployment, which a request provides only if it wants to
+/// deploy the configuration locally (`smithy_query(query="doc",
+/// shape="ConfigurationDefinitionInput", member="Parameters")`). A definition naming
+/// [`PARAMETER_TARGET_ORGANIZATIONAL_UNITS`] alone is deployed through the organization
+/// instead, and needs nothing a local deployment needs.
+///
+/// Read through the same [`comma_separated`] reading every other rule about a target list
+/// applies: a key written with no entries names no account, so such a definition is no
+/// local deployment.
+pub fn deploys_locally<P: ConfigurationParameters + ?Sized>(parameters: &P) -> bool {
+    !comma_separated(parameters.parameter(PARAMETER_TARGET_ACCOUNTS)).is_empty()
+}
+
+/// Why a configuration definition that deploys LOCALLY cannot be served without the role
+/// such a deployment is administered with, or `None` when it can.
+///
+/// A definition deploys locally exactly when [`deploys_locally`] says so. A local
+/// deployment is administered with the role
+/// [`LOCAL_DEPLOYMENT_ADMINISTRATION_ROLE_ARN`] names, so one that names none cannot be
+/// administered at all and is refused before anything is stored — which is why that
+/// member is modelled optional and required here: a definition deployed through an
+/// organization needs no local administration role, so the requirement is conditional on
+/// another value of the same request and no per-member constraint can express it.
+///
+/// The member beside it, `LocalDeploymentExecutionRoleName`, is a role NAME rather than
+/// an ARN and this service requires none: the recorded refusal of a local deployment
+/// names only the administration role, and the model states no requirement for the other.
+///
+/// Whether the role a definition DOES name can administer the deployment is the other
+/// half of the rule, and lives in [`local_administration_role`].
+///
+/// The one place this half lives, so a create and an update refuse the same definitions.
+pub fn local_deployment_rejection<P: ConfigurationParameters + ?Sized>(
+    parameters: &P,
+    administration_role_arn: Option<&str>,
+) -> Option<String> {
+    if !deploys_locally(parameters) {
+        return None;
+    }
+    administration_role_arn
+        .is_none_or(|arn| arn.trim().is_empty())
+        .then(|| missing_required_member_message(LOCAL_DEPLOYMENT_ADMINISTRATION_ROLE_ARN))
 }
 
 /// How many account-and-Region deployments ONE configuration definition may fan out
@@ -2155,6 +2224,14 @@ pub fn paginate<'a, T>(
     }
     (page, next_token)
 }
+
+/// The sentence this service refuses an invalid `StartingToken` with.
+///
+/// Wholly fixed text: the refusal reports neither the token nor the listing it was sent
+/// to, so there is nothing in it derived from the request or from this environment. The
+/// one place it lives, so every paginated listing of this service refuses a token it did
+/// not issue with the same sentence.
+pub const INVALID_STARTING_TOKEN_MESSAGE: &str = "Provided starting token is not valid";
 
 /// The record a request means to resume at, or `None` when it names none: an absent
 /// `StartingToken`, or the empty one.

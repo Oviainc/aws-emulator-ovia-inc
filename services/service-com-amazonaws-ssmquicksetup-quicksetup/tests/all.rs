@@ -25,6 +25,8 @@ mod configuration_manager_teardown;
 mod configuration_managers;
 #[path = "all/configuration_token_region_scope.rs"]
 mod configuration_token_region_scope;
+#[path = "all/constraint_refusal_wording.rs"]
+mod constraint_refusal_wording;
 #[path = "all/date_time_timestamps.rs"]
 mod date_time_timestamps;
 #[path = "all/deployment_target_count.rs"]
@@ -41,6 +43,8 @@ mod first_class_parameters;
 mod idempotent_mutations;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/local_deployment_roles.rs"]
+mod local_deployment_roles;
 #[path = "all/manager_not_found_message.rs"]
 mod manager_not_found_message;
 #[path = "all/manager_region_scope.rs"]

@@ -381,8 +381,9 @@ async fn a_create_is_measured_against_the_store_the_clock_owes() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case}: the torn-down manager must be absent, got {status} / {gone:?}"
+            status, 401,
+            "case {case}: the torn-down manager is no target this endpoint serves, got \
+             {status} / {gone:?}"
         );
     }
 }

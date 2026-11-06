@@ -16,7 +16,6 @@
 //! deployed set the same way.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
@@ -32,15 +31,11 @@ const REGION: &str = "us-west-2";
 /// below is refused only for the reason under test.
 const TYPE: &str = "AWSQuickSetupType-SSMHostMgmt";
 
-/// One emulator with an empty store, mounted exactly as the router mounts it.
+/// One emulator with an empty store, mounted exactly as the router mounts it, with the
+/// administration role every local deployment below names already in the account
+/// (`tests/all/local_deployment_roles.rs`, which owns that rule).
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ssmquicksetup_quicksetup::EmulatedService::new(engine),
-    );
-    router
+    super::local_deployment_roles::emulator()
 }
 
 /// A request signed for `ssm-quicksetup` in [`REGION`], the signal the router routes on
@@ -123,10 +118,19 @@ fn label(value: &str) -> String {
 }
 
 /// `CreateConfigurationManager` with ONE definition carrying `parameters`.
+///
+/// Every definition names the administration role a LOCAL deployment must name, since a
+/// case here may target accounts and none of them is about that rule
+/// (`tests/all/local_deployment_roles.rs`).
 async fn create(router: &MultiServiceRouter, name: &str, parameters: &Value) -> (u16, Value) {
     let body = json!({
         "Name": name,
-        "ConfigurationDefinitions": [{ "Type": TYPE, "Parameters": parameters }],
+        "ConfigurationDefinitions": [{
+            "Type": TYPE,
+            "Parameters": parameters,
+            "LocalDeploymentAdministrationRoleArn":
+                super::local_deployment_roles::administration_role_arn(),
+        }],
     });
     call(router, "POST", "/configurationManager", Some(&body)).await
 }

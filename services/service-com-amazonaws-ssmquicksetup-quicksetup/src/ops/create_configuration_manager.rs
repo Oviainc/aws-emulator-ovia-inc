@@ -130,7 +130,9 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// type's service-owned template with the parameters it provides
 /// (`crate::state::configuration_parameters_rejection`, which counts those pairs the
 /// way the handler below deploys them, from `local_account` for a definition naming no
-/// account). The
+/// account). A definition that deploys LOCALLY must also name the role such a
+/// deployment is administered with
+/// (`crate::state::local_deployment_rejection`). The
 /// remaining checks are
 /// the store's own bounds on collections the model gives no length (see
 /// `crate::state`'s `MAX_*` constants), the provider-reserved tag-key namespace a
@@ -227,6 +229,22 @@ fn definitions_rejection(
         )
     })
     .or_else(|| {
+        // A definition whose parameters name the account initiating the deployment is
+        // deployed LOCALLY, and a local deployment is administered with the role
+        // `LocalDeploymentAdministrationRoleArn` names, so one that names none cannot be
+        // administered: `crate::state::local_deployment_rejection` is the one place that
+        // rule lives, shared with `UpdateConfigurationDefinition`.
+        input
+            .configuration_definitions
+            .iter()
+            .find_map(|definition| {
+                crate::state::local_deployment_rejection(
+                    &definition.parameters,
+                    definition.local_deployment_administration_role_arn.as_deref(),
+                )
+            })
+    })
+    .or_else(|| {
         // `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
         // `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to
         // enforce it; `crate::state::iam_role_arn_rejection` is the one place that
@@ -306,6 +324,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account = ::engine::emulator_account_id().to_string();
 
         if let Some(why) = definitions_rejection(&input, &account) {
+            return Err(CreateConfigurationManagerErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        // A local deployment is administered with the role its definition names, and the
+        // service that deploys a configuration has to be able to assume that role: the
+        // account's IAM records are what say whether it can, so they are read before
+        // anything is stored (`crate::state::local_administration_role`).
+        if let Some(why) = input
+            .configuration_definitions
+            .iter()
+            .find_map(|definition| {
+                crate::state::local_administration_role::deployment_role_rejection(
+                    &*self.engine,
+                    &definition.parameters,
+                    definition.local_deployment_administration_role_arn.as_deref(),
+                )
+            })
+        {
             return Err(CreateConfigurationManagerErrorModeled::ValidationException(
                 ValidationException { message: Some(why) },
             )

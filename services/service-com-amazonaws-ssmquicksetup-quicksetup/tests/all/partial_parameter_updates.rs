@@ -20,7 +20,6 @@
 //! stored map names them keeps satisfying.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -58,15 +57,11 @@ fn local_account() -> String {
     engine::emulator_account_id().to_string()
 }
 
-/// One emulator with an empty store, mounted exactly as the router mounts it.
+/// One emulator with an empty store, mounted exactly as the router mounts it, with the
+/// administration role every local deployment below names already in the account
+/// (`tests/all/local_deployment_roles.rs`, which owns that rule).
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ssmquicksetup_quicksetup::EmulatedService::new(engine),
-    );
-    router
+    super::local_deployment_roles::emulator()
 }
 
 /// A request signed for `ssm-quicksetup` in [`REGION`], the signal the router routes on
@@ -167,7 +162,7 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, parameters: &Value) 
             "Parameters": parameters,
             "LocalDeploymentExecutionRoleName": "QuickSetupExecution",
             "LocalDeploymentAdministrationRoleArn":
-                "arn:aws:iam::000000000000:role/QuickSetupAdministration",
+                super::local_deployment_roles::administration_role_arn(),
         }],
     });
     let (status, answer) = call(router, "POST", "/configurationManager", Some(&body)).await;

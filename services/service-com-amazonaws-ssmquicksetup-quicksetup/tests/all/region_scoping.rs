@@ -490,7 +490,7 @@ async fn a_configuration_is_served_by_the_region_that_created_its_manager() {
 
             let (status, got) = get_manager(&router, other, &manager_arn).await;
             assert_eq!(
-                status, 404,
+                status, 401,
                 "case {case}: {other} must not serve a manager of {home}, got {status} / {got:?}"
             );
         }
@@ -569,14 +569,15 @@ const PER_RESOURCE_OPERATIONS: &[&str] = &[
 ];
 
 /// Which refusal one of [`PER_RESOURCE_OPERATIONS`] earns for a resource of another
-/// Region: the 401 of the stage that fronts this service's cross-resource routes where
-/// the ROUTE labels a resource the operation does not itself address (the tag plane's
-/// `ResourceArn`, the configuration-definition route's parent `ManagerArn`), and the
-/// handler's own modelled 404 everywhere else — the manager's own route, a `ManagerArn`
-/// in the body, a configuration id.
+/// Region: the 401 of the stage that fronts every route carrying a resource ARN as a path
+/// label (the manager's own route, the tag plane's `ResourceArn`, the
+/// configuration-definition route's parent `ManagerArn`), and the handler's own modelled
+/// 404 where the request names the resource somewhere else — a `ManagerArn` in the body,
+/// a configuration id in the path.
 fn cross_region_refusal(operation: &str) -> (u16, &'static str) {
     match operation {
-        "ListTagsForResource" | "TagResource" | "UntagResource"
+        "GetConfigurationManager" | "UpdateConfigurationManager" | "DeleteConfigurationManager"
+        | "ListTagsForResource" | "TagResource" | "UntagResource"
         | "UpdateConfigurationDefinition" => (401, "UnauthorizedException"),
         _ => (404, "ResourceNotFoundException"),
     }
@@ -748,7 +749,7 @@ async fn an_identifier_of_another_region_is_not_found() {
     }
 
     // The same requests, signed for the Region that owns the resource, are served: the
-    // 404s above are about the Region, not about the request.
+    // refusals above are about the Region, not about the request.
     for owner in &fixtures {
         for operation in PER_RESOURCE_OPERATIONS {
             let case = format!(

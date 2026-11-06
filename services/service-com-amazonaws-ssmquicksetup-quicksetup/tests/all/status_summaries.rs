@@ -19,7 +19,6 @@
 //! settled, submitted again, being torn down).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -40,15 +39,11 @@ fn past_transition() -> Duration {
     TRANSITION_SPAN + Duration::from_millis(400)
 }
 
-/// One emulator with an empty store, mounted exactly as the router mounts it.
+/// One emulator with an empty store, mounted exactly as the router mounts it, with the
+/// administration role every local deployment below names already in the account
+/// (`tests/all/local_deployment_roles.rs`, which owns that rule).
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ssmquicksetup_quicksetup::EmulatedService::new(engine),
-    );
-    router
+    super::local_deployment_roles::emulator()
 }
 
 /// A request signed for `ssm-quicksetup` in [`REGION`], the signal the router routes on
@@ -129,7 +124,15 @@ fn definition(type_: &str, parameters: Value) -> Value {
         type_,
         Value::Object(parameters),
     );
-    json!({ "Type": type_, "Parameters": parameters })
+    // Every definition names the administration role a LOCAL deployment must name, since
+    // a case here may target accounts and none of them is about that rule
+    // (`tests/all/local_deployment_roles.rs`).
+    json!({
+        "Type": type_,
+        "Parameters": parameters,
+        "LocalDeploymentAdministrationRoleArn":
+            super::local_deployment_roles::administration_role_arn(),
+    })
 }
 
 /// Create a manager that must succeed, answering its ARN.

@@ -7,6 +7,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# `validation_message`: the workspace's ONE rendering of a modelled-constraint refusal as
+# AWS words it on a JSON protocol — the `@pattern` requirement quoted without the
+# whole-value anchor pair — which `service.rs` answers `override_refusal` on.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -23,6 +27,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `NextToken` the list operations hand out.
 hex = { workspace = true }
+# The IAM store a definition's `LocalDeploymentAdministrationRoleArn` is resolved against,
+# to decide whether the service that deploys a LOCAL configuration may assume that role
+# (`state::local_administration_role`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

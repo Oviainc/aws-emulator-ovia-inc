@@ -373,9 +373,10 @@ async fn a_page_token_of_one_regions_endpoint_is_refused_by_another_regions_endp
                 "case {name}: expected ValidationException, got {answer:?}"
             );
             let message = error_message(&answer);
-            assert!(
-                message.contains("StartingToken"),
-                "case {name}: the refusal must name the member it refused, got {message:?}"
+            assert_eq!(
+                message, "Provided starting token is not valid",
+                "case {name}: the refusal must state the service's fixed invalid-token \
+                 sentence, got {message:?}"
             );
 
             // The issuing endpoint still accepts its own token...

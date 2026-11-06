@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for the request-authorization stage that fronts this service's
-//! cross-resource routes.
+//! ARN-labelled routes.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`, restJson1
 //! serialization, the modelled-constraint walk and the handlers — so what is asserted is
 //! what a signed AWS SDK request observes.
 //!
-//! The rule under test: a route that carries, as a path label, the ARN of a resource it
-//! does not itself address — the tag plane's `/tags/{ResourceArn}`, whose label is any
-//! taggable resource's ARN, and `/configurationDefinition/{ManagerArn}/{Id}`, whose label
-//! is the addressed definition's PARENT — is authorized against that ARN before the
-//! request reaches the service, and an ARN that names no resource the endpoint serves is
-//! refused there: HTTP 401, the wire error code `UnauthorizedException`, and the one fixed
-//! body member `message` = `Unauthorized`. Four consequences are what the rows below span:
+//! The rule under test: EVERY route that carries a resource ARN as a path label — the
+//! manager's own `/configurationManager/{ManagerArn}`, the tag plane's
+//! `/tags/{ResourceArn}`, whose label is any taggable resource's ARN, and
+//! `/configurationDefinition/{ManagerArn}/{Id}`, whose label is the addressed definition's
+//! PARENT — is authorized against that ARN before the request reaches the service, and an
+//! ARN that names no resource the endpoint serves is refused there: HTTP 401, the wire
+//! error code `UnauthorizedException`, and the one fixed body member `message` =
+//! `Unauthorized`. Four consequences are what the rows below span:
 //!
 //! * it precedes the modelled constraint walk, so a label outside its own `@pattern` —
 //!   and a label no `@pattern` bounds at all — earns the same refusal rather than a
@@ -21,10 +22,8 @@
 //! * it precedes the handler, so an unauthorized target earns it rather than the handler's
 //!   modelled `ResourceNotFoundException`, whatever else the request carries (a body the
 //!   handler would refuse, a tag key the service reserves);
-//! * it fronts those routes only: `/configurationManager/{ManagerArn}` labels the very
-//!   resource it addresses, so the same ARNs earn this service's own modelled refusal
-//!   there — which is what a caller polling a manager it created, through a deletion, is
-//!   answered;
+//! * it fronts the ARN-labelled routes only: `GetConfiguration`'s label is a configuration
+//!   id rather than an ARN, so that route names no ARN to authorize;
 //! * it judges a ROUTE's label only, so an ARN carried in the request BODY is resolved by
 //!   the handler, in this service's own modelled shapes.
 //!
@@ -175,26 +174,19 @@ fn label(value: &str) -> String {
         .collect()
 }
 
-/// Every operation the stage fronts: the three bound to `/tags/{ResourceArn}`, whose
-/// label is any taggable resource's ARN, and the one bound to
+/// Every operation the stage fronts: the three bound to `/configurationManager/
+/// {ManagerArn}`, whose label is the manager's own ARN, the three bound to
+/// `/tags/{ResourceArn}`, whose label is any taggable resource's ARN, and the one bound to
 /// `/configurationDefinition/{ManagerArn}/{Id}`, whose label is the ARN of the manager
 /// that OWNS the definition it addresses (`smithy_query(query="digest")`).
-const CROSS_RESOURCE_OPERATIONS: &[&str] = &[
+const ARN_LABELLED_OPERATIONS: &[&str] = &[
+    "GetConfigurationManager",
+    "UpdateConfigurationManager",
+    "DeleteConfigurationManager",
     "UpdateConfigurationDefinition",
     "ListTagsForResource",
     "TagResource",
     "UntagResource",
-];
-
-/// Every operation bound to `/configurationManager/{ManagerArn}`, whose label IS the
-/// resource it addresses: the stage fronts none of them, so each resolves the ARN itself
-/// and answers this service's modelled `ResourceNotFoundException`
-/// (`tests/all/manager_not_found_message.rs` owns that sentence; what is asserted here is
-/// only that these routes are NOT the stage's).
-const MANAGER_ROUTE_OPERATIONS: &[&str] = &[
-    "GetConfigurationManager",
-    "UpdateConfigurationManager",
-    "DeleteConfigurationManager",
 ];
 
 /// Drive one operation of either list against `arn` in `region`, on the route and with
@@ -410,8 +402,8 @@ const SOME_DEFINITION_ID: &str = "cfg-1";
 
 /// Every route the stage fronts refuses a target the endpoint serves no resource for with
 /// the authorization refusal — whatever form the value takes, including forms the
-/// modelled label pattern would have refused — while the manager's own route answers this
-/// service's modelled `ResourceNotFoundException` for the very same values.
+/// modelled label pattern would have refused — while a route whose label is no ARN at all
+/// still resolves its own identifier.
 #[tokio::test]
 async fn an_unserved_target_is_refused_by_the_authorization_stage() {
     let router = emulator();
@@ -420,7 +412,7 @@ async fn an_unserved_target_is_refused_by_the_authorization_stage() {
     let live = create_manager(&router, "a live manager", "front-door").await;
 
     for (target_case, target) in UNSERVED_ARNS.iter().chain(UNSERVED_LABELS) {
-        for operation in CROSS_RESOURCE_OPERATIONS {
+        for operation in ARN_LABELLED_OPERATIONS {
             let case = format!("{operation} on {target_case}");
             let (status, answer) =
                 call_naming(&router, operation, target, SOME_DEFINITION_ID).await;
@@ -428,43 +420,38 @@ async fn an_unserved_target_is_refused_by_the_authorization_stage() {
         }
     }
 
-    // The other edge of the rule: a route whose label IS the resource it addresses keeps
-    // resolving that label itself, so the same ARNs earn this service's own modelled
-    // refusal there — a well-formed one the modelled 404, and one the label's `@pattern`
-    // rejects the modelled 400 of the constraint walk, which only a route in front of the
-    // walk can preempt.
-    for (target_case, target) in UNSERVED_ARNS {
-        for operation in MANAGER_ROUTE_OPERATIONS {
-            let case = format!("{operation} on {target_case}");
-            let (status, answer) =
-                call_naming(&router, operation, target, SOME_DEFINITION_ID).await;
-            assert_eq!(
-                status, 404,
-                "case {case:?}: the manager's own route keeps the modelled 404, got \
-                 {status} / {answer:?}"
-            );
-            let code = error_code(&answer);
-            assert_eq!(
-                code, "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException, got {code:?} in {answer:?}"
-            );
-        }
-    }
-    for (target_case, target) in UNSERVED_LABELS {
-        let case = format!("GetConfigurationManager on {target_case}");
-        let (status, answer) =
-            call_naming(&router, "GetConfigurationManager", target, SOME_DEFINITION_ID).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a label outside its modelled pattern is the walk's 400 on this \
-             route, got {status} / {answer:?}"
-        );
-        let code = error_code(&answer);
-        assert_eq!(
-            code, "ValidationException",
-            "case {case:?}: expected ValidationException, got {code:?} in {answer:?}"
-        );
-    }
+    // The other edge of the rule: a route whose label is no ARN keeps resolving that
+    // label itself. `GetConfiguration`'s label is a configuration id, so an id naming no
+    // stored configuration is the handler's own modelled refusal — and one outside that
+    // label's `@pattern` is the constraint walk's 400, which only a stage in front of the
+    // walk could preempt.
+    let (status, answer) = call(&router, "GET", "/getConfiguration/no-such-config", None).await;
+    assert_eq!(
+        status, 404,
+        "a configuration id naming nothing stays the modelled 404, got {status} / {answer:?}"
+    );
+    let code = error_code(&answer);
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {code:?} in {answer:?}"
+    );
+    let (status, answer) = call(
+        &router,
+        "GET",
+        &format!("/getConfiguration/{}", label("not a configuration id")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a configuration id outside its modelled pattern is the walk's 400, got {status} / \
+         {answer:?}"
+    );
+    let code = error_code(&answer);
+    assert_eq!(
+        code, "ValidationException",
+        "expected ValidationException, got {code:?} in {answer:?}"
+    );
 
     // The live manager is still readable, so the refusals above were about the targets
     // they named and nothing else.
@@ -491,8 +478,13 @@ async fn the_arn_of_a_torn_down_manager_is_refused_by_the_authorization_stage() 
     let id = definition_id(&router, "a manager about to be deleted", &doomed).await;
 
     // Positive control: while the manager is live, the very same calls are served by the
-    // handlers behind the stage.
-    for operation in CROSS_RESOURCE_OPERATIONS {
+    // handlers behind the stage. The delete is left out of this loop only because it is
+    // what the next call makes: it is driven below, and then again once the teardown is
+    // due.
+    for operation in ARN_LABELLED_OPERATIONS
+        .iter()
+        .filter(|operation| **operation != "DeleteConfigurationManager")
+    {
         let case = format!("{operation} on a live manager");
         let (status, answer) = call_naming(&router, operation, &doomed, &id).await;
         assert_eq!(
@@ -516,7 +508,7 @@ async fn the_arn_of_a_torn_down_manager_is_refused_by_the_authorization_stage() 
     // once that teardown comes due.
     tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(400)).await;
 
-    for operation in CROSS_RESOURCE_OPERATIONS {
+    for operation in ARN_LABELLED_OPERATIONS {
         let case = format!("{operation} on the ARN of a torn-down manager");
         let (status, answer) = call_naming(&router, operation, &doomed, &id).await;
         assert_unauthorized(&case, status, &answer);
@@ -534,7 +526,7 @@ async fn an_arn_of_another_regions_endpoint_is_refused_by_the_authorization_stag
 
     // Three other endpoints, so the refusal is not about one Region's name.
     for foreign in ["us-east-1", "eu-west-3", "ap-northeast-1"] {
-        for operation in CROSS_RESOURCE_OPERATIONS {
+        for operation in ARN_LABELLED_OPERATIONS {
             let case = format!("{operation} through the {foreign} endpoint");
             let (status, answer) =
                 call_naming_in(&router, operation, &home, &id, foreign).await;
@@ -578,6 +570,16 @@ async fn the_stage_precedes_every_refusal_the_service_itself_states() {
         served_code: &'static str,
     }
     let rows = vec![
+        Row {
+            // The manager's own route, with a `Name` outside its modelled pattern: the
+            // walk refuses it, but only once the target has been authorized.
+            case: "UpdateConfigurationManager with a Name outside its modelled pattern",
+            method: "PUT",
+            path: |arn, _| format!("/configurationManager/{}", label(arn)),
+            body: Some(json!({ "Name": "renamed!!" })),
+            served_status: 400,
+            served_code: "ValidationException",
+        },
         Row {
             // `TagsMap` is `@required`, so a body without it is refused by the walk — but
             // only once the target has been authorized.

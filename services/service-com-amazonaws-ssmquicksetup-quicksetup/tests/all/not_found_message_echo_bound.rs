@@ -21,13 +21,13 @@
 //! supplies — the shortest the pattern admits, the bound exactly, one byte past it, and
 //! far past it — and the encoding of the text that makes it long, since an elision must
 //! cut on a character boundary rather than inside a multi-byte character. Each row is
-//! driven through every operation that reaches the sentence: the three whose route
-//! labels the manager they address and `ListConfigurations`, which takes the ARN as a
-//! body member. The tag plane reaches no ARN of its own here — its routes are refused
-//! ahead of the handler by the request-authorization stage, with one fixed sentence that
-//! renders nothing of the request (`tests/all/target_authorization.rs`) — so the row
-//! class below also checks that an oversized `ResourceArn` earns that fixed refusal and
-//! no echo.
+//! driven through every operation that reaches the sentence: `ListConfigurations`, which
+//! takes the ARN as a body member, is this service's only one. The routes that carry an
+//! ARN as a path LABEL reach no ARN of their own here — they are refused ahead of the
+//! handler by the request-authorization stage, with one fixed sentence that renders
+//! nothing of the request (`tests/all/target_authorization.rs`) — so the row class below
+//! also checks that an oversized label, on the manager's own route and on the tag plane,
+//! earns that fixed refusal and no echo.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -113,13 +113,8 @@ fn expected_message(arn: &str) -> String {
 }
 
 /// Every operation that reaches this service's own configuration-manager lookup with an
-/// ARN its request supplied.
-const MANAGER_ARN_OPERATIONS: &[&str] = &[
-    "GetConfigurationManager",
-    "DeleteConfigurationManager",
-    "UpdateConfigurationManager",
-    "ListConfigurations",
-];
+/// ARN its request supplied in the BODY.
+const MANAGER_ARN_OPERATIONS: &[&str] = &["ListConfigurations"];
 
 /// Drive one of [`MANAGER_ARN_OPERATIONS`] against `arn`, on the route and with the
 /// payload the model binds for it (`OPERATIONS.md`).
@@ -228,15 +223,18 @@ async fn an_oversized_arn_is_echoed_only_as_far_as_the_echo_bound() {
 }
 
 /// The tag plane takes the ARN on a member with no modelled constraint at all, so its
-/// value is the most unbounded one this service receives: those routes are refused ahead
-/// of the handler with the one fixed sentence that renders nothing of the request, so an
-/// oversized value earns no echo whatever its length.
+/// value is the most unbounded one this service receives — and the manager's own route
+/// takes it on a member whose pattern leaves the Region segment unbounded. Both carry the
+/// ARN as a path LABEL, so both are refused ahead of the handler with the one fixed
+/// sentence that renders nothing of the request: an oversized value earns no echo
+/// whatever its length.
 #[tokio::test]
-async fn an_oversized_resource_arn_earns_no_echo_from_the_tag_plane() {
+async fn an_oversized_label_earns_no_echo_from_the_arn_labelled_routes() {
     let router = emulator();
 
     for (arn_case, arn) in oversized_and_bounded_arns() {
         let path = format!("/tags/{}", label(&arn));
+        let manager = format!("/configurationManager/{}", label(&arn));
         let calls: Vec<(&str, (u16, Value))> = vec![
             ("ListTagsForResource", call(&router, "GET", &path, None).await),
             (
@@ -246,6 +244,18 @@ async fn an_oversized_resource_arn_earns_no_echo_from_the_tag_plane() {
             (
                 "UntagResource",
                 call(&router, "DELETE", &format!("{path}?tagKeys=Tier"), None).await,
+            ),
+            (
+                "GetConfigurationManager",
+                call(&router, "GET", &manager, None).await,
+            ),
+            (
+                "UpdateConfigurationManager",
+                call(&router, "PUT", &manager, Some(&json!({ "Name": "renamed" }))).await,
+            ),
+            (
+                "DeleteConfigurationManager",
+                call(&router, "DELETE", &manager, None).await,
             ),
         ];
         for (operation, (status, answer)) in calls {

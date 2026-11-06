@@ -21,9 +21,9 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. EDITED here: the operations whose route labels a resource they do not
-//!   themselves address are served behind [`TargetAuthorization`], the
-//!   request-authorization stage described below.
+//!   correctly. EDITED here: the operations whose route carries a resource ARN as a path
+//!   label are served behind [`TargetAuthorization`], the request-authorization stage
+//!   described below.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -41,42 +41,45 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! ## The request-authorization stage in front of the cross-resource routes
+//! ## The request-authorization stage in front of the ARN-labelled routes
 //!
-//! Two of this service's route families carry, as a path label, the ARN of a resource
-//! that is NOT the resource the route addresses:
+//! EVERY route of this endpoint that carries a resource ARN as a path label is authorized
+//! against that ARN before the request reaches the service. Three route families carry
+//! one:
 //!
+//! * `/configurationManager/{ManagerArn}`, whose label is the ARN of a configuration
+//!   manager — `GetConfigurationManager`, `UpdateConfigurationManager` and
+//!   `DeleteConfigurationManager`;
 //! * the tag plane, `/tags/{ResourceArn}`, whose label is any taggable resource's ARN —
 //!   the model bounds it with no `@pattern` and no `@length` at all, so the route does not
 //!   even say which of this service's resource kinds it names;
 //! * `/configurationDefinition/{ManagerArn}/{Id}`, which addresses one configuration
 //!   definition and labels it with the ARN of the configuration manager that OWNS it.
 //!
-//! Those routes are authorized against that ARN before the request reaches the service:
-//! an ARN that names no resource the endpoint serves is not an ARN the caller may act on,
+//! An ARN that names no resource the endpoint serves is not an ARN the caller may act on,
 //! so the request is refused there with HTTP 401, the wire error code
 //! [`UNAUTHORIZED_CODE`] and the one fixed sentence [`UNAUTHORIZED_MESSAGE`] — carried by
 //! a shape this service's model does NOT declare, which is how a client can tell the two
 //! layers apart: `ResourceNotFoundException` and `ValidationException` are what the
-//! service itself answers, and neither is what a request stopped ahead of it gets.
+//! service itself answers, and neither is what a request stopped ahead of it gets. Such a
+//! client is told that it may not act on the ARN it named rather than that the resource is
+//! absent, so a caller naming an ARN it is not entitled to re-acquires credentials instead
+//! of looping, re-creating the resource, or reading a delete as already done.
 //!
 //! The stage sits in front of EVERYTHING those requests say, which is what makes it
 //! observable: it precedes the modelled constraint walk (so a path label outside its
 //! `@pattern` never reaches validation) and the handler's own lookup (so the modelled 404
 //! is not what an unauthorized target earns).
 //!
-//! It fronts NOTHING else, and the two exclusions are the rule's edges rather than
-//! omissions:
+//! What it fronts is decided by the route's LABEL, and the two exclusions are the rule's
+//! edges rather than omissions:
 //!
-//! * `/configurationManager/{ManagerArn}` labels the very resource it addresses, and
-//!   `GetConfigurationManager`, `UpdateConfigurationManager` and
-//!   `DeleteConfigurationManager` resolve it themselves and answer the modelled
-//!   `ResourceNotFoundException` for an ARN naming no manager — which is what a caller
-//!   polling a manager it created, through a deletion, is answered;
 //! * an ARN a request carries in its BODY is no route label at all, so no route is
 //!   authorized against it and the handler resolves it like any other input — which is why
 //!   `ListConfigurations` answers its modelled `ResourceNotFoundException`, with this
-//!   service's own not-found sentence, for a `ManagerArn` naming no manager.
+//!   service's own not-found sentence, for a `ManagerArn` naming no manager;
+//! * `GetConfiguration`'s label is a configuration id rather than an ARN, so that route
+//!   names no ARN to authorize and its handler resolves the id itself.
 //!
 //! Only the ARN is judged here. Everything a request says about the resource it named —
 //! the definition id under a manager that does exist, the tags, the parameters, the
@@ -116,7 +119,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The wire error code (`__type` and `x-amzn-errortype`) of the authorization refusal
-/// that fronts this service's cross-resource routes.
+/// that fronts this service's ARN-labelled routes.
 ///
 /// Not a shape this service's model declares: the refusal is stated ahead of the code
 /// that owns the modelled errors, so it travels with its own code and status rather than
@@ -181,10 +184,10 @@ impl SerializableStruct for Unauthorized {
 /// The modelled input member that carries the ARN of the configuration manager an
 /// operation addresses — `GetConfigurationManager`, `UpdateConfigurationManager`,
 /// `DeleteConfigurationManager` and `UpdateConfigurationDefinition` all bind it as an
-/// `@httpLabel` of their route.
-/// The modelled input member that carries the ARN of the configuration manager OWNING
-/// the configuration definition `UpdateConfigurationDefinition` addresses: the parent's
-/// ARN, labelling the child route `/configurationDefinition/{ManagerArn}/{Id}`.
+/// `@httpLabel` of their route: the first three on the manager's own
+/// `/configurationManager/{ManagerArn}`, and the fourth on
+/// `/configurationDefinition/{ManagerArn}/{Id}`, where it is the ARN of the manager that
+/// OWNS the definition the route addresses.
 const MANAGER_ARN_MEMBER: &str = "ManagerArn";
 
 /// The modelled input member that carries the ARN of the resource a tag operation
@@ -368,18 +371,16 @@ fn unauthorized(svc: &dyn Service, req: &RtRequest) -> RtResponse {
         .unwrap_or_else(|error| svc.definition().framework_error_response(error, req))
 }
 
-/// Every operation whose route carries, as a path label, the ARN of a resource the route
-/// does not itself address, each served behind the request-authorization stage, keyed by
-/// the routing key the protocol resolves.
+/// Every operation whose route carries a resource ARN as a path label, each served behind
+/// the request-authorization stage, keyed by the routing key the protocol resolves.
 ///
 /// The list is the model's (`smithy_query(query="digest")`): the three operations bound to
-/// `/tags/{ResourceArn}`, whose label is any taggable resource's ARN, and the one bound to
+/// `/configurationManager/{ManagerArn}`, the three bound to `/tags/{ResourceArn}` — whose
+/// label is any taggable resource's ARN — and the one bound to
 /// `/configurationDefinition/{ManagerArn}/{Id}`, whose label is the addressed definition's
-/// PARENT. The three operations bound to `/configurationManager/{ManagerArn}` are
-/// deliberately absent — that label IS the resource they address, and they answer the
-/// modelled `ResourceNotFoundException` for an ARN naming no manager (see the module
-/// docs) — and so is `GetConfiguration`, whose label is a configuration id rather than an
-/// ARN.
+/// PARENT. Every other operation of this service is absent because its route carries no
+/// ARN to authorize: `GetConfiguration`'s label is a configuration id rather than an ARN,
+/// and the rest name whatever they address in the request body.
 fn target_authorization_table<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> OperationRoutingTable {
@@ -398,6 +399,9 @@ fn target_authorization_table<Eng: Send + Sync + 'static>(
         };
     }
     authorize!(
+        get_configuration_manager::GetConfigurationManager => MANAGER_ARN_MEMBER,
+        update_configuration_manager::UpdateConfigurationManager => MANAGER_ARN_MEMBER,
+        delete_configuration_manager::DeleteConfigurationManager => MANAGER_ARN_MEMBER,
         update_configuration_definition::UpdateConfigurationDefinition => MANAGER_ARN_MEMBER,
         list_tags_for_resource::ListTagsForResource => RESOURCE_ARN_MEMBER,
         tag_resource::TagResource => RESOURCE_ARN_MEMBER,
@@ -413,7 +417,7 @@ fn target_authorization_table<Eng: Send + Sync + 'static>(
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The cross-resource routes, each behind the request-authorization stage
+    /// The ARN-labelled routes, each behind the request-authorization stage
     /// ([`target_authorization_table`]).
     authorized: OperationRoutingTable,
 }
@@ -449,9 +453,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
-        // Serve every operation whose route labels a resource it does not itself address
-        // behind the request-authorization stage (see the module docs), so the ARN is
-        // authorized where those routes share one rule rather than in four handlers — and
+        // Serve every operation whose route carries a resource ARN as a path label behind
+        // the request-authorization stage (see the module docs), so the ARN is authorized
+        // where those routes share one rule rather than in seven handlers — and
         // ahead of the modelled constraint walk, which is where the stage has to be:
         // behind it, a path label outside its `@pattern` would be refused as malformed
         // input before the target was ever judged. The stage delegates a request whose
@@ -465,17 +469,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal (an absent required
+        // member, or a value outside a declared bound) to let this service reword it.
+        //
+        // This model is restJson1, where AWS states a constraint refusal as the
+        // `400 ValidationException` envelope the framework already renders —
+        // `N validation error(s) detected: Value '<value>' at '<member path>' failed to
+        // satisfy constraint: <requirement>` — except that it quotes a `@pattern`
+        // requirement WITHOUT the `^`/`$` anchor pair a whole-value Smithy pattern wraps
+        // the expression in. That rendering is shared by every service on a JSON protocol,
+        // so it lives in `service-common` rather than here; the CHECK still uses the
+        // model's pattern as written, so only the way the expression is quoted back
+        // changes. The value half stays the framework's, which is what keeps a `@sensitive`
+        // member's value out of the sentence.
+        ::service_common::validation_message::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(&self, req: &RtRequest) -> Option<RtResponse> {

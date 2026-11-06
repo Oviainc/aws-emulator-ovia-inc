@@ -388,6 +388,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A definition whose parameters name the account initiating the deployment is
+        // deployed LOCALLY, and a local deployment is administered with the role
+        // `LocalDeploymentAdministrationRoleArn` names. The rule is about the definition
+        // this update LEAVES BEHIND, like every other rule here, so it reads the merged
+        // parameter set (the stored one when the request carries none) and the role the
+        // update leaves stored. `crate::state::local_deployment_rejection` is the one
+        // place that rule lives, shared with the create that stores a definition.
+        let stored_parameters = &*definition.parameters;
+        if let Some(why) = crate::state::local_deployment_rejection(
+            held_parameters.as_ref().unwrap_or(stored_parameters),
+            input
+                .local_deployment_administration_role_arn
+                .as_deref()
+                .or(definition
+                    .local_deployment_administration_role_arn
+                    .as_deref()),
+        ) {
+            return Err(
+                UpdateConfigurationDefinitionErrorModeled::ValidationException(
+                    ValidationException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        // And the role it leaves behind has to be one the service that deploys a
+        // configuration can assume, which the account's IAM records are what say: a
+        // local deployment this emulator's IAM shows no assumable administration role
+        // for could never be administered, so nothing is written for it
+        // (`crate::state::local_administration_role`). Read off the definition the
+        // update leaves behind, exactly as the half above is.
+        if let Some(why) = crate::state::local_administration_role::deployment_role_rejection(
+            &*self.engine,
+            held_parameters.as_ref().unwrap_or(stored_parameters),
+            input
+                .local_deployment_administration_role_arn
+                .as_deref()
+                .or(definition
+                    .local_deployment_administration_role_arn
+                    .as_deref()),
+        ) {
+            return Err(
+                UpdateConfigurationDefinitionErrorModeled::ValidationException(
+                    ValidationException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
         // A `TypeVersion` names one shipped revision of the service-owned template
         // this definition's `Type` deploys, so it is resolved against the published
         // catalog before anything is written: a version that type publishes (or the

@@ -192,9 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     ListConfigurationManagersErrorModeled::ValidationException(
                         ValidationException {
+                            // The service's own fixed invalid-token sentence, stated once
+                            // in `crate::state` so every paginated listing refuses alike.
                             message: Some(
-                                "StartingToken is not a pagination token issued by ListConfigurationManagers"
-                                    .to_string(),
+                                crate::state::INVALID_STARTING_TOKEN_MESSAGE.to_string(),
                             ),
                         },
                     )

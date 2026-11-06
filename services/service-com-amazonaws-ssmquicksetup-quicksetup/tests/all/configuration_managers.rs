@@ -9,7 +9,9 @@
 //! The rule under test: each of these operations answers from the persisted
 //! configuration-manager and configuration records, so whatever a create or an update
 //! stored is what a later Get or List reports — including the ids the service assigned
-//! — and anything never stored (or since deleted) is the modelled 404.
+//! — and anything never stored (or since deleted) is refused: an ARN a request carries in
+//! its body is the modelled 404, and one it carries as a route's path label is the
+//! authorization stage's 401 (`tests/all/target_authorization.rs`).
 //!
 //! This file no longer carries a stub census: every operation it used to assert a 501
 //! for is implemented and covered by its own suite — `ListTagsForResource` in
@@ -1368,10 +1370,10 @@ async fn a_delete_removes_the_manager_and_the_configurations_it_owned() {
 
     let (status, answer) = get(&router, &doomed).await;
     assert_eq!(
-        status, 404,
-        "a deleted manager must be absent, got {status} / {answer:?}"
+        status, 401,
+        "a deleted manager is no target this endpoint serves, got {status} / {answer:?}"
     );
-    assert_eq!(error_code(&answer), "ResourceNotFoundException", "{answer:?}");
+    assert_eq!(error_code(&answer), "UnauthorizedException", "{answer:?}");
 
     let (status, answer) = list_managers(&router, &json!({})).await;
     assert_eq!(status, 200, "got {answer:?}");
@@ -1401,13 +1403,14 @@ async fn a_delete_removes_the_manager_and_the_configurations_it_owned() {
         "a deleted manager's configurations go with it, got {owners:?}"
     );
 
-    // Deleting it again names a manager the store no longer holds.
+    // Deleting it again names a manager the store no longer holds, so the route's own
+    // label is no longer a target this endpoint serves.
     let (status, answer) = delete(&router, &doomed).await;
     assert_eq!(
-        status, 404,
-        "a repeated delete must answer 404, got {status} / {answer:?}"
+        status, 401,
+        "a repeated delete must answer 401, got {status} / {answer:?}"
     );
-    assert_eq!(error_code(&answer), "ResourceNotFoundException", "{answer:?}");
+    assert_eq!(error_code(&answer), "UnauthorizedException", "{answer:?}");
 
     // And the survivor is still readable, unchanged.
     let survivor_record = get_ok(&router, "delete", &survivor).await;
@@ -1418,12 +1421,11 @@ async fn a_delete_removes_the_manager_and_the_configurations_it_owned() {
     );
 }
 
-/// An ARN no create ever minted is a 404 on every operation whose route labels the very
-/// manager it addresses: those three resolve the ARN themselves, so the stage that fronts
-/// this service's cross-resource routes (`tests/all/target_authorization.rs`) is not what
-/// answers them.
+/// An ARN no create ever minted is the authorization stage's 401 on every operation whose
+/// route carries it as a path label: those three routes are authorized against the ARN
+/// ahead of the handler (`tests/all/target_authorization.rs`).
 #[tokio::test]
-async fn an_unknown_manager_arn_is_a_404_on_every_operation() {
+async fn an_unknown_manager_arn_is_a_401_on_every_labelled_operation() {
     let router = emulator();
     let uri = format!("/configurationManager/{}", label(UNKNOWN_MANAGER_ARN));
     let cases: [(&str, &str, Option<Value>); 3] = [
@@ -1434,13 +1436,13 @@ async fn an_unknown_manager_arn_is_a_404_on_every_operation() {
     for (method, uri, body) in cases {
         let (status, answer) = call(&router, method, uri, body.as_ref()).await;
         assert_eq!(
-            status, 404,
-            "case {method}: expected 404, got {status} / {answer:?}"
+            status, 401,
+            "case {method}: expected 401, got {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case {method}: expected ResourceNotFoundException, got {answer:?}"
+            "UnauthorizedException",
+            "case {method}: expected UnauthorizedException, got {answer:?}"
         );
     }
 }

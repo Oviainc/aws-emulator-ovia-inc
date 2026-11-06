@@ -15,7 +15,6 @@
 //! is accepted without disturbing it.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -38,15 +37,11 @@ fn past_transition() -> Duration {
     TRANSITION_SPAN + Duration::from_millis(400)
 }
 
-/// One emulator with an empty store, mounted exactly as the router mounts it.
+/// One emulator with an empty store, mounted exactly as the router mounts it, with the
+/// administration role every local deployment below names already in the account
+/// (`tests/all/local_deployment_roles.rs`, which owns that rule).
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ssmquicksetup_quicksetup::EmulatedService::new(engine),
-    );
-    router
+    super::local_deployment_roles::emulator()
 }
 
 /// A request signed for `ssm-quicksetup` in [`REGION`], the signal the router routes on
@@ -150,7 +145,15 @@ fn definition(type_: &str, parameters: Value) -> Value {
         type_,
         Value::Object(parameters),
     );
-    json!({ "Type": type_, "Parameters": parameters })
+    // Every definition names the administration role a LOCAL deployment must name, since
+    // a case here may target accounts and none of them is about that rule
+    // (`tests/all/local_deployment_roles.rs`).
+    json!({
+        "Type": type_,
+        "Parameters": parameters,
+        "LocalDeploymentAdministrationRoleArn":
+            super::local_deployment_roles::administration_role_arn(),
+    })
 }
 
 /// Create a manager that must succeed, answering its ARN.
@@ -554,18 +557,19 @@ async fn a_delete_winds_the_manager_and_its_configurations_down_before_removing_
 
         let (status, answer) = get_manager(&router, &doomed).await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: a torn-down manager must be absent, got {status} / {answer:?}"
+            status, 401,
+            "case {name:?}: a torn-down manager is no target this endpoint serves, got \
+             {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
+            "UnauthorizedException",
             "case {name:?}: got {answer:?}"
         );
 
-        // The tag plane's route labels any taggable resource's ARN rather than the
-        // resource it addresses, so it is the authorization stage — not this handler —
-        // that answers an ARN naming nothing (`tests/all/target_authorization.rs`).
+        // The manager's own route and the tag plane's both carry an ARN as a path label,
+        // so both are authorized against it ahead of the handler
+        // (`tests/all/target_authorization.rs`).
         let (status, answer) = list_tags(&router, &doomed).await;
         assert_eq!(
             status, 401,
@@ -574,12 +578,12 @@ async fn a_delete_winds_the_manager_and_its_configurations_down_before_removing_
 
         let (status, answer) = delete_manager(&router, &doomed).await;
         assert_eq!(
-            status, 404,
+            status, 401,
             "case {name:?}: deleting a torn-down manager names nothing, got {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
+            "UnauthorizedException",
             "case {name:?}: got {answer:?}"
         );
 
@@ -765,17 +769,11 @@ async fn a_manager_being_torn_down_takes_no_further_mutation() {
             "case {name}: a refused mutation must not disturb the teardown, got {actual:?}"
         );
 
-        // And once the teardown has completed there is no resource to mutate. WHICH
-        // refusal says so follows the route: `/configurationManager/{ManagerArn}` labels
-        // the manager it addresses and resolves the ARN itself, while the tag plane's and
-        // the configuration-definition route's labels name a resource they do not address
-        // and are authorized ahead of the handler
-        // (`tests/all/target_authorization.rs`).
+        // And once the teardown has completed there is no resource to mutate: every one
+        // of these routes carries an ARN as a path label, so each is authorized against
+        // it ahead of the handler (`tests/all/target_authorization.rs`).
         tokio::time::sleep(past_transition()).await;
-        let (expected_status, expected_code) = match name {
-            "UpdateConfigurationManager" => (404, "ResourceNotFoundException"),
-            _ => (401, "UnauthorizedException"),
-        };
+        let (expected_status, expected_code) = (401, "UnauthorizedException");
         let (status, answer) =
             call(&router, mutation.method, &uri, mutation.body.as_ref()).await;
         assert_eq!(
