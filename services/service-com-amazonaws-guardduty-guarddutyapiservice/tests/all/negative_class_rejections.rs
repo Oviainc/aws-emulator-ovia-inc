@@ -112,7 +112,7 @@ fn assert_bad_request(case: &str, status: u16, body: &Value, member: &str, value
 /// this one is for the families whose refusal is one fixed text naming nothing — the
 /// absent-resource and finding-identifier classes — where "contains the member name"
 /// is not the rule and the message itself is.
-fn assert_bad_request_message(
+pub(crate) fn assert_bad_request_message(
     case: &str,
     status: u16,
     body: &Value,

@@ -29,20 +29,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::now_millis;
 
 use super::client_rejections::UNUSABLE_INPUT_VALUE;
-use super::detector_lifecycle::{
-    call, enabled_detector, error_code, error_shape, new_router, router_over, Router,
-};
-use super::negative_class_rejections::seed_invitation;
-
-/// The error CLASS every 400 on this service carries in the body's `__type` and in its
-/// `type` member.
-const INVALID_INPUT: &str = "InvalidInputException";
-
-/// The modelled error SHAPE a 400 is enveloped in, as `x-amzn-errortype` carries it:
-/// the acceptances model exactly `BadRequestException` (400) and
-/// `InternalServerErrorException` (500)
-/// (`smithy_query(operation="AcceptInvitation,AcceptAdministratorInvitation")`).
-const BAD_REQUEST: &str = "BadRequestException";
+use super::detector_lifecycle::{call, enabled_detector, new_router, router_over, Router};
+use super::negative_class_rejections::{assert_bad_request_message, seed_invitation};
 
 /// The Region the shared harness signs its requests for.
 const REGION: &str = "us-east-1";
@@ -326,35 +314,14 @@ async fn a_consumed_pair_is_refused_with_the_same_sentence() {
     }
 }
 
-/// Assert one acceptance refusal: HTTP 400, the modelled envelope shape, the error
-/// class in both places the body carries it, the WHOLE message, and that the message
-/// interpolates nothing — neither member name, neither of the caller's values, nor the
-/// detector id.
+/// Assert one acceptance refusal: the envelope the whole service answers a client
+/// rejection with — status, shape, class in both body places and the WHOLE message —
+/// through the shared assertion the `negative_class_rejections` suite already defines,
+/// plus the rule specific to this one: the message interpolates nothing, neither member
+/// name, neither of the caller's values, nor the detector id.
 fn assert_fixed_refusal(case: &str, status: u16, body: &Value, detector_id: &str, pair: Pair) {
-    assert_eq!(
-        status, 400,
-        "case {case}: expected HTTP 400, got {status} {body:?}"
-    );
-    assert_eq!(
-        error_shape(body),
-        BAD_REQUEST,
-        "case {case}: expected the modelled envelope shape, got {body:?}"
-    );
-    assert_eq!(
-        error_code(body),
-        INVALID_INPUT,
-        "case {case}: expected the invalid-input class in __type, got {body:?}"
-    );
-    assert_eq!(
-        body["type"],
-        json!(INVALID_INPUT),
-        "case {case}: expected the invalid-input class in the type member, got {body:?}"
-    );
+    assert_bad_request_message(case, status, body, UNUSABLE_INPUT_VALUE, "");
     let message = body["message"].as_str().unwrap_or_default();
-    assert_eq!(
-        message, UNUSABLE_INPUT_VALUE,
-        "case {case}: expected the fixed input-parameter sentence {UNUSABLE_INPUT_VALUE:?}, got {message:?}"
-    );
     for (what, value) in [
         ("the administrator member name", "masterId"),
         ("the administrator member name", "administratorId"),
