@@ -8,7 +8,8 @@
 //! composition, an ingest configuration, an encoder configuration, a storage configuration
 //! or a public key — and `ListTagsForResource`, `TagResource` and `UntagResource` all reach
 //! the record of that one resolution; an ARN whose resource type names a kind the store
-//! never holds is the modelled `ResourceNotFoundException` (HTTP 404) on all three.
+//! never holds is a 404 on all three, under this surface's own `NotFoundException` code
+//! and its one fixed sentence.
 //!
 //! Each test drives the service through the router's own `dispatch`, so every assertion is
 //! about what an SDK client sees: the HTTP status, the error code and the JSON body. The
@@ -235,10 +236,11 @@ fn arn(resource_type: &str, id: &str) -> String {
     format!("arn:aws:ivs:{REGION}:{ACCOUNT}:{resource_type}/{id}")
 }
 
-/// The not-found sentence this service states for an ARN it holds no resource for.
-fn not_found(identifier: &str) -> String {
-    format!("Resource: {identifier} not found")
-}
+/// The code and the sentence the tagging surface states for an ARN it holds no resource
+/// for: its own, which name neither the ARN nor the kind of resource the ARN named (see
+/// `tagging.rs`).
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The three methods the tagging surface binds, with the query and body that make each a
 /// well-formed call: `GET` reads, `POST` writes one tag, `DELETE` removes one key.
@@ -347,7 +349,8 @@ async fn every_stored_resource_kind_resolves_on_both_the_read_and_the_write_tag_
 }
 
 /// The refusing side of the same table: an ARN whose resource type names no kind this store
-/// holds is the modelled not-found on the read operation and on both writes alike — the two
+/// holds is the tagging surface's own not-found on the read operation and on both writes
+/// alike — the two
 /// sides cannot disagree about which kinds are resolvable.
 ///
 /// The rows differ in WHY nothing is held: a kind the store does hold whose record it
@@ -387,11 +390,11 @@ async fn an_arn_of_no_stored_kind_is_a_not_found_on_the_read_and_the_write_tag_p
                 ),
                 (
                     404,
-                    "ResourceNotFoundException".to_string(),
-                    not_found(&missing)
+                    TAGGING_NOT_FOUND_CODE.to_string(),
+                    TAGGING_NOT_FOUND_MESSAGE.to_string()
                 ),
                 "case {case:?} ({method}): an ARN naming no stored resource must be the \
-                 modelled not-found, got {status} {response}"
+                 tagging surface's not-found, got {status} {response}"
             );
         }
     }

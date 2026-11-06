@@ -299,10 +299,14 @@ fn stop_request(source: &str, destination: &str, participant: &str) -> Value {
 }
 
 /// How this service names the replication a failed stop could not find: the one not-found
-/// sentence of this service, over the publisher and the two stages a request names a
-/// replication by.
+/// sentence of this service, over the publisher — named the way every non-ARN identifier
+/// of this service is, by its kind with the id quoted — and the two stages a request names
+/// a replication by.
 fn replication_not_found(participant: &str, source: &str, destination: &str) -> String {
-    format!("Resource: participant {participant} of {source} replicated to {destination} not found")
+    format!(
+        "Resource: participant \"{participant}\" of {source} replicated to \
+         {destination} not found"
+    )
 }
 
 /// One row of the stop class: how the replication was started, and what else this store

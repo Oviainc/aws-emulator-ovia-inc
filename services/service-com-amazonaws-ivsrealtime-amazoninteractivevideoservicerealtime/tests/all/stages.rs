@@ -301,8 +301,19 @@ async fn create_stage_mints_an_arn_and_one_token_per_configuration() {
     }
 }
 
-/// Each configuration's own values reach its token, and the model's documented
-/// defaults fill in what the configuration leaves out.
+/// One row of a reported-token table: the case, the row's own `Value` (the request it
+/// sends, or the `userId` its token must report), and the `duration` and `capabilities`
+/// the token must report — `None` where the request carried the member not at all.
+type ReportedTokenRow = (
+    &'static str,
+    Value,
+    Option<i64>,
+    Option<Vec<&'static str>>,
+);
+
+/// Each configuration's own values reach its token, the model's documented
+/// defaults fill in what the configuration leaves out, and a default the service applied
+/// is not echoed back as the member the configuration left out.
 #[tokio::test]
 async fn create_stage_applies_each_configuration_to_its_own_token() {
     let emulator = Emulator::new();
@@ -315,6 +326,7 @@ async fn create_stage_applies_each_configuration_to_its_own_token() {
               "attributes": { "seat": "1a" } },
         ],
     });
+    let issued_at = now_secs();
     let (status, response) = emulator.call("CreateStage", &request).await;
     assert_eq!(status, 200, "CreateStage: expected 200, got {response}");
     let tokens = response["participantTokens"]
@@ -323,19 +335,26 @@ async fn create_stage_applies_each_configuration_to_its_own_token() {
         .unwrap_or_default();
     assert_eq!(tokens.len(), 3, "expected three tokens, got {response}");
 
-    let expected: Vec<(&str, Value, i64, Vec<&str>)> = vec![
-        ("explicit duration and one capability", json!("alice"), 60, vec!["PUBLISH"]),
+    // The third and fourth columns are what the token must REPORT for `duration` and
+    // `capabilities`: `None` where the configuration carried the member not at all.
+    let expected: Vec<ReportedTokenRow> = vec![
+        (
+            "explicit duration and one capability",
+            json!("alice"),
+            Some(60),
+            Some(vec!["PUBLISH"]),
+        ),
         (
             "defaults for duration and capabilities",
             json!("bob"),
-            DEFAULT_DURATION,
-            vec!["PUBLISH", "SUBSCRIBE"],
+            None,
+            None,
         ),
         (
             "the modelled maximum duration, no userId",
             Value::Null,
-            20160,
-            vec!["PUBLISH", "SUBSCRIBE"],
+            Some(20160),
+            Some(vec!["PUBLISH", "SUBSCRIBE"]),
         ),
     ];
     for (index, (case, user_id, duration, capabilities)) in expected.into_iter().enumerate() {
@@ -345,17 +364,27 @@ async fn create_stage_applies_each_configuration_to_its_own_token() {
             "case {case:?}: expected userId {user_id}, got {token}"
         );
         assert_eq!(
-            token["duration"].as_i64(),
-            Some(duration),
-            "case {case:?}: expected duration {duration}, got {token}"
+            token.get("duration").and_then(Value::as_i64),
+            duration,
+            "case {case:?}: expected duration {duration:?}, got {token}"
         );
-        let actual: Vec<&str> = token["capabilities"]
-            .as_array()
-            .map(|values| values.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+        let reported: Option<Vec<&str>> = token.get("capabilities").map(|values| {
+            values
+                .as_array()
+                .map(|values| values.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default()
+        });
         assert_eq!(
-            actual, capabilities,
-            "case {case:?}: expected capabilities {capabilities:?}, got {actual:?}"
+            reported, capabilities,
+            "case {case:?}: expected capabilities {capabilities:?}, got {reported:?}"
+        );
+        // Whatever the token reports, its expiry is computed from the EFFECTIVE duration:
+        // the documented default where the configuration sized nothing.
+        let expiry = timestamp_secs(&token["expirationTime"]);
+        let minutes = duration.unwrap_or(DEFAULT_DURATION);
+        assert!(
+            (expiry - (issued_at + minutes * 60)).abs() <= 120,
+            "case {case:?}: expected an expirationTime {minutes} minutes out, got {token}"
         );
     }
     assert_eq!(
@@ -394,7 +423,7 @@ async fn attributes_over_one_kilobyte_are_refused() {
     let emulator = Emulator::new();
     let stage_arn = emulator.create_stage(&json!({ "name": "attrs" })).await;
 
-    // Rows differ only in total attribute size, which is what the rule bounds.
+    // Rows differ only in the size of the map as JSON, which is what the rule bounds.
     let cases: Vec<(&str, usize, u16)> = vec![
         ("well under the cap", 100, 200),
         ("exactly at the cap", 1024, 200),
@@ -403,7 +432,9 @@ async fn attributes_over_one_kilobyte_are_refused() {
     ];
     for (case, total_bytes, expected_status) in cases {
         let key = "a";
-        let value = "v".repeat(total_bytes - key.len());
+        // The measured size is the map's JSON encoding, so the value carries the target
+        // minus the punctuation around one entry (`{"a":"…"}`).
+        let value = "v".repeat(total_bytes - "{\"a\":\"\"}".len());
         let attributes = json!({ key: value });
 
         let (status, response) = emulator
@@ -728,7 +759,13 @@ async fn list_stages_refuses_a_pagination_token_it_did_not_issue() {
 // ---------------------------------------------------------------------------
 
 /// The token reflects the request, the model's documented defaults fill in what the
-/// request omits, and `expirationTime` is the issue instant plus the duration.
+/// request omits, and `expirationTime` is the issue instant plus the effective duration.
+///
+/// A default the SERVICE applied is not echoed back as the member the caller left out:
+/// `duration` and `capabilities` are reported exactly when the request carried them, so a
+/// client can tell "the caller sized this token" from "the service defaulted it". What
+/// the default did is visible in `expirationTime`, which lands the documented 720 minutes
+/// out for a request that sized nothing.
 #[tokio::test]
 async fn create_participant_token_reflects_the_request_and_its_defaults() {
     let emulator = Emulator::new();
@@ -736,25 +773,27 @@ async fn create_participant_token_reflects_the_request_and_its_defaults() {
 
     // Rows differ along every member the rule covers: duration (absent, both
     // modelled bounds, a middle value), capabilities (absent, one, both), userId
-    // and attributes (absent, present).
-    let cases: Vec<(&str, Value, i64, Vec<&str>)> = vec![
+    // and attributes (absent, present). The third and fourth columns are what the
+    // RESPONSE must carry for `duration` and `capabilities` — `None` where the request
+    // carried the member not at all.
+    let cases: Vec<ReportedTokenRow> = vec![
         (
             "every member omitted",
             json!({ "stageArn": stage_arn }),
-            DEFAULT_DURATION,
-            vec!["PUBLISH", "SUBSCRIBE"],
+            None,
+            None,
         ),
         (
             "userId only, so both defaults apply",
             json!({ "stageArn": stage_arn, "userId": "bob" }),
-            DEFAULT_DURATION,
-            vec!["PUBLISH", "SUBSCRIBE"],
+            None,
+            None,
         ),
         (
             "the modelled minimum duration",
             json!({ "stageArn": stage_arn, "duration": 1, "capabilities": ["SUBSCRIBE"] }),
-            1,
-            vec!["SUBSCRIBE"],
+            Some(1),
+            Some(vec!["SUBSCRIBE"]),
         ),
         (
             "a middling duration and both capabilities",
@@ -765,14 +804,14 @@ async fn create_participant_token_reflects_the_request_and_its_defaults() {
                 "capabilities": ["PUBLISH", "SUBSCRIBE"],
                 "attributes": { "seat": "12b" },
             }),
-            90,
-            vec!["PUBLISH", "SUBSCRIBE"],
+            Some(90),
+            Some(vec!["PUBLISH", "SUBSCRIBE"]),
         ),
         (
             "the modelled maximum duration",
             json!({ "stageArn": stage_arn, "duration": 20160 }),
-            20160,
-            vec!["PUBLISH", "SUBSCRIBE"],
+            Some(20160),
+            None,
         ),
     ];
 
@@ -790,17 +829,20 @@ async fn create_participant_token_reflects_the_request_and_its_defaults() {
         let token = &response["participantToken"];
 
         assert_eq!(
-            token["duration"].as_i64(),
-            Some(duration),
-            "case {case:?}: expected duration {duration}, got {token}"
+            token.get("duration").and_then(Value::as_i64),
+            duration,
+            "case {case:?}: expected duration {duration:?}, got {token}"
         );
-        let actual: Vec<&str> = token["capabilities"]
-            .as_array()
-            .map(|values| values.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+        let reported_capabilities: Option<Vec<&str>> = token.get("capabilities").map(|values| {
+            values
+                .as_array()
+                .map(|values| values.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default()
+        });
         assert_eq!(
-            actual, capabilities,
-            "case {case:?}: expected capabilities {capabilities:?}, got {actual:?}"
+            reported_capabilities, capabilities,
+            "case {case:?}: expected capabilities {capabilities:?}, \
+             got {reported_capabilities:?}"
         );
         assert_eq!(
             token["userId"], request["userId"],
@@ -835,19 +877,21 @@ async fn create_participant_token_reflects_the_request_and_its_defaults() {
              got the already-issued {issued:?}"
         );
 
-        // `expirationTime` is the issue instant plus `duration` minutes, rendered as
-        // the ISO-8601 date-time string the model's `@timestampFormat` requires.
+        // `expirationTime` is the issue instant plus the EFFECTIVE duration — the one the
+        // request asked for, or the documented default where it asked for none — rendered
+        // as the ISO-8601 date-time string the model's `@timestampFormat` requires.
         let rendered = &token["expirationTime"];
         assert!(
             rendered.is_string(),
             "case {case:?}: expected expirationTime as an ISO-8601 string, got {rendered}"
         );
         let actual = timestamp_secs(rendered);
-        let expected = issued_at + duration * 60;
+        let effective = duration.unwrap_or(DEFAULT_DURATION);
+        let expected = issued_at + effective * 60;
         assert!(
             (actual - expected).abs() <= 120,
-            "case {case:?}: expected an expirationTime near {expected}, got {actual} \
-             ({rendered})"
+            "case {case:?}: expected an expirationTime near {expected} \
+             ({effective} minutes out), got {actual} ({rendered})"
         );
     }
 }
@@ -1730,21 +1774,24 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
     }
 }
 
-/// A participant token reports `capabilities` only when it grants some: an explicitly
-/// empty list is honoured rather than replaced by the documented default, and the token
-/// then carries no `capabilities` member — the same way `attributes` is carried only when
-/// the token holds attributes. Asserted on both operations that issue a token.
+/// A participant token reports `capabilities` only when the REQUEST asked for some: an
+/// explicitly empty list is honoured rather than replaced by the documented default, a
+/// request that asks for nothing is answered without the member at all — the service does
+/// not echo the default it applied — and a non-empty ask is reported as asked. The same
+/// way `attributes` is carried only when the token holds attributes. Asserted on both
+/// operations that issue a token.
 #[tokio::test]
 async fn a_participant_token_reports_a_collection_member_only_when_it_holds_entries() {
     let emulator = Emulator::new();
     let stage = emulator.create_stage(&json!({ "name": "tokens" })).await;
 
-    // Rows differ in the capabilities the request asks for: absent (the documented
-    // `PUBLISH,SUBSCRIBE` default), explicitly empty (`@length 0..2` makes it legal), and
+    // Rows differ in the capabilities the request asks for: absent (so the documented
+    // `PUBLISH,SUBSCRIBE` default applies and nothing is reported), explicitly empty
+    // (`@length 0..2` makes it legal), and
     // each non-empty subset of the two `ParticipantTokenCapability` values the model
     // lists, in both orders.
     let capability_cases: Vec<(&str, Value, Value)> = vec![
-        ("absent", Value::Null, json!(["PUBLISH", "SUBSCRIBE"])),
+        ("absent", Value::Null, Value::Null),
         ("explicitly empty", json!([]), Value::Null),
         ("publish only", json!(["PUBLISH"]), json!(["PUBLISH"])),
         ("subscribe only", json!(["SUBSCRIBE"]), json!(["SUBSCRIBE"])),

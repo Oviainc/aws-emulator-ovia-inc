@@ -80,6 +80,10 @@ const STATE_STOPPED: &str = "STOPPED";
 /// The modelled error a call naming a composition the clock has reclaimed is answered with.
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The error code the TAGGING surface answers the same reclaim with — its own, not the
+/// modelled one the resource operations answer (see `tagging.rs`).
+const TAGGING_NOT_FOUND: &str = "NotFoundException";
+
 /// The modelled error a stop of a composition that is no longer composing is answered with.
 const CONFLICT: &str = "ConflictException";
 
@@ -924,8 +928,9 @@ async fn the_delete_and_the_tag_write_see_the_state_the_clock_reached() {
         if expected == 404 {
             assert_eq!(
                 error_code(&response),
-                NOT_FOUND,
-                "case {case:?}: expected the modelled {NOT_FOUND}, got {response}"
+                TAGGING_NOT_FOUND,
+                "case {case:?}: expected the tagging surface's {TAGGING_NOT_FOUND}, \
+                 got {response}"
             );
         }
     }

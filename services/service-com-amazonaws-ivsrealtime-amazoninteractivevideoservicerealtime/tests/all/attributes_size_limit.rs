@@ -5,11 +5,12 @@
 //! `participantTokenConfigurations` entry), `CreateIngestConfiguration` and
 //! `StartParticipantReplication`.
 //!
-//! The rule under test: a map whose keys and values total more than the documented
-//! maximum is refused with the modelled `ValidationException` (HTTP 400), worded in this
-//! service's constraint-refusal construction — the operation, the dotted member path, the
-//! bound and the total the request sent — and a map at or under it is accepted, whatever
-//! shape the map has.
+//! The rule under test: a map whose JSON encoding is larger than the documented maximum
+//! is refused with the modelled `ValidationException` (HTTP 400), worded in the
+//! member-constraint envelope this service states a rejection of one member's value with
+//! — `Request member: <member> failed to satisfy the constraints: <member> is required to
+//! have a maximum size of 1 KB, found <n> bytes` — and a map at or under it is accepted,
+//! whatever shape the map has.
 //!
 //! Every test drives the service through the router's own `dispatch`, so each assertion is
 //! about what an SDK client sees: the HTTP status, the error code and the JSON body —
@@ -30,6 +31,11 @@ use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::Emu
 /// is 1 KB total."
 /// (`smithy_query(query="doc",shape="CreateParticipantTokenRequest",member="attributes")`).
 const MAX_ATTRIBUTES_BYTES: usize = 1024;
+
+/// How the refusal SPELLS that maximum: the model states the bound in kilobytes ("The
+/// maximum length of this field is 1 KB total."), and the refusal quotes it in those
+/// words.
+const MAX_ATTRIBUTES_SIZE_LABEL: &str = "1 KB";
 
 /// The capability that makes a participant a publisher, from
 /// `smithy_query(query="shape",shape="ParticipantTokenCapability")` — the one
@@ -116,9 +122,9 @@ fn member(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-/// The shapes an `attributes` map of a given total size can take. The rule bounds the
-/// TOTAL of the key and value bytes, so a map of one long value, a map of many short pairs
-/// and a map of multi-byte text are the same input to it at the same total.
+/// The shapes an `attributes` map of a given size can take. The rule bounds the size of
+/// the map as JSON, so a map of one long value, a map of many short pairs and a map of
+/// multi-byte text are the same input to it at the same size.
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     /// One pair whose value carries almost all of the bytes.
@@ -130,8 +136,26 @@ enum Shape {
     MultiByteValue,
 }
 
-/// An `attributes` map of `shape` whose keys and values total exactly `total` bytes.
+/// How many entries a map of `shape` holds.
+fn pairs_of(shape: Shape) -> usize {
+    match shape {
+        Shape::OneLongValue | Shape::MultiByteValue => 1,
+        Shape::Pairs(pairs) => pairs,
+    }
+}
+
+/// The JSON punctuation a map of `pairs` entries carries, which the measured size counts
+/// beside the keys and values themselves: the two braces, the two quotes around each key
+/// and each value, the colon in every entry and the comma between entries.
+fn json_punctuation(pairs: usize) -> usize {
+    2 + pairs * 5 + pairs.saturating_sub(1)
+}
+
+/// An `attributes` map of `shape` whose JSON encoding is exactly `total` bytes — keys,
+/// values and the punctuation around them. Nothing in these maps needs escaping, so the
+/// keys and values carry `total` minus that punctuation.
 fn attributes(shape: Shape, total: usize) -> BTreeMap<String, String> {
+    let total = total - json_punctuation(pairs_of(shape));
     let mut map = BTreeMap::new();
     match shape {
         Shape::OneLongValue => {
@@ -171,17 +195,21 @@ fn attributes(shape: Shape, total: usize) -> BTreeMap<String, String> {
     map
 }
 
-/// The size the rule measures: the sum of the key and value BYTES the caller sent.
+/// The size the rule measures: the bytes the map occupies as JSON — the braces, the
+/// quoted keys, the colons, the commas and the quoted values — which is the form every
+/// request carries one in.
 fn size_of(map: &BTreeMap<String, String>) -> usize {
-    map.iter().map(|(key, value)| key.len() + value.len()).sum()
+    serde_json::to_string(map)
+        .expect("a map of strings serializes")
+        .len()
 }
 
-/// The sentence this service states the bound with, for `operation` and the dotted
-/// `member` path the map arrived in.
-fn expected_message(operation: &str, member: &str, size: usize) -> String {
+/// The sentence this service states the bound with, for the dotted `member` path the map
+/// arrived in and the size it measured.
+fn expected_message(member: &str, size: usize) -> String {
     format!(
-        "{operation}.{member} is required to have a maximum size of {MAX_ATTRIBUTES_BYTES} \
-         bytes, found {size}"
+        "Request member: {member} failed to satisfy the constraints: {member} is required \
+         to have a maximum size of {MAX_ATTRIBUTES_SIZE_LABEL}, found {size} bytes"
     )
 }
 
@@ -218,20 +246,21 @@ enum Expectation {
     Refused(String),
 }
 
-/// The verdict the rule gives a map of `size` bytes sent in `member` of `operation`.
-fn expectation(operation: &str, member: &str, size: usize) -> Expectation {
+/// The verdict the rule gives a map of `size` bytes sent in `member`.
+fn expectation(member: &str, size: usize) -> Expectation {
     if size <= MAX_ATTRIBUTES_BYTES {
         Expectation::Accepted
     } else {
-        Expectation::Refused(expected_message(operation, member, size))
+        Expectation::Refused(expected_message(member, size))
     }
 }
 
 /// The totals every operation is driven over: each published bound, one byte either side
-/// of the maximum, and totals well inside and well past it.
+/// of the maximum, and totals well inside and well past it. The smallest is sized so
+/// every shape below fits inside it once the JSON punctuation is paid for.
 fn totals() -> Vec<usize> {
     vec![
-        64,
+        128,
         MAX_ATTRIBUTES_BYTES / 2,
         MAX_ATTRIBUTES_BYTES - 1,
         MAX_ATTRIBUTES_BYTES,
@@ -268,7 +297,7 @@ async fn create_participant_token_bounds_its_attributes_map() {
                     &json!({ "stageArn": stage_arn, "attributes": map }),
                 )
                 .await;
-            let expected = expectation("CreateParticipantToken", "attributes", size);
+            let expected = expectation("attributes", size);
             assert_verdict(&case, &expected, status, &response);
             if let Expectation::Accepted = expected {
                 // The accepted map is the one the minted token reports: the bound refuses,
@@ -316,7 +345,6 @@ async fn create_stage_bounds_each_participant_token_configuration() {
                     )
                     .await;
                 let expected = expectation(
-                    "CreateStage",
                     &format!("participantTokenConfigurations.{position}.member.attributes"),
                     size,
                 );
@@ -361,7 +389,7 @@ async fn create_ingest_configuration_bounds_its_attributes_map() {
                     &json!({ "ingestProtocol": "RTMPS", "attributes": map }),
                 )
                 .await;
-            let expected = expectation("CreateIngestConfiguration", "attributes", size);
+            let expected = expectation("attributes", size);
             assert_verdict(&case, &expected, status, &response);
             if let Expectation::Accepted = expected {
                 let reported: BTreeMap<String, String> = serde_json::from_value(
@@ -407,7 +435,7 @@ async fn start_participant_replication_bounds_its_attributes_map() {
                     }),
                 )
                 .await;
-            let expected = expectation("StartParticipantReplication", "attributes", size);
+            let expected = expectation("attributes", size);
             assert_verdict(&case, &expected, status, &response);
         }
     }

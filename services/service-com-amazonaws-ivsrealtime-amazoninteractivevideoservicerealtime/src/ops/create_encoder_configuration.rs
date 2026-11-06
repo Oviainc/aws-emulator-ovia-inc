@@ -81,6 +81,18 @@ use super::types::*;
 /// `crate::state::quota_exceeded_message` states it.
 const ENCODER_CONFIGURATION_QUOTA_RESOURCE: &str = "encoder-configuration";
 
+/// The member the resolution refusals NAME: `video`, the member whose own documentation
+/// carries both unmodelled rules ("This must be an even number", "the maximum total
+/// pixels is 2073600").
+const VIDEO_MEMBER: &str = "video";
+
+/// The requirement the total-pixel refusal states, inside the member-constraint envelope
+/// (`crate::state::member_constraint_message`): the named detail code AWS classifies this
+/// one limit with, and its sentence. Both parts are fixed text — the limit that was
+/// exceeded and the resolution that exceeded it are not in it.
+const VIDEO_RESOLUTION_LIMIT_DETAIL: &str =
+    "Code: VideoResolutionLimitError Message: video resolution exceeded max limit";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,12 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if value % 2 != 0 {
                 return Err(crate::state::validation_failed(
                     CreateEncoderConfigurationErrorModeled::ValidationException,
-                    // Worded in the construction this service states every constraint
-                    // refusal with (`crate::state::violation_clause`): the operation, the
-                    // dotted member path and the requirement, with what the request sent.
-                    format!(
-                        "{}.video.{member} is required to be an even number, found {value}",
-                        Self::NAME,
+                    // Worded in the member-constraint envelope this service states a
+                    // rejection of one member's value with
+                    // (`crate::state::member_constraint_message`): the member whose
+                    // documentation carries the rule, then the requirement it failed,
+                    // with what the request sent.
+                    crate::state::member_constraint_message(
+                        VIDEO_MEMBER,
+                        &format!("{member} is required to be an even number, found {value}"),
                     ),
                 ));
             }
@@ -192,10 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if pixels > crate::state::MAX_VIDEO_PIXELS {
             return Err(crate::state::validation_failed(
                 CreateEncoderConfigurationErrorModeled::ValidationException,
-                format!(
-                    "{}.video is required to have a maximum of {} total pixels, found {pixels}",
-                    Self::NAME,
-                    crate::state::MAX_VIDEO_PIXELS,
+                crate::state::member_constraint_message(
+                    VIDEO_MEMBER,
+                    VIDEO_RESOLUTION_LIMIT_DETAIL,
                 ),
             ));
         }

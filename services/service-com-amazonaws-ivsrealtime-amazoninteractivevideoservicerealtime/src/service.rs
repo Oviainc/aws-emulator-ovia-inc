@@ -628,6 +628,15 @@ where
             // not `Sync`, and this future is. The protocol itself is.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
             let violations = refused_by::<O>(protocol, req);
+            // The one modelled constraint of this service whose refusal is NOT this
+            // service's constraint wording: the tagging surface's own bound on a
+            // resource's tag set, which that surface answers in its own code and words
+            // wherever the count is found (see `crate::state::check_tag_count`).
+            if crate::state::is_tag_limit_violation(O::NAME, &violations) {
+                if let Some(refusal) = tag_limit_exceeded(protocol) {
+                    return with_response_envelope(refusal);
+                }
+            }
             if let Some(refusal) = validation_exception(protocol, O::NAME, &violations) {
                 return with_response_envelope(refusal);
             }
@@ -696,6 +705,37 @@ fn validation_exception(
                 %error,
                 "the stated ValidationException would not serialize; this refusal falls \
                  back to the framework's generic envelope"
+            );
+        })
+        .ok()
+}
+
+/// The tagging surface's answer to a request whose own `tags` map is already past the
+/// modelled `Tags` maximum: the code and the sentence that surface states the bound with
+/// (`crate::state::tagging_bad_request`), rather than this service's constraint wording.
+///
+/// The bound belongs to the RESOURCE's tag set, so a handler answers it for a call whose
+/// composition would exceed it (`crate::state::check_tag_count`); a request carrying more
+/// entries than the bound by itself never reaches that handler, because the framework's
+/// walk refuses the map first. Both are the one bound, so both are answered in the one
+/// code and the one sentence.
+///
+/// `None` when the refusal cannot be serialized, which leaves the request to
+/// [`validation_exception`] rather than answering with no reason at all.
+fn tag_limit_exceeded(protocol: &dyn ServerHttpProtocol) -> Option<RtResponse> {
+    let refused = crate::scaffolded::StatedBody::new(crate::state::tag_limit_exceeded_message());
+    protocol
+        .serialize_error(
+            &refused,
+            &crate::scaffolded::STATED_ERROR_SCHEMA,
+            crate::state::TAGGING_BAD_REQUEST_CODE,
+            crate::state::TAGGING_BAD_REQUEST_STATUS,
+        )
+        .inspect_err(|error| {
+            tracing::warn!(
+                %error,
+                "the tagging surface's tag-limit refusal would not serialize; this \
+                 refusal falls back to the stated ValidationException"
             );
         })
         .ok()

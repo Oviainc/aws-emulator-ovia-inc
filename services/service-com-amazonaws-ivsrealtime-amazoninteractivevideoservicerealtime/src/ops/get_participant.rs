@@ -197,7 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     GetParticipantErrorModeled::ResourceNotFoundException,
-                    &input.session_id,
+                    // Neither a `sessionId` nor a `participantId` is an ARN, so neither
+                    // names its own kind of resource: each refusal names the kind and
+                    // quotes the id, which is what tells a caller WHICH of the three
+                    // identifiers resolved to nothing (`crate::state::named_resource`).
+                    &crate::state::named_resource(
+                        crate::state::STAGE_SESSION_RESOURCE,
+                        &input.session_id,
+                    ),
                 )
             })?;
         let record = session
@@ -207,7 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     GetParticipantErrorModeled::ResourceNotFoundException,
-                    &input.participant_id,
+                    &crate::state::named_resource(
+                        crate::state::PARTICIPANT_RESOURCE,
+                        &input.participant_id,
+                    ),
                 )
             })?;
 

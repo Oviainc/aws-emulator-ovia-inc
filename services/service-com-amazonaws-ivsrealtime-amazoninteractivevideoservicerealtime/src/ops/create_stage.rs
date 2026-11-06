@@ -171,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
             crate::state::check_attributes_size(
-                Self::NAME,
                 // The member path names the list position the way the framework's own
                 // constraint walk does.
                 &format!("participantTokenConfigurations.{}.member.attributes", index + 1),

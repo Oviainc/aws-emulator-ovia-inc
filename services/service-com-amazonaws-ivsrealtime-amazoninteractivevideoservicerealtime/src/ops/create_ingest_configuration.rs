@@ -115,6 +115,21 @@ const INGEST_CONFIGURATION_QUOTA_RESOURCE: &str = "ingest-configuration";
 /// enforces it and answers the modelled `ValidationException`.
 const CLEARTEXT_INGEST_PROTOCOL: &str = "RTMP";
 
+/// The member the cleartext-ingest refusal NAMES.
+///
+/// The rule is documented on `ingestProtocol` ("If this is set to `RTMP`,
+/// `insecureIngest` must be set to `true`"), and the refusal names the member whose
+/// documentation carries it, so a caller is pointed at the member that decided the
+/// outcome rather than at the flag it needs beside it.
+const INGEST_PROTOCOL_MEMBER: &str = "ingestProtocol";
+
+/// The requirement the cleartext-ingest refusal states, inside the member-constraint
+/// envelope (`crate::state::member_constraint_message`): one fixed clause naming the
+/// protocol that needs the flag, with nothing else of the request in it.
+fn cleartext_ingest_requirement() -> String {
+    format!("insecure ingest is required for Ingest {CLEARTEXT_INGEST_PROTOCOL} protocol")
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -205,25 +220,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before anything is minted or persisted, so a refused request leaves no
         // configuration behind. The same limit, measured the same way, as the one
         // `CreateParticipantToken` and `CreateStage` enforce on a token's attributes.
-        crate::state::check_attributes_size(Self::NAME, "attributes", &attributes).map_err(
-            |message| {
-                crate::state::validation_failed(
-                    CreateIngestConfigurationErrorModeled::ValidationException,
-                    message,
-                )
-            },
-        )?;
+        crate::state::check_attributes_size("attributes", &attributes).map_err(|message| {
+            crate::state::validation_failed(
+                CreateIngestConfigurationErrorModeled::ValidationException,
+                message,
+            )
+        })?;
 
         // The documented pairing of the two members (see [`CLEARTEXT_INGEST_PROTOCOL`]):
         // cleartext ingest is refused unless the request also allows insecure ingest.
+        //
+        // The refusal names `ingestProtocol`, the member whose documentation carries the
+        // rule, and states it in the member-constraint envelope this service words a
+        // rejection of one member's value with (`crate::state::member_constraint_message`).
         if input.ingest_protocol == CLEARTEXT_INGEST_PROTOCOL && !input.insecure_ingest {
             return Err(crate::state::validation_failed(
                 CreateIngestConfigurationErrorModeled::ValidationException,
-                format!(
-                    "{}.insecureIngest is required to be true when ingestProtocol is \
-                     {CLEARTEXT_INGEST_PROTOCOL}, found {}",
-                    Self::NAME,
-                    input.insecure_ingest,
+                crate::state::member_constraint_message(
+                    INGEST_PROTOCOL_MEMBER,
+                    &cleartext_ingest_requirement(),
                 ),
             ));
         }

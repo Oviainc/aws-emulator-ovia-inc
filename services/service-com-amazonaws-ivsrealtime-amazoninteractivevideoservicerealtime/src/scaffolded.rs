@@ -281,6 +281,52 @@ impl<E> SerializableStruct for Stated<E> {
     }
 }
 
+/// A failure whose wire error CODE this service's model does not declare for the
+/// operation answering it, carried explicitly because no modelled shape names it.
+///
+/// Reach for it only where a recording shows AWS answering a code that is not in the
+/// operation's modelled error set — IVS RealTime's tagging surface answers
+/// `NotFoundException` and `BadRequestException` where the rest of the service answers
+/// `ResourceNotFoundException` and `ValidationException`
+/// (`crate::state::TAGGING_NOT_FOUND_CODE`, `crate::state::TAGGING_BAD_REQUEST_CODE`).
+/// Everything the model does declare goes through [`Scaffolded::stated`], where the code
+/// and status stay model-derived.
+#[derive(Debug, Clone)]
+pub struct Unmodeled {
+    /// The wire error code (`__type` / `x-amzn-errortype`).
+    code: &'static str,
+    /// The HTTP status the recorded response carries.
+    status: u16,
+    /// The text the body's `message` key carries.
+    message: String,
+}
+
+impl Unmodeled {
+    /// A failure answered with `code` and `status`, stating `message`.
+    pub fn new(code: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Unmodeled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for Unmodeled {}
+
+impl SerializableStruct for Unmodeled {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&STATED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -297,6 +343,9 @@ pub enum Scaffolded<E> {
     /// A modeled error the operation declares, with the body AWS sends for it: the
     /// `message` key. See [`Stated`] and [`Scaffolded::stated`].
     Stated(Stated<E>),
+    /// A failure answered with an error code the operation's model does not declare.
+    /// See [`Unmodeled`].
+    Unmodeled(Unmodeled),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -330,6 +379,12 @@ impl<E> Scaffolded<E> {
         })
     }
 
+    /// Answer with an error code the operation's model does not declare. See
+    /// [`Unmodeled`] for the one surface of this service that needs it.
+    pub fn unmodeled(code: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self::Unmodeled(Unmodeled::new(code, status, message))
+    }
+
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
     ///
     /// Reach for this when the request is wrong in a way the model cannot express,
@@ -355,6 +410,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::Stated(e) => write!(f, "{e}"),
+            Self::Unmodeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -368,6 +424,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::Stated(e) => e.source(),
+            Self::Unmodeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -384,6 +441,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             // The stated body: the `message` key, not the modelled shape's members.
             Self::Stated(e) => e,
+            Self::Unmodeled(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -392,7 +450,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
-            Self::Stated(_) => &STATED_ERROR_SCHEMA,
+            Self::Stated(_) | Self::Unmodeled(_) => &STATED_ERROR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -408,6 +466,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The code stays MODEL-derived: it is the modelled shape the operation
             // declares, read off the same enum `Modeled` carries.
             Self::Stated(e) => e.modeled.shape_name(),
+            Self::Unmodeled(e) => e.code,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -422,6 +481,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             // The status stays MODEL-derived (`@httpError` on the modelled shape).
             Self::Stated(e) => e.modeled.http_status(),
+            Self::Unmodeled(e) => e.status,
             Self::ValidationException(_) => 400,
         }
     }
@@ -434,6 +494,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
             Self::Stated(e) => e.modeled.query_error_code(),
+            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            Self::Unmodeled(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

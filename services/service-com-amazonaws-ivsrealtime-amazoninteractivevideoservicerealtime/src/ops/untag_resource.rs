@@ -179,12 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let tags = crate::state::resource_tags_mut(&mut store, &input.resource_arn, &region)
-            .ok_or_else(|| {
-                crate::state::resource_not_found(
-                    UntagResourceErrorModeled::ResourceNotFoundException,
-                    &input.resource_arn,
-                )
-            })?;
+            // The tagging surface's own not-found code and sentence, as `TagResource`
+            // and `ListTagsForResource` answer it; see
+            // `crate::state::tagging_not_found`.
+            .ok_or_else(crate::state::tagging_not_found)?;
         for key in &input.tag_keys {
             tags.remove(key);
         }

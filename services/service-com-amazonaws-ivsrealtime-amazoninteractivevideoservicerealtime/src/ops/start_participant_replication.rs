@@ -205,13 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the replicated participant's own, so the bound is measured again on that
         // composition once the participant is resolved, below.
         let requested_attributes = input.attributes.unwrap_or_default();
-        crate::state::check_attributes_size(Self::NAME, "attributes", &requested_attributes)
-            .map_err(|message| {
+        crate::state::check_attributes_size("attributes", &requested_attributes).map_err(
+            |message| {
                 crate::state::validation_failed(
                     StartParticipantReplicationErrorModeled::ValidationException,
                     message,
                 )
-            })?;
+            },
+        )?;
 
         // Replication is INTO another stage: the destination holds a replica of a
         // participant publishing somewhere else, so a request naming one stage twice
@@ -258,7 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(crate::state::resource_not_found(
                 StartParticipantReplicationErrorModeled::ResourceNotFoundException,
-                &input.participant_id,
+                &crate::state::named_resource(
+                    crate::state::PARTICIPANT_RESOURCE,
+                    &input.participant_id,
+                ),
             ));
         };
         if !participant.publishes {
@@ -288,7 +292,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // session is opened or any record written, so a refused composition leaves the
         // store exactly as it was.
         let attributes = crate::state::merge_attributes_within_bound(
-            Self::NAME,
             "attributes",
             &participant.attributes,
             requested_attributes,

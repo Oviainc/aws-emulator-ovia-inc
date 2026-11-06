@@ -305,6 +305,26 @@ fn not_found(identifier: &str) -> String {
     format!("Resource: {identifier} not found")
 }
 
+/// The code and the sentence the `/tags/{resourceArn}` surface answers a not-found with:
+/// its own, which name neither the ARN nor the kind of resource it addressed (see
+/// `tagging.rs`), where every resource-specific read answers the modelled code and
+/// [`not_found`].
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// What the call `call` answers for a resource this account view does not hold: the
+/// tagging surface's own refusal for the three operations bound to `/tags/{resourceArn}`,
+/// and the modelled one naming the ARN for every other.
+fn expected_not_found(call: Call, arn: &str) -> (String, String) {
+    match call {
+        Call::Tagging(..) => (
+            TAGGING_NOT_FOUND_CODE.to_string(),
+            TAGGING_NOT_FOUND_MESSAGE.to_string(),
+        ),
+        Call::Operation(..) => ("ResourceNotFoundException".to_string(), not_found(arn)),
+    }
+}
+
 /// The refusal this service states for a member that names a resource of this service
 /// this account view holds none of.
 fn unresolved_reference(operation: &str, member: &str, resource: &str, identifier: &str) -> String {
@@ -547,13 +567,10 @@ async fn a_resource_of_another_region_is_not_found_by_the_call_that_names_it() {
         let arn = realtime.create(kind, home).await;
 
         let (status, response) = realtime.dispatch(other, call, &arn).await;
+        let (expected_code, expected_message) = expected_not_found(call, &arn);
         assert_eq!(
             (status, error_code(&response), member_of(&response, "message")),
-            (
-                404,
-                "ResourceNotFoundException".to_string(),
-                not_found(&arn)
-            ),
+            (404, expected_code, expected_message),
             "case {case:?}: naming a resource of {home} through {other} must be a \
              not-found, got {status} {response}"
         );

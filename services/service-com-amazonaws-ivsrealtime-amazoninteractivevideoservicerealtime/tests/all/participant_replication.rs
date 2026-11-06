@@ -258,10 +258,11 @@ fn matches(pattern: &str, value: &str) -> bool {
     }
 }
 
-/// An `attributes` map whose keys and values total `bytes` bytes — the measure the
-/// documented 1 KB limit is stated in.
+/// An `attributes` map whose JSON encoding is `bytes` bytes — the measure the documented
+/// 1 KB limit is stated in. One entry, so its punctuation is the two braces, the two
+/// quotes around the key, the colon and the two quotes around the value.
 fn attributes_of_size(bytes: usize) -> HashMap<String, String> {
-    HashMap::from([("a".to_string(), "v".repeat(bytes - 1))])
+    HashMap::from([("a".to_string(), "v".repeat(bytes - "{\"a\":\"\"}".len()))])
 }
 
 /// Assert `session_id` is a session id in the modelled `StageSessionId` form.
@@ -793,7 +794,7 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
             }),
             status: 404,
             code: "ResourceNotFoundException",
-            message: Some("Resource: ghost-1 not found".to_string()),
+            message: Some("Resource: participant \"ghost-1\" not found".to_string()),
         },
         RefusalCase {
             case: "a participant of the destination stage rather than the source",
@@ -804,7 +805,7 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
             }),
             status: 404,
             code: "ResourceNotFoundException",
-            message: Some(format!("Resource: {elsewhere} not found")),
+            message: Some(format!("Resource: participant \"{elsewhere}\" not found")),
         },
         RefusalCase {
             case: "a participant whose token grants no publish capability",
@@ -846,8 +847,8 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
             status: 400,
             code: "ValidationException",
             message: Some(format!(
-                "StartParticipantReplication.attributes is required to have a maximum size \
-                 of {MAX_ATTRIBUTES_BYTES} bytes, found {}",
+                "Request member: attributes failed to satisfy the constraints: attributes \
+                 is required to have a maximum size of 1 KB, found {} bytes",
                 MAX_ATTRIBUTES_BYTES + 1
             )),
         },
@@ -961,8 +962,8 @@ async fn replicating_into_a_stage_twice_conflicts() {
         assert_eq!(
             error_message(&response),
             format!(
-                "Resource: participant {participant} of {source} is already replicated to \
-                 {destination}"
+                "Resource: participant \"{participant}\" of {source} is already replicated \
+                 to {destination}"
             ),
             "case {repeat_case:?}: the conflict must name the participant and both stages, \
              got {response}"

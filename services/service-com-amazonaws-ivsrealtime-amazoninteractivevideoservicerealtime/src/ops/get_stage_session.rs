@@ -197,7 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     GetStageSessionErrorModeled::ResourceNotFoundException,
-                    &input.session_id,
+                    // A `sessionId` is not an ARN, so it does not name its own kind of
+                    // resource: the refusal names the kind and quotes the id, which is
+                    // what tells a caller the SESSION is what resolved to nothing and not
+                    // the stage it named beside it (`crate::state::named_resource`).
+                    &crate::state::named_resource(
+                        crate::state::STAGE_SESSION_RESOURCE,
+                        &input.session_id,
+                    ),
                 )
             })?;
 

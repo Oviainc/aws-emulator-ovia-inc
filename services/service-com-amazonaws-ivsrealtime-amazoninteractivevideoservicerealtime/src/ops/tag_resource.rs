@@ -9,7 +9,10 @@
 //! The `resourceArn` is checked the way `ListTagsForResource` checks it (see that file
 //! for why the modelled pattern cannot be enforced literally), and the tag set the call
 //! would LEAVE is checked against the modelled `Tags` `@length` — the bound is on the
-//! resource's tags, not on one request's entries.
+//! resource's tags, not on one request's entries. Both refusals of this surface carry
+//! its own error codes rather than the modelled ones (see
+//! [`crate::state::TAGGING_NOT_FOUND_CODE`] and
+//! [`crate::state::TAGGING_BAD_REQUEST_CODE`]).
 //!
 //! A key in the reserved `aws:` namespace is refused outright: the member's doc defers to
 //! the AWS-wide tagging restrictions, which reserve that prefix for AWS's own tags (see
@@ -183,12 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let tags = crate::state::resource_tags_mut(&mut store, &input.resource_arn, &region)
-            .ok_or_else(|| {
-                crate::state::resource_not_found(
-                    TagResourceErrorModeled::ResourceNotFoundException,
-                    &input.resource_arn,
-                )
-            })?;
+            // The tagging surface answers an ARN naming no resource with its OWN code
+            // and sentence, which are not the ones the resource-specific reads of the
+            // same resources answer; see `crate::state::tagging_not_found`.
+            .ok_or_else(crate::state::tagging_not_found)?;
 
         // The count the resource would be left with: its own keys plus the new ones the
         // request adds. A key it already carries is replaced, so it adds nothing. Checked
@@ -198,12 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .keys()
             .filter(|key| !tags.contains_key(key.as_str()))
             .count();
-        crate::state::check_tag_count(Self::NAME, tags.len() + added).map_err(|message| {
-            crate::state::validation_failed(
-                TagResourceErrorModeled::ValidationException,
-                message,
-            )
-        })?;
+        crate::state::check_tag_count(tags.len() + added)?;
 
         tags.extend(input.tags);
 

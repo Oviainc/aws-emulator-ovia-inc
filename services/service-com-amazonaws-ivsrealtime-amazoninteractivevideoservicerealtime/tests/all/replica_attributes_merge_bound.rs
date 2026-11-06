@@ -16,7 +16,7 @@
 //! The rule under test: the bound is measured on the map that will be STORED and REPORTED,
 //! so a composition past the documented maximum is refused with the modelled
 //! `ValidationException` (HTTP 400) in this service's constraint-refusal construction —
-//! naming the operation, the member and the COMPOSED total — and a composition at or under
+//! naming the member and the COMPOSED size — and a composition at or under
 //! it is accepted and reported back unchanged. The rows span what the rule generalises
 //! over: which half carries the bytes, whether the keys overlap (an overlapping key takes
 //! the overriding value, so a composition can total less than the sum of its halves), how
@@ -241,9 +241,27 @@ fn pair(key: &str, value_bytes: usize) -> BTreeMap<String, String> {
     BTreeMap::from([(key.to_string(), "v".repeat(value_bytes))])
 }
 
-/// The size the rule measures: the sum of the key and value BYTES of the map.
+/// The size the rule measures: the bytes the map occupies as JSON — the braces, the
+/// quoted keys, the colons, the commas and the quoted values — which is the form every
+/// request carries one in.
 fn size_of(map: &BTreeMap<String, String>) -> usize {
-    map.iter().map(|(key, value)| key.len() + value.len()).sum()
+    serde_json::to_string(map)
+        .expect("a map of strings serializes")
+        .len()
+}
+
+/// The JSON punctuation a map of `pairs` entries carries, which the measured size counts
+/// beside the keys and values themselves: the two braces, the two quotes around each key
+/// and each value, the colon in every entry and the comma between entries.
+fn json_punctuation(pairs: usize) -> usize {
+    2 + pairs * 5 + pairs.saturating_sub(1)
+}
+
+/// The keys-and-values total a map of `pairs` entries needs for its JSON encoding to be
+/// exactly `json_total` bytes — how a row below lands a COMPOSITION of several entries on
+/// the bound.
+fn raw_total(pairs: usize, json_total: usize) -> usize {
+    json_total - json_punctuation(pairs)
 }
 
 /// The map `StartParticipantReplication` stores: the participant's own attributes with the
@@ -257,11 +275,11 @@ fn composed(
     merged
 }
 
-/// The sentence this service states the bound with, for the composed total.
+/// The sentence this service states the bound with, for the composed size.
 fn expected_message(size: usize) -> String {
     format!(
-        "{OPERATION}.attributes is required to have a maximum size of {MAX_ATTRIBUTES_BYTES} \
-         bytes, found {size}"
+        "Request member: attributes failed to satisfy the constraints: attributes is \
+         required to have a maximum size of 1 KB, found {size} bytes"
     )
 }
 
@@ -306,13 +324,21 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "disjoint halves composing to exactly the maximum",
-            token: attributes("t", 4, 512),
-            requested: Some(attributes("r", 4, 512)),
+            token: attributes("t", 4, raw_total(8, MAX_ATTRIBUTES_BYTES) / 2),
+            requested: Some(attributes(
+                "r",
+                4,
+                raw_total(8, MAX_ATTRIBUTES_BYTES) - raw_total(8, MAX_ATTRIBUTES_BYTES) / 2,
+            )),
         },
         Row {
             case: "disjoint halves composing to one byte past the maximum",
-            token: attributes("t", 4, 512),
-            requested: Some(attributes("r", 1, 513)),
+            token: attributes("t", 4, raw_total(8, MAX_ATTRIBUTES_BYTES) / 2),
+            requested: Some(attributes(
+                "r",
+                4,
+                raw_total(8, MAX_ATTRIBUTES_BYTES) - raw_total(8, MAX_ATTRIBUTES_BYTES) / 2 + 1,
+            )),
         },
         Row {
             case: "many small pairs on both halves, composing past the maximum",
@@ -321,23 +347,26 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "the token at the maximum and the request adding one byte on a new key",
-            token: attributes("t", 1, MAX_ATTRIBUTES_BYTES),
+            token: attributes("t", 1, raw_total(1, MAX_ATTRIBUTES_BYTES)),
             requested: Some(pair("r", 0)),
         },
         Row {
             case: "the token at the maximum with no request attributes",
-            token: attributes("t", 2, MAX_ATTRIBUTES_BYTES),
+            token: attributes("t", 2, raw_total(2, MAX_ATTRIBUTES_BYTES)),
             requested: None,
         },
         Row {
             case: "an overlapping key replacing a large value with a small one",
-            token: pair("seat", MAX_ATTRIBUTES_BYTES - 4),
+            token: pair("seat", raw_total(1, MAX_ATTRIBUTES_BYTES) - "seat".len()),
             requested: Some(pair("seat", 8)),
         },
         Row {
             case: "an overlapping key replacing a small value with one past the maximum",
             token: pair("seat", 8),
-            requested: Some(pair("seat", MAX_ATTRIBUTES_BYTES - 3)),
+            requested: Some(pair(
+                "seat",
+                raw_total(1, MAX_ATTRIBUTES_BYTES) - "seat".len() + 1,
+            )),
         },
         Row {
             case: "multi-byte text on both halves, composing past the maximum",
@@ -346,13 +375,16 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "multi-byte text on both halves, composing to exactly the maximum",
-            token: multi_byte_attributes("ключ", 512),
-            requested: Some(multi_byte_attributes("клавиша", 512)),
+            token: multi_byte_attributes("ключ", raw_total(2, MAX_ATTRIBUTES_BYTES) / 2),
+            requested: Some(multi_byte_attributes(
+                "клавиша",
+                raw_total(2, MAX_ATTRIBUTES_BYTES) - raw_total(2, MAX_ATTRIBUTES_BYTES) / 2,
+            )),
         },
         Row {
-            case: "a request map past the maximum on its own",
+            case: "a request map one byte past the maximum on its own",
             token: BTreeMap::new(),
-            requested: Some(attributes("r", 1, MAX_ATTRIBUTES_BYTES + 1)),
+            requested: Some(attributes("r", 1, raw_total(1, MAX_ATTRIBUTES_BYTES) + 1)),
         },
     ]
 }
@@ -449,7 +481,7 @@ async fn a_refused_composition_leaves_the_store_as_it_was() {
     let destination = emulator.stage(case, "refused-destination").await;
     // The token holds the whole maximum, so any non-empty new key on the request composes
     // past it.
-    let token = attributes("t", 2, MAX_ATTRIBUTES_BYTES);
+    let token = attributes("t", 2, raw_total(2, MAX_ATTRIBUTES_BYTES));
     let publisher = emulator.publisher(case, &source, &token).await;
 
     let refused = json!({
@@ -531,10 +563,7 @@ async fn the_same_total_is_refused_as_one_map_elsewhere() {
             "case {case:?}: {operation} must answer ValidationException, got {response}"
         );
         let stated = member(&response, "message");
-        let expected = format!(
-            "{operation}.attributes is required to have a maximum size of \
-             {MAX_ATTRIBUTES_BYTES} bytes, found {size}"
-        );
+        let expected = expected_message(size);
         assert_eq!(
             stated, expected,
             "case {case:?}: {operation} must state {expected:?}, got {stated:?}"

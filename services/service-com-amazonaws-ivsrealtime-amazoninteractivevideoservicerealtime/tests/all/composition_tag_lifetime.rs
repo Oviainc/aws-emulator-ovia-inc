@@ -11,10 +11,12 @@
 //! stop recorded, so every reader of it answers the same at the same instant and no
 //! unrelated call in between can change that answer. Concretely, for a composition the
 //! clock has reclaimed (the model's `StartComposition` doc: the "Composition stops and the
-//! resource is deleted … When StopComposition is called"), `/tags/{resourceArn}` answers
-//! the modelled `ResourceNotFoundException` (HTTP 404) exactly when `GetComposition` does
+//! resource is deleted … When StopComposition is called"), `/tags/{resourceArn}` answers a
+//! 404 exactly when `GetComposition` does
 //! — whether or not any call has touched the store since the stop, and however many times
-//! the same request is repeated.
+//! the same request is repeated. Each surface answers the 404 with its OWN error code: the
+//! tagging surface's `NotFoundException`, and the modelled `ResourceNotFoundException` for
+//! the resource read.
 //!
 //! The rows differ along what the rule generalises over: HOW LONG after the stop the read
 //! is made (inside the stop span, once the stop has finished, past the retention of the
@@ -55,6 +57,10 @@ const STATE_STOPPED: &str = "STOPPED";
 
 /// The modelled error a read of a composition the clock has reclaimed is answered with.
 const NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The error code the TAGGING surface answers the same reclaim with — its own, which is
+/// not the modelled one the resource read above answers (see `tagging.rs`).
+const TAGGING_NOT_FOUND: &str = "NotFoundException";
 
 /// One IVS RealTime emulator over one shared engine, reached the way the router reaches
 /// it, plus the engine handle the clock-driven expiry of a stopped record is run out
@@ -451,17 +457,17 @@ async fn the_tagging_surface_and_get_composition_agree_over_a_compositions_whole
             // The clock reclaimed the ephemeral resource before either reader was asked:
             // both must answer the modelled not-found, and the repeat of the listing must
             // answer it too rather than changing its mind because another call ran.
-            for (what, (status, response)) in [
-                ("ListTagsForResource", &listed),
-                ("GetComposition", &read),
-                ("the repeated ListTagsForResource", &repeated),
+            for (what, expected_code, (status, response)) in [
+                ("ListTagsForResource", TAGGING_NOT_FOUND, &listed),
+                ("GetComposition", NOT_FOUND, &read),
+                ("the repeated ListTagsForResource", TAGGING_NOT_FOUND, &repeated),
             ] {
                 assert_eq!(
                     (*status, error_code(response)),
-                    (404, NOT_FOUND.to_string()),
+                    (404, expected_code.to_string()),
                     "case {case:?}: {what} read {before:?}..{after:?} after the stop, past \
                      the reclaim of the ephemeral resource, must answer HTTP 404 \
-                     {NOT_FOUND}, got {status} {response}"
+                     {expected_code}, got {status} {response}"
                 );
                 assert!(
                     !member(response, "message").is_empty(),
@@ -524,17 +530,17 @@ async fn no_tagging_operation_serves_a_composition_the_clock_has_reclaimed() {
         );
         assert_eq!(
             (status, error_code(&response)),
-            (404, NOT_FOUND.to_string()),
+            (404, TAGGING_NOT_FOUND.to_string()),
             "case {case:?}: {operation} on a composition the clock has reclaimed must \
-             answer HTTP 404 {NOT_FOUND}, got {status} {response}"
+             answer HTTP 404 {TAGGING_NOT_FOUND}, got {status} {response}"
         );
 
         let (status, response) = service.read(&composition_arn).await;
         assert_eq!(
             (status, error_code(&response)),
             (404, NOT_FOUND.to_string()),
-            "case {case:?}: GetComposition must answer the same refusal as {operation}, \
-             got {status} {response}"
+            "case {case:?}: GetComposition must answer the same 404 as {operation}, under \
+             the modelled code, got {status} {response}"
         );
     }
 }

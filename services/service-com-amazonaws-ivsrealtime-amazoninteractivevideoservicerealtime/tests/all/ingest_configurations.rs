@@ -255,10 +255,11 @@ fn arn(region: &str, resource_type: &str, id: &str) -> String {
     format!("arn:aws:ivs:{region}:{ACCOUNT}:{resource_type}/{id}")
 }
 
-/// An `attributes` map whose keys and values total `bytes` bytes — the measure the
-/// documented 1 KB limit is stated in.
+/// An `attributes` map whose JSON encoding is `bytes` bytes — the measure the documented
+/// 1 KB limit is stated in. One entry, so its punctuation is the two braces, the two
+/// quotes around the key, the colon and the two quotes around the value.
 fn attributes_of_size(bytes: usize) -> HashMap<String, String> {
-    HashMap::from([("a".to_string(), "v".repeat(bytes - 1))])
+    HashMap::from([("a".to_string(), "v".repeat(bytes - "{\"a\":\"\"}".len()))])
 }
 
 /// The create requests this suite spans the class of inputs with: each row differs from
@@ -700,9 +701,9 @@ async fn cleartext_ingest_requires_insecure_ingest() {
                 );
                 let message = member(&response, "message");
                 assert!(
-                    message.starts_with("CreateIngestConfiguration.insecureIngest "),
-                    "case {case:?}: expected a refusal naming the operation and the member, \
-                     got {message:?}"
+                    message.starts_with("Request member: ingestProtocol "),
+                    "case {case:?}: expected a refusal naming the member the rule is \
+                     documented on, got {message:?}"
                 );
             } else {
                 assert_eq!(
@@ -727,7 +728,7 @@ async fn cleartext_ingest_requires_insecure_ingest() {
 async fn an_oversized_attributes_map_is_refused_at_the_documented_bound() {
     let emulator = RealTime::new();
     let cases = [
-        ("one byte", 1usize, true),
+        ("the smallest map a request can carry", "{\"a\":\"\"}".len(), true),
         ("half the maximum", MAX_ATTRIBUTES_BYTES / 2, true),
         ("exactly the maximum", MAX_ATTRIBUTES_BYTES, true),
         ("one byte past the maximum", MAX_ATTRIBUTES_BYTES + 1, false),
@@ -763,9 +764,8 @@ async fn an_oversized_attributes_map_is_refused_at_the_documented_bound() {
             );
             let message = member(&response, "message");
             assert!(
-                message.starts_with("CreateIngestConfiguration.attributes "),
-                "case {case:?}: expected a refusal naming the operation and the member, \
-                 got {message:?}"
+                message.starts_with("Request member: attributes "),
+                "case {case:?}: expected a refusal naming the member, got {message:?}"
             );
         }
     }

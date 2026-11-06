@@ -213,7 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(crate::state::resource_not_found(
                 DisconnectParticipantErrorModeled::ResourceNotFoundException,
-                &input.participant_id,
+                // A `participantId` is not an ARN, so the refusal names the kind of
+                // resource and quotes the id (`crate::state::named_resource`): that is
+                // what tells a caller the participant is what the stage does not have,
+                // and not the stage itself.
+                &crate::state::named_resource(
+                    crate::state::PARTICIPANT_RESOURCE,
+                    &input.participant_id,
+                ),
             ));
         }
 

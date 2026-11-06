@@ -15,8 +15,11 @@
 //! `ListTagsForResourceInput`'s `skip_validation` so the framework's walk does not refuse
 //! it first.
 //!
-//! An ARN that is well formed but names no resource this store holds is the modelled
-//! `ResourceNotFoundException` (HTTP 404), not a validation failure.
+//! An ARN that is well formed but names no resource this store holds is refused with the
+//! tagging surface's own not-found code and sentence (HTTP 404
+//! [`crate::state::TAGGING_NOT_FOUND_CODE`]), not as a validation failure and not with
+//! the modelled `ResourceNotFoundException` the resource-specific reads of the very same
+//! resources answer.
 //!
 //! ## Shape of an operation
 //!
@@ -169,12 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let tags = crate::state::resource_tags(&state.lock(), &input.resource_arn, &region)
-            .ok_or_else(|| {
-                crate::state::resource_not_found(
-                    ListTagsForResourceErrorModeled::ResourceNotFoundException,
-                    &input.resource_arn,
-                )
-            })?;
+            .ok_or_else(crate::state::tagging_not_found)?;
 
         // `tags` is `@required` on the output: a resource carrying none answers the empty
         // map, which is not the same answer as a missing member.

@@ -17,8 +17,11 @@
 //!    resource type satisfies; so admission cannot turn on the type's LENGTH, and every
 //!    resource type this model declares an ARN shape for is admitted alike.
 //! 2. EXISTENCE. An admitted ARN that names no resource the region the request was
-//!    processed in holds is the modelled `ResourceNotFoundException` (HTTP 404), not a
-//!    validation failure. A resource belongs to the region its ARN names, so each test
+//!    processed in holds is refused with this surface's OWN not-found — HTTP 404
+//!    `NotFoundException` stating one fixed, resource-agnostic sentence — and not as a
+//!    validation failure, and not with the `ResourceNotFoundException` the
+//!    resource-specific reads of the very same resources answer. A resource belongs to
+//!    the region its ARN names, so each test
 //!    addresses its fixture through the region the fixture was created in; the region
 //!    scoping itself is asserted in `region_scoped_resources.rs`.
 //! 3. ROUND TRIP. `TagResource` is additive — a key the resource carries takes the new
@@ -27,7 +30,8 @@
 //!    named keys and is idempotent. Both answer the recorded 204 with no body.
 //! 4. The modelled `Tags` `@length` maximum bounds the RESOURCE's tag set, so a call is
 //!    refused when the set it would LEAVE is over the maximum, even though each request
-//!    is within it.
+//!    is within it — with this surface's own HTTP 400 `BadRequestException` and the one
+//!    fixed sentence it states that bound with.
 //! 5. RESERVED NAMESPACE. Every `Tags`/`TagKeyList` member of this model defers to the
 //!    AWS-wide tagging restrictions ("Amazon IVS has no constraints on tags beyond what
 //!    is documented there"), which reserve the `aws:` key namespace for AWS's own tags: a
@@ -68,6 +72,23 @@ const RESOURCE_ARN_MAX_LENGTH: usize = 128;
 /// The modelled `@length` maximum of `Tags`
 /// (`smithy_query(query="shape", shape="Tags")`): the tags one resource carries.
 const MAX_TAGS: usize = 50;
+
+/// The error code this surface answers for an ARN it holds no resource for, and the
+/// fixed sentence it states — both distinct from the `ResourceNotFoundException` /
+/// `Resource: <arn> not found` the resource-specific reads answer (see
+/// `not_found_envelope`-style cover in `error_envelope.rs`).
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The error code this surface answers for a request it refuses as malformed.
+const TAGGING_BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The sentence this surface states when the tag set a call would leave is over
+/// `MAX_TAGS`. Written out independently of the service, with the bound interpolated
+/// from the modelled maximum above.
+fn tag_limit_refusal() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS} user tags.")
+}
 
 /// What a tagging WRITE answers: `TagResource` and `UntagResource` leave their success
 /// code defaulted in the model (`codeDefaulted: true`), and the recorded AWS responses
@@ -317,11 +338,6 @@ fn arn(region: &str, resource_type: &str, id: &str) -> String {
     format!("arn:aws:ivs:{region}:{ACCOUNT}:{resource_type}/{id}")
 }
 
-/// The not-found text this service states for an ARN it holds no resource for.
-fn not_found(identifier: &str) -> String {
-    format!("Resource: {identifier} not found")
-}
-
 /// A tag map of `count` distinct entries.
 fn tag_map(count: usize) -> HashMap<String, String> {
     (0..count)
@@ -500,7 +516,11 @@ async fn an_admitted_arn_naming_no_resource_is_a_not_found_on_every_tagging_oper
                     reply.error_code.as_str(),
                     reply.message.as_str()
                 ),
-                (404, "ResourceNotFoundException", not_found(&missing).as_str()),
+                (
+                    404,
+                    TAGGING_NOT_FOUND_CODE,
+                    TAGGING_NOT_FOUND_MESSAGE
+                ),
                 "case {case:?} ({method}): an admitted ARN naming no resource must be a \
                  not-found, got {} {} {}",
                 reply.status,
@@ -611,7 +631,7 @@ async fn a_resource_arn_outside_its_constraints_is_refused_naming_the_constraint
         let reply = realtime.tagging(method, &at_maximum, query, body).await;
         assert_eq!(
             (reply.status, reply.error_code.as_str()),
-            (404, "ResourceNotFoundException"),
+            (404, TAGGING_NOT_FOUND_CODE),
             "case {method} at the length maximum: a label on the bound is admitted, got \
              {} {} {}",
             reply.status,
@@ -657,17 +677,14 @@ async fn the_tag_maximum_bounds_the_resource_not_one_request() {
             Some(json!({ "tags": { "one-too-many": "x" } })),
         )
         .await;
-    let expected = format!(
-        "TagResource.tags is required to have a maximum length of {MAX_TAGS}, found {}",
-        MAX_TAGS + 1
-    );
+    let expected = tag_limit_refusal();
     assert_eq!(
         (
             reply.status,
             reply.error_code.as_str(),
             reply.message.as_str()
         ),
-        (400, "ValidationException", expected.as_str()),
+        (400, TAGGING_BAD_REQUEST_CODE, expected.as_str()),
         "a call that would leave the resource over the maximum must be refused, got {} {} {}",
         reply.status,
         reply.error_code,
