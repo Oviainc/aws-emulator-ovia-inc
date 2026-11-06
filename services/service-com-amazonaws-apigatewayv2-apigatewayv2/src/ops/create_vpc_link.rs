@@ -145,7 +145,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let bad_request = |message: String| -> Self::Error {
             CreateVpcLinkErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message),
@@ -172,6 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::SECURITY_GROUP_ID_PREFIX,
             &security_group_ids,
         ) {
+            return Err(bad_request(message));
+        }
+
+        // An id of the right FORM still has to name a subnet the account HAS, and the
+        // link's network interfaces — one per subnet — live in a single VPC, so the list
+        // has to agree on one. Neither fact is this service's: subnets belong to Amazon
+        // EC2, so both are resolved against the service that owns them
+        // ([`crate::state::resolve_vpc_link_subnets`]), in the Region the request was
+        // signed for. Asked BEFORE anything is persisted, and with no store lock held, so
+        // a refused create writes nothing and the hop cannot block a reader.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(message) =
+            crate::state::resolve_vpc_link_subnets(ctx, &region, &input.subnet_ids).await
+        {
             return Err(bad_request(message));
         }
 

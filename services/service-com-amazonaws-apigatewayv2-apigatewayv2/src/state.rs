@@ -15,9 +15,14 @@
 //! the opaque `NextToken` that resumes a walk — lives in [`paging`], the module that
 //! holds those bounds, and the selection expressions several members carry live in
 //! [`selection_expression`]. The statuses the service answers where they differ from the
-//! model's `@http code` live in [`wire_status`]. All three are re-exported here so a
+//! model's `@http code` live in [`wire_status`]. All of them are re-exported here so a
 //! handler reaches them the way it reaches everything else in this module.
+//!
+//! One fact a request names is NOT this service's to hold: the subnets of the account a
+//! VPC link is placed in are Amazon EC2's resources, so they are resolved against the
+//! service that owns them in [`ec2_subnets`].
 
+pub mod ec2_subnets;
 pub mod paging;
 pub mod selection_expression;
 pub mod wire_status;
@@ -4167,6 +4172,23 @@ pub fn validate_ec2_resource_ids(
 /// shape="StringWithLengthBetween1And128")`). The shape carries no `@length` trait, so
 /// the bound is a handler's to enforce rather than the boundary validator's.
 pub const MAX_VPC_LINK_NAME_LEN: usize = API_NAME_LEN.1;
+
+/// Resolve every subnet a `CreateVpcLink` names against the account's own network — see
+/// [`ec2_subnets::resolve_vpc_link_subnets`], which asks the service that OWNS subnets.
+pub use ec2_subnets::resolve_vpc_link_subnets;
+
+/// How a refusal names a subnet the account has none of — see
+/// [`ec2_subnets::subnet_does_not_exist_message`].
+pub use ec2_subnets::subnet_does_not_exist_message;
+
+/// The sentence a create is refused with when its subnets span two VPCs — see
+/// [`ec2_subnets::SUBNETS_NOT_IN_ONE_VPC_MESSAGE`].
+pub use ec2_subnets::SUBNETS_NOT_IN_ONE_VPC_MESSAGE;
+
+/// The most distinct subnets one create resolves — see
+/// [`ec2_subnets::MAX_SUBNET_IDS_RESOLVED`], the server-side bound on the work one call
+/// costs.
+pub use ec2_subnets::MAX_SUBNET_IDS_RESOLVED;
 
 /// Refuse a VPC link `Name` outside the documented bound of the shape it targets: at
 /// least one character and at most [`MAX_VPC_LINK_NAME_LEN`].

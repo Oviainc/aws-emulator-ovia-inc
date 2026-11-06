@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetAuthorizersCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetAuthorizersCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers 204 for a stage of an api this service holds, and the modelled 404
+//! for an `ApiId` or a `StageName` that names nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetAuthorizersCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What a reset removes
+//!
+//! "Resets all authorizer cache entries on a stage" — a cache entry is a decision an
+//! authorizer in front of a route ALREADY returned for some identity, kept for its
+//! `AuthorizerResultTtlInSeconds`, so the entries a stage holds are exactly the decisions
+//! this emulator has obtained for it. It obtains none: the data plane cannot invoke a
+//! `REQUEST` authorizer's function at all (`crate::service::invoke`'s
+//! `authorization_refusal`, which answers the gateway's 500 for one), and a `JWT`
+//! authorizer's token is evaluated per request and never cached — AWS caches no JWT result
+//! either, since `AuthorizerResultTtlInSeconds` is a `REQUEST` authorizer's member. So
+//! there is no entry to remove, the postcondition this call asks for already holds, and
+//! the answer is the modelled 204 rather than work reported for something nothing did.
+//! Nothing is written: this call changes no resource a later reader sees.
+//!
+//! That is true only while the crate caches no authorizer decision. The moment the data
+//! plane can invoke a `REQUEST` authorizer and keep its result for
+//! `AuthorizerResultTtlInSeconds` — the open reports
+//! `20261029T070719Z-apigatewayv2-lambda-a-request-authorizer-gated-route-never-serves.md` and
+//! `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md` own
+//! the runtime that gap needs — this handler is where that store is emptied, and the checks
+//! that watch a reset change what an invoke answers cannot pass before then.
+//!
+//! What IS computed from persisted state is the refusal: the `ApiId` and the `StageName`
+//! address a stage of an api, and a label that resolves to nothing is the modelled
+//! `NotFoundException` (404), worded the way every other reader and writer of that level
+//! words one.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +181,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetAuthorizersCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetAuthorizersCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetAuthorizersCache"))
+        // Which stage's cache is reset is decided by the two path labels alone, so nothing
+        // else of the request is read.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ResetAuthorizersCache",
+            ));
+        };
+        // A stage holds no cached authorizer decision in this emulator (see the module
+        // docs), so the reset removes nothing and this reads the store without writing to
+        // it: what the call still has to compute from persisted state is whether the stage
+        // it addresses exists.
+        let store = state.lock();
+
+        // Each label of the path is resolved in turn, and a level that names nothing is the
+        // modelled 404, reported the way every other reader and writer of that level
+        // reports one.
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(ResetAuthorizersCacheErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+        if !api.stages.contains_key(&input.stage_name) {
+            return Err(ResetAuthorizersCacheErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::STAGE_RESOURCE,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        }
+
+        // The stage exists and holds no cache entry, which is the state this call asks
+        // for: the modelled empty output at 204, and idempotent — a second call answers
+        // the same.
+        Ok(ResetAuthorizersCacheOutput)
     }
 }

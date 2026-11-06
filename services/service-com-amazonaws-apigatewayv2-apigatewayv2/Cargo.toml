@@ -26,12 +26,24 @@ serde_json = { workspace = true }
 # Hex, for the opaque pagination tokens the paginated readers mint and verify.
 hex = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the subnets a `CreateVpcLink` places a VPC link's network
+# interfaces in are EC2's resources, so `src/state/ec2_subnets.rs` asks EC2 what the
+# account has rather than deciding it here. Only the generated client is needed — the
+# emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The EC2 service, mounted beside this one in the test harness: that a VPC link can only
+# be created in subnets of one VPC the account really has is driven end to end with the
+# owner of subnets on the same engine. DEV-ONLY: this crate depends on no other service's
+# crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [lints]
 workspace = true

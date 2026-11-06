@@ -41,6 +41,8 @@ mod authorizer_deletion;
 mod authorizer_lifecycle;
 #[path = "all/authorizer_update.rs"]
 mod authorizer_update;
+#[path = "all/authorizers_cache_reset.rs"]
+mod authorizers_cache_reset;
 #[path = "all/auto_deploy_republishes.rs"]
 mod auto_deploy_republishes;
 #[path = "all/child_resource_delete_is_applied.rs"]
@@ -205,12 +207,16 @@ mod stage_lifecycle;
 mod stage_pagination;
 #[path = "all/stage_update.rs"]
 mod stage_update;
+#[path = "all/stage_variable_values.rs"]
+mod stage_variable_values;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/vpc_link_deletion.rs"]
 mod vpc_link_deletion;
 #[path = "all/vpc_link_lifecycle.rs"]
 mod vpc_link_lifecycle;
+#[path = "all/vpc_link_subnet_resolution.rs"]
+mod vpc_link_subnet_resolution;
 #[path = "all/vpc_link_update.rs"]
 mod vpc_link_update;
 #[path = "all/websocket_connect_authorization.rs"]
