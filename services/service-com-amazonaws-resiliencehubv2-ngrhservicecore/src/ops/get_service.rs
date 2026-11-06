@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-formed ARN that names no stored service is a 404.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(record) = store.resolve(&input.service_arn, now) else {
+        let Some(service) = store.service_view(&input.service_arn, now) else {
             return Err(GetServiceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("No service found for {}", input.service_arn),
@@ -159,8 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        Ok(GetServiceOutput {
-            service: record.to_service(),
-        })
+        Ok(GetServiceOutput { service })
     }
 }

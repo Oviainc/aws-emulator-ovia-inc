@@ -208,8 +208,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         record.updated_at = now;
 
-        Ok(UpdateServiceOutput {
-            service: record.to_service(),
-        })
+        // The body is projected through the store's one `Service` view rather than from
+        // the record alone: `effectivePolicyValues` is derived from the policy the
+        // (possibly just-changed) `policyArn` names, which this call cannot reach while it
+        // holds the record. The record was found above, so the lookup cannot miss.
+        let Some(service) = store.service_view(&input.service_arn, now) else {
+            return Err(UpdateServiceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No service found for {}", input.service_arn),
+                    resource_id: Some(input.service_arn.clone()),
+                    resource_type: Some("Service".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(UpdateServiceOutput { service })
     }
 }

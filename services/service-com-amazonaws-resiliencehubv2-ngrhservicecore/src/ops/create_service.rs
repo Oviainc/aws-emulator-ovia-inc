@@ -180,10 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|token| store.idempotency.get(token))
             .cloned()
         {
-            if let Some(record) = store.resolve(&arn, now) {
-                return Ok(CreateServiceOutput {
-                    service: record.to_service(),
-                });
+            if let Some(service) = store.service_view(&arn, now) {
+                return Ok(CreateServiceOutput { service });
             }
         }
 
@@ -262,7 +260,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             store.idempotency.insert(token, service_arn.clone());
         }
-        let service = record.to_service();
+        // `effectivePolicyValues` is derived from the policy `policyArn` names, resolved
+        // here against the policy store under this same lock rather than copied into the
+        // record, so a later read reflects the policy as it stands then.
+        let effective =
+            store.effective_policy_values(record.policy_arn.as_deref(), &record.account_id);
+        let service = record.to_service(effective);
         store.services.insert(service_arn, record);
         Ok(CreateServiceOutput { service })
     }

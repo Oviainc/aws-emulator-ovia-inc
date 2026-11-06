@@ -25,15 +25,18 @@
 
 mod policies;
 
-pub use policies::{mint_policy_arn, PolicyRecord, MAX_POLICIES, POLICY_RESOURCE};
+pub use policies::{
+    mint_policy_arn, PolicyRecord, MAX_POLICIES, POLICY_RESOURCE, POLICY_VALUE_SOURCE_CROSS_ACCOUNT,
+    POLICY_VALUE_SOURCE_SELF,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AssociatedSystem, DependencyDiscoveryConfig, DevOpsAgentConfiguration,
-    DevOpsAgentConfigurationView, PermissionModel, Service, ServiceFunction,
-    ServiceReportConfiguration, ServiceSummary, TestTemplateSummary,
+    DevOpsAgentConfigurationView, EffectivePolicyValues, PermissionModel, Service,
+    ServiceFunction, ServiceReportConfiguration, ServiceSummary, TestTemplateSummary,
 };
 
 /// The ARN service namespace for this service's resources: the model's `sigv4Name` /
@@ -212,11 +215,17 @@ impl ServiceRecord {
     /// This record as the `Service` shape `CreateService` / `GetService` / `UpdateService`
     /// return.
     ///
-    /// Members no operation in this slice computes (`effectivePolicyValues`,
-    /// `achievability`, `estimatedAssessmentCost`, `resourceDiscovery`,
-    /// `rerunAssessment`, `organizationId`) are left absent rather than filled with a
-    /// value nothing derived.
-    pub fn to_service(&self) -> Service {
+    /// `effectivePolicyValues` is DERIVED rather than stored — it is the policy this
+    /// record's `policyArn` names, resolved at projection time — so it is passed in by
+    /// the store that holds both resources (see
+    /// [`ComAmazonawsResiliencehubv2NgrhservicecoreState::effective_policy_values`]) the
+    /// way `associatedServiceCount` is passed into the policy projection. It is always
+    /// present: a service with nothing to derive reports the empty object.
+    ///
+    /// Members no operation in this slice computes (`achievability`,
+    /// `estimatedAssessmentCost`, `resourceDiscovery`, `rerunAssessment`,
+    /// `organizationId`) are left absent rather than filled with a value nothing derived.
+    pub fn to_service(&self, effective_policy_values: EffectivePolicyValues) -> Service {
         Service {
             service_arn: self.service_arn.clone(),
             name: self.name.clone(),
@@ -226,7 +235,7 @@ impl ServiceRecord {
             regions: Some(self.regions.clone()),
             permission_model: self.permission_model.clone(),
             dependency_discovery: self.dependency_discovery.clone(),
-            effective_policy_values: None,
+            effective_policy_values: Some(effective_policy_values),
             achievability: None,
             report_configuration: self.report_configuration.clone(),
             kms_key_id: self.kms_key_id.clone(),
@@ -433,6 +442,20 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
         let record = self.services.get_mut(arn)?;
         record.materialise(now);
         Some(record)
+    }
+
+    /// The `Service` body for the service stored under `arn`, with every clock-owed status
+    /// change applied first — the one path every `Service` reader answers from.
+    ///
+    /// It hangs off the STORE rather than the record because the body's
+    /// `effectivePolicyValues` is derived from the policy the record's `policyArn` names,
+    /// which lives beside it under this same lock.
+    pub fn service_view(&mut self, arn: &str, now: SystemTime) -> Option<Service> {
+        self.resolve(arn, now)?;
+        let record = self.services.get(arn)?;
+        let effective =
+            self.effective_policy_values(record.policy_arn.as_deref(), &record.account_id);
+        Some(record.to_service(effective))
     }
 
     /// Apply every clock-owed status change across the store — what a listing does before
